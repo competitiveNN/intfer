@@ -7,6 +7,13 @@ compile_commands.json
 # Agent internal state
 .maki/
 
+# Generated quantized-model artifacts (large binaries; rebuild via scripts)
+*.intfer
+*.dequant.bin
+*.unrot.dump
+*.noembed.intfer
+*.noembed.dequant.bin
+
 # Editor / OS noise
 *.swp
 .DS_Store

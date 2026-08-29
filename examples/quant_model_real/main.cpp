@@ -78,11 +78,15 @@ int main(int argc, char** argv) {
   int max_layers = 1 << 30;
   double budget_frac = 0.30;
   bool no_embed = false;
+  std::string out_path;
+  std::string dump_path;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--layers" && i + 1 < argc) max_layers = std::stoi(argv[++i]);
     else if (a == "--budget-frac" && i + 1 < argc) budget_frac = std::stod(argv[++i]);
     else if (a == "--no-embed") no_embed = true;
+    else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+    else if (a == "--dump" && i + 1 < argc) dump_path = argv[++i];
     else if (a.rfind("--", 0) != 0) path = a;
   }
 
@@ -245,5 +249,42 @@ int main(int argc, char** argv) {
   printf("\nVERDICT: quantization reproduces the FP16 linear operators: %s\n",
          ok ? "PASS" : "REVIEW");
   printf("(operator-level fidelity; full autoregressive generation not yet run)\n");
+
+  // ---- Write the native-SYCL artifact (if requested) ---------------------
+  if (!out_path.empty()) {
+    std::vector<uint8_t> blob = serialize_intfer(res.model, res.rotations);
+    if (write_file(out_path, blob)) {
+      printf("\nwrote native-SYCL artifact: %s (%.1f MiB)\n",
+             out_path.c_str(), (double)blob.size() / (1024.0 * 1024.0));
+      printf("  contains %zu tensors, %zu rotations (magic INTFER1)\n",
+             res.model.tensors.size(), res.rotations.size());
+    } else {
+      printf("\nFAIL: could not write %s\n", out_path.c_str());
+      return 1;
+    }
+  }
+
+  // ---- Dump dequantized weights (for external validation, e.g. transformers) -
+  // Simple format: magic "DQMP" | uint32 count | per tensor:
+  //   uint32 name_len | name bytes | uint32 N | uint32 K | N*K float32 LE.
+  if (!dump_path.empty()) {
+    FILE* f = std::fopen(dump_path.c_str(), "wb");
+    if (!f) { printf("\nFAIL: cannot open dump %s\n", dump_path.c_str()); return 1; }
+    uint32_t cnt = (uint32_t)res.model.tensors.size();
+    fwrite("DQMP", 1, 4, f);
+    fwrite(&cnt, 4, 1, f);
+    std::vector<float> w;
+    for (const auto& t : res.model.tensors) {
+      w.clear(); dashq::dequant_tensor(res.model, t, w);
+      uint32_t nl = (uint32_t)t.name.size();
+      fwrite(&nl, 4, 1, f);
+      fwrite(t.name.data(), 1, nl, f);
+      fwrite(&t.N, 4, 1, f);
+      fwrite(&t.K, 4, 1, f);
+      fwrite(w.data(), 4, w.size(), f);
+    }
+    std::fclose(f);
+    printf("\nwrote dequantized weights: %s (%u tensors)\n", dump_path.c_str(), cnt);
+  }
   return ok ? 0 : 2;
 }
