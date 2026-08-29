@@ -1,0 +1,6 @@
+add_executable(flash_attention_demo main.cpp)
+target_link_libraries(flash_attention_demo PRIVATE intfer_device intfer_attention intfer_common)
+if(INTFER_ENABLE_L0)
+  target_link_libraries(flash_attention_demo PRIVATE intfer_l0)
+endif()
+add_sycl_to_target(TARGET flash_attention_demo SOURCES main.cpp)

@@ -1,0 +1,12 @@
+# Build artifacts
+build/
+build_*/
+.cache/
+compile_commands.json
+
+# Agent internal state
+.maki/
+
+# Editor / OS noise
+*.swp
+.DS_Store

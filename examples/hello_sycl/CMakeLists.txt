@@ -1,0 +1,6 @@
+add_executable(hello_sycl main.cpp)
+target_link_libraries(hello_sycl PRIVATE intfer_device intfer_common)
+if(INTFER_ENABLE_L0)
+  target_link_libraries(hello_sycl PRIVATE intfer_l0)
+endif()
+add_sycl_to_target(TARGET hello_sycl SOURCES main.cpp)

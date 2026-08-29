@@ -1,0 +1,6 @@
+add_executable(gemm_demo main.cpp)
+target_link_libraries(gemm_demo PRIVATE intfer_device intfer_gemm intfer_common)
+if(INTFER_ENABLE_L0)
+  target_link_libraries(gemm_demo PRIVATE intfer_l0)
+endif()
+add_sycl_to_target(TARGET gemm_demo SOURCES main.cpp)
