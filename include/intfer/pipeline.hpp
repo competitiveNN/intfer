@@ -26,6 +26,7 @@ struct PipelineConfig {
   bool learn_codebook = false;       // t4 DASH-Q learned non-uniform codebook
   bool use_calibration = false;      // use cfg.calib activations for the Hessian
   CalibrationData calib;             // optional calibration X (t4 diagonal-Hessian)
+  uint64_t skip_int8_above = 0;      // skip INT8 candidate for tensors > N·K elems (0=off)
   std::string model_id = "Qwen3-32B";
   uint32_t n_layers = 0;
 };

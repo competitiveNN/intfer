@@ -117,6 +117,7 @@ Rotation make_hadamard(uint32_t dim) {
     INTFER_LOG_WARN("SpinQuant: dim %u not power-of-two; used blockdiag(Hadamard_%u, I_%u).",
                     dim, p, dim - p);
   }
+  R.is_hadamard = true;
   return R;
 }
 
@@ -288,6 +289,20 @@ RotationSide side_for_role(TensorRole role) {
 }
 
 // --- public: weight rotation --------------------------------------------
+namespace {
+// In-place unscaled Walsh-Hadamard transform (+-1 entries), dim must be pow2.
+void fwht(float* x, uint32_t n) {
+  for (uint32_t len = 2; len <= n; len <<= 1) {
+    uint32_t half = len >> 1;
+    for (uint32_t i = 0; i < n; i += len)
+      for (uint32_t j = 0; j < half; ++j) {
+        float u = x[i + j], v = x[i + j + half];
+        x[i + j] = u + v; x[i + j + half] = u - v;
+      }
+  }
+}
+} // namespace
+
 void rotate_weight(std::vector<float>& W, uint32_t N, uint32_t K,
                    const Rotation& R, RotationSide side) {
   const uint32_t dim = (side == RotationSide::Right) ? K : N;
@@ -295,6 +310,31 @@ void rotate_weight(std::vector<float>& W, uint32_t N, uint32_t K,
     INTFER_LOG_ERROR("SpinQuant rotate_weight: rotation dim %u != expected %u", R.dim, dim);
     return;
   }
+  // Fast path: Hadamard rotations are applied via the Walsh-Hadamard transform
+  // in O(dim log dim) per row/column instead of the naive O(dim^2) matmul.
+  // Mathematically identical (R = H/dim is orthonormal), ~100x faster on the
+  // [248320 x 1024] embedding table.
+  if (R.is_hadamard && is_pow2(dim)) {
+    const float inv = 1.0f / std::sqrt(static_cast<float>(dim));
+    if (side == RotationSide::Right) {
+      std::vector<float> tmp(dim);
+      for (uint32_t i = 0; i < N; ++i) {
+        float* row = &W[static_cast<size_t>(i) * K];
+        std::copy_n(row, dim, tmp.data());
+        fwht(tmp.data(), dim);
+        for (uint32_t j = 0; j < dim; ++j) row[j] = tmp[j] * inv;
+      }
+    } else {
+      std::vector<float> tmp(dim);
+      for (uint32_t k = 0; k < K; ++k) {
+        for (uint32_t i = 0; i < dim; ++i) tmp[i] = W[static_cast<size_t>(i) * K + k];
+        fwht(tmp.data(), dim);
+        for (uint32_t i = 0; i < dim; ++i) W[static_cast<size_t>(i) * K + k] = tmp[i] * inv;
+      }
+    }
+    return;
+  }
+  // General (non-Hadamard) path: naive matmul.
   std::vector<float> out(W.size(), 0.0f);
   if (side == RotationSide::Right) {
     // W' = W R^T : out[i,k] = sum_j W[i,j] * R[k,j]

@@ -49,6 +49,7 @@ struct Rotation {
   uint8_t     id   = 0;            // links to TensorIR::qcfg.rotation_id (0 = none)
   RotationSite site = RotationSite::NONE;
   uint32_t    dim  = 0;
+  bool        is_hadamard = false; // set by make_hadamard(); enables O(n log n) apply
   std::vector<float> mat;           // row-major dim*dim, orthogonal
 };
 

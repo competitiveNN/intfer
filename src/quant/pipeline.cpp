@@ -46,7 +46,8 @@ PipelineResult run_pipeline(const ModelIR& input, const PipelineConfig& cfg) {
         }
       }
     }
-    dashq::quantize_candidates(t, W.data(), t.N, t.K, H, m, cfg.learn_codebook);
+    dashq::quantize_candidates(t, W.data(), t.N, t.K, H, m, cfg.learn_codebook,
+                               cfg.skip_int8_above);
   }
 
   // ---- t5: RCO bit-budget search (mutates m to single canonical config) ----

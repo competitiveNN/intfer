@@ -119,8 +119,8 @@ void dequant_tensor(const ModelIR& m, const TensorIR& t, std::vector<float>& out
 // (code_buf / scale_buf / global_buf). This is exactly the object RCO (t5)
 // consumes.
 void quantize_candidates(TensorIR& parent, const float* W, uint32_t N, uint32_t K,
-                         const DiagHessian& H, ModelIR& model,
-                         bool learn_codebook = false);
+                         const DiagHessian& H, ModelIR& model, bool learn_codebook = false,
+                         uint64_t skip_int8_above_elements = 0);
 
 } // namespace dashq
 } // namespace intfer

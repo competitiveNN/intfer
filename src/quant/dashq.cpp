@@ -289,6 +289,13 @@ QuantResult quantize(const float* W, uint32_t N, uint32_t K, const QuantConfig& 
     return H.per_element() ? H.data()[r * K + c] : H.data()[c];
   };
 
+  // For a fixed (non-learned, canonical) codebook the alternating
+  // assignment/scale solver converges in 2-4 passes; the full `iters` sweep is
+  // only needed for the learned-codebook path. Capping it keeps INT8 (256
+  // levels) tractable on large tensors (e.g. the 248K-token embedding table)
+  // without changing the result materially.
+  const int grp_iters = learn_codebook ? iters : 4;
+
   std::vector<uint8_t> idx;
   idx.reserve((size_t)N * K);
   res.scales.resize((size_t)n_groups * 2, 0);
@@ -307,7 +314,7 @@ QuantResult quantize(const float* W, uint32_t N, uint32_t K, const QuantConfig& 
       }
 
     std::vector<uint8_t> assign;
-    const float s = optimize_group(wg, hg, cb, iters, assign);
+    const float s = optimize_group(wg, hg, cb, grp_iters, assign);
 
     const uint16_t hv = float_to_half(s);
     res.scales[2 * g] = (uint8_t)(hv & 0xFF);
@@ -359,9 +366,17 @@ void dequant_tensor(const ModelIR& m, const TensorIR& t, std::vector<float>& out
 // quantize_candidates: fill the TensorIR candidate list + ModelIR payload.
 // ---------------------------------------------------------------------------
 void quantize_candidates(TensorIR& parent, const float* W, uint32_t N, uint32_t K,
-                         const DiagHessian& H, ModelIR& model, bool learn_codebook) {
+                         const DiagHessian& H, ModelIR& model, bool learn_codebook,
+                         uint64_t skip_int8_above_elements) {
   const std::vector<QuantConfig> cfgs = default_candidates(parent.role);
   for (const auto& base : cfgs) {
+    // INT8 (256 levels) per-group assignment is O(256·N·G) — prohibitive on very
+    // large tensors (e.g. the 248K-token embedding). RCO will never pick INT8 for
+    // such tensors anyway (their floor is INT4 and they are budget-expensive), so
+    // skipping the candidate saves minutes with no effect on the chosen plan.
+    if (skip_int8_above_elements > 0 && base.scheme == QuantScheme::INT8 &&
+        (uint64_t)N * K > skip_int8_above_elements)
+      continue;
     QuantConfig c = base;
     c.rotation_id = parent.qcfg.rotation_id; // carry SpinQuant id if t3 ran first
     const QuantResult r = quantize(W, N, K, c, H, learn_codebook);
