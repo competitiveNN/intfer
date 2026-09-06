@@ -29,21 +29,96 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cinttypes>
+#include <fstream>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
 using namespace intfer;
 
+static std::string model_id = "Qwen3.5-0.8B";
+
+// ---------------------------------------------------------------------------
+// Memory budget enforcement
+// ---------------------------------------------------------------------------
+// Read /proc/meminfo to get MemAvailable. Returns 0 on failure (e.g. non-Linux).
+static uint64_t meminfo_available_bytes() {
+  std::ifstream f("/proc/meminfo");
+  if (!f) return 0;
+  std::string key;
+  uint64_t kb = 0;
+  while (f >> key) {
+    if (key == "MemAvailable:") {
+      f >> kb;
+      return kb * 1024ULL;
+    }
+  }
+  return 0;
+}
+
+// Estimate the FP16 weight bytes per layer by walking the safetensors tensor
+// list once (only metadata, no decode). Used to derive a safe --layer-count
+// when --max-mem-frac / --max-mem-mib are set.
+struct LayerFootprint {
+  uint64_t per_layer_bytes = 0;   // average FP16 size of linear tensors per layer
+  uint64_t embed_bytes = 0;       // embed/lm_head (kept once across the whole run)
+  int      layers = 0;            // number of distinct model layers found
+};
+static LayerFootprint scan_layer_footprint(const SafetensorsReader& sr) {
+  LayerFootprint fp;
+  std::set<int> seen;
+  for (const auto& t : sr.tensors()) {
+    if (t.shape.size() != 2) continue;
+    bool is_embed = (t.name.find("embed_tokens.weight") != std::string::npos ||
+                     t.name.find("lm_head.weight") != std::string::npos);
+    uint64_t bytes = 2ULL;
+    for (size_t d : t.shape) bytes *= d;
+    if (is_embed) {
+      fp.embed_bytes += bytes;
+    } else {
+      int L = parse_layer_index(t.name);
+      if (L < 0) continue;
+      if (seen.insert(L).second) ++fp.layers;
+      fp.per_layer_bytes += bytes;
+    }
+  }
+  if (fp.layers > 0) fp.per_layer_bytes /= size_t(fp.layers);
+  return fp;
+}
+
 static TensorRole role_for_name(const std::string& n, bool& keep) {
+  // Skip speculative-decoder / MTP tensors entirely. They live in
+  // "mtp.layers.*" or "mtp.*" and are a separate model that the
+  // Stage-2 engine doesn't consume. Skipping them here also prevents
+  // them from being duplicated into every layer-chunk of the output.
+  if (n.rfind("mtp.", 0) == 0 || n.find("/mtp.") != std::string::npos) {
+    keep = false;
+    return TensorRole::OTHER;
+  }
   keep = true;
   if (n.find("self_attn.q_proj.weight") != std::string::npos) return TensorRole::ATTN_Q;
   if (n.find("self_attn.k_proj.weight") != std::string::npos) return TensorRole::ATTN_K;
   if (n.find("self_attn.v_proj.weight") != std::string::npos) return TensorRole::ATTN_V;
   if (n.find("self_attn.o_proj.weight") != std::string::npos) return TensorRole::ATTN_O;
+  if (n.find("self_attn.q_norm.weight") != std::string::npos) return TensorRole::NORM;
+  if (n.find("self_attn.k_norm.weight") != std::string::npos) return TensorRole::NORM;
   if (n.find("mlp.gate_proj.weight")   != std::string::npos) return TensorRole::MLP_GATE;
   if (n.find("mlp.up_proj.weight")     != std::string::npos) return TensorRole::MLP_UP;
   if (n.find("mlp.down_proj.weight")   != std::string::npos) return TensorRole::MLP_DOWN;
+  // linear_attn (SSM, Qwen3.5 hybrid) — bulk of the 27B params.
+  // Each in/out Linear gets its own role so DASH-Q can target the
+  // bulk-projection tensors (qkv, z, out_proj) with INT2/INT4/INT8 and
+  // the small-projection tensors (a, b) with the same ladder. conv1d is
+  // small (3-4 columns) and gets the FP16-only floor via OTHER.
+  if (n.find("linear_attn.in_proj_qkv.weight") != std::string::npos) return TensorRole::LINEAR_ATTN_QKV;
+  if (n.find("linear_attn.in_proj_z.weight")   != std::string::npos) return TensorRole::LINEAR_ATTN_Z;
+  if (n.find("linear_attn.in_proj_b.weight")   != std::string::npos) return TensorRole::LINEAR_ATTN_B;
+  if (n.find("linear_attn.in_proj_a.weight")   != std::string::npos) return TensorRole::LINEAR_ATTN_A;
+  if (n.find("linear_attn.out_proj.weight")    != std::string::npos) return TensorRole::LINEAR_ATTN_OUT;
   if (n.find("embed_tokens.weight")    != std::string::npos) return TensorRole::EMBED;
   if (n.find("lm_head.weight")         != std::string::npos) return TensorRole::LM_HEAD;
   keep = false;
@@ -61,6 +136,14 @@ static const char* role_name(TensorRole r) {
     case TensorRole::MLP_GATE:return "MLP_GATE";
     case TensorRole::MLP_UP:  return "MLP_UP";
     case TensorRole::MLP_DOWN:return "MLP_DOWN";
+    case TensorRole::NORM:    return "NORM";
+    case TensorRole::ROPE:    return "ROPE";
+    case TensorRole::LINEAR_ATTN_QKV: return "LINEAR_ATTN_QKV";
+    case TensorRole::LINEAR_ATTN_Z:   return "LINEAR_ATTN_Z";
+    case TensorRole::LINEAR_ATTN_B:   return "LINEAR_ATTN_B";
+    case TensorRole::LINEAR_ATTN_A:   return "LINEAR_ATTN_A";
+    case TensorRole::LINEAR_ATTN_CONV:return "LINEAR_ATTN_CONV";
+    case TensorRole::LINEAR_ATTN_OUT: return "LINEAR_ATTN_OUT";
     default: return "OTHER";
   }
 }
@@ -76,30 +159,98 @@ static const char* scheme_name(QuantScheme s) {
 int main(int argc, char** argv) {
   std::string path = "test/models/Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors";
   int max_layers = 1 << 30;
+  int layer_start = 0;   // inclusive lower bound on layer index
+  int layer_count = -1;  // -1 = no upper bound (use max_layers as the inclusive upper bound)
   double budget_frac = 0.30;
+  double max_mem_frac = 0.90;   // max fraction of available RAM for the fp16_buf
+  uint64_t max_mem_mib = 0;     // explicit cap in MiB; overrides max_mem_frac if nonzero
   bool no_embed = false;
   std::string out_path;
   std::string dump_path;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--layers" && i + 1 < argc) max_layers = std::stoi(argv[++i]);
+    else if (a == "--layer-start" && i + 1 < argc) layer_start = std::stoi(argv[++i]);
+    else if (a == "--layer-count" && i + 1 < argc) layer_count = std::stoi(argv[++i]);
     else if (a == "--budget-frac" && i + 1 < argc) budget_frac = std::stod(argv[++i]);
+    else if (a == "--max-mem-frac" && i + 1 < argc) max_mem_frac = std::stod(argv[++i]);
+    else if (a == "--max-mem-mib" && i + 1 < argc) max_mem_mib = std::stoull(argv[++i]);
     else if (a == "--no-embed") no_embed = true;
     else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
     else if (a == "--dump" && i + 1 < argc) dump_path = argv[++i];
     else if (a.rfind("--", 0) != 0) path = a;
   }
+  // --layer-start + --layer-count define a half-open range [start, start+count).
+  // They take precedence over --layers (which is treated as the inclusive upper bound).
+  const int layer_end_excl = (layer_count >= 0) ? (layer_start + layer_count)
+                                                : max_layers;
 
-  printf("=== Quantize REAL Qwen3.5-0.8B with intfer Stage-1 ===\n");
+  // Auto-detect model_id from the safetensors directory name.
+  // e.g. .../Qwen3.8-27B/model.safetensors-... -> "Qwen3.8-27B"
+  {
+    size_t pos = path.rfind('/');
+    if (pos == std::string::npos) pos = path.rfind('\\');
+    if (pos != std::string::npos) {
+      std::string dir = path.substr(0, pos);
+      size_t p2 = dir.rfind('/');
+      if (p2 != std::string::npos) {
+        std::string d = dir.substr(p2 + 1);
+        // strip any ".safetensors" suffix info — we want the model dir name.
+        if (d.find("Qwen3.") != std::string::npos)
+          model_id = d;
+        else if (d.find("Qwen3_5") != std::string::npos)
+          model_id = "Qwen3.5-0.8B";
+      }
+    }
+  }
+
+  printf("=== Quantize %s with intfer Stage-1 ===\n", model_id.c_str());
   printf("model : %s\n", path.c_str());
-  printf("layers: up to %d | budget_frac: %.2f (INT2 stress)\n\n", max_layers, budget_frac);
+  if (layer_count >= 0)
+    printf("layers: [%d, %d) (%d layers) | budget_frac: %.2f (INT2 stress)\n\n",
+           layer_start, layer_end_excl, layer_count, budget_frac);
+  else
+    printf("layers: up to %d | budget_frac: %.2f (INT2 stress)\n\n", max_layers, budget_frac);
 
   SafetensorsReader reader;
   if (!reader.open(path)) { printf("FAIL: cannot open safetensors\n"); return 1; }
 
+  // ---- Memory budget enforcement ---------------------------------------
+  // Compute how many layers fit into memory given max_mem_frac (default
+  // 0.90) of available RAM.  The per-layer fp16 footprint is computed
+  // from the safetensors metadata; embed/lm_head are counted once.
+  // If --max-mem-mib is given it overrides max_mem_frac.
+  {
+    const uint64_t avail = meminfo_available_bytes();
+    uint64_t cap_bytes = (max_mem_mib > 0)
+                             ? max_mem_mib * 1024ULL * 1024ULL
+                             : uint64_t(double(avail) * max_mem_frac);
+    LayerFootprint fp = scan_layer_footprint(reader);
+    // Guard against divide-by-zero if the model has no learnable layers.
+    uint64_t per_layer = fp.per_layer_bytes;
+    uint64_t extra = fp.embed_bytes;  // embed/lm_head loaded once total
+    int safe_layers = max_layers;
+    if (per_layer > 0) {
+      // Budget must cover: (layers * per_layer) + extra
+      safe_layers = int((cap_bytes - extra) / per_layer);
+      if (safe_layers < 1) safe_layers = 1;
+    }
+    if (layer_count > safe_layers) {
+      printf("[max-mem] cap=%" PRIu64 " MiB avail=%" PRIu64 " MiB "
+             "per_layer=%" PRIu64 " MiB -> max %d layers (requested %d)\n",
+             cap_bytes / (1024 * 1024), avail / (1024 * 1024),
+             per_layer / (1024 * 1024), safe_layers, layer_count);
+      layer_count = safe_layers;
+    }
+    printf("[max-mem] available=%" PRIu64 " MiB cap=%" PRIu64 " MiB "
+           "(%.1f%%) per_layer_footprint=%" PRIu64 " MiB\n",
+           avail / (1024 * 1024), cap_bytes / (1024 * 1024),
+           max_mem_frac * 100.0, per_layer / (1024 * 1024));
+  }
+
   // ---- Load Linear weights into ModelIR ----------------------------------
   ModelIR model;
-  model.model_id = "Qwen3.5-0.8B";
+  model.model_id = model_id;
   uint32_t n_layers = 0;
   size_t kept = 0, skipped = 0;
   uint64_t fp16_bytes = 0;
@@ -110,7 +261,7 @@ int main(int argc, char** argv) {
     if (!keep) { ++skipped; continue; }
     int layer = parse_layer_index(t.name);
     if (layer >= 0) {
-      if (layer >= max_layers) { ++skipped; continue; }
+      if (layer < layer_start || layer >= layer_end_excl) { ++skipped; continue; }
       n_layers = std::max(n_layers, (uint32_t)(layer + 1));
     }
     if (t.shape.size() != 2) { ++skipped; continue; }

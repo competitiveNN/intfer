@@ -16,7 +16,20 @@ enum class TensorRole : uint8_t {
   EMBED = 0, LM_HEAD = 1,
   ATTN_Q = 2, ATTN_K = 3, ATTN_V = 4, ATTN_O = 5,
   MLP_GATE = 6, MLP_UP = 7, MLP_DOWN = 8,
-  NORM = 9, ROPE = 10, OTHER = 11
+  NORM = 9, ROPE = 10,
+  // linear_attn (SSM) — Qwen3.5 hybrid model. Mamba-style tensors have
+  // unique shapes (no attention QKV split), so we map them to dedicated
+  // roles so DASH-Q can target them with the same INT2/INT4/INT8
+  // candidate ladder as self_attn/MLP. They get rotated at the same
+  // sites (QKV/FFN_IN/O) so the Stage-2 engine can apply the matching
+  // online replay.
+  LINEAR_ATTN_QKV = 11,   // in_proj_qkv: H -> conv_dim
+  LINEAR_ATTN_Z   = 12,   // in_proj_z:   H -> n_v*v_head_dim
+  LINEAR_ATTN_B   = 13,   // in_proj_b:   H -> n_v_heads
+  LINEAR_ATTN_A   = 14,   // in_proj_a:   H -> n_v_heads
+  LINEAR_ATTN_CONV= 15,   // conv1d:      (conv_k, conv_dim)
+  LINEAR_ATTN_OUT = 16,   // out_proj:    n_v*v_head_dim -> H
+  OTHER = 17
 };
 
 enum class ActScheme : uint8_t { FP16 = 0, BF16 = 1, INT8_G64 = 2 };

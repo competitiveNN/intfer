@@ -18,7 +18,10 @@ namespace rco {
 // Floors
 // ---------------------------------------------------------------------------
 int parse_layer_index(const std::string& name) {
-  const std::string key = "layers.";
+  // Match the canonical HF prefix "model.language_model.layers." exactly.
+  // We intentionally do NOT match the speculative "mtp.layers." decoder
+  // (a separate model in Qwen3.5+) nor "model.layers." (older formats).
+  static const std::string key = "model.language_model.layers.";
   size_t p = name.find(key);
   if (p == std::string::npos) return -1;
   p += key.size();
@@ -40,11 +43,12 @@ QuantScheme floor_scheme(TensorRole role, int layer_idx) {
     case TensorRole::ATTN_Q:
     case TensorRole::ATTN_K:
     case TensorRole::ATTN_V:
+    case TensorRole::LINEAR_ATTN_QKV:
       // ninfer-style early-outlier escape: first layer forced >= INT4.
       return (layer_idx == 0) ? QuantScheme::INT4 : QuantScheme::INT2;
     default:
-      // attn_o / mlp_* floor INT2; norm/rope/other only expose an FP16
-      // candidate anyway, so INT2 floor keeps it selectable.
+      // attn_o / mlp_* / linear_attn_* floor INT2; norm/rope/other only
+      // expose an FP16 candidate anyway, so INT2 floor keeps it selectable.
       return QuantScheme::INT2;
   }
 }
@@ -402,6 +406,12 @@ const char* role_name(TensorRole r) {
     case TensorRole::MLP_DOWN: return "MLP_DOWN";
     case TensorRole::NORM: return "NORM";
     case TensorRole::ROPE: return "ROPE";
+    case TensorRole::LINEAR_ATTN_QKV: return "LINEAR_ATTN_QKV";
+    case TensorRole::LINEAR_ATTN_Z:   return "LINEAR_ATTN_Z";
+    case TensorRole::LINEAR_ATTN_B:   return "LINEAR_ATTN_B";
+    case TensorRole::LINEAR_ATTN_A:   return "LINEAR_ATTN_A";
+    case TensorRole::LINEAR_ATTN_CONV:return "LINEAR_ATTN_CONV";
+    case TensorRole::LINEAR_ATTN_OUT: return "LINEAR_ATTN_OUT";
     default: return "OTHER";
   }
 }

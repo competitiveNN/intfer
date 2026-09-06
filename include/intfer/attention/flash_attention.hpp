@@ -31,6 +31,8 @@ struct FlashAttentionParams {
   int dim = 0;        // head dimension
   float scale = 0.0f; // softmax scale; default 1/sqrt(dim)
   bool causal = true;
+  int q_offset = 0;   // absolute position of query[0]; causal masks tk > qi+q_offset.
+                       // For decode (seq_q==1) this is the current token position.
 };
 
 // (1) FP16 fused causal/non-causal self-attention forward.

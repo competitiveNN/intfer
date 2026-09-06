@@ -21,5 +21,6 @@ SRC=(
 
 mkdir -p "$(dirname "$OUT")"
 
-g++ -std=c++20 -O2 -pthread -I "$ROOT/include" "${SRC[@]}" -o "$OUT"
+# -fopenmp enables the multi-threaded DASH-Q group/tensor loops
+g++ -std=c++20 -O2 -pthread -fopenmp -I "$ROOT/include" "${SRC[@]}" -o "$OUT"
 echo "Built: $OUT"

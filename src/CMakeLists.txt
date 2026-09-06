@@ -43,16 +43,40 @@ target_link_libraries(intfer_gemm PUBLIC intfer_common)
 add_sycl_to_target(TARGET intfer_gemm SOURCES gemm/quant_gemm.cpp)
 
 # ---------------------------------------------------------------------------
-# Stage-1 quantization core (host-only, no SYCL needed for preprocessing):
-#   - quant_spec.cpp : Tensor-IR contract helpers (docs/quant_spec.md)
-#   - spinquant.cpp  : t3 SpinQuant orthogonal rotation preprocessing
-#   - dashq.cpp/rco.cpp : t4/t5 DASH-Q + RCO solver (under src/quant/)
-# Built only when INTFER_BUILD_QUANT=ON (experimental; not required for t2/t8).
+# Stage-2 inference engine: loads the .intfer, tensor-parallel shards the
+# quantized Linears across the Arc fleet, and runs the per-token decode via the
+# quantized GEMM + fused FlashAttention primitives. Needs the Stage-1 quant core
+# for deserialize_intfer / dequant_tensor.
+# Always-built: quant_core (deserialize, canonical codebook, dashq dequant).
+# Optional:    quant (RCO solver, pipeline) — built only for INTFER_BUILD_QUANT.
+# ---------------------------------------------------------------------------
+add_library(intfer_quant_core STATIC quant_spec.cpp spinquant.cpp
+            quant/dashq.cpp quant/output.cpp quant/safetensors.cpp)
+target_include_directories(intfer_quant_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(intfer_quant_core PUBLIC intfer_common)
+
+add_library(intfer_engine STATIC engine/engine.cpp)
+target_include_directories(intfer_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(intfer_engine PUBLIC intfer_common intfer_device
+                       intfer_gemm intfer_attention intfer_quant_core)
+if(INTFER_ENABLE_L0)
+  target_link_libraries(intfer_engine PUBLIC intfer_l0)
+  target_compile_definitions(intfer_engine PUBLIC INTFER_HAS_L0=1)
+endif()
+if(INTFER_PROFILE_GPU)
+  target_compile_definitions(intfer_engine PUBLIC INTFER_PROFILE_GPU)
+endif()
+if(INTFER_GRAPH_CAPTURE)
+  target_compile_definitions(intfer_engine PUBLIC INTFER_GRAPH_CAPTURE=1)
+endif()
+add_sycl_to_target(TARGET intfer_engine SOURCES engine/engine.cpp)
+
+# ---------------------------------------------------------------------------
+# Stage-1 full quantization pipeline (experimental).
+# Built only when INTFER_BUILD_QUANT=ON.
 # ---------------------------------------------------------------------------
 if(INTFER_BUILD_QUANT)
-  add_library(intfer_quant STATIC quant_spec.cpp spinquant.cpp
-             quant/dashq.cpp quant/rco.cpp
-             quant/pipeline.cpp quant/output.cpp)
+  add_library(intfer_quant STATIC quant/rco.cpp quant/pipeline.cpp)
   target_include_directories(intfer_quant PUBLIC ${CMAKE_SOURCE_DIR}/include)
-  target_link_libraries(intfer_quant PUBLIC intfer_common)
+  target_link_libraries(intfer_quant PUBLIC intfer_quant_core)
 endif()

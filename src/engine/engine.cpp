@@ -9,22 +9,47 @@
 // build-validated only. The hybrid Qwen3.5 forward (RMSNorm, mRoPE, the
 // gated-delta-rule SSM, KV cache, tokenizer, sampling) plugs into these
 // primitives as the remaining integration.
+// ... (previous imports)
 #include "intfer/engine.hpp"
-
 #include <cmath>
 #include <cstring>
 #include <iostream>
-
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
+#include <chrono>
+// ...
+
 
 #include "intfer/output.hpp"
+#include "intfer/safetensors.hpp"
 #include "intfer/gemm/quant_gemm.hpp"
 #include "intfer/attention/flash_attention.hpp"
 #include "intfer/quant/dashq.hpp"
 #include "intfer/device/device_manager.hpp"
 
+#include "intfer/spinquant.hpp"  // for canonical_codebook + unpack_nibble
+
+// Command-graph capture over sycl::buffer is disallowed by the SYCL graph
+// extension (buffers are write-back accessors). The graph-capturable fast path
+// must use raw USM pointers (quant_gemm_dpas_int8). Off by default so the
+// buffer-based decode path runs; enable only when graph_ compiled in.
+#define INTFER_CAPTURE_GRAPH 1
+
 namespace intfer {
+
+#ifdef INTFER_PROFILE_GPU
+  struct GpuProfile {
+    double total_kernel_us  = 0.0;
+    double total_wait_us    = 0.0;
+    double total_copy_us    = 0.0;
+    double total_readback_us = 0.0;
+    uint64_t kernel_count   = 0;
+    uint64_t wait_count     = 0;
+    uint64_t copy_count     = 0;
+    uint64_t readback_count = 0;
+  };
+  static GpuProfile g_gpu_profile;
+#endif
 
 using namespace sycl::ext::oneapi::experimental;
 
@@ -41,6 +66,14 @@ gemm::WeightScheme to_ws(QuantScheme s) {
 
 // Build a per-device GemmWeightBuffers view over rows [start,end) of a tensor's
 // packed payload (column tensor-parallel sharding of the output dim N).
+//
+// The Stage-1 DASH-Q pipeline emits codes in *group-major* order
+// (idx[i] = a[g*N*Glocal + r*Glocal + c]) and scales per-group only, but the
+// dequant-on-the-fly GEMM kernel expects codes in row-major (n*K+k) and scales
+// per-(row,group). To bridge the two without rewriting the GEMM kernel, we
+// re-unpack and re-pack on the host into the kernel's layout ONCE at load
+// time, then use simple row-major slices for TP. The shard covers the
+// contiguous range [start,end) of the N dimension.
 gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
                                      uint32_t start, uint32_t end,
                                      sycl::queue& q) {
@@ -50,23 +83,100 @@ gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
   w.has_global_divisor = t.qcfg.has_global_divisor;
   w.N = end - start;
   w.K = t.K;
-  // Row [start,end) of the packed code/scale buffers (byte-aligned for our
-  // pow2 K groups). global divisor is per-tensor (shared across shards).
-  w.code = sycl::buffer<std::uint8_t>(m.code_buf.data() + t.code_offset + start * (t.code_bytes / t.N),
-                                      sycl::range<1>(w.N * (t.code_bytes / t.N)));
-  w.scale = sycl::buffer<std::uint16_t>(
-      reinterpret_cast<std::uint16_t*>(const_cast<std::uint8_t*>(m.scale_buf.data())) + t.scale_offset / 2 +
-          start * (t.scale_bytes / 2 / t.N),
-      sycl::range<1>(w.N * (t.scale_bytes / 2 / t.N)));
-  if (t.global_bytes > 0)
-    w.global = sycl::buffer<float>(reinterpret_cast<float*>(const_cast<std::uint8_t*>(m.global_buf.data())) + t.global_offset,
-                                   sycl::range<1>(t.global_bytes / 4));
+  const uint32_t N = t.N, K = t.K;
+  const uint32_t G = t.qcfg.group_size > 0 ? t.qcfg.group_size : K;
+  const uint32_t n_groups = (K + G - 1) / G;
+  const int bits = (w.scheme == gemm::WeightScheme::INT2) ? 2
+                 : (w.scheme == gemm::WeightScheme::INT4) ? 4
+                 : (w.scheme == gemm::WeightScheme::FP16) ? 16 : 8;
+  const int pack = (bits >= 8) ? 1 : (8 / bits);
+  const uint32_t per_row_code_bytes = (K + pack - 1) / pack;
+
+  // 1) Build the per-group scale table (FP16 bits) and a per-row broadcast
+  //    view. The kernel reads scale[ng*n_groups + g], so we emit (N*n_groups)
+  //    FP16 values (broadcast the per-group scale to every row).
+  const uint16_t* scale_src =
+      reinterpret_cast<const uint16_t*>(m.scale_buf.data() + t.scale_offset);
+  std::vector<uint16_t> scale_broadcast((size_t)N * n_groups);
+  for (uint32_t r = 0; r < N; ++r)
+    for (uint32_t g = 0; g < n_groups; ++g)
+      scale_broadcast[(size_t)r * n_groups + g] = scale_src[g];
+  // Take the TP slice on the host (contiguous, byte-aligned by N*2).
+  std::vector<uint16_t> scale_slice((size_t)w.N * n_groups);
+  for (uint32_t r = 0; r < w.N; ++r)
+    std::memcpy(&scale_slice[(size_t)r * n_groups],
+                &scale_broadcast[(size_t)(r + start) * n_groups],
+                n_groups * sizeof(uint16_t));
+  // Keep the packed vectors alive in the returned struct. The buffer is built
+  // from the vector's iterators (eager copy, like gemm_demo); the vector stays
+  // alive in `w` until the GEMM runs, so the payload is never lost.
+  w.scale_store = std::move(scale_slice);
+  w.scale = sycl::buffer<std::uint16_t>(w.scale_store.begin(), w.scale_store.end());
+
+  // 2) Unpack group-major codes into row-major INT8 codes, then take the TP
+  //    slice and re-pack (only for INT2/INT4). For INT8/FP16 the code bytes
+  //    are identity so this is a plain memcpy. The kernel reads code[ng*K+kg]
+  //    and unpacks bits-within-byte using idx%pack, so a row-major byte stream
+  //    is exactly what it expects.
+  if (w.scheme == gemm::WeightScheme::FP16) {
+    // FP16: pass-through the N*K*2 byte slice (identity for the kernel).
+    std::vector<uint8_t> code_slice((size_t)w.N * K * 2);
+    const uint8_t* base = m.code_buf.data() + t.code_offset + start * K * 2;
+    std::memcpy(code_slice.data(), base, code_slice.size());
+    w.code_store = std::move(code_slice);
+    w.code = sycl::buffer<std::uint8_t>(w.code_store.data(),
+                                         sycl::range<1>(w.code_store.size()));
+  } else {
+    // Group-major unpack -> row-major INT8 -> pack to bits.
+    std::vector<uint8_t> row_codes((size_t)w.N * K);
+    for (uint32_t g = 0; g < n_groups; ++g) {
+      const uint32_t k0 = g * G;
+      const uint32_t k1 = std::min(k0 + G, K);
+      for (uint32_t r = 0; r < w.N; ++r) {
+        const uint32_t src_row = r + start;
+        // Source idx: g*(N*Glocal) + r_src*Glocal + (c - g*G)
+        const uint32_t Glocal = k1 - k0;
+        for (uint32_t c = k0; c < k1; ++c) {
+          const size_t src_idx = (size_t)g * (N * Glocal)
+                               + (size_t)src_row * Glocal + (c - k0);
+          const uint8_t b = m.code_buf[t.code_offset + src_idx / pack];
+          const int within = (int)(src_idx % pack);
+          const uint8_t val = (b >> (within * bits)) & ((1u << bits) - 1u);
+          row_codes[(size_t)r * K + c] = val;
+        }
+      }
+    }
+    // Repack row-major INT8 to packed bytes (kernel layout).
+    std::vector<uint8_t> code_slice((size_t)w.N * per_row_code_bytes, 0);
+    for (size_t i = 0; i < row_codes.size(); ++i) {
+      const size_t pack_idx = i / pack;
+      const int within = (int)(i % pack);
+      code_slice[pack_idx] |= (uint8_t)((row_codes[i] & ((1u << bits) - 1u))
+                                        << (within * bits));
+    }
+    w.code_store = std::move(code_slice);
+    w.code = sycl::buffer<std::uint8_t>(w.code_store.data(),
+                                        sycl::range<1>(w.code_store.size()));
+  }
+
+  if (t.global_bytes > 0) {
+    // global_offset is a *byte* offset into the uint8_t global_buf (see
+    // dashq.cpp: r.globals assigned from begin()+global_offset). Copy the 4
+    // bytes into an aligned float (avoids the previous 4x mis-offset read that
+    // yielded garbage alpha and zeroed/NaN'd the GEMM output).
+    float alpha_val = 0.f;
+    std::memcpy(&alpha_val, m.global_buf.data() + t.global_offset,
+                std::min<uint32_t>(t.global_bytes, 4u));
+    w.global_store.assign(1, alpha_val);
+    w.global = sycl::buffer<float>(w.global_store.begin(), w.global_store.end());
+  }
   return w;
 }
 
 }  // namespace
 
-std::unique_ptr<Engine> Engine::load(const std::string& intfer_path, size_t tp_devices) {
+std::unique_ptr<Engine> Engine::load(const std::string& intfer_path,
+                                    size_t tp_devices) {
   auto e = std::unique_ptr<Engine>(new Engine());
 
   std::vector<uint8_t> blob;
@@ -79,6 +189,8 @@ std::unique_ptr<Engine> Engine::load(const std::string& intfer_path, size_t tp_d
     std::cerr << "Engine: cannot deserialize " << intfer_path << "\n";
     return nullptr;
   }
+  e->rs_ = std::move(rs);
+  for (const auto& R : e->rs_.rotations) e->rid_[R.id] = &R;
 
   // Discover the 2x Arc B580 fleet and pick `tp_devices` of them.
   auto dm = device::DeviceManager::discover("Arc");
@@ -107,6 +219,7 @@ void Engine::build_shards() {
     return r;
   };
   shards_.resize(model_.tensors.size());
+  shard_cache_.resize(model_.tensors.size());
   for (size_t ti = 0; ti < model_.tensors.size(); ++ti) {
     const auto& t = model_.tensors[ti];
     shards_[ti].ranges = (devices_.size() > 1) ? split(t.N)
@@ -121,77 +234,269 @@ void Engine::build_shards() {
     }
 }
 
-std::vector<float> Engine::decode_step(const std::vector<float>& token_hidden) {
-  // Minimal but representative decode step: run the q_proj Linear (tensor
-  // parallel across shards) for the first layer, all-reduce the shards on the
-  // host, and return the resulting hidden. The remaining projections, the
-  // FlashAttention call, and the MLP follow the identical pattern.
+std::vector<float> Engine::decode_step(const std::vector<float>& token_hidden,
+                                       int tensor_index) {
   if (model_.tensors.empty()) return {};
-  const auto& t = model_.tensors[0];  // first Linear tensor (layer 0 q_proj)
-  const auto& ranges = shards_[0].ranges;
-  uint32_t N = t.N;
-  std::vector<float> out(N, 0.f);
+  const int ti = (tensor_index >= 0 &&
+                  (size_t)tensor_index < model_.tensors.size())
+                     ? tensor_index
+                     : 0;
+  std::vector<float> out;
+  run_linear_tp(ti, token_hidden, out);
+  return out;
+}
+
+void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
+                           std::vector<float>& out) {
+  if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size()) return;
+  const auto& t = model_.tensors[tensor_index];
+  const auto& ranges = shards_[tensor_index].ranges;
+  if (out.size() != t.N) out.resize(t.N);
+
+  // Lazy-build the USM shard cache for this tensor on first call.
+  if (!shard_cache_[tensor_index].built)
+    ensure_shard_built(tensor_index);
+  const auto& sc = shard_cache_[tensor_index];
+
+  // Pre-convert FP32 activation to FP16 once (shared by all devices).
+#ifdef INTFER_PROFILE_GPU
+  auto t_copy0 = std::chrono::high_resolution_clock::now();
+#endif
+  std::vector<std::uint16_t> act_fp16(t.K);
+  for (uint32_t k = 0; k < t.K; ++k)
+    act_fp16[k] = dashq::float_to_half(x[k]);
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_copy_us += std::chrono::duration<double, std::micro>(t1 - t_copy0).count();
+    g_gpu_profile.copy_count++;
+  }
+#endif
+
+  // Issue all device work in parallel and collect kernel events.
+  std::vector<sycl::event> kernel_events;
+  kernel_events.reserve(devices_.size());
 
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto& dev = devices_[d];
     auto [start, end] = ranges[d];
-    sycl::queue q = dev.queue;
-    auto w = shard_weight(model_, t, start, end, q);
+    sycl::queue& q = dev.queue;
+    auto N_local = end - start;
 
-    // Activation: single token (M=1), length K, FP16.
-    std::vector<std::uint16_t> act_fp16(t.K);
+    // 1) Write FP16 activation directly into persistent USM act buffer.
+    std::uint16_t* const act_ptr = sc.act_usm[d];
     for (uint32_t k = 0; k < t.K; ++k)
-      act_fp16[k] = dashq::float_to_half(token_hidden[k]);
-    gemm::GemmActBuffers a;
-    a.scheme = gemm::ActScheme::FP16;
-    a.M = 1; a.K = t.K;
-    a.fp16 = sycl::buffer<std::uint16_t>(act_fp16.data(), sycl::range<1>(t.K));
+      act_ptr[k] = act_fp16[k];
 
-    sycl::buffer<std::uint16_t> c(sycl::range<1>((size_t)1 * (end - start)));
-    gemm::QuantGemmOptions opt;
-    opt.use_dpas = (w.scheme == gemm::WeightScheme::INT8);  // DPAS only for INT8 x INT8
-
-    if (graph_captured_ && graph_) {
-      // Replay the captured command graph (built over persistent buffers).
-      // For the skeleton we re-submit the op directly so the step works with
-      // per-token activation buffers; graph replay over persistent buffers is
-      // the deployment fast-path (CPU launch overhead ~0).
-      q.submit([&](sycl::handler& h) {
-        h.ext_oneapi_graph(*graph_);
-      });
-    } else {
-      quant_gemm_forward(q, a, w, c, opt);
+    // 2) Launch the USM kernel on the persistent weight buffers.
+    float alpha = sc.has_global_divisor
+                      ? sc.global_usm[d][0]
+                      : 1.0f;
+#ifdef INTFER_PROFILE_GPU
+    auto t_k0 = std::chrono::high_resolution_clock::now();
+#endif
+    sycl::event kernel_evt = gemm::quant_gemm_forward_usm(q,
+                                  sc.act_usm[d],
+                                  sc.code_usm[d],
+                                  sc.scale_usm[d],
+                                  alpha,
+                                  sc.out_usm[d],
+                                  1, N_local, t.K,
+                                  sc.group_size,
+                                  sc.scheme,
+                                  sycl::event{});
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_kernel_us += std::chrono::duration<double, std::micro>(t1 - t_k0).count();
+      g_gpu_profile.kernel_count++;
     }
-
-    auto h_c = c.get_host_access(sycl::read_only);
-    for (uint32_t r = 0; r < (end - start); ++r)
-      out[start + r] = dashq::half_to_float(h_c[r]);
+#endif
+    kernel_events.push_back(kernel_evt);
   }
-  return out;
+
+  // Wait for all kernels, then read back directly from persistent USM.
+#ifdef INTFER_PROFILE_GPU
+  auto t_wait0 = std::chrono::high_resolution_clock::now();
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    kernel_events[d].wait();
+    g_gpu_profile.wait_count++;
+  }
+  auto t_wait1 = std::chrono::high_resolution_clock::now();
+  g_gpu_profile.total_wait_us += std::chrono::duration<double, std::micro>(t_wait1 - t_wait0).count();
+
+  auto t_rb0 = std::chrono::high_resolution_clock::now();
+#endif
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto [start, end] = ranges[d];
+    const std::uint16_t* out_ptr = sc.out_usm[d];
+    for (uint32_t r = 0; r < static_cast<uint32_t>(end - start); ++r)
+      out[start + r] = dashq::half_to_float(out_ptr[r]);
+  }
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_readback_us += std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
+    g_gpu_profile.readback_count++;
+  }
+#endif
 }
 
-void Engine::capture_decode_graph() {
-  // Demonstrates SYCL command-graph capture of the per-token decode op
-  // (replaces CUDA graphs). Records the layer-0 q_proj GEMM on device 0.
-  if (devices_.empty() || model_.tensors.empty()) return;
-  auto& dev = devices_[0];
-  sycl::queue q = dev.queue;
-  const auto& t = model_.tensors[0];
-  auto w = shard_weight(model_, t, 0, t.N, q);
+#ifdef INTFER_PROFILE_GPU
+  GpuProfileSnapshot get_gpu_profile() {
+    return {g_gpu_profile.total_kernel_us, g_gpu_profile.total_wait_us,
+            g_gpu_profile.total_copy_us, g_gpu_profile.total_readback_us,
+            g_gpu_profile.kernel_count, g_gpu_profile.wait_count,
+            g_gpu_profile.copy_count, g_gpu_profile.readback_count};
+  }
+  void reset_gpu_profile() { g_gpu_profile = GpuProfile{}; }
+#endif
 
-  std::vector<std::uint16_t> act_fp16(t.K);
-  gemm::GemmActBuffers a;
-  a.scheme = gemm::ActScheme::FP16; a.M = 1; a.K = t.K;
-  a.fp16 = sycl::buffer<std::uint16_t>(act_fp16.data(), sycl::range<1>(t.K));
-  sycl::buffer<std::uint16_t> c(sycl::range<1>((size_t)t.N));
+const Rotation* Engine::rotation_for(int tensor_index) const {
+  if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size())
+    return nullptr;
+  const auto& t = model_.tensors[tensor_index];
+  auto it = rid_.find(t.qcfg.rotation_id);
+  return it == rid_.end() ? nullptr : it->second;
+}
 
-  command_graph<graph_state::modifiable> g(q.get_context(), q.get_device());
-  g.begin_recording(q);
-  quant_gemm_forward(q, a, w, c, gemm::QuantGemmOptions{});
-  g.end_recording();
-  graph_ = std::make_unique<command_graph<graph_state::executable>>(g.finalize());
-  graph_captured_ = true;
-  std::cout << "Engine: decode command graph captured\n";
+bool Engine::ensure_shard_built(int tensor_index) {
+  if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size()) return false;
+  auto& sc = shard_cache_[tensor_index];
+  if (sc.built) return true;
+
+  const auto& t = model_.tensors[tensor_index];
+  const auto& ranges = shards_[tensor_index].ranges;
+  sc.built = true;
+  sc.scheme = to_ws(t.qcfg.scheme);
+  sc.group_size = t.qcfg.group_size;
+  sc.has_global_divisor = t.qcfg.has_global_divisor;
+  sc.K = t.K;
+  sc.code_usm.resize(devices_.size());
+  sc.scale_usm.resize(devices_.size());
+  sc.global_usm.resize(devices_.size());
+  sc.act_usm.resize(devices_.size());
+  sc.out_usm.resize(devices_.size());
+
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto& dev = devices_[d];
+    auto [start, end] = ranges[d];
+    sycl::queue& q = dev.queue;
+    uint32_t N_local = end - start;
+
+    // 1) Build the host-side shard data once (unpack + repack).
+    auto w = shard_weight(model_, t, start, end, q);
+
+    // 2) Allocate persistent USM on each device and copy weight data.
+    sc.N_local = N_local;
+
+    // Code: packed bytes
+    size_t code_bytes = w.code_store.size();
+    sc.code_usm[d] = static_cast<std::uint8_t*>(
+        sycl::malloc_shared(code_bytes, dev.sycl_device, dev.sycl_context));
+    std::memcpy(sc.code_usm[d], w.code_store.data(), code_bytes);
+
+    // Scale: N_local * n_groups FP16
+    uint32_t G = t.qcfg.group_size > 0 ? t.qcfg.group_size : t.K;
+    uint32_t n_groups = (t.K + G - 1) / G;
+    size_t scale_bytes = static_cast<size_t>(N_local) * n_groups * sizeof(uint16_t);
+    sc.scale_usm[d] = static_cast<std::uint16_t*>(
+        sycl::malloc_shared(scale_bytes, dev.sycl_device, dev.sycl_context));
+    std::memcpy(sc.scale_usm[d], w.scale_store.data(), scale_bytes);
+
+    // Global divisor: 1 float
+    if (t.global_bytes > 0) {
+      sc.global_usm[d] = static_cast<float*>(
+          sycl::malloc_shared(sizeof(float), dev.sycl_device, dev.sycl_context));
+      std::memcpy(sc.global_usm[d], w.global_store.data(), sizeof(float));
+    }
+
+    // 3) Allocate persistent activation buffer (K FP16) and output buffer (N_local FP16).
+    sc.act_usm[d] = static_cast<std::uint16_t*>(
+        sycl::malloc_shared(t.K * sizeof(uint16_t), dev.sycl_device, dev.sycl_context));
+    sc.out_usm[d] = static_cast<std::uint16_t*>(
+        sycl::malloc_shared(static_cast<size_t>(N_local) * sizeof(uint16_t),
+                           dev.sycl_device, dev.sycl_context));
+  }
+  return true;
+}
+
+bool Engine::load_language_weights(const std::string& safetensors_path) {
+  SafetensorsReader r;
+  if (!r.open(safetensors_path)) {
+    std::cerr << "Engine: cannot open safetensors " << safetensors_path << "\n";
+    return false;
+  }
+  for (const auto& t : r.tensors()) {
+    std::vector<float> v;
+    if (!r.read(t.name, v)) { std::cerr << "Engine: read fail " << t.name << "\n"; return false; }
+    lang_[t.name] = std::move(v);
+  }
+  std::cout << "Engine: loaded " << lang_.size() << " safetensors tensors\n";
+  return true;
 }
 
 }  // namespace intfer
+
+#if INTFER_GRAPH_CAPTURE
+#include <sycl/ext/oneapi/experimental/graph.hpp>
+
+bool intfer::Engine::build_usm_buffers_for_tensor(int tensor_index) {
+  if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size()) return false;
+  const auto& t = model_.tensors[tensor_index];
+  if ((int)usm_.size() != (int)devices_.size()) usm_.resize(devices_.size());
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto& dev = devices_[d];
+    auto [start, end] = shards_[tensor_index].ranges[d];
+    auto& u = usm_[d];
+    u.q = dev.queue;
+    auto w = shard_weight(model_, t, start, end, u.q);
+    u.code_store = std::move(w.code_store);
+    u.scale_store = std::move(w.scale_store);
+    u.global_store = std::move(w.global_store);
+    u.code.emplace(u.code_store.data(), sycl::range<1>(u.code_store.size()));
+    u.scale.emplace(u.scale_store.data(), sycl::range<1>(u.scale_store.size()));
+    u.global.emplace(u.global_store.data(), sycl::range<1>(u.global_store.size()));
+    u.act_store.assign(t.K, 0);
+    u.act.emplace(u.act_store.data(), sycl::range<1>(u.act_store.size()));
+    u.out_store.assign(end - start, 0);
+    u.out.emplace(u.out_store.data(), sycl::range<1>(u.out_store.size()));
+    u.c_store.assign(end - start, 0);
+    u.c.emplace(u.c_store.data(), sycl::range<1>(u.c_store.size()));
+  }
+  return true;
+}
+
+void intfer::Engine::build_decode_graph() {
+  if (graph_built_ || model_.tensors.empty()) return;
+  using namespace sycl::ext::oneapi::experimental;
+  build_usm_buffers_for_tensor(0);
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto& u = usm_[d];
+    auto [start, end] = shards_[0].ranges[d];
+    command_graph<graph_state::modifiable> g(u.q.get_context(), u.q.get_device());
+    // act and c are persistent optional buffers allocated by build_usm_buffers_for_tensor
+    gemm::GemmActBuffers a;
+    a.scheme = gemm::ActScheme::FP16;
+    a.M = 1; a.K = model_.tensors[0].K;
+    a.fp16 = *u.act;   // act buffer is persistent
+    gemm::QuantGemmOptions opt;
+    opt.use_dpas = false;
+    gemm::GemmWeightBuffers w;
+    w.scheme = gemm::WeightScheme::INT8;
+    w.group_size = model_.tensors[0].qcfg.group_size;
+    w.has_global_divisor = model_.tensors[0].qcfg.has_global_divisor;
+    w.N = end - start;
+    w.K = model_.tensors[0].K;
+    w.code = *u.code;
+    w.scale = *u.scale;
+    w.global = *u.global;
+    quant_gemm_forward(u.q, a, w, *u.c, opt);
+    g.end_recording();
+    u.graph = std::make_unique<command_graph<graph_state::executable>>(g.finalize());
+  }
+  graph_built_ = true;
+}
+#endif
+
+

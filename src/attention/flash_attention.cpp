@@ -57,7 +57,8 @@ void flash_attention_forward_f16(sycl::queue& q,
       const int bh = block / num_q_blocks;
       const int h_idx = bh % H;
       const int b_idx = bh / H;
-      const int qi = qb * kBr + tid;             // global query token index
+      const int qi = qb * kBr + tid;             // global query token index (within Q tensor)
+      const int qi_abs = qi + p.q_offset;        // absolute position in the KV cache
       const bool active = qi < Sq;
 
       const int base = off3(b_idx, h_idx, 0, H, Sq, D);
@@ -90,7 +91,7 @@ void flash_attention_forward_f16(sycl::queue& q,
         if (active) {
           for (int j = 0; j < kBc; ++j) {
             const int tk = k_start + j;
-            if (tk >= Sk || (causal && tk > qi)) {
+            if (tk >= Sk || (causal && tk > qi_abs)) {
               pj[j] = -1e30f;
               continue;
             }
@@ -123,7 +124,7 @@ void flash_attention_forward_f16(sycl::queue& q,
           float l_block = 0.0f;
           for (int j = 0; j < kBc; ++j) {
             const int tk = k_start + j;
-            if (tk >= Sk || (causal && tk > qi)) continue;
+            if (tk >= Sk || (causal && tk > qi_abs)) continue;
             const float w = sycl::exp(pj[j] - m_block);
             l_block += w;
             for (int d = 0; d < D; ++d)
@@ -187,6 +188,7 @@ void flash_attention_forward_int8_kv(sycl::queue& q,
       const int h_idx = bh % H;
       const int b_idx = bh / H;
       const int qi = qb * kBr + tid;
+      const int qi_abs = qi + p.q_offset;
       const bool active = qi < Sq;
 
       const int base = off3(b_idx, h_idx, 0, H, Sq, D);
@@ -223,7 +225,7 @@ void flash_attention_forward_int8_kv(sycl::queue& q,
         if (active) {
           for (int j = 0; j < kBc; ++j) {
             const int tk = k_start + j;
-            if (tk >= Sk || (causal && tk > qi)) {
+            if (tk >= Sk || (causal && tk > qi_abs)) {
               pj[j] = -1e30f;
               continue;
             }
@@ -245,7 +247,7 @@ void flash_attention_forward_int8_kv(sycl::queue& q,
           float l_block = 0.0f;
           for (int j = 0; j < kBc; ++j) {
             const int tk = k_start + j;
-            if (tk >= Sk || (causal && tk > qi)) continue;
+            if (tk >= Sk || (causal && tk > qi_abs)) continue;
             const float w = sycl::exp(pj[j] - m_block);
             l_block += w;
             for (int d = 0; d < D; ++d)

@@ -52,7 +52,15 @@ std::vector<QuantConfig> default_candidates(TensorRole role) {
     case TensorRole::MLP_GATE:
     case TensorRole::MLP_UP:
     case TensorRole::MLP_DOWN:
+    case TensorRole::LINEAR_ATTN_QKV:
+    case TensorRole::LINEAR_ATTN_Z:
+    case TensorRole::LINEAR_ATTN_B:
+    case TensorRole::LINEAR_ATTN_A:
+    case TensorRole::LINEAR_ATTN_OUT:
       // Bulk of params -> INT2 target; FP16 escape at the end.
+      // LINEAR_ATTN_B and _A have tiny N (n_v_heads ~16-64) and
+      // unrotated scalars, so we keep them at INT4/INT8 floor; DASH-Q
+      // will still try the lower bit-widths in the candidate set.
       out.push_back(mk(QuantScheme::INT2, 16));
       out.push_back(mk(QuantScheme::INT2, 32));
       out.push_back(mk(QuantScheme::INT4, 64));

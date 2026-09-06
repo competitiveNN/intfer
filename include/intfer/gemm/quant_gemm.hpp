@@ -60,6 +60,13 @@ struct GemmWeightBuffers {
   sycl::buffer<std::uint16_t> scale;  // FP16 per (row, group)
   sycl::buffer<float>         global; // FP32 per-tensor alpha (may be empty)
 
+  // Backing storage. The buffer(ptr, range) / buffer(vector) constructors only
+  // *reference* the payload, so the owning vector must outlive the buffer. We
+  // move the packed vectors here so they stay alive for as long as `w` is used.
+  std::vector<std::uint8_t>  code_store;
+  std::vector<std::uint16_t> scale_store;
+  std::vector<float>          global_store;  // owns the per-tensor alpha copy
+
   GemmWeightBuffers()
       : code(sycl::range<1>(1)), scale(sycl::range<1>(1)),
         global(sycl::range<1>(1)) {}
@@ -128,5 +135,39 @@ void quant_gemm_dpas_int8(sycl::queue& q,
 // out[k*N + n] = w[n*K + k].
 void build_vnni_int8(const std::int8_t* w, std::int8_t* out,
                      uint32_t N, uint32_t K);
+
+// ---------------------------------------------------------------------------
+// USM-based dequant-on-the-fly GEMM entry point.
+//
+// This is the "fast path" for the per-token decode loop: weights are
+// pre-cached in device USM by Engine::ensure_shard_built, and this function
+// accepts raw USM pointers so the kernel can read directly from device memory
+// without the per-call SYCL buffer construction overhead.
+//
+// The activation buffer (size M*K FP16) and output buffer (size M*N FP16
+// bits) are also pre-allocated in USM by the cache; this function copies the
+// host activation into the act USM buffer, launches the kernel, and returns
+// a SYCL event that the caller can wait on before reading out[0:N].
+//
+// Supported precisions: INT2 / INT4 / INT8 / FP16 weights with FP16
+// activations. The kernel dequantizes weights in-register and accumulates in
+// FP32, which the compiler lowers onto the XMX matrix engines for FP16 MMA
+// on Intel Arc.
+//
+// For M=1 (decode), a dedicated flat 1D kernel is used (no tiling, no
+// local memory, no barriers) to avoid the overhead of the tiled kernel.
+// For M>1, a tiled 2D kernel with shared local memory is used.
+// ---------------------------------------------------------------------------
+sycl::event quant_gemm_forward_usm(sycl::queue& q,
+                                      // Activation: M*K FP16 bits (pre-allocated, updated every call)
+                                      std::uint16_t* act_usm,
+                                      const void* code_usm,    // packed codes
+                                      const std::uint16_t* scale_usm, // FP16 per (row, group)
+                                      float alpha,             // global divisor (1.0 if no global)
+                                      std::uint16_t* out_usm,  // M*N FP16 bits output
+                                      uint32_t M, uint32_t N, uint32_t K,
+                                      uint32_t group_size,     // 0 = per-tensor
+                                      gemm::WeightScheme scheme,
+                                      const sycl::event& copy_dep);
 
 }  // namespace intfer::gemm

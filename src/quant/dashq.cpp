@@ -8,6 +8,10 @@
 #include <cmath>
 #include <cstring>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace intfer {
 namespace dashq {
 
@@ -222,9 +226,15 @@ void QuantResult::dequant(std::vector<float>& out, uint32_t N, uint32_t K) const
   std::vector<uint8_t> idx;
   const size_t n = (size_t)N * K;
   idx.reserve(n);
-  for (size_t i = 0; i < n; ++i) idx.push_back(unpack_code(codes.data(), i, bits));
+  for (size_t i = 0; i < n; ++i) {
+    if (bits != 8 && (i >> (bits == 2 ? 2 : 1)) >= codes.size()) break; // ragged slice
+    if (bits == 8 && i >= codes.size()) break;
+    idx.push_back(unpack_code(codes.data(), i, bits));
+  }
+  if (idx.size() < n) idx.resize(n, 0);
 
   for (uint32_t g = 0; g < n_groups; ++g) {
+    if (2 * (size_t)g + 1 >= scales.size()) break; // corrupt/ragged scale slice
     const uint16_t hv = (uint16_t)(scales[2 * g] | ((uint16_t)scales[2 * g + 1] << 8));
     const float s = half_to_float(hv) * alpha;
     const uint32_t gend = std::min((uint32_t)((g + 1) * G), K);
@@ -232,7 +242,10 @@ void QuantResult::dequant(std::vector<float>& out, uint32_t N, uint32_t K) const
     for (uint32_t r = 0; r < N; ++r)
       for (uint32_t c = g * G; c < gend; ++c) {
         const uint32_t wi = r * Glocal + (c - g * G);
-        const uint8_t a = idx[(size_t)g * (N * G) + wi];
+        const size_t ii = (size_t)g * (N * G) + wi;
+        if (ii >= idx.size()) continue; // ragged slice
+        const uint8_t a = idx[ii];
+        if ((size_t)a >= cb.size()) continue;
         out[r * K + c] = s * cb[a];
       }
   }
@@ -296,15 +309,22 @@ QuantResult quantize(const float* W, uint32_t N, uint32_t K, const QuantConfig& 
   // without changing the result materially.
   const int grp_iters = learn_codebook ? iters : 4;
 
-  std::vector<uint8_t> idx;
-  idx.reserve((size_t)N * K);
+  // Layout assumption (matches dequant_tensor): each group occupies
+  // N*G slots, group g lives at idx[g * N * G .. g*N*G + N*Glocal - 1].
+  // The last group's trailing Glocal < G slots are left at 0.
+  const size_t idx_per_group = (size_t)N * G;
+  std::vector<uint8_t> idx(idx_per_group * n_groups, 0);
   res.scales.resize((size_t)n_groups * 2, 0);
   double mse = 0.0, norm = 0.0;
 
+#ifdef _OPENMP
+  #pragma omp parallel for schedule(dynamic) reduction(+:mse,norm)
+#endif
   for (uint32_t g = 0; g < n_groups; ++g) {
-    std::vector<float> wg, hg;
-    uint32_t gend = std::min((uint32_t)((g + 1) * G), K);
+    const uint32_t gend = std::min((uint32_t)((g + 1) * G), K);
     const uint32_t Glocal = gend - g * G;
+    // Build the local [N, Glocal] weight/Hessian slice.
+    std::vector<float> wg, hg;
     wg.reserve((size_t)N * Glocal);
     hg.reserve((size_t)N * Glocal);
     for (uint32_t r = 0; r < N; ++r)
@@ -320,12 +340,12 @@ QuantResult quantize(const float* W, uint32_t N, uint32_t K, const QuantConfig& 
     res.scales[2 * g] = (uint8_t)(hv & 0xFF);
     res.scales[2 * g + 1] = (uint8_t)(hv >> 8);
 
+    const size_t goff = (size_t)g * idx_per_group;
     for (uint32_t r = 0; r < N; ++r)
       for (uint32_t c = g * G; c < gend; ++c) {
         const uint32_t wi = r * Glocal + (c - g * G);
-        const uint8_t a = assign[wi];
-        idx.push_back(a);
-        const float dq = s * cb[a];
+        idx[goff + wi] = assign[wi];
+        const float dq = s * cb[assign[wi]];
         const float wv = W[r * K + c];
         const float hh = h_at(r, c);
         const double e = wv - dq;

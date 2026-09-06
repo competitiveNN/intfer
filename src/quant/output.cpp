@@ -310,6 +310,12 @@ const char* role_name(TensorRole r) {
     case TensorRole::MLP_DOWN: return "MLP_DOWN";
     case TensorRole::NORM: return "NORM";
     case TensorRole::ROPE: return "ROPE";
+    case TensorRole::LINEAR_ATTN_QKV: return "LINEAR_ATTN_QKV";
+    case TensorRole::LINEAR_ATTN_Z:   return "LINEAR_ATTN_Z";
+    case TensorRole::LINEAR_ATTN_B:   return "LINEAR_ATTN_B";
+    case TensorRole::LINEAR_ATTN_A:   return "LINEAR_ATTN_A";
+    case TensorRole::LINEAR_ATTN_CONV:return "LINEAR_ATTN_CONV";
+    case TensorRole::LINEAR_ATTN_OUT: return "LINEAR_ATTN_OUT";
     default: return "OTHER";
   }
 }
@@ -325,6 +331,12 @@ TensorRole role_from_name(const std::string& s) {
   if (s == "MLP_DOWN") return TensorRole::MLP_DOWN;
   if (s == "NORM") return TensorRole::NORM;
   if (s == "ROPE") return TensorRole::ROPE;
+  if (s == "LINEAR_ATTN_QKV") return TensorRole::LINEAR_ATTN_QKV;
+  if (s == "LINEAR_ATTN_Z")   return TensorRole::LINEAR_ATTN_Z;
+  if (s == "LINEAR_ATTN_B")   return TensorRole::LINEAR_ATTN_B;
+  if (s == "LINEAR_ATTN_A")   return TensorRole::LINEAR_ATTN_A;
+  if (s == "LINEAR_ATTN_CONV")return TensorRole::LINEAR_ATTN_CONV;
+  if (s == "LINEAR_ATTN_OUT") return TensorRole::LINEAR_ATTN_OUT;
   return TensorRole::OTHER;
 }
 const char* scheme_name(QuantScheme s) {

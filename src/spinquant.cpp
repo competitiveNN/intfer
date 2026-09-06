@@ -7,6 +7,10 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <numeric>
 #include <random>
 
@@ -275,12 +279,17 @@ RotationSite site_for_role(TensorRole role) {
   switch (role) {
     case TensorRole::ATTN_Q:
     case TensorRole::ATTN_K:
-    case TensorRole::ATTN_V:   return RotationSite::QKV;
-    case TensorRole::ATTN_O:   return RotationSite::O;
+    case TensorRole::ATTN_V:
+    case TensorRole::LINEAR_ATTN_QKV:
+    case TensorRole::LINEAR_ATTN_Z:
+    case TensorRole::LINEAR_ATTN_B:
+    case TensorRole::LINEAR_ATTN_A:   return RotationSite::QKV;
+    case TensorRole::ATTN_O:
+    case TensorRole::LINEAR_ATTN_OUT: return RotationSite::O;
     case TensorRole::MLP_GATE:
     case TensorRole::MLP_UP:   return RotationSite::FFN_IN;
     case TensorRole::MLP_DOWN: return RotationSite::FFN_OUT;
-    default:                   return RotationSite::NONE;  // no rotation (embed/lm_head/norm/rope/other)
+    default:                   return RotationSite::NONE;  // no rotation (embed/lm_head/norm/rope/conv/other)
   }
 }
 RotationSide side_for_role(TensorRole role) {
@@ -310,52 +319,80 @@ void rotate_weight(std::vector<float>& W, uint32_t N, uint32_t K,
     INTFER_LOG_ERROR("SpinQuant rotate_weight: rotation dim %u != expected %u", R.dim, dim);
     return;
   }
-  // Fast path: Hadamard rotations are applied via the Walsh-Hadamard transform
-  // in O(dim log dim) per row/column instead of the naive O(dim^2) matmul.
-  // Mathematically identical (R = H/dim is orthonormal), ~100x faster on the
-  // [248320 x 1024] embedding table.
-  if (R.is_hadamard && is_pow2(dim)) {
-    const float inv = 1.0f / std::sqrt(static_cast<float>(dim));
+  // Fast path: Hadamard rotations. For power-of-two dims use the
+  // Walsh-Hadamard transform (O(dim log dim)). For the blockdiag
+  // fallback (make_hadamard splits off a power-of-two tail into I),
+  // apply FWHT to the power-of-two prefix and leave the tail as-is.
+  if (R.is_hadamard) {
+    const uint32_t p = floor_pow2(dim);
+    const bool is_blockdiag = !is_pow2(dim) && p < dim;
+    const float inv = 1.0f / std::sqrt(static_cast<float>(p));
     if (side == RotationSide::Right) {
-      std::vector<float> tmp(dim);
-      for (uint32_t i = 0; i < N; ++i) {
+      #pragma omp parallel for schedule(static) if((size_t)N * p >= 65536)
+      for (int64_t i = 0; i < (int64_t)N; ++i) {
         float* row = &W[static_cast<size_t>(i) * K];
-        std::copy_n(row, dim, tmp.data());
-        fwht(tmp.data(), dim);
-        for (uint32_t j = 0; j < dim; ++j) row[j] = tmp[j] * inv;
+        if (is_blockdiag) {
+          // blockdiag(Hadamard_p, I_{dim-p}): FWHT on first p cols,
+          // leave cols [p..dim) untouched.
+          std::vector<float> tmp(p);
+          std::copy_n(row, p, tmp.data());
+          fwht(tmp.data(), p);
+          for (uint32_t j = 0; j < p; ++j) row[j] = tmp[j] * inv;
+        } else {
+          std::vector<float> tmp(dim);
+          std::copy_n(row, dim, tmp.data());
+          fwht(tmp.data(), dim);
+          for (uint32_t j = 0; j < dim; ++j) row[j] = tmp[j] * inv;
+        }
       }
     } else {
-      std::vector<float> tmp(dim);
-      for (uint32_t k = 0; k < K; ++k) {
-        for (uint32_t i = 0; i < dim; ++i) tmp[i] = W[static_cast<size_t>(i) * K + k];
-        fwht(tmp.data(), dim);
-        for (uint32_t i = 0; i < dim; ++i) W[static_cast<size_t>(i) * K + k] = tmp[i] * inv;
+      #pragma omp parallel for schedule(static) if((size_t)K * p >= 65536)
+      for (int64_t k = 0; k < (int64_t)K; ++k) {
+        if (is_blockdiag) {
+          std::vector<float> tmp(p);
+          for (uint32_t i = 0; i < p; ++i) tmp[i] = W[static_cast<size_t>(i) * K + k];
+          fwht(tmp.data(), p);
+          for (uint32_t i = 0; i < p; ++i) W[static_cast<size_t>(i) * K + k] = tmp[i] * inv;
+        } else {
+          std::vector<float> tmp(dim);
+          for (uint32_t i = 0; i < dim; ++i) tmp[i] = W[static_cast<size_t>(i) * K + k];
+          fwht(tmp.data(), dim);
+          for (uint32_t i = 0; i < dim; ++i) W[static_cast<size_t>(i) * K + k] = tmp[i] * inv;
+        }
       }
     }
-    return;
-  }
-  // General (non-Hadamard) path: naive matmul.
-  std::vector<float> out(W.size(), 0.0f);
-  if (side == RotationSide::Right) {
-    // W' = W R^T : out[i,k] = sum_j W[i,j] * R[k,j]
-    for (uint32_t i = 0; i < N; ++i)
-      for (uint32_t k = 0; k < K; ++k) {
-        float acc = 0.0f;
-        for (uint32_t j = 0; j < K; ++j)
-          acc += W[static_cast<size_t>(i) * K + j] * R.mat[static_cast<size_t>(k) * K + j];
-        out[static_cast<size_t>(i) * K + k] = acc;
-      }
   } else {
-    // W' = R W : out[i,k] = sum_j R[i,j] * W[j,k]
-    for (uint32_t i = 0; i < N; ++i)
-      for (uint32_t k = 0; k < K; ++k) {
-        float acc = 0.0f;
-        for (uint32_t j = 0; j < N; ++j)
-          acc += R.mat[static_cast<size_t>(i) * N + j] * W[static_cast<size_t>(j) * K + k];
-        out[static_cast<size_t>(i) * K + k] = acc;
+    // General (non-Hadamard) path: naive matmul.
+    // Parallelize over the OUTER i dimension (rows of W). With 5k+ rows and
+    // 5120-element inner accumulation, this gives near-linear scaling up to the
+    // core count. Each thread writes only into its own `out[i*K .. i*K+K]`,
+    // so no synchronization is needed.
+    std::vector<float> out(W.size(), 0.0f);
+    if (side == RotationSide::Right) {
+      // W' = W R^T : out[i,k] = sum_j W[i,j] * R[k,j]
+      #pragma omp parallel for schedule(static) if((size_t)N * K >= 65536)
+      for (int64_t i = 0; i < (int64_t)N; ++i) {
+        for (uint32_t k = 0; k < K; ++k) {
+          float acc = 0.0f;
+          for (uint32_t j = 0; j < K; ++j)
+          acc += W[static_cast<size_t>(i) * K + j] * R.mat[static_cast<size_t>(k) * K + j];
+          out[static_cast<size_t>(i) * K + k] = acc;
+        }
       }
+    } else {
+      // W' = R W : out[i,k] = sum_j R[i,j] * W[j,k]
+      #pragma omp parallel for schedule(static) if((size_t)N * K >= 65536)
+      for (int64_t i = 0; i < (int64_t)N; ++i) {
+        for (uint32_t k = 0; k < K; ++k) {
+          float acc = 0.0f;
+          for (uint32_t j = 0; j < N; ++j)
+          acc += R.mat[static_cast<size_t>(i) * N + j] * W[static_cast<size_t>(j) * K + k];
+          out[static_cast<size_t>(i) * K + k] = acc;
+        }
+      }
+    }
+    W = std::move(out);
   }
-  W = std::move(out);
 }
 
 // --- public: fp16 helpers ------------------------------------------------
@@ -382,10 +419,13 @@ void store_tensor_fp16(ModelIR& m, TensorIR& t, const std::vector<float>& data) 
 }
 
 int parse_layer_index(const std::string& name) {
-  // match "layers.<N>."
-  size_t pos = name.find("layers.");
+  // Match the canonical HF prefix "model.language_model.layers." exactly.
+  // We intentionally do NOT match the speculative "mtp.layers." decoder
+  // (a separate model in Qwen3.5+) nor "model.layers." (older formats).
+  static const std::string key = "model.language_model.layers.";
+  size_t pos = name.find(key);
   if (pos == std::string::npos) return -1;
-  pos += 7;
+  pos += key.size();
   size_t end = name.find('.', pos);
   if (end == std::string::npos) end = name.size();
   try {

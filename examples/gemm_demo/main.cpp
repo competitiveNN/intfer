@@ -33,16 +33,32 @@ float from_half(std::uint16_t h) {
 int levels(int bits) { return 1 << bits; }
 int max_code(int bits) { return (1 << (bits - 1)) - 1; }  // signed symmetric
 
+// Canonical DASH-Q codebook value for unsigned index `code` (mirrors the kernel
+// and dashq.cpp canonical_codebook): stored codes are *indices*, the dequantized
+// weight is scale * cb[code].
+static float canon_value(int bits, int code) {
+  if (bits >= 8) return (2.0f * (float)code - 255.0f) / 255.0f;
+  if (bits == 4) return (2.0f * (float)code - 15.0f) / 15.0f;
+  static const float c2[4] = {-1.0f, -1.0f / 3.0f, 1.0f / 3.0f, 1.0f};
+  return c2[code & 3];
+}
+
 // Double-precision abs used in reductions so std::max is type-consistent.
 inline double fabsd(double x) { return std::fabs(x); }
 
-// Symmetric per-(row,group) quantization of a [N,K] tensor.
+// Symmetric per-(row,group) quantization of a [N,K] tensor. Codes are stored as
+// *indices* into the canonical DASH-Q codebook (matches the engine kernel and
+// dashq.cpp serialization), so the dequant is scale * cb[index].
 void quantize_weight(const std::vector<float>& W, uint32_t N, uint32_t K,
                      int bits, uint16_t group, std::vector<std::uint8_t>& code,
                      std::vector<std::uint16_t>& scale) {
   const int G = (group == 0) ? static_cast<int>(K) : group;
   const int num_groups = (static_cast<int>(K) + G - 1) / G;
   const int pack = (bits >= 8) ? 1 : (8 / bits);
+  const int L = levels(bits);
+  std::vector<float> cb(L);
+  for (int j = 0; j < L; ++j) cb[j] = canon_value(bits, j);
+  const float cb_max = std::fabs(cb[L - 1]);
   code.assign((static_cast<size_t>(N) * K + pack - 1) / pack, 0);
   scale.assign(static_cast<size_t>(N) * num_groups, 0);
   std::vector<float> scales_f(N * num_groups, 0);
@@ -53,18 +69,21 @@ void quantize_weight(const std::vector<float>& W, uint32_t N, uint32_t K,
       const int k0 = g * G, k1 = std::min(k0 + G, static_cast<int>(K));
       for (int k = k0; k < k1; ++k)
         mx = std::max(mx, fabsd(W[static_cast<size_t>(n) * K + k]));
-      scales_f[n * num_groups + g] = mx / static_cast<float>(max_code(bits));
+      scales_f[n * num_groups + g] = mx / cb_max;
     }
   for (uint32_t n = 0; n < N; ++n)
     for (uint32_t k = 0; k < K; ++k) {
       const int g = k / G;
       const float s = scales_f[n * num_groups + g];
       float v = W[static_cast<size_t>(n) * K + k] / s;
-      int c = static_cast<int>(std::round(v));
-      c = std::max(-max_code(bits) - 1, std::min(max_code(bits), c));
+      int best = 0; float bd = 1e30f;
+      for (int j = 0; j < L; ++j) {
+        float d = std::fabs(v - cb[j]);
+        if (d < bd) { bd = d; best = j; }
+      }
       const size_t idx = static_cast<size_t>(n) * K + k;
       const int within = static_cast<int>(idx % pack);
-      code[idx / pack] |= (static_cast<std::uint8_t>(c & ((1u << bits) - 1))
+      code[idx / pack] |= (static_cast<std::uint8_t>(best & ((1u << bits) - 1))
                            << (within * bits));
     }
   for (size_t i = 0; i < scales_f.size(); ++i) scale[i] = to_half(scales_f[i]);
@@ -78,6 +97,9 @@ void dequant_weight(const std::vector<std::uint8_t>& code,
   const int G = (group == 0) ? static_cast<int>(K) : group;
   const int num_groups = (static_cast<int>(K) + G - 1) / G;
   const int pack = (bits >= 8) ? 1 : (8 / bits);
+  const int L = levels(bits);
+  std::vector<float> cb(L);
+  for (int j = 0; j < L; ++j) cb[j] = canon_value(bits, j);
   out.assign(static_cast<size_t>(N) * K, 0);
   for (uint32_t n = 0; n < N; ++n)
     for (uint32_t k = 0; k < K; ++k) {
@@ -85,13 +107,9 @@ void dequant_weight(const std::vector<std::uint8_t>& code,
       int c = (bits >= 8) ? static_cast<int>(code[idx])
                            : (code[idx / pack] >> (static_cast<int>(idx % pack) * bits)) &
                                  ((1u << bits) - 1);
-      if (bits < 8) {
-        int s = 32 - bits;
-        c = (c << s) >> s;
-      }
       const int g = k / G;
       float s = from_half(scale[n * num_groups + g]) / (has_global ? alpha : 1.0f);
-      out[idx] = s * static_cast<float>(c);
+      out[idx] = s * cb[c];
     }
 }
 

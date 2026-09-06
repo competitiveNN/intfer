@@ -1,0 +1,6 @@
+add_executable(engine_demo main.cpp)
+target_link_libraries(engine_demo PRIVATE intfer_engine intfer_common)
+if(INTFER_ENABLE_L0)
+  target_link_libraries(engine_demo PRIVATE intfer_l0)
+endif()
+add_sycl_to_target(TARGET engine_demo SOURCES main.cpp)

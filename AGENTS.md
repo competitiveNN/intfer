@@ -43,3 +43,8 @@ SYCL Command Graphs: Replace CUDA Graphs with sycl::ext::oneapi::experimental::c
 Stage 3.
 Implement features for maximizing throughput for concurrent requests, starting from continuous batching.
 
+
+# guidelines
+
+- remember to commit any meaningful change made such that in case of regressions everything can be bisected.
+- remember to not litter /tmp with large tmp files, RAM is precious

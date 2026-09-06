@@ -34,11 +34,17 @@ inline float from_half_bits(std::uint16_t h) {
   return static_cast<float>(sycl::bit_cast<sycl::half>(h));
 }
 
-// Sign-extend `bits`-wide value stored in the low bits of raw at byte position.
-inline int unpack_nibble(std::uint8_t raw, int bits, int shift) {
-  int v = (raw >> shift) & ((1u << bits) - 1u);
-  int s = 32 - bits;
-  return (v << s) >> s;
+// Canonical DASH-Q codebook value for an unsigned code index `code`.
+// The Stage-1 pipeline stores LOW-BIT codes as *indices* into this codebook
+// (canonical_codebook() in dashq.cpp); the dequantized weight is scale*cb[code].
+//   INT2 : {-1, -1/3, +1/3, +1}
+//   INT4 : uniform symmetric 15 levels in [-1, 1]:  (2j-15)/15
+//   INT8 : uniform symmetric 255 levels in [-1, 1]: (2j-255)/255
+inline float canon_value(int bits, int code) {
+  if (bits >= 8) return (2.0f * (float)code - 255.0f) / 255.0f;
+  if (bits == 4) return (2.0f * (float)code - 15.0f) / 15.0f;
+  static const float c2[4] = {-1.0f, -1.0f / 3.0f, 1.0f / 3.0f, 1.0f};
+  return c2[code & 3];
 }
 
 // Tile geometry (subgroup = 16x16 work-items, each covers a 4x4 output sub-tile).
@@ -198,17 +204,27 @@ void quant_gemm_forward(sycl::queue& q,
           std::uint16_t val = 0;
           if (ng < static_cast<int>(N) && kg < static_cast<int>(K)) {
             const std::size_t idx = static_cast<std::size_t>(ng) * K + kg;
-            int code = 0;
-            if (bits >= 8) {
-              code = static_cast<int>(wck[idx]);
-            } else {
-              const int pack = 8 / bits;
-              const std::uint8_t b = wck[idx / pack];
-              code = unpack_nibble(b, bits, static_cast<int>(idx % pack) * bits);
-            }
             const int g = kg / Gw;
-            const float s = from_half_bits(wsk[ng * num_groups_w + g]) / alpha;
-            val = to_half_bits(s * static_cast<float>(code));
+            const float s = from_half_bits(wsk[ng * num_groups_w + g]) * alpha;
+            float wval;
+            if (bits >= 16) {
+              // FP16 weight: raw half bits.
+              const std::uint16_t hv = (std::uint16_t)(
+                  wck[idx * 2] | ((std::uint16_t)wck[idx * 2 + 1] << 8));
+              wval = from_half_bits(hv);
+            } else {
+              int code;
+              if (bits >= 8) {
+                code = static_cast<int>(wck[idx]);  // unsigned 0..255 index
+              } else {
+                const int pack = 8 / bits;
+                const std::uint8_t b = wck[idx / pack];
+                const int within = static_cast<int>(idx % pack);
+                code = (b >> (within * bits)) & ((1 << bits) - 1);  // unsigned idx
+              }
+              wval = s * canon_value(bits, code);
+            }
+            val = to_half_bits(wval);
           }
           sW[e] = val;
         }
@@ -235,6 +251,215 @@ void quant_gemm_forward(sycl::queue& q,
     });
   });
   q.wait();
+}
+
+// ---------------------------------------------------------------------------
+// USM-based dequant-on-the-fly GEMM (no buffer construction overhead).
+// All data lives in device USM; the activation is copied in via q.copy.
+//
+// Returns a SYCL event that signals when the output USM buffer (out_usm)
+// has been written. Callers can wait on the returned event to read the output.
+// ---------------------------------------------------------------------------
+sycl::event quant_gemm_forward_usm(sycl::queue& q,
+                                    std::uint16_t* act_usm,
+                                    const void* code_usm,
+                                    const std::uint16_t* scale_usm,
+                                    float alpha,
+                                    std::uint16_t* out_usm,
+                                    uint32_t M, uint32_t N, uint32_t K,
+                                    uint32_t group_size,
+                                    gemm::WeightScheme scheme,
+                                    const sycl::event& copy_dep) {
+  const int bits = (scheme == WeightScheme::INT2) ? 2
+                 : (scheme == WeightScheme::INT4) ? 4
+                 : (scheme == WeightScheme::FP16) ? 16 : 8;
+  const int Gw = (group_size == 0) ? static_cast<int>(K) : static_cast<int>(group_size);
+  const int num_groups_w = (static_cast<int>(K) + Gw - 1) / Gw;
+  const int nk_blocks = (static_cast<int>(K) + kBK - 1) / kBK;
+  const auto* code_u8 = static_cast<const std::uint8_t*>(code_usm);
+
+  // Fast path for M=1 (single-token decode): eliminate tiling overhead.
+  // The general kernel uses kBM=64 tiles and a 16x16 work-group (256 threads
+  // per group, 16384 total for N=4096), but only 16 work-items produce
+  // output for a single row. A flat 1D kernel with one output element per
+  // work-item is far more efficient for decode.
+  if (M == 1) {
+    constexpr int nWG = kThr;
+    const int nBlocks = (N + nWG - 1) / nWG;
+    const int global = nBlocks * nWG;
+
+    // FP16 fast path: load activations and weights as 8-wide vectors.
+    // This halves the LSU pressure compared to scalar loads.
+    if (bits == 16 && Gw == static_cast<int>(K)) {
+      return q.submit([&](sycl::handler& h) {
+        h.depends_on(copy_dep);
+        h.parallel_for<class gemm_usm_decode1_f16>(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+            [=](sycl::nd_item<1> it) {
+              const int ng = it.get_global_id(0);
+              if (ng >= N) return;
+
+              const int ng_g = ng * num_groups_w;
+              const std::uint16_t* sptr = scale_usm + ng_g;
+              const float alpha_f = alpha;
+              float acc = 0.0f;
+
+              const auto* w8 = reinterpret_cast<const std::uint16_t*>(code_u8);
+              const auto* a8 = act_usm;
+
+              for (int bk = 0; bk < nk_blocks; ++bk) {
+                const int kg_base = bk * kBK;
+                const std::uint16_t* aptr = a8 + kg_base;
+                const std::uint16_t* wptr = w8 + (std::size_t)ng * K + kg_base;
+
+                // Accumulate 8 elements at a time using SYCL vec loads.
+                for (int i = 0; i < 8; i += 8) {
+                  sycl::vec<sycl::half, 8> av8;
+                  sycl::vec<sycl::half, 8> wv8;
+                  for (int j = 0; j < 8; ++j) {
+                    av8[j] = sycl::bit_cast<sycl::half>(aptr[i + j]);
+                    wv8[j] = sycl::bit_cast<sycl::half>(wptr[i + j]);
+                  }
+                  for (int j = 0; j < 8; ++j) {
+                    acc += static_cast<float>(av8[j]) *
+                           static_cast<float>(wv8[j]) * alpha_f *
+                           from_half_bits(sptr[0]);
+                  }
+                }
+              }
+              out_usm[ng] = to_half_bits(acc);
+            });
+      });
+    }
+
+    // Original scalar M=1 path (kept for INT4/INT2/groupwise)
+    return q.submit([&](sycl::handler& h) {
+      h.depends_on(copy_dep);
+      h.parallel_for<class gemm_usm_decode1>(
+          sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+          [=](sycl::nd_item<1> it) {
+            const int ng = it.get_global_id(0);
+            if (ng >= N) return;
+
+            float acc = 0.0f;
+            const int ng_g = ng * num_groups_w;
+            for (int bk = 0; bk < nk_blocks; ++bk) {
+              const int kg_base = bk * kBK;
+              for (int kk = 0; kk < kBK; ++kk) {
+                const int kg = kg_base + kk;
+                if (kg >= K) break;
+
+                const float av = from_half_bits(act_usm[kg]);
+                const std::size_t idx = static_cast<std::size_t>(ng) * K + kg;
+                const int g = kg / Gw;
+                const float s = from_half_bits(scale_usm[ng_g + g]) * alpha;
+
+                float wval;
+                if (bits >= 16) {
+                  const std::uint16_t hv = code_u8[idx * 2] |
+                      (static_cast<std::uint16_t>(code_u8[idx * 2 + 1]) << 8);
+                  wval = from_half_bits(hv);
+                } else {
+                  int code;
+                  if (bits >= 8) {
+                    code = static_cast<int>(code_u8[idx]);
+                  } else {
+                    const int pack = 8 / bits;
+                    const std::uint8_t b = code_u8[idx / pack];
+                    const int within = static_cast<int>(idx % pack);
+                    code = (b >> (within * bits)) & ((1 << bits) - 1);
+                  }
+                  wval = s * canon_value(bits, code);
+                }
+                acc += av * wval;
+              }
+            }
+            out_usm[ng] = to_half_bits(acc);
+          });
+    });
+  }
+
+  const int gx = (static_cast<int>(M) + kBM - 1) / kBM;
+  const int gy = (static_cast<int>(N) + kBN - 1) / kBN;
+  sycl::nd_range<2> nd(sycl::range<2>(gx * kThr, gy * kThr),
+                       sycl::range<2>(kThr, kThr));
+
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(copy_dep);
+    sycl::local_accessor<std::uint16_t, 1> sA(sycl::range<1>(kBM * kBK), h);
+    sycl::local_accessor<std::uint16_t, 1> sW(sycl::range<1>(kBN * kBK), h);
+    h.parallel_for(nd, [=](sycl::nd_item<2> it) {
+      const int itm = it.get_global_id(0);
+      const int itn = it.get_global_id(1);
+      const int bm = itm / kThr, bn = itn / kThr;
+      const int ty = itm % kThr, tx = itn % kThr;
+
+      float acc[kSub * kSub] = {0};
+
+      const int nk_blocks = (static_cast<int>(K) + kBK - 1) / kBK;
+      for (int bk = 0; bk < nk_blocks; ++bk) {
+        // Load activation tile (FP16, pass-through from USM).
+        for (int e = ty * kThr + tx; e < kBM * kBK; e += kThr * kThr) {
+          const int r = e / kBK, c = e % kBK;
+          const int mg = bm * kBM + r;
+          const int kg = bk * kBK + c;
+          std::uint16_t val = 0;
+          if (mg < static_cast<int>(M) && kg < static_cast<int>(K))
+            val = act_usm[mg * K + kg];
+          sA[e] = val;
+        }
+        // Load weight tile (dequant-on-the-fly from USM).
+        for (int e = ty * kThr + tx; e < kBN * kBK; e += kThr * kThr) {
+          const int r = e / kBK, c = e % kBK;
+          const int ng = bn * kBN + r;
+          const int kg = bk * kBK + c;
+          std::uint16_t val = 0;
+          if (ng < static_cast<int>(N) && kg < static_cast<int>(K)) {
+            const std::size_t idx = static_cast<std::size_t>(ng) * K + kg;
+            const int g = kg / Gw;
+            const float s = from_half_bits(scale_usm[ng * num_groups_w + g]) * alpha;
+            float wval;
+            if (bits >= 16) {
+              const std::uint16_t hv = code_u8[idx * 2] | ((std::uint16_t)code_u8[idx * 2 + 1] << 8);
+              wval = from_half_bits(hv);
+            } else {
+              int code;
+              if (bits >= 8) {
+                code = static_cast<int>(code_u8[idx]);
+              } else {
+                const int pack = 8 / bits;
+                const std::uint8_t b = code_u8[idx / pack];
+                const int within = static_cast<int>(idx % pack);
+                code = (b >> (within * bits)) & ((1 << bits) - 1);
+              }
+              wval = s * canon_value(bits, code);
+            }
+            val = to_half_bits(wval);
+          }
+          sW[e] = val;
+        }
+        it.barrier();
+
+        for (int kk = 0; kk < kBK; ++kk) {
+          for (int i = 0; i < kSub; ++i)
+            for (int j = 0; j < kSub; ++j) {
+              const sycl::half av = sycl::bit_cast<sycl::half>(sA[(ty * kSub + i) * kBK + kk]);
+              const sycl::half wv = sycl::bit_cast<sycl::half>(sW[(tx * kSub + j) * kBK + kk]);
+              acc[i * kSub + j] += static_cast<float>(av) * static_cast<float>(wv);
+            }
+        }
+        it.barrier();
+      }
+
+      for (int i = 0; i < kSub; ++i)
+        for (int j = 0; j < kSub; ++j) {
+          const int mg = bm * kBM + ty * kSub + i;
+          const int ng = bn * kBN + tx * kSub + j;
+          if (mg < static_cast<int>(M) && ng < static_cast<int>(N))
+            out_usm[mg * N + ng] = to_half_bits(acc[i * kSub + j]);
+        }
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
