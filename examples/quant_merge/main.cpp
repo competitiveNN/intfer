@@ -48,6 +48,12 @@ static const char* role_name(TensorRole r) {
     case TensorRole::MLP_DOWN: return "MLP_DOWN";
     case TensorRole::NORM: return "NORM";
     case TensorRole::ROPE: return "ROPE";
+    case TensorRole::LINEAR_ATTN_QKV: return "LINEAR_ATTN_QKV";
+    case TensorRole::LINEAR_ATTN_Z: return "LINEAR_ATTN_Z";
+    case TensorRole::LINEAR_ATTN_B: return "LINEAR_ATTN_B";
+    case TensorRole::LINEAR_ATTN_A: return "LINEAR_ATTN_A";
+    case TensorRole::LINEAR_ATTN_CONV: return "LINEAR_ATTN_CONV";
+    case TensorRole::LINEAR_ATTN_OUT: return "LINEAR_ATTN_OUT";
     default: break;
   }
   return "OTHER";
@@ -197,6 +203,12 @@ int main(int argc, char** argv) {
     TensorOffset off;
   };
   std::vector<TensorMeta> metas;
+  // Buffered scale/global bytes (tiny: ~60KB total for 27B). Codes stream
+  // directly to the payload file; these are appended after all codes so
+  // the payload layout is [code][scale][global][rotations], matching the
+  // JSON offsets and deserialize_intfer.
+  std::vector<uint8_t> aux_scales;
+  std::vector<uint8_t> aux_globals;
 
   for (int a = 2; a < argc; ++a) {
     std::string path = argv[a];
@@ -279,16 +291,25 @@ int main(int argc, char** argv) {
       t.scale_offset = off.scale_off;
       t.global_offset = off.global_off;
 
+      // Payload layout is segregated [all code][all scale][all global]
+      // (matching deserialize_intfer), NOT interleaved per tensor: the
+      // JSON offsets (cp/sp/gp cursors) index into the separate regions.
+      // Codes stream straight to disk (tens of GB); scales+globals are
+      // tiny (~60KB total) so we buffer them and append after all codes.
+      // (The old code wrote code/scale/global inline per tensor, which
+      // skewed every tensor after the first scale-bearing one.)
       if (t.code_bytes) {
         fwrite(chunk_m.code_buf.data() + local_code_off, 1, t.code_bytes, fpld);
         cp += t.code_bytes;
       }
       if (t.scale_bytes) {
-        fwrite(chunk_m.scale_buf.data() + local_scale_off, 1, t.scale_bytes, fpld);
+        const uint8_t* sb = chunk_m.scale_buf.data() + local_scale_off;
+        aux_scales.insert(aux_scales.end(), sb, sb + t.scale_bytes);
         sp += t.scale_bytes;
       }
       if (t.global_bytes) {
-        fwrite(chunk_m.global_buf.data() + local_global_off, 1, t.global_bytes, fpld);
+        const uint8_t* gb = chunk_m.global_buf.data() + local_global_off;
+        aux_globals.insert(aux_globals.end(), gb, gb + t.global_bytes);
         gp += t.global_bytes;
       }
 
@@ -303,6 +324,27 @@ int main(int argc, char** argv) {
                  a - 1, metas.size(), (double)cp / (1024.0 * 1024.0));
   }
 
+  // Append buffered scales + globals (segregated regions), then rotations.
+  // Payload layout is [all code][all scale][all global][rotations],
+  // matching the JSON offsets and deserialize_intfer.
+  if (!aux_scales.empty())
+    fwrite(aux_scales.data(), 1, aux_scales.size(), fpld);
+  if (!aux_globals.empty())
+    fwrite(aux_globals.data(), 1, aux_globals.size(), fpld);
+  std::vector<uint8_t>().swap(aux_scales);
+  std::vector<uint8_t>().swap(aux_globals);
+  // Layout self-check (O(1)): ftell must equal cp+sp+gp now. This catches
+  // interleave-class bugs (writing scales/globals inline per tensor,
+  // which skewed every tensor after the first scale-bearing one).
+  {
+    long aux_end = ftell(fpld);
+    if (aux_end < 0 || (uint64_t)aux_end != cp + sp + gp) {
+      std::fprintf(stderr, "SELF-VERIFY FAIL: payload %ld vs cp+sp+gp=%llu\n",
+                   aux_end, (unsigned long long)(cp + sp + gp));
+      fclose(fpld); fclose(fhdr);
+      return 1;
+    }
+  }
   // Append rotations to payload
   for (const auto& r : merged_rs) {
     for (uint32_t k = 0; k < r.dim * r.dim; ++k) {
