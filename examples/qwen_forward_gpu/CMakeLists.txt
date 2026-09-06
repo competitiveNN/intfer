@@ -1,0 +1,13 @@
+add_executable(qwen_forward_gpu main.cpp)
+target_link_libraries(qwen_forward_gpu PRIVATE intfer_engine intfer_common)
+if(INTFER_ENABLE_L0)
+  target_link_libraries(qwen_forward_gpu PRIVATE intfer_l0)
+endif()
+add_sycl_to_target(TARGET qwen_forward_gpu SOURCES main.cpp)
+
+add_executable(diag2 diag2.cpp)
+target_link_libraries(diag2 PRIVATE intfer_engine intfer_quant_core intfer_gemm intfer_common)
+if(INTFER_ENABLE_L0)
+  target_link_libraries(diag2 PRIVATE intfer_l0)
+endif()
+add_sycl_to_target(TARGET diag2 SOURCES diag2.cpp)

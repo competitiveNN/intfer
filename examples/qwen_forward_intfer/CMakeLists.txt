@@ -1,0 +1,2 @@
+add_executable(qwen_forward_intfer main.cpp)
+target_link_libraries(qwen_forward_intfer PRIVATE intfer_quant_core intfer_common)
