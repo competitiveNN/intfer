@@ -87,6 +87,22 @@ struct ModelIR {
   std::vector<uint8_t> global_buf;  // per-tensor FP32 global divisors (alpha)
   std::vector<uint16_t> fp16_buf;   // FP16 (binary16) weights, used by t3/t4 stage
 
+  // Borrowed payload views (zero-copy load): when set, the accessors below
+  // read from these instead of the owned vectors. Set by
+  // deserialize_intfer_borrowed(); the caller must keep the source mapping
+  // alive as long as the ModelIR lives. Pipeline writers (DASH-Q/RCO)
+  // always use the owned vectors and never run on borrowed models.
+  const uint8_t* code_view = nullptr; size_t code_view_len = 0;
+  const uint8_t* scale_view = nullptr; size_t scale_view_len = 0;
+  const uint8_t* global_view = nullptr; size_t global_view_len = 0;
+  const uint8_t* code_data() const { return code_view ? code_view : code_buf.data(); }
+  size_t code_size() const { return code_view ? code_view_len : code_buf.size(); }
+  const uint8_t* scale_data() const { return scale_view ? scale_view : scale_buf.data(); }
+  size_t scale_size() const { return scale_view ? scale_view_len : scale_buf.size(); }
+  const uint8_t* global_data() const { return global_view ? global_view : global_buf.data(); }
+  size_t global_size() const { return global_view ? global_view_len : global_buf.size(); }
+  bool borrowed() const { return code_view || scale_view || global_view; }
+
   uint64_t total_weight_bytes() const; // sum of tensor.weight_bytes()
 };
 

@@ -633,6 +633,17 @@ static StepOut step(int token, int pos,
   // NaN tracer (INTFER_TRACE_NAN=1): check every GEMM output + hidden state
   // for NaN/Inf and report the first offender. Off by default (hot loop).
   static const bool trace_nan = (std::getenv("INTFER_TRACE_NAN") != nullptr);
+  // Hidden-state probe (INTFER_TRACE_H=1): print |h| + h[:4] after each
+  // layer's MLP at pos 0 so CPU vs GPU runs can be diffed per layer.
+  static const bool trace_h = (std::getenv("INTFER_TRACE_H") != nullptr);
+  auto ckpt_h = [&](int L, const std::vector<float>& v){
+    if(trace_h && pos==0){
+      double n2=0; for(float x : v) n2+=(double)x*x;
+      std::fprintf(stderr, "[h] L=%d |h|=%.6f h[:4]=%.6f %.6f %.6f %.6f\n",
+                   L, sqrt(n2), v[0], v[1], v[2], v[3]);
+      std::fflush(stderr);
+    }
+  };
   auto is_bad = [](const std::vector<float>& v) -> bool {
     for(float x : v) if(!std::isfinite(x)) return true;
     return false;
@@ -857,8 +868,7 @@ static StepOut step(int token, int pos,
       }
       h = backend->run_linear(name(L,"linear_attn.out_proj.weight"), normed_core);
       ckpt("la.out", L, h);
-#ifdef QP_PROBE_SIZES
-  if(pos==0 && (L==0 || L==3)){
+  if(trace_h && pos==0 && (L==0 || L==3)){
     std::vector<float> pmqkv = backend->run_linear(name(L,"linear_attn.in_proj_qkv.weight"), normed);
     std::vector<float> pz = backend->run_linear(name(L,"linear_attn.in_proj_z.weight"), normed);
     std::vector<float> pa = backend->run_linear(name(L,"linear_attn.in_proj_a.weight"), normed);
@@ -869,15 +879,7 @@ static StepOut step(int token, int pos,
                  pa.empty()?-999:pa[0], pb.empty()?-999:pb[0]);
     std::fflush(stderr);
   }
-#endif
       }
-#ifdef QP_PROBE_SIZES
-  if(false){
-    std::fprintf(stderr, "[dbg] L=%d pos=%d h_attn[:4]=%.4f %.4f %.4f %.4f\n",
-                 L, pos, h[0], h[1], h[2], h[3]);
-    std::fflush(stderr);
-  }
-#endif
     for(int i=0;i<cfg.H;i++) h[i] += res[i];
     ckpt("h.post_attn", L, h);
     // ---- MLP (gate/up right-site; down left-site) ----
@@ -894,11 +896,19 @@ static StepOut step(int token, int pos,
     std::vector<float> md = backend->run_linear(name(L, "mlp.down_proj.weight"), mg);
     ckpt("mlp.down", L, md);
     const Rotation* Rd = backend->rot_for(name(L, "mlp.down_proj.weight"));
+    if(trace_h && pos==0 && L==0){
+      double n2=0; for(float x : mg) n2+=(double)x*x;
+      std::fprintf(stderr, "[dbg] L=%d mlp mg|.|=%.6f mg[:4]=%.6f %.6f %.6f %.6f mu[:4]=%.6f %.6f %.6f %.6f md[:4]=%.6f %.6f %.6f %.6f Rg=%p Rd=%p\n",
+                   L, sqrt(n2), mg[0], mg[1], mg[2], mg[3], mu[0], mu[1], mu[2], mu[3],
+                   md[0], md[1], md[2], md[3], (const void*)Rg, (const void*)Rd);
+      std::fflush(stderr);
+    }
     std::vector<float> mlp_out(cfg.H);
     if(Rd) rot_left(md.data(), *Rd, mlp_out.data());
     else mlp_out = md;
     for(int i=0;i<cfg.H;i++) h[i] = h[i] + mlp_out[i];
     ckpt("h.post_mlp", L, h);
+    ckpt_h(L, h);
     if(record){
       if(pos < 0 || (size_t)pos >= dump[L].size()/cfg.H){
         std::fprintf(stderr, "[intfer] FATAL L=%d dump OOB: pos=%d cap=%zu\n",
@@ -1208,23 +1218,22 @@ int main(int argc, char** argv){
   std::fprintf(stderr, "[intfer] safetensors: %s\n", st_path.c_str());
 
   // ---- Load .intifer (Stage-1 quantized MLP + attn)
-  // Use mmap to avoid copying 18GB into a vector (would OOM).
+  // Borrowed mmap views (zero-copy): the 22GB code region stays in page
+  // cache instead of being copied into RAM. mblob must outlive main, so it
+  // is munmap'd only at the very end.
   ModelIR m; RotationSet rs;
-  {
-    MmapBlob mblob = mmap_blob(intfer_path);
-    if (!mblob.base || mblob.size == 0) {
-      std::fprintf(stderr, "FAIL: cannot mmap %s\n", intfer_path.c_str()); return 1;
-    }
-    std::fprintf(stderr, "[intfer] mmap'd %zu bytes for %s (gpu_mode=%d)...\n",
-                 mblob.size, intfer_path.c_str(), (int)gpu_mode); std::fflush(stderr);
-    std::fprintf(stderr, "[intfer] calling deserialize_intfer...\n"); std::fflush(stderr);
-    if(!deserialize_intfer((const uint8_t*)mblob.base, mblob.size, m, rs)){
-      std::fprintf(stderr, "FAIL: cannot deserialize .intifer\n"); munmap_blob(mblob); return 1;
-    }
-    munmap_blob(mblob);
-    std::fprintf(stderr, "[intfer] deserialize_intfer done: %zu tensors, %zu rotations\n",
-                 m.tensors.size(), rs.rotations.size()); std::fflush(stderr);
+  MmapBlob mblob = mmap_blob(intfer_path);
+  if (!mblob.base || mblob.size == 0) {
+    std::fprintf(stderr, "FAIL: cannot mmap %s\n", intfer_path.c_str()); return 1;
   }
+  std::fprintf(stderr, "[intfer] mmap'd %zu bytes for %s (gpu_mode=%d)...\n",
+               mblob.size, intfer_path.c_str(), (int)gpu_mode); std::fflush(stderr);
+  std::fprintf(stderr, "[intfer] calling deserialize_intfer_borrowed...\n"); std::fflush(stderr);
+  if(!deserialize_intfer_borrowed((const uint8_t*)mblob.base, mblob.size, m, rs)){
+    std::fprintf(stderr, "FAIL: cannot deserialize .intifer\n"); munmap_blob(mblob); return 1;
+  }
+  std::fprintf(stderr, "[intfer] deserialize_intfer done: %zu tensors, %zu rotations (borrowed)\n",
+               m.tensors.size(), rs.rotations.size()); std::fflush(stderr);
   std::map<uint8_t, const Rotation*> rid_map;
   for(const auto& R : rs.rotations) rid_map[R.id] = &R;
   rid_map_global = rid_map;
@@ -1587,5 +1596,6 @@ int main(int argc, char** argv){
 #endif
   if(!stream) std::fwrite(output.data(), 1, output.size(), stdout);
   std::fwrite("\n", 1, 1, stdout);
+  munmap_blob(mblob); // release the borrowed payload mapping at the very end
   return 0;
 }

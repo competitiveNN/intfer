@@ -373,12 +373,12 @@ QuantResult quantize(const float* W, uint32_t N, uint32_t K, const QuantConfig& 
 void dequant_tensor(const ModelIR& m, const TensorIR& t, std::vector<float>& out) {
   QuantResult r;
   r.qcfg = t.qcfg;
-  r.codes.assign(m.code_buf.begin() + t.code_offset,
-                 m.code_buf.begin() + t.code_offset + t.code_bytes);
-  r.scales.assign(m.scale_buf.begin() + t.scale_offset,
-                  m.scale_buf.begin() + t.scale_offset + t.scale_bytes);
-  r.globals.assign(m.global_buf.begin() + t.global_offset,
-                   m.global_buf.begin() + t.global_offset + t.global_bytes);
+  r.codes.assign(m.code_data() + t.code_offset,
+                 m.code_data() + t.code_offset + t.code_bytes);
+  r.scales.assign(m.scale_data() + t.scale_offset,
+                  m.scale_data() + t.scale_offset + t.scale_bytes);
+  r.globals.assign(m.global_data() + t.global_offset,
+                   m.global_data() + t.global_offset + t.global_bytes);
   r.dequant(out, t.N, t.K);
 }
 

@@ -40,6 +40,11 @@ namespace intfer {
 //   rotation region: for each rotation, dim*dim float32 (offset recorded in JSON)
 std::vector<uint8_t> serialize_intfer(const ModelIR& model, const RotationSet& rs);
 bool deserialize_intfer(const uint8_t* data, size_t n, ModelIR& out_model, RotationSet& out_rs);
+// Zero-copy variant: payload views point into [data, data+n) instead of
+// copying (saves ~22GB RAM on the 27B model when loading from mmap).
+// Caller must keep the source mapping alive as long as out_model lives.
+bool deserialize_intfer_borrowed(const uint8_t* data, size_t n, ModelIR& out_model,
+                                 RotationSet& out_rs);
 
 // ---------------------------------------------------------------------------
 // GGUF interop (magic "GGUF", ggml-compatible container)

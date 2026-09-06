@@ -455,16 +455,17 @@ std::vector<uint8_t> serialize_intfer(const ModelIR& model, const RotationSet& r
   for (int i = 0; i < 8; ++i) out.push_back((uint8_t)magic[i]);
   put_u32(out, 1);                                        // version
   put_u32(out, (uint32_t)model.tensors.size());           // n_tensors
-  put_u64(out, model.code_buf.size());                    // code_len
-  put_u64(out, model.scale_buf.size());                   // scale_len
-  put_u64(out, model.global_buf.size());                  // global_len
+  put_u64(out, model.code_size());                    // code_len
+  put_u64(out, model.scale_size());                   // scale_len
+  put_u64(out, model.global_size());                  // global_len
   put_u32(out, (uint32_t)rs.rotations.size());            // n_rotations
   put_u16(out, 0);                                        // reserved
   put_u64(out, js.size());                                // json_len
   out.insert(out.end(), js.begin(), js.end());
-  out.insert(out.end(), model.code_buf.begin(), model.code_buf.end());
-  out.insert(out.end(), model.scale_buf.begin(), model.scale_buf.end());
-  out.insert(out.end(), model.global_buf.begin(), model.global_buf.end());
+  // Accessors (not .begin()) so borrowed models re-serialize correctly.
+  { const uint8_t* p = model.code_data(); out.insert(out.end(), p, p + model.code_size()); }
+  { const uint8_t* p = model.scale_data(); out.insert(out.end(), p, p + model.scale_size()); }
+  { const uint8_t* p = model.global_data(); out.insert(out.end(), p, p + model.global_size()); }
   for (const auto& r : rs.rotations) {
     for (uint32_t k = 0; k < r.dim * r.dim; ++k) {
       uint32_t u;
@@ -476,7 +477,12 @@ std::vector<uint8_t> serialize_intfer(const ModelIR& model, const RotationSet& r
   return out;
 }
 
-bool deserialize_intfer(const uint8_t* data, size_t n, ModelIR& out_model, RotationSet& out_rs) {
+namespace {
+// borrow=true: point the payload views at the source mapping (zero-copy for
+// multi-GB mmap'd models). The caller must keep [data, data+n) alive as long
+// as out_model lives. Rotations are always copied (tiny).
+bool deser_impl(const uint8_t* data, size_t n, ModelIR& out_model, RotationSet& out_rs,
+                bool borrow) {
   out_model = ModelIR{};
   out_rs = RotationSet{};
   if (n < 8 + 4 + 4 + 24 + 4 + 2 + 8) return false;
@@ -547,12 +553,21 @@ bool deserialize_intfer(const uint8_t* data, size_t n, ModelIR& out_model, Rotat
 
   // buffers
   if (pos + code_len + scale_len + global_len > n) return false;
-  out_model.code_buf.assign(data + pos, data + pos + code_len);
-  pos += code_len;
-  out_model.scale_buf.assign(data + pos, data + pos + scale_len);
-  pos += scale_len;
-  out_model.global_buf.assign(data + pos, data + pos + global_len);
-  pos += global_len;
+  if (borrow) {
+    out_model.code_view = data + pos; out_model.code_view_len = (size_t)code_len;
+    pos += code_len;
+    out_model.scale_view = data + pos; out_model.scale_view_len = (size_t)scale_len;
+    pos += scale_len;
+    out_model.global_view = data + pos; out_model.global_view_len = (size_t)global_len;
+    pos += global_len;
+  } else {
+    out_model.code_buf.assign(data + pos, data + pos + code_len);
+    pos += code_len;
+    out_model.scale_buf.assign(data + pos, data + pos + scale_len);
+    pos += scale_len;
+    out_model.global_buf.assign(data + pos, data + pos + global_len);
+    pos += global_len;
+  }
 
   // rotations
   const Json* jr = jobj_find(root, "rotations");
@@ -574,6 +589,16 @@ bool deserialize_intfer(const uint8_t* data, size_t n, ModelIR& out_model, Rotat
     out_rs.rotations.push_back(std::move(r));
   }
   return true;
+}
+} // namespace
+
+bool deserialize_intfer(const uint8_t* data, size_t n, ModelIR& out_model, RotationSet& out_rs) {
+  return deser_impl(data, n, out_model, out_rs, false);
+}
+
+bool deserialize_intfer_borrowed(const uint8_t* data, size_t n, ModelIR& out_model,
+                                 RotationSet& out_rs) {
+  return deser_impl(data, n, out_model, out_rs, true);
 }
 
 // ===========================================================================
@@ -667,8 +692,8 @@ std::vector<uint8_t> serialize_gguf(const ModelIR& model, const RotationSet& rs)
         st.name = t.name + ".scale";
         st.dims = {t.scale_bytes / 2};
         st.ggml_type = 1;  // F16 scale
-        st.data.assign(model.scale_buf.begin() + t.scale_offset,
-                       model.scale_buf.begin() + t.scale_offset + t.scale_bytes);
+        st.data.assign(model.scale_data() + t.scale_offset,
+                       model.scale_data() + t.scale_offset + t.scale_bytes);
         tensors.push_back(std::move(st));
       }
       if (t.global_bytes) {
@@ -676,13 +701,13 @@ std::vector<uint8_t> serialize_gguf(const ModelIR& model, const RotationSet& rs)
         gt2.name = t.name + ".global";
         gt2.dims = {1};
         gt2.ggml_type = 0;  // F32 alpha
-        gt2.data.assign(model.global_buf.begin() + t.global_offset,
-                        model.global_buf.begin() + t.global_offset + t.global_bytes);
+        gt2.data.assign(model.global_data() + t.global_offset,
+                        model.global_data() + t.global_offset + t.global_bytes);
         tensors.push_back(std::move(gt2));
       }
     }
-    gt.data.assign(model.code_buf.begin() + t.code_offset,
-                   model.code_buf.begin() + t.code_offset + t.code_bytes);
+    gt.data.assign(model.code_data() + t.code_offset,
+                   model.code_data() + t.code_offset + t.code_bytes);
     tensors.push_back(std::move(gt));
   }
   // rotation matrices as F32 tensors

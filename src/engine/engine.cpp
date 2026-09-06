@@ -96,7 +96,7 @@ gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
   //    view. The kernel reads scale[ng*n_groups + g], so we emit (N*n_groups)
   //    FP16 values (broadcast the per-group scale to every row).
   const uint16_t* scale_src =
-      reinterpret_cast<const uint16_t*>(m.scale_buf.data() + t.scale_offset);
+      reinterpret_cast<const uint16_t*>(m.scale_data() + t.scale_offset);
   std::vector<uint16_t> scale_broadcast((size_t)N * n_groups);
   for (uint32_t r = 0; r < N; ++r)
     for (uint32_t g = 0; g < n_groups; ++g)
@@ -121,7 +121,7 @@ gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
   if (w.scheme == gemm::WeightScheme::FP16) {
     // FP16: pass-through the N*K*2 byte slice (identity for the kernel).
     std::vector<uint8_t> code_slice((size_t)w.N * K * 2);
-    const uint8_t* base = m.code_buf.data() + t.code_offset + start * K * 2;
+    const uint8_t* base = m.code_data() + t.code_offset + start * K * 2;
     std::memcpy(code_slice.data(), base, code_slice.size());
     w.code_store = std::move(code_slice);
     w.code = sycl::buffer<std::uint8_t>(w.code_store.data(),
@@ -139,7 +139,7 @@ gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
         for (uint32_t c = k0; c < k1; ++c) {
           const size_t src_idx = (size_t)g * (N * Glocal)
                                + (size_t)src_row * Glocal + (c - k0);
-          const uint8_t b = m.code_buf[t.code_offset + src_idx / pack];
+          const uint8_t b = m.code_data()[t.code_offset + src_idx / pack];
           const int within = (int)(src_idx % pack);
           const uint8_t val = (b >> (within * bits)) & ((1u << bits) - 1u);
           row_codes[(size_t)r * K + c] = val;
@@ -165,7 +165,7 @@ gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
     // bytes into an aligned float (avoids the previous 4x mis-offset read that
     // yielded garbage alpha and zeroed/NaN'd the GEMM output).
     float alpha_val = 0.f;
-    std::memcpy(&alpha_val, m.global_buf.data() + t.global_offset,
+    std::memcpy(&alpha_val, m.global_data() + t.global_offset,
                 std::min<uint32_t>(t.global_bytes, 4u));
     w.global_store.assign(1, alpha_val);
     w.global = sycl::buffer<float>(w.global_store.begin(), w.global_store.end());
@@ -316,12 +316,19 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   }
 
   // Wait for all kernels, then read back directly from persistent USM.
+  // NOTE: the wait is load-bearing, not profiling — without it the host
+  // reads out_usm before the kernel runs (fresh zero pages => all-zero
+  // GEMM outputs). Only the timing accumulation is profiling-gated.
 #ifdef INTFER_PROFILE_GPU
   auto t_wait0 = std::chrono::high_resolution_clock::now();
+#endif
   for (size_t d = 0; d < devices_.size(); ++d) {
     kernel_events[d].wait();
+#ifdef INTFER_PROFILE_GPU
     g_gpu_profile.wait_count++;
+#endif
   }
+#ifdef INTFER_PROFILE_GPU
   auto t_wait1 = std::chrono::high_resolution_clock::now();
   g_gpu_profile.total_wait_us += std::chrono::duration<double, std::micro>(t_wait1 - t_wait0).count();
 
