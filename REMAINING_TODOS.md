@@ -32,6 +32,8 @@ CPU.
 
 ## TODO 2 — Persistent kernel across the 7 Linears × 24 layers
 
+**Status:** Scaffold exists (`INTFER_GRAPH_CAPTURE` + `build_decode_graph`), but only captures a single tensor. Full multi-tensor capture requires building USM buffers per tensor per layer and recording a graph that includes activation copy, GEMM, and output read for each linear in order. Left as documented stub pending build environment.
+
 **Why:** Every `run_linear_tp` call currently goes through:
   host pre-convert FP32→FP16 → direct USM write → `q.submit()` → kernel
 launch → `event.wait()` → host readback. For 7 linears × 24 layers × ~20
