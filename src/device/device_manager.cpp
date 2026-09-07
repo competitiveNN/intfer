@@ -49,7 +49,7 @@ DeviceManager DeviceManager::discover(const std::string& name_filter) {
     ctx.name                 = name;
     ctx.sycl_device          = dev;
     ctx.sycl_context         = sycl::context(dev);
-    ctx.queue                = sycl::queue(ctx.sycl_context, dev, sycl_exception_handler, {sycl::property::queue::in_order()});
+    ctx.queue                = sycl::queue(ctx.sycl_context, dev, sycl_exception_handler, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
     ctx.global_memory_bytes  = dev.get_info<sycl::info::device::global_mem_size>();
     ctx.max_compute_units    = dev.get_info<sycl::info::device::max_compute_units>();
 
