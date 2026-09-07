@@ -11,6 +11,10 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "intfer/safetensors.hpp"
 #include "intfer/output.hpp"
@@ -35,13 +39,21 @@ int main(int argc, char** argv) {
   if (!r.open(st_path)) { printf("FAIL open safetensors\n"); return 1; }
   printf("safetensors index open: %s\n", st_path);
 
-  // .intfer model
-  std::vector<uint8_t> blob;
-  if (!read_file(intfer_path, blob)) { printf("FAIL read intfer\n"); return 1; }
+  // .intifer model (borrowed mmap views: a 22GB 27B payload stays in page
+  // cache instead of being copied into RAM).
   intfer::ModelIR m;
   intfer::RotationSet rs;
-  if (!intfer::deserialize_intfer(blob.data(), blob.size(), m, rs)) {
-    printf("FAIL deserialize intfer\n"); return 1;
+  {
+    int fdi = ::open(intfer_path, O_RDONLY);
+    if (fdi < 0) { printf("FAIL open intfer\n"); return 1; }
+    struct stat sti;
+    if (::fstat(fdi, &sti) != 0 || sti.st_size <= 0) { ::close(fdi); printf("FAIL stat intfer\n"); return 1; }
+    void* mbase = ::mmap(nullptr, (size_t)sti.st_size, PROT_READ, MAP_PRIVATE, fdi, 0);
+    ::close(fdi);
+    if (mbase == MAP_FAILED) { printf("FAIL mmap intfer\n"); return 1; }
+    if (!intfer::deserialize_intfer_borrowed((const uint8_t*)mbase, (size_t)sti.st_size, m, rs)) {
+      printf("FAIL deserialize intfer\n"); return 1;
+    }
   }
   printf("intfer tensors=%zu  (rotation sets=%zu)\n", m.tensors.size(), rs.size());
 
@@ -124,6 +136,16 @@ int main(int argc, char** argv) {
     double dot = 0, na = 0, nb = 0;
     for (size_t i = 0; i < n; ++i) { dot += w[i]*ref[i]; na += w[i]*w[i]; nb += ref[i]*ref[i]; }
     float c = (float)(dot / (std::sqrt(na)*std::sqrt(nb) + 1e-12));
+    // Scale check: cosine is scale-invariant, so also report the optimal
+    // least-squares scale s = <w,ref>/<w,w> (want ~1.0) and both norms.
+    // A bad global alpha / merge offset shows up here, not in cos.
+    double s = dot / (na + 1e-12);
+    static int scnt = 0;
+    if (scnt < 40) {
+      printf("  [scale] %-52s s=%.4f |w|=%.4g |ref|=%.4g cos=%.6f\n",
+             t.name.c_str(), s, std::sqrt(na), std::sqrt(nb), c);
+      scnt++;
+    }
     int role = (int)t.role;
     if (!role_min.count(role) || c < role_min[role]) role_min[role] = c;
     role_cnt[role]++;

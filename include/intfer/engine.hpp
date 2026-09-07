@@ -77,10 +77,22 @@ class Engine {
 
  private:
   Engine() = default;
+ public:
+  // Releases the borrowed mmap backing (if any). Defined in engine.cpp.
+  ~Engine();
+ private:
   void build_shards();
 
   ModelIR model_;
   std::vector<intfer::device::DeviceContext> devices_;
+  // Borrowed mmap mapping backing model_ when loaded via deserialize_borrowed
+  // (zero-copy for multi-GB files). Must outlive model_. Empty when the model
+  // was deserialized from an owned blob (small files).
+  struct MappedFile {
+    void* base = nullptr;
+    size_t size = 0;
+  };
+  MappedFile backing_;
 
   // One contiguous shard range [start,end) of the output dim N per device, for
   // each quantized Linear tensor (indexed parallel to model_.tensors).

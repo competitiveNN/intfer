@@ -12,8 +12,13 @@
 // ... (previous imports)
 #include "intfer/engine.hpp"
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <chrono>
@@ -36,6 +41,12 @@
 #define INTFER_CAPTURE_GRAPH 1
 
 namespace intfer {
+
+Engine::~Engine() {
+  if (backing_.base && backing_.size) ::munmap(backing_.base, backing_.size);
+  backing_.base = nullptr;
+  backing_.size = 0;
+}
 
 #ifdef INTFER_PROFILE_GPU
   struct GpuProfile {
@@ -179,15 +190,44 @@ std::unique_ptr<Engine> Engine::load(const std::string& intfer_path,
                                     size_t tp_devices) {
   auto e = std::unique_ptr<Engine>(new Engine());
 
-  std::vector<uint8_t> blob;
-  if (!read_file(intfer_path, blob)) {
-    std::cerr << "Engine: cannot read " << intfer_path << "\n";
-    return nullptr;
-  }
+  // Zero-copy load: mmap the file and borrow the payload views instead of
+  // copying multi-GB payloads into RAM (a 22GB .intifer would otherwise need
+  // ~44GB transient RSS: file blob + deserialized vectors). The mapping is
+  // kept in e->backing_ for the Engine's lifetime. Small files (<1GB) use
+  // the old read+copy path so short-lived tools don't pin mappings.
   RotationSet rs;
-  if (!deserialize_intfer(blob.data(), blob.size(), e->model_, rs)) {
-    std::cerr << "Engine: cannot deserialize " << intfer_path << "\n";
-    return nullptr;
+  {
+    FILE* f = std::fopen(intfer_path.c_str(), "rb");
+    if (!f) { std::cerr << "Engine: cannot read " << intfer_path << "\n"; return nullptr; }
+    std::fseek(f, 0, SEEK_END);
+    long fsize = std::ftell(f);
+    std::fclose(f);
+    if (fsize <= 0) { std::cerr << "Engine: cannot read " << intfer_path << "\n"; return nullptr; }
+    if ((size_t)fsize < (1ULL << 30)) {
+      std::vector<uint8_t> blob;
+      if (!read_file(intfer_path, blob)) {
+        std::cerr << "Engine: cannot read " << intfer_path << "\n";
+        return nullptr;
+      }
+      if (!deserialize_intfer(blob.data(), blob.size(), e->model_, rs)) {
+        std::cerr << "Engine: cannot deserialize " << intfer_path << "\n";
+        return nullptr;
+      }
+    } else {
+      int fd = ::open(intfer_path.c_str(), O_RDONLY);
+      if (fd < 0) { std::cerr << "Engine: cannot mmap " << intfer_path << "\n"; return nullptr; }
+      void* m = ::mmap(nullptr, (size_t)fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+      ::close(fd);
+      if (m == MAP_FAILED) { std::cerr << "Engine: cannot mmap " << intfer_path << "\n"; return nullptr; }
+      e->backing_.base = m;
+      e->backing_.size = (size_t)fsize;
+      if (!deserialize_intfer_borrowed((const uint8_t*)m, (size_t)fsize, e->model_, rs)) {
+        ::munmap(m, (size_t)fsize);
+        e->backing_ = Engine::MappedFile{};
+        std::cerr << "Engine: cannot deserialize " << intfer_path << "\n";
+        return nullptr;
+      }
+    }
   }
   e->rs_ = std::move(rs);
   for (const auto& R : e->rs_.rotations) e->rid_[R.id] = &R;
