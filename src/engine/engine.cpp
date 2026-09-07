@@ -272,6 +272,73 @@ void Engine::build_shards() {
       auto pos = p.find("layers.");
       if (pos != std::string::npos) layer_names_.push_back(p.substr(0, p.find('.', pos + 7) + 1));
     }
+  // Per-layer tensor index (layer-wise VRAM streaming). Unlayered tensors
+  // (lm_head, ...) get -1 and are never evicted by begin_layer().
+  layer_of_.assign(model_.tensors.size(), -1);
+  int maxL = -1;
+  for (size_t ti = 0; ti < model_.tensors.size(); ++ti) {
+    int L = layer_of_name(model_.tensors[ti].name);
+    layer_of_[ti] = L;
+    if (L > maxL) maxL = L;
+  }
+  layer_tensors_.assign(maxL + 1, {});
+  for (size_t ti = 0; ti < model_.tensors.size(); ++ti)
+    if (layer_of_[ti] >= 0) layer_tensors_[(size_t)layer_of_[ti]].push_back((int)ti);
+}
+
+int Engine::layer_of_name(const std::string& name) {
+  size_t p = name.find("model.language_model.layers.");
+  if (p == std::string::npos) return -1;
+  int L = std::atoi(name.c_str() + p + 28);
+  if (L < 0) return -1;
+  // Guard against atoi garbage on malformed names: require digits.
+  const char* s = name.c_str() + p + 28;
+  if (*s < '0' || *s > '9') return -1;
+  return L;
+}
+
+void Engine::release_shard(int tensor_index) {
+  if (tensor_index < 0 || (size_t)tensor_index >= shard_cache_.size()) return;
+  auto& sc = shard_cache_[(size_t)tensor_index];
+  if (!sc.built) return;
+  // run_linear_tp waits on kernel events before readback, so by the time a
+  // later begin_layer() releases this shard no kernel can still reference
+  // it. Belt-and-braces queue sync (already complete => ~free).
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    devices_[d].queue.wait();
+    if (sc.code_usm.size() > d && sc.code_usm[d]) {
+      sycl::free(sc.code_usm[d], devices_[d].queue);
+      sc.code_usm[d] = nullptr;
+    }
+    if (sc.scale_usm.size() > d && sc.scale_usm[d]) {
+      sycl::free(sc.scale_usm[d], devices_[d].queue);
+      sc.scale_usm[d] = nullptr;
+    }
+    if (sc.global_usm.size() > d && sc.global_usm[d]) {
+      sycl::free(sc.global_usm[d], devices_[d].queue);
+      sc.global_usm[d] = nullptr;
+    }
+    if (sc.act_usm.size() > d && sc.act_usm[d]) {
+      sycl::free(sc.act_usm[d], devices_[d].queue);
+      sc.act_usm[d] = nullptr;
+    }
+    if (sc.out_usm.size() > d && sc.out_usm[d]) {
+      sycl::free(sc.out_usm[d], devices_[d].queue);
+      sc.out_usm[d] = nullptr;
+    }
+  }
+  sc.code_usm.clear(); sc.scale_usm.clear(); sc.global_usm.clear();
+  sc.act_usm.clear(); sc.out_usm.clear();
+  sc.built = false;
+}
+
+void Engine::begin_layer(int L) {
+  if (layer_tensors_.empty()) return;
+  for (size_t ti = 0; ti < shard_cache_.size(); ++ti) {
+    if (!shard_cache_[ti].built) continue;
+    int tl = (ti < layer_of_.size()) ? layer_of_[ti] : -1;
+    if (tl >= 0 && tl != L) release_shard((int)ti);
+  }
 }
 
 std::vector<float> Engine::decode_step(const std::vector<float>& token_hidden,

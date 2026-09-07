@@ -70,6 +70,20 @@ class Engine {
   std::vector<float> run_linear_tp_ret(int tensor_index, const std::vector<float>& x) {
     std::vector<float> out; run_linear_tp(tensor_index, x, out); return out;
   }
+
+  // --- Layer-wise VRAM streaming (27B on 12GB GPUs) -------------------------
+  // The full-model shard cache (~23GB for 27B) exceeds B580 VRAM. Call
+  // begin_layer(L) when the caller advances to layer L: it frees every built
+  // shard that does not belong to L (unlayered tensors like lm_head stay
+  // resident). The next run_linear_tp for a freed tensor rebuilds its shard
+  // on demand, so streaming is numerically transparent. Peak VRAM drops to
+  // one layer + lm_head (~1.1GB on 27B).
+  void begin_layer(int L);
+  // Free one tensor's device shard (no-op if not built).
+  void release_shard(int tensor_index);
+  // Layer index parsed from a tensor name ("...layers.<L>..."), or -1 when
+  // the tensor is not per-layer (lm_head, norms).
+  static int layer_of_name(const std::string& name);
   
   // SYCL queue for device i (for attention kernels etc.).
   sycl::queue& device_queue(size_t i) { return devices_.at(i).queue; }
@@ -137,6 +151,11 @@ class Engine {
   };
   std::vector<CachedShard> shard_cache_;
   bool ensure_shard_built(int tensor_index);
+  // Per-layer tensor index lists, built by build_shards() from tensor names.
+  // layer_tensors_[L] = indices of "...layers.<L>..." tensors; layer_of_[i]
+  // mirrors it per tensor index (-1 = unlayered: lm_head, norms, ...).
+  std::vector<std::vector<int>> layer_tensors_;
+  std::vector<int> layer_of_;
 
   // Command-graph capture state (experimental; requires INTFER_GRAPH_CAPTURE=1).
 #if INTFER_GRAPH_CAPTURE

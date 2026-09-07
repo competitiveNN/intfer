@@ -539,6 +539,10 @@ struct GpuBackend : public LinearBackend {
   // Optional safetensors fallback for tensors not in the .intifer
   // (e.g. linear_attn tensors that weren't quantized).
   const SafetensorsReader* sr_fallback = nullptr;
+  // Layer-wise VRAM streaming: the Engine holds one layer's shards + lm_head
+  // (~1.1GB on 27B) instead of the full ~23GB model. Track the current layer
+  // from tensor names and evict the previous layer on advance.
+  int cur_layer_ = -1;
 
   const char* name() const override { return "gpu"; }
   bool is_distributed() const override { return num_devices_ > 1; }
@@ -596,6 +600,11 @@ struct GpuBackend : public LinearBackend {
       std::fprintf(stderr, "gpu: unknown tensor %s\n", name.c_str());
       return {};
     }
+    // Layer-wise streaming: evict the previous layer's device shards when the
+    // forward advances (unlayered tensors like lm_head are kept resident by
+    // the Engine). Rebuild on next use is transparent via ensure_shard_built.
+    int L = Engine::layer_of_name(name);
+    if(L >= 0 && L != cur_layer_){ eng->begin_layer(L); cur_layer_ = L; }
     return eng->run_linear_tp_ret(it->second, x);
   }
   const Rotation* rot_for(const std::string& name) override {
