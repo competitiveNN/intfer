@@ -626,10 +626,14 @@ struct GpuBackend : public LinearBackend {
             sycl::malloc_device(w_bytes, q.get_device(), q.get_context()));
         lm_head_c_dev_[d] = static_cast<sycl::half*>(
             sycl::malloc_device((size_t)N * sizeof(sycl::half), q.get_device(), q.get_context()));
-        // Upload once.
+        // Upload once. NOTE: the per-queue wait below is load-bearing, not
+        // profiling — the H2D memcpy is async; without the wait the host
+        // reuses/frees the staging buffer while the copy is still in flight,
+        // which surfaces as DEVICE_LOST under full-model device pressure.
         std::vector<sycl::half> w_fp16((size_t)N * K);
         for(uint32_t i=0;i<(size_t)N*K;i++) w_fp16[i] = sycl::half(W[i]);
         q.memcpy(lm_head_w_dev_[d], w_fp16.data(), w_bytes);
+        q.wait();
       }
       for(size_t d=0; d<eng->num_devices(); ++d)
         eng->device_queue((int)d).wait();
@@ -661,6 +665,11 @@ struct GpuBackend : public LinearBackend {
       sycl::event evt = gemm::quant_gemm_f16(q, x_dev, lm_head_w_dev_[d],
                                              lm_head_c_dev_[d], 1, N, K);
       q.memcpy(out_h.data(), lm_head_c_dev_[d], (size_t)N * sizeof(sycl::half), evt);
+      // Load-bearing: waiting only on the kernel event leaves the D2H
+      // readback in flight while the host consumes out_h (and frees x_dev).
+      // Under full-model device pressure that race kills the device; the
+      // queue wait makes host consumption safe.
+      q.wait();
       evts.push_back(evt);
     }
     for(auto& e : evts) e.wait();
