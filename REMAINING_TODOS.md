@@ -150,6 +150,15 @@ the batch.
 - RE-VALIDATED on 27B post-4b (no further change): `.re` GPU
   `-p "The capital of France is" -n 3` gives prefill→11751 +
   decode→13, 198, matching the HF oracle `11751 13 198 760`.
+- DONE (norm/copy fusion): eliminated dead pre-copies ahead of
+  SpinQuant replays (rot_apply fully overwrites when R present;
+  else-branch preserves the no-rotation path), in-place per-head
+  q_norm/k_norm rmsnorm (bit-identical; kills tmp[] + memcpy), dead
+  attn bulk zero. CPU `854×12` byte-identical.
+- DONE (4d KV-group attention tiling): heads grouped by KV head so
+  each K/V cache row loads once per group instead of n_heads/n_kv
+  times (4x on 0.8B, 6x on 27B). Bit-identical (independent-head
+  interleaving only). CPU + GPU both byte-identical to refs.
 - 4c (continued): host elementwise now ~45ms/tok on GPU path (was ~134ms).
   Next candidates: `name()` snprintf + map finds per linear (4b, hygiene),
   norm/copy fusion. GPU profile now: submit 36ms + wait 10 + write 5.7 +
