@@ -332,7 +332,60 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       });
     }
 
-    // Original scalar M=1 path (kept for INT4/INT2/groupwise)
+    // Original scalar M=1 path (kept for INT4/INT2/groupwise).
+    // Vectorized variant: load 8 activations at a time to halve LSU
+    // pressure while keeping weight dequant scalar.
+    if (bits < 16) {
+      return q.submit([&](sycl::handler& h) {
+        h.depends_on(copy_dep);
+        h.parallel_for<class gemm_usm_decode1_vec>(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+            [=](sycl::nd_item<1> it) {
+              const int ng = it.get_global_id(0);
+              if (ng >= N) return;
+
+              float acc = 0.0f;
+              const int ng_g = ng * num_groups_w;
+              const std::uint16_t* sptr = scale_usm + ng_g;
+
+              for (int bk = 0; bk < nk_blocks; ++bk) {
+                const int kg_base = bk * kBK;
+                // Load 8 activations as a vector per K-step.
+                for (int kk = 0; kk < kBK; kk += 8) {
+                  sycl::vec<sycl::half, 8> av8;
+                  for (int j = 0; j < 8; ++j) {
+                    const int kg = kg_base + kk + j;
+                    if (kg >= static_cast<int>(K)) break;
+                    av8[j] = sycl::bit_cast<sycl::half>(act_usm[kg]);
+                  }
+                  const int g0 = (kg_base + kk) / Gw;
+                  const float s0 = from_half_bits(sptr[g0]) * alpha;
+                  for (int j = 0; j < 8; ++j) {
+                    const int kg = kg_base + kk + j;
+                    if (kg >= static_cast<int>(K)) break;
+                    const std::size_t idx = static_cast<std::size_t>(ng) * K + kg;
+                    const int g = kg / Gw;
+                    const float scale = from_half_bits(sptr[ng_g + g]) * alpha;
+                    float wval;
+                    if (bits >= 8) {
+                      wval = scale * static_cast<float>(code_u8[idx]);
+                    } else {
+                      const int pack = 8 / bits;
+                      const std::uint8_t b = code_u8[idx / pack];
+                      const int within = static_cast<int>(idx % pack);
+                      const int code = (b >> (within * bits)) & ((1 << bits) - 1);
+                      wval = scale * canon_value(bits, code);
+                    }
+                    acc += static_cast<float>(av8[j]) * wval;
+                  }
+                }
+              }
+              out_usm[ng] = to_half_bits(acc);
+            });
+      });
+    }
+
+    // Scalar M=1 path (kept for groupwise FP16 activations).
     return q.submit([&](sycl::handler& h) {
       h.depends_on(copy_dep);
       h.parallel_for<class gemm_usm_decode1>(
