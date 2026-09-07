@@ -311,6 +311,14 @@ struct LinearBackend {
   // y has length t.N (both from the .intifer TensorIR for `tensor_name`).
   virtual std::vector<float> run_linear(const std::string& tensor_name,
                                         const std::vector<float>& x) = 0;
+  // Allocation-free variant: writes y into `out` (resized only when the
+  // size differs, so a reused scratch buffer performs zero mallocs).
+  // Default impl wraps run_linear; backends override for zero-copy.
+  virtual void run_linear_into(const std::string& tensor_name,
+                               const std::vector<float>& x,
+                               std::vector<float>& out){
+    out = run_linear(tensor_name, x);
+  }
   // SpinQuant rotation for this tensor (right-site for q/k/v/gate/up;
   // left-site for o/down; nullptr if no rotation).
   virtual const Rotation* rot_for(const std::string& tensor_name) = 0;
@@ -482,6 +490,33 @@ struct CpuBackend : public LinearBackend {
     }
     return y;
   }
+  void run_linear_into(const std::string& name,
+                       const std::vector<float>& x,
+                       std::vector<float>& out) override {
+    // Same math as run_linear, but writes into the caller's buffer.
+    // out keeps its capacity across tokens: steady-state zero mallocs.
+    // NOTE: the JIT (!keep_cached) path is unchanged — weights are still
+    // freed after each GEMM; only the OUTPUT allocation is eliminated.
+    auto it = cache_w.find(name);
+    if(it == cache_w.end()){
+      if(!ensure_cached(name)){ std::fprintf(stderr, "cpu: unknown tensor %s\n", name.c_str()); out.clear(); return; }
+      it = cache_w.find(name);
+    }
+    int N = cache_N[name];
+    int K = cache_K[name];
+    const float* W = it->second.data();
+    size_t xn = x.size();
+    if(xn < (size_t)K) K = (int)xn;
+    if(out.size() != (size_t)N) out.assign(N, 0.f);
+    float* yp = out.data();
+    const float* xp = x.data();
+    for(int i=0;i<N;i++){ const float* wr=W+(size_t)i*cache_K[name]; float s=0;
+      for(int k=0;k<K;k++) s+=wr[k]*xp[k]; yp[i]=s; }
+    if(!keep_cached){
+      cache_w.erase(it);
+      cache_R.erase(name);
+    }
+  }
   // Eager models keep every dequantized weight cached (fast); JIT models
   // (27B) free each weight right after its GEMM (RAM-bounded). Set by main().
   bool keep_cached = true;
@@ -607,6 +642,24 @@ struct GpuBackend : public LinearBackend {
     if(L >= 0 && L != cur_layer_){ eng->begin_layer(L); cur_layer_ = L; }
     return eng->run_linear_tp_ret(it->second, x);
   }
+  void run_linear_into(const std::string& name,
+                       const std::vector<float>& x,
+                       std::vector<float>& out) override {
+    if(!eng){ out.clear(); return; }
+    build_index();
+    auto it = ti_cache.find(name);
+    if(it == ti_cache.end()){
+      // Fallback path is rare (tensors missing from .intifer); keep the
+      // allocating impl there and move into out (one alloc, cold path).
+      out = run_linear(name, x);
+      return;
+    }
+    int L = Engine::layer_of_name(name);
+    if(L >= 0 && L != cur_layer_){ eng->begin_layer(L); cur_layer_ = L; }
+    // Engine resizes out only when the size differs: steady-state zero
+    // mallocs on the host output buffer.
+    eng->run_linear_tp(it->second, x, out);
+  }
 
   // Cached lm_head FP16 upload + one-off FP16 GEMM on device.
   // The first call uploads W[N,K] as FP16 to each device; later calls reuse
@@ -720,6 +773,58 @@ struct Layer {
 static std::vector<Layer> layers;
 
 // ============================================================================
+// Step scratch arena (TODO 4a): reusable per-token intermediates.
+// ============================================================================
+// step() used to allocate ~1500 std::vectors per token (GEMM outputs,
+// norm copies, attention/ahead temporaries, logits). The arena holds one
+// named buffer per intermediate, sized once for the model; run_linear_into
+// resizes only when the shape differs, so steady-state decode performs
+// zero mallocs for all of these. RSS cost ~ (a few MB); correctness is
+// unchanged (same write-then-read order, no aliasing between live values).
+struct StepScratch {
+  bool sized = false;
+  // trunk
+  std::vector<float> h, res, normed;
+  // full-attention path
+  std::vector<float> xq, qp, gate, qpart, xk, xv, k, v, attn, scores, o_in, o_raw;
+  // linear-attention path
+  std::vector<float> xqkv, mqkv, conv_out, xz, xb, xa, z, b, a, g, core,
+                     kv_mem, delta, normed_core, o_la;
+  // MLP
+  std::vector<float> rn2, rin, mg, mu, md, mlp_out;
+  // tail
+  std::vector<float> fn, logits;
+  void ensure(int H, int inter, int vocab, int qrows2, int kvrows, int attnrows,
+              int conv, int nvb, int nvrows, int vhd){
+    auto need = [&](std::vector<float>& v, size_t n){
+      if(v.size() != n) v.assign(n, 0.f);
+    };
+    need(h, H); need(res, H); need(normed, H);
+    need(xq, H); need(qp, qrows2); need(gate, attnrows); need(qpart, attnrows);
+    need(xk, H); need(xv, H); need(k, kvrows); need(v, kvrows);
+    need(attn, attnrows);
+    // scores sized lazily per pos below (pos grows monotonically per run).
+    need(o_in, attnrows*2);
+    need(o_raw, H);
+    need(xqkv, H); need(mqkv, conv); need(conv_out, conv);
+    need(xz, H); need(xb, H); need(xa, H);
+    need(z, nvrows); need(b, nvb); need(a, nvb); need(g, nvb);
+    need(core, nvrows); need(kv_mem, vhd); need(delta, vhd);
+    need(normed_core, nvrows); need(o_la, H);
+    need(rn2, H); need(rin, H); need(mg, inter); need(mu, inter);
+    need(md, H); need(mlp_out, H);
+    need(fn, H); need(logits, vocab);
+    sized = true;
+  }
+  // Attention scores scratch: grows monotonically with pos (amortized ~zero).
+  float* scores_for(int pos){
+    if((int)scores.size() < pos+1) scores.assign(pos+1, 0.f);
+    return scores.data();
+  }
+};
+static StepScratch g_scratch;
+
+// ============================================================================
 // Forward step
 // ============================================================================
 struct StepOut { int best; std::vector<float> logits; };
@@ -757,7 +862,15 @@ static StepOut step(int token, int pos,
     }
   };
   const float* row = embed + (size_t)token*cfg.H;
-  std::vector<float> h(row, row+cfg.H);
+  // Scratch arena: sized once per model dims; all intermediates below reuse
+  // these buffers (run_linear_into resizes only on shape change).
+  if(!g_scratch.sized)
+    g_scratch.ensure(cfg.H, cfg.inter, cfg.vocab,
+                     2*cfg.n_heads*cfg.head_dim, cfg.n_kv*cfg.head_dim,
+                     cfg.n_heads*cfg.head_dim, cfg.conv_dim, cfg.n_v_heads,
+                     cfg.n_v_heads*cfg.v_head_dim, cfg.v_head_dim);
+  std::vector<float>& h = g_scratch.h;
+  for(int i=0;i<cfg.H;i++) h[i] = row[i];
 
   // Per-layer HF-tensor name prefix
   auto name = [&](int L, const char* slot){
@@ -775,16 +888,19 @@ static StepOut step(int token, int pos,
    if((L & 15) == 0){ std::fprintf(stderr, "[intfer] forward L=%d/%d pos=%d hsize=%zu layers=%zu\n", L, cfg.layers, pos, h.size(), layers.size()); std::fflush(stderr); }
    if(L < 0 || (size_t)L >= layers.size()){ std::fprintf(stderr, "[intfer] FATAL layer OOB\n"); std::exit(1); }
    Layer& ly = layers[L];
-   std::vector<float> res = h;
-   std::vector<float> normed(cfg.H);
+   std::vector<float>& res = g_scratch.res;
+   for(int i=0;i<cfg.H;i++) res[i] = h[i];
+   std::vector<float>& normed = g_scratch.normed;
    rmsnorm(h.data(), ly.in_ln, normed.data(), cfg.H);
    ckpt_h(L, normed, "post_in_ln");
   if(ly.is_full){
       // ---- Attention path (q/k/v right-site; o left-site) ----
       const Rotation* Rq = backend->rot_for(name(L, "self_attn.q_proj.weight"));
-      std::vector<float> xq(normed);
+      std::vector<float>& xq = g_scratch.xq;
+      for(int i=0;i<cfg.H;i++) xq[i] = normed[i];
       if(Rq) rot_apply(normed.data(), *Rq, xq.data());
-      std::vector<float> qp = backend->run_linear(name(L, "self_attn.q_proj.weight"), xq);
+      std::vector<float>& qp = g_scratch.qp;
+      backend->run_linear_into(name(L, "self_attn.q_proj.weight"), xq, qp);
       ckpt("attn.q_proj", L, qp);
       // q/gate split. Both known models pack q+gate per-head interleaved:
       // rows = 2*n_heads*head_dim (0.8B: 2*8*256=4096; 27B: 2*24*256=12288;
@@ -799,7 +915,9 @@ static StepOut step(int token, int pos,
                      L, qp.size(), qrows);
         std::exit(1);
       }
-      std::vector<float> gate(cfg.n_heads*cfg.head_dim, 0.f), qpart(cfg.n_heads*cfg.head_dim);
+      std::vector<float>& gate = g_scratch.gate;
+      std::vector<float>& qpart = g_scratch.qpart;
+      for(size_t i=0;i<qrows;i++){ gate[i] = 0.f; }
       if(packed_gate){
         for(int hh=0; hh<cfg.n_heads; hh++) for(int d=0; d<cfg.head_dim; d++){
           qpart[hh*cfg.head_dim+d] = qp[hh*2*cfg.head_dim+d];
@@ -815,11 +933,15 @@ static StepOut step(int token, int pos,
       }
       const Rotation* Rk = backend->rot_for(name(L, "self_attn.k_proj.weight"));
       const Rotation* Rv = backend->rot_for(name(L, "self_attn.v_proj.weight"));
-      std::vector<float> xk(normed), xv(normed);
+      std::vector<float>& xk = g_scratch.xk;
+      std::vector<float>& xv = g_scratch.xv;
+      for(int i=0;i<cfg.H;i++){ xk[i] = normed[i]; xv[i] = normed[i]; }
       if(Rk) rot_apply(normed.data(), *Rk, xk.data());
       if(Rv) rot_apply(normed.data(), *Rv, xv.data());
-      std::vector<float> k = backend->run_linear(name(L, "self_attn.k_proj.weight"), xk);
-      std::vector<float> v = backend->run_linear(name(L, "self_attn.v_proj.weight"), xv);
+      std::vector<float>& k = g_scratch.k;
+      std::vector<float>& v = g_scratch.v;
+      backend->run_linear_into(name(L, "self_attn.k_proj.weight"), xk, k);
+      backend->run_linear_into(name(L, "self_attn.v_proj.weight"), xv, v);
       ckpt("attn.k_proj", L, k); ckpt("attn.v_proj", L, v);
       for(int hh=0; hh<cfg.n_kv; hh++){
         float tmp[cfg.head_dim]; rmsnorm(&k[hh*cfg.head_dim], ly.k_norm_w, tmp, cfg.head_dim);
@@ -850,10 +972,11 @@ static StepOut step(int token, int pos,
       // Attention compute (host, since the SSM/attn kernel is a 1-token
       // decode and the TP shard of K/V is small — see `qwen_forward_gpu`
       // for the FlashAttention integration on the 1st device).
-      std::vector<float> attn(cfg.n_heads*cfg.head_dim, 0.f);
+      std::vector<float>& attn = g_scratch.attn;
+      for(int i=0;i<cfg.n_heads*cfg.head_dim;i++) attn[i] = 0.f;
       for(int hh=0; hh<cfg.n_heads; hh++){
         int kvh=hh/(cfg.n_heads/cfg.n_kv);
-        std::vector<float> scores(pos+1); float mx=-1e30f;
+        float* scores = g_scratch.scores_for(pos); float mx=-1e30f;
         for(int t=0;t<=pos;t++){
           const float* qh=&qpart[hh*cfg.head_dim];
           const float* kh=&ly.kcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
@@ -873,20 +996,23 @@ static StepOut step(int token, int pos,
       // o_proj contracts attn (packed-gate layout, both known models).
       // The !packed_gate fallback feeds attn concat gate; run_linear
       // contracts min(x.size(), K) so both widths are safe.
-      std::vector<float> o_raw;
+      std::vector<float>& o_raw = g_scratch.o_raw;
       {
         size_t attn_n = (size_t)cfg.n_heads * cfg.head_dim;
         // Peek at the IR weight size without caching: run_linear derives K
         // from the stored N/K; instead probe via a zero probe is wasteful,
         // so infer from q layout: unpacked-gate models need attn+gate input.
-        std::vector<float> o_in;
+        // o_in is scratch; the !packed_gate branch copies attn+gate into it,
+        // the packed branch passes attn directly (same as old `o_in = attn`
+        // copy, minus the allocation).
+        const std::vector<float>* o_x = &attn;
+        std::vector<float>& o_in = g_scratch.o_in;
         if(!packed_gate){
-          o_in.resize(attn_n + attn_n);
+          if(o_in.size() < attn_n + attn_n) o_in.assign(attn_n + attn_n, 0.f);
           for(size_t i=0;i<attn_n;i++){ o_in[i]=attn[i]; o_in[attn_n+i]=gate[i]; }
-        } else {
-          o_in = attn;
+          o_x = &o_in;
         }
-        o_raw = backend->run_linear(name(L, "self_attn.o_proj.weight"), o_in);
+        backend->run_linear_into(name(L, "self_attn.o_proj.weight"), *o_x, o_raw);
         ckpt("attn.o_proj", L, o_raw);
         // If the backend used the packed width (K=n_heads*hd) the extra gate
         // tail is ignored by the GEMM (x longer than K); if it used the wide
@@ -895,7 +1021,7 @@ static StepOut step(int token, int pos,
       }
       const Rotation* Ro = backend->rot_for(name(L, "self_attn.o_proj.weight"));
       if(Ro) rot_left(o_raw.data(), *Ro, h.data());
-      else h = o_raw;
+      else for(int i=0;i<cfg.H;i++) h[i] = o_raw[i];
     } else {
       // ---- Linear-attention / SSM path (uses .intifer quantized weights) ----
       const float* conv_w = get(name(L,"linear_attn.conv1d.weight")).data();
@@ -909,11 +1035,13 @@ static StepOut step(int token, int pos,
       // The LA branch previously skipped both replays, feeding raw normed
       // into rotated-quantized weights (27B: L0 out 0.1781 vs HF -0.0240).
         const Rotation* Rqkv = backend->rot_for(name(L,"linear_attn.in_proj_qkv.weight"));
-        std::vector<float> xqkv(normed);
+        std::vector<float>& xqkv = g_scratch.xqkv;
+        for(int i=0;i<cfg.H;i++) xqkv[i] = normed[i];
         if(Rqkv) rot_apply(normed.data(), *Rqkv, xqkv.data());
-        std::vector<float> mqkv = backend->run_linear(name(L,"linear_attn.in_proj_qkv.weight"), xqkv);
+        std::vector<float>& mqkv = g_scratch.mqkv;
+        backend->run_linear_into(name(L,"linear_attn.in_proj_qkv.weight"), xqkv, mqkv);
         ckpt("la.qkv", L, mqkv);
-        std::vector<float> conv_out(cfg.conv_dim);
+        std::vector<float>& conv_out = g_scratch.conv_out;
       for(int c=0;c<cfg.conv_dim;c++){
         float s=0;
         s+=conv_w[c*cfg.conv_k+0]*ly.conv_state[c*3+0];
@@ -931,19 +1059,26 @@ static StepOut step(int token, int pos,
         const Rotation* Rz = backend->rot_for(name(L,"linear_attn.in_proj_z.weight"));
         const Rotation* Rb = backend->rot_for(name(L,"linear_attn.in_proj_b.weight"));
         const Rotation* Ra = backend->rot_for(name(L,"linear_attn.in_proj_a.weight"));
-        std::vector<float> xz(normed), xb(normed), xa(normed);
+        std::vector<float>& xz = g_scratch.xz;
+        std::vector<float>& xb = g_scratch.xb;
+        std::vector<float>& xa = g_scratch.xa;
+        for(int i=0;i<cfg.H;i++){ xz[i] = normed[i]; xb[i] = normed[i]; xa[i] = normed[i]; }
         if(Rz) rot_apply(normed.data(), *Rz, xz.data());
         if(Rb) rot_apply(normed.data(), *Rb, xb.data());
         if(Ra) rot_apply(normed.data(), *Ra, xa.data());
-        std::vector<float> z = backend->run_linear(name(L,"linear_attn.in_proj_z.weight"), xz);
-        std::vector<float> b = backend->run_linear(name(L,"linear_attn.in_proj_b.weight"), xb);
-        std::vector<float> a = backend->run_linear(name(L,"linear_attn.in_proj_a.weight"), xa);
+        std::vector<float>& z = g_scratch.z;
+        std::vector<float>& b = g_scratch.b;
+        std::vector<float>& a = g_scratch.a;
+        backend->run_linear_into(name(L,"linear_attn.in_proj_z.weight"), xz, z);
+        backend->run_linear_into(name(L,"linear_attn.in_proj_b.weight"), xb, b);
+        backend->run_linear_into(name(L,"linear_attn.in_proj_a.weight"), xa, a);
         ckpt("la.z", L, z); ckpt("la.b", L, b); ckpt("la.a", L, a);
-          std::vector<float> g(cfg.n_v_heads);
+        std::vector<float>& g = g_scratch.g;
       for(int hh=0; hh<cfg.n_v_heads; hh++){
         float sp=log1pf(expf(a[hh]+dt_bias[hh])); g[hh]=-expf(A_log[hh])*sp;
       }
-        std::vector<float> core(cfg.n_v_heads*cfg.v_head_dim,0.f);
+        std::vector<float>& core = g_scratch.core;
+        for(int i=0;i<cfg.n_v_heads*cfg.v_head_dim;i++) core[i] = 0.f;
       float qn[cfg.k_head_dim], kn[cfg.k_head_dim];
         // HF Qwen3NextGatedDeltaNet.fix_query_key_value_ordering: the conv
         // output holds num_k_heads query/key heads but num_v_heads value
@@ -961,10 +1096,13 @@ static StepOut step(int token, int pos,
         float g_t=expf(g[hh]); float beta=sigmoidf(b[hh]);
         float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
         for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
-        std::vector<float> kv_mem(cfg.v_head_dim,0.f);
+        // kv_mem/delta are per-head scratch (reused across heads).
+        std::vector<float>& kv_mem = g_scratch.kv_mem;
+        std::vector<float>& delta = g_scratch.delta;
+        for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
         for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
-        std::vector<float> delta(cfg.v_head_dim); const float* vh=&value[hh*cfg.v_head_dim];
-        for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta;
+        { const float* vh=&value[hh*cfg.v_head_dim];
+        for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
         for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
         for(int c=0;c<cfg.v_head_dim;c++){
           float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
@@ -972,7 +1110,7 @@ static StepOut step(int token, int pos,
         }
       }
         const float* ssm_norm_w = get(name(L,"linear_attn.norm.weight")).data();
-      std::vector<float> normed_core(cfg.n_v_heads*cfg.v_head_dim);
+      std::vector<float>& normed_core = g_scratch.normed_core;
       for(int hh=0; hh<cfg.n_v_heads; hh++){
         const float* x=&core[hh*cfg.v_head_dim];
         const float* zg=&z[hh*cfg.v_head_dim];
@@ -981,12 +1119,14 @@ static StepOut step(int token, int pos,
         float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
         for(int i=0;i<cfg.v_head_dim;i++) o[i]=(x[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
       }
-      std::vector<float> o_la = backend->run_linear(name(L,"linear_attn.out_proj.weight"), normed_core);
+      std::vector<float>& o_la = g_scratch.o_la;
+      backend->run_linear_into(name(L,"linear_attn.out_proj.weight"), normed_core, o_la);
       const Rotation* Ro_la = backend->rot_for(name(L,"linear_attn.out_proj.weight"));
-      if(Ro_la){ h.assign(cfg.H, 0.f); rot_left(o_la.data(), *Ro_la, h.data()); }
-      else h = std::move(o_la);
+      if(Ro_la){ for(int i=0;i<cfg.H;i++) h[i] = 0.f; rot_left(o_la.data(), *Ro_la, h.data()); }
+      else for(int i=0;i<cfg.H;i++) h[i] = o_la[i];
       ckpt("la.out", L, h);
   if(trace_h && pos==0 && (L==0 || L==3)){
+    // Debug-only path: keep allocating impl (cold, gated by env flag).
     std::vector<float> pmqkv = backend->run_linear(name(L,"linear_attn.in_proj_qkv.weight"), xqkv);
     std::vector<float> pz = backend->run_linear(name(L,"linear_attn.in_proj_z.weight"), xz);
     std::vector<float> pa = backend->run_linear(name(L,"linear_attn.in_proj_a.weight"), xa);
@@ -1002,17 +1142,21 @@ static StepOut step(int token, int pos,
     ckpt("h.post_attn", L, h);
     ckpt_h(L, h, "post_attn");
     // ---- MLP (gate/up right-site; down left-site) ----
-    std::vector<float> rn2(cfg.H);
+    std::vector<float>& rn2 = g_scratch.rn2;
     rmsnorm(h.data(), ly.post_ln, rn2.data(), cfg.H);
     const Rotation* Rg = backend->rot_for(name(L, "mlp.gate_proj.weight"));
-    std::vector<float> rin(rn2);
+    std::vector<float>& rin = g_scratch.rin;
+    for(int i=0;i<cfg.H;i++) rin[i] = rn2[i];
     if(Rg) rot_apply(rn2.data(), *Rg, rin.data());
-    std::vector<float> mg = backend->run_linear(name(L, "mlp.gate_proj.weight"), rin);
+    std::vector<float>& mg = g_scratch.mg;
+    backend->run_linear_into(name(L, "mlp.gate_proj.weight"), rin, mg);
     ckpt("mlp.gate", L, mg);
-    std::vector<float> mu = backend->run_linear(name(L, "mlp.up_proj.weight"),   rin);
+    std::vector<float>& mu = g_scratch.mu;
+    backend->run_linear_into(name(L, "mlp.up_proj.weight"),   rin, mu);
     ckpt("mlp.up", L, mu);
     for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
-    std::vector<float> md = backend->run_linear(name(L, "mlp.down_proj.weight"), mg);
+    std::vector<float>& md = g_scratch.md;
+    backend->run_linear_into(name(L, "mlp.down_proj.weight"), mg, md);
     ckpt("mlp.down", L, md);
     const Rotation* Rd = backend->rot_for(name(L, "mlp.down_proj.weight"));
     if(trace_h && pos==0 && L==0){
@@ -1022,9 +1166,9 @@ static StepOut step(int token, int pos,
                    md[0], md[1], md[2], md[3], (const void*)Rg, (const void*)Rd);
       std::fflush(stderr);
     }
-    std::vector<float> mlp_out(cfg.H);
+    std::vector<float>& mlp_out = g_scratch.mlp_out;
     if(Rd) rot_left(md.data(), *Rd, mlp_out.data());
-    else mlp_out = md;
+    else for(int i=0;i<cfg.H;i++) mlp_out[i] = md[i];
     for(int i=0;i<cfg.H;i++) h[i] = h[i] + mlp_out[i];
     ckpt("h.post_mlp", L, h);
     ckpt_h(L, h, "post_mlp");
@@ -1040,7 +1184,8 @@ static StepOut step(int token, int pos,
   // Final norm + lm_head + greedy argmax. Untied models (27B,
   // tie_word_embeddings=false) use the separate lm_head.weight rows;
   // tied models (0.8B) reuse the embed rows.
-  std::vector<float> fn(cfg.H); rmsnorm(h.data(), final_norm, fn.data(), cfg.H);
+  std::vector<float>& fn = g_scratch.fn;
+  rmsnorm(h.data(), final_norm, fn.data(), cfg.H);
 #ifdef QP_PROBE_SIZES
   if(pos==0 || pos==5){
     std::fprintf(stderr, "[dbg] L23? pos=%d h[:4]=%.4f %.4f %.4f %.4f fn[:4]=%.4f %.4f %.4f %.4f\n",
@@ -1048,7 +1193,10 @@ static StepOut step(int token, int pos,
     std::fflush(stderr);
   }
 #endif
-  std::vector<float> logits(cfg.vocab, 0.f);
+  // logits live in scratch; the GPU lm_head path writes into them directly,
+  // the CPU path fills them in place. out.logits keeps one copy (1 alloc +
+  // 1MB memcpy per token — negligible vs the ~1500 allocs eliminated).
+  std::vector<float>& logits = g_scratch.logits;
   int best=-1; float bestv=-1e30f;
   const float* head = lm_head ? lm_head : embed;
   std::fprintf(stderr, "[intfer] logits: vocab=%d H=%d head=%p\n", cfg.vocab, cfg.H, (const void*)head);
@@ -1062,7 +1210,8 @@ static StepOut step(int token, int pos,
       // bottleneck per profiling: kernels were 10.6% of decode).
       // The embed table uploads once via the backend's (N,K)-keyed cache.
       const float* W = lm_head ? lm_head : embed;
-      logits = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+      std::vector<float> lm = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+      if((int)lm.size() == cfg.vocab) for(int i=0;i<cfg.vocab;i++) logits[i] = lm[i];
     }else{
       for(int v=0; v<cfg.vocab; v++){
         const float* er = head + (size_t)v*cfg.H;
@@ -1086,7 +1235,7 @@ static StepOut step(int token, int pos,
     }
   }
   out.best = best;
-  out.logits = std::move(logits);
+  out.logits = logits; // one copy out of scratch (see note above)
   return out;
 }
 
@@ -1120,7 +1269,9 @@ static int sample(const std::vector<float>& logits, int top_k, float top_p,
   if(temperature <= 0.f) temperature = 1e-5f;
   float mx = -1e30f;
   for(float v : logits) if(v>mx) mx=v;
-  std::vector<float> probs(logits.size());
+  // Reused across calls (single-threaded CLI); sized to vocab once.
+  static std::vector<float> probs;
+  if(probs.size() != logits.size()) probs.assign(logits.size(), 0.f);
   float sum = 0.f;
   for(size_t i=0;i<logits.size();i++){
     probs[i] = expf((logits[i]-mx)/temperature);

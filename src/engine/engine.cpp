@@ -421,10 +421,12 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   const auto& sc = shard_cache_[tensor_index];
  
   // Pre-convert FP32 activation to FP16 once (shared by all devices).
+  // Staging buffer is reused across calls (resize only on shape growth).
 #ifdef INTFER_PROFILE_GPU
   auto t_copy0 = std::chrono::high_resolution_clock::now();
 #endif
-  std::vector<std::uint16_t> act_fp16((size_t)M * t.K);
+  if (act_staging_.size() != (size_t)M * t.K) act_staging_.resize((size_t)M * t.K);
+  std::vector<std::uint16_t>& act_fp16 = act_staging_;
   for (uint32_t m = 0; m < M; ++m)
     for (uint32_t k = 0; k < t.K; ++k)
       act_fp16[(size_t)m * t.K + k] = dashq::float_to_half(x[(size_t)m * t.K + k]);

@@ -165,6 +165,9 @@ class Engine {
   };
   std::vector<CachedShard> shard_cache_;
   bool ensure_shard_built(int tensor_index);
+  // Reusable FP16 activation staging for run_linear_tp (M*K). Resized only
+  // when the shape grows: steady-state zero mallocs per GEMM call.
+  std::vector<std::uint16_t> act_staging_;
   // Per-layer tensor index lists, built by build_shards() from tensor names.
   // layer_tensors_[L] = indices of "...layers.<L>..." tensors; layer_of_[i]
   // mirrors it per tensor index (-1 = unlayered: lm_head, norms, ...).
