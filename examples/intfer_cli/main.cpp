@@ -639,24 +639,34 @@ struct GpuBackend : public LinearBackend {
                    N, K, lm_head_N_, lm_head_K_);
       return {};
     }
-    // Upload activation as FP16 and run GEMM.
+    // Upload activation as FP16 and run GEMM. Read back halves and
+    // convert on the host (device buffer holds N halves, not N floats).
+    // x_dev frees are deferred until after the kernel events complete
+    // (sycl::free acts on the host immediately; freeing in-loop is a
+    // use-after-free race against the not-yet-run kernel).
     std::vector<sycl::half> x_fp16(K);
     for(uint32_t i=0;i<K;i++) x_fp16[i] = sycl::half(fn[i]);
     std::vector<float> out(N, 0.f);
+    std::vector<sycl::half> out_h(N);
     std::vector<sycl::event> evts;
     evts.reserve(eng->num_devices());
+    std::vector<sycl::half*> x_devs;
+    x_devs.reserve(eng->num_devices());
     for(size_t d=0; d<eng->num_devices(); ++d){
       sycl::queue& q = eng->device_queue((int)d);
       sycl::half* x_dev = static_cast<sycl::half*>(
           sycl::malloc_device((size_t)K * sizeof(sycl::half), q.get_device(), q.get_context()));
+      x_devs.push_back(x_dev);
       q.memcpy(x_dev, x_fp16.data(), (size_t)K * sizeof(sycl::half));
       sycl::event evt = gemm::quant_gemm_f16(q, x_dev, lm_head_w_dev_[d],
                                              lm_head_c_dev_[d], 1, N, K);
-      q.memcpy(out.data(), lm_head_c_dev_[d], (size_t)N * sizeof(float), evt);
+      q.memcpy(out_h.data(), lm_head_c_dev_[d], (size_t)N * sizeof(sycl::half), evt);
       evts.push_back(evt);
-      sycl::free(x_dev, q);
     }
     for(auto& e : evts) e.wait();
+    for(size_t d=0; d<eng->num_devices(); ++d)
+      sycl::free(x_devs[d], eng->device_queue((int)d));
+    for(uint32_t i=0;i<N;i++) out[i] = static_cast<float>(out_h[i]);
     return out;
   }
 
@@ -1039,7 +1049,8 @@ static StepOut step(int token, int pos,
       if(s>bestv){ bestv=s; best=v; }
     }
   }
-  if(lm_head==nullptr || !backend || dynamic_cast<CpuBackend*>(backend)){
+  if(lm_head==nullptr || !backend || dynamic_cast<CpuBackend*>(backend) ||
+     dynamic_cast<GpuBackend*>(backend)){
     for(int v=0; v<cfg.vocab; v++){
       if(logits[v]>bestv){ bestv=logits[v]; best=v; }
     }
@@ -1224,6 +1235,7 @@ int main(int argc, char** argv){
     else                                                detok_py = "/var/home/fra/dev/intfer/scripts/bpe_detokenize.py";
   }
   int max_new = 64;
+  int decode_batch = 1;  // 1 = single-token decode (default), >1 = batch M tokens
   float temperature = 0.0f;
   int top_k = 0;
   float top_p = 0.0f;
@@ -1239,6 +1251,7 @@ int main(int argc, char** argv){
     else if(a=="-p" && i+1<argc) prompt = argv[++i];
     else if(a=="-P" && i+1<argc) prompt_file = argv[++i];
     else if(a=="-n" && i+1<argc) max_new = std::atoi(argv[++i]);
+    else if(a=="--decode-batch" && i+1<argc) decode_batch = std::atoi(argv[++i]);
     else if(a=="-t" && i+1<argc) temperature = std::atof(argv[++i]);
     else if(a=="-k" && i+1<argc) top_k = std::atoi(argv[++i]);
     else if(a=="-T" && i+1<argc) top_p = std::atof(argv[++i]);

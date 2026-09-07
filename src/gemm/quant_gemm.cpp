@@ -633,7 +633,7 @@ sycl::event quant_gemm_f16(sycl::queue& q,
           const int mg = bm * kBM + ty * kSub + i;
           const int ng = bn * kBN + tx * kSub + j;
           if (mg < static_cast<int>(M) && ng < static_cast<int>(N))
-            c[mg * N + ng] = to_half_bits(acc[i * kSub + j]);
+            c[mg * N + ng] = sycl::bit_cast<sycl::half>(to_half_bits(acc[i * kSub + j]));
         }
     });
   });
