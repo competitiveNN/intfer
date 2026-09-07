@@ -636,11 +636,11 @@ static StepOut step(int token, int pos,
   // Hidden-state probe (INTFER_TRACE_H=1): print |h| + h[:4] after each
   // layer's MLP at pos 0 so CPU vs GPU runs can be diffed per layer.
   static const bool trace_h = (std::getenv("INTFER_TRACE_H") != nullptr);
-  auto ckpt_h = [&](int L, const std::vector<float>& v){
+  auto ckpt_h = [&](int L, const std::vector<float>& v, const char* tag){
     if(trace_h && pos==0){
       double n2=0; for(float x : v) n2+=(double)x*x;
-      std::fprintf(stderr, "[h] L=%d |h|=%.6f h[:4]=%.6f %.6f %.6f %.6f\n",
-                   L, sqrt(n2), v[0], v[1], v[2], v[3]);
+      std::fprintf(stderr, "[h] L=%d %s |h|=%.6f h[:4]=%.6f %.6f %.6f %.6f\n",
+                   L, tag, sqrt(n2), v[0], v[1], v[2], v[3]);
       std::fflush(stderr);
     }
   };
@@ -678,6 +678,7 @@ static StepOut step(int token, int pos,
    std::vector<float> res = h;
    std::vector<float> normed(cfg.H);
    rmsnorm(h.data(), ly.in_ln, normed.data(), cfg.H);
+   ckpt_h(L, normed, "post_in_ln");
   if(ly.is_full){
       // ---- Attention path (q/k/v right-site; o left-site) ----
       const Rotation* Rq = backend->rot_for(name(L, "self_attn.q_proj.weight"));
@@ -882,6 +883,7 @@ static StepOut step(int token, int pos,
       }
     for(int i=0;i<cfg.H;i++) h[i] += res[i];
     ckpt("h.post_attn", L, h);
+    ckpt_h(L, h, "post_attn");
     // ---- MLP (gate/up right-site; down left-site) ----
     std::vector<float> rn2(cfg.H);
     rmsnorm(h.data(), ly.post_ln, rn2.data(), cfg.H);
@@ -908,7 +910,7 @@ static StepOut step(int token, int pos,
     else mlp_out = md;
     for(int i=0;i<cfg.H;i++) h[i] = h[i] + mlp_out[i];
     ckpt("h.post_mlp", L, h);
-    ckpt_h(L, h);
+    ckpt_h(L, h, "post_mlp");
     if(record){
       if(pos < 0 || (size_t)pos >= dump[L].size()/cfg.H){
         std::fprintf(stderr, "[intfer] FATAL L=%d dump OOB: pos=%d cap=%zu\n",
