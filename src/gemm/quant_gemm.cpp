@@ -375,9 +375,14 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       });
     }
 
-    // Vectorized M=1 variant: load 8 activations at a time to halve LSU
-    // pressure while keeping weight dequant scalar.
+    // Vectorized M=1 variant: group-outer loop hoists the per-group scale
+    // (was recomputed per K element), vector LSU loads for activations and
+    // INT8 codes, and constant-trip-count inner loops so the compiler can
+    // unroll/interleave the dequant+MAC chains. Same numerics as scalar path.
     if (bits < 16) {
+      const int num_groups = (static_cast<int>(K) + Gw - 1) / Gw;
+      const bool is_int8 = (bits >= 8);
+      const int pack = is_int8 ? 1 : 8 / bits;
       return q.submit([&](sycl::handler& h) {
         h.depends_on(copy_dep);
         h.parallel_for<class gemm_usm_decode1_vec>(
@@ -387,36 +392,77 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
               if (ng >= N) return;
 
               float acc = 0.0f;
-              const int ng_g = ng * num_groups_w;
-              const std::uint16_t* sptr = scale_usm + ng_g;
+              const std::uint16_t* sptr = scale_usm + ng * num_groups_w;
+              const std::uint8_t* wrow =
+                  code_u8 + static_cast<std::size_t>(ng) * K;
+              sycl::multi_ptr<const std::uint16_t,
+                  sycl::access::address_space::global_space> act_mp(act_usm);
+              sycl::multi_ptr<const std::uint8_t,
+                  sycl::access::address_space::global_space> w_mp(wrow);
 
-              for (int bk = 0; bk < nk_blocks; ++bk) {
-                const int kg_base = bk * kBK;
-                // Load 8 activations as a vector per K-step.
-                for (int kk = 0; kk < kBK; kk += 8) {
-                  sycl::vec<sycl::half, 8> av8;
-                  for (int j = 0; j < 8; ++j) {
-                    const int kg = kg_base + kk + j;
-                    if (kg >= static_cast<int>(K)) break;
-                    av8[j] = sycl::bit_cast<sycl::half>(act_usm[kg]);
-                  }
-                  for (int j = 0; j < 8; ++j) {
-                    const int kg = kg_base + kk + j;
-                    if (kg >= static_cast<int>(K)) break;
-                    const std::size_t idx = static_cast<std::size_t>(ng) * K + kg;
-                    const int g = kg / Gw;
-                    const float scale = from_half_bits(sptr[g]) * alpha;
-                    int code;
-                    if (bits >= 8) {
-                      code = static_cast<int>(code_u8[idx]);
-                    } else {
-                      const int pack = 8 / bits;
-                      const std::uint8_t b = code_u8[idx / pack];
-                      const int within = static_cast<int>(idx % pack);
-                      code = (b >> (within * bits)) & ((1 << bits) - 1);
+              for (int g = 0; g < num_groups; ++g) {
+                const float scale = from_half_bits(sptr[g]) * alpha;
+                const int kg0 = g * Gw;
+                int kg1 = kg0 + Gw;
+                if (kg1 > static_cast<int>(K)) kg1 = (int)K;
+                if (is_int8) {
+                  int kg = kg0;
+                  for (; kg + 8 <= kg1; kg += 8) {
+                    sycl::vec<std::uint16_t, 8> a16;
+                    a16.load(0, act_mp + kg);
+                    sycl::vec<std::uint8_t, 8> cv;
+                    cv.load(0, w_mp + kg);
+                    for (int j = 0; j < 8; ++j) {
+                      const float av =
+                          static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                      const float wval =
+                          scale * ((2.0f * (float)cv[j] - 255.0f) / 255.0f);
+                      acc += av * wval;
                     }
-                    const float wval = scale * canon_value(bits, code);
-                    acc += static_cast<float>(av8[j]) * wval;
+                  }
+                  for (; kg < kg1; ++kg) {
+                    const float av = from_half_bits(act_usm[kg]);
+                    const float wval =
+                        scale * ((2.0f * (float)wrow[kg] - 255.0f) / 255.0f);
+                    acc += av * wval;
+                  }
+                } else {
+                  // Packed codes (INT4/INT2): 8-code chunks; byte index and
+                  // bit position derive from j with shifts (no div/mod).
+                  const int codes_per_chunk = 8;
+                  const int bytes_per_chunk = codes_per_chunk / pack;
+                  const int code_mask = (1 << bits) - 1;
+                  const std::size_t row_base =
+                      static_cast<std::size_t>(ng) * K;
+                  const int shr = (bits == 4) ? 1 : 2;  // j -> byte index
+                  int kg = kg0;
+                  std::size_t b0 =
+                      (row_base + (std::size_t)kg) / (std::size_t)pack;
+                  for (; kg + codes_per_chunk <= kg1;
+                       kg += codes_per_chunk) {
+                    sycl::vec<std::uint16_t, 8> a16;
+                    a16.load(0, act_mp + kg);
+                    std::uint8_t b[4];
+                    for (int t = 0; t < bytes_per_chunk; ++t)
+                      b[t] = code_u8[b0 + t];
+                    b0 += bytes_per_chunk;
+                    for (int j = 0; j < codes_per_chunk; ++j) {
+                      const float av =
+                          static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                      const int code =
+                          (b[j >> shr] >> ((j & (pack - 1)) * bits)) &
+                          code_mask;
+                      acc += av * scale * canon_value(bits, code);
+                    }
+                  }
+                  for (; kg < kg1; ++kg) {
+                    const float av = from_half_bits(act_usm[kg]);
+                    const std::size_t idx = row_base + kg;
+                    const std::uint8_t byte = code_u8[idx / pack];
+                    const int within = (int)(idx % pack);
+                    const int code =
+                        (byte >> (within * bits)) & ((1 << bits) - 1);
+                    acc += av * scale * canon_value(bits, code);
                   }
                 }
               }
