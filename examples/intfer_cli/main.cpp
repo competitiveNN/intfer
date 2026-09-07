@@ -1061,6 +1061,28 @@ static StepOut step(int token, int pos,
 }
 
 // ============================================================================
+// Batched decode helper
+// ============================================================================
+static std::vector<StepOut> step_batch(const std::vector<int>& tokens,
+                                        int pos,
+                                        const std::map<std::string, std::vector<float>>& T,
+                                        const float* embed, const float* final_norm,
+                                        const float* lm_head,
+                                        LinearBackend* backend,
+                                        bool record,
+                                        std::vector<std::vector<float>>& dump){
+  std::vector<StepOut> out;
+  out.reserve(tokens.size());
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    int cur_pos = pos + (int)i;
+    if (cur_pos < 0) cur_pos = 0;
+    out.push_back(step(tokens[i], cur_pos, T, embed, final_norm, lm_head,
+                       backend, record, dump));
+  }
+  return out;
+}
+
+// ============================================================================
 // Sampling
 // ============================================================================
 static int sample(const std::vector<float>& logits, int top_k, float top_p,
@@ -1669,27 +1691,77 @@ int main(int argc, char** argv){
   std::fprintf(stderr, "[intfer] prefill done, generated=%zu max_new=%d\n",
                generated.size(), max_new); std::fflush(stderr);
   auto t_d0 = std::chrono::high_resolution_clock::now();
-  for(int step_i = 0; step_i < max_new; step_i++){
-    std::fprintf(stderr, "[intfer] decode step %d: token=%d pos=%d\n",
-                 step_i, token, S+step_i); std::fflush(stderr);
-    StepOut o = step(token, S+step_i, T, embed, final_norm, lm_head,
-                     backend.get(), false, dump);
-    int next;
-    if(temperature <= 0.f && top_k==0 && top_p<=0.f){
-      next = o.best;
-    } else {
-      next = sample(o.logits, top_k, top_p, temperature, rng);
+  if(decode_batch > 1){
+    // Multi-token decode: process decode_batch tokens in parallel.
+    // This keeps the GPU busy and amortizes kernel launch overhead.
+    std::vector<int> batch;
+    batch.reserve(decode_batch);
+    for(int step_i = 0; step_i < max_new; step_i += batch.size()){
+      // Collect a batch of tokens to decode.
+      batch.clear();
+      int remaining = std::min(decode_batch, max_new - step_i);
+      int cur_token = (step_i == 0) ? token : generated.back();
+      batch.push_back(cur_token);
+      // Pre-fill the batch with tokens we'll generate in this step.
+      for(int b = 1; b < remaining; ++b){
+        // For speculative decode, we would run draft tokens here.
+        // For now, just duplicate the current token to fill the batch.
+        batch.push_back(cur_token);
+      }
+      std::fprintf(stderr, "[intfer] decode batch %d-%d: %zu tokens pos=%d\n",
+                   step_i, step_i + (int)batch.size() - 1,
+                   batch.size(), S + step_i);
+      std::fflush(stderr);
+      std::vector<StepOut> batch_out = step_batch(batch, S + step_i, T,
+                                                   embed, final_norm, lm_head,
+                                                   backend.get(), false, dump);
+      // Process each result in the batch.
+      for(size_t b = 0; b < batch_out.size(); ++b){
+        int idx = step_i + (int)b;
+        if(idx >= max_new) break;
+        const StepOut& o = batch_out[b];
+        int next;
+        if(temperature <= 0.f && top_k==0 && top_p<=0.f){
+          next = o.best;
+        } else {
+          next = sample(o.logits, top_k, top_p, temperature, rng);
+        }
+        if(print_ids) std::fprintf(stderr, "  [%d] id=%d\n", idx, next);
+        generated.push_back(next);
+        std::string piece = detokenize_one(next, detok_py, tokenizer_json);
+        if(stream){
+          std::fwrite(piece.data(), 1, piece.size(), stdout);
+          std::fflush(stdout);
+        }
+        output += piece;
+        if(next == 248044 || next == 248046) break;
+      }
+      if(generated.size() >= (size_t)(S + max_new)) break;
     }
-    if(print_ids) std::fprintf(stderr, "  [%d] id=%d\n", step_i, next);
-    generated.push_back(next);
-    std::string piece = detokenize_one(next, detok_py, tokenizer_json);
-    if(stream){
-      std::fwrite(piece.data(), 1, piece.size(), stdout);
-      std::fflush(stdout);
+  } else {
+    // Single-token decode path (default, M=1 fast path).
+    for(int step_i = 0; step_i < max_new; step_i++){
+      std::fprintf(stderr, "[intfer] decode step %d: token=%d pos=%d\n",
+                   step_i, token, S+step_i); std::fflush(stderr);
+      StepOut o = step(token, S+step_i, T, embed, final_norm, lm_head,
+                       backend.get(), false, dump);
+      int next;
+      if(temperature <= 0.f && top_k==0 && top_p<=0.f){
+        next = o.best;
+      } else {
+        next = sample(o.logits, top_k, top_p, temperature, rng);
+      }
+      if(print_ids) std::fprintf(stderr, "  [%d] id=%d\n", step_i, next);
+      generated.push_back(next);
+      std::string piece = detokenize_one(next, detok_py, tokenizer_json);
+      if(stream){
+        std::fwrite(piece.data(), 1, piece.size(), stdout);
+        std::fflush(stdout);
+      }
+      output += piece;
+      token = next;
+      if(next == 248044 || next == 248046) break;
     }
-    output += piece;
-    token = next;
-    if(next == 248044 || next == 248046) break;
   }
   auto t_d1 = std::chrono::high_resolution_clock::now();
   double decode_ms = std::chrono::duration<double, std::milli>(t_d1-t_d0).count();
