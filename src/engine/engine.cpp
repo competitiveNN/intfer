@@ -461,6 +461,37 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   void reset_gpu_profile() { g_gpu_profile = GpuProfile{}; }
 #endif
 
+void Engine::run_linear_f16_tp(const sycl::half* x, const sycl::half* w,
+                               float* out, uint32_t N, uint32_t K,
+                               const sycl::event& copy_dep) {
+  // One-off per-device weight buffer. We copy the full W to each device;
+  // each device computes the full N rows and the host then reads back.
+  // This is fine because lm_head is a one-off matmul, not the hot loop.
+  std::vector<sycl::event> evts;
+  evts.reserve(devices_.size());
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto& dev = devices_[d];
+    sycl::queue& q = dev.queue;
+    size_t w_bytes = (size_t)N * K * sizeof(sycl::half);
+    sycl::half* w_dev = static_cast<sycl::half*>(
+        sycl::malloc_device(w_bytes, dev.sycl_device, dev.sycl_context));
+    sycl::half* x_dev = static_cast<sycl::half*>(
+        sycl::malloc_device((size_t)K * sizeof(sycl::half), dev.sycl_device, dev.sycl_context));
+    sycl::half* c_dev = static_cast<sycl::half*>(
+        sycl::malloc_device((size_t)N * sizeof(sycl::half), dev.sycl_device, dev.sycl_context));
+
+    q.memcpy(w_dev, w, w_bytes);
+    q.memcpy(x_dev, x, (size_t)K * sizeof(sycl::half)).wait();
+    sycl::event evt = gemm::quant_gemm_f16(q, x_dev, w_dev, c_dev, 1, N, K);
+    q.memcpy(out, c_dev, (size_t)N * sizeof(float), evt);
+    evts.push_back(evt);
+    sycl::free(w_dev, q);
+    sycl::free(x_dev, q);
+    sycl::free(c_dev, q);
+  }
+  for (auto& e : evts) e.wait();
+}
+
 const Rotation* Engine::rotation_for(int tensor_index) const {
   if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size())
     return nullptr;

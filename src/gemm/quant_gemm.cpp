@@ -572,17 +572,17 @@ void build_vnni_int8(const std::int8_t* w, std::int8_t* out,
 // C[M,N] = A[M,K] * W[N,K]^T. All row-major. FP16 inputs, FP32 accum,
 // FP16 output. The compiler lowers this onto XMX FP16 matrix engines on Arc.
 // ---------------------------------------------------------------------------
-void quant_gemm_f16(sycl::queue& q,
-                    const sycl::half* a,
-                    const sycl::half* w,
-                    sycl::half* c,
+sycl::event quant_gemm_f16(sycl::queue& q,
+                    const sycl::half* a,  // M*K row-major
+                    const sycl::half* w,  // N*K row-major
+                    sycl::half* c,        // M*N row-major
                     uint32_t M, uint32_t N, uint32_t K) {
   const int gx = (static_cast<int>(M) + kBM - 1) / kBM;
   const int gy = (static_cast<int>(N) + kBN - 1) / kBN;
   sycl::nd_range<2> nd(sycl::range<2>(gx * kThr, gy * kThr),
                        sycl::range<2>(kThr, kThr));
 
-  q.submit([&](sycl::handler& h) {
+  auto evt = q.submit([&](sycl::handler& h) {
     sycl::local_accessor<std::uint16_t, 1> sA(sycl::range<1>(kBM * kBK), h);
     sycl::local_accessor<std::uint16_t, 1> sW(sycl::range<1>(kBN * kBK), h);
     h.parallel_for(nd, [=](sycl::nd_item<2> it) {
@@ -637,7 +637,7 @@ void quant_gemm_f16(sycl::queue& q,
         }
     });
   });
-  q.wait();
+  return evt;
 }
 
 sycl::event quant_gemm_dpas_int8(sycl::queue& q,

@@ -162,4 +162,13 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                       gemm::WeightScheme scheme,
                                       const sycl::event& copy_dep);
 
+// FP16 x FP16 GEMM for non-quantized tensors like lm_head.
+// C[M,N] = A[M,K] * W[N,K]^T. A is row-major FP16, W is row-major FP16,
+// C is row-major FP16. Uses the XMX DPAS path via the portable FP16 kernel.
+sycl::event quant_gemm_f16(sycl::queue& q,
+                    const sycl::half* a,  // M*K row-major
+                    const sycl::half* w,  // N*K row-major
+                    sycl::half* c,        // M*N row-major
+                    uint32_t M, uint32_t N, uint32_t K);
+
 }  // namespace intfer::gemm

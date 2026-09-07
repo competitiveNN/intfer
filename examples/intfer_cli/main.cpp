@@ -607,6 +607,63 @@ struct GpuBackend : public LinearBackend {
     if(L >= 0 && L != cur_layer_){ eng->begin_layer(L); cur_layer_ = L; }
     return eng->run_linear_tp_ret(it->second, x);
   }
+
+  // Cached lm_head FP16 upload + one-off FP16 GEMM on device.
+  // The first call uploads W[N,K] as FP16 to each device; later calls reuse
+  // the cached device pointer and just launch the GEMM.
+  std::vector<float> run_lm_head_f16(const float* fn, // final norm hidden [K]
+                                     const float* W,   // lm_head weight [N,K]
+                                     uint32_t N, uint32_t K){
+    if(!eng) return {};
+    if(lm_head_w_dev_.empty()){
+      size_t w_bytes = (size_t)N * K * sizeof(sycl::half);
+      lm_head_N_ = N; lm_head_K_ = K;
+      lm_head_w_dev_.resize(eng->num_devices());
+      lm_head_c_dev_.resize(eng->num_devices());
+      for(size_t d=0; d<eng->num_devices(); ++d){
+        sycl::queue& q = eng->device_queue((int)d);
+        lm_head_w_dev_[d] = static_cast<sycl::half*>(
+            sycl::malloc_device(w_bytes, q.get_device(), q.get_context()));
+        lm_head_c_dev_[d] = static_cast<sycl::half*>(
+            sycl::malloc_device((size_t)N * sizeof(sycl::half), q.get_device(), q.get_context()));
+        // Upload once.
+        std::vector<sycl::half> w_fp16((size_t)N * K);
+        for(uint32_t i=0;i<(size_t)N*K;i++) w_fp16[i] = sycl::half(W[i]);
+        q.memcpy(lm_head_w_dev_[d], w_fp16.data(), w_bytes);
+      }
+      for(size_t d=0; d<eng->num_devices(); ++d)
+        eng->device_queue((int)d).wait();
+    }
+    if(lm_head_N_ != N || lm_head_K_ != K){
+      std::fprintf(stderr, "gpu: lm_head size mismatch %u x %u vs cached %u x %u\n",
+                   N, K, lm_head_N_, lm_head_K_);
+      return {};
+    }
+    // Upload activation as FP16 and run GEMM.
+    std::vector<sycl::half> x_fp16(K);
+    for(uint32_t i=0;i<K;i++) x_fp16[i] = sycl::half(fn[i]);
+    std::vector<float> out(N, 0.f);
+    std::vector<sycl::event> evts;
+    evts.reserve(eng->num_devices());
+    for(size_t d=0; d<eng->num_devices(); ++d){
+      sycl::queue& q = eng->device_queue((int)d);
+      sycl::half* x_dev = static_cast<sycl::half*>(
+          sycl::malloc_device((size_t)K * sizeof(sycl::half), q.get_device(), q.get_context()));
+      q.memcpy(x_dev, x_fp16.data(), (size_t)K * sizeof(sycl::half));
+      sycl::event evt = gemm::quant_gemm_f16(q, x_dev, lm_head_w_dev_[d],
+                                             lm_head_c_dev_[d], 1, N, K);
+      q.memcpy(out.data(), lm_head_c_dev_[d], (size_t)N * sizeof(float), evt);
+      evts.push_back(evt);
+      sycl::free(x_dev, q);
+    }
+    for(auto& e : evts) e.wait();
+    return out;
+  }
+
+  // Cache state for lm_head upload.
+  std::vector<sycl::half*> lm_head_w_dev_;
+  std::vector<sycl::half*> lm_head_c_dev_;
+  uint32_t lm_head_N_ = 0, lm_head_K_ = 0;
   const Rotation* rot_for(const std::string& name) override {
     if(!eng) return nullptr;
     auto it = ti_cache.find(name);
@@ -962,11 +1019,30 @@ static StepOut step(int token, int pos,
   const float* head = lm_head ? lm_head : embed;
   std::fprintf(stderr, "[intfer] logits: vocab=%d H=%d head=%p\n", cfg.vocab, cfg.H, (const void*)head);
   std::fflush(stderr);
-  for(int v=0; v<cfg.vocab; v++){
-    const float* er = head + (size_t)v*cfg.H;
-    float s=0; for(int i=0;i<cfg.H;i++) s+=fn[i]*er[i];
-    logits[v]=s;
-    if(s>bestv){ bestv=s; best=v; }
+  if(lm_head && backend){
+    auto gpu = dynamic_cast<GpuBackend*>(backend);
+    if(gpu){
+      logits = gpu->run_lm_head_f16(fn.data(), lm_head, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+    }else{
+      for(int v=0; v<cfg.vocab; v++){
+        const float* er = head + (size_t)v*cfg.H;
+        float s=0; for(int i=0;i<cfg.H;i++) s+=fn[i]*er[i];
+        logits[v]=s;
+        if(s>bestv){ bestv=s; best=v; }
+      }
+    }
+  }else{
+    for(int v=0; v<cfg.vocab; v++){
+      const float* er = head + (size_t)v*cfg.H;
+      float s=0; for(int i=0;i<cfg.H;i++) s+=fn[i]*er[i];
+      logits[v]=s;
+      if(s>bestv){ bestv=s; best=v; }
+    }
+  }
+  if(lm_head==nullptr || !backend || dynamic_cast<CpuBackend*>(backend)){
+    for(int v=0; v<cfg.vocab; v++){
+      if(logits[v]>bestv){ bestv=logits[v]; best=v; }
+    }
   }
   out.best = best;
   out.logits = std::move(logits);

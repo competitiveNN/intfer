@@ -63,6 +63,12 @@ class Engine {
   void run_linear_tp(int tensor_index, const std::vector<float>& x,
                      std::vector<float>& out);
   
+  // FP16 x FP16 GEMM for non-quantized final heads (lm_head/embed).
+  // C[1,N] = x[1,K] * W[N,K]^T. All row-major. Outputs FP32 logits.
+  void run_linear_f16_tp(const sycl::half* x, const sycl::half* w,
+                         float* out, uint32_t N, uint32_t K,
+                         const sycl::event& copy_dep = {});
+  
   // Which Rotation (SpinQuant) belongs to tensor ti (by its rotation_id).
   const Rotation* rotation_for(int tensor_index) const;
   
