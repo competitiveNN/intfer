@@ -96,25 +96,30 @@ the batch.
 
 ---
 
-## TODO 4 — Host hot path: allocation storm, not compute (scoped 2026-09-07)
+## TODO 4 — Host hot path (updated 2026-09-07: detok + 4a done, memcpy dead)
 
-**Status:** Scoped, not started. Key correction to the original framing:
-the host path is NOT compute-bound (~16M FLOP/tok running at ~70 MFLOPS,
-<1% of scalar peak — the SSM S-update dominates at ~15M). It is
-ALLOCATION-bound: ~500 vector malloc/free per token + snprintf/map-find
-per linear (173×/token) + repeated elementwise passes. Moving norm/attn
-to GPU kernels is the wrong first move (they are microseconds of compute);
-killing the malloc storm is. Sub-items in priority order:
+**Status:**
+- DONE `711000d`: in-process BPE detokenizer (killed 158ms/token python
+  spawn). CPU 3.05→5.19 tok/s, GPU 3.3→4.01 tok/s. Byte-identical stdout.
+- DONE `73494a2`: 4a scratch arena (`StepScratch` + `run_linear_into` +
+  engine `act_staging_`). Mallocs 1540→~420/token, churn 4.8→1.1MB.
+  Wall-time NEUTRAL — the loop is compute-bound, not allocation-bound
+  (correction to the "allocation-bound" scoping below).
+- DEAD (reverted, uncommitted): memcpy H2D/D2H in `run_linear_tp`.
+  1236→1379ms decode; per-memcpy enqueue (~164µs) costs more than the
+  touch loop (~59µs) at 3KB/transfer. Lesson: at 128 SYCL calls/token,
+  per-CALL overhead dominates; fewer calls is the only lever.
+- GPU profile (0.8B, 128 GEMM/tok): submit 38ms + wait 10.6 + write 7.5 +
+  readback 5.4 + kernel 9.7ms ≈ 72ms GPU-attributable; host elementwise
+  ≈134ms/tok (65% of GPU decode). Submit overhead largely irreducible
+  (graphs dead per TODO 2, fusion blocked by sequential deps).
 
-- 4a: scratch arena — bump-allocated reusable buffers sized once per
-  (model, max_pos); replace per-intermediate `std::vector` in `step()`.
-- 4b: hoist loop-invariant work out of the token loop: `name(L,slot)`
-  snprintf + `T`/`ti_cache` finds (identical every token).
-- 4c: fuse elementwise chains (silu×mul, gate×attn, residual adds).
-- 4d (later): host attention tiling for long context (scores are O(pos));
-  GPU norm/attn kernels only if 4a–c are exhausted.
-- Math: host 233→~70ms/tok puts GPU ≈114 vs CPU ≈157ms/tok → GPU 1.4×,
-  goal met. Helps both backends; GPU wins on its GEMM edge once host fixed.
+**Remaining (priority order):**
+- 4c: fuse elementwise chains (silu×mul, gate×attn, residual adds) —
+  biggest remaining chunk (~134ms host), helps BOTH backends.
+- 4b: hoist `name()` snprintf + map finds — kills remaining ~420
+  mallocs/token; hygiene, minimal wall-time (compute-bound).
+- 4d (later): host attention tiling for long context.
 
 **Why (original):** Only the 7 quantized Linears per layer are GPU-accelerated. The
 RMSNorm, RoPE, attention scores, mamba SSM, lm_head matmul (248320×1024),
