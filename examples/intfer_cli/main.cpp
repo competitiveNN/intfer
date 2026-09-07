@@ -846,7 +846,7 @@ struct StepScratch {
   // trunk
   std::vector<float> h, res, normed;
   // full-attention path
-  std::vector<float> xq, qp, gate, qpart, xk, xv, k, v, attn, scores, o_in, o_raw;
+  std::vector<float> xq, qp, gate, qpart, xk, xv, k, v, attn, gscores, o_in, o_raw;
   // linear-attention path
   std::vector<float> xqkv, mqkv, conv_out, xz, xb, xa, z, b, a, g, core,
                      kv_mem, delta, normed_core, o_la;
@@ -863,7 +863,10 @@ struct StepScratch {
     need(xq, H); need(qp, qrows2); need(gate, attnrows); need(qpart, attnrows);
     need(xk, H); need(xv, H); need(k, kvrows); need(v, kvrows);
     need(attn, attnrows);
-    // scores sized lazily per pos below (pos grows monotonically per run).
+    // Grouped attention scores: (max_group_heads) x (pos+1), grown
+  // monotonically per run (amortized ~zero). Replaces the old shared
+  // single-row `scores` buffer (removed: each head needs its row live
+  // through the group's shared V pass).
     need(o_in, attnrows*2);
     need(o_raw, H);
     need(xqkv, H); need(mqkv, conv); need(conv_out, conv);
@@ -877,9 +880,9 @@ struct StepScratch {
     sized = true;
   }
   // Attention scores scratch: grows monotonically with pos (amortized ~zero).
-  float* scores_for(int pos){
-    if((int)scores.size() < pos+1) scores.assign(pos+1, 0.f);
-    return scores.data();
+  float* gscores_for(int gh, int pos){
+    if((int)gscores.size() < gh*(pos+1)) gscores.assign((size_t)gh*(pos+1), 0.f);
+    return gscores.data();
   }
 };
 static StepScratch g_scratch;
@@ -1024,27 +1027,47 @@ static StepOut step(int token, int pos,
         else { memcpy(&ly.vcache[base], v.data(), have_v*sizeof(float));
                memset(&ly.vcache[base]+have_v, 0, (need-have_v)*sizeof(float)); }
       }
-      // Attention compute (host, since the SSM/attn kernel is a 1-token
-      // decode and the TP shard of K/V is small — see `qwen_forward_gpu`
-      // for the FlashAttention integration on the 1st device).
+      // Attention compute, tiled by KV group (4d). Heads sharing a KV
+      // head reuse the same K/V cache rows: the old per-head loop loaded
+      // each kh[t]/vh[t] row n_heads/n_kv times (4x on 0.8B). Now each
+      // row is loaded once per group and dotted/fanned-out to all group
+      // heads. Bit-identical: every head's dot/softmax/weighted-sum keeps
+      // its original element order; only the interleaving across heads
+      // changed (independent reductions).
       std::vector<float>& attn = g_scratch.attn;
       // Fusion: the bulk zero is dead — each head's block is zeroed
       // (oh[d]=0) before accumulation in the loop below.
-      for(int hh=0; hh<cfg.n_heads; hh++){
-        int kvh=hh/(cfg.n_heads/cfg.n_kv);
-        float* scores = g_scratch.scores_for(pos); float mx=-1e30f;
+      const int G = cfg.n_heads / cfg.n_kv; // heads per KV head (group size)
+      if(G > 64){ std::fprintf(stderr, "[intfer] FATAL: kv group %d > 64\n", G); std::exit(1); }
+      float* gs = g_scratch.gscores_for(G, pos);
+      for(int kvh=0; kvh<cfg.n_kv; kvh++){
+        // Score pass: for each t load kh once, dot against every head.
+        float mx[64]; for(int j=0;j<G;j++) mx[j]=-1e30f;
         for(int t=0;t<=pos;t++){
-          const float* qh=&qpart[hh*cfg.head_dim];
           const float* kh=&ly.kcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
-          float s=0; for(int d=0;d<cfg.head_dim;d++) s+=qh[d]*kh[d];
-          s*=1.0f/sqrtf((float)cfg.head_dim); scores[t]=s; if(s>mx) mx=s;
+          for(int j=0;j<G;j++){
+            int hh=kvh*G+j;
+            const float* qh=&qpart[hh*cfg.head_dim];
+            float s=0; for(int d=0;d<cfg.head_dim;d++) s+=qh[d]*kh[d];
+            s*=1.0f/sqrtf((float)cfg.head_dim); gs[j*(pos+1)+t]=s; if(s>mx[j]) mx[j]=s;
+          }
         }
-        float sum=0; for(int t=0;t<=pos;t++){ scores[t]=expf(scores[t]-mx); sum+=scores[t]; }
-        for(int t=0;t<=pos;t++) scores[t]/=sum;
-        float* oh=&attn[hh*cfg.head_dim]; for(int d=0;d<cfg.head_dim;d++) oh[d]=0;
+        for(int j=0;j<G;j++){
+          float* row=&gs[j*(pos+1)];
+          float sum=0; for(int t=0;t<=pos;t++){ row[t]=expf(row[t]-mx[j]); sum+=row[t]; }
+          for(int t=0;t<=pos;t++) row[t]/=sum;
+        }
+        // Output pass: zero group outputs, then fan-out shared vh rows.
+        for(int j=0;j<G;j++){
+          float* oh=&attn[(kvh*G+j)*cfg.head_dim]; for(int d=0;d<cfg.head_dim;d++) oh[d]=0;
+        }
         for(int t=0;t<=pos;t++){
           const float* vh=&ly.vcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
-          for(int d=0;d<cfg.head_dim;d++) oh[d]+=scores[t]*vh[d];
+          for(int j=0;j<G;j++){
+            float st=gs[j*(pos+1)+t];
+            float* oh=&attn[(kvh*G+j)*cfg.head_dim];
+            for(int d=0;d<cfg.head_dim;d++) oh[d]+=st*vh[d];
+          }
         }
       }
       if (cfg.attn_output_gate && packed_gate)
