@@ -96,9 +96,27 @@ the batch.
 
 ---
 
-## TODO 4 — Move host hot path (RMSNorm, RoPE, SSM, sampling) to the GPU
+## TODO 4 — Host hot path: allocation storm, not compute (scoped 2026-09-07)
 
-**Why:** Only the 7 quantized Linears per layer are GPU-accelerated. The
+**Status:** Scoped, not started. Key correction to the original framing:
+the host path is NOT compute-bound (~16M FLOP/tok running at ~70 MFLOPS,
+<1% of scalar peak — the SSM S-update dominates at ~15M). It is
+ALLOCATION-bound: ~500 vector malloc/free per token + snprintf/map-find
+per linear (173×/token) + repeated elementwise passes. Moving norm/attn
+to GPU kernels is the wrong first move (they are microseconds of compute);
+killing the malloc storm is. Sub-items in priority order:
+
+- 4a: scratch arena — bump-allocated reusable buffers sized once per
+  (model, max_pos); replace per-intermediate `std::vector` in `step()`.
+- 4b: hoist loop-invariant work out of the token loop: `name(L,slot)`
+  snprintf + `T`/`ti_cache` finds (identical every token).
+- 4c: fuse elementwise chains (silu×mul, gate×attn, residual adds).
+- 4d (later): host attention tiling for long context (scores are O(pos));
+  GPU norm/attn kernels only if 4a–c are exhausted.
+- Math: host 233→~70ms/tok puts GPU ≈114 vs CPU ≈157ms/tok → GPU 1.4×,
+  goal met. Helps both backends; GPU wins on its GEMM edge once host fixed.
+
+**Why (original):** Only the 7 quantized Linears per layer are GPU-accelerated. The
 RMSNorm, RoPE, attention scores, mamba SSM, lm_head matmul (248320×1024),
 and the sampling loop all run on the host. The lm_head matmul alone is
 ~248M MAC per token, which is the largest single matmul in the model.
