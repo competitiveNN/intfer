@@ -8,6 +8,11 @@ has a "why" and a concrete next step.
 
 ## TODO 1 — Vectorized FP16 loads in the M=1 decode kernel
 
+**Status:** DONE in `a173efe` (went beyond the sketch: group-outer loop
+hoisting the per-group scale, uchar8 INT8 loads, shift/mask INT4/INT2
+extracts). Probe M=1: INT8 334→100µs, INT4 487→65µs, N=248320
+5.4ms→0.44ms. 0.8B decode 2.73→3.05 tok/s, GPU stream bit-identical.
+
 **Why:** The current `gemm_usm_decode1` kernel reads `act_usm[kg]` and
 `code_u8[idx]` one element at a time (scalar loads). On Xe-core this means
 one transaction per element. With `sycl::vec` or `sycl::half` aligned loads
@@ -32,9 +37,17 @@ CPU.
 
 ## TODO 2 — Persistent kernel across the 7 Linears × 24 layers
 
-**Status:** Scaffold exists (`INTFER_GRAPH_CAPTURE` + `build_decode_graph`), but only captures a single tensor. Full multi-tensor capture requires building USM buffers per tensor per layer and recording a graph that includes activation copy, GEMM, and output read for each linear in order. Left as documented stub pending build environment.
+**Status:** MEASURED DEAD — do not pursue. Probe 2026-09-07
+(`/var/home/fra/probe_graph.cpp`): executable-graph launch = 19.7µs vs
+plain `q.submit` = 11.9µs on B580, i.e. graphs are *slower*. The ~250µs
+"submit" cost was misattributed launch overhead; probes (`probe_gemm.cpp`)
+proved it is the dequant kernel body itself (fixed by TODO 1 → a173efe).
+Remaining per-submit host cost (~150-250µs in-engine) exceeds kernel time,
+but graphs cannot reduce it. If pursued at all, the lever is launch-COUNT
+reduction (fusion), not launch-cost reduction. Scaffold
+(`INTFER_GRAPH_CAPTURE` + `build_decode_graph`) left untouched.
 
-**Why:** Every `run_linear_tp` call currently goes through:
+**Why (original, superseded):** Every `run_linear_tp` call currently goes through:
   host pre-convert FP32→FP16 → direct USM write → `q.submit()` → kernel
 launch → `event.wait()` → host readback. For 7 linears × 24 layers × ~20
 decode steps = thousands of kernel launches per generated token. The launch
