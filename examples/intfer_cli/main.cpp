@@ -804,7 +804,14 @@ static StepOut step(int token, int pos,
       // Use the .intifer dequantized weights via the CPU backend instead of
       // loading FP32 safetensors for these matmuls. The .intifer stores the
       // same weights (FP16-quantized) and the backend dequantizes on demand.
-        std::vector<float> mqkv = backend->run_linear(name(L,"linear_attn.in_proj_qkv.weight"), normed);
+      // SpinQuant: in_proj_qkv/z/b/a are right-site (replay x.R on the
+      // activation before the GEMM), out_proj is left-site (R.y after).
+      // The LA branch previously skipped both replays, feeding raw normed
+      // into rotated-quantized weights (27B: L0 out 0.1781 vs HF -0.0240).
+        const Rotation* Rqkv = backend->rot_for(name(L,"linear_attn.in_proj_qkv.weight"));
+        std::vector<float> xqkv(normed);
+        if(Rqkv) rot_apply(normed.data(), *Rqkv, xqkv.data());
+        std::vector<float> mqkv = backend->run_linear(name(L,"linear_attn.in_proj_qkv.weight"), xqkv);
         ckpt("la.qkv", L, mqkv);
         std::vector<float> conv_out(cfg.conv_dim);
       for(int c=0;c<cfg.conv_dim;c++){
@@ -821,9 +828,16 @@ static StepOut step(int token, int pos,
       float* query=conv_out.data();
       float* key=conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
       float* value=conv_out.data()+2*cfg.k_head_dim*cfg.n_k_heads;
-        std::vector<float> z = backend->run_linear(name(L,"linear_attn.in_proj_z.weight"), normed);
-        std::vector<float> b = backend->run_linear(name(L,"linear_attn.in_proj_b.weight"), normed);
-        std::vector<float> a = backend->run_linear(name(L,"linear_attn.in_proj_a.weight"), normed);
+        const Rotation* Rz = backend->rot_for(name(L,"linear_attn.in_proj_z.weight"));
+        const Rotation* Rb = backend->rot_for(name(L,"linear_attn.in_proj_b.weight"));
+        const Rotation* Ra = backend->rot_for(name(L,"linear_attn.in_proj_a.weight"));
+        std::vector<float> xz(normed), xb(normed), xa(normed);
+        if(Rz) rot_apply(normed.data(), *Rz, xz.data());
+        if(Rb) rot_apply(normed.data(), *Rb, xb.data());
+        if(Ra) rot_apply(normed.data(), *Ra, xa.data());
+        std::vector<float> z = backend->run_linear(name(L,"linear_attn.in_proj_z.weight"), xz);
+        std::vector<float> b = backend->run_linear(name(L,"linear_attn.in_proj_b.weight"), xb);
+        std::vector<float> a = backend->run_linear(name(L,"linear_attn.in_proj_a.weight"), xa);
         ckpt("la.z", L, z); ckpt("la.b", L, b); ckpt("la.a", L, a);
           std::vector<float> g(cfg.n_v_heads);
       for(int hh=0; hh<cfg.n_v_heads; hh++){
@@ -867,13 +881,16 @@ static StepOut step(int token, int pos,
         float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
         for(int i=0;i<cfg.v_head_dim;i++) o[i]=(x[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
       }
-      h = backend->run_linear(name(L,"linear_attn.out_proj.weight"), normed_core);
+      std::vector<float> o_la = backend->run_linear(name(L,"linear_attn.out_proj.weight"), normed_core);
+      const Rotation* Ro_la = backend->rot_for(name(L,"linear_attn.out_proj.weight"));
+      if(Ro_la){ h.assign(cfg.H, 0.f); rot_left(o_la.data(), *Ro_la, h.data()); }
+      else h = std::move(o_la);
       ckpt("la.out", L, h);
   if(trace_h && pos==0 && (L==0 || L==3)){
-    std::vector<float> pmqkv = backend->run_linear(name(L,"linear_attn.in_proj_qkv.weight"), normed);
-    std::vector<float> pz = backend->run_linear(name(L,"linear_attn.in_proj_z.weight"), normed);
-    std::vector<float> pa = backend->run_linear(name(L,"linear_attn.in_proj_a.weight"), normed);
-    std::vector<float> pb = backend->run_linear(name(L,"linear_attn.in_proj_b.weight"), normed);
+    std::vector<float> pmqkv = backend->run_linear(name(L,"linear_attn.in_proj_qkv.weight"), xqkv);
+    std::vector<float> pz = backend->run_linear(name(L,"linear_attn.in_proj_z.weight"), xz);
+    std::vector<float> pa = backend->run_linear(name(L,"linear_attn.in_proj_a.weight"), xa);
+    std::vector<float> pb = backend->run_linear(name(L,"linear_attn.in_proj_b.weight"), xb);
     std::fprintf(stderr, "[dbg] L=%d pos=%d h_attn[:4]=%.4f %.4f %.4f %.4f qkv_sz=%zu qkv0=%.4f z0=%.4f a0=%.4f b0=%.4f\n",
                  L, pos, h[0], h[1], h[2], h[3], pmqkv.size(),
                  pmqkv.empty()?-999:pmqkv[0], pz.empty()?-999:pz[0],
