@@ -313,7 +313,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                 const std::uint16_t* wptr = w8 + (std::size_t)ng * K + kg_base;
 
                 // Accumulate 8 elements at a time using SYCL vec loads.
-                for (int i = 0; i < 8; i += 8) {
+                for (int i = 0; i < kBK; i += 8) {
                   sycl::vec<sycl::half, 8> av8;
                   sycl::vec<sycl::half, 8> wv8;
                   for (int j = 0; j < 8; ++j) {
@@ -332,8 +332,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       });
     }
 
-    // Original scalar M=1 path (kept for INT4/INT2/groupwise).
-    // Vectorized variant: load 8 activations at a time to halve LSU
+    // Vectorized M=1 variant: load 8 activations at a time to halve LSU
     // pressure while keeping weight dequant scalar.
     if (bits < 16) {
       return q.submit([&](sycl::handler& h) {
@@ -358,24 +357,22 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                     if (kg >= static_cast<int>(K)) break;
                     av8[j] = sycl::bit_cast<sycl::half>(act_usm[kg]);
                   }
-                  const int g0 = (kg_base + kk) / Gw;
-                  const float s0 = from_half_bits(sptr[g0]) * alpha;
                   for (int j = 0; j < 8; ++j) {
                     const int kg = kg_base + kk + j;
                     if (kg >= static_cast<int>(K)) break;
                     const std::size_t idx = static_cast<std::size_t>(ng) * K + kg;
                     const int g = kg / Gw;
-                    const float scale = from_half_bits(sptr[ng_g + g]) * alpha;
-                    float wval;
+                    const float scale = from_half_bits(sptr[g]) * alpha;
+                    int code;
                     if (bits >= 8) {
-                      wval = scale * static_cast<float>(code_u8[idx]);
+                      code = static_cast<int>(code_u8[idx]);
                     } else {
                       const int pack = 8 / bits;
                       const std::uint8_t b = code_u8[idx / pack];
                       const int within = static_cast<int>(idx % pack);
-                      const int code = (b >> (within * bits)) & ((1 << bits) - 1);
-                      wval = scale * canon_value(bits, code);
+                      code = (b >> (within * bits)) & ((1 << bits) - 1);
                     }
+                    const float wval = scale * canon_value(bits, code);
                     acc += static_cast<float>(av8[j]) * wval;
                   }
                 }
