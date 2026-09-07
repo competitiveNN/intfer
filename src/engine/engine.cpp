@@ -106,12 +106,18 @@ gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
   // 1) Build the per-group scale table (FP16 bits) and a per-row broadcast
   //    view. The kernel reads scale[ng*n_groups + g], so we emit (N*n_groups)
   //    FP16 values (broadcast the per-group scale to every row).
+  //    FP16-scheme tensors carry no meaningful scale (CPU dequant is a raw
+  //    half->float copy); the kernel still multiplies by the table, so emit
+  //    all-ones (0x3C00) instead of copying scale_src (which holds a small
+  //    fallback value that would attenuate the output ~50x).
   const uint16_t* scale_src =
       reinterpret_cast<const uint16_t*>(m.scale_data() + t.scale_offset);
+  const bool fp16_passthrough = (w.scheme == gemm::WeightScheme::FP16);
   std::vector<uint16_t> scale_broadcast((size_t)N * n_groups);
   for (uint32_t r = 0; r < N; ++r)
     for (uint32_t g = 0; g < n_groups; ++g)
-      scale_broadcast[(size_t)r * n_groups + g] = scale_src[g];
+      scale_broadcast[(size_t)r * n_groups + g] =
+          fp16_passthrough ? 0x3C00 : scale_src[g];
   // Take the TP slice on the host (contiguous, byte-aligned by N*2).
   std::vector<uint16_t> scale_slice((size_t)w.N * n_groups);
   for (uint32_t r = 0; r < w.N; ++r)

@@ -474,7 +474,7 @@ void build_vnni_int8(const std::int8_t* w, std::int8_t* out,
           w[static_cast<std::size_t>(n) * K + k];
 }
 
-void quant_gemm_dpas_int8(sycl::queue& q,
+sycl::event quant_gemm_dpas_int8(sycl::queue& q,
                           const std::int8_t* a_int8,
                           float a_scale,
                           const std::int8_t* w_vnni,
@@ -484,6 +484,7 @@ void quant_gemm_dpas_int8(sycl::queue& q,
   using namespace sycl;
   using namespace sycl::ext::intel::esimd;
   using namespace sycl::ext::intel::esimd::xmx;
+  using namespace intfer::gemm;
 
   constexpr int SD = 8;  // systolic depth
   constexpr int RC = 8;  // repeat count -> _M = 8
@@ -492,14 +493,14 @@ void quant_gemm_dpas_int8(sycl::queue& q,
   constexpr int TK = 32;
   constexpr int TN = 8;
 
-  const uint32_t M8 = M / TM;
-  const uint32_t N16 = N / TN;
+  const uint32_t M8 = (M + TM - 1) / TM;
+  const uint32_t N16 = (N + TN - 1) / TN;
   const uint32_t Ksteps = K / TK;
   const uint32_t n_blocks = M8 * N16;
   const uint32_t nWG = 16;  // work-group size == SIMD width
   const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
 
-  q.submit([&](handler& h) {
+  auto evt = q.submit([&](handler& h) {
     h.parallel_for<class gemm_dpas_int8_kernel>(
         nd_range<1>(range<1>(global), range<1>(nWG)),
         [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
@@ -535,6 +536,7 @@ void quant_gemm_dpas_int8(sycl::queue& q,
         });
   });
   q.wait();
+  return evt;
 }
 
 }  // namespace intfer::gemm

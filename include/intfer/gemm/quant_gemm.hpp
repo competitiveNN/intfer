@@ -113,17 +113,9 @@ void quant_gemm_forward(sycl::queue& q,
 
 // ---------------------------------------------------------------------------
 // ESIMD DPAS INT8 x INT8 GEMM (raw USM pointers, per-tensor symmetric scales).
-//
-//   w_vnni : device pointer to W transposed into VNNI layout, shape (K x N),
-//            i.e. w_vnni[k*N + n] = round(W[n, k] / w_scale[n]), int8.
-//   a_int8 : device pointer to A, shape (M x K), int8 (per-tensor scale a_scale).
-//   w_scale: device pointer to FP32 per-row weight scales, length N.
-//   a_scale: per-tensor FP32 activation scale (single value).
-//   c      : device pointer to output, shape (M x N), FP16 bits.
-// C[m, n] = a_scale * w_scale[n] * sum_k a_int8[m,k] * w_vnni[k, n].
-// M, N, K must be multiples of 8 / 8 / 32 respectively (DPAS tiling).
+// Returns a SYCL event that signals when the kernel has completed.
 // ---------------------------------------------------------------------------
-void quant_gemm_dpas_int8(sycl::queue& q,
+sycl::event quant_gemm_dpas_int8(sycl::queue& q,
                           const std::int8_t* a_int8,
                           float a_scale,
                           const std::int8_t* w_vnni,
