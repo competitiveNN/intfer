@@ -218,7 +218,12 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "chunk %d: read %zu bytes from %s\n", a - 1, blob.size(), path.c_str());
     ModelIR chunk_m; RotationSet chunk_rs;
-    if (!deserialize_intfer(blob.data(), blob.size(), chunk_m, chunk_rs)) {
+    // Borrowed views (zero-copy): chunk payloads stay in `blob` instead of
+    // being copied into vectors. Halves peak RAM on multi-GB inputs (a 22GB
+    // .intifer would otherwise need ~44GB transient). Safe: merge only reads
+    // payload via code_data()/scale_data()/global_data(), and `blob` outlives
+    // the chunk iteration (freed via swap at the loop end).
+    if (!deserialize_intfer_borrowed(blob.data(), blob.size(), chunk_m, chunk_rs)) {
       std::fprintf(stderr, "FAIL: deserialize failed for %s\n", path.c_str());
       return 1;
     }
@@ -299,16 +304,16 @@ int main(int argc, char** argv) {
       // (The old code wrote code/scale/global inline per tensor, which
       // skewed every tensor after the first scale-bearing one.)
       if (t.code_bytes) {
-        fwrite(chunk_m.code_buf.data() + local_code_off, 1, t.code_bytes, fpld);
+        fwrite(chunk_m.code_data() + local_code_off, 1, t.code_bytes, fpld);
         cp += t.code_bytes;
       }
       if (t.scale_bytes) {
-        const uint8_t* sb = chunk_m.scale_buf.data() + local_scale_off;
+        const uint8_t* sb = chunk_m.scale_data() + local_scale_off;
         aux_scales.insert(aux_scales.end(), sb, sb + t.scale_bytes);
         sp += t.scale_bytes;
       }
       if (t.global_bytes) {
-        const uint8_t* gb = chunk_m.global_buf.data() + local_global_off;
+        const uint8_t* gb = chunk_m.global_data() + local_global_off;
         aux_globals.insert(aux_globals.end(), gb, gb + t.global_bytes);
         gp += t.global_bytes;
       }

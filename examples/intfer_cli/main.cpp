@@ -1752,7 +1752,8 @@ static void usage(const char* p){
     "intfer — low-bit LLM inference (Stage-1 quantized .intifer, host or SYCL GPU)\n"
     "Usage: %s -m <model.intifer> [options]\n"
     "  -m PATH        .intifer model file (required)\n"
-    "  -s PATH        safetensors file for embed/norms/SSM (auto-detected)\n"
+    "  -s PATH        safetensors file for embed/norms/SSM (optional: used only\n"
+    "                 as fallback for tensors missing from the .intifer)\n"
     "  -p TEXT        prompt text (default: empty)\n"
     "  -P FILE        read prompt from file\n"
     "  -n N           max new tokens to generate (default: 64)\n"
@@ -1762,6 +1763,7 @@ static void usage(const char* p){
     "  -S SEED        RNG seed (default: 0 = time)\n"
     "  --gpu          force SYCL/GPU backend (intfer::Engine)\n"
     "  --no-gpu       force CPU backend (dequant + host matmul)\n"
+    "  --tp N         tensor-parallel GPU count (default: 2, the 2x B580 fleet)\n"
     "  --tokenizer P  path to tokenizer.json (default: Qwen3.5-0.8B)\n"
     "  --tokenizer-py P path to bpe_tokenize.py\n"
     "  --detok-py P   path to bpe_detokenize.py\n"
@@ -1799,6 +1801,7 @@ int main(int argc, char** argv){
   bool stream = true;
   bool print_ids = false;
   GpuMode gpu_mode = GpuMode::Auto;
+  size_t tp_devices = 2;  // 2x Arc B580 fleet; Engine::load clamps to discovered
   int i = 1;
   while(i < argc){
     std::string a = argv[i];
@@ -1814,6 +1817,7 @@ int main(int argc, char** argv){
     else if(a=="-S" && i+1<argc) seed = (uint32_t)std::atoi(argv[++i]);
     else if(a=="--gpu") gpu_mode = GpuMode::ForceOn;
     else if(a=="--no-gpu") gpu_mode = GpuMode::ForceOff;
+    else if(a=="--tp" && i+1<argc) tp_devices = (size_t)std::max(1, std::atoi(argv[++i]));
     else if(a=="--tokenizer" && i+1<argc) tokenizer_json = argv[++i];
     else if(a=="--tokenizer-py" && i+1<argc) tokenizer_py = argv[++i];
     else if(a=="--detok-py" && i+1<argc) detok_py = argv[++i];
@@ -1850,7 +1854,11 @@ int main(int argc, char** argv){
       else
         st_path = dir + "/model.safetensors-00001-of-00001.safetensors";
     };
-    // Try model-name-derived paths first (from -m model.intifer name)
+    // Try model-name-derived paths first (from -m model.intifer name).
+    // Strip chunk suffixes (-sc/-full/-noembed/-host) so a self-contained
+    // file like Qwen3.8-27B-sc.intifer resolves to the Qwen3.8-27B dir;
+    // without this the lookup misses and falls through to the hardcoded
+    // 0.8B default (wrong dims -> crash).
     std::string model_name;
     {
       size_t sp = intfer_path.rfind('/');
@@ -1858,6 +1866,11 @@ int main(int argc, char** argv){
       // strip .intifer suffix
       size_t dot = model_name.rfind(".intifer");
       if(dot != std::string::npos) model_name = model_name.substr(0, dot);
+      for(const char* suf : {"-sc", "-full", "-noembed", "-host"}){
+        size_t s = model_name.rfind(suf);
+        if(s != std::string::npos && s + strlen(suf) == model_name.size())
+          model_name = model_name.substr(0, s);
+      }
     }
     if(!model_name.empty() && try_path("/var/home/fra/data/models/safetensors/" + model_name))
       set_st("/var/home/fra/data/models/safetensors/" + model_name);
@@ -1877,23 +1890,62 @@ int main(int argc, char** argv){
                                 "Pass -s <path>\n"); return 1; }
   }
   // ---- Auto-detect model config from config.json
+  // Prefer config.json alongside the safetensors (correct model dims);
+  // without -s (self-contained .intifer) fall back to the directory derived
+  // from -m (strip .intifer suffix) and sibling safetensors dirs.
   {
     std::string config_dir;
-    // Prefer config.json alongside the safetensors (correct model dims).
-    size_t sp = st_path.rfind('/');
-    if(sp != std::string::npos) config_dir = st_path.substr(0, sp);
+    auto cfg_try = [&](const std::string& dir) -> bool {
+      if(dir.empty()) return false;
+      std::string p = dir + "/config.json";
+      FILE* f = fopen(p.c_str(), "rb");
+      if(!f) return false;
+      fclose(f);
+      config_dir = dir;
+      return true;
+    };
+    std::string model_name;
+    {
+      size_t sp = intfer_path.rfind('/');
+      if(sp != std::string::npos) model_name = intfer_path.substr(sp+1);
+      size_t dot = model_name.rfind(".intifer");
+      if(dot != std::string::npos) model_name = model_name.substr(0, dot);
+    }
+    if(!st_path.empty()){
+      size_t sp = st_path.rfind('/');
+      if(sp != std::string::npos) cfg_try(st_path.substr(0, sp));
+    }
+    if(config_dir.empty() && !model_name.empty()){
+      // Self-contained mode: -m /path/to/Qwen3.5-0.8B-sc.intifer ->
+      // config in sibling dirs (same basename minus any -sc/-full suffix).
+      std::string base = model_name;
+      for(const char* suf : {"-sc", "-full", "-noembed"}){
+        size_t s = base.rfind(suf);
+        if(s != std::string::npos) base = base.substr(0, s);
+      }
+      size_t sp = intfer_path.rfind('/');
+      std::string idir = (sp != std::string::npos) ? intfer_path.substr(0, sp) : ".";
+      cfg_try(idir + "/" + base);
+      if(config_dir.empty()) cfg_try("/var/home/fra/data/models/safetensors/" + base);
+      if(config_dir.empty()) cfg_try("test/models/" + base);
+    }
     ModelConfig loaded = load_model_config(config_dir);
     cfg = loaded;
-    std::fprintf(stderr, "[intfer] config: model_id=%s H=%d layers=%d inter=%d heads=%d kv=%d conv_dim=%d sdim=%d\n",
-                 cfg.model_id.c_str(), cfg.H, cfg.layers, cfg.inter, cfg.n_heads, cfg.n_kv, cfg.conv_dim, cfg.sdim);
+    std::fprintf(stderr, "[intfer] config: model_id=%s H=%d layers=%d inter=%d heads=%d kv=%d conv_dim=%d sdim=%d (from %s)\n",
+                 cfg.model_id.c_str(), cfg.H, cfg.layers, cfg.inter, cfg.n_heads, cfg.n_kv, cfg.conv_dim, cfg.sdim,
+                 config_dir.empty() ? "<defaults>" : (config_dir + "/config.json").c_str());
   }
   std::fprintf(stderr, "[intfer] intfer: %s\n", intfer_path.c_str());
   std::fprintf(stderr, "[intfer] safetensors: %s\n", st_path.c_str());
 
-  // ---- Load .intifer (Stage-1 quantized MLP + attn)
-  // Borrowed mmap views (zero-copy): the 22GB code region stays in page
+  // ---- Load .intifer FIRST (Stage-1 quantized MLP + attn, plus FP16
+  // passthrough host tensors in self-contained files). Borrowed mmap views
+  // (zero-copy): the 22GB code region stays in page
   // cache instead of being copied into RAM. mblob must outlive main, so it
   // is munmap'd only at the very end.
+  // NOTE: this moved ahead of the safetensors/config handling: config.json
+  // now falls back to the directory derived from -m, and safetensors is an
+  // optional fallback for tensors missing from the .intifer.
   ModelIR m; RotationSet rs;
   MmapBlob mblob = mmap_blob(intfer_path);
   if (!mblob.base || mblob.size == 0) {
@@ -1921,14 +1973,21 @@ int main(int argc, char** argv){
     // Populate CPU backend's per-layer QLinear tables from the deserialized IR.
   // (Done lazily after backend selection; see below.)
 
-  // ---- Load safetensors (embed, norms, SSM)
+  // ---- Host tensors: IR FP16 passthrough FIRST, safetensors as fallback
+  // Self-contained .intifer files carry embed/norms/SSM/lm_head as unrotated
+  // FP16 (GGUF-style); legacy files rely on safetensors for those. -s is now
+  // optional: without it, tensors missing from the IR are fatal (as before).
   // For the GPU backend, the large q/k/v/o/gate/up/down projection weights are
   // NOT loaded into RAM — the .intifer file already contains them as quantized
   // tensors and the Engine reads them on demand. Only the small "host" tensors
   // (embed_tokens, norms, SSM params) are pulled in. For the CPU backend we
   // keep loading everything, since the CPU path uses these for run_linear().
   SafetensorsReader sr;
-  if(!sr.open(st_path)){ std::fprintf(stderr, "FAIL: open safetensors\n"); return 1; }
+  bool have_sr = false;
+  if(!st_path.empty()){
+    if(!sr.open(st_path)){ std::fprintf(stderr, "FAIL: open safetensors\n"); return 1; }
+    have_sr = true;
+  }
 
   // Determine which tensor names are "host-only" (small). The full-attention
   // / MLP projection weights are excluded for GPU mode to keep peak RAM sane
@@ -1976,7 +2035,7 @@ int main(int argc, char** argv){
   std::unique_ptr<Engine> gpu_probe;
 #ifdef INTFER_HAS_GPU_BACKEND
   if(gpu_mode != GpuMode::ForceOff){
-    gpu_probe = Engine::load(intfer_path, 1);
+    gpu_probe = Engine::load(intfer_path, tp_devices);
     if(gpu_probe){
       skip_large_weights = true;
     } else if(gpu_mode == GpuMode::ForceOn){
@@ -1991,7 +2050,46 @@ int main(int argc, char** argv){
 
   std::map<std::string, std::vector<float>> T;
   size_t total_loaded = 0;
+  // 1) IR FP16 passthrough tensors first (self-contained files). Trust the
+  // dequantized shape; the IR stores N/K explicitly (conv1d is [conv_dim,
+  // conv_k] flattened, norms/A_log/dt_bias are [D,1]).
+  size_t ir_host = 0;
+  {
+    std::unordered_map<std::string, size_t> ir_idx;
+    for(size_t i=0;i<m.tensors.size();++i) ir_idx[m.tensors[i].name]=i;
+    auto ir_get = [&](const std::string& n, std::vector<float>& out) -> bool {
+      auto it = ir_idx.find(n);
+      if(it==ir_idx.end()) return false;
+      const auto& t = m.tensors[it->second];
+      if(t.qcfg.scheme != QuantScheme::FP16) return false;
+      intfer::dashq::dequant_tensor(m, t, out);
+      return !out.empty();
+    };
+    std::vector<std::string> want = {
+      "model.language_model.embed_tokens.weight",
+      "model.language_model.norm.weight",
+      "lm_head.weight",
+      "model.language_model.lm_head.weight",
+    };
+    for(int L=0; L<cfg.layers; L++) for(const char* s : {
+        "input_layernorm.weight", "post_attention_layernorm.weight",
+        "self_attn.q_norm.weight", "self_attn.k_norm.weight",
+        "linear_attn.conv1d.weight", "linear_attn.A_log",
+        "linear_attn.dt_bias", "linear_attn.norm.weight"}){
+      char b[256];
+      snprintf(b, sizeof(b), "model.language_model.layers.%d.%s", L, s);
+      want.push_back(b);
+    }
+    for(const auto& n : want){
+      std::vector<float> v;
+      if(ir_get(n, v)){ total_loaded += v.size()*sizeof(float); T[n]=std::move(v); ++ir_host; }
+    }
+  }
+  std::fprintf(stderr, "[intfer] IR host tensors loaded=%zu\n", ir_host);
+  // 2) Safetensors fallback for host tensors missing from the IR.
+  if(have_sr){
   for(const auto& t : sr.tensors()){
+    if(T.count(t.name)) continue;  // IR wins over safetensors
     if(skip_large_weights && !host_only_names.count(t.name)) continue;
     // CPU path: load host tensors eagerly; projection weights are read
     // on demand through sr_fallback, so skip them here even on CPU
@@ -2003,37 +2101,49 @@ int main(int argc, char** argv){
     total_loaded += v.size() * sizeof(float);
     T[t.name] = std::move(v);
   }
-  std::fprintf(stderr, "[intfer] safetensors host tensors loaded=%zu (%.1f MB) projections=%s\n",
-               T.size(), total_loaded / (1024.0*1024.0),
+  std::fprintf(stderr, "[intfer] safetensors host tensors loaded=%zu (%.1f MB total) projections=%s\n",
+               T.size()-ir_host, total_loaded / (1024.0*1024.0),
                skip_large_weights ? "GPU-owned" : "on-demand via reader");
-  // ---- Auto-detect linear-attention head counts from safetensors shapes ----
+  } else {
+    std::fprintf(stderr, "[intfer] no safetensors (self-contained .intifer): host tensors=%zu\n", T.size());
+  }
+  // ---- Auto-detect linear-attention head counts from weight shapes ----
   // (Linear attention may use different head counts than full attention.)
   // in_proj_a: [N_V_HEADS, H], in_proj_z: [N_V_HEADS*V_HEAD_DIM, H]
-  for(const auto& t : sr.tensors()){
-    if(t.name.find("linear_attn.in_proj_a.weight") != std::string::npos){
-      if(t.shape.size()>=2 && t.shape[0] > 0 && t.shape[1] == cfg.H)
-        cfg.n_v_heads = (int)t.shape[0];
-    }
-    if(t.name.find("linear_attn.norm.weight") != std::string::npos){
-      if(!t.shape.empty()) cfg.v_head_dim = (int)t.shape[0];
-    }
-    if(t.name.find("linear_attn.in_proj_z.weight") != std::string::npos){
-      if(t.shape.size()>=2 && t.shape[1] == cfg.H){
-        int total = (int)t.shape[0];
-        int kk = total / cfg.n_v_heads;
-        if(total == cfg.n_v_heads * cfg.k_head_dim * 3)
-          cfg.k_head_dim = kk;
+  // Scans the IR first (self-contained files), then safetensors if present.
+  {
+    auto scan_shape = [&](const std::string& name, uint32_t N, uint32_t K){
+      if(name.find("linear_attn.in_proj_a.weight") != std::string::npos){
+        if(K == (uint32_t)cfg.H && N > 0)
+          cfg.n_v_heads = (int)N;
       }
-    }
-    if(t.name.find("linear_attn.in_proj_qkv.weight") != std::string::npos){
-      // qkv total = 2*K_HEAD_DIM*N_K_HEADS + N_V_HEADS*V_HEAD_DIM
-      if(t.shape.size()>=2 && t.shape[1] == cfg.H){
-        int total = (int)t.shape[0];
-        int vdim = cfg.n_v_heads * cfg.v_head_dim;
-        int qk = total - vdim;
-        if(qk > 0 && qk % (2*cfg.k_head_dim) == 0)
-          cfg.n_k_heads = qk / (2*cfg.k_head_dim);
+      if(name.find("linear_attn.norm.weight") != std::string::npos){
+        if(N > 0) cfg.v_head_dim = (int)N;
       }
+      if(name.find("linear_attn.in_proj_z.weight") != std::string::npos){
+        if(K == (uint32_t)cfg.H){
+          int total = (int)N;
+          int kk = total / cfg.n_v_heads;
+          if(total == cfg.n_v_heads * cfg.k_head_dim * 3)
+            cfg.k_head_dim = kk;
+        }
+      }
+      if(name.find("linear_attn.in_proj_qkv.weight") != std::string::npos){
+        // qkv total = 2*K_HEAD_DIM*N_K_HEADS + N_V_HEADS*V_HEAD_DIM
+        if(K == (uint32_t)cfg.H){
+          int total = (int)N;
+          int vdim = cfg.n_v_heads * cfg.v_head_dim;
+          int qk = total - vdim;
+          if(qk > 0 && qk % (2*cfg.k_head_dim) == 0)
+            cfg.n_k_heads = qk / (2*cfg.k_head_dim);
+        }
+      }
+    };
+    for(const auto& t : m.tensors) scan_shape(t.name, t.N, t.K);
+    if(have_sr) for(const auto& t : sr.tensors()){
+      uint32_t N = t.shape.empty() ? 0 : (uint32_t)t.shape[0];
+      uint32_t K = t.shape.size() < 2 ? 0 : (uint32_t)t.shape[1];
+      scan_shape(t.name, N, K);
     }
   }
   cfg.build();
@@ -2053,18 +2163,21 @@ int main(int argc, char** argv){
 
   // ---- Wire up layers (host state only)
   const float* embed = get("model.language_model.embed_tokens.weight").data();
-  // Pre-scan the safetensors to find which layers are linear-attention
-  // (have linear_attn.in_proj_qkv) vs full-attention (have self_attn.q_proj).
+  // Pre-scan the IR (then safetensors fallback) to find which layers are
+  // linear-attention (have linear_attn.in_proj_qkv) vs full-attention
+  // (have self_attn.q_proj).
   std::set<int> la_layers;
-  for(const auto& t : sr.tensors()){
-    if(t.name.find("linear_attn.in_proj_qkv") != std::string::npos){
-      size_t p = t.name.find("layers.");
-      if(p != std::string::npos){
-        std::string num = t.name.substr(p+7);
-        size_t dot = num.find('.');
-        if(dot != std::string::npos) la_layers.insert(std::atoi(num.c_str()));
-      }
-    }
+  {
+    auto scan_la = [&](const std::string& name){
+      if(name.find("linear_attn.in_proj_qkv") == std::string::npos) return;
+      size_t p = name.find("layers.");
+      if(p == std::string::npos) return;
+      std::string num = name.substr(p+7);
+      size_t dot = num.find('.');
+      if(dot != std::string::npos) la_layers.insert(std::atoi(num.c_str()));
+    };
+    for(const auto& t : m.tensors) scan_la(t.name);
+    if(have_sr) for(const auto& t : sr.tensors()) scan_la(t.name);
   }
   std::fprintf(stderr, "[intfer] la_layers detected: %zu layers (", la_layers.size());
   bool first = true;
@@ -2128,7 +2241,7 @@ int main(int argc, char** argv){
     // GPU backend probe succeeded earlier — reuse the loaded Engine.
     gpu_backend = std::make_unique<GpuBackend>();
     gpu_backend->eng = std::move(gpu_probe);
-    gpu_backend->sr_fallback = &sr;
+    gpu_backend->sr_fallback = have_sr ? &sr : nullptr;
     gpu_backend->build_index();
     std::fprintf(stderr, "[intfer] GPU backend: %d device(s) (TP=%s)\n",
                  gpu_backend->num_devices_,
@@ -2188,7 +2301,7 @@ int main(int argc, char** argv){
                    fp32_total / 1e9);
     }
     // (rid_map_global is a small global lookup populated right after deserialize)
-    cpu->sr_fallback = &sr;
+    cpu->sr_fallback = have_sr ? &sr : nullptr;
     cpu->host_names_fallback = &host_only_names;
     backend = std::move(cpu);
   }
