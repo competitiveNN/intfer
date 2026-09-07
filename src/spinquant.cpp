@@ -577,4 +577,53 @@ RotationSet deserialize_rotations(const uint8_t* data, size_t n) {
   return rs;
 }
 
+// --- Online activation application (fast Hadamard path) ---------------------
+// out = x R for Hadamard R (symmetric, so left-site R y is identical).
+// pow2: FWHT(x)/sqrt(n). Non-pow2 blockdiag(H_p, I): FWHT on the first p
+// entries, tail passes through. Temp buffer is caller-visible only as a
+// stack/local vector sized dim (max 4096 floats = 16KB, fine on stack, but
+// heap vector keeps this re-entrant and sanitizer-clean).
+void apply_rotation_fwht(const Rotation& R, const float* x, float* out) {
+  const uint32_t dim = R.dim;
+  if (dim == 0) return;
+  if (is_pow2(dim)) {
+    for (uint32_t i = 0; i < dim; ++i) out[i] = x[i];
+    fwht(out, dim);
+    const float inv = 1.0f / std::sqrt(static_cast<float>(dim));
+    for (uint32_t i = 0; i < dim; ++i) out[i] *= inv;
+  } else {
+    const uint32_t p = floor_pow2(dim);
+    std::vector<float> tmp(p);
+    for (uint32_t i = 0; i < p; ++i) tmp[i] = x[i];
+    fwht(tmp.data(), p);
+    const float inv = 1.0f / std::sqrt(static_cast<float>(p));
+    for (uint32_t i = 0; i < p; ++i) out[i] = tmp[i] * inv;
+    for (uint32_t i = p; i < dim; ++i) out[i] = x[i];
+  }
+}
+
+// Empirical Hadamard-shape check (see header). Tolerates float rounding:
+// mat entries are +/-s exactly as stored, so eps=1e-6 is generous.
+bool rotation_is_hadamard(const Rotation& R) {
+  const uint32_t dim = R.dim;
+  if (dim == 0 || R.mat.size() != (size_t)dim * dim) return false;
+  const uint32_t p = floor_pow2(dim);
+  const float s = 1.0f / std::sqrt(static_cast<float>(p));
+  const float eps = 1e-6f;
+  for (uint32_t i = 0; i < dim; ++i) {
+    for (uint32_t j = 0; j < dim; ++j) {
+      const float v = R.mat[(size_t)i * dim + j];
+      const float av = std::fabs(v);
+      if (i < p && j < p) {
+        if (std::fabs(av - s) > eps) return false;
+      } else if (i >= p && j >= p) {
+        if ((i == j ? std::fabs(v - 1.0f) : av) > eps) return false;
+      } else {
+        if (av > eps) return false;
+      }
+    }
+  }
+  return true;
+}
+
 } // namespace intfer

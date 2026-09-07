@@ -240,7 +240,12 @@ std::unique_ptr<Engine> Engine::load(const std::string& intfer_path,
     }
   }
   e->rs_ = std::move(rs);
-  for (const auto& R : e->rs_.rotations) e->rid_[R.id] = &R;
+  for (auto& R : e->rs_.rotations){
+    // The serializer does not persist is_hadamard: re-detect empirically so
+    // online replay (via rotation_for) can use the O(n log n) FWHT path.
+    R.is_hadamard = rotation_is_hadamard(R);
+    e->rid_[R.id] = &R;
+  }
 
   // Discover the 2x Arc B580 fleet and pick `tp_devices` of them.
   auto dm = device::DeviceManager::discover("Arc");

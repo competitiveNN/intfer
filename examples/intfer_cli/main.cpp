@@ -286,12 +286,16 @@ static void rope(float* h, int pos){
     h[d+cfg.rotary_dim/2]  = a*s + b*c;
   }
 }
-// SpinQuant online rotation helpers
+// SpinQuant online rotation helpers. Hadamard rotations (the only kind the
+// quantizer emits) take the O(n log n) FWHT path; anything else keeps the
+// dense O(n^2) matvec. Both compute the same map up to summation order.
 static void rot_apply(const float* x, const Rotation& R, float* out){
+  if(R.is_hadamard){ apply_rotation_fwht(R, x, out); return; }
   int dim = (int)R.dim;
   for(int j=0;j<dim;j++){ float s=0; for(int i=0;i<dim;i++) s+=x[i]*R.mat[i*dim+j]; out[j]=s; }
 }
 static void rot_left(const float* y, const Rotation& R, float* out){
+  if(R.is_hadamard){ apply_rotation_fwht(R, y, out); return; }
   int dim = (int)R.dim;
   for(int j=0;j<dim;j++){ float s=0; for(int i=0;i<dim;i++) s+=R.mat[j*dim+i]*y[i]; out[j]=s; }
 }
@@ -1824,7 +1828,15 @@ int main(int argc, char** argv){
   std::fprintf(stderr, "[intfer] deserialize_intfer done: %zu tensors, %zu rotations (borrowed)\n",
                m.tensors.size(), rs.rotations.size()); std::fflush(stderr);
   std::map<uint8_t, const Rotation*> rid_map;
-  for(const auto& R : rs.rotations) rid_map[R.id] = &R;
+  for(auto& R : rs.rotations){
+    // The serializer does not persist is_hadamard: re-detect it empirically
+    // so the online replay can use the O(n log n) FWHT path. Safe for any
+    // model file (learned/dense rotations fail the check and keep O(n^2)).
+    R.is_hadamard = rotation_is_hadamard(R);
+    std::fprintf(stderr, "[intfer] rotation id=%u dim=%u hadamard=%d\n",
+                 R.id, R.dim, (int)R.is_hadamard);
+    rid_map[R.id] = &R;
+  }
   rid_map_global = rid_map;
     // Populate CPU backend's per-layer QLinear tables from the deserialized IR.
   // (Done lazily after backend selection; see below.)

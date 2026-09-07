@@ -96,7 +96,25 @@ the batch.
 
 ---
 
-## TODO 4 — Host hot path (updated 2026-09-07: detok + 4a done, memcpy dead)
+## TODO 4 — Host hot path (updated 2026-09-07: detok + 4a + FWHT done, memcpy dead)
+
+**Status:**
+- DONE `711000d`: in-process BPE detokenizer (killed 158ms/token python
+  spawn). CPU 3.05→5.19 tok/s, GPU 3.3→4.01 tok/s. Byte-identical stdout.
+- DONE `73494a2`: 4a scratch arena (`StepScratch` + `run_linear_into` +
+  engine `act_staging_`). Mallocs 1540→~420/token, churn 4.8→1.1MB.
+  Wall-time NEUTRAL — the loop is compute-bound, not allocation-bound
+  (correction to the "allocation-bound" scoping below).
+- DONE (this commit): 4c FWHT online rotations. Probe (`INTFER_TIME_SSM`,
+  since removed) showed SSM = 2.7ms/tok (1.3%, vectorizes fine — DEAD end)
+  but SpinQuant replays = ~108ms/tok (~50% of GPU decode): the CLI ran
+  dense O(n²) matvecs (1.49ms each, strided columns) for Hadamard rotations.
+  Fix: `apply_rotation_fwht` + `rotation_is_hadamard` in spinquant lib,
+  flag re-detected after deserialize (serializer doesn't persist it),
+  wired in CLI `rot_apply`/`rot_left` + `Engine::load`. Rot cost
+  860→1.3ms/run. CPU 4.21→8.03 tok/s, GPU 4.06→8.55 tok/s, both parities
+  intact (`854×12`, `16 13 198 760 4087`). Handles non-pow2 dims via
+  blockdiag(H_p, I) (needed for 27B H=5120).
 
 **Status:**
 - DONE `711000d`: in-process BPE detokenizer (killed 158ms/token python
@@ -115,8 +133,11 @@ the batch.
   (graphs dead per TODO 2, fusion blocked by sequential deps).
 
 **Remaining (priority order):**
-- 4c: fuse elementwise chains (silu×mul, gate×attn, residual adds) —
-  biggest remaining chunk (~134ms host), helps BOTH backends.
+- 4c (continued): host elementwise now ~45ms/tok on GPU path (was ~134ms).
+  Next candidates: `name()` snprintf + map finds per linear (4b, hygiene),
+  norm/copy fusion. GPU profile now: submit 36ms + wait 10 + write 5.7 +
+  readback 5.2 + kernel 9.7 ≈ 67ms device-attributable vs 117ms decode —
+  host (~50ms) and submit overhead (~36ms) are the remaining chunks.
 - 4b: hoist `name()` snprintf + map finds — kills remaining ~420
   mallocs/token; hygiene, minimal wall-time (compute-bound).
 - 4d (later): host attention tiling for long context.

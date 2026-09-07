@@ -93,6 +93,19 @@ RotationSide side_for_role(TensorRole role);
 void rotate_weight(std::vector<float>& W, uint32_t N, uint32_t K,
                    const Rotation& R, RotationSide side);
 
+// --- Online activation application (fast Hadamard path) --------------------
+// out = x R (right-site, replaces rot_apply) or out = R y (left-site,
+// replaces rot_left): the same transform because the normalized Hadamard
+// matrix is symmetric. O(n log n) via FWHT; for non-pow2 dims the FWHT runs
+// on the power-of-two prefix and the identity tail passes through
+// (blockdiag(H_p, I) layout, matching make_hadamard). Only valid for
+// Hadamard-shaped R — gate with rotation_is_hadamard() (the serializer does
+// not persist is_hadamard, so it must be re-detected after deserialization).
+void apply_rotation_fwht(const Rotation& R, const float* x, float* out);
+// Empirical Hadamard check: every entry must be +/-1/sqrt(p) on the
+// power-of-two prefix block, identity on the tail, zero elsewhere.
+bool rotation_is_hadamard(const Rotation& R);
+
 // --- FP16 <-> float helpers (binary16, IEEE 754) -------------------------
 uint16_t f32_to_f16(float v);
 float    f16_to_f32(uint16_t h);
