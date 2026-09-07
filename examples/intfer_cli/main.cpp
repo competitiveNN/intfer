@@ -648,6 +648,8 @@ struct GpuBackend : public LinearBackend {
     // x_dev frees are deferred until after the kernel events complete
     // (sycl::free acts on the host immediately; freeing in-loop is a
     // use-after-free race against the not-yet-run kernel).
+    static const bool trace_lm = (std::getenv("INTFER_TRACE_LMHEAD") != nullptr);
+    auto t_lm0 = std::chrono::high_resolution_clock::now();
     std::vector<sycl::half> x_fp16(K);
     for(uint32_t i=0;i<K;i++) x_fp16[i] = sycl::half(fn[i]);
     std::vector<float> out(N, 0.f);
@@ -656,6 +658,7 @@ struct GpuBackend : public LinearBackend {
     evts.reserve(eng->num_devices());
     std::vector<sycl::half*> x_devs;
     x_devs.reserve(eng->num_devices());
+    double lm_kernel_us = 0;
     for(size_t d=0; d<eng->num_devices(); ++d){
       sycl::queue& q = eng->device_queue((int)d);
       sycl::half* x_dev = static_cast<sycl::half*>(
@@ -670,12 +673,24 @@ struct GpuBackend : public LinearBackend {
       // Under full-model device pressure that race kills the device; the
       // queue wait makes host consumption safe.
       q.wait();
+      try {
+        auto ts = evt.get_profiling_info<sycl::info::event_profiling::command_start>();
+        auto te = evt.get_profiling_info<sycl::info::event_profiling::command_end>();
+        lm_kernel_us += (double)(te - ts) / 1000.0;
+      } catch (...) {}
       evts.push_back(evt);
     }
     for(auto& e : evts) e.wait();
     for(size_t d=0; d<eng->num_devices(); ++d)
       sycl::free(x_devs[d], eng->device_queue((int)d));
     for(uint32_t i=0;i<N;i++) out[i] = static_cast<float>(out_h[i]);
+    if(trace_lm){
+      auto t_lm1 = std::chrono::high_resolution_clock::now();
+      double wall_us = std::chrono::duration<double, std::micro>(t_lm1 - t_lm0).count();
+      std::fprintf(stderr, "[lmhead] N=%u K=%u kernel=%.0fus wall=%.0fus\n",
+                   N, K, lm_kernel_us, wall_us);
+      std::fflush(stderr);
+    }
     return out;
   }
 
@@ -1038,10 +1053,16 @@ static StepOut step(int token, int pos,
   const float* head = lm_head ? lm_head : embed;
   std::fprintf(stderr, "[intfer] logits: vocab=%d H=%d head=%p\n", cfg.vocab, cfg.H, (const void*)head);
   std::fflush(stderr);
-  if(lm_head && backend){
+  if(backend){
     auto gpu = dynamic_cast<GpuBackend*>(backend);
     if(gpu){
-      logits = gpu->run_lm_head_f16(fn.data(), lm_head, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+      // GPU path for both untied (lm_head) and tied (embed rows) models.
+      // Tied models (0.8B) otherwise burn vocab*H host MACs per token
+      // (248320x1024 = 254M — ~5x the GPU GEMM work, the decode
+      // bottleneck per profiling: kernels were 10.6% of decode).
+      // The embed table uploads once via the backend's (N,K)-keyed cache.
+      const float* W = lm_head ? lm_head : embed;
+      logits = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
     }else{
       for(int v=0; v<cfg.vocab; v++){
         const float* er = head + (size_t)v*cfg.H;
@@ -1789,10 +1810,14 @@ int main(int argc, char** argv){
       "  total_wait_us     : %.1f (%lu waits)\n"
       "  total_copy_us     : %.1f (%lu copies)\n"
       "  total_readback_us : %.1f (%lu readbacks)\n"
+      "  total_usm_write_us: %.1f\n"
+      "  total_submit_us   : %.1f\n"
+      "  total_waitblock_us: %.1f\n"
       "  peak_wait_depth   : %lu\n"
       "  kernel %% of decode : %.1f%%\n",
       p.kernel_us, p.kernel_count, p.wait_us, p.wait_count,
       p.copy_us, p.copy_count, p.readback_us, p.readback_count,
+      p.usm_write_us, p.submit_us, p.waitblock_us,
       p.peak_wait_depth,
       100.0 * (p.kernel_us / 1000.0) / std::max(1.0, decode_ms));
   }

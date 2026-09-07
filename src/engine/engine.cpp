@@ -54,6 +54,9 @@ Engine::~Engine() {
     double total_wait_us    = 0.0;
     double total_copy_us    = 0.0;
     double total_readback_us = 0.0;
+    double total_usm_write_us = 0.0;  // host USM activation write loop
+    double total_submit_us = 0.0;     // q.submit (launch) host overhead
+    double total_waitblock_us = 0.0;  // event.wait() blocking host time
     uint64_t peak_wait_depth = 0;
     uint64_t kernel_count   = 0;
     uint64_t wait_count     = 0;
@@ -291,6 +294,22 @@ void Engine::build_shards() {
   layer_tensors_.assign(maxL + 1, {});
   for (size_t ti = 0; ti < model_.tensors.size(); ++ti)
     if (layer_of_[ti] >= 0) layer_tensors_[(size_t)layer_of_[ti]].push_back((int)ti);
+  // Auto-disable layer-wise streaming when the full model fits comfortably
+  // in VRAM. Streaming evicts + rebuilds every layer on each advance, so a
+  // small model (0.8B: ~0.2GB) pays a full malloc_shared + host repack per
+  // tensor per token for no benefit. begin_layer() early-returns on an
+  // empty layer_tensors_, so clearing it disables eviction entirely.
+  // Threshold 4GB: far above small models, far below 27B (~23GB).
+  {
+    uint64_t total_w = 0;
+    for (const auto& t : model_.tensors) total_w += t.weight_bytes();
+    // Per-device footprint ≈ weights + act/out working buffers (small).
+    if (total_w < 4ULL * 1024 * 1024 * 1024) {
+      layer_tensors_.clear();
+      std::cout << "Engine: streaming disabled (model "
+                << total_w / (1024 * 1024) << " MB fits in VRAM)\n";
+    }
+  }
 }
 
 int Engine::layer_of_name(const std::string& name) {
@@ -429,14 +448,26 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
  
     // 1) Write FP16 activation directly into persistent USM act buffer.
     std::uint16_t* const act_ptr = sc.act_usm[d];
+#ifdef INTFER_PROFILE_GPU
+    auto t_w0 = std::chrono::high_resolution_clock::now();
+#endif
     for (uint32_t m = 0; m < M; ++m)
       for (uint32_t k = 0; k < t.K; ++k)
         act_ptr[(size_t)m * t.K + k] = act_fp16[(size_t)m * t.K + k];
- 
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_usm_write_us += std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+    }
+#endif
+
     // 2) Launch the USM kernel on the persistent weight buffers.
     float alpha = sc.has_global_divisor
                       ? sc.global_usm[d][0]
                       : 1.0f;
+#ifdef INTFER_PROFILE_GPU
+    auto t_s0 = std::chrono::high_resolution_clock::now();
+#endif
     sycl::event kernel_evt = gemm::quant_gemm_forward_usm(q,
                                   sc.act_usm[d],
                                   sc.code_usm[d],
@@ -448,6 +479,12 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
                                   sc.scheme,
                                   sycl::event{});
 #ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_submit_us += std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+    }
+#endif
+#ifdef INTFER_PROFILE_GPU
     if (kernel_events.size() + 1 > g_gpu_profile.peak_wait_depth)
       g_gpu_profile.peak_wait_depth = kernel_events.size() + 1;
 #endif
@@ -458,12 +495,30 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   // NOTE: the wait is load-bearing, not profiling — without it the host
   // reads out_usm before the kernel runs (fresh zero pages => all-zero
   // GEMM outputs). Only the timing accumulation is profiling-gated.
+#ifdef INTFER_PROFILE_GPU
+  auto t_wb0 = std::chrono::high_resolution_clock::now();
+#endif
   for (size_t d = 0; d < devices_.size(); ++d) {
     kernel_events[d].wait();
   }
 #ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_waitblock_us += std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
+  }
   g_gpu_profile.wait_count += devices_.size();
- 
+  // Device-side kernel time from event profiling timestamps (the queue is
+  // created with enable_profiling). This separates actual XMX/compute time
+  // from host-side launch + wait overhead.
+  for (auto& e : kernel_events) {
+    try {
+      auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
+      auto t1 = e.get_profiling_info<sycl::info::event_profiling::command_end>();
+      g_gpu_profile.total_kernel_us += (double)(t1 - t0) / 1000.0;
+      g_gpu_profile.kernel_count++;
+    } catch (...) {}
+  }
+
   auto t_rb0 = std::chrono::high_resolution_clock::now();
 #endif
   for (size_t d = 0; d < devices_.size(); ++d) {
@@ -487,6 +542,8 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   GpuProfileSnapshot get_gpu_profile() {
     return {g_gpu_profile.total_kernel_us, g_gpu_profile.total_wait_us,
             g_gpu_profile.total_copy_us, g_gpu_profile.total_readback_us,
+            g_gpu_profile.total_usm_write_us, g_gpu_profile.total_submit_us,
+            g_gpu_profile.total_waitblock_us,
             g_gpu_profile.peak_wait_depth,
             g_gpu_profile.kernel_count, g_gpu_profile.wait_count,
             g_gpu_profile.copy_count, g_gpu_profile.readback_count};
