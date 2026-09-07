@@ -278,6 +278,49 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
   const int nk_blocks = (static_cast<int>(K) + kBK - 1) / kBK;
   const auto* code_u8 = static_cast<const std::uint8_t*>(code_usm);
 
+  // TODO 6: INT8 DPAS fast path. Quantize FP16 activations to INT8 and
+  // dispatch the XMX DPAS systolic path when shapes are compatible.
+  if (scheme == WeightScheme::INT8 && M >= 8 && (K % 32 == 0) && (N % 16 == 0) && group_size == 0) {
+    std::vector<std::int8_t> a_int8(M * K);
+    float a_scale = 0.0f;
+    for (uint32_t i = 0; i < M * K; ++i) {
+      const float v = static_cast<float>(sycl::bit_cast<sycl::half>(act_usm[i]));
+      a_scale = std::max(a_scale, std::abs(v));
+    }
+    a_scale = std::max(a_scale, 1e-6f) / 127.0f;
+    for (uint32_t i = 0; i < static_cast<uint32_t>(M * K); ++i) {
+      const float v = static_cast<float>(sycl::bit_cast<sycl::half>(act_usm[i]));
+      a_int8[i] = static_cast<std::int8_t>(
+          std::round(std::clamp(v / a_scale, -127.0f, 127.0f)));
+    }
+
+    std::vector<std::int8_t> w_int8(static_cast<size_t>(N) * K);
+    for (uint32_t n = 0; n < N; ++n)
+      for (uint32_t k = 0; k < K; ++k)
+        w_int8[static_cast<size_t>(k) * N + n] =
+            static_cast<std::int8_t>(code_u8[static_cast<size_t>(n) * K + k]);
+    std::vector<std::int8_t> w_vnni(static_cast<size_t>(N) * K);
+    build_vnni_int8(w_int8.data(), w_vnni.data(), N, K);
+
+    std::vector<float> w_scale_f(N);
+    for (uint32_t n = 0; n < N; ++n)
+      w_scale_f[n] = from_half_bits(scale_usm[n]) * alpha;
+
+    auto* a_dev = sycl::malloc_device<std::int8_t>(static_cast<size_t>(M) * K, q);
+    auto* w_dev = sycl::malloc_device<std::int8_t>(static_cast<size_t>(N) * K, q);
+    auto* ws_dev = sycl::malloc_device<float>(N, q);
+    q.memcpy(a_dev, a_int8.data(), static_cast<size_t>(M) * K * sizeof(std::int8_t)).wait();
+    q.memcpy(w_dev, w_vnni.data(), static_cast<size_t>(N) * K * sizeof(std::int8_t)).wait();
+    q.memcpy(ws_dev, w_scale_f.data(), N * sizeof(float)).wait();
+
+    auto evt = quant_gemm_dpas_int8(q, a_dev, a_scale, w_dev, ws_dev,
+                                      out_usm, M, N, K);
+    sycl::free(a_dev, q);
+    sycl::free(w_dev, q);
+    sycl::free(ws_dev, q);
+    return evt;
+  }
+
   // Fast path for M=1 (single-token decode): eliminate tiling overhead.
   // The general kernel uses kBM=64 tiles and a 16x16 work-group (256 threads
   // per group, 16384 total for N=4096), but only 16 work-items produce

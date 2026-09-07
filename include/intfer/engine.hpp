@@ -135,8 +135,10 @@ class Engine {
   struct CachedShard {
     bool built = false;
     gemm::WeightScheme scheme = gemm::WeightScheme::INT8;
+    gemm::ActScheme act_scheme = gemm::ActScheme::FP16;
     uint32_t group_size = 0;
     bool has_global_divisor = false;
+    bool use_dpas = true;  // TODO 6: enable XMX DPAS path when eligible
     uint32_t N_local = 0;   // N rows on this device (post-shard)
     uint32_t K = 0;
     // Per-device persistent USM pointers (size = devices_.size()).
