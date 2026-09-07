@@ -1070,7 +1070,7 @@ static StepOut step(int token, int pos,
 }
 
 // ============================================================================
-// Batched decode helper
+// Batched decode helper (runs each token through the full step() sequentially)
 // ============================================================================
 static std::vector<StepOut> step_batch(const std::vector<int>& tokens,
                                         int pos,
@@ -1703,6 +1703,9 @@ int main(int argc, char** argv){
   if(decode_batch > 1){
     // Multi-token decode: process decode_batch tokens in parallel.
     // This keeps the GPU busy and amortizes kernel launch overhead.
+    // NOTE: current step_batch() runs each token sequentially through step().
+    // A true batched forward (single kernel launch per layer) requires
+    // restructuring step() to accept M>1 hidden states.
     std::vector<int> batch;
     batch.reserve(decode_batch);
     for(int step_i = 0; step_i < max_new; step_i += batch.size()){
