@@ -138,14 +138,26 @@ the batch.
   (graphs dead per TODO 2, fusion blocked by sequential deps).
 
 **Remaining (priority order):**
+- DONE `202cfa0`: 4b hoist per-layer names + SSM host pointers into `g_ln`
+  (built once after backend selection — kills ~366 snprintf+malloc/token).
+  ROTATIONS DELIBERATELY NOT HOISTED: `CpuBackend::rot_for` is
+  state-dependent (cold pre-GEMM it falls through to a per-layer first-hit
+  scan; warm it returns the per-slot rotation from `cache_R`). Resolving up
+  front froze wrong pointers (prefill 854→13104 garbage). Also removed an
+  OOB `g_ln[L]` read in the layer-setup loop (ran before `g_ln` was built).
+  CPU parity `854×12` == baseline; GPU `220 16 13 198 760` == ref.
+  Decode 4.03→6.09 tok/s CPU, 7.94 tok/s GPU (0.8B).
+- RE-VALIDATED on 27B post-4b (no further change): `.re` GPU
+  `-p "The capital of France is" -n 3` gives prefill→11751 +
+  decode→13, 198, matching the HF oracle `11751 13 198 760`.
 - 4c (continued): host elementwise now ~45ms/tok on GPU path (was ~134ms).
   Next candidates: `name()` snprintf + map finds per linear (4b, hygiene),
   norm/copy fusion. GPU profile now: submit 36ms + wait 10 + write 5.7 +
   readback 5.2 + kernel 9.7 ≈ 67ms device-attributable vs 117ms decode —
   host (~50ms) and submit overhead (~36ms) are the remaining chunks.
-- 4b: hoist `name()` snprintf + map finds — kills remaining ~420
-  mallocs/token; hygiene, minimal wall-time (compute-bound).
 - 4d (later): host attention tiling for long context.
+- (4b struck: hoisting is DONE per above — the old "4b: hoist name()
+  snprintf + map finds" line below is superseded by `202cfa0`.)
 
 **Why (original):** Only the 7 quantized Linears per layer are GPU-accelerated. The
 RMSNorm, RoPE, attention scores, mamba SSM, lm_head matmul (248320×1024),
