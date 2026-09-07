@@ -1194,6 +1194,272 @@ static void munmap_blob(MmapBlob& b) {
 static bool file_exists(const std::string& p){
   struct stat st; return stat(p.c_str(), &st)==0;
 }
+
+// ============================================================================
+// In-process BPE detokenizer (no python subprocess per token)
+// ============================================================================
+// Qwen3.5/3.8 vocabs are pure GPT-2 byte-images: every vocab string consists
+// solely of the 256 byte-image codepoints (printable ASCII/latin-1 kept as-is,
+// other bytes mapped to U+0100..U+0143). Verified over all 248044 entries of
+// both tokenizers. Decode = id->string lookup + codepoint->byte reversal.
+// Parsed once from tokenizer.json ("model"."vocab" object + "added_tokens"
+// array); raw UTF-8 with only \" and \\ escapes inside the vocab region.
+// Byte-identical to scripts/bpe_detokenize.py for mergeable ids; added-token
+// ids decode to their content (old script emitted empty — only affects text
+// rendering of special tokens, never the EOS break which compares ids).
+struct BpDecoder {
+  std::vector<std::string> bytes_of; // bytes_of[id] = raw bytes
+  bool ok = false;
+
+  // GPT-2 byte<->unicode maps (identical to the python helper).
+  static void byte_image_maps(unsigned char img2byte[324], uint32_t byte2img[256]){
+    // Printable bytes map to themselves; non-printables (in byte order)
+    // map to U+0100... in sequence.
+    bool printable[256] = {};
+    for(int b=33;b<=126;b++) printable[b]=true;
+    for(int b=161;b<=172;b++) printable[b]=true;
+    for(int b=174;b<=255;b++) printable[b]=true;
+    for(int b=0;b<256;b++)
+      if(printable[b]){ img2byte[b]= (unsigned char)b; byte2img[b]=(uint32_t)b; }
+    int n = 0;
+    for(int b=0;b<256;b++)
+      if(!printable[b]){ img2byte[256+n]= (unsigned char)b; byte2img[b]=256+n; n++; }
+  }
+
+  // Decode one UTF-8 codepoint at p; returns bytes consumed (0 on error).
+  static int utf8_decode(const char* p, const char* end, uint32_t* cp){
+    unsigned char c = (unsigned char)*p;
+    if(c < 0x80){ *cp = c; return 1; }
+    if((c & 0xE0) == 0xC0){
+      if(p+1 >= end) return 0;
+      *cp = ((uint32_t)(c & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F);
+      return 2;
+    }
+    if((c & 0xF0) == 0xE0){
+      if(p+2 >= end) return 0;
+      *cp = ((uint32_t)(c & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6)
+          | ((unsigned char)p[2] & 0x3F);
+      return 3;
+    }
+    if((c & 0xF8) == 0xF0){
+      if(p+3 >= end) return 0;
+      *cp = ((uint32_t)(c & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12)
+          | (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F);
+      return 4;
+    }
+    return 0;
+  }
+
+  // token string (JSON-unescaped, UTF-8) -> raw bytes via byte-image map.
+  static std::string token_to_bytes(const std::string& tok,
+                                    const unsigned char img2byte[324],
+                                    const uint32_t byte2img[256]){
+    (void)byte2img;
+    std::string out; out.reserve(tok.size());
+    const char* p = tok.data(); const char* end = p + tok.size();
+    while(p < end){
+      uint32_t cp = 0; int n = utf8_decode(p, end, &cp);
+      if(n <= 0) break; // malformed: stop (matches old script's best-effort)
+      if(cp < 256)
+        out.push_back((char)img2byte[cp]);
+      else if(cp >= 256 && cp < 256+68)
+        out.push_back((char)img2byte[cp]);
+      else {
+        // Non-byte-image char (never occurs in audited vocabs): re-encode
+        // as UTF-8 like the old script's ch.encode("utf-8") fallback.
+        if(cp < 0x80) out.push_back((char)cp);
+        else if(cp < 0x800){
+          out.push_back((char)(0xC0 | (cp >> 6)));
+          out.push_back((char)(0x80 | (cp & 0x3F)));
+        } else if(cp < 0x10000){
+          out.push_back((char)(0xE0 | (cp >> 12)));
+          out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+          out.push_back((char)(0x80 | (cp & 0x3F)));
+        } else {
+          out.push_back((char)(0xF0 | (cp >> 18)));
+          out.push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
+          out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+          out.push_back((char)(0x80 | (cp & 0x3F)));
+        }
+      }
+      p += n;
+    }
+    return out;
+  }
+
+  bool load(const std::string& tok_json_path){
+    std::vector<uint8_t> blob;
+    if(!read_blob(tok_json_path, blob)) return false;
+    blob.push_back(0); // null-terminate for strstr/strchr/strtol
+    const char* base = (const char*)blob.data();
+    size_t size = blob.size();
+    // Find "model" object then its "vocab" object.
+    const char* p = strstr(base, "\"vocab\"");
+    if(!p) return false;
+    p = strchr(p, '{');
+    if(!p) return false;
+    p++;
+    unsigned char img2byte[324]; uint32_t byte2img[256];
+    byte_image_maps(img2byte, byte2img);
+    std::vector<std::pair<std::string,int>> pairs;
+    pairs.reserve(250000);
+    auto skip_ws = [&](){
+      while(p < base+size && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r')) p++;
+    };
+    while(p < base+size){
+      skip_ws();
+      if(p >= base+size) break;
+      if(*p == '}') break;
+      if(*p != '"') return false;
+      p++; // opening quote of key
+      std::string key;
+      bool esc = false;
+      while(p < base+size){
+        char c = *p++;
+        if(esc){
+          if(c=='"'||c=='\\'||c=='/') key.push_back(c);
+          else if(c=='n') key.push_back('\n');
+          else if(c=='t') key.push_back('\t');
+          else if(c=='u'){
+            // \uXXXX (never occurs in audited vocab regions; support BMP)
+            if(p+4 > base+size) return false;
+            unsigned v = 0;
+            for(int i=0;i<4;i++){
+              char h = *p++;
+              v <<= 4;
+              if(h>='0'&&h<='9') v |= (unsigned)(h-'0');
+              else if(h>='a'&&h<='f') v |= (unsigned)(h-'a'+10);
+              else if(h>='A'&&h<='F') v |= (unsigned)(h-'A'+10);
+              else return false;
+            }
+            if(v < 0x80) key.push_back((char)v);
+            else if(v < 0x800){
+              key.push_back((char)(0xC0|(v>>6)));
+              key.push_back((char)(0x80|(v&0x3F)));
+            } else {
+              key.push_back((char)(0xE0|(v>>12)));
+              key.push_back((char)(0x80|((v>>6)&0x3F)));
+              key.push_back((char)(0x80|(v&0x3F)));
+            }
+          }
+          else { key.push_back(c); } // best-effort
+          esc = false;
+        } else if(c == '\\'){ esc = true; }
+        else if(c == '"'){ break; }
+        else key.push_back(c);
+      }
+      skip_ws();
+      if(p >= base+size || *p != ':') return false;
+      p++;
+      skip_ws();
+      char* e = nullptr;
+      long id = strtol(p, &e, 10);
+      if(e == p || id < 0) return false;
+      p = e;
+      pairs.emplace_back(std::move(key), (int)id);
+      skip_ws();
+      if(p < base+size && *p == ','){ p++; continue; }
+      if(p < base+size && *p == '}') break;
+    }
+    size_t vmax = 0;
+    for(auto& kv : pairs) if((size_t)kv.second > vmax) vmax = kv.second;
+    bytes_of.assign(vmax+1, std::string());
+    for(auto& kv : pairs) bytes_of[kv.second] = token_to_bytes(kv.first, img2byte, byte2img);
+    // Added tokens: decode to their UTF-8 content.
+    const char* ap = strstr(base, "\"added_tokens\"");
+    if(ap){
+      const char* arr = strchr(ap, '[');
+      if(arr){
+        // Bounded scan: find the array's closing ']' with string awareness,
+        // then parse each top-level {...} object strictly within bounds.
+        // (Unbounded strstr past the array would match "id" vocab keys.)
+        const char* ae = nullptr;
+        {
+          bool instr = false, esc = false; int depth = 0;
+          for(const char* q = arr; q < base+size; q++){
+            char c = *q;
+            if(instr){
+              if(esc) esc = false;
+              else if(c == '\\') esc = true;
+              else if(c == '"') instr = false;
+            } else {
+              if(c == '"') instr = true;
+              else if(c == '[') depth++;
+              else if(c == ']'){ if(--depth == 0){ ae = q; break; } }
+            }
+          }
+        }
+        if(ae){
+          auto find_lit = [](const char* lo, const char* hi,
+                             const char* lit) -> const char* {
+            size_t n = strlen(lit);
+            if(hi < lo || (size_t)(hi - lo) < n) return nullptr;
+            for(const char* q = lo; q + n <= hi; q++)
+              if(memcmp(q, lit, n) == 0) return q;
+            return nullptr;
+          };
+          for(const char* q = arr + 1; q < ae;){
+            const char* ob = find_lit(q, ae, "{");
+            if(!ob) break;
+            // match the object's closing brace (string-aware)
+            const char* oe = nullptr;
+            {
+              bool instr = false, esc = false; int depth = 0;
+              for(const char* r = ob; r < ae; r++){
+                char c = *r;
+                if(instr){
+                  if(esc) esc = false;
+                  else if(c == '\\') esc = true;
+                  else if(c == '"') instr = false;
+                } else {
+                  if(c == '"') instr = true;
+                  else if(c == '{') depth++;
+                  else if(c == '}'){ if(--depth == 0){ oe = r; break; } }
+                }
+              }
+            }
+            if(!oe) break;
+            const char* ids = find_lit(ob, oe, "\"id\"");
+            const char* cs = find_lit(ob, oe, "\"content\"");
+            if(ids && cs){
+              char* e = nullptr;
+              const char* num = ids + 4;
+              while(num < oe && (*num==' '||*num=='\t'||*num==':')) num++;
+              long id = strtol(num, &e, 10);
+              const char* q1 = find_lit(cs + 9, oe, "\"");
+              if(e != num && q1){
+                q1++;
+                std::string content;
+                bool es2 = false;
+                const char* r = q1;
+                while(r < oe){
+                  char c = *r++;
+                  if(es2){ content.push_back(c=='n'?'\n':c=='t'?'\t':c); es2=false; }
+                  else if(c=='\\') es2 = true;
+                  else if(c=='"') break;
+                  else content.push_back(c);
+                }
+                if(id >= 0){
+                  if((size_t)id >= bytes_of.size()) bytes_of.resize((size_t)id+1);
+                  bytes_of[(size_t)id] = content;
+                }
+              }
+            }
+            q = oe + 1;
+          }
+        }
+      }
+    }
+    ok = true;
+    return true;
+  }
+
+  std::string decode_one(int id) const {
+    if(id < 0 || (size_t)id >= bytes_of.size()) return {};
+    return bytes_of[id];
+  }
+};
+static BpDecoder g_bpdec;
 static std::string quote_for_shell(const std::string& s){
   std::string out = "'";
   for(char c : s){
@@ -1224,6 +1490,9 @@ static std::vector<int> encode_text(const std::string& text,
 }
 static std::string detokenize_one(int id, const std::string& detok_py,
                                   const std::string& tokenizer_json){
+  (void)detok_py;
+  // In-process fast path: parsed vocab lookup (no python spawn).
+  if(g_bpdec.ok) return g_bpdec.decode_one(id);
   char idbuf[32]; snprintf(idbuf, sizeof(idbuf), " --id %d", id);
   std::string cmd = "python3 " + quote_for_shell(detok_py) +
                     " --tokenizer " + quote_for_shell(tokenizer_json) +
@@ -1684,6 +1953,12 @@ int main(int argc, char** argv){
   std::fprintf(stderr, "[intfer] starting prefill...\n"); std::fflush(stderr);
 
   // ---- Tokenize the prompt
+  // In-process detokenizer: parse the vocab once (12MB JSON, ~50ms) so the
+  // decode loop needs no python subprocess per token (~158ms each).
+  if(g_bpdec.load(tokenizer_json))
+    std::fprintf(stderr, "[intfer] BpDecoder: %zu ids ready\n", g_bpdec.bytes_of.size());
+  else
+    std::fprintf(stderr, "[intfer] BpDecoder: load failed, using python fallback\n");
   std::vector<int> prompt_ids;
   if(!prompt.empty()){
     prompt_ids = encode_text(prompt, tokenizer_json, tokenizer_py);
