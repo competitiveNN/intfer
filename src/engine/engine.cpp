@@ -359,26 +359,56 @@ std::vector<float> Engine::decode_step(const std::vector<float>& token_hidden,
   run_linear_tp(ti, token_hidden, out);
   return out;
 }
-
+ 
+std::vector<std::vector<float>> Engine::decode_step_batch(
+    const std::vector<std::vector<float>>& batch_hidden,
+    int tensor_index) {
+  std::vector<std::vector<float>> out;
+  if (batch_hidden.empty()) return out;
+  const uint32_t M = static_cast<uint32_t>(batch_hidden.size());
+  const int ti = (tensor_index >= 0 &&
+                  (size_t)tensor_index < model_.tensors.size())
+                     ? tensor_index
+                     : 0;
+  const auto& t = model_.tensors[ti];
+  std::vector<float> x;
+  x.reserve((size_t)M * t.K);
+  for (const auto& row : batch_hidden) x.insert(x.end(), row.begin(), row.end());
+  std::vector<float> y;
+  run_linear_tp(ti, x, y, M);
+  out.reserve(M);
+  for (uint32_t i = 0; i < M; ++i)
+    out.emplace_back(y.begin() + i * t.N, y.begin() + (i + 1) * t.N);
+  return out;
+}
+ 
 void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
                            std::vector<float>& out) {
+  run_linear_tp(tensor_index, x, out, 1);
+}
+
+void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
+                           std::vector<float>& out, uint32_t M) {
   if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size()) return;
   const auto& t = model_.tensors[tensor_index];
   const auto& ranges = shards_[tensor_index].ranges;
-  if (out.size() != t.N) out.resize(t.N);
-
+  if (M == 0) M = 1;
+  const uint32_t out_elems = M * t.N;
+  if (out.size() != out_elems) out.resize(out_elems);
+ 
   // Lazy-build the USM shard cache for this tensor on first call.
   if (!shard_cache_[tensor_index].built)
     ensure_shard_built(tensor_index);
   const auto& sc = shard_cache_[tensor_index];
-
+ 
   // Pre-convert FP32 activation to FP16 once (shared by all devices).
 #ifdef INTFER_PROFILE_GPU
   auto t_copy0 = std::chrono::high_resolution_clock::now();
 #endif
-  std::vector<std::uint16_t> act_fp16(t.K);
-  for (uint32_t k = 0; k < t.K; ++k)
-    act_fp16[k] = dashq::float_to_half(x[k]);
+  std::vector<std::uint16_t> act_fp16((size_t)M * t.K);
+  for (uint32_t m = 0; m < M; ++m)
+    for (uint32_t k = 0; k < t.K; ++k)
+      act_fp16[(size_t)m * t.K + k] = dashq::float_to_half(x[(size_t)m * t.K + k]);
 #ifdef INTFER_PROFILE_GPU
   {
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -386,22 +416,23 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     g_gpu_profile.copy_count++;
   }
 #endif
-
+ 
   // Issue all device work in parallel and collect kernel events.
   std::vector<sycl::event> kernel_events;
   kernel_events.reserve(devices_.size());
-
+ 
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto& dev = devices_[d];
     auto [start, end] = ranges[d];
     sycl::queue& q = dev.queue;
     auto N_local = end - start;
-
+ 
     // 1) Write FP16 activation directly into persistent USM act buffer.
     std::uint16_t* const act_ptr = sc.act_usm[d];
-    for (uint32_t k = 0; k < t.K; ++k)
-      act_ptr[k] = act_fp16[k];
-
+    for (uint32_t m = 0; m < M; ++m)
+      for (uint32_t k = 0; k < t.K; ++k)
+        act_ptr[(size_t)m * t.K + k] = act_fp16[(size_t)m * t.K + k];
+ 
     // 2) Launch the USM kernel on the persistent weight buffers.
     float alpha = sc.has_global_divisor
                       ? sc.global_usm[d][0]
@@ -412,7 +443,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
                                   sc.scale_usm[d],
                                   alpha,
                                   sc.out_usm[d],
-                                  1, N_local, t.K,
+                                  M, N_local, t.K,
                                   sc.group_size,
                                   sc.scheme,
                                   sycl::event{});
@@ -422,7 +453,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
 #endif
     kernel_events.push_back(kernel_evt);
   }
-
+ 
   // Wait for all kernels, then read back directly from persistent USM.
   // NOTE: the wait is load-bearing, not profiling — without it the host
   // reads out_usm before the kernel runs (fresh zero pages => all-zero
@@ -432,14 +463,16 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   }
 #ifdef INTFER_PROFILE_GPU
   g_gpu_profile.wait_count += devices_.size();
-
+ 
   auto t_rb0 = std::chrono::high_resolution_clock::now();
 #endif
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto [start, end] = ranges[d];
     const std::uint16_t* out_ptr = sc.out_usm[d];
-    for (uint32_t r = 0; r < static_cast<uint32_t>(end - start); ++r)
-      out[start + r] = dashq::half_to_float(out_ptr[r]);
+    const uint32_t N_local_rb = static_cast<uint32_t>(end - start);
+    for (uint32_t m = 0; m < M; ++m)
+      for (uint32_t r = 0; r < N_local_rb; ++r)
+        out[(size_t)m * t.N + (start + r)] = dashq::half_to_float(out_ptr[(size_t)m * N_local_rb + r]);
   }
 #ifdef INTFER_PROFILE_GPU
   {
@@ -465,8 +498,14 @@ void Engine::run_linear_f16_tp(const sycl::half* x, const sycl::half* w,
                                float* out, uint32_t N, uint32_t K,
                                const sycl::event& copy_dep) {
   // One-off per-device weight buffer. We copy the full W to each device;
-  // each device computes the full N rows and the host then reads back.
-  // This is fine because lm_head is a one-off matmul, not the hot loop.
+  // each device computes the full N rows; the host reads back halves from
+  // device 0 and converts to float on the host (c_dev holds N halves, not
+  // N floats — a direct N*sizeof(float) device read is a 2x OOB read).
+  // Device frees are deferred until after all events complete (sycl::free
+  // acts on the host immediately; freeing in-loop races the kernel).
+  struct DevBufs { sycl::half *w_dev, *x_dev, *c_dev; sycl::queue* q; };
+  std::vector<DevBufs> bufs;
+  bufs.reserve(devices_.size());
   std::vector<sycl::event> evts;
   evts.reserve(devices_.size());
   for (size_t d = 0; d < devices_.size(); ++d) {
@@ -479,17 +518,23 @@ void Engine::run_linear_f16_tp(const sycl::half* x, const sycl::half* w,
         sycl::malloc_device((size_t)K * sizeof(sycl::half), dev.sycl_device, dev.sycl_context));
     sycl::half* c_dev = static_cast<sycl::half*>(
         sycl::malloc_device((size_t)N * sizeof(sycl::half), dev.sycl_device, dev.sycl_context));
+    bufs.push_back({w_dev, x_dev, c_dev, &q});
 
     q.memcpy(w_dev, w, w_bytes);
     q.memcpy(x_dev, x, (size_t)K * sizeof(sycl::half)).wait();
     sycl::event evt = gemm::quant_gemm_f16(q, x_dev, w_dev, c_dev, 1, N, K);
-    q.memcpy(out, c_dev, (size_t)N * sizeof(float), evt);
     evts.push_back(evt);
-    sycl::free(w_dev, q);
-    sycl::free(x_dev, q);
-    sycl::free(c_dev, q);
   }
   for (auto& e : evts) e.wait();
+  // Read back N halves from device 0 and convert on the host.
+  std::vector<sycl::half> tmp(N);
+  bufs[0].q->memcpy(tmp.data(), bufs[0].c_dev, (size_t)N * sizeof(sycl::half)).wait();
+  for (uint32_t i = 0; i < N; ++i) out[i] = static_cast<float>(tmp[i]);
+  for (auto& b : bufs) {
+    sycl::free(b.w_dev, *b.q);
+    sycl::free(b.x_dev, *b.q);
+    sycl::free(b.c_dev, *b.q);
+  }
 }
 
 const Rotation* Engine::rotation_for(int tensor_index) const {

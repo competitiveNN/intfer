@@ -51,6 +51,9 @@ class Engine {
   // `tensor_index` selects which Linear tensor is exercised (defaults to 0).
   std::vector<float> decode_step(const std::vector<float>& token_hidden,
                                  int tensor_index = 0);
+  // Batched decode: M tokens, each hidden length K. Returns M x hidden.
+  std::vector<std::vector<float>> decode_step_batch(const std::vector<std::vector<float>>& batch_hidden,
+                                 int tensor_index = 0);
 
   // --- Full hybrid forward (Stage-2 integration) -----------------------------
   // Get the model IR (readonly).
@@ -62,6 +65,9 @@ class Engine {
   // Run ONE quantized Linear tensor-parallel across the fleet.
   void run_linear_tp(int tensor_index, const std::vector<float>& x,
                      std::vector<float>& out);
+  // Batched variant: x is M*K row-major; out is M*N row-major.
+  void run_linear_tp(int tensor_index, const std::vector<float>& x,
+                     std::vector<float>& out, uint32_t M);
   
   // FP16 x FP16 GEMM for non-quantized final heads (lm_head/embed).
   // C[1,N] = x[1,K] * W[N,K]^T. All row-major. Outputs FP32 logits.
