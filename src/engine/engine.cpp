@@ -54,6 +54,7 @@ Engine::~Engine() {
     double total_wait_us    = 0.0;
     double total_copy_us    = 0.0;
     double total_readback_us = 0.0;
+    uint64_t peak_wait_depth = 0;
     uint64_t kernel_count   = 0;
     uint64_t wait_count     = 0;
     uint64_t copy_count     = 0;
@@ -405,9 +406,6 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     float alpha = sc.has_global_divisor
                       ? sc.global_usm[d][0]
                       : 1.0f;
-#ifdef INTFER_PROFILE_GPU
-    auto t_k0 = std::chrono::high_resolution_clock::now();
-#endif
     sycl::event kernel_evt = gemm::quant_gemm_forward_usm(q,
                                   sc.act_usm[d],
                                   sc.code_usm[d],
@@ -419,11 +417,8 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
                                   sc.scheme,
                                   sycl::event{});
 #ifdef INTFER_PROFILE_GPU
-    {
-      auto t1 = std::chrono::high_resolution_clock::now();
-      g_gpu_profile.total_kernel_us += std::chrono::duration<double, std::micro>(t1 - t_k0).count();
-      g_gpu_profile.kernel_count++;
-    }
+    if (kernel_events.size() + 1 > g_gpu_profile.peak_wait_depth)
+      g_gpu_profile.peak_wait_depth = kernel_events.size() + 1;
 #endif
     kernel_events.push_back(kernel_evt);
   }
@@ -432,18 +427,11 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   // NOTE: the wait is load-bearing, not profiling — without it the host
   // reads out_usm before the kernel runs (fresh zero pages => all-zero
   // GEMM outputs). Only the timing accumulation is profiling-gated.
-#ifdef INTFER_PROFILE_GPU
-  auto t_wait0 = std::chrono::high_resolution_clock::now();
-#endif
   for (size_t d = 0; d < devices_.size(); ++d) {
     kernel_events[d].wait();
-#ifdef INTFER_PROFILE_GPU
-    g_gpu_profile.wait_count++;
-#endif
   }
 #ifdef INTFER_PROFILE_GPU
-  auto t_wait1 = std::chrono::high_resolution_clock::now();
-  g_gpu_profile.total_wait_us += std::chrono::duration<double, std::micro>(t_wait1 - t_wait0).count();
+  g_gpu_profile.wait_count += devices_.size();
 
   auto t_rb0 = std::chrono::high_resolution_clock::now();
 #endif
@@ -466,6 +454,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   GpuProfileSnapshot get_gpu_profile() {
     return {g_gpu_profile.total_kernel_us, g_gpu_profile.total_wait_us,
             g_gpu_profile.total_copy_us, g_gpu_profile.total_readback_us,
+            g_gpu_profile.peak_wait_depth,
             g_gpu_profile.kernel_count, g_gpu_profile.wait_count,
             g_gpu_profile.copy_count, g_gpu_profile.readback_count};
   }

@@ -1616,10 +1616,12 @@ int main(int argc, char** argv){
       "  total_wait_us     : %.1f (%lu waits)\n"
       "  total_copy_us     : %.1f (%lu copies)\n"
       "  total_readback_us : %.1f (%lu readbacks)\n"
+      "  peak_wait_depth   : %lu\n"
       "  kernel %% of decode : %.1f%%\n",
       p.kernel_us, p.kernel_count, p.wait_us, p.wait_count,
       p.copy_us, p.copy_count, p.readback_us, p.readback_count,
-      100.0 * p.kernel_us / decode_ms);
+      p.peak_wait_depth,
+      100.0 * (p.kernel_us / 1000.0) / std::max(1.0, decode_ms));
   }
 #endif
   if(!stream) std::fwrite(output.data(), 1, output.size(), stdout);

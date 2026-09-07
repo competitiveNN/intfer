@@ -193,7 +193,14 @@ class Engine {
 #ifdef INTFER_PROFILE_GPU
 // GPU profiling helpers (enabled via -DINTFER_PROFILE_GPU).
 struct GpuProfileSnapshot {
-  double kernel_us, wait_us, copy_us, readback_us;
+  // Aggregate accumulated times (host-side chrono + device timestamps where available).
+  double kernel_us;
+  double wait_us;
+  double copy_us;
+  double readback_us;
+  // Peak instantaneous queue depth observed during `run_linear_tp`.
+  uint64_t peak_wait_depth;
+  // Counters.
   uint64_t kernel_count, wait_count, copy_count, readback_count;
 };
 namespace intfer {
