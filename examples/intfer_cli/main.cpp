@@ -764,6 +764,62 @@ struct GpuBackend : public LinearBackend {
 };
 #endif
 
+// Per-layer precomputed tensor names + host pointers (TODO 4b). step()
+// used to rebuild every "model.language_model.layers.L.slot" string via
+// snprintf (~366/token) plus per-call get() map finds for SSM params.
+// All loop-invariant: build once after backend selection, use by
+// reference. ROTATIONS ARE DELIBERATELY NOT HOISTED: CpuBackend::rot_for
+// is state-dependent — cold (pre-GEMM) it falls through to a per-layer
+// first-hit scan, warm (post-ensure_cached) it returns the per-slot
+// rotation from cache_R. Resolving up front froze wrong pointers and
+// broke output (854 -> 13104 on prefill). rot_for itself is cheap
+// (a few map finds); the snprintf+malloc was the cost.
+struct LayerNames {
+  std::string q, k, v, o;          // full-attn linears
+  std::string qkv, z, b, a, la_out;// LA linears
+  std::string gate, up, down;      // MLP linears
+  const float *conv_w=nullptr, *A_log=nullptr, *dt_bias=nullptr, *ssm_norm_w=nullptr;
+};
+static std::vector<LayerNames> g_ln;
+// layer_state: pass is_full flags (Layer is defined below; vector<bool>
+// avoids the forward-declaration tangle).
+static void build_layer_names(
+    const std::map<std::string, std::vector<float>>& T,
+    const std::vector<char>& layer_is_full){
+  g_ln.assign(cfg.layers, LayerNames());
+  auto hptr = [&](const std::string& n) -> const float* {
+    auto it = T.find(n);
+    if(it==T.end()){ std::fprintf(stderr, "missing tensor: %s\n", n.c_str()); std::exit(1); }
+    return it->second.data();
+  };
+  for(int L=0; L<cfg.layers; L++){
+    LayerNames& ln = g_ln[L];
+    char b[256];
+    auto mk = [&](const char* slot) -> std::string {
+      snprintf(b, sizeof(b), "model.language_model.layers.%d.%s", L, slot);
+      return std::string(b);
+    };
+    ln.q=mk("self_attn.q_proj.weight"); ln.k=mk("self_attn.k_proj.weight");
+    ln.v=mk("self_attn.v_proj.weight"); ln.o=mk("self_attn.o_proj.weight");
+    ln.qkv=mk("linear_attn.in_proj_qkv.weight"); ln.z=mk("linear_attn.in_proj_z.weight");
+    ln.b=mk("linear_attn.in_proj_b.weight");     ln.a=mk("linear_attn.in_proj_a.weight");
+    ln.la_out=mk("linear_attn.out_proj.weight");
+    ln.gate=mk("mlp.gate_proj.weight"); ln.up=mk("mlp.up_proj.weight");
+    ln.down=mk("mlp.down_proj.weight");
+    if(!layer_is_full[(size_t)L]){
+      char hb[256];
+      auto hm = [&](const char* slot) -> std::string {
+        snprintf(hb, sizeof(hb), "model.language_model.layers.%d.%s", L, slot);
+        return std::string(hb);
+      };
+      ln.conv_w=hptr(hm("linear_attn.conv1d.weight"));
+      ln.A_log =hptr(hm("linear_attn.A_log"));
+      ln.dt_bias=hptr(hm("linear_attn.dt_bias"));
+      ln.ssm_norm_w=hptr(hm("linear_attn.norm.weight"));
+    }
+  }
+  std::fprintf(stderr, "[intfer] layer names + host ptrs precomputed for %d layers\n", cfg.layers);
+}
 // ============================================================================
 // Per-layer state (host-resident)
 // ============================================================================
@@ -876,21 +932,11 @@ static StepOut step(int token, int pos,
   std::vector<float>& h = g_scratch.h;
   for(int i=0;i<cfg.H;i++) h[i] = row[i];
 
-  // Per-layer HF-tensor name prefix
-  auto name = [&](int L, const char* slot){
-    char b[256]; snprintf(b, sizeof(b),
-        "model.language_model.layers.%d.%s", L, slot);
-    return std::string(b);
-  };
-  auto get = [&](const std::string& n) -> const std::vector<float>& {
-    auto it = T.find(n);
-    if(it==T.end()){ std::fprintf(stderr, "missing tensor: %s\n", n.c_str()); std::exit(1); }
-    return it->second;
-  };
-
+  // Per-layer names/rotations/host-ptrs are precomputed once (g_ln).
    for(int L=0; L<cfg.layers; L++){
    if((L & 15) == 0){ std::fprintf(stderr, "[intfer] forward L=%d/%d pos=%d hsize=%zu layers=%zu\n", L, cfg.layers, pos, h.size(), layers.size()); std::fflush(stderr); }
    if(L < 0 || (size_t)L >= layers.size()){ std::fprintf(stderr, "[intfer] FATAL layer OOB\n"); std::exit(1); }
+   const LayerNames& ln = g_ln[(size_t)L];
    Layer& ly = layers[L];
    std::vector<float>& res = g_scratch.res;
    for(int i=0;i<cfg.H;i++) res[i] = h[i];
@@ -899,12 +945,12 @@ static StepOut step(int token, int pos,
    ckpt_h(L, normed, "post_in_ln");
   if(ly.is_full){
       // ---- Attention path (q/k/v right-site; o left-site) ----
-      const Rotation* Rq = backend->rot_for(name(L, "self_attn.q_proj.weight"));
+      const Rotation* Rq = backend->rot_for(ln.q);
       std::vector<float>& xq = g_scratch.xq;
       for(int i=0;i<cfg.H;i++) xq[i] = normed[i];
       if(Rq) rot_apply(normed.data(), *Rq, xq.data());
       std::vector<float>& qp = g_scratch.qp;
-      backend->run_linear_into(name(L, "self_attn.q_proj.weight"), xq, qp);
+      backend->run_linear_into(ln.q, xq, qp);
       ckpt("attn.q_proj", L, qp);
       // q/gate split. Both known models pack q+gate per-head interleaved:
       // rows = 2*n_heads*head_dim (0.8B: 2*8*256=4096; 27B: 2*24*256=12288;
@@ -935,8 +981,8 @@ static StepOut step(int token, int pos,
         memcpy(&qpart[hh*cfg.head_dim], tmp, cfg.head_dim*sizeof(float));
         rope(&qpart[hh*cfg.head_dim], pos);
       }
-      const Rotation* Rk = backend->rot_for(name(L, "self_attn.k_proj.weight"));
-      const Rotation* Rv = backend->rot_for(name(L, "self_attn.v_proj.weight"));
+      const Rotation* Rk = backend->rot_for(ln.k);
+      const Rotation* Rv = backend->rot_for(ln.v);
       std::vector<float>& xk = g_scratch.xk;
       std::vector<float>& xv = g_scratch.xv;
       for(int i=0;i<cfg.H;i++){ xk[i] = normed[i]; xv[i] = normed[i]; }
@@ -944,8 +990,8 @@ static StepOut step(int token, int pos,
       if(Rv) rot_apply(normed.data(), *Rv, xv.data());
       std::vector<float>& k = g_scratch.k;
       std::vector<float>& v = g_scratch.v;
-      backend->run_linear_into(name(L, "self_attn.k_proj.weight"), xk, k);
-      backend->run_linear_into(name(L, "self_attn.v_proj.weight"), xv, v);
+      backend->run_linear_into(ln.k, xk, k);
+      backend->run_linear_into(ln.v, xv, v);
       ckpt("attn.k_proj", L, k); ckpt("attn.v_proj", L, v);
       for(int hh=0; hh<cfg.n_kv; hh++){
         float tmp[cfg.head_dim]; rmsnorm(&k[hh*cfg.head_dim], ly.k_norm_w, tmp, cfg.head_dim);
@@ -1016,21 +1062,21 @@ static StepOut step(int token, int pos,
           for(size_t i=0;i<attn_n;i++){ o_in[i]=attn[i]; o_in[attn_n+i]=gate[i]; }
           o_x = &o_in;
         }
-        backend->run_linear_into(name(L, "self_attn.o_proj.weight"), *o_x, o_raw);
+        backend->run_linear_into(ln.o, *o_x, o_raw);
         ckpt("attn.o_proj", L, o_raw);
         // If the backend used the packed width (K=n_heads*hd) the extra gate
         // tail is ignored by the GEMM (x longer than K); if it used the wide
         // width the full concat is consumed. Both cases are handled because
         // run_linear contracts min(x.size(), K).
       }
-      const Rotation* Ro = backend->rot_for(name(L, "self_attn.o_proj.weight"));
+      const Rotation* Ro = backend->rot_for(ln.o);
       if(Ro) rot_left(o_raw.data(), *Ro, h.data());
       else for(int i=0;i<cfg.H;i++) h[i] = o_raw[i];
     } else {
       // ---- Linear-attention / SSM path (uses .intifer quantized weights) ----
-      const float* conv_w = get(name(L,"linear_attn.conv1d.weight")).data();
-      const float* A_log  = get(name(L,"linear_attn.A_log")).data();
-      const float* dt_bias= get(name(L,"linear_attn.dt_bias")).data();
+      const float* conv_w = ln.conv_w;
+      const float* A_log  = ln.A_log;
+      const float* dt_bias= ln.dt_bias;
       // Use the .intifer dequantized weights via the CPU backend instead of
       // loading FP32 safetensors for these matmuls. The .intifer stores the
       // same weights (FP16-quantized) and the backend dequantizes on demand.
@@ -1038,12 +1084,12 @@ static StepOut step(int token, int pos,
       // activation before the GEMM), out_proj is left-site (R.y after).
       // The LA branch previously skipped both replays, feeding raw normed
       // into rotated-quantized weights (27B: L0 out 0.1781 vs HF -0.0240).
-        const Rotation* Rqkv = backend->rot_for(name(L,"linear_attn.in_proj_qkv.weight"));
+        const Rotation* Rqkv = backend->rot_for(ln.qkv);
         std::vector<float>& xqkv = g_scratch.xqkv;
         for(int i=0;i<cfg.H;i++) xqkv[i] = normed[i];
         if(Rqkv) rot_apply(normed.data(), *Rqkv, xqkv.data());
         std::vector<float>& mqkv = g_scratch.mqkv;
-        backend->run_linear_into(name(L,"linear_attn.in_proj_qkv.weight"), xqkv, mqkv);
+        backend->run_linear_into(ln.qkv, xqkv, mqkv);
         ckpt("la.qkv", L, mqkv);
         std::vector<float>& conv_out = g_scratch.conv_out;
       for(int c=0;c<cfg.conv_dim;c++){
@@ -1060,9 +1106,9 @@ static StepOut step(int token, int pos,
       float* query=conv_out.data();
       float* key=conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
       float* value=conv_out.data()+2*cfg.k_head_dim*cfg.n_k_heads;
-        const Rotation* Rz = backend->rot_for(name(L,"linear_attn.in_proj_z.weight"));
-        const Rotation* Rb = backend->rot_for(name(L,"linear_attn.in_proj_b.weight"));
-        const Rotation* Ra = backend->rot_for(name(L,"linear_attn.in_proj_a.weight"));
+        const Rotation* Rz = backend->rot_for(ln.z);
+        const Rotation* Rb = backend->rot_for(ln.b);
+        const Rotation* Ra = backend->rot_for(ln.a);
         std::vector<float>& xz = g_scratch.xz;
         std::vector<float>& xb = g_scratch.xb;
         std::vector<float>& xa = g_scratch.xa;
@@ -1073,9 +1119,9 @@ static StepOut step(int token, int pos,
         std::vector<float>& z = g_scratch.z;
         std::vector<float>& b = g_scratch.b;
         std::vector<float>& a = g_scratch.a;
-        backend->run_linear_into(name(L,"linear_attn.in_proj_z.weight"), xz, z);
-        backend->run_linear_into(name(L,"linear_attn.in_proj_b.weight"), xb, b);
-        backend->run_linear_into(name(L,"linear_attn.in_proj_a.weight"), xa, a);
+        backend->run_linear_into(ln.z, xz, z);
+        backend->run_linear_into(ln.b, xb, b);
+        backend->run_linear_into(ln.a, xa, a);
         ckpt("la.z", L, z); ckpt("la.b", L, b); ckpt("la.a", L, a);
         std::vector<float>& g = g_scratch.g;
       for(int hh=0; hh<cfg.n_v_heads; hh++){
@@ -1113,7 +1159,7 @@ static StepOut step(int token, int pos,
           core[hh*cfg.v_head_dim+c]=s;
         }
       }
-        const float* ssm_norm_w = get(name(L,"linear_attn.norm.weight")).data();
+        const float* ssm_norm_w = ln.ssm_norm_w;
       std::vector<float>& normed_core = g_scratch.normed_core;
       for(int hh=0; hh<cfg.n_v_heads; hh++){
         const float* x=&core[hh*cfg.v_head_dim];
@@ -1124,17 +1170,17 @@ static StepOut step(int token, int pos,
         for(int i=0;i<cfg.v_head_dim;i++) o[i]=(x[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
       }
       std::vector<float>& o_la = g_scratch.o_la;
-      backend->run_linear_into(name(L,"linear_attn.out_proj.weight"), normed_core, o_la);
-      const Rotation* Ro_la = backend->rot_for(name(L,"linear_attn.out_proj.weight"));
+      backend->run_linear_into(ln.la_out, normed_core, o_la);
+      const Rotation* Ro_la = backend->rot_for(ln.la_out);
       if(Ro_la){ for(int i=0;i<cfg.H;i++) h[i] = 0.f; rot_left(o_la.data(), *Ro_la, h.data()); }
       else for(int i=0;i<cfg.H;i++) h[i] = o_la[i];
       ckpt("la.out", L, h);
   if(trace_h && pos==0 && (L==0 || L==3)){
     // Debug-only path: keep allocating impl (cold, gated by env flag).
-    std::vector<float> pmqkv = backend->run_linear(name(L,"linear_attn.in_proj_qkv.weight"), xqkv);
-    std::vector<float> pz = backend->run_linear(name(L,"linear_attn.in_proj_z.weight"), xz);
-    std::vector<float> pa = backend->run_linear(name(L,"linear_attn.in_proj_a.weight"), xa);
-    std::vector<float> pb = backend->run_linear(name(L,"linear_attn.in_proj_b.weight"), xb);
+    std::vector<float> pmqkv = backend->run_linear(ln.qkv, xqkv);
+    std::vector<float> pz = backend->run_linear(ln.z, xz);
+    std::vector<float> pa = backend->run_linear(ln.a, xa);
+    std::vector<float> pb = backend->run_linear(ln.b, xb);
     std::fprintf(stderr, "[dbg] L=%d pos=%d h_attn[:4]=%.4f %.4f %.4f %.4f qkv_sz=%zu qkv0=%.4f z0=%.4f a0=%.4f b0=%.4f\n",
                  L, pos, h[0], h[1], h[2], h[3], pmqkv.size(),
                  pmqkv.empty()?-999:pmqkv[0], pz.empty()?-999:pz[0],
@@ -1148,21 +1194,21 @@ static StepOut step(int token, int pos,
     // ---- MLP (gate/up right-site; down left-site) ----
     std::vector<float>& rn2 = g_scratch.rn2;
     rmsnorm(h.data(), ly.post_ln, rn2.data(), cfg.H);
-    const Rotation* Rg = backend->rot_for(name(L, "mlp.gate_proj.weight"));
+    const Rotation* Rg = backend->rot_for(ln.gate);
     std::vector<float>& rin = g_scratch.rin;
     for(int i=0;i<cfg.H;i++) rin[i] = rn2[i];
     if(Rg) rot_apply(rn2.data(), *Rg, rin.data());
     std::vector<float>& mg = g_scratch.mg;
-    backend->run_linear_into(name(L, "mlp.gate_proj.weight"), rin, mg);
+    backend->run_linear_into(ln.gate, rin, mg);
     ckpt("mlp.gate", L, mg);
     std::vector<float>& mu = g_scratch.mu;
-    backend->run_linear_into(name(L, "mlp.up_proj.weight"),   rin, mu);
+    backend->run_linear_into(ln.up,   rin, mu);
     ckpt("mlp.up", L, mu);
     for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
     std::vector<float>& md = g_scratch.md;
-    backend->run_linear_into(name(L, "mlp.down_proj.weight"), mg, md);
+    backend->run_linear_into(ln.down, mg, md);
     ckpt("mlp.down", L, md);
-    const Rotation* Rd = backend->rot_for(name(L, "mlp.down_proj.weight"));
+    const Rotation* Rd = backend->rot_for(ln.down);
     if(trace_h && pos==0 && L==0){
       double n2=0; for(float x : mg) n2+=(double)x*x;
       std::fprintf(stderr, "[dbg] L=%d mlp mg|.|=%.6f mg[:4]=%.6f %.6f %.6f %.6f mu[:4]=%.6f %.6f %.6f %.6f md[:4]=%.6f %.6f %.6f %.6f Rg=%p Rd=%p\n",
@@ -2113,6 +2159,14 @@ int main(int argc, char** argv){
     backend = std::move(cpu);
   }
   std::fprintf(stderr, "[intfer] backend: %s\n", backend->name());
+  // 4b: precompute per-layer names + host pointers (loop-invariant).
+  // NOTE: rotations stay live via backend->rot_for (state-dependent,
+  // must not be resolved before the first GEMM warms the cache).
+  {
+    std::vector<char> is_full((size_t)cfg.layers);
+    for(int L=0; L<cfg.layers; L++) is_full[(size_t)L] = layers[(size_t)L].is_full ? 1 : 0;
+    build_layer_names(T, is_full);
+  }
   std::fprintf(stderr, "[intfer] starting prefill...\n"); std::fflush(stderr);
 
   // ---- Tokenize the prompt
