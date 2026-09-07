@@ -947,8 +947,10 @@ static StepOut step(int token, int pos,
       // ---- Attention path (q/k/v right-site; o left-site) ----
       const Rotation* Rq = backend->rot_for(ln.q);
       std::vector<float>& xq = g_scratch.xq;
-      for(int i=0;i<cfg.H;i++) xq[i] = normed[i];
+      // Fusion: rot_apply fully overwrites xq, so the pre-copy is dead
+      // when Rq is present (else-branch preserves the no-rotation path).
       if(Rq) rot_apply(normed.data(), *Rq, xq.data());
+      else for(int i=0;i<cfg.H;i++) xq[i] = normed[i];
       std::vector<float>& qp = g_scratch.qp;
       backend->run_linear_into(ln.q, xq, qp);
       ckpt("attn.q_proj", L, qp);
@@ -977,25 +979,28 @@ static StepOut step(int token, int pos,
         for(size_t i=0; i<qrows && i<qp.size(); i++) qpart[i] = qp[i];
       }
       for(int hh=0; hh<cfg.n_heads; hh++){
-        float tmp[cfg.head_dim]; rmsnorm(&qpart[hh*cfg.head_dim], ly.q_norm_w, tmp, cfg.head_dim);
-        memcpy(&qpart[hh*cfg.head_dim], tmp, cfg.head_dim*sizeof(float));
+        // Fusion: rmsnorm reduces first, then writes element-wise, so
+        // in-place is bit-identical (kills tmp[] + memcpy per head).
+        rmsnorm(&qpart[hh*cfg.head_dim], ly.q_norm_w, &qpart[hh*cfg.head_dim], cfg.head_dim);
         rope(&qpart[hh*cfg.head_dim], pos);
       }
       const Rotation* Rk = backend->rot_for(ln.k);
       const Rotation* Rv = backend->rot_for(ln.v);
       std::vector<float>& xk = g_scratch.xk;
       std::vector<float>& xv = g_scratch.xv;
-      for(int i=0;i<cfg.H;i++){ xk[i] = normed[i]; xv[i] = normed[i]; }
+      // Fusion: rot_apply fully overwrites; pre-copy only for !R path.
       if(Rk) rot_apply(normed.data(), *Rk, xk.data());
+      else for(int i=0;i<cfg.H;i++) xk[i] = normed[i];
       if(Rv) rot_apply(normed.data(), *Rv, xv.data());
+      else for(int i=0;i<cfg.H;i++) xv[i] = normed[i];
       std::vector<float>& k = g_scratch.k;
       std::vector<float>& v = g_scratch.v;
       backend->run_linear_into(ln.k, xk, k);
       backend->run_linear_into(ln.v, xv, v);
       ckpt("attn.k_proj", L, k); ckpt("attn.v_proj", L, v);
       for(int hh=0; hh<cfg.n_kv; hh++){
-        float tmp[cfg.head_dim]; rmsnorm(&k[hh*cfg.head_dim], ly.k_norm_w, tmp, cfg.head_dim);
-        memcpy(&k[hh*cfg.head_dim], tmp, cfg.head_dim*sizeof(float));
+        // Fusion: in-place rmsnorm is bit-identical (see q_norm above).
+        rmsnorm(&k[hh*cfg.head_dim], ly.k_norm_w, &k[hh*cfg.head_dim], cfg.head_dim);
         rope(&k[hh*cfg.head_dim], pos);
       }
       int base = pos*(cfg.n_kv*cfg.head_dim);
@@ -1023,7 +1028,8 @@ static StepOut step(int token, int pos,
       // decode and the TP shard of K/V is small — see `qwen_forward_gpu`
       // for the FlashAttention integration on the 1st device).
       std::vector<float>& attn = g_scratch.attn;
-      for(int i=0;i<cfg.n_heads*cfg.head_dim;i++) attn[i] = 0.f;
+      // Fusion: the bulk zero is dead — each head's block is zeroed
+      // (oh[d]=0) before accumulation in the loop below.
       for(int hh=0; hh<cfg.n_heads; hh++){
         int kvh=hh/(cfg.n_heads/cfg.n_kv);
         float* scores = g_scratch.scores_for(pos); float mx=-1e30f;
@@ -1086,8 +1092,9 @@ static StepOut step(int token, int pos,
       // into rotated-quantized weights (27B: L0 out 0.1781 vs HF -0.0240).
         const Rotation* Rqkv = backend->rot_for(ln.qkv);
         std::vector<float>& xqkv = g_scratch.xqkv;
-        for(int i=0;i<cfg.H;i++) xqkv[i] = normed[i];
+        // Fusion: rot_apply fully overwrites; pre-copy only for !R path.
         if(Rqkv) rot_apply(normed.data(), *Rqkv, xqkv.data());
+        else for(int i=0;i<cfg.H;i++) xqkv[i] = normed[i];
         std::vector<float>& mqkv = g_scratch.mqkv;
         backend->run_linear_into(ln.qkv, xqkv, mqkv);
         ckpt("la.qkv", L, mqkv);
@@ -1112,10 +1119,13 @@ static StepOut step(int token, int pos,
         std::vector<float>& xz = g_scratch.xz;
         std::vector<float>& xb = g_scratch.xb;
         std::vector<float>& xa = g_scratch.xa;
-        for(int i=0;i<cfg.H;i++){ xz[i] = normed[i]; xb[i] = normed[i]; xa[i] = normed[i]; }
+        // Fusion: rot_apply fully overwrites; pre-copy only for !R path.
         if(Rz) rot_apply(normed.data(), *Rz, xz.data());
+        else for(int i=0;i<cfg.H;i++) xz[i] = normed[i];
         if(Rb) rot_apply(normed.data(), *Rb, xb.data());
+        else for(int i=0;i<cfg.H;i++) xb[i] = normed[i];
         if(Ra) rot_apply(normed.data(), *Ra, xa.data());
+        else for(int i=0;i<cfg.H;i++) xa[i] = normed[i];
         std::vector<float>& z = g_scratch.z;
         std::vector<float>& b = g_scratch.b;
         std::vector<float>& a = g_scratch.a;
@@ -1196,8 +1206,9 @@ static StepOut step(int token, int pos,
     rmsnorm(h.data(), ly.post_ln, rn2.data(), cfg.H);
     const Rotation* Rg = backend->rot_for(ln.gate);
     std::vector<float>& rin = g_scratch.rin;
-    for(int i=0;i<cfg.H;i++) rin[i] = rn2[i];
+    // Fusion: rot_apply fully overwrites; pre-copy only for !R path.
     if(Rg) rot_apply(rn2.data(), *Rg, rin.data());
+    else for(int i=0;i<cfg.H;i++) rin[i] = rn2[i];
     std::vector<float>& mg = g_scratch.mg;
     backend->run_linear_into(ln.gate, rin, mg);
     ckpt("mlp.gate", L, mg);
