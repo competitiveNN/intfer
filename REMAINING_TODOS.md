@@ -115,6 +115,11 @@ the batch.
   860→1.3ms/run. CPU 4.21→8.03 tok/s, GPU 4.06→8.55 tok/s, both parities
   intact (`854×12`, `16 13 198 760 4087`). Handles non-pow2 dims via
   blockdiag(H_p, I) (needed for 27B H=5120).
+- VALIDATED on 27B post-commit (no code change): `.re` GPU `-n 1` run gives
+  prefill→11751 + decode→13, matching the HF oracle sequence
+  `11751 13 198 760`. Prefill 414→331s. The blockdiag FWHT path (p=4096 +
+  identity tail, all 4 rotations dim=5120 detected hadamard=1) is
+  argmax-correct at 27B scale.
 
 **Status:**
 - DONE `711000d`: in-process BPE detokenizer (killed 158ms/token python
