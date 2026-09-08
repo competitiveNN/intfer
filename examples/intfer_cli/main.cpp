@@ -2924,6 +2924,18 @@ int main(int argc, char** argv){
   double prefill_ms = std::chrono::duration<double, std::milli>(t1-t0).count();
   std::fprintf(stderr, "[intfer] prefill: %d tokens in %.1f ms (%.1f tok/s)\n",
                S, prefill_ms, S*1000.0/std::max(1.0, prefill_ms));
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto p = get_gpu_profile();
+    std::fprintf(stderr,
+      "[GPU profile @prefill] kernel=%.1fms submit=%.1fms waitblock=%.1fms "
+      "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms\n",
+      p.kernel_us/1000.0, p.submit_us/1000.0, p.waitblock_us/1000.0,
+      p.rebuild_us/1000.0, p.rebuild_count,
+      p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0);
+    reset_gpu_profile();
+  }
+#endif
 
   int token = generated.back();
   std::string output;
@@ -3011,6 +3023,17 @@ int main(int argc, char** argv){
   int ng = (int)generated.size();
   std::fprintf(stderr, "\n[intfer] decode: %d tokens in %.1f ms (%.2f tok/s)\n",
                ng, decode_ms, ng*1000.0/std::max(1.0, decode_ms));
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto p = get_gpu_profile();
+    std::fprintf(stderr,
+      "[GPU profile @decode] kernel=%.1fms submit=%.1fms waitblock=%.1fms "
+      "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms\n",
+      p.kernel_us/1000.0, p.submit_us/1000.0, p.waitblock_us/1000.0,
+      p.rebuild_us/1000.0, p.rebuild_count,
+      p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0);
+  }
+#endif
 #ifdef INTFER_PROFILE_GPU
   {
     auto p = get_gpu_profile();
