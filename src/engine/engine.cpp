@@ -13,6 +13,7 @@
 #include "intfer/engine.hpp"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <fcntl.h>
@@ -367,8 +368,17 @@ void Engine::release_shard(int tensor_index) {
 
 void Engine::begin_layer(int L) {
   if (layer_tensors_.empty()) return;
+  // Phase 1: FP16-scheme shards are memcpy-identity slices (no unpack work)
+  // and small enough to stay resident: layered FP16 is ~13.5GB total, i.e.
+  // ~6.7GB per device under TP=2, well under the 12GB B580 budget
+  // (plus ~2.5GB cached lm_head and the INT4 streaming working set).
+  // Skipping their eviction kills ~75% of per-token evict+rebuild traffic.
+  // INTFER_STREAM_F16=1 restores the old evict-everything behavior.
+  static const bool stream_f16 = (std::getenv("INTFER_STREAM_F16") != nullptr);
   for (size_t ti = 0; ti < shard_cache_.size(); ++ti) {
     if (!shard_cache_[ti].built) continue;
+    if (!stream_f16 && shard_cache_[ti].scheme == gemm::WeightScheme::FP16)
+      continue;
     int tl = (ti < layer_of_.size()) ? layer_of_[ti] : -1;
     if (tl >= 0 && tl != L) release_shard((int)ti);
   }

@@ -55,6 +55,7 @@ echo "---"
 echo "prefill token: $(grep -a -oE 'decode step 0: token=[0-9]+' "$CLI_ERR" | sed -E 's/.*=//') (expect 11751)"
 echo "decode ids:    $GOT (expect prefix: $EXPECT)"
 grep -a -E "prefill:|decode:" "$CLI_ERR" | tail -2
+grep -a -A11 "GPU profile" "$CLI_ERR" | tail -12
 
 PASS=1
 [ "$PREFILL_OK" = 1 ] || { echo "GATE FAIL: prefill != 11751" >&2; PASS=0; }
