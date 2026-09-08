@@ -57,6 +57,8 @@ Engine::~Engine() {
     double total_usm_write_us = 0.0;  // host USM activation write loop
     double total_submit_us = 0.0;     // q.submit (launch) host overhead
     double total_waitblock_us = 0.0;  // event.wait() blocking host time
+    double total_rebuild_us = 0.0;    // ensure_shard_built (host repack + malloc_shared + memcpy)
+    uint64_t rebuild_count = 0;
     uint64_t peak_wait_depth = 0;
     uint64_t kernel_count   = 0;
     uint64_t wait_count     = 0;
@@ -551,6 +553,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
             g_gpu_profile.total_copy_us, g_gpu_profile.total_readback_us,
             g_gpu_profile.total_usm_write_us, g_gpu_profile.total_submit_us,
             g_gpu_profile.total_waitblock_us,
+            g_gpu_profile.total_rebuild_us, g_gpu_profile.rebuild_count,
             g_gpu_profile.peak_wait_depth,
             g_gpu_profile.kernel_count, g_gpu_profile.wait_count,
             g_gpu_profile.copy_count, g_gpu_profile.readback_count};
@@ -614,6 +617,9 @@ bool Engine::ensure_shard_built(int tensor_index) {
   auto& sc = shard_cache_[tensor_index];
   if (sc.built) return true;
 
+#ifdef INTFER_PROFILE_GPU
+  auto t_rb0 = std::chrono::high_resolution_clock::now();
+#endif
   const auto& t = model_.tensors[tensor_index];
   const auto& ranges = shards_[tensor_index].ranges;
   sc.built = true;
@@ -667,6 +673,13 @@ bool Engine::ensure_shard_built(int tensor_index) {
         sycl::malloc_shared(static_cast<size_t>(N_local) * sizeof(uint16_t),
                            dev.sycl_device, dev.sycl_context));
   }
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_rebuild_us += std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
+    g_gpu_profile.rebuild_count++;
+  }
+#endif
   return true;
 }
 

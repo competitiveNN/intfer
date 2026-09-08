@@ -216,6 +216,8 @@ struct GpuProfileSnapshot {
   double usm_write_us;
   double submit_us;
   double waitblock_us;
+  double rebuild_us;
+  uint64_t rebuild_count;
   // Peak instantaneous queue depth observed during `run_linear_tp`.
   uint64_t peak_wait_depth;
   // Counters.

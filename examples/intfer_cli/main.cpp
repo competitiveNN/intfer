@@ -2452,11 +2452,13 @@ int main(int argc, char** argv){
       "  total_usm_write_us: %.1f\n"
       "  total_submit_us   : %.1f\n"
       "  total_waitblock_us: %.1f\n"
+      "  total_rebuild_us  : %.1f (%lu rebuilds)\n"
       "  peak_wait_depth   : %lu\n"
       "  kernel %% of decode : %.1f%%\n",
       p.kernel_us, p.kernel_count, p.wait_us, p.wait_count,
       p.copy_us, p.copy_count, p.readback_us, p.readback_count,
-      p.usm_write_us, p.submit_us, p.waitblock_us,
+      p.usm_write_us, p.submit_us, p.waitblock_us, p.rebuild_us,
+      p.rebuild_count,
       p.peak_wait_depth,
       100.0 * (p.kernel_us / 1000.0) / std::max(1.0, decode_ms));
   }

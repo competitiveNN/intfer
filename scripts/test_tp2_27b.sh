@@ -62,5 +62,5 @@ PASS=1
 TP_LINE="$(grep -a "GPU backend:" "$CLI_ERR" | head -1)"
 echo "$TP_LINE"
 echo "$TP_LINE" | grep -q "TP=sharded" || { echo "GATE FAIL: TP not sharded (need 2 devices)" >&2; PASS=0; }
-rm -f "$CLI_OUT" "$CLI_ERR" "$LOG"
+rm -f "$LOG"  # CLI_OUT/CLI_ERR are handled by the EXIT trap (kept on FAIL)
 if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi
