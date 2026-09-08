@@ -1,0 +1,223 @@
+=== Quantize Qwen3.5-0.8B with intfer Stage-1 ===
+model : test/models/Qwen3.5-0.8B/model.safetensors.index.json
+layers: up to 1073741824 | budget_frac: 0.40 (INT2 stress)
+
+[max-mem] available=32011 MiB cap=8192 MiB (90.0%) per_layer_footprint=39 MiB
+loaded 187 linear tensors (skipped 301), fp16 = 1434.1 MiB, layers = 24
+
+role         cnt  w_recon    max_out     scheme   params
+---------------------------------------------------------------------
+EMBED          1   0.2184     0.2457     INT4    254.3M
+LINEAR_ATTN_A     1   0.0000     0.0000     FP16      0.0M
+LINEAR_ATTN_B     1   0.0001     0.0001     FP16      0.0M
+LINEAR_ATTN_QKV     1   0.0001     0.0001     FP16      6.3M
+LINEAR_ATTN_Z     1   0.0001     0.0001     FP16      2.1M
+LINEAR_ATTN_OUT     1   0.0001     0.0001     FP16      2.1M
+MLP_DOWN       1   0.1513     0.1608     INT4      3.7M
+MLP_GATE       1   0.3581     0.3674     INT2      3.7M
+MLP_UP         1   0.3477     0.3579     INT2      3.7M
+LINEAR_ATTN_A     2   0.0000     0.0000     FP16      0.0M
+LINEAR_ATTN_B     2   0.0000     0.0002     FP16      0.0M
+LINEAR_ATTN_QKV     2   0.0001     0.0001     FP16     12.6M
+LINEAR_ATTN_Z     2   0.0000     0.0001     FP16      4.2M
+LINEAR_ATTN_OUT     2   0.0001     0.0001     FP16      4.2M
+MLP_DOWN       2   0.1507     0.1609     INT4      7.3M
+MLP_GATE       2   0.3576     0.3725     INT2      7.3M
+MLP_UP         2   0.3476     0.3586     INT2      7.3M
+LINEAR_ATTN_A     3   0.0000     0.0001     FP16      0.0M
+LINEAR_ATTN_B     3   0.0000     0.0002     FP16      0.0M
+LINEAR_ATTN_QKV     3   0.0001     0.0001     FP16     18.9M
+LINEAR_ATTN_Z     3   0.0001     0.0001     FP16      6.3M
+LINEAR_ATTN_OUT     3   0.0001     0.0001     FP16      6.3M
+MLP_DOWN       3   0.2187     0.3780     INT2     11.0M
+MLP_GATE       3   0.3768     0.4410     INT2     11.0M
+MLP_UP         3   0.3500     0.3669     INT2     11.0M
+MLP_DOWN       4   0.2525     0.3824     INT2     14.7M
+MLP_GATE       4   0.3859     0.4410     INT2     14.7M
+MLP_UP         4   0.3515     0.3739     INT2     14.7M
+ATTN_K         1   0.0001     0.0001     FP16      0.5M
+ATTN_O         1   0.1671     0.1784     INT4      2.1M
+ATTN_Q         1   0.3892     0.4234     INT2      4.2M
+ATTN_V         1   0.0108     0.0121     INT8      0.5M
+LINEAR_ATTN_A     4   0.0000     0.0001     FP16      0.1M
+LINEAR_ATTN_B     4   0.0000     0.0002     FP16      0.1M
+LINEAR_ATTN_QKV     4   0.0001     0.0001     FP16     25.2M
+LINEAR_ATTN_Z     4   0.0001     0.0001     FP16      8.4M
+LINEAR_ATTN_OUT     4   0.0001     0.0001     FP16      8.4M
+MLP_DOWN       5   0.2728     0.3824     INT2     18.4M
+MLP_GATE       5   0.3939     0.4447     INT2     18.4M
+MLP_UP         5   0.3521     0.3739     INT2     18.4M
+LINEAR_ATTN_A     5   0.0000     0.0001     FP16      0.1M
+LINEAR_ATTN_B     5   0.0001     0.0002     FP16      0.1M
+LINEAR_ATTN_QKV     5   0.0001     0.0001     FP16     31.5M
+LINEAR_ATTN_Z     5   0.0001     0.0001     FP16     10.5M
+LINEAR_ATTN_OUT     5   0.0001     0.0001     FP16     10.5M
+MLP_DOWN       6   0.2864     0.3884     INT2     22.0M
+MLP_GATE       6   0.3992     0.4447     INT2     22.0M
+MLP_UP         6   0.3527     0.3739     INT2     22.0M
+LINEAR_ATTN_A     6   0.0000     0.0001     FP16      0.1M
+LINEAR_ATTN_B     6   0.0001     0.0002     FP16      0.1M
+LINEAR_ATTN_QKV     6   0.0001     0.0001     FP16     37.7M
+LINEAR_ATTN_Z     6   0.0001     0.0001     FP16     12.6M
+LINEAR_ATTN_OUT     6   0.0001     0.0001     FP16     12.6M
+MLP_DOWN       7   0.2964     0.3884     INT2     25.7M
+MLP_GATE       7   0.3769     0.4447     INT4     25.7M
+MLP_UP         7   0.3536     0.3748     INT2     25.7M
+MLP_DOWN       8   0.3040     0.3884     INT2     29.4M
+MLP_GATE       8   0.3814     0.4447     INT2     29.4M
+MLP_UP         8   0.3548     0.3748     INT2     29.4M
+ATTN_K         2   0.0063     0.0140     INT8      1.0M
+ATTN_O         2   0.1757     0.1939     INT4      4.2M
+ATTN_Q         2   0.3957     0.4449     INT2      8.4M
+ATTN_V         2   0.0118     0.0135     INT8      1.0M
+LINEAR_ATTN_A     7   0.0000     0.0001     FP16      0.1M
+LINEAR_ATTN_B     7   0.0001     0.0002     FP16      0.1M
+LINEAR_ATTN_QKV     7   0.0001     0.0001     FP16     44.0M
+LINEAR_ATTN_Z     7   0.0001     0.0001     FP16     14.7M
+LINEAR_ATTN_OUT     7   0.0001     0.0001     FP16     14.7M
+MLP_DOWN       9   0.2875     0.3884     INT4     33.0M
+MLP_GATE       9   0.3836     0.4447     INT2     33.0M
+MLP_UP         9   0.3545     0.3748     INT2     33.0M
+LINEAR_ATTN_A     8   0.0000     0.0001     FP16      0.1M
+LINEAR_ATTN_B     8   0.0001     0.0002     FP16      0.1M
+LINEAR_ATTN_QKV     8   0.0001     0.0001     FP16     50.3M
+LINEAR_ATTN_Z     8   0.0001     0.0001     FP16     16.8M
+LINEAR_ATTN_OUT     8   0.0001     0.0001     FP16     16.8M
+MLP_DOWN      10   0.2938     0.3884     INT2     36.7M
+MLP_GATE      10   0.3839     0.4447     INT2     36.7M
+MLP_UP        10   0.3542     0.3748     INT2     36.7M
+LINEAR_ATTN_A     9   0.0000     0.0001     FP16      0.1M
+LINEAR_ATTN_B     9   0.0001     0.0002     FP16      0.1M
+LINEAR_ATTN_QKV     9   0.0000     0.0001     FP16     56.6M
+LINEAR_ATTN_Z     9   0.0001     0.0001     FP16     18.9M
+LINEAR_ATTN_OUT     9   0.0001     0.0001     FP16     18.9M
+MLP_DOWN      11   0.2989     0.3884     INT2     40.4M
+MLP_GATE      11   0.3835     0.4447     INT2     40.4M
+MLP_UP        11   0.3539     0.3748     INT2     40.4M
+MLP_DOWN      12   0.2869     0.3884     INT4     44.0M
+MLP_GATE      12   0.3833     0.4447     INT2     44.0M
+MLP_UP        12   0.3536     0.3748     INT2     44.0M
+ATTN_K         3   0.0080     0.0140     INT8      1.6M
+ATTN_O         3   0.1737     0.1939     INT4      6.3M
+ATTN_Q         3   0.3987     0.4449     INT2     12.6M
+ATTN_V         3   0.0113     0.0135     INT8      1.6M
+LINEAR_ATTN_A    10   0.0000     0.0001     FP16      0.2M
+LINEAR_ATTN_B    10   0.0001     0.0002     FP16      0.2M
+LINEAR_ATTN_QKV    10   0.0000     0.0001     FP16     62.9M
+LINEAR_ATTN_Z    10   0.0001     0.0001     FP16     21.0M
+LINEAR_ATTN_OUT    10   0.0001     0.0001     FP16     21.0M
+MLP_DOWN      13   0.2764     0.3884     INT4     47.7M
+MLP_GATE      13   0.3820     0.4447     INT2     47.7M
+MLP_UP        13   0.3531     0.3748     INT2     47.7M
+LINEAR_ATTN_A    11   0.0000     0.0001     FP16      0.2M
+LINEAR_ATTN_B    11   0.0001     0.0002     FP16      0.2M
+LINEAR_ATTN_QKV    11   0.0000     0.0001     FP16     69.2M
+LINEAR_ATTN_Z    11   0.0001     0.0001     FP16     23.1M
+LINEAR_ATTN_OUT    11   0.0001     0.0001     FP16     23.1M
+MLP_DOWN      14   0.2676     0.3884     INT4     51.4M
+MLP_GATE      14   0.3819     0.4447     INT2     51.4M
+MLP_UP        14   0.3529     0.3748     INT2     51.4M
+LINEAR_ATTN_A    12   0.0000     0.0001     FP16      0.2M
+LINEAR_ATTN_B    12   0.0001     0.0002     FP16      0.2M
+LINEAR_ATTN_QKV    12   0.0000     0.0001     FP16     75.5M
+LINEAR_ATTN_Z    12   0.0001     0.0001     FP16     25.2M
+LINEAR_ATTN_OUT    12   0.0001     0.0001     FP16     25.2M
+MLP_DOWN      15   0.2731     0.3884     INT2     55.1M
+MLP_GATE      15   0.3818     0.4447     INT2     55.1M
+MLP_UP        15   0.3527     0.3748     INT2     55.1M
+LINEAR_ATTN_A    13   0.0000     0.0001     FP16      0.2M
+LINEAR_ATTN_B    13   0.0001     0.0002     FP16      0.2M
+LINEAR_ATTN_QKV    13   0.0000     0.0001     FP16     81.8M
+LINEAR_ATTN_Z    13   0.0001     0.0001     FP16     27.3M
+LINEAR_ATTN_OUT    13   0.0001     0.0001     FP16     27.3M
+MLP_DOWN      16   0.2780     0.3884     INT2     58.7M
+MLP_GATE      16   0.3822     0.4447     INT2     58.7M
+MLP_UP        16   0.3527     0.3748     INT2     58.7M
+MLP_DOWN      17   0.2827     0.3884     INT2     62.4M
+MLP_GATE      17   0.3823     0.4447     INT2     62.4M
+MLP_UP        17   0.3532     0.3764     INT2     62.4M
+ATTN_K         4   0.0088     0.0140     INT8      2.1M
+ATTN_O         4   0.1803     0.2153     INT4      8.4M
+ATTN_Q         4   0.4037     0.4524     INT2     16.8M
+ATTN_V         4   0.0114     0.0135     INT8      2.1M
+MLP_DOWN      18   0.2755     0.3884     INT4     66.1M
+MLP_GATE      18   0.3820     0.4447     INT2     66.1M
+MLP_UP        18   0.3529     0.3764     INT2     66.1M
+ATTN_K         5   0.0096     0.0140     INT8      2.6M
+ATTN_O         5   0.1783     0.2153     INT4     10.5M
+ATTN_Q         5   0.4067     0.4524     INT2     21.0M
+ATTN_V         5   0.0114     0.0135     INT8      2.6M
+LINEAR_ATTN_A    14   0.0000     0.0001     FP16      0.2M
+LINEAR_ATTN_B    14   0.0001     0.0002     FP16      0.2M
+LINEAR_ATTN_QKV    14   0.0000     0.0001     FP16     88.1M
+LINEAR_ATTN_Z    14   0.0001     0.0001     FP16     29.4M
+LINEAR_ATTN_OUT    14   0.0001     0.0001     FP16     29.4M
+MLP_DOWN      19   0.2690     0.3884     INT4     69.7M
+MLP_GATE      19   0.3815     0.4447     INT2     69.7M
+MLP_UP        19   0.3527     0.3764     INT2     69.7M
+LINEAR_ATTN_A    15   0.0000     0.0001     FP16      0.2M
+LINEAR_ATTN_B    15   0.0001     0.0002     FP16      0.2M
+LINEAR_ATTN_QKV    15   0.0000     0.0001     FP16     94.4M
+LINEAR_ATTN_Z    15   0.0001     0.0001     FP16     31.5M
+LINEAR_ATTN_OUT    15   0.0001     0.0001     FP16     31.5M
+MLP_DOWN      20   0.2730     0.3884     INT2     73.4M
+MLP_GATE      20   0.3812     0.4447     INT2     73.4M
+MLP_UP        20   0.3525     0.3764     INT2     73.4M
+LINEAR_ATTN_A    16   0.0000     0.0001     FP16      0.3M
+LINEAR_ATTN_B    16   0.0001     0.0002     FP16      0.3M
+LINEAR_ATTN_QKV    16   0.0000     0.0001     FP16    100.7M
+LINEAR_ATTN_Z    16   0.0001     0.0001     FP16     33.6M
+LINEAR_ATTN_OUT    16   0.0001     0.0001     FP16     33.6M
+MLP_DOWN      21   0.2768     0.3884     INT2     77.1M
+MLP_GATE      21   0.3817     0.4447     INT2     77.1M
+MLP_UP        21   0.3526     0.3764     INT2     77.1M
+MLP_DOWN      22   0.2802     0.3884     INT2     80.7M
+MLP_GATE      22   0.3818     0.4447     INT2     80.7M
+MLP_UP        22   0.3526     0.3764     INT2     80.7M
+ATTN_K         6   0.0098     0.0140     INT8      3.1M
+ATTN_O         6   0.1763     0.2153     INT4     12.6M
+ATTN_Q         6   0.4069     0.4524     INT2     25.2M
+ATTN_V         6   0.0113     0.0135     INT8      3.1M
+LINEAR_ATTN_A    17   0.0000     0.0001     FP16      0.3M
+LINEAR_ATTN_B    17   0.0001     0.0002     FP16      0.3M
+LINEAR_ATTN_QKV    17   0.0000     0.0001     FP16    107.0M
+LINEAR_ATTN_Z    17   0.0001     0.0001     FP16     35.7M
+LINEAR_ATTN_OUT    17   0.0001     0.0001     FP16     35.7M
+MLP_DOWN      23   0.2748     0.3884     INT4     84.4M
+MLP_GATE      23   0.3820     0.4447     INT2     84.4M
+MLP_UP        23   0.3526     0.3764     INT2     84.4M
+LINEAR_ATTN_A    18   0.0000     0.0001     FP16      0.3M
+LINEAR_ATTN_B    18   0.0001     0.0002     FP16      0.3M
+LINEAR_ATTN_QKV    18   0.0000     0.0001     FP16    113.2M
+LINEAR_ATTN_Z    18   0.0001     0.0001     FP16     37.7M
+LINEAR_ATTN_OUT    18   0.0001     0.0001     FP16     37.7M
+MLP_DOWN      24   0.2699     0.3884     INT4     88.1M
+MLP_GATE      24   0.3821     0.4447     INT2     88.1M
+MLP_UP        24   0.3526     0.3764     INT2     88.1M
+
+---------------------------------------------------------------------
+RCO feasible: YES | budget 573.6 MiB | selected 573.5 MiB | compression 2.50x
+scheme dist: INT2=67 INT4=18 INT8=11 FP16=91
+overall weight reconstruction (params-weighted): 0.2082 rel-L2
+overall max linear-output error: 0.4524 rel-L2
+
+per-role mean weight reconstruction:
+  EMBED      0.2184  (max_out 0.2457, 1 tensors)
+  ATTN_Q     0.4069  (max_out 0.4524, 6 tensors)
+  ATTN_K     0.0098  (max_out 0.0140, 6 tensors)
+  ATTN_V     0.0113  (max_out 0.0135, 6 tensors)
+  ATTN_O     0.1763  (max_out 0.2153, 6 tensors)
+  MLP_GATE   0.3821  (max_out 0.4447, 24 tensors)
+  MLP_UP     0.3526  (max_out 0.3764, 24 tensors)
+  MLP_DOWN   0.2699  (max_out 0.3884, 24 tensors)
+  LINEAR_ATTN_QKV 0.0000  (max_out 0.0001, 18 tensors)
+  LINEAR_ATTN_Z 0.0001  (max_out 0.0001, 18 tensors)
+  LINEAR_ATTN_B 0.0001  (max_out 0.0002, 18 tensors)
+  LINEAR_ATTN_A 0.0000  (max_out 0.0001, 18 tensors)
+  LINEAR_ATTN_OUT 0.0001  (max_out 0.0001, 18 tensors)
+
+VERDICT: quantization reproduces the FP16 linear operators: REVIEW
+(operator-level fidelity; full autoregressive generation not yet run)
+
+wrote native-SYCL artifact: /dev/null (589.6 MiB)
+  contains 187 tensors, 4 rotations (magic INTFER1)

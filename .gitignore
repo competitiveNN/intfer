@@ -17,3 +17,6 @@ compile_commands.json
 # Editor / OS noise
 *.swp
 .DS_Store
+
+# Local secrets (API keys); never commit
+.envrc

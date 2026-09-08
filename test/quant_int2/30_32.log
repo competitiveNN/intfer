@@ -1,0 +1,12 @@
+=== Quantize Qwen3.8-27B with intfer Stage-1 ===
+model : /var/home/fra/data/models/safetensors/Qwen3.8-27B/model.safetensors.index.json
+layers: [30, 32) (2 layers) | budget_frac: 0.25 (INT2 stress)
+
+[max-mem] available=32744 MiB cap=8192 MiB (90.0%) per_layer_footprint=725 MiB
+loaded 16 linear tensors (skipped 1183), fp16 = 3865.9 MiB, layers = 32
+
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+FAIL: run_pipeline threw: RCO produced an infeasible allocation (exceeds VRAM budget)

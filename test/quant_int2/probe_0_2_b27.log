@@ -1,0 +1,36 @@
+=== Quantize Qwen3.8-27B with intfer Stage-1 ===
+model : /var/home/fra/data/models/safetensors/Qwen3.8-27B/model.safetensors.index.json
+layers: [0, 2) (2 layers) | budget_frac: 0.27 (INT2 stress)
+
+[max-mem] available=41123 MiB cap=32898 MiB (80.0%) per_layer_footprint=725 MiB
+loaded 18 linear tensors (skipped 1181), fp16 = 6311.9 MiB, layers = 2
+
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+FAIL: run_pipeline threw: RCO produced an infeasible allocation (exceeds VRAM budget)
+Command exited with non-zero status 1
+	Command being timed: "./build_quant_real/quant_model_real /var/home/fra/data/models/safetensors/Qwen3.8-27B/model.safetensors.index.json --out /dev/null --layer-start 0 --layer-count 2 --max-mem-frac 0.80 --budget-frac 0.27"
+	User time (seconds): 202.76
+	System time (seconds): 29.82
+	Percent of CPU this job got: 186%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:04.48
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 38808136
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 267
+	Minor (reclaiming a frame) page faults: 27195767
+	Voluntary context switches: 5258
+	Involuntary context switches: 12990
+	Swaps: 0
+	File system inputs: 10834400
+	File system outputs: 16
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1

@@ -1,0 +1,55 @@
+=== Quantize Qwen3.8-27B with intfer Stage-1 ===
+model : /var/home/fra/data/models/safetensors/Qwen3.8-27B/model.safetensors.index.json
+layers: [0, 2) (2 layers) | budget_frac: 0.28 (INT2 stress)
+
+[max-mem] available=41288 MiB cap=33031 MiB (80.0%) per_layer_footprint=725 MiB
+loaded 18 linear tensors (skipped 1181), fp16 = 6311.9 MiB, layers = 2
+
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+[intfer][WARN ] SpinQuant: dim 5120 not power-of-two; used blockdiag(Hadamard_4096, I_1024). (src/spinquant.cpp:121)
+role         cnt  w_recon    max_out     scheme   params
+---------------------------------------------------------------------
+LM_HEAD        1   0.2435     0.2524     INT4   1271.4M
+LINEAR_ATTN_A     1   0.0000     0.0001     FP16      0.2M
+LINEAR_ATTN_B     1   0.0001     0.0002     FP16      0.2M
+LINEAR_ATTN_QKV     1   0.0001     0.0001     FP16     52.4M
+LINEAR_ATTN_Z     1   0.0001     0.0001     FP16     31.5M
+LINEAR_ATTN_OUT     1   0.0001     0.0001     FP16     31.5M
+MLP_DOWN       1   0.3475     0.3567     INT2     89.1M
+MLP_GATE       1   0.3511     0.3572     INT2     89.1M
+MLP_UP         1   0.3483     0.3552     INT2     89.1M
+LINEAR_ATTN_A     2   0.0000     0.0001     FP16      0.5M
+LINEAR_ATTN_B     2   0.0001     0.0002     FP16      0.5M
+LINEAR_ATTN_QKV     2   0.0001     0.0001     FP16    104.9M
+LINEAR_ATTN_Z     2   0.0001     0.0001     FP16     62.9M
+LINEAR_ATTN_OUT     2   0.0001     0.0001     FP16     62.9M
+MLP_DOWN       2   0.3477     0.3586     INT2    178.3M
+MLP_GATE       2   0.3498     0.3572     INT2    178.3M
+MLP_UP         2   0.3479     0.3552     INT2    178.3M
+EMBED          1   0.2631     0.2664     INT4   1271.4M
+
+---------------------------------------------------------------------
+RCO feasible: YES | budget 1798.9 MiB | selected 1781.9 MiB | compression 3.54x
+scheme dist: INT2=6 INT4=2 INT8=0 FP16=10
+overall weight reconstruction (params-weighted): 0.2509 rel-L2
+overall max linear-output error: 0.3586 rel-L2
+
+per-role mean weight reconstruction:
+  EMBED      0.2631  (max_out 0.2664, 1 tensors)
+  LM_HEAD    0.2435  (max_out 0.2524, 1 tensors)
+  MLP_GATE   0.3498  (max_out 0.3572, 2 tensors)
+  MLP_UP     0.3479  (max_out 0.3552, 2 tensors)
+  MLP_DOWN   0.3477  (max_out 0.3586, 2 tensors)
+  LINEAR_ATTN_QKV 0.0001  (max_out 0.0001, 2 tensors)
+  LINEAR_ATTN_Z 0.0001  (max_out 0.0001, 2 tensors)
+  LINEAR_ATTN_B 0.0001  (max_out 0.0002, 2 tensors)
+  LINEAR_ATTN_A 0.0000  (max_out 0.0001, 2 tensors)
+  LINEAR_ATTN_OUT 0.0001  (max_out 0.0001, 2 tensors)
+
+VERDICT: quantization reproduces the FP16 linear operators: REVIEW
+(operator-level fidelity; full autoregressive generation not yet run)
+
+wrote native-SYCL artifact: /dev/null (2181.9 MiB)
+  contains 18 tensors, 4 rotations (magic INTFER1)

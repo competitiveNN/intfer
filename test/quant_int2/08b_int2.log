@@ -1,0 +1,8 @@
+=== Quantize Qwen3.5-0.8B with intfer Stage-1 ===
+model : test/models/Qwen3.5-0.8B/model.safetensors.index.json
+layers: up to 1073741824 | budget_frac: 0.20 (INT2 stress)
+
+[max-mem] available=31790 MiB cap=8192 MiB (90.0%) per_layer_footprint=39 MiB
+loaded 187 linear tensors (skipped 301), fp16 = 1434.1 MiB, layers = 24
+
+FAIL: run_pipeline threw: RCO produced an infeasible allocation (exceeds VRAM budget)
