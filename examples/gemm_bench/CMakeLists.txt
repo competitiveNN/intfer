@@ -1,0 +1,6 @@
+add_executable(gemm_bench main.cpp)
+target_link_libraries(gemm_bench PRIVATE intfer_engine intfer_common)
+if(INTFER_ENABLE_L0)
+  target_link_libraries(gemm_bench PRIVATE intfer_l0)
+endif()
+add_sycl_to_target(TARGET gemm_bench SOURCES main.cpp)

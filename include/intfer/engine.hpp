@@ -93,6 +93,8 @@ class Engine {
   void begin_layer(int L);
   // Free one tensor's device shard (no-op if not built).
   void release_shard(int tensor_index);
+  // Grow a built shard's act/out buffers to fit batch M (M>1 path).
+  void grow_act_buffers(int tensor_index, uint32_t M);
   // Layer index parsed from a tensor name ("...layers.<L>..."), or -1 when
   // the tensor is not per-layer (lm_head, norms).
   static int layer_of_name(const std::string& name);
@@ -157,9 +159,12 @@ class Engine {
     std::vector<std::uint8_t*>  code_usm;   // packed codes (FP16: 2*N*K bytes; INT*: packed)
     std::vector<std::uint16_t*> scale_usm;  // FP16 scale broadcast, N_local*n_groups
     std::vector<float*>         global_usm; // 1 element (alpha)
-    // Per-device persistent USM act / output buffers.
-    std::vector<std::uint16_t*> act_usm;    // size = K
-    std::vector<std::uint16_t*> out_usm;    // size = N_local (FP16 gemm output)
+    // Per-device persistent USM act / output buffers, sized for the
+    // largest M used so far (grow-only; the M>1 batched path writes M*K /
+    // M*N_local elements, so M=1 sizing would OOB-write).
+    std::vector<std::uint16_t*> act_usm;    // size = act_M * K
+    std::vector<std::uint16_t*> out_usm;    // size = act_M * N_local (FP16 gemm output)
+    uint32_t act_M = 0;                     // M the act/out buffers are sized for
     // SYCL event tracking the latest GEMM launch (so host can wait on it).
     sycl::event last_kernel_event;
     // Phase 2: repack-once host cache. shard_weight() output is immutable

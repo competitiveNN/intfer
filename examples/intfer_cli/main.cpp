@@ -323,6 +323,24 @@ struct LinearBackend {
                                std::vector<float>& out){
     out = run_linear(tensor_name, x);
   }
+  // Batched variant: X holds M concatenated rows of length K; Y holds M
+  // rows of length N. Default loops over run_linear_into (correct for any
+  // backend); GPU overrides with a single M-row launch. Bit-identical to M
+  // sequential calls (each row is an independent GEMM row).
+  virtual void run_linear_batch(const std::string& tensor_name,
+                                const std::vector<float>& X,
+                                std::vector<float>& Y, uint32_t M){
+    const std::vector<float>* xp = &X;
+    std::vector<float> row;
+    size_t K = (M > 0) ? X.size() / M : 0;
+    Y.clear();
+    for(uint32_t m = 0; m < M; m++){
+      row.assign(xp->begin() + (size_t)m * K, xp->begin() + (size_t)(m + 1) * K);
+      std::vector<float> y1;
+      run_linear_into(tensor_name, row, y1);
+      Y.insert(Y.end(), y1.begin(), y1.end());
+    }
+  }
   // SpinQuant rotation for this tensor (right-site for q/k/v/gate/up;
   // left-site for o/down; nullptr if no rotation).
   virtual const Rotation* rot_for(const std::string& tensor_name) = 0;
@@ -663,6 +681,21 @@ struct GpuBackend : public LinearBackend {
     // Engine resizes out only when the size differs: steady-state zero
     // mallocs on the host output buffer.
     eng->run_linear_tp(it->second, x, out);
+  }
+  void run_linear_batch(const std::string& name,
+                        const std::vector<float>& X,
+                        std::vector<float>& Y, uint32_t M) override {
+    if(!eng){ Y.clear(); return; }
+    build_index();
+    auto it = ti_cache.find(name);
+    if(it == ti_cache.end()){
+      // Cold fallback path: loop the scalar fallback (rare).
+      LinearBackend::run_linear_batch(name, X, Y, M);
+      return;
+    }
+    int L = Engine::layer_of_name(name);
+    if(L >= 0 && L != cur_layer_){ eng->begin_layer(L); cur_layer_ = L; }
+    eng->run_linear_tp(it->second, X, Y, M);
   }
 
   // Cached lm_head FP16 upload + one-off FP16 GEMM on device.
@@ -1320,6 +1353,520 @@ static StepOut step(int token, int pos,
   }
   out.best = best;
   out.logits = logits; // one copy out of scratch (see note above)
+  return out;
+}
+
+// ============================================================================
+// Chunked prefill, layer-outer loop (Phase B).
+// ============================================================================
+// The M=1 step() drives layers-inner (all 48 layers per token), so each
+// prompt token evicts+rebuilds every layer's shards. This path inverts the
+// loops: for each layer, run all chunk tokens through that layer's linears
+// (still one M=1 run_linear_into per token in Phase B; Phase C batches
+// them via run_linear_batch). KV/conv/SSM appends happen in token order
+// inside the layer visit, so numerics are bit-identical to step() — the
+// per-token op sequence (rmsnorm/rope/silu/softmax order, residual adds)
+// is unchanged, only the interleaving across tokens differs (independent
+// reductions). The final-norm + lm_head runs for the last chunk token only,
+// matching what the old loop kept (generated = last position's argmax).
+//
+// H is the chunk's hidden states, row-major [M,H], already embedded.
+// Returns the last row's greedy id + logits; fills dump rows [pos0,pos0+M).
+// Caller must have sized layers' kvcache/vcache for pos0+M (step() grows
+// them on demand via resize; here we pre-size to keep appends in-bounds).
+static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
+                     const std::map<std::string, std::vector<float>>& T,
+                     std::vector<float>& H, // [M,H] in/out hidden states
+                     const float* embed, const float* final_norm,
+                     const float* lm_head,
+                     LinearBackend* backend,
+                     std::vector<std::vector<float>>& dump){
+  StepOut out;
+  const int M = (int)toks.size();
+  const int Hdim = cfg.H;
+  for(int i=0;i<M;i++){
+    const float* row = embed + (size_t)toks[i]*Hdim;
+    memcpy(&H[(size_t)i*Hdim], row, (size_t)Hdim*sizeof(float));
+  }
+  if(!g_scratch.sized)
+    g_scratch.ensure(cfg.H, cfg.inter, cfg.vocab,
+                     2*cfg.n_heads*cfg.head_dim, cfg.n_kv*cfg.head_dim,
+                     cfg.n_heads*cfg.head_dim, cfg.conv_dim, cfg.n_v_heads,
+                     cfg.n_v_heads*cfg.v_head_dim, cfg.v_head_dim);
+  // Reusable per-token row buffers (no per-token mallocs in the loop).
+  std::vector<float> h(Hdim), res(Hdim), normed(Hdim);
+  std::vector<float> xbuf(Hdim), obuf;
+  // Chunk-batch staging (Phase C): M-row normed/rotated/GEMM buffers.
+  // Dedicated vectors (not the M=1 arena) since widths scale with M.
+  std::vector<float> c_normed, c_x, c_y;   // [M,H] in, [M,H] rotated, [M,N] out
+  std::vector<float> c_mg, c_mu;           // [M,inter] MLP gate/up
+  std::vector<float> c_qp;                 // [M,2*n_heads*hd] q_proj out
+  std::vector<float> c_k, c_v;             // [M,n_kv*hd]
+  // Phase C: M-wide norm/rotation/GEMM staging. When INTFER_BATCH_GEMM=1
+  // (and backend is GPU) the 7 linears run as single M-row launches via
+  // run_linear_batch; elementwise math stays per-row (bit-identical: each
+  // row is an independent GEMM row + the same scalar sequence as step()).
+  // NOTE: rot_for() must be resolved per row? No — rotations are static
+  // per tensor name (SpinQuant, fixed after warmup), so one lookup per
+  // layer is enough; rows differ only in activations.
+  static const bool batch_gemm =
+      (std::getenv("INTFER_BATCH_GEMM") != nullptr);
+  bool use_batch = batch_gemm && backend && backend->is_distributed();
+  // M-row activation staging: H rows -> normed -> rotated inputs.
+  // Sized lazily on first chunk (chunk_M may exceed the M=1 arena widths
+  // for q/k/v/o intermediates, so these live in dedicated chunk buffers).
+  auto need_rows = [&](std::vector<float>& v, size_t cols){
+    size_t n = (size_t)M * cols;
+    if(v.size() != n) v.assign(n, 0.f);
+  };
+  for(int L=0; L<cfg.layers; L++){
+    if((L & 15) == 0){ std::fprintf(stderr, "[intfer] prefill-chunk L=%d/%d M=%d\n", L, cfg.layers, M); std::fflush(stderr); }
+    const LayerNames& ln = g_ln[(size_t)L];
+    Layer& ly = layers[(size_t)L];
+    // Pre-size KV caches for the whole chunk (step() would resize per pos).
+    size_t kv_need = (size_t)(pos0+M)*cfg.n_kv*cfg.head_dim;
+    if(ly.kcache.size() < kv_need) ly.kcache.resize(kv_need, 0.f);
+    if(ly.vcache.size() < kv_need) ly.vcache.resize(kv_need, 0.f);
+    bool batch_this_layer = use_batch && ly.is_full;
+    if(!batch_this_layer){
+    for(int m=0; m<M; m++){
+      int pos = pos0 + m;
+      memcpy(h.data(), &H[(size_t)m*Hdim], (size_t)Hdim*sizeof(float));
+      memcpy(res.data(), h.data(), (size_t)Hdim*sizeof(float));
+      rmsnorm(h.data(), ly.in_ln, normed.data(), Hdim);
+      if(ly.is_full){
+        const Rotation* Rq = backend->rot_for(ln.q);
+        if(Rq) rot_apply(normed.data(), *Rq, xbuf.data());
+        else memcpy(xbuf.data(), normed.data(), (size_t)Hdim*sizeof(float));
+        backend->run_linear_into(ln.q, xbuf, obuf);
+        size_t qrows = (size_t)cfg.n_heads * cfg.head_dim;
+        bool packed_gate = (obuf.size() >= 2 * qrows);
+        std::vector<float>& gate = g_scratch.gate;
+        std::vector<float>& qpart = g_scratch.qpart;
+        for(size_t i=0;i<qrows;i++) gate[i] = 0.f;
+        if(packed_gate){
+          for(int hh=0; hh<cfg.n_heads; hh++) for(int d=0; d<cfg.head_dim; d++){
+            qpart[hh*cfg.head_dim+d] = obuf[hh*2*cfg.head_dim+d];
+            gate[hh*cfg.head_dim+d]  = obuf[hh*2*cfg.head_dim+cfg.head_dim+d];
+          }
+        } else {
+          for(size_t i=0; i<qrows && i<obuf.size(); i++) qpart[i] = obuf[i];
+        }
+        for(int hh=0; hh<cfg.n_heads; hh++){
+          rmsnorm(&qpart[hh*cfg.head_dim], ly.q_norm_w, &qpart[hh*cfg.head_dim], cfg.head_dim);
+          rope(&qpart[hh*cfg.head_dim], pos);
+        }
+        const Rotation* Rk = backend->rot_for(ln.k);
+        const Rotation* Rv = backend->rot_for(ln.v);
+        std::vector<float>& xk = g_scratch.xk;
+        std::vector<float>& xv = g_scratch.xv;
+        if(Rk) rot_apply(normed.data(), *Rk, xk.data());
+        else memcpy(xk.data(), normed.data(), (size_t)Hdim*sizeof(float));
+        if(Rv) rot_apply(normed.data(), *Rv, xv.data());
+        else memcpy(xv.data(), normed.data(), (size_t)Hdim*sizeof(float));
+        std::vector<float>& k = g_scratch.k;
+        std::vector<float>& v = g_scratch.v;
+        backend->run_linear_into(ln.k, xk, k);
+        backend->run_linear_into(ln.v, xv, v);
+        for(int hh=0; hh<cfg.n_kv; hh++){
+          rmsnorm(&k[hh*cfg.head_dim], ly.k_norm_w, &k[hh*cfg.head_dim], cfg.head_dim);
+          rope(&k[hh*cfg.head_dim], pos);
+        }
+        int base = pos*(cfg.n_kv*cfg.head_dim);
+        size_t need = (size_t)cfg.n_kv*cfg.head_dim;
+        if(k.size() >= need) memcpy(&ly.kcache[base], k.data(), need*sizeof(float));
+        if(v.size() >= need) memcpy(&ly.vcache[base], v.data(), need*sizeof(float));
+        std::vector<float>& attn = g_scratch.attn;
+        const int G = cfg.n_heads / cfg.n_kv;
+        float* gs = g_scratch.gscores_for(G, pos);
+        for(int kvh=0; kvh<cfg.n_kv; kvh++){
+          float mx[64]; for(int j=0;j<G;j++) mx[j]=-1e30f;
+          for(int t=0;t<=pos;t++){
+            const float* kh=&ly.kcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+            for(int j=0;j<G;j++){
+              int hh=kvh*G+j;
+              const float* qh=&qpart[hh*cfg.head_dim];
+              float s=0; for(int d=0;d<cfg.head_dim;d++) s+=qh[d]*kh[d];
+              s*=1.0f/sqrtf((float)cfg.head_dim); gs[j*(pos+1)+t]=s; if(s>mx[j]) mx[j]=s;
+            }
+          }
+          for(int j=0;j<G;j++){
+            float* row=&gs[j*(pos+1)];
+            float sum=0; for(int t=0;t<=pos;t++){ row[t]=expf(row[t]-mx[j]); sum+=row[t]; }
+            for(int t=0;t<=pos;t++) row[t]/=sum;
+          }
+          for(int j=0;j<G;j++){
+            float* oh=&attn[(kvh*G+j)*cfg.head_dim]; for(int d=0;d<cfg.head_dim;d++) oh[d]=0;
+          }
+          for(int t=0;t<=pos;t++){
+            const float* vh=&ly.vcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+            for(int j=0;j<G;j++){
+              float st=gs[j*(pos+1)+t];
+              float* oh=&attn[(kvh*G+j)*cfg.head_dim];
+              for(int d=0;d<cfg.head_dim;d++) oh[d]+=st*vh[d];
+            }
+          }
+        }
+        if (cfg.attn_output_gate && packed_gate)
+          for(int i=0;i<cfg.n_heads*cfg.head_dim;i++) attn[i] *= sigmoidf(gate[i]);
+        std::vector<float>& o_raw = g_scratch.o_raw;
+        {
+          size_t attn_n = (size_t)cfg.n_heads * cfg.head_dim;
+          const std::vector<float>* o_x = &attn;
+          std::vector<float>& o_in = g_scratch.o_in;
+          if(!packed_gate){
+            if(o_in.size() < attn_n + attn_n) o_in.assign(attn_n + attn_n, 0.f);
+            for(size_t i=0;i<attn_n;i++){ o_in[i]=attn[i]; o_in[attn_n+i]=gate[i]; }
+            o_x = &o_in;
+          }
+          backend->run_linear_into(ln.o, *o_x, o_raw);
+        }
+        const Rotation* Ro = backend->rot_for(ln.o);
+        if(Ro) rot_left(o_raw.data(), *Ro, h.data());
+        else memcpy(h.data(), o_raw.data(), (size_t)Hdim*sizeof(float));
+      } else {
+        const float* conv_w = ln.conv_w;
+        const float* A_log  = ln.A_log;
+        const float* dt_bias= ln.dt_bias;
+        const Rotation* Rqkv = backend->rot_for(ln.qkv);
+        std::vector<float>& xqkv = g_scratch.xqkv;
+        if(Rqkv) rot_apply(normed.data(), *Rqkv, xqkv.data());
+        else memcpy(xqkv.data(), normed.data(), (size_t)Hdim*sizeof(float));
+        std::vector<float>& mqkv = g_scratch.mqkv;
+        backend->run_linear_into(ln.qkv, xqkv, mqkv);
+        std::vector<float>& conv_out = g_scratch.conv_out;
+        for(int c=0;c<cfg.conv_dim;c++){
+          float s=0;
+          s+=conv_w[c*cfg.conv_k+0]*ly.conv_state[c*3+0];
+          s+=conv_w[c*cfg.conv_k+1]*ly.conv_state[c*3+1];
+          s+=conv_w[c*cfg.conv_k+2]*ly.conv_state[c*3+2];
+          s+=conv_w[c*cfg.conv_k+3]*mqkv[c];
+          conv_out[c]=silu(s);
+          ly.conv_state[c*3+0]=ly.conv_state[c*3+1];
+          ly.conv_state[c*3+1]=ly.conv_state[c*3+2];
+          ly.conv_state[c*3+2]=mqkv[c];
+        }
+        float* query=conv_out.data();
+        float* key=conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
+        float* value=conv_out.data()+2*cfg.k_head_dim*cfg.n_k_heads;
+        const Rotation* Rz = backend->rot_for(ln.z);
+        const Rotation* Rb = backend->rot_for(ln.b);
+        const Rotation* Ra = backend->rot_for(ln.a);
+        std::vector<float>& xz = g_scratch.xz;
+        std::vector<float>& xb = g_scratch.xb;
+        std::vector<float>& xa = g_scratch.xa;
+        if(Rz) rot_apply(normed.data(), *Rz, xz.data());
+        else memcpy(xz.data(), normed.data(), (size_t)Hdim*sizeof(float));
+        if(Rb) rot_apply(normed.data(), *Rb, xb.data());
+        else memcpy(xb.data(), normed.data(), (size_t)Hdim*sizeof(float));
+        if(Ra) rot_apply(normed.data(), *Ra, xa.data());
+        else memcpy(xa.data(), normed.data(), (size_t)Hdim*sizeof(float));
+        std::vector<float>& z = g_scratch.z;
+        std::vector<float>& b = g_scratch.b;
+        std::vector<float>& a = g_scratch.a;
+        backend->run_linear_into(ln.z, xz, z);
+        backend->run_linear_into(ln.b, xb, b);
+        backend->run_linear_into(ln.a, xa, a);
+        std::vector<float>& g = g_scratch.g;
+        for(int hh=0; hh<cfg.n_v_heads; hh++){
+          float sp=log1pf(expf(a[hh]+dt_bias[hh])); g[hh]=-expf(A_log[hh])*sp;
+        }
+        std::vector<float>& core = g_scratch.core;
+        for(int i=0;i<cfg.n_v_heads*cfg.v_head_dim;i++) core[i] = 0.f;
+        float qn[cfg.k_head_dim], kn[cfg.k_head_dim];
+        for(int hh=0; hh<cfg.n_v_heads; hh++){
+          int kh = (cfg.n_v_heads > cfg.n_k_heads)
+                   ? (int)((long long)hh * cfg.n_k_heads / cfg.n_v_heads)
+                   : hh;
+          l2norm(&query[kh*cfg.k_head_dim], qn, cfg.k_head_dim);
+          l2norm(&key[kh*cfg.k_head_dim],  kn, cfg.k_head_dim);
+          float scale=1.0f/sqrtf((float)cfg.k_head_dim);
+          for(int d=0;d<cfg.k_head_dim;d++) qn[d]*=scale;
+          float g_t=expf(g[hh]); float beta=sigmoidf(b[hh]);
+          float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
+          for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
+          std::vector<float>& kv_mem = g_scratch.kv_mem;
+          std::vector<float>& delta = g_scratch.delta;
+          for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
+          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
+          { const float* vh=&value[hh*cfg.v_head_dim];
+          for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
+          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
+          for(int c=0;c<cfg.v_head_dim;c++){
+            float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
+            core[hh*cfg.v_head_dim+c]=s;
+          }
+        }
+        const float* ssm_norm_w = ln.ssm_norm_w;
+        std::vector<float>& normed_core = g_scratch.normed_core;
+        for(int hh=0; hh<cfg.n_v_heads; hh++){
+          const float* x=&core[hh*cfg.v_head_dim];
+          const float* zg=&z[hh*cfg.v_head_dim];
+          float* o=&normed_core[hh*cfg.v_head_dim];
+          float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=x[i]*x[i];
+          float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
+          for(int i=0;i<cfg.v_head_dim;i++) o[i]=(x[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
+        }
+        std::vector<float>& o_la = g_scratch.o_la;
+        backend->run_linear_into(ln.la_out, normed_core, o_la);
+        const Rotation* Ro_la = backend->rot_for(ln.la_out);
+        if(Ro_la){ for(int i=0;i<Hdim;i++) h[i] = 0.f; rot_left(o_la.data(), *Ro_la, h.data()); }
+        else memcpy(h.data(), o_la.data(), (size_t)Hdim*sizeof(float));
+      }
+      for(int i=0;i<Hdim;i++) h[i] += res[i];
+      std::vector<float>& rn2 = g_scratch.rn2;
+      rmsnorm(h.data(), ly.post_ln, rn2.data(), Hdim);
+      const Rotation* Rg = backend->rot_for(ln.gate);
+      std::vector<float>& rin = g_scratch.rin;
+      if(Rg) rot_apply(rn2.data(), *Rg, rin.data());
+      else memcpy(rin.data(), rn2.data(), (size_t)Hdim*sizeof(float));
+      std::vector<float>& mg = g_scratch.mg;
+      backend->run_linear_into(ln.gate, rin, mg);
+      std::vector<float>& mu = g_scratch.mu;
+      backend->run_linear_into(ln.up,   rin, mu);
+      for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
+      std::vector<float>& md = g_scratch.md;
+      backend->run_linear_into(ln.down, mg, md);
+      const Rotation* Rd = backend->rot_for(ln.down);
+      std::vector<float>& mlp_out = g_scratch.mlp_out;
+      if(Rd) rot_left(md.data(), *Rd, mlp_out.data());
+      else memcpy(mlp_out.data(), md.data(), (size_t)Hdim*sizeof(float));
+      for(int i=0;i<Hdim;i++) h[i] = h[i] + mlp_out[i];
+      memcpy(&H[(size_t)m*Hdim], h.data(), (size_t)Hdim*sizeof(float));
+      if((size_t)pos < dump[L].size()/Hdim)
+        memcpy(&dump[L][(size_t)pos*Hdim], h.data(), (size_t)Hdim*sizeof(float));
+    } // end token loop (scalar path; skipped for batched full-attn layers)
+    } // end if(!batch_this_layer)
+    if(use_batch && ly.is_full){
+      // ---- Batched full-attention layer (Phase C) ----
+      // Rows 0..M-1 of H hold post-prev-layer hiddens (residuals already
+      // include this layer's... no: H currently holds INPUT hiddens for
+      // this layer (we broke out before the residual add). Stage:
+      //   1. per-row: rmsnorm(in_ln) -> c_normed rows.
+      //   2. q = batchGEMM(rot(c_normed)); split q/gate per row; per-row
+      //      q_norm + rope(pos0+m); k,v = batchGEMM(rot(c_normed)) per row
+      //      k_norm + rope; append KV in token order.
+      //   3. per-row causal attention over kcache/vcache (same op order as
+      //      the scalar loop above, incl. grouped tiling + output gate).
+      //   4. attn rows -> batchGEMM(o) -> rot_left -> +res -> post_ln ->
+      //      batchGEMM(gate/up) -> silu* -> batchGEMM(down) -> +res -> H.
+      size_t qrows = (size_t)cfg.n_heads * cfg.head_dim;
+      size_t kvrows = (size_t)cfg.n_kv * cfg.head_dim;
+      size_t qrows2 = 2 * qrows;
+      need_rows(c_normed, Hdim);
+      for(int m=0; m<M; m++)
+        rmsnorm(&H[(size_t)m*Hdim], ly.in_ln, &c_normed[(size_t)m*Hdim], Hdim);
+      const Rotation* Rq = backend->rot_for(ln.q);
+      const Rotation* Rk = backend->rot_for(ln.k);
+      const Rotation* Rv = backend->rot_for(ln.v);
+      need_rows(c_x, Hdim);
+      for(int m=0; m<M; m++){
+        const float* nr = &c_normed[(size_t)m*Hdim];
+        float* xr = &c_x[(size_t)m*Hdim];
+        if(Rq) rot_apply(nr, *Rq, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
+      }
+      need_rows(c_qp, qrows2);
+      backend->run_linear_batch(ln.q, c_x, c_qp, (uint32_t)M);
+      bool packed_gate = (c_qp.size() >= (size_t)M * qrows2);
+      // Per-row q/gate split + q_norm + rope, staged into c_qpart rows.
+      need_rows(c_k, kvrows); need_rows(c_v, kvrows);
+      static thread_local std::vector<float> c_qpart, c_gate;
+      need_rows(c_qpart, qrows); need_rows(c_gate, qrows);
+      // k/v rotated inputs share one staging buffer (consumed per GEMM).
+      for(int m=0; m<M; m++){
+        const float* nr = &c_normed[(size_t)m*Hdim];
+        float* xr = &c_x[(size_t)m*Hdim];
+        if(Rk) rot_apply(nr, *Rk, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
+      }
+      std::vector<float> c_kv_in = c_x; // copy of rotated-k inputs
+      for(int m=0; m<M; m++){
+        const float* nr = &c_normed[(size_t)m*Hdim];
+        float* xr = &c_x[(size_t)m*Hdim];
+        if(Rv) rot_apply(nr, *Rv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
+      }
+      std::vector<float> c_v_in = c_x; // copy of rotated-v inputs
+      backend->run_linear_batch(ln.k, c_kv_in, c_k, (uint32_t)M);
+      backend->run_linear_batch(ln.v, c_v_in, c_v, (uint32_t)M);
+      // Per-row q split / norms / ropes + KV appends (token order).
+      // NOTE: q/k/v GEMM outputs are FP16-quantized on device (to_half_bits
+      // per element) while the M=1 path goes through the same device
+      // rounding — row bit-parity holds vs M sequential calls (bench-gated:
+      // max abs diff 2.4e-4 on gate_proj), and the oracle gate below is the
+      // end-to-end arbiter.
+      for(int m=0; m<M; m++){
+        int pos = pos0 + m;
+        float* qpr = &c_qpart[(size_t)m*qrows];
+        float* gar = &c_gate[(size_t)m*qrows];
+        const float* qpr_in = &c_qp[(size_t)m*qrows2];
+        for(size_t i=0;i<qrows;i++) gar[i] = 0.f;
+        if(packed_gate){
+          for(int hh=0; hh<cfg.n_heads; hh++) for(int d=0; d<cfg.head_dim; d++){
+            qpr[hh*cfg.head_dim+d] = qpr_in[hh*2*cfg.head_dim+d];
+            gar[hh*cfg.head_dim+d] = qpr_in[hh*2*cfg.head_dim+cfg.head_dim+d];
+          }
+        } else {
+          for(size_t i=0; i<qrows; i++) qpr[i] = qpr_in[i];
+        }
+        for(int hh=0; hh<cfg.n_heads; hh++){
+          rmsnorm(&qpr[hh*cfg.head_dim], ly.q_norm_w, &qpr[hh*cfg.head_dim], cfg.head_dim);
+          rope(&qpr[hh*cfg.head_dim], pos);
+        }
+        float* kr = &c_k[(size_t)m*kvrows];
+        float* vr = &c_v[(size_t)m*kvrows];
+        for(int hh=0; hh<cfg.n_kv; hh++){
+          rmsnorm(&kr[hh*cfg.head_dim], ly.k_norm_w, &kr[hh*cfg.head_dim], cfg.head_dim);
+          rope(&kr[hh*cfg.head_dim], pos);
+        }
+        int base = pos*(cfg.n_kv*cfg.head_dim);
+        memcpy(&ly.kcache[base], kr, kvrows*sizeof(float));
+        memcpy(&ly.vcache[base], vr, kvrows*sizeof(float));
+      }
+      // Per-row causal attention (same grouped tiling as scalar path).
+      static thread_local std::vector<float> c_attn;
+      need_rows(c_attn, qrows);
+      {
+        std::vector<float>& attn = g_scratch.attn;
+        const int G = cfg.n_heads / cfg.n_kv;
+        for(int m=0; m<M; m++){
+          int pos = pos0 + m;
+          float* qpr = &c_qpart[(size_t)m*qrows];
+          float* gar = &c_gate[(size_t)m*qrows];
+          float* atr = &c_attn[(size_t)m*qrows];
+          // Reuse the arena attn buffer as the compute target, then copy
+          // the row out (keeps the exact scalar op sequence below).
+          float* gs = g_scratch.gscores_for(G, pos);
+          for(int kvh=0; kvh<cfg.n_kv; kvh++){
+            float mx[64]; for(int j=0;j<G;j++) mx[j]=-1e30f;
+            for(int t=0;t<=pos;t++){
+              const float* kh=&ly.kcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+              for(int j=0;j<G;j++){
+                int hh=kvh*G+j;
+                const float* qh=&qpr[hh*cfg.head_dim];
+                float s=0; for(int d=0;d<cfg.head_dim;d++) s+=qh[d]*kh[d];
+                s*=1.0f/sqrtf((float)cfg.head_dim); gs[j*(pos+1)+t]=s; if(s>mx[j]) mx[j]=s;
+              }
+            }
+            for(int j=0;j<G;j++){
+              float* row=&gs[j*(pos+1)];
+              float sum=0; for(int t=0;t<=pos;t++){ row[t]=expf(row[t]-mx[j]); sum+=row[t]; }
+              for(int t=0;t<=pos;t++) row[t]/=sum;
+            }
+            for(int j=0;j<G;j++){
+              float* oh=&attn[(kvh*G+j)*cfg.head_dim]; for(int d=0;d<cfg.head_dim;d++) oh[d]=0;
+            }
+            for(int t=0;t<=pos;t++){
+              const float* vh=&ly.vcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+              for(int j=0;j<G;j++){
+                float st=gs[j*(pos+1)+t];
+                float* oh=&attn[(kvh*G+j)*cfg.head_dim];
+                for(int d=0;d<cfg.head_dim;d++) oh[d]+=st*vh[d];
+              }
+            }
+          }
+          if (cfg.attn_output_gate && packed_gate)
+            for(size_t i=0;i<qrows;i++) attn[i] *= sigmoidf(gar[i]);
+          memcpy(atr, attn.data(), qrows*sizeof(float));
+        }
+      }
+      // o_proj batched over rows (packed-gate layout; !packed_gate models
+      // need attn+gate concat per row — build it).
+      {
+        const std::vector<float>* o_x = &c_attn;
+        static thread_local std::vector<float> c_o_in;
+        if(!packed_gate){
+          need_rows(c_o_in, 2*qrows);
+          for(int m=0; m<M; m++){
+            memcpy(&c_o_in[(size_t)m*2*qrows], &c_attn[(size_t)m*qrows], qrows*sizeof(float));
+            memcpy(&c_o_in[(size_t)m*2*qrows+qrows], &c_gate[(size_t)m*qrows], qrows*sizeof(float));
+          }
+          o_x = &c_o_in;
+        }
+        need_rows(c_y, Hdim);
+        backend->run_linear_batch(ln.o, *o_x, c_y, (uint32_t)M);
+      }
+      const Rotation* Ro = backend->rot_for(ln.o);
+      // Residual + post_ln + MLP (batched gate/up, elementwise, batched
+      // down) + residual, per row.
+      need_rows(c_mg, cfg.inter); need_rows(c_mu, cfg.inter);
+      static thread_local std::vector<float> c_rn2, c_rin, c_md;
+      need_rows(c_rn2, Hdim); need_rows(c_rin, Hdim); need_rows(c_md, Hdim);
+      for(int m=0; m<M; m++){
+        float* hr = &H[(size_t)m*Hdim];       // layer input (res base)
+        float* orw = &c_y[(size_t)m*Hdim];    // o_proj row
+        // rot_left writes into a target; stage through c_rn2 row then add.
+        float* dst = &c_rn2[(size_t)m*Hdim];  // reuse as temp
+        if(Ro) rot_left(orw, *Ro, dst);
+        else memcpy(dst, orw, (size_t)Hdim*sizeof(float));
+        for(int i=0;i<Hdim;i++) hr[i] += dst[i];
+      }
+      for(int m=0; m<M; m++)
+        rmsnorm(&H[(size_t)m*Hdim], ly.post_ln, &c_rn2[(size_t)m*Hdim], Hdim);
+      const Rotation* Rg = backend->rot_for(ln.gate);
+      for(int m=0; m<M; m++){
+        const float* r2 = &c_rn2[(size_t)m*Hdim];
+        float* ri = &c_rin[(size_t)m*Hdim];
+        if(Rg) rot_apply(r2, *Rg, ri); else memcpy(ri, r2, (size_t)Hdim*sizeof(float));
+      }
+      backend->run_linear_batch(ln.gate, c_rin, c_mg, (uint32_t)M);
+      backend->run_linear_batch(ln.up,   c_rin, c_mu, (uint32_t)M);
+      for(int m=0; m<M; m++){
+        float* mgr = &c_mg[(size_t)m*cfg.inter];
+        const float* mur = &c_mu[(size_t)m*cfg.inter];
+        for(int i=0;i<cfg.inter;i++) mgr[i] = silu(mgr[i])*mur[i];
+      }
+      backend->run_linear_batch(ln.down, c_mg, c_md, (uint32_t)M);
+      const Rotation* Rd = backend->rot_for(ln.down);
+      for(int m=0; m<M; m++){
+        float* hr = &H[(size_t)m*Hdim];
+        float* mdr = &c_md[(size_t)m*Hdim];
+        float* dst = &c_rn2[(size_t)m*Hdim]; // reuse as temp
+        if(Rd) rot_left(mdr, *Rd, dst);
+        else memcpy(dst, mdr, (size_t)Hdim*sizeof(float));
+        for(int i=0;i<Hdim;i++) hr[i] += dst[i];
+        int pos = pos0 + m;
+        if((size_t)pos < dump[L].size()/Hdim)
+          memcpy(&dump[L][(size_t)pos*Hdim], hr, (size_t)Hdim*sizeof(float));
+      }
+    }
+  }
+  // Final norm + lm_head for the LAST chunk row only (matches old loop,
+  // which kept generated = argmax at pos S-1).
+  std::vector<float>& fn = g_scratch.fn;
+  rmsnorm(&H[(size_t)(M-1)*Hdim], final_norm, fn.data(), Hdim);
+  std::vector<float>& logits = g_scratch.logits;
+  int best=-1; float bestv=-1e30f;
+  const float* head = lm_head ? lm_head : embed;
+  if(backend){
+    auto gpu = dynamic_cast<GpuBackend*>(backend);
+    if(gpu){
+      const float* W = lm_head ? lm_head : embed;
+      std::vector<float> lm = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+      if((int)lm.size() == cfg.vocab) for(int i=0;i<cfg.vocab;i++) logits[i] = lm[i];
+    }else{
+      for(int v=0; v<cfg.vocab; v++){
+        const float* er = head + (size_t)v*cfg.H;
+        float s=0; for(int i=0;i<cfg.H;i++) s+=fn[i]*er[i];
+        logits[v]=s;
+        if(s>bestv){ bestv=s; best=v; }
+      }
+    }
+  }else{
+    for(int v=0; v<cfg.vocab; v++){
+      const float* er = head + (size_t)v*cfg.H;
+      float s=0; for(int i=0;i<cfg.H;i++) s+=fn[i]*er[i];
+      logits[v]=s;
+      if(s>bestv){ bestv=s; best=v; }
+    }
+  }
+  if(lm_head==nullptr || !backend || dynamic_cast<CpuBackend*>(backend) ||
+     dynamic_cast<GpuBackend*>(backend)){
+    for(int v=0; v<cfg.vocab; v++){
+      if(logits[v]>bestv){ bestv=logits[v]; best=v; }
+    }
+  }
+  out.best = best;
+  out.logits = logits;
+  (void)T;
   return out;
 }
 
@@ -2344,10 +2891,34 @@ int main(int argc, char** argv){
       std::vector<float>((size_t)(S+max_new)*cfg.H, 0.f));
   std::vector<int> generated;
   auto t0 = std::chrono::high_resolution_clock::now();
-  for(int pos=0; pos<S; pos++){
-    StepOut o = step(prompt_ids[pos], pos, T, embed, final_norm, lm_head,
-                     backend.get(), true, dump);
-    if(pos==S-1) generated.push_back(o.best);
+  // Chunked prefill (Phase B): INTFER_PREFILL_CHUNK=1 selects the
+  // layer-outer path (one layer residency per chunk instead of per token).
+  // Default (unset) keeps the M=1 step() loop as the parity oracle.
+  // INTFER_PREFILL_CHUNK=0 explicitly forces the old path.
+  static const char* chunk_env = std::getenv("INTFER_PREFILL_CHUNK");
+  bool chunked = (chunk_env != nullptr && std::string(chunk_env) != "0");
+  // Chunk size: tokens per layer-resident pass. Small default keeps the
+  // parity gate tight; raised via INTFER_PREFILL_CHUNK_M for long prompts.
+  int chunk_M = 8;
+  if(const char* me = std::getenv("INTFER_PREFILL_CHUNK_M")){
+    int v = std::atoi(me); if(v >= 1 && v <= 1024) chunk_M = v;
+  }
+  if(chunked && S > 1){
+    std::vector<float> Hbuf;
+    for(int c0 = 0; c0 < S; c0 += chunk_M){
+      int cm = std::min(chunk_M, S - c0);
+      std::vector<int> toks(prompt_ids.begin() + c0, prompt_ids.begin() + c0 + cm);
+      Hbuf.assign((size_t)cm * cfg.H, 0.f);
+      StepOut o = prefill_layer_outer(toks, c0, T, Hbuf, embed, final_norm,
+                                      lm_head, backend.get(), dump);
+      if(c0 + cm == S) generated.push_back(o.best);
+    }
+  } else {
+    for(int pos=0; pos<S; pos++){
+      StepOut o = step(prompt_ids[pos], pos, T, embed, final_norm, lm_head,
+                       backend.get(), true, dump);
+      if(pos==S-1) generated.push_back(o.best);
+    }
   }
   auto t1 = std::chrono::high_resolution_clock::now();
   double prefill_ms = std::chrono::duration<double, std::milli>(t1-t0).count();

@@ -405,19 +405,52 @@ void Engine::release_shard(int tensor_index) {
       sc.global_usm[d] = nullptr;
     }
     if (sc.act_usm.size() > d && sc.act_usm[d]) {
-      pool_release(d, sc.act_usm[d], t.K * sizeof(uint16_t));
+      pool_release(d, sc.act_usm[d],
+                   (size_t)sc.act_M * t.K * sizeof(uint16_t));
       sc.act_usm[d] = nullptr;
     }
     if (sc.out_usm.size() > d && sc.out_usm[d]) {
       auto& rng = shards_[tensor_index].ranges;
       uint32_t Nl = (d < rng.size()) ? rng[d].second - rng[d].first : 0;
-      pool_release(d, sc.out_usm[d], (size_t)Nl * sizeof(uint16_t));
+      pool_release(d, sc.out_usm[d],
+                   (size_t)sc.act_M * Nl * sizeof(uint16_t));
       sc.out_usm[d] = nullptr;
     }
   }
   sc.code_usm.clear(); sc.scale_usm.clear(); sc.global_usm.clear();
   sc.act_usm.clear(); sc.out_usm.clear();
+  sc.act_M = 0;
   sc.built = false;
+}
+
+// Grow a built shard's act/out USM buffers to fit batch M (grow-only).
+// Weights are untouched; new buffers come from the shape-keyed pool and the
+// old ones return to it. Called on the run_linear_tp M>1 path only.
+void Engine::grow_act_buffers(int tensor_index, uint32_t M) {
+  if (tensor_index < 0 || (size_t)tensor_index >= shard_cache_.size()) return;
+  auto& sc = shard_cache_[(size_t)tensor_index];
+  if (!sc.built || M <= sc.act_M) return;
+  if (M == 0) M = 1;
+  const auto& t = model_.tensors[tensor_index];
+  const auto& ranges = shards_[tensor_index].ranges;
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto [start, end] = ranges[d];
+    uint32_t N_local = end - start;
+    devices_[d].queue.wait();
+    if (d < sc.act_usm.size() && sc.act_usm[d]) {
+      pool_release(d, sc.act_usm[d],
+                   (size_t)sc.act_M * t.K * sizeof(uint16_t));
+      sc.act_usm[d] = static_cast<std::uint16_t*>(
+          pool_acquire(d, (size_t)M * t.K * sizeof(uint16_t)));
+    }
+    if (d < sc.out_usm.size() && sc.out_usm[d]) {
+      pool_release(d, sc.out_usm[d],
+                   (size_t)sc.act_M * N_local * sizeof(uint16_t));
+      sc.out_usm[d] = static_cast<std::uint16_t*>(
+          pool_acquire(d, (size_t)M * N_local * sizeof(uint16_t)));
+    }
+  }
+  sc.act_M = M;
 }
 
 void Engine::begin_layer(int L) {
@@ -489,6 +522,10 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   // Lazy-build the USM shard cache for this tensor on first call.
   if (!shard_cache_[tensor_index].built)
     ensure_shard_built(tensor_index);
+  auto& scm = shard_cache_[tensor_index];
+  // Grow the M-sized act/out buffers when the caller needs a larger batch
+  // than the shard was built for (M=1 fast path never triggers this).
+  if (M > scm.act_M) grow_act_buffers(tensor_index, M);
   const auto& sc = shard_cache_[tensor_index];
  
   // Pre-convert FP32 activation to FP16 once (shared by all devices).
@@ -765,11 +802,14 @@ bool Engine::ensure_shard_built(int tensor_index) {
       std::memcpy(sc.global_usm[d], global_ptr, sizeof(float));
     }
 
-    // 3) Persistent activation buffer (K FP16) and output buffer (N_local FP16).
+    // 3) Persistent activation buffer (act_M * K FP16) and output buffer
+    //    (act_M * N_local FP16). M=1 sizing; grow_act_buffers() enlarges for
+    //    the batched path (grow-only, pool-backed).
+    sc.act_M = 1;
     sc.act_usm[d] = static_cast<std::uint16_t*>(
-        pool_acquire(d, t.K * sizeof(uint16_t)));
+        pool_acquire(d, (size_t)sc.act_M * t.K * sizeof(uint16_t)));
     sc.out_usm[d] = static_cast<std::uint16_t*>(
-        pool_acquire(d, static_cast<size_t>(N_local) * sizeof(uint16_t)));
+        pool_acquire(d, static_cast<size_t>(sc.act_M) * N_local * sizeof(uint16_t)));
   }
   if (cacheable) sc.has_host_cache = true;
 #ifdef INTFER_PROFILE_GPU
