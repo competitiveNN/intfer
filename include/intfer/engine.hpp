@@ -90,17 +90,40 @@ class Engine {
   // resident). The next run_linear_tp for a freed tensor rebuilds its shard
   // on demand, so streaming is numerically transparent. Peak VRAM drops to
   // one layer + lm_head (~1.1GB on 27B).
+  //
+  // Full-VRAM residency: preload_all() builds every runnable Linear shard
+  // once (except lm_head-named tensors, which the CLI uploads via its own
+  // TP-sharded run_lm_head_f16 path) and pins them: begin_layer() and
+  // release_shard() become no-ops, so steady-state prefill/decode performs
+  // zero evict+rebuild. Measured 27B-sc TP=2: ~10.9GB weights/dev + 2.5GB
+  // sharded lm_head vs 12216MiB budget (dev0 keeps ~384MiB display
+  // reservation). INTFER_PRELOAD=0 restores layer streaming.
   void begin_layer(int L);
+  // Build all runnable Linear shards now and pin them resident (no evict).
+  // Frees the 9.4GB INT4 host repack cache afterwards (no rebuilds remain).
+  void preload_all();
+  // True when preload_all() pinned the shards (streaming disabled).
+  bool preloaded() const { return pinned_; }
+  // Shared per-device act/out workspaces (replaces per-shard act/out USM).
+  // A shard's act/out buffers are written+consumed within one run_linear_tp
+  // call and never live across calls (single-threaded CLI), so one
+  // (maxM × maxK / maxM × maxNl) buffer pair per device serves all shards.
+  // This kills ~2000 live USM allocs on 27B-sc (~460MB L0 overhead) — the
+  // margin that makes full residency + lm_head fit the 12GB budget.
+  void ensure_workspace(uint32_t M, uint32_t K, uint32_t Nl_max);
   // Free one tensor's device shard (no-op if not built).
   void release_shard(int tensor_index);
-  // Grow a built shard's act/out buffers to fit batch M (M>1 path).
-  void grow_act_buffers(int tensor_index, uint32_t M);
   // Layer index parsed from a tensor name ("...layers.<L>..."), or -1 when
   // the tensor is not per-layer (lm_head, norms).
   static int layer_of_name(const std::string& name);
   
   // SYCL queue for device i (for attention kernels etc.).
   sycl::queue& device_queue(size_t i) { return devices_.at(i).queue; }
+  // Free VRAM bytes currently visible on device i (sysman zesMemoryGetState,
+  // matched by native-handle UUID; 0 when unavailable). Used to size the
+  // asymmetric lm_head TP split after preload_all() — never assume index
+  // equality across APIs (sysman enumerates in reverse vs SYCL/xpu-smi).
+  uint64_t device_free_bytes(size_t i);
 
 
  private:
@@ -158,13 +181,12 @@ class Engine {
     // Per-device persistent USM pointers (size = devices_.size()).
     std::vector<std::uint8_t*>  code_usm;   // packed codes (FP16: 2*N*K bytes; INT*: packed)
     std::vector<std::uint16_t*> scale_usm;  // FP16 scale broadcast, N_local*n_groups
-    std::vector<float*>         global_usm; // 1 element (alpha)
-    // Per-device persistent USM act / output buffers, sized for the
-    // largest M used so far (grow-only; the M>1 batched path writes M*K /
-    // M*N_local elements, so M=1 sizing would OOB-write).
-    std::vector<std::uint16_t*> act_usm;    // size = act_M * K
-    std::vector<std::uint16_t*> out_usm;    // size = act_M * N_local (FP16 gemm output)
-    uint32_t act_M = 0;                     // M the act/out buffers are sized for
+    // NOTE: no global_usm — the alpha divisor already lives on the host
+    // (global_host) and the kernel takes it by value, so a 4-byte device
+    // alloc per shard per rank (~400 USM allocs of pure overhead) is waste.
+    // NOTE: no per-shard act/out — run_linear_tp uses the shared per-device
+    // workspaces (ws_): one (M x K / M x Nl) pair per device serves all
+    // shards, killing ~2000 live USM allocs (~460MB L0 overhead on 27B-sc).
     // SYCL event tracking the latest GEMM launch (so host can wait on it).
     sycl::event last_kernel_event;
     // Phase 2: repack-once host cache. shard_weight() output is immutable
@@ -188,14 +210,35 @@ class Engine {
   std::vector<std::map<size_t, std::vector<void*>>> usm_pool_;  // [device][bytes]
   void* pool_acquire(size_t device, size_t bytes);
   void pool_release(size_t device, void* ptr, size_t bytes);
+  uint64_t pool_acquires_ = 0, pool_hits_ = 0;  // allocator audit counters
   // Reusable FP16 activation staging for run_linear_tp (M*K). Resized only
   // when the shape grows: steady-state zero mallocs per GEMM call.
   std::vector<std::uint16_t> act_staging_;
+  // Shared per-device act/out workspaces (replaces per-shard act/out USM).
+  // One buffer pair per device serves all shards: a shard's act/out are
+  // written+consumed within a single run_linear_tp call and never live
+  // across calls (single-threaded CLI), so aliasing is safe. Grow-only;
+  // steady-state zero allocs. Direct malloc_shared (NOT the shape pool —
+  // pool entries stay live and would keep the old size resident).
+  struct Workspace {
+    std::uint16_t* act = nullptr;  // M * K FP16
+    std::uint16_t* out = nullptr;  // M * Nl FP16
+    uint32_t M = 0, K = 0, Nl = 0;
+  };
+  std::vector<Workspace> ws_;
   // Per-layer tensor index lists, built by build_shards() from tensor names.
   // layer_tensors_[L] = indices of "...layers.<L>..." tensors; layer_of_[i]
   // mirrors it per tensor index (-1 = unlayered: lm_head, norms, ...).
+  // pinned_ (set by preload_all()) disables all eviction: begin_layer() and
+  // release_shard() early-return, keeping every shard resident.
+  // skip_host_cache_ (set by preload_all()): with eviction disabled no
+  // rebuild can ever need the INT4 repack cache, so ensure_shard_built()
+  // skips populating it (~9.4GB host RAM on 27B-sc). Streaming mode keeps
+  // the cache (rebuilds need it).
   std::vector<std::vector<int>> layer_tensors_;
   std::vector<int> layer_of_;
+  bool pinned_ = false;
+  bool skip_host_cache_ = false;
 
   // Command-graph capture state (experimental; requires INTFER_GRAPH_CAPTURE=1).
 #if INTFER_GRAPH_CAPTURE

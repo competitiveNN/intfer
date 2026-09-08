@@ -28,6 +28,101 @@ int main(int argc, char** argv) {
     return 1;
   }
   printf("engine: %zu devices\n", eng->num_devices());
+
+  // Footprint mode: argv[3] == "footprint" -> account device bytes for ALL
+  // runnable linears (no GEMM timing). Per device: code TP slice +
+  // scale slice + act (M=1: K) + out (M=1: N_local), FP16 scheme included.
+  if (reps == 0 || (argc > 3 && std::string(argv[3]) == "footprint")) {
+    const auto& tensors = eng->model().tensors;
+    size_t ndev = eng->num_devices();
+    std::vector<double> dev_total(ndev, 0.0);
+    std::vector<double> dev_weights(ndev, 0.0);  // code+scale+global only
+    std::vector<double> dev_work(ndev, 0.0);     // act+out (M=1) only
+    double host_cache_total = 0.0;
+    // role -> count, bytes(full tensor, code+scale)
+    std::map<std::string, std::pair<int, double>> by_role;
+    auto role_of = [&](const std::string& nm) -> std::string {
+      if (nm.find("self_attn.q_proj") != std::string::npos) return "attn_q";
+      if (nm.find("self_attn.k_proj") != std::string::npos) return "attn_k";
+      if (nm.find("self_attn.v_proj") != std::string::npos) return "attn_v";
+      if (nm.find("self_attn.o_proj") != std::string::npos) return "attn_o";
+      if (nm.find("mlp.gate_proj") != std::string::npos) return "mlp_gate";
+      if (nm.find("mlp.up_proj") != std::string::npos) return "mlp_up";
+      if (nm.find("mlp.down_proj") != std::string::npos) return "mlp_down";
+      if (nm.find("in_proj_qkv") != std::string::npos) return "la_qkv";
+      if (nm.find("in_proj_z") != std::string::npos) return "la_z";
+      if (nm.find("in_proj_b") != std::string::npos) return "la_b";
+      if (nm.find("in_proj_a") != std::string::npos) return "la_a";
+      if (nm.find("out_proj") != std::string::npos) return "la_out";
+      if (nm.find("lm_head") != std::string::npos) return "lm_head";
+      return "other";
+    };
+    for (size_t i = 0; i < tensors.size(); ++i) {
+      const auto& tt = tensors[i];
+      std::string rl = role_of(tt.name);
+      if (rl == "other") continue;
+      int bits = (tt.qcfg.scheme == intfer::QuantScheme::INT2)    ? 2
+                 : (tt.qcfg.scheme == intfer::QuantScheme::INT4)  ? 4
+                 : (tt.qcfg.scheme == intfer::QuantScheme::FP16)  ? 16
+                                                                 : 8;
+      uint32_t G = tt.qcfg.group_size > 0 ? tt.qcfg.group_size : tt.K;
+      uint32_t ng = (tt.K + G - 1) / G;
+      int pack = (bits >= 8) ? 1 : (8 / bits);
+      // Full-tensor kernel-layout bytes (row-major slice of shard_weight):
+      // code = N*ceil(K/pack) (+FP16: N*K*2), scale = N*ng*2.
+      double code_full = (bits == 16) ? (double)tt.N * tt.K * 2.0
+                                      : (double)tt.N * ((tt.K + pack - 1) / pack);
+      double scale_full = (double)tt.N * ng * 2.0;
+      auto& e = by_role[rl + (bits == 16 ? "/fp16" : bits == 4 ? "/int4"
+                                            : bits == 8       ? "/int8"
+                                                              : "/int2")];
+      e.first++;
+      e.second += code_full + scale_full;
+      host_cache_total += (bits == 16) ? 0.0 : code_full + scale_full;
+      for (size_t d = 0; d < ndev; ++d) {
+        uint32_t start = (uint32_t)(tt.N * d / ndev);
+        uint32_t end = (uint32_t)(tt.N * (d + 1) / ndev);
+        uint32_t Nl = end - start;
+        double code = (bits == 16) ? (double)Nl * tt.K * 2.0
+                                   : (double)Nl * ((tt.K + pack - 1) / pack);
+        double scale = (double)Nl * ng * 2.0;
+        double act = (double)tt.K * 2.0;      // M=1
+        double out = (double)Nl * 2.0;        // M=1
+        double glob = (tt.global_bytes > 0) ? 4.0 : 0.0;
+        dev_total[d] += code + scale + act + out + glob;
+        dev_weights[d] += code + scale + glob;
+        dev_work[d] += act + out;
+      }
+    }
+    printf("--- runnable-linears footprint (kernel layout, TP=%zu) ---\n",
+           ndev);
+    // Debug: tensors NOT matched to a runnable role (preload-all must decide
+    // whether to build them; dead tensors waste VRAM + host cache).
+    {
+      int n_other = 0; double other_nk = 0.0;
+      for (size_t i = 0; i < tensors.size(); ++i) {
+        const auto& tt = tensors[i];
+        if (role_of(tt.name) != "other") continue;
+        n_other++;
+        other_nk += (double)tt.N * tt.K;
+        if (n_other <= 15)
+          printf("  other: %-70s N=%u K=%u role=%d scheme=%d\n",
+                 tt.name.c_str(), tt.N, tt.K, (int)tt.role,
+                 (int)tt.qcfg.scheme);
+      }
+      printf("  other total: count=%d NK-elems=%.3f G\n", n_other,
+             other_nk / 1e9);
+    }
+    for (auto& kv : by_role)
+      printf("  %-12s count=%4d full=%.3f GB\n", kv.first.c_str(), kv.second.first,
+             kv.second.second / 1e9);
+    for (size_t d = 0; d < ndev; ++d)
+      printf("  device %zu shard total: %.3f GB (weights %.3f + work %.3f)\n",
+             d, dev_total[d] / 1e9, dev_weights[d] / 1e9, dev_work[d] / 1e9);
+    printf("  host INT4/8/2 cache total: %.3f GB\n", host_cache_total / 1e9);
+    return 0;
+  }
+
   // Tensor-name matching: CLI names carry the ".weight" suffix and the
   // "model.language_model." prefix; accept short substrings by also trying
   // with the suffix appended.

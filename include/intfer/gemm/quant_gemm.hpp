@@ -171,4 +171,17 @@ sycl::event quant_gemm_f16(sycl::queue& q,
                     sycl::half* c,        // M*N row-major
                     uint32_t M, uint32_t N, uint32_t K);
 
+// FP16 x INT8 GEMM for the VRAM-resident lm_head (27B TP=2): dev0 cannot
+// hold the 1.27GB FP16 shard next to the preloaded engine (12647 > 12216
+// hard), so lm_head uploads as per-row symmetric INT8 (0.64GB/dev) +
+// FP16 per-row scales. W_int8[n,k] = round(W[n,k]/scale[n]),
+// scale[n] = max|W[n,:]|/127. Same 64x64x64 tiling as quant_gemm_f16;
+// dequant is one FMA (scale * int8) in the weight-load path.
+sycl::event quant_gemm_f16_int8w(sycl::queue& q,
+                    const sycl::half* a,    // M*K row-major FP16
+                    const std::int8_t* w,   // N*K row-major INT8 codes
+                    const sycl::half* ws,   // N per-row FP16 scales
+                    sycl::half* c,          // M*N row-major FP16 out
+                    uint32_t M, uint32_t N, uint32_t K);
+
 }  // namespace intfer::gemm

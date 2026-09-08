@@ -686,6 +686,79 @@ sycl::event quant_gemm_f16(sycl::queue& q,
   return evt;
 }
 
+sycl::event quant_gemm_f16_int8w(sycl::queue& q,
+                    const sycl::half* a,    // M*K row-major FP16
+                    const std::int8_t* w,   // N*K row-major INT8 codes
+                    const sycl::half* ws,   // N per-row FP16 scales
+                    sycl::half* c,          // M*N row-major FP16 out
+                    uint32_t M, uint32_t N, uint32_t K) {
+  const int gx = (static_cast<int>(M) + kBM - 1) / kBM;
+  const int gy = (static_cast<int>(N) + kBN - 1) / kBN;
+  sycl::nd_range<2> nd(sycl::range<2>(gx * kThr, gy * kThr),
+                       sycl::range<2>(kThr, kThr));
+
+  auto evt = q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<std::uint16_t, 1> sA(sycl::range<1>(kBM * kBK), h);
+    sycl::local_accessor<std::uint16_t, 1> sW(sycl::range<1>(kBN * kBK), h);
+    h.parallel_for(nd, [=](sycl::nd_item<2> it) {
+      const int itm = it.get_global_id(0);
+      const int itn = it.get_global_id(1);
+      const int bm = itm / kThr, bn = itn / kThr;
+      const int ty = itm % kThr, tx = itn % kThr;
+
+      float acc[kSub * kSub] = {0};
+
+      const int nk_blocks = (K + kBK - 1) / kBK;
+      for (int bk = 0; bk < nk_blocks; ++bk) {
+        for (int e = ty * kThr + tx; e < kBM * kBK; e += kThr * kThr) {
+          const int r = e / kBK, cc = e % kBK;
+          const int mg = bm * kBM + r;
+          const int kg = bk * kBK + cc;
+          std::uint16_t val = 0;
+          if (mg < static_cast<int>(M) && kg < static_cast<int>(K))
+            val = sycl::bit_cast<std::uint16_t>(a[mg * K + kg]);
+          sA[e] = val;
+        }
+        for (int e = ty * kThr + tx; e < kBN * kBK; e += kThr * kThr) {
+          const int r = e / kBK, cc = e % kBK;
+          const int ng = bn * kBN + r;
+          const int kg = bk * kBK + cc;
+          std::uint16_t val = 0;
+          if (ng < static_cast<int>(N) && kg < static_cast<int>(K)) {
+            // Per-row symmetric dequant: w = scale[ng] * int8.
+            const float s = static_cast<float>(ws[ng]);
+            const float wv = s * static_cast<float>(w[(std::size_t)ng * K + kg]);
+            val = to_half_bits(wv);
+          }
+          sW[e] = val;
+        }
+        it.barrier();
+
+        for (int kk = 0; kk < kBK; ++kk) {
+          for (int i = 0; i < kSub; ++i)
+            for (int j = 0; j < kSub; ++j) {
+              const float av = static_cast<float>(
+                  sycl::bit_cast<sycl::half>(sA[(ty * kSub + i) * kBK + kk]));
+              const float wv = static_cast<float>(
+                  sycl::bit_cast<sycl::half>(sW[(tx * kSub + j) * kBK + kk]));
+              acc[i * kSub + j] += av * wv;
+            }
+        }
+        it.barrier();
+      }
+
+      for (int i = 0; i < kSub; ++i)
+        for (int j = 0; j < kSub; ++j) {
+          const int mg = bm * kBM + ty * kSub + i;
+          const int ng = bn * kBN + tx * kSub + j;
+          if (mg < static_cast<int>(M) && ng < static_cast<int>(N))
+            c[mg * N + ng] = sycl::bit_cast<sycl::half>(to_half_bits(acc[i * kSub + j]));
+        }
+    });
+  });
+  return evt;
+}
+
 sycl::event quant_gemm_dpas_int8(sycl::queue& q,
                           const std::int8_t* a_int8,
                           float a_scale,

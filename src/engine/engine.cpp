@@ -23,6 +23,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <chrono>
+#include <vector>
 // ...
 
 
@@ -54,19 +55,39 @@ Engine::~Engine() {
       for (void* p : vec) sycl::free(p, devices_[d].queue);
       vec.clear();
     }
+  // Free the shared act/out workspaces (2 live allocs per device max).
+  for (size_t d = 0; d < ws_.size() && d < devices_.size(); ++d) {
+    if (ws_[d].act) sycl::free(ws_[d].act, devices_[d].queue);
+    if (ws_[d].out) sycl::free(ws_[d].out, devices_[d].queue);
+    ws_[d].act = nullptr; ws_[d].out = nullptr;
+  }
 }
 
 void* Engine::pool_acquire(size_t device, size_t bytes) {
   if (device >= devices_.size() || bytes == 0) return nullptr;
   if (device >= usm_pool_.size()) usm_pool_.resize(device + 1);
+  pool_acquires_++;
   auto& vec = usm_pool_[device][bytes];
   if (!vec.empty()) {
     void* p = vec.back();
     vec.pop_back();
+    pool_hits_++;
     return p;
   }
   auto& dev = devices_[device];
-  return sycl::malloc_shared(bytes, dev.sycl_device, dev.sycl_context);
+  void* p = sycl::malloc_shared(bytes, dev.sycl_device, dev.sycl_context);
+  if (!p) {
+    // Device OOM under preload-all: fail loudly with the exact shortfall
+    // instead of a downstream nullptr-memcpy SIGSEGV. Steady-state VRAM is
+    // ~10.9GB weights/dev (27B-sc TP=2) vs the 12216MiB B580 budget.
+    std::fprintf(stderr,
+                 "[intfer] FATAL: USM alloc of %zu bytes failed on device %zu "
+                 "(VRAM budget exceeded?)\n",
+                 bytes, device);
+    std::fflush(stderr);
+    std::abort();
+  }
+  return p;
 }
 
 void Engine::pool_release(size_t device, void* ptr, size_t bytes) {
@@ -289,6 +310,64 @@ std::unique_ptr<Engine> Engine::load(const std::string& intfer_path,
   return e;
 }
 
+#ifdef INTFER_HAS_L0
+#include <level_zero/zes_api.h>
+#endif
+
+// Free VRAM bytes on device i via sysman (see header). Sysman device order
+// is NOT SYCL order (measured reversed on 2x B580), so match by native
+// UUID: sycl::get_native<L0> handle -> zeDeviceGetProperties uuid vs
+// zesDeviceGetProperties core.uuid (same UUID space; never call the core
+// getter on a sysman handle — it segfaults). Returns 0 on any failure;
+// the caller falls back to an even split.
+uint64_t Engine::device_free_bytes(size_t i) {
+  if (i >= devices_.size()) return 0;
+#ifdef INTFER_HAS_L0
+  if (!devices_[i].has_l0()) return 0;
+  ze_device_properties_t want{};
+  want.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+  if (zeDeviceGetProperties(devices_[i].ze_device, &want) != ZE_RESULT_SUCCESS)
+    return 0;
+  if (zesInit(0) != ZE_RESULT_SUCCESS) return 0;
+  uint64_t free_total = 0;
+  bool matched = false;
+  uint32_t ndrv = 0;
+  if (zesDriverGet(&ndrv, nullptr) != ZE_RESULT_SUCCESS) return 0;
+  std::vector<zes_driver_handle_t> drvs(ndrv);
+  if (zesDriverGet(&ndrv, drvs.data()) != ZE_RESULT_SUCCESS) return 0;
+  for (auto drv : drvs) {
+    uint32_t ndev = 0;
+    if (zesDeviceGet(drv, &ndev, nullptr) != ZE_RESULT_SUCCESS) continue;
+    std::vector<zes_device_handle_t> sdevs(ndev);
+    if (zesDeviceGet(drv, &ndev, sdevs.data()) != ZE_RESULT_SUCCESS) continue;
+    for (auto sd : sdevs) {
+      zes_device_properties_t sp{};
+      sp.stype = ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+      if (zesDeviceGetProperties(sd, &sp) != ZE_RESULT_SUCCESS) continue;
+      bool eq = true;
+      for (int b = 0; b < 16; ++b)
+        if (sp.core.uuid.id[b] != want.uuid.id[b]) { eq = false; break; }
+      if (!eq) continue;
+      matched = true;
+      uint32_t nmem = 0;
+      if (zesDeviceEnumMemoryModules(sd, &nmem, nullptr) != ZE_RESULT_SUCCESS)
+        return 0;
+      std::vector<zes_mem_handle_t> mems(nmem);
+      if (zesDeviceEnumMemoryModules(sd, &nmem, mems.data()) != ZE_RESULT_SUCCESS)
+        return 0;
+      for (auto mh : mems) {
+        zes_mem_state_t st{};
+        st.stype = ZES_STRUCTURE_TYPE_MEM_STATE;
+        if (zesMemoryGetState(mh, &st) == ZE_RESULT_SUCCESS) free_total += st.free;
+      }
+    }
+  }
+  return matched ? free_total : 0;
+#else
+  return 0;
+#endif
+}
+
 void Engine::build_shards() {
   // Balanced contiguous sharding of the output dim N across the devices
   // (tensor-parallel column split). Mirrors DeviceManager::shard.
@@ -358,6 +437,7 @@ int Engine::layer_of_name(const std::string& name) {
 }
 
 void Engine::release_shard(int tensor_index) {
+  if (pinned_) return;  // preload_all(): everything stays resident.
   if (tensor_index < 0 || (size_t)tensor_index >= shard_cache_.size()) return;
   auto& sc = shard_cache_[(size_t)tensor_index];
   if (!sc.built) return;
@@ -400,60 +480,51 @@ void Engine::release_shard(int tensor_index) {
       pool_release(d, sc.scale_usm[d], scale_bytes);
       sc.scale_usm[d] = nullptr;
     }
-    if (sc.global_usm.size() > d && sc.global_usm[d]) {
-      pool_release(d, sc.global_usm[d], sizeof(float));
-      sc.global_usm[d] = nullptr;
-    }
-    if (sc.act_usm.size() > d && sc.act_usm[d]) {
-      pool_release(d, sc.act_usm[d],
-                   (size_t)sc.act_M * t.K * sizeof(uint16_t));
-      sc.act_usm[d] = nullptr;
-    }
-    if (sc.out_usm.size() > d && sc.out_usm[d]) {
-      auto& rng = shards_[tensor_index].ranges;
-      uint32_t Nl = (d < rng.size()) ? rng[d].second - rng[d].first : 0;
-      pool_release(d, sc.out_usm[d],
-                   (size_t)sc.act_M * Nl * sizeof(uint16_t));
-      sc.out_usm[d] = nullptr;
-    }
+    // NOTE: alpha is host-side only (global_host); no device global buffer.
+    // NOTE: no per-shard act/out — the shared workspaces (ws_) serve all
+    // shards, so release only the weight buffers (code/scale).
   }
-  sc.code_usm.clear(); sc.scale_usm.clear(); sc.global_usm.clear();
-  sc.act_usm.clear(); sc.out_usm.clear();
-  sc.act_M = 0;
+  sc.code_usm.clear(); sc.scale_usm.clear();
   sc.built = false;
 }
 
-// Grow a built shard's act/out USM buffers to fit batch M (grow-only).
-// Weights are untouched; new buffers come from the shape-keyed pool and the
-// old ones return to it. Called on the run_linear_tp M>1 path only.
-void Engine::grow_act_buffers(int tensor_index, uint32_t M) {
-  if (tensor_index < 0 || (size_t)tensor_index >= shard_cache_.size()) return;
-  auto& sc = shard_cache_[(size_t)tensor_index];
-  if (!sc.built || M <= sc.act_M) return;
+// Shared per-device act/out workspaces (replaces per-shard act/out USM).
+// One buffer pair per device serves all shards: a shard's act/out are
+// written+consumed within one run_linear_tp call and never live across calls
+// (single-threaded CLI), and every kernel event is waited before readback,
+// so aliasing across shards is safe. Grow-only, direct malloc_shared (NOT
+// the shape pool — pool entries stay live and would pin the old size
+// resident). K/Nl vary per tensor, so the workspace covers the max seen.
+void Engine::ensure_workspace(uint32_t M, uint32_t K, uint32_t Nl_max) {
   if (M == 0) M = 1;
-  const auto& t = model_.tensors[tensor_index];
-  const auto& ranges = shards_[tensor_index].ranges;
+  if (ws_.size() != devices_.size()) ws_.resize(devices_.size());
   for (size_t d = 0; d < devices_.size(); ++d) {
-    auto [start, end] = ranges[d];
-    uint32_t N_local = end - start;
+    auto& w = ws_[d];
+    if (w.act && w.out && M <= w.M && K <= w.K && Nl_max <= w.Nl) continue;
     devices_[d].queue.wait();
-    if (d < sc.act_usm.size() && sc.act_usm[d]) {
-      pool_release(d, sc.act_usm[d],
-                   (size_t)sc.act_M * t.K * sizeof(uint16_t));
-      sc.act_usm[d] = static_cast<std::uint16_t*>(
-          pool_acquire(d, (size_t)M * t.K * sizeof(uint16_t)));
+    uint32_t nM = std::max(M, w.M);
+    uint32_t nK = std::max(K, w.K);
+    uint32_t nNl = std::max(Nl_max, w.Nl);
+    if (w.act) { sycl::free(w.act, devices_[d].queue); w.act = nullptr; }
+    if (w.out) { sycl::free(w.out, devices_[d].queue); w.out = nullptr; }
+    auto& dev = devices_[d];
+    w.act = static_cast<std::uint16_t*>(sycl::malloc_shared(
+        (size_t)nM * nK * sizeof(uint16_t), dev.sycl_device, dev.sycl_context));
+    w.out = static_cast<std::uint16_t*>(sycl::malloc_shared(
+        (size_t)nM * nNl * sizeof(uint16_t), dev.sycl_device, dev.sycl_context));
+    if (!w.act || !w.out) {
+      std::fprintf(stderr,
+                   "[intfer] FATAL: workspace alloc failed on device %zu "
+                   "(M=%u K=%u Nl=%u)\n", d, nM, nK, nNl);
+      std::fflush(stderr);
+      std::abort();
     }
-    if (d < sc.out_usm.size() && sc.out_usm[d]) {
-      pool_release(d, sc.out_usm[d],
-                   (size_t)sc.act_M * N_local * sizeof(uint16_t));
-      sc.out_usm[d] = static_cast<std::uint16_t*>(
-          pool_acquire(d, (size_t)M * N_local * sizeof(uint16_t)));
-    }
+    w.M = nM; w.K = nK; w.Nl = nNl;
   }
-  sc.act_M = M;
 }
 
 void Engine::begin_layer(int L) {
+  if (pinned_) return;  // preload_all(): steady-state zero evict+rebuild.
   if (layer_tensors_.empty()) return;
   // Phase 1: FP16-scheme shards are memcpy-identity slices (no unpack work)
   // and small enough to stay resident: layered FP16 is ~13.5GB total, i.e.
@@ -469,6 +540,141 @@ void Engine::begin_layer(int L) {
     int tl = (ti < layer_of_.size()) ? layer_of_[ti] : -1;
     if (tl >= 0 && tl != L) release_shard((int)ti);
   }
+}
+
+// Full-VRAM residency: build every runnable Linear shard once and pin it.
+// Only GEMM-runnable roles are built (ATTN Q/K/V/O, MLP gate/up/down, linear
+// attention QKV/Z/B/A/OUT). Skipped: lm_head-named tensors (the CLI serves
+// lm_head through its own TP-sharded run_lm_head_f16 upload, never through
+// engine shards — building the slot would waste 1.27GB/dev), norms/vectors
+// (K=1), conv1d and OTHER roles (host-side; ~1.27GB/dev of dead shards).
+// Anything missed lazy-builds on first run_linear_tp (correct by
+// construction: pinning blocks eviction, never construction).
+// Afterwards the INT4 host repack cache (~9.4GB host RAM on 27B-sc) is
+// dropped — with eviction disabled no rebuild can ever need it. Bit-identical:
+// same bytes as lazy builds.
+void Engine::preload_all() {
+  if (pinned_) return;
+  // No rebuilds will ever happen: skip the host repack cache entirely
+  // (saves ~9.4GB host RAM; without this the OOM killer takes the preload).
+  skip_host_cache_ = true;
+  auto is_runnable = [](TensorRole r) {
+    switch (r) {
+      case TensorRole::ATTN_Q: case TensorRole::ATTN_K:
+      case TensorRole::ATTN_V: case TensorRole::ATTN_O:
+      case TensorRole::MLP_GATE: case TensorRole::MLP_UP:
+      case TensorRole::MLP_DOWN:
+      case TensorRole::LINEAR_ATTN_QKV: case TensorRole::LINEAR_ATTN_Z:
+      case TensorRole::LINEAR_ATTN_B: case TensorRole::LINEAR_ATTN_A:
+      case TensorRole::LINEAR_ATTN_OUT:
+        return true;
+      default:
+        return false;
+    }
+  };
+  auto t0 = std::chrono::high_resolution_clock::now();
+  size_t n_built = 0, n_skip = 0;
+  uint64_t dev_bytes = 0;
+  // Bisection knob (DEVICE_LOST triage): cap the number of preloaded shards.
+  // Anything not preloaded lazy-builds on first use (correct by construction).
+  size_t preload_max = (size_t)-1;
+  if (const char* pm = std::getenv("INTFER_PRELOAD_MAX")) {
+    long v = std::atol(pm); if (v > 0) preload_max = (size_t)v;
+  }
+  for (size_t ti = 0; ti < model_.tensors.size(); ++ti) {
+    const auto& t = model_.tensors[ti];
+    if (t.name.find("lm_head") != std::string::npos) { n_skip++; continue; }
+    if (!is_runnable(t.role)) { n_skip++; continue; }
+    if (t.N == 0 || t.K == 0) { n_skip++; continue; }
+    if (shard_cache_[ti].built) continue;
+    if (n_built >= preload_max) continue;
+    ensure_shard_built((int)ti);
+    n_built++;
+    if ((n_built % 100) == 0) {
+      std::cout << "Engine: preload " << n_built << " shards...\n";
+      std::cout.flush();
+    }
+    if (const char* pt = std::getenv("INTFER_PRELOAD_TRACE")) {
+      // Per-shard trace: cumulative geometry bytes per device + tensor name.
+      // Correlates engine accounting with xpu-smi to find device-asymmetric
+      // growth (dev0-only jumps). Enable with INTFER_PRELOAD_TRACE=1.
+      static uint64_t trace_acc[8] = {0,0,0,0,0,0,0,0};
+      auto& rng = shards_[ti].ranges;
+      for (size_t d = 0; d < devices_.size() && d < 8; ++d) {
+        uint32_t Nl = (d < rng.size()) ? rng[d].second - rng[d].first : 0;
+        uint32_t G = t.qcfg.group_size > 0 ? t.qcfg.group_size : t.K;
+        uint32_t ng = (t.K + G - 1) / G;
+        const int tbits = (t.qcfg.scheme == QuantScheme::INT2) ? 2
+                        : (t.qcfg.scheme == QuantScheme::INT4) ? 4
+                        : (t.qcfg.scheme == QuantScheme::FP16) ? 16 : 8;
+        const int tpack = (tbits >= 8) ? 1 : (8 / tbits);
+        trace_acc[d] += (tbits == 16)
+            ? (uint64_t)Nl * t.K * 2 + (uint64_t)Nl * ng * 2
+            : (uint64_t)Nl * ((t.K + tpack - 1) / tpack)
+              + (uint64_t)Nl * ng * 2;
+      }
+      auto now = std::chrono::high_resolution_clock::now();
+      double el = std::chrono::duration<double>(now - t0).count();
+      std::cout << "Engine: preload #" << n_built << " t=" << (long)el
+                << "s dev0=" << trace_acc[0] / (1024*1024) << "MiB dev1="
+                << (devices_.size() > 1 ? trace_acc[1] / (1024*1024) : 0)
+                << "MiB " << t.name << "\n";
+      std::cout.flush();
+    }
+  }
+  // Pin first: any concurrent begin_layer() (none expected — single-threaded
+  // CLI, but belt-and-braces) must not evict what we just built.
+  // (skip_host_cache_ stays on: pinned shards are never rebuilt, and any
+  // lazy-built straggler is single-use — caching it would be dead RAM.)
+  pinned_ = true;
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    devices_[d].queue.wait();
+    // Tally resident weight bytes per device (code+scale+global).
+    uint64_t per_dev = 0;
+    for (size_t ti = 0; ti < shard_cache_.size(); ++ti) {
+      const auto& sc = shard_cache_[ti];
+      if (!sc.built || d >= sc.code_usm.size() || !sc.code_usm[d]) continue;
+      const auto& t = model_.tensors[ti];
+      auto& rng = shards_[ti].ranges;
+      uint32_t Nl = (d < rng.size()) ? rng[d].second - rng[d].first : 0;
+      uint32_t G = t.qcfg.group_size > 0 ? t.qcfg.group_size : t.K;
+      uint32_t ng = (t.K + G - 1) / G;
+      const int bits = (sc.scheme == gemm::WeightScheme::INT2) ? 2
+                     : (sc.scheme == gemm::WeightScheme::INT4) ? 4
+                     : (sc.scheme == gemm::WeightScheme::FP16) ? 16 : 8;
+      const int pack = (bits >= 8) ? 1 : (8 / bits);
+      per_dev += (sc.scheme == gemm::WeightScheme::FP16)
+          ? (uint64_t)Nl * t.K * 2
+          : (uint64_t)Nl * ((t.K + pack - 1) / pack);
+      per_dev += (uint64_t)Nl * ng * sizeof(uint16_t);
+      // Alpha is host-side (no device global buffer).
+    }
+    if (d == 0) dev_bytes = per_dev;
+    std::cout << "Engine: preload device " << d << " resident weights: "
+              << per_dev / (1024 * 1024) << " MiB\n";
+    std::cout.flush();
+  }
+  // Allocator audit: pool contents (should be empty post-preload) + total
+  // acquire count, to separate geometry bytes from runtime overhead.
+  {
+    size_t pool_n = 0; uint64_t pool_bytes = 0;
+    for (size_t d = 0; d < usm_pool_.size(); ++d)
+      for (auto& [bytes, vec] : usm_pool_[d]) {
+        pool_n += vec.size(); pool_bytes += bytes * vec.size();
+      }
+    std::cout << "Engine: preload audit: pool holds " << pool_n
+              << " bufs (" << pool_bytes / (1024 * 1024)
+              << " MiB), pool_acquire calls=" << pool_acquires_
+              << " pool_hits=" << pool_hits_ << "\n";
+    std::cout.flush();
+  }
+  auto t1 = std::chrono::high_resolution_clock::now();
+  double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  std::cout << "Engine: preload_all built " << n_built << " shards (skipped "
+            << n_skip << ", host cache bypassed), dev0 weights "
+            << dev_bytes / (1024 * 1024)
+            << " MiB in " << (long)ms << " ms; shards pinned (no evict)\n";
+  std::cout.flush();
 }
 
 std::vector<float> Engine::decode_step(const std::vector<float>& token_hidden,
@@ -522,10 +728,15 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   // Lazy-build the USM shard cache for this tensor on first call.
   if (!shard_cache_[tensor_index].built)
     ensure_shard_built(tensor_index);
-  auto& scm = shard_cache_[tensor_index];
-  // Grow the M-sized act/out buffers when the caller needs a larger batch
-  // than the shard was built for (M=1 fast path never triggers this).
-  if (M > scm.act_M) grow_act_buffers(tensor_index, M);
+  // Shared workspaces cover this call's (M, K, max-Nl) shape (grow-only;
+  // the M>1 batched path writes M*K / M*N_local elements, so M=1 sizing
+  // would OOB-write). Nl_max is over TP ranks (column sharding of N).
+  {
+    uint32_t Nl_max = 0;
+    for (size_t d = 0; d < ranges.size(); ++d)
+      Nl_max = std::max(Nl_max, ranges[d].second - ranges[d].first);
+    ensure_workspace(M, t.K, Nl_max);
+  }
   const auto& sc = shard_cache_[tensor_index];
  
   // Pre-convert FP32 activation to FP16 once (shared by all devices).
@@ -556,8 +767,8 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     sycl::queue& q = dev.queue;
     auto N_local = end - start;
  
-    // 1) Write FP16 activation directly into persistent USM act buffer.
-    std::uint16_t* const act_ptr = sc.act_usm[d];
+    // 1) Write FP16 activation into the shared per-device workspace.
+    std::uint16_t* const act_ptr = ws_[d].act;
 #ifdef INTFER_PROFILE_GPU
     auto t_w0 = std::chrono::high_resolution_clock::now();
 #endif
@@ -572,18 +783,18 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
 #endif
 
     // 2) Launch the USM kernel on the persistent weight buffers.
-    float alpha = sc.has_global_divisor
-                      ? sc.global_usm[d][0]
-                      : 1.0f;
+    // Alpha comes from the host copy (kernel takes it by value; no device
+    // alloc for 4 bytes).
+    float alpha = sc.has_global_divisor ? sc.global_host : 1.0f;
 #ifdef INTFER_PROFILE_GPU
     auto t_s0 = std::chrono::high_resolution_clock::now();
 #endif
     sycl::event kernel_evt = gemm::quant_gemm_forward_usm(q,
-                                  sc.act_usm[d],
+                                  ws_[d].act,
                                   sc.code_usm[d],
                                   sc.scale_usm[d],
                                   alpha,
-                                  sc.out_usm[d],
+                                  ws_[d].out,
                                   M, N_local, t.K,
                                   sc.group_size,
                                   sc.scheme,
@@ -601,9 +812,9 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     kernel_events.push_back(kernel_evt);
   }
  
-  // Wait for all kernels, then read back directly from persistent USM.
+  // Wait for all kernels, then read back from the shared workspace.
   // NOTE: the wait is load-bearing, not profiling — without it the host
-  // reads out_usm before the kernel runs (fresh zero pages => all-zero
+  // reads ws out before the kernel runs (fresh zero pages => all-zero
   // GEMM outputs). Only the timing accumulation is profiling-gated.
 #ifdef INTFER_PROFILE_GPU
   auto t_wb0 = std::chrono::high_resolution_clock::now();
@@ -633,7 +844,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
 #endif
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto [start, end] = ranges[d];
-    const std::uint16_t* out_ptr = sc.out_usm[d];
+    const std::uint16_t* out_ptr = ws_[d].out;
     const uint32_t N_local_rb = static_cast<uint32_t>(end - start);
     for (uint32_t m = 0; m < M; ++m)
       for (uint32_t r = 0; r < N_local_rb; ++r)
@@ -730,12 +941,12 @@ bool Engine::ensure_shard_built(int tensor_index) {
   sc.K = t.K;
   sc.code_usm.resize(devices_.size());
   sc.scale_usm.resize(devices_.size());
-  sc.global_usm.resize(devices_.size());
-  sc.act_usm.resize(devices_.size());
-  sc.out_usm.resize(devices_.size());
   // Host-cache gate (see below): FP16 is memcpy-identity + resident, so only
   // cache the schemes whose shard_weight() does scalar unpack work (INT4/8/2).
-  const bool cacheable = (sc.scheme != gemm::WeightScheme::FP16);
+  // skip_host_cache_ (preload_all): pinned shards are never rebuilt, so the
+  // cache would be dead host RAM (~9.4GB on 27B-sc) — skip populating it.
+  const bool cacheable =
+      (sc.scheme != gemm::WeightScheme::FP16) && !skip_host_cache_;
 
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto& dev = devices_[d];
@@ -795,21 +1006,11 @@ bool Engine::ensure_shard_built(int tensor_index) {
     // Scale: N_local * n_groups FP16
     sc.scale_usm[d] = static_cast<std::uint16_t*>(pool_acquire(d, scale_bytes));
     std::memcpy(sc.scale_usm[d], scale_ptr, scale_bytes);
+    // NOTE: no global_usm alloc — alpha stays host-side (global_host) and is
+    // passed to the kernel by value (see run_linear_tp).
 
-    // Global divisor: 1 float
-    if (global_ptr) {
-      sc.global_usm[d] = static_cast<float*>(pool_acquire(d, sizeof(float)));
-      std::memcpy(sc.global_usm[d], global_ptr, sizeof(float));
-    }
-
-    // 3) Persistent activation buffer (act_M * K FP16) and output buffer
-    //    (act_M * N_local FP16). M=1 sizing; grow_act_buffers() enlarges for
-    //    the batched path (grow-only, pool-backed).
-    sc.act_M = 1;
-    sc.act_usm[d] = static_cast<std::uint16_t*>(
-        pool_acquire(d, (size_t)sc.act_M * t.K * sizeof(uint16_t)));
-    sc.out_usm[d] = static_cast<std::uint16_t*>(
-        pool_acquire(d, static_cast<size_t>(sc.act_M) * N_local * sizeof(uint16_t)));
+    // NOTE: no per-shard act/out — run_linear_tp writes into the shared
+    // per-device workspaces (ensure_workspace, grow-only).
   }
   if (cacheable) sc.has_host_cache = true;
 #ifdef INTFER_PROFILE_GPU

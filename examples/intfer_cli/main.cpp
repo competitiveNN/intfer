@@ -698,34 +698,236 @@ struct GpuBackend : public LinearBackend {
     eng->run_linear_tp(it->second, X, Y, M);
   }
 
-  // Cached lm_head FP16 upload + one-off FP16 GEMM on device.
-  // The first call uploads W[N,K] as FP16 to each device; later calls reuse
-  // the cached device pointer and just launch the GEMM.
+  // Cached lm_head INT8 upload + per-row-symmetric INT8 GEMM on device.
+  // The full FP16 head (2.54GB on 27B: 1.27GB/dev TP=2) can NEVER fit next
+  // to the preloaded engine on dev0 (11360+1270=12647 > 12216 hard), so the
+  // head uploads as per-row symmetric INT8 (~0.64GB/dev) + FP16 row scales:
+  //   q[n,k] = round(W[n,k]/s[n]), s[n] = max|W[n,:]|/127
+  // via gemm::quant_gemm_f16_int8w (same 64x64x64 tiling as quant_gemm_f16;
+  // dequant is one FMA in the weight-load path; probe-gated maxerr ~1e-3
+  // vs signal ~2, argmax stable over 5 seeds — see build_tmp probe).
+  // TP split is ASYMMETRIC by measured free VRAM (dev0 keeps a ~393MiB
+  // display reservation): after preload_all(), query eng->device_free_bytes
+  // per rank, subtract a 128MiB margin (per-token x_dev/out + L0
+  // fragmentation), split rows proportional to the remainder. Falls back to
+  // an even split when the sysman query is unavailable (returns 0).
+  // INTFER_LMHEAD_SPLIT0=<rows> overrides the dev0 row count (bisection);
+  // INTFER_LMHEAD_FP16=1 restores the old FP16 tiled path (bisection only —
+  // it cannot fit 27B TP=2; kept so the 0.8B parity gate can A/B).
+  // Bit-considerations: GEMM rows are independent (row-blocked over N with
+  // bounds guards), so any row partition concatenates to the same logits
+  // up to INT8 rounding (argmax-gated, not bit-identical vs FP32).
   std::vector<float> run_lm_head_f16(const float* fn, // final norm hidden [K]
                                      const float* W,   // lm_head weight [N,K]
                                      uint32_t N, uint32_t K){
     if(!eng) return {};
-    if(lm_head_w_dev_.empty()){
-      size_t w_bytes = (size_t)N * K * sizeof(sycl::half);
-      lm_head_N_ = N; lm_head_K_ = K;
-      lm_head_w_dev_.resize(eng->num_devices());
-      lm_head_c_dev_.resize(eng->num_devices());
-      for(size_t d=0; d<eng->num_devices(); ++d){
-        sycl::queue& q = eng->device_queue((int)d);
-        lm_head_w_dev_[d] = static_cast<sycl::half*>(
-            sycl::malloc_device(w_bytes, q.get_device(), q.get_context()));
-        lm_head_c_dev_[d] = static_cast<sycl::half*>(
-            sycl::malloc_device((size_t)N * sizeof(sycl::half), q.get_device(), q.get_context()));
-        // Upload once. NOTE: the per-queue wait below is load-bearing, not
-        // profiling — the H2D memcpy is async; without the wait the host
-        // reuses/frees the staging buffer while the copy is still in flight,
-        // which surfaces as DEVICE_LOST under full-model device pressure.
-        std::vector<sycl::half> w_fp16((size_t)N * K);
-        for(uint32_t i=0;i<(size_t)N*K;i++) w_fp16[i] = sycl::half(W[i]);
-        q.memcpy(lm_head_w_dev_[d], w_fp16.data(), w_bytes);
-        q.wait();
+    size_t ndev = eng->num_devices();
+    static const bool force_fp16 = (std::getenv("INTFER_LMHEAD_FP16") != nullptr);
+    // Function scope: both the upload path and the per-token GEMM path
+    // (x_dev alloc / submit throws under VRAM pressure) reset through
+    // fail_reset so a shortfall degrades to {} instead of SIGABRT.
+    std::vector<sycl::half*> x_devs;
+    auto fail_reset = [&](){
+      // Alloc failure (VRAM pressure) must not leave a half-initialized
+      // cache: the next call would GEMM from nullptr (DEVICE_LOST). Free
+      // partials and reset so the next call retries cleanly (caller gets
+      // {} -> zero logits for this token).
+      for(size_t dd=0; dd<x_devs.size(); ++dd)
+        if(x_devs[dd]) sycl::free(x_devs[dd], eng->device_queue((int)dd));
+      x_devs.clear();
+      for(size_t d=0; d<ndev; ++d){
+        for(size_t t=0; t<lm_head_q_dev_[d].size(); ++t){
+          if(lm_head_q_dev_[d][t]){
+            sycl::free(lm_head_q_dev_[d][t], eng->device_queue((int)d));
+            lm_head_q_dev_[d][t] = nullptr;
+          }
+          if(t<lm_head_s_dev_[d].size() && lm_head_s_dev_[d][t]){
+            sycl::free(lm_head_s_dev_[d][t], eng->device_queue((int)d));
+            lm_head_s_dev_[d][t] = nullptr;
+          }
+          if(t<lm_head_c_dev_[d].size() && lm_head_c_dev_[d][t]){
+            sycl::free(lm_head_c_dev_[d][t], eng->device_queue((int)d));
+            lm_head_c_dev_[d][t] = nullptr;
+          }
+        }
+        for(size_t t=0; t<lm_head_w_dev_[d].size(); ++t){
+          if(lm_head_w_dev_[d][t]){
+            sycl::free(lm_head_w_dev_[d][t], eng->device_queue((int)d));
+            lm_head_w_dev_[d][t] = nullptr;
+          }
+        }
       }
-      for(size_t d=0; d<eng->num_devices(); ++d)
+      lm_head_q_dev_.clear(); lm_head_s_dev_.clear();
+      lm_head_w_dev_.clear(); lm_head_c_dev_.clear();
+      lm_head_ranges_.clear(); lm_head_tiles_.clear();
+      lm_head_N_ = 0; lm_head_K_ = 0;
+    };
+    if(lm_head_q_dev_.empty() && lm_head_w_dev_.empty()){
+      lm_head_N_ = N; lm_head_K_ = K;
+      lm_head_ranges_.resize(ndev);
+      lm_head_tiles_.resize(ndev);
+      if(force_fp16){
+        lm_head_w_dev_.resize(ndev);
+        lm_head_c_dev_.resize(ndev);
+      } else {
+        lm_head_q_dev_.resize(ndev);
+        lm_head_s_dev_.resize(ndev);
+        lm_head_c_dev_.resize(ndev);
+      }
+      if(ndev == 1){
+        lm_head_ranges_[0] = {0, N};
+      } else if(force_fp16){
+        for(size_t d=0; d<ndev; ++d)
+          lm_head_ranges_[d] = {(uint32_t)(N * d / ndev), (uint32_t)(N * (d + 1) / ndev)};
+      } else {
+        // Asymmetric split by measured free VRAM (post-preload). Per-row
+        // resident bytes: K INT8 codes + 1 FP16 scale.
+        const uint64_t row_bytes = (uint64_t)K + sizeof(sycl::half);
+        const uint64_t margin = 128u * 1024u * 1024u;
+        uint64_t cap0 = 0, cap1 = 0;
+        {
+          uint64_t f0 = eng->device_free_bytes(0);
+          uint64_t f1 = (ndev > 1) ? eng->device_free_bytes(1) : 0;
+          std::fprintf(stderr, "[intfer] lm_head: free VRAM dev0=%lluMiB dev1=%lluMiB\n",
+                       (unsigned long long)(f0 / (1024*1024)),
+                       (unsigned long long)(f1 / (1024*1024)));
+          std::fflush(stderr);
+          cap0 = (f0 > margin) ? (f0 - margin) / row_bytes : 0;
+          cap1 = (f1 > margin) ? (f1 - margin) / row_bytes : 0;
+        }
+        uint32_t split0 = 0;
+        if(const char* so = std::getenv("INTFER_LMHEAD_SPLIT0")){
+          long v = std::atol(so);
+          if(v > 0 && (uint64_t)v < N) split0 = (uint32_t)v;
+        }
+        if(!split0){
+          if(cap0 + cap1 >= N && (cap0 > 0 || cap1 > 0)){
+            // Rows proportional to capacity; dev0 capped at its capacity.
+            split0 = (uint32_t)std::min<uint64_t>(cap0, N);
+            if(cap0 + cap1 > 0)
+              split0 = (uint32_t)std::min<uint64_t>(cap0, (N * cap0) / (cap0 + cap1));
+          } else {
+            // Sysman unavailable (both 0) or short: even split, same as before.
+            split0 = N / (uint32_t)ndev;
+            std::fprintf(stderr, "[intfer] lm_head: free-VRAM query unavailable "
+                         "(cap0=%llu cap1=%llu rows, N=%u) — even split\n",
+                         (unsigned long long)cap0, (unsigned long long)cap1, N);
+          }
+        }
+        if(split0 == 0 || split0 >= N) split0 = N / (uint32_t)ndev;
+        lm_head_ranges_[0] = {0, split0};
+        if(ndev > 1) lm_head_ranges_[1] = {split0, N};
+        for(size_t d=2; d<ndev; ++d) lm_head_ranges_[d] = {N, N};
+        std::fprintf(stderr, "[intfer] lm_head INT8: dev0 rows [0,%u) dev1 rows [%u,%u)\n",
+                     split0, split0, N);
+        std::fflush(stderr);
+      }
+      // Rows per tile: cap tile weight bytes at 128MB so the upload fits
+      // alongside the preloaded engine. >=1 row. (INT8 tiles are 2x smaller
+      // than the FP16 ones this formula was sized for — conservative.)
+      uint32_t tile_rows = (uint32_t)std::max<size_t>(
+          1, (128u * 1024u * 1024u) / ((size_t)K * sizeof(sycl::half)));
+      for(size_t d=0; d<ndev; ++d){
+        uint32_t start = lm_head_ranges_[d].first, end = lm_head_ranges_[d].second;
+        if(end <= start) continue;
+        sycl::queue& q = eng->device_queue((int)d);
+        // Tile this device's row range (peak transient = 1 tile).
+        for(uint32_t ts = start; ts < end; ts += tile_rows){
+          uint32_t te = std::min(ts + tile_rows, end);
+          uint32_t Nl = te - ts;
+          lm_head_tiles_[d].push_back({ts, te});
+          size_t t_idx = lm_head_tiles_[d].size() - 1;
+          // NOTE: sycl::malloc_device THROWS (bad_alloc / UR_RESULT_ERROR_-
+          // OUT_OF_RESOURCES) on OOM instead of returning nullptr — catch
+          // and route through fail_reset so a shortfall degrades to zero
+          // logits for this token, not SIGABRT.
+          sycl::half* c_tile = nullptr;
+          try {
+            c_tile = static_cast<sycl::half*>(
+                sycl::malloc_device((size_t)Nl * sizeof(sycl::half), q.get_device(), q.get_context()));
+          } catch (...) { c_tile = nullptr; }
+          lm_head_c_dev_[d].push_back(c_tile);
+          if(!lm_head_c_dev_[d][t_idx]){
+            std::fprintf(stderr, "[intfer] FATAL: lm_head tile out alloc failed "
+                         "on device %zu (rows %u-%u)\n", d, ts, te);
+            std::fflush(stderr);
+            fail_reset();
+            return {};
+          }
+          if(force_fp16){
+            size_t w_bytes = (size_t)Nl * K * sizeof(sycl::half);
+            sycl::half* w_tile = nullptr;
+            try {
+              w_tile = static_cast<sycl::half*>(
+                  sycl::malloc_device(w_bytes, q.get_device(), q.get_context()));
+            } catch (...) { w_tile = nullptr; }
+            lm_head_w_dev_[d].push_back(w_tile);
+            if(!lm_head_w_dev_[d][t_idx]){
+              std::fprintf(stderr, "[intfer] FATAL: lm_head tile alloc failed "
+                           "on device %zu (rows %u-%u, VRAM budget exceeded?)\n",
+                           d, ts, te);
+              std::fflush(stderr);
+              fail_reset();
+              return {};
+            }
+            // Upload once. NOTE: the per-queue wait below is load-bearing, not
+            // profiling — the H2D memcpy is async; without the wait the host
+            // reuses/frees the staging buffer while the copy is still in flight,
+            // which surfaces as DEVICE_LOST under full-model device pressure.
+            std::vector<sycl::half> w_fp16((size_t)Nl * K);
+            for(uint32_t r=0;r<Nl;r++) for(uint32_t k=0;k<K;k++)
+              w_fp16[(size_t)r*K+k] = sycl::half(W[(size_t)(ts+r)*K+k]);
+            q.memcpy(lm_head_w_dev_[d][t_idx], w_fp16.data(), w_bytes);
+            q.wait();
+          } else {
+            // INT8 upload: quantize rows on the host (per-row symmetric),
+            // upload codes + FP16 scales. Host staging is Nl*K int8 (~half
+            // the FP16 tile) + Nl scales.
+            std::vector<std::int8_t> q_i8((size_t)Nl * K);
+            std::vector<sycl::half> q_sc(Nl);
+            for(uint32_t r=0;r<Nl;r++){
+              const float* Wr = W + (size_t)(ts+r)*K;
+              float mx = 0;
+              for(uint32_t k=0;k<K;k++){
+                float a = std::fabs(Wr[k]);
+                if(a > mx) mx = a;
+              }
+              float s = (mx > 0) ? mx / 127.0f : 1.0f;
+              q_sc[r] = sycl::half(s);
+              float inv = 1.0f / s;
+              std::int8_t* qr = q_i8.data() + (size_t)r*K;
+              for(uint32_t k=0;k<K;k++)
+                qr[k] = (std::int8_t)std::lrint(Wr[k] * inv);
+            }
+            std::int8_t* q_tile = nullptr;
+            try {
+              q_tile = static_cast<std::int8_t*>(sycl::malloc_device(
+                  (size_t)Nl * K, q.get_device(), q.get_context()));
+            } catch (...) { q_tile = nullptr; }
+            lm_head_q_dev_[d].push_back(q_tile);
+            sycl::half* s_tile = nullptr;
+            try {
+              s_tile = static_cast<sycl::half*>(sycl::malloc_device(
+                  (size_t)Nl * sizeof(sycl::half), q.get_device(), q.get_context()));
+            } catch (...) { s_tile = nullptr; }
+            lm_head_s_dev_[d].push_back(s_tile);
+            if(!lm_head_q_dev_[d][t_idx] || !lm_head_s_dev_[d][t_idx]){
+              std::fprintf(stderr, "[intfer] FATAL: lm_head INT8 tile alloc failed "
+                           "on device %zu (rows %u-%u, VRAM budget exceeded?)\n",
+                           d, ts, te);
+              std::fflush(stderr);
+              fail_reset();
+              return {};
+            }
+            q.memcpy(lm_head_q_dev_[d][t_idx], q_i8.data(), (size_t)Nl * K);
+            q.wait();
+            q.memcpy(lm_head_s_dev_[d][t_idx], q_sc.data(),
+                     (size_t)Nl * sizeof(sycl::half));
+            q.wait();
+          }
+        }
+      }
+      for(size_t d=0; d<ndev; ++d)
         eng->device_queue((int)d).wait();
     }
     if(lm_head_N_ != N || lm_head_K_ != K){
@@ -743,37 +945,73 @@ struct GpuBackend : public LinearBackend {
     std::vector<sycl::half> x_fp16(K);
     for(uint32_t i=0;i<K;i++) x_fp16[i] = sycl::half(fn[i]);
     std::vector<float> out(N, 0.f);
-    std::vector<sycl::half> out_h(N);
     std::vector<sycl::event> evts;
     evts.reserve(eng->num_devices());
-    std::vector<sycl::half*> x_devs;
-    x_devs.reserve(eng->num_devices());
     double lm_kernel_us = 0;
+    // Per-device output staging (row shard), concatenated below.
+    std::vector<std::vector<sycl::half>> out_seg(eng->num_devices());
     for(size_t d=0; d<eng->num_devices(); ++d){
+      uint32_t start = lm_head_ranges_[d].first, end = lm_head_ranges_[d].second;
+      uint32_t Nl = end - start;
+      out_seg[d].resize(Nl);
       sycl::queue& q = eng->device_queue((int)d);
-      sycl::half* x_dev = static_cast<sycl::half*>(
-          sycl::malloc_device((size_t)K * sizeof(sycl::half), q.get_device(), q.get_context()));
+      // x_dev alloc can throw under VRAM pressure (submit path throws
+      // UR_RESULT_ERROR_OUT_OF_RESOURCES too — see below): degrade to {}
+      // via fail_reset instead of SIGABRT.
+      sycl::half* x_dev = nullptr;
+      try {
+        x_dev = static_cast<sycl::half*>(
+            sycl::malloc_device((size_t)K * sizeof(sycl::half), q.get_device(), q.get_context()));
+      } catch (...) { x_dev = nullptr; }
+      if(!x_dev){ fail_reset(); return {}; }
       x_devs.push_back(x_dev);
       q.memcpy(x_dev, x_fp16.data(), (size_t)K * sizeof(sycl::half));
-      sycl::event evt = gemm::quant_gemm_f16(q, x_dev, lm_head_w_dev_[d],
-                                             lm_head_c_dev_[d], 1, N, K);
-      q.memcpy(out_h.data(), lm_head_c_dev_[d], (size_t)N * sizeof(sycl::half), evt);
-      // Load-bearing: waiting only on the kernel event leaves the D2H
-      // readback in flight while the host consumes out_h (and frees x_dev).
-      // Under full-model device pressure that race kills the device; the
-      // queue wait makes host consumption safe.
-      q.wait();
-      try {
-        auto ts = evt.get_profiling_info<sycl::info::event_profiling::command_start>();
-        auto te = evt.get_profiling_info<sycl::info::event_profiling::command_end>();
-        lm_kernel_us += (double)(te - ts) / 1000.0;
-      } catch (...) {}
-      evts.push_back(evt);
+      // One GEMM per resident tile; tiles concatenate in row order.
+      // The submit itself can throw when the device is full — catch per
+      // tile so a shortfall degrades to {} (fail_reset frees everything
+      // including x_devs allocated so far) instead of terminate.
+      for(size_t t=0; t<lm_head_tiles_[d].size(); ++t){
+        uint32_t ts = lm_head_tiles_[d][t].first, te = lm_head_tiles_[d][t].second;
+        uint32_t Nlt = te - ts;
+        sycl::event evt;
+        try {
+          evt = force_fp16
+              ? gemm::quant_gemm_f16(q, x_dev, lm_head_w_dev_[d][t],
+                                     lm_head_c_dev_[d][t], 1, Nlt, K)
+              : gemm::quant_gemm_f16_int8w(q, x_dev, lm_head_q_dev_[d][t],
+                                           lm_head_s_dev_[d][t],
+                                           lm_head_c_dev_[d][t], 1, Nlt, K);
+        } catch (...) {
+          std::fprintf(stderr, "[intfer] FATAL: lm_head GEMM submit failed "
+                       "on device %zu tile %zu (VRAM pressure?)\n", d, t);
+          std::fflush(stderr);
+          fail_reset();
+          return {};
+        }
+        q.memcpy(out_seg[d].data() + (ts - start), lm_head_c_dev_[d][t],
+                 (size_t)Nlt * sizeof(sycl::half), evt);
+        // Load-bearing: waiting only on the kernel event leaves the D2H
+        // readback in flight while the host consumes out_seg (and frees x_dev).
+        // Under full-model device pressure that race kills the device; the
+        // queue wait makes host consumption safe.
+        q.wait();
+        try {
+          auto tss = evt.get_profiling_info<sycl::info::event_profiling::command_start>();
+          auto tee = evt.get_profiling_info<sycl::info::event_profiling::command_end>();
+          lm_kernel_us += (double)(tee - tss) / 1000.0;
+        } catch (...) {}
+        evts.push_back(evt);
+      }
     }
     for(auto& e : evts) e.wait();
     for(size_t d=0; d<eng->num_devices(); ++d)
       sycl::free(x_devs[d], eng->device_queue((int)d));
-    for(uint32_t i=0;i<N;i++) out[i] = static_cast<float>(out_h[i]);
+    // Concatenate the TP row shards into full-vocab order.
+    for(size_t d=0; d<eng->num_devices(); ++d){
+      uint32_t start = lm_head_ranges_[d].first;
+      for(uint32_t i=0;i<out_seg[d].size();i++)
+        out[start+i] = static_cast<float>(out_seg[d][i]);
+    }
     if(trace_lm){
       auto t_lm1 = std::chrono::high_resolution_clock::now();
       double wall_us = std::chrono::duration<double, std::micro>(t_lm1 - t_lm0).count();
@@ -784,9 +1022,15 @@ struct GpuBackend : public LinearBackend {
     return out;
   }
 
-  // Cache state for lm_head upload.
-  std::vector<sycl::half*> lm_head_w_dev_;
-  std::vector<sycl::half*> lm_head_c_dev_;
+  // Cache state for lm_head upload (tiled per device).
+  // INT8 path (default): per-tile INT8 codes + FP16 row scales + FP16 out.
+  // FP16 path (INTFER_LMHEAD_FP16=1, bisection only): per-tile FP16 weights.
+  std::vector<std::vector<sycl::half*>> lm_head_w_dev_;  // fp16 weights (fp16 path)
+  std::vector<std::vector<std::int8_t*>> lm_head_q_dev_;  // int8 codes (int8 path)
+  std::vector<std::vector<sycl::half*>> lm_head_s_dev_;  // fp16 row scales (int8 path)
+  std::vector<std::vector<sycl::half*>> lm_head_c_dev_;  // fp16 outputs (both)
+  std::vector<std::pair<uint32_t,uint32_t>> lm_head_ranges_;  // TP row shard per device
+  std::vector<std::vector<std::pair<uint32_t,uint32_t>>> lm_head_tiles_;  // upload/GEMM tiles per device
   uint32_t lm_head_N_ = 0, lm_head_K_ = 0;
   const Rotation* rot_for(const std::string& name) override {
     if(!eng) return nullptr;
@@ -2853,6 +3097,23 @@ int main(int argc, char** argv){
     backend = std::move(cpu);
   }
   std::fprintf(stderr, "[intfer] backend: %s\n", backend->name());
+  // Full-VRAM residency (default-on): load the entire model into VRAM
+  // before prefill/decode — zero evict+rebuild in steady state.
+  // INTFER_PRELOAD=0 restores layer streaming.
+  {
+    static const char* pre_env = std::getenv("INTFER_PRELOAD");
+    bool preload = !(pre_env && std::string(pre_env) == "0");
+    auto gpu = dynamic_cast<GpuBackend*>(backend.get());
+    if(preload && gpu && gpu->eng){
+      std::fprintf(stderr, "[intfer] preloading all shards into VRAM...\n");
+      std::fflush(stderr);
+      gpu->eng->preload_all();
+    } else {
+      std::fprintf(stderr, "[intfer] preload skipped (%s)\n",
+                   !preload ? "INTFER_PRELOAD=0" : "non-GPU backend");
+      std::fflush(stderr);
+    }
+  }
   // 4b: precompute per-layer names + host pointers (loop-invariant).
   // NOTE: rotations stay live via backend->rot_for (state-dependent,
   // must not be resolved before the first GEMM warms the cache).
