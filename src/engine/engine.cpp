@@ -47,6 +47,32 @@ Engine::~Engine() {
   if (backing_.base && backing_.size) ::munmap(backing_.base, backing_.size);
   backing_.base = nullptr;
   backing_.size = 0;
+  // Drain the USM pool (body runs before member destruction, so queues live).
+  for (size_t d = 0; d < usm_pool_.size() && d < devices_.size(); ++d)
+    for (auto& [bytes, vec] : usm_pool_[d]) {
+      (void)bytes;
+      for (void* p : vec) sycl::free(p, devices_[d].queue);
+      vec.clear();
+    }
+}
+
+void* Engine::pool_acquire(size_t device, size_t bytes) {
+  if (device >= devices_.size() || bytes == 0) return nullptr;
+  if (device >= usm_pool_.size()) usm_pool_.resize(device + 1);
+  auto& vec = usm_pool_[device][bytes];
+  if (!vec.empty()) {
+    void* p = vec.back();
+    vec.pop_back();
+    return p;
+  }
+  auto& dev = devices_[device];
+  return sycl::malloc_shared(bytes, dev.sycl_device, dev.sycl_context);
+}
+
+void Engine::pool_release(size_t device, void* ptr, size_t bytes) {
+  if (!ptr || bytes == 0) return;
+  if (device >= usm_pool_.size()) usm_pool_.resize(device + 1);
+  usm_pool_[device][bytes].push_back(ptr);
 }
 
 #ifdef INTFER_PROFILE_GPU
@@ -335,29 +361,57 @@ void Engine::release_shard(int tensor_index) {
   if (tensor_index < 0 || (size_t)tensor_index >= shard_cache_.size()) return;
   auto& sc = shard_cache_[(size_t)tensor_index];
   if (!sc.built) return;
+  // Park buffers in the shape-keyed pool instead of freeing (Phase 3): the
+  // same shapes recur every layer, so steady-state rebuild is acquire+memcpy
+  // with no L0 alloc or page re-pinning. Sizes recomputed exactly as in
+  // ensure_shard_built (host-cache sizes when present, else model geometry).
+  const auto& t = model_.tensors[tensor_index];
   // run_linear_tp waits on kernel events before readback, so by the time a
   // later begin_layer() releases this shard no kernel can still reference
   // it. Belt-and-braces queue sync (already complete => ~free).
   for (size_t d = 0; d < devices_.size(); ++d) {
     devices_[d].queue.wait();
+    size_t code_bytes = sc.has_host_cache && d < sc.code_host.size()
+        ? sc.code_host[d].size() : 0;
+    size_t scale_bytes = sc.has_host_cache && d < sc.scale_host.size()
+        ? sc.scale_host[d].size() * sizeof(uint16_t) : 0;
+    if (code_bytes == 0 || scale_bytes == 0) {
+      // No host cache (e.g. FP16 first-build): derive from model geometry.
+      // FP16 code = full N_local*K halves; INT* packed = via group math.
+      // These shards are resident in practice; this is a safe fallback.
+      auto& rng = shards_[tensor_index].ranges;
+      uint32_t Nl = (d < rng.size()) ? rng[d].second - rng[d].first : 0;
+      uint32_t G = t.qcfg.group_size > 0 ? t.qcfg.group_size : t.K;
+      uint32_t ng = (t.K + G - 1) / G;
+      const int bits = (sc.scheme == gemm::WeightScheme::INT2) ? 2
+                     : (sc.scheme == gemm::WeightScheme::INT4) ? 4
+                     : (sc.scheme == gemm::WeightScheme::FP16) ? 16 : 8;
+      const int pack = (bits >= 8) ? 1 : (8 / bits);
+      code_bytes = (sc.scheme == gemm::WeightScheme::FP16)
+          ? (size_t)Nl * t.K * 2
+          : (size_t)Nl * ((t.K + pack - 1) / pack);
+      scale_bytes = (size_t)Nl * ng * sizeof(uint16_t);
+    }
     if (sc.code_usm.size() > d && sc.code_usm[d]) {
-      sycl::free(sc.code_usm[d], devices_[d].queue);
+      pool_release(d, sc.code_usm[d], code_bytes);
       sc.code_usm[d] = nullptr;
     }
     if (sc.scale_usm.size() > d && sc.scale_usm[d]) {
-      sycl::free(sc.scale_usm[d], devices_[d].queue);
+      pool_release(d, sc.scale_usm[d], scale_bytes);
       sc.scale_usm[d] = nullptr;
     }
     if (sc.global_usm.size() > d && sc.global_usm[d]) {
-      sycl::free(sc.global_usm[d], devices_[d].queue);
+      pool_release(d, sc.global_usm[d], sizeof(float));
       sc.global_usm[d] = nullptr;
     }
     if (sc.act_usm.size() > d && sc.act_usm[d]) {
-      sycl::free(sc.act_usm[d], devices_[d].queue);
+      pool_release(d, sc.act_usm[d], t.K * sizeof(uint16_t));
       sc.act_usm[d] = nullptr;
     }
     if (sc.out_usm.size() > d && sc.out_usm[d]) {
-      sycl::free(sc.out_usm[d], devices_[d].queue);
+      auto& rng = shards_[tensor_index].ranges;
+      uint32_t Nl = (d < rng.size()) ? rng[d].second - rng[d].first : 0;
+      pool_release(d, sc.out_usm[d], (size_t)Nl * sizeof(uint16_t));
       sc.out_usm[d] = nullptr;
     }
   }
@@ -697,29 +751,25 @@ bool Engine::ensure_shard_built(int tensor_index) {
       sc.scale_host[d] = w.scale_store;
     }
 
-    // Code: packed bytes
-    sc.code_usm[d] = static_cast<std::uint8_t*>(
-        sycl::malloc_shared(code_bytes, dev.sycl_device, dev.sycl_context));
+    // Code: packed bytes (pool: same shapes recur every layer).
+    sc.code_usm[d] = static_cast<std::uint8_t*>(pool_acquire(d, code_bytes));
     std::memcpy(sc.code_usm[d], code_ptr, code_bytes);
 
     // Scale: N_local * n_groups FP16
-    sc.scale_usm[d] = static_cast<std::uint16_t*>(
-        sycl::malloc_shared(scale_bytes, dev.sycl_device, dev.sycl_context));
+    sc.scale_usm[d] = static_cast<std::uint16_t*>(pool_acquire(d, scale_bytes));
     std::memcpy(sc.scale_usm[d], scale_ptr, scale_bytes);
 
     // Global divisor: 1 float
     if (global_ptr) {
-      sc.global_usm[d] = static_cast<float*>(
-          sycl::malloc_shared(sizeof(float), dev.sycl_device, dev.sycl_context));
+      sc.global_usm[d] = static_cast<float*>(pool_acquire(d, sizeof(float)));
       std::memcpy(sc.global_usm[d], global_ptr, sizeof(float));
     }
 
-    // 3) Allocate persistent activation buffer (K FP16) and output buffer (N_local FP16).
+    // 3) Persistent activation buffer (K FP16) and output buffer (N_local FP16).
     sc.act_usm[d] = static_cast<std::uint16_t*>(
-        sycl::malloc_shared(t.K * sizeof(uint16_t), dev.sycl_device, dev.sycl_context));
+        pool_acquire(d, t.K * sizeof(uint16_t)));
     sc.out_usm[d] = static_cast<std::uint16_t*>(
-        sycl::malloc_shared(static_cast<size_t>(N_local) * sizeof(uint16_t),
-                           dev.sycl_device, dev.sycl_context));
+        pool_acquire(d, static_cast<size_t>(N_local) * sizeof(uint16_t)));
   }
   if (cacheable) sc.has_host_cache = true;
 #ifdef INTFER_PROFILE_GPU

@@ -174,6 +174,15 @@ class Engine {
   };
   std::vector<CachedShard> shard_cache_;
   bool ensure_shard_built(int tensor_index);
+  // Phase 3: shape-keyed USM pool. Layer streaming frees + reallocs the same
+  // few buffer shapes every layer (INT4 gate/up/down per rank); parking freed
+  // buffers here turns rebuild into acquire + memcpy (no L0 alloc, no page
+  // re-pinning). Keyed by byte size; per device; u8-typed (aliased by callers).
+  // Correctness: buffers re-enter the pool only via release_shard(), which
+  // runs after run_linear_tp's event waits — no kernel can reference them.
+  std::vector<std::map<size_t, std::vector<void*>>> usm_pool_;  // [device][bytes]
+  void* pool_acquire(size_t device, size_t bytes);
+  void pool_release(size_t device, void* ptr, size_t bytes);
   // Reusable FP16 activation staging for run_linear_tp (M*K). Resized only
   // when the shape grows: steady-state zero mallocs per GEMM call.
   std::vector<std::uint16_t> act_staging_;
