@@ -184,4 +184,51 @@ sycl::event quant_gemm_f16_int8w(sycl::queue& q,
                     sycl::half* c,          // M*N row-major FP16 out
                     uint32_t M, uint32_t N, uint32_t K);
 
+// ---------------------------------------------------------------------------
+// W4A8 / W2A8 native sub-byte DPAS GEMM (TODO 6, M=1 decode).
+//
+// Exact-weight path for grouped INT4/INT2 tensors: the DASH-Q codebooks are
+// affine in the stored index (INT4: (2j-15)/15, INT2: (2j-3)/3), so
+//   out = a_s * w_s * (2*T - C*S) / C,  T = DPAS(a_q, idx), S = sum(a_q),
+// with C=15 (INT4) or C=3 (INT2). Weights stay bit-exact; the only error
+// source vs the FP16-act engine is the per-tensor/per-GA activation quant
+// to INT8 (argmax-gated, not bit-identical).
+//
+// Weight layout (built once at shard build by repack_dpas412, per device):
+// per (16-N tile t, K-op o) contiguous dwords, vertical pack
+//   dword[(k/E)*16+n] bit (k%E)*b, E=8/b... i.e. u4: E=8, u2: E=16.
+// Per-op K: 32 (u4/u8: ops/chan 4), 32 (u2xs8: max bits 8 -> 4).
+// Validity needs a_s and w_s constant over the op K-range:
+//   INT4/G64: op K=32 divides 64 -> 2 ops per w-group. CLEAN (1 DPAS/op).
+//   INT8/G32: op K=32 == group. CLEAN (1 DPAS/op).
+//   INT2/G32: op K=32 == group. CLEAN (1 DPAS/op).
+//   INT2/G16: op = 2 subgroups -> linearity split: T_full + masked T_0
+//     (T_1 = T_full - T_0, 2 DPAS/op). GA=64 act scale: fold per op via
+//     the op's GA slice (op K=32 divides GA=64 -> 2 slices/op).
+// Shapes: N_local % 16 == 0, K % 32 == 0 required (all 27B/0.8B tensors
+// satisfy this post-TP-split); otherwise returns a null event and the
+// caller must use quant_gemm_forward_usm.
+// ---------------------------------------------------------------------------
+struct Dpas48Params {
+  const void* code_dpas = nullptr;  // repacked vertical B (per-device USM)
+  const std::uint16_t* scale_usm = nullptr;  // FP16 per (row, w-group)
+  const std::int8_t* act_int8 = nullptr;     // M*K INT8 acts (device USM)
+  const float* act_scale = nullptr;          // per GA-slice FP32 (device USM)
+  float alpha = 1.0f;               // global divisor (host, by value)
+  std::uint16_t* out_usm = nullptr; // M*N FP16 bits
+  uint32_t M = 0, N = 0, K = 0;
+  uint32_t group_size = 0;          // weight K-group (64/32/16)
+  uint32_t act_group = 64;          // activation quant group
+  int bits = 4;                     // 8/4/2
+};
+
+// Host-side repack: row-major packed codes (n*K+k indices) -> DPAS vertical
+// B tiles. out size = (N/16) * (K/opK) * (opK*16*b/8) bytes; opK=32.
+// Returns false when N%16 != 0 or K%32 != 0 (caller falls back).
+bool repack_dpas412(const std::uint8_t* row_codes, uint32_t N, uint32_t K,
+                    int bits, std::vector<std::uint8_t>& out);
+
+// M=1 W4A8/W2A8 decode kernel. Returns the kernel event.
+sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p);
+
 }  // namespace intfer::gemm

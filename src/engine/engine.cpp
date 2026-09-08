@@ -129,6 +129,31 @@ gemm::WeightScheme to_ws(QuantScheme s) {
   }
 }
 
+// TODO 6 (W4A8/W2A8): DPAS eligibility for a shard. Requirements:
+//   * low-bit scheme with supported (bits, weight-group) combo:
+//     INT4/G64, INT8/G32, INT2/G32, INT2/G16 (G16 = 2 DPAS/op split)
+//   * N_local % 16 == 0, K % 32 == 0 (all 27B/0.8B tensors post-TP-split)
+//   * per-tensor global divisor only via host alpha (already the case)
+// Activation quant (INT8/GA64) and repack happen at shard build; dispatch
+// is then a flag check in run_linear_tp. INTFER_DPAS48=0 force-disables.
+bool dpas48_eligible(QuantScheme scheme, uint32_t group_size,
+                     uint32_t N_local, uint32_t K) {
+  const char* env = std::getenv("INTFER_DPAS48");
+  static const bool disabled = (env && env[0] == '0' && env[1] == '\0');
+  if (disabled) return false;
+  int bits = (scheme == QuantScheme::INT2)    ? 2
+             : (scheme == QuantScheme::INT4)  ? 4
+             : (scheme == QuantScheme::INT8)  ? 8
+                                              : 16;
+  if (bits == 16) return false;
+  const uint32_t G = (group_size == 0) ? K : group_size;
+  const bool combo_ok =
+      (bits == 4 && G == 64) || (bits == 8 && G == 32) ||
+      (bits == 2 && (G == 32 || G == 16));
+  if (!combo_ok) return false;
+  return (N_local % 16 == 0) && (K % 32 == 0);
+}
+
 // Build a per-device GemmWeightBuffers view over rows [start,end) of a tensor's
 // packed payload (column tensor-parallel sharding of the output dim N).
 //
@@ -455,6 +480,10 @@ void Engine::release_shard(int tensor_index) {
         ? sc.code_host[d].size() : 0;
     size_t scale_bytes = sc.has_host_cache && d < sc.scale_host.size()
         ? sc.scale_host[d].size() * sizeof(uint16_t) : 0;
+    // TODO 6: DPAS shards hold repacked tiles in USM (dpas_bytes), not the
+    // row-major code_host bytes — pool/release by the USM size.
+    if (sc.dpas48 && d < sc.dpas_bytes.size() && sc.dpas_bytes[d] > 0)
+      code_bytes = sc.dpas_bytes[d];
     if (code_bytes == 0 || scale_bytes == 0) {
       // No host cache (e.g. FP16 first-build): derive from model geometry.
       // FP16 code = full N_local*K halves; INT* packed = via group math.
@@ -520,6 +549,38 @@ void Engine::ensure_workspace(uint32_t M, uint32_t K, uint32_t Nl_max) {
       std::abort();
     }
     w.M = nM; w.K = nK; w.Nl = nNl;
+  }
+}
+
+// TODO 6 (W4A8/W2A8): grow-only per-device INT8-act + act-scale workspaces.
+// GA=64 fixed (matches model qcfg act INT8_G64); nGA covers max K seen.
+void Engine::ensure_workspace48(uint32_t M, uint32_t K) {
+  constexpr uint32_t GA = 64;
+  if (M == 0) M = 1;
+  if (ws48_.size() != devices_.size()) ws48_.resize(devices_.size());
+  const uint32_t nGA = (K + GA - 1) / GA;
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto& w = ws48_[d];
+    if (w.act && w.as && M <= w.M && K <= w.K && nGA <= w.nGA) continue;
+    devices_[d].queue.wait();
+    uint32_t nM = std::max(M, w.M);
+    uint32_t nK = std::max(K, w.K);
+    uint32_t nnGA = std::max(nGA, w.nGA);
+    if (w.act) { sycl::free(w.act, devices_[d].queue); w.act = nullptr; }
+    if (w.as) { sycl::free(w.as, devices_[d].queue); w.as = nullptr; }
+    auto& dev = devices_[d];
+    w.act = static_cast<std::int8_t*>(sycl::malloc_shared(
+        (size_t)nM * nK, dev.sycl_device, dev.sycl_context));
+    w.as = static_cast<float*>(sycl::malloc_shared(
+        (size_t)nM * nnGA * sizeof(float), dev.sycl_device, dev.sycl_context));
+    if (!w.act || !w.as) {
+      std::fprintf(stderr,
+                   "[intfer] FATAL: workspace48 alloc failed on device %zu "
+                   "(M=%u K=%u nGA=%u)\n", d, nM, nK, nnGA);
+      std::fflush(stderr);
+      std::abort();
+    }
+    w.M = nM; w.K = nK; w.nGA = nnGA;
   }
 }
 
@@ -716,6 +777,142 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   run_linear_tp(tensor_index, x, out, 1);
 }
 
+// TODO 6 (W4A8/W2A8): DPAS dispatch. Fused host act-quant (FP32 -> INT8,
+// per-row GA=64 slices, symmetric) writes the shared ws48_ workspaces;
+// the kernel then runs fully from device-resident data. Readback reuses
+// ws_[d].out (M*N_local FP16). Same event-wait contract as run_linear_tp.
+void Engine::run_linear_tp_dpas48(int tensor_index,
+                                  const std::vector<float>& x,
+                                  std::vector<float>& out, uint32_t M) {
+  const auto& t = model_.tensors[tensor_index];
+  const auto& ranges = shards_[tensor_index].ranges;
+  if (M == 0) M = 1;
+  const uint32_t out_elems = M * t.N;
+  if (out.size() != out_elems) out.resize(out_elems);
+  const auto& sc = shard_cache_[tensor_index];
+  constexpr uint32_t GA = 64;
+  const uint32_t K = t.K;
+  const uint32_t nGA = (K + GA - 1) / GA;
+  ensure_workspace48(M, K);
+
+  const int bits = (sc.scheme == gemm::WeightScheme::INT2)    ? 2
+                   : (sc.scheme == gemm::WeightScheme::INT4)  ? 4
+                                                              : 8;
+  // 1) Fused act quant on the host: per (row, GA-slice) max-abs scale.
+#ifdef INTFER_PROFILE_GPU
+  auto t_copy0 = std::chrono::high_resolution_clock::now();
+#endif
+  for (uint32_t m = 0; m < M; ++m) {
+    const float* xr = x.data() + (size_t)m * K;
+    for (uint32_t g = 0; g < nGA; ++g) {
+      const uint32_t k0 = g * GA;
+      uint32_t k1 = k0 + GA;
+      if (k1 > K) k1 = K;
+      float mx = 1e-6f;
+      for (uint32_t k = k0; k < k1; ++k) {
+        float v = xr[k] >= 0 ? xr[k] : -xr[k];
+        if (v > mx) mx = v;
+      }
+      const float s = mx / 127.0f;
+      const float inv = 1.0f / s;
+      for (size_t d = 0; d < devices_.size(); ++d)
+        ws48_[d].as[(size_t)m * ws48_[d].nGA + g] = s;
+      // INT8 codes identical for all ranks: quantize once into rank 0's
+      // buffer, memcpy to the others (K <= 17408, trivial cost).
+      std::int8_t* q0 = ws48_[0].act + (size_t)m * ws48_[0].K;
+      for (uint32_t k = k0; k < k1; ++k) {
+        float v = xr[k] * inv;
+        if (v > 127.0f) v = 127.0f;
+        else if (v < -127.0f) v = -127.0f;
+        q0[k] = (std::int8_t)std::lround(v);
+      }
+    }
+  }
+  for (size_t d = 1; d < devices_.size(); ++d)
+    std::memcpy(ws48_[d].act, ws48_[0].act, (size_t)M * K);
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_copy_us += std::chrono::duration<double, std::micro>(t1 - t_copy0).count();
+    g_gpu_profile.copy_count++;
+  }
+#endif
+
+  // 2) Launch per device.
+  float alpha = sc.has_global_divisor ? sc.global_host : 1.0f;
+  std::vector<sycl::event> kernel_events;
+  kernel_events.reserve(devices_.size());
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto& dev = devices_[d];
+    auto [start, end] = ranges[d];
+    sycl::queue& q = dev.queue;
+    uint32_t N_local = end - start;
+    gemm::Dpas48Params p;
+    p.code_dpas = sc.code_usm[d];
+    p.scale_usm = sc.scale_usm[d];
+    p.act_int8 = ws48_[d].act;
+    p.act_scale = ws48_[d].as;
+    p.alpha = alpha;
+    p.out_usm = ws_[d].out;
+    p.M = M;
+    p.N = N_local;
+    p.K = K;
+    p.group_size = sc.group_size;
+    p.act_group = GA;
+    p.bits = bits;
+#ifdef INTFER_PROFILE_GPU
+    auto t_s0 = std::chrono::high_resolution_clock::now();
+#endif
+    kernel_events.push_back(gemm::quant_gemm_dpas48(q, p));
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_submit_us += std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+    }
+    if (kernel_events.size() > g_gpu_profile.peak_wait_depth)
+      g_gpu_profile.peak_wait_depth = kernel_events.size();
+#endif
+  }
+#ifdef INTFER_PROFILE_GPU
+  auto t_wb0 = std::chrono::high_resolution_clock::now();
+#endif
+  for (auto& e : kernel_events) e.wait();
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_waitblock_us += std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
+  }
+  g_gpu_profile.wait_count += devices_.size();
+  for (auto& e : kernel_events) {
+    try {
+      auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
+      auto t1 = e.get_profiling_info<sycl::info::event_profiling::command_end>();
+      g_gpu_profile.total_kernel_us += (double)(t1 - t0) / 1000.0;
+      g_gpu_profile.kernel_count++;
+    } catch (...) {}
+  }
+  auto t_rb0 = std::chrono::high_resolution_clock::now();
+#endif
+
+  // 3) Read back FP16 -> FP32 (same as run_linear_tp tail).
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto [start, end] = ranges[d];
+    const std::uint16_t* out_ptr = ws_[d].out;
+    const uint32_t N_local_rb = static_cast<uint32_t>(end - start);
+    for (uint32_t m = 0; m < M; ++m)
+      for (uint32_t r = 0; r < N_local_rb; ++r)
+        out[(size_t)m * t.N + (start + r)] =
+            dashq::half_to_float(out_ptr[(size_t)m * N_local_rb + r]);
+  }
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_readback_us += std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
+    g_gpu_profile.readback_count++;
+  }
+#endif
+}
+
 void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
                            std::vector<float>& out, uint32_t M) {
   if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size()) return;
@@ -738,6 +935,15 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     ensure_workspace(M, t.K, Nl_max);
   }
   const auto& sc = shard_cache_[tensor_index];
+
+  // TODO 6 (W4A8/W2A8) DPAS fast path: fused FP32->INT8 activation quant
+  // (per-row, GA=64 slices) + native sub-byte DPAS kernel. Weights stay
+  // bit-exact (affine fold); only the act quant is new error vs the
+  // FP16-act path. INTFER_DPAS48=0 or ineligible shapes use the legacy path.
+  if (sc.dpas48) {
+    run_linear_tp_dpas48(tensor_index, x, out, M);
+    return;
+  }
  
   // Pre-convert FP32 activation to FP16 once (shared by all devices).
   // Staging buffer is reused across calls (resize only on shape growth).
@@ -989,6 +1195,12 @@ bool Engine::ensure_shard_built(int tensor_index) {
 
     // 2) Allocate persistent USM on each device and copy weight data.
     //    On first build, retain the shard_weight() output in the host cache.
+    //    TODO 6 (W4A8/W2A8): DPAS-eligible shards repack row-major codes to
+    //    vertical-B tiles ONCE here (repack_dpas412); the kernel then reads
+    //    code_usm[d] directly. dpas_bytes[d] records the USM size so
+    //    release_shard pools by exact size (code_host keeps the row-major
+    //    bytes for rebuilds — repack re-runs from them, still no scalar
+    //    unpack repetition of the group-major payload).
     sc.N_local = N_local;
     if (!sc.has_host_cache && cacheable) {
       if (sc.code_host.size() != devices_.size()) {
@@ -998,10 +1210,47 @@ bool Engine::ensure_shard_built(int tensor_index) {
       sc.code_host[d] = w.code_store;
       sc.scale_host[d] = w.scale_store;
     }
+    if (d == 0) {
+      sc.dpas48 = dpas48_eligible(t.qcfg.scheme, t.qcfg.group_size,
+                                  N_local, t.K) &&
+                  (ranges.size() == devices_.size());
+      // All ranks share N_local only for even splits; re-check per rank
+      // below (N_local varies per d on asymmetric lm_head-style ranges —
+      // run_linear shards are even, but verify anyway).
+      for (size_t dd = 0; dd < devices_.size(); ++dd) {
+        uint32_t Nl_dd = ranges[dd].second - ranges[dd].first;
+        if (!dpas48_eligible(t.qcfg.scheme, t.qcfg.group_size, Nl_dd, t.K)) {
+          sc.dpas48 = false;
+          break;
+        }
+      }
+      if (sc.dpas48) sc.dpas_bytes.assign(devices_.size(), 0);
+    }
 
     // Code: packed bytes (pool: same shapes recur every layer).
-    sc.code_usm[d] = static_cast<std::uint8_t*>(pool_acquire(d, code_bytes));
-    std::memcpy(sc.code_usm[d], code_ptr, code_bytes);
+    if (sc.dpas48) {
+      const int bits = (sc.scheme == gemm::WeightScheme::INT2)    ? 2
+                       : (sc.scheme == gemm::WeightScheme::INT4)  ? 4
+                                                                 : 8;
+      std::vector<std::uint8_t> dpas_tiles;
+      if (!gemm::repack_dpas412(code_ptr, N_local, t.K, bits, dpas_tiles)) {
+        // Shape refused (should not happen after dpas48_eligible, but
+        // safe): fall back to the row-major path for this shard.
+        sc.dpas48 = false;
+        sc.code_usm[d] =
+            static_cast<std::uint8_t*>(pool_acquire(d, code_bytes));
+        std::memcpy(sc.code_usm[d], code_ptr, code_bytes);
+      } else {
+        sc.dpas_bytes[d] = dpas_tiles.size();
+        sc.code_usm[d] = static_cast<std::uint8_t*>(
+            pool_acquire(d, dpas_tiles.size()));
+        std::memcpy(sc.code_usm[d], dpas_tiles.data(), dpas_tiles.size());
+      }
+    } else {
+      sc.code_usm[d] =
+          static_cast<std::uint8_t*>(pool_acquire(d, code_bytes));
+      std::memcpy(sc.code_usm[d], code_ptr, code_bytes);
+    }
 
     // Scale: N_local * n_groups FP16
     sc.scale_usm[d] = static_cast<std::uint16_t*>(pool_acquire(d, scale_bytes));

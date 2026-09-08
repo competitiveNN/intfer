@@ -198,6 +198,13 @@ class Engine {
     std::vector<std::vector<std::uint16_t>> scale_host;  // per device
     float global_host = 0.0f;
     bool has_host_cache = false;
+    // TODO 6 (W4A8/W2A8): DPAS fast path. When dpas48 is true, code_usm[d]
+    // holds the repacked vertical-B tiles (repack_dpas412 layout, NOT the
+    // row-major packed codes) and dpas_bytes[d] is the USM allocation size
+    // (release_shard pools by exact size). Act quant + scales live in the
+    // shared workspaces (ws_act48_/ws_as48_), sized by ensure_workspace48.
+    bool dpas48 = false;
+    std::vector<size_t> dpas_bytes;  // per device USM bytes for code_usm
   };
   std::vector<CachedShard> shard_cache_;
   bool ensure_shard_built(int tensor_index);
@@ -226,6 +233,18 @@ class Engine {
     uint32_t M = 0, K = 0, Nl = 0;
   };
   std::vector<Workspace> ws_;
+  // TODO 6 (W4A8/W2A8): per-device INT8-act + act-scale workspaces for the
+  // DPAS path (M*K int8, M*nGA fp32). Same grow-only aliasing contract as
+  // ws_: written+consumed within one run_linear_tp call.
+  struct Workspace48 {
+    std::int8_t* act = nullptr;  // M * K INT8
+    float* as = nullptr;         // M * nGA FP32 act scales (nGA = max over K)
+    uint32_t M = 0, K = 0, nGA = 0;
+  };
+  std::vector<Workspace48> ws48_;
+  void ensure_workspace48(uint32_t M, uint32_t K);
+  void run_linear_tp_dpas48(int tensor_index, const std::vector<float>& x,
+                            std::vector<float>& out, uint32_t M);
   // Per-layer tensor index lists, built by build_shards() from tensor names.
   // layer_tensors_[L] = indices of "...layers.<L>..." tensors; layer_of_[i]
   // mirrors it per tensor index (-1 = unlayered: lm_head, norms, ...).

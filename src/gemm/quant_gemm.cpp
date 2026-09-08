@@ -824,4 +824,184 @@ sycl::event quant_gemm_dpas_int8(sycl::queue& q,
   return evt;
 }
 
+// ---------------------------------------------------------------------------
+// W4A8 / W2A8 native sub-byte DPAS (M=1 decode). See header for math/layout.
+// ---------------------------------------------------------------------------
+bool repack_dpas412(const std::uint8_t* row_codes, uint32_t N, uint32_t K,
+                    int bits, std::vector<std::uint8_t>& out) {
+  constexpr uint32_t TN = 16, OP = 32;
+  if (N % TN != 0 || K % OP != 0) return false;
+  if (bits != 8 && bits != 4 && bits != 2) return false;
+  const uint32_t nT = N / TN, nOp = K / OP;
+  const uint32_t op_bytes = OP * TN * (uint32_t)bits / 8;
+  out.assign((size_t)nT * nOp * op_bytes, 0);
+  const int pack = (bits >= 8) ? 1 : 8 / bits;  // codes per row-major byte
+  const int E = 32 / bits;                       // rows per dword
+  const uint32_t mask = (bits >= 8) ? 0xFFu : ((1u << bits) - 1u);
+  auto get_idx = [&](uint32_t n, uint32_t k) -> uint32_t {
+    const size_t flat = (size_t)n * K + k;
+    if (bits >= 8) return row_codes[flat];
+    const uint8_t b = row_codes[flat / (size_t)pack];
+    return (b >> ((flat % (size_t)pack) * (uint32_t)bits)) & mask;
+  };
+  for (uint32_t t = 0; t < nT; ++t)
+    for (uint32_t o = 0; o < nOp; ++o) {
+      uint32_t* d = reinterpret_cast<uint32_t*>(
+          out.data() + ((size_t)t * nOp + o) * op_bytes);
+      for (uint32_t kl = 0; kl < OP; ++kl)
+        for (uint32_t nl = 0; nl < TN; ++nl) {
+          const uint32_t v = get_idx(t * TN + nl, o * OP + kl);
+          d[(size_t)(kl / E) * TN + nl] |= v << ((kl % E) * bits);
+        }
+    }
+  return true;
+}
+
+sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p) {
+  using namespace sycl::ext::intel::esimd;
+  using namespace sycl::ext::intel::esimd::xmx;
+  constexpr uint32_t TN = 16, OP = 32;
+  const uint32_t M = p.M, N = p.N, K = p.K;
+  const uint32_t G = (p.group_size == 0) ? K : p.group_size;
+  const uint32_t GA = (p.act_group == 0) ? K : p.act_group;
+  const uint32_t nT = N / TN, nOp = K / OP;
+  const uint32_t nGA = (K + GA - 1) / GA;
+  const uint32_t nG = (K + G - 1) / G;
+  const uint32_t op_bytes = OP * TN * (uint32_t)p.bits / 8;
+  const uint8_t* B = static_cast<const uint8_t*>(p.code_dpas);
+  const auto BPrec = (p.bits == 4) ? dpas_argument_type::u4
+                     : (p.bits == 2) ? dpas_argument_type::u2
+                                     : dpas_argument_type::u8;
+  // INT2/G16 needs a masked-A second DPAS per op (linearity split);
+  // every other (bits, G) combo is 1 DPAS/op.
+  const bool need_split = (p.bits == 2 && G == 16);
+  const float C = (p.bits == 4) ? 15.0f : (p.bits == 2) ? 3.0f : 255.0f;
+  const float Cinv = 1.0f / C;
+  const float alpha = p.alpha;
+
+  // One WI per (row m, 16-N tile t). B op-tiles reload per WI (L1-resident
+  // across the M rows of a tile); A is per-row. Same fold math as the M=1
+  // probe (probe_dpas_fold.cpp T5/T6, 1e-16 exact).
+  const uint32_t nWG = 16;
+  const uint32_t n_blocks = M * nT;
+  const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
+
+  return q.submit([&](sycl::handler& h) {
+    h.parallel_for<class gemm_dpas48_m1_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+          const uint32_t block = it.get_global_id(0);
+          if (block >= n_blocks) return;
+          const uint32_t m = block / nT;
+          const uint32_t t = block % nT;
+          const std::int8_t* Aq = p.act_int8 + (size_t)m * K;
+          const float* As = p.act_scale + (size_t)m * nGA;
+          float acc_tile[TN];
+          for (uint32_t nl = 0; nl < TN; ++nl) acc_tile[nl] = 0.0f;
+          for (uint32_t o = 0; o < nOp; ++o) {
+            const uint32_t k0 = o * OP;
+            simd<std::int8_t, OP> va;
+            va.copy_from(Aq + k0);
+            const float as = As[k0 / GA];
+            if (BPrec == dpas_argument_type::u4) {
+              simd<uint8_t, 256> vb;  // op_bytes(u4) = 32*16*4/8
+              vb.copy_from(B + ((size_t)t * nOp + o) * op_bytes);
+              simd<int, TN> c;
+              c = dpas<8, 1, int, uint8_t, std::int8_t,
+                       dpas_argument_type::u4, dpas_argument_type::s8>(vb, va);
+              int S = 0;
+              for (uint32_t k = 0; k < OP; ++k) S += va[k];
+              const uint32_t g = k0 / G;
+              for (uint32_t nl = 0; nl < TN; ++nl) {
+                const uint32_t n = t * TN + nl;
+                const float ws = static_cast<float>(
+                    sycl::bit_cast<sycl::half>(
+                        p.scale_usm[(size_t)n * nG + g]));
+                acc_tile[nl] += as * ws * alpha *
+                                (2.0f * (float)c[nl] - 15.0f * (float)S) *
+                                Cinv;
+              }
+            } else if (BPrec == dpas_argument_type::u8) {
+              simd<uint8_t, 512> vb;  // op_bytes(u8) = 32*16*8/8
+              vb.copy_from(B + ((size_t)t * nOp + o) * op_bytes);
+              simd<int, TN> c;
+              c = dpas<8, 1, int, uint8_t, std::int8_t,
+                       dpas_argument_type::u8, dpas_argument_type::s8>(vb, va);
+              int S = 0;
+              for (uint32_t k = 0; k < OP; ++k) S += va[k];
+              const uint32_t g = k0 / G;
+              for (uint32_t nl = 0; nl < TN; ++nl) {
+                const uint32_t n = t * TN + nl;
+                const float ws = static_cast<float>(
+                    sycl::bit_cast<sycl::half>(
+                        p.scale_usm[(size_t)n * nG + g]));
+                acc_tile[nl] += as * ws * alpha *
+                                (2.0f * (float)c[nl] - 255.0f * (float)S) *
+                                Cinv;
+              }
+            } else {
+              // u2: K=32 op, E=16 rows/dword, 32*16*2/8 = 128B.
+              simd<uint8_t, 128> vb;
+              vb.copy_from(B + ((size_t)t * nOp + o) * op_bytes);
+              if (!need_split) {
+                simd<int, TN> c;
+                c = dpas<8, 1, int, uint8_t, std::int8_t,
+                         dpas_argument_type::u2, dpas_argument_type::s8>(vb, va);
+                int S = 0;
+                for (uint32_t k = 0; k < OP; ++k) S += va[k];
+                const uint32_t g = k0 / G;
+                for (uint32_t nl = 0; nl < TN; ++nl) {
+                  const uint32_t n = t * TN + nl;
+                  const float ws = static_cast<float>(
+                      sycl::bit_cast<sycl::half>(
+                          p.scale_usm[(size_t)n * nG + g]));
+                  acc_tile[nl] += as * ws * alpha *
+                                  (2.0f * (float)c[nl] - 3.0f * (float)S) *
+                                  Cinv;
+                }
+              } else {
+                // G16 split: T_full on va, T_0 on va masked to first 16.
+                simd<int, TN> cf, c0;
+                cf = dpas<8, 1, int, uint8_t, std::int8_t,
+                          dpas_argument_type::u2, dpas_argument_type::s8>(vb, va);
+                simd<std::int8_t, OP> va0(0);
+                int S0 = 0;
+                for (uint32_t k = 0; k < 16; ++k) {
+                  va0[k] = va[k];
+                  S0 += va[k];
+                }
+                c0 = dpas<8, 1, int, uint8_t, std::int8_t,
+                          dpas_argument_type::u2, dpas_argument_type::s8>(vb, va0);
+                int Sf = S0;
+                for (uint32_t k = 16; k < OP; ++k) Sf += va[k];
+                const uint32_t g0 = k0 / G, g1 = g0 + 1;
+                for (uint32_t nl = 0; nl < TN; ++nl) {
+                  const uint32_t n = t * TN + nl;
+                  const float ws0 = static_cast<float>(
+                      sycl::bit_cast<sycl::half>(
+                          p.scale_usm[(size_t)n * nG + g0]));
+                  const float ws1 = static_cast<float>(
+                      sycl::bit_cast<sycl::half>(
+                          p.scale_usm[(size_t)n * nG + g1]));
+                  const float T0 = (float)c0[nl], Tf = (float)cf[nl];
+                  const float T1 = Tf - T0;
+                  const float S1 = (float)(Sf - S0);
+                  acc_tile[nl] += as * alpha *
+                                  ((2.0f * T0 - 3.0f * (float)S0) * ws0 +
+                                   (2.0f * T1 - 3.0f * S1) * ws1) *
+                                  Cinv;
+                }
+              }
+            }
+          }
+          std::uint16_t oh[TN];
+          for (uint32_t nl = 0; nl < TN; ++nl)
+            oh[nl] = to_half_bits(acc_tile[nl]);
+          simd<std::uint16_t, TN> oc;
+          oc.copy_from(oh);
+          oc.copy_to(p.out_usm + (size_t)m * N + (size_t)t * TN);
+        });
+  });
+}
+
 }  // namespace intfer::gemm
