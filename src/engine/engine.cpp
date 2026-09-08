@@ -642,6 +642,9 @@ bool Engine::ensure_shard_built(int tensor_index) {
   sc.global_usm.resize(devices_.size());
   sc.act_usm.resize(devices_.size());
   sc.out_usm.resize(devices_.size());
+  // Host-cache gate (see below): FP16 is memcpy-identity + resident, so only
+  // cache the schemes whose shard_weight() does scalar unpack work (INT4/8/2).
+  const bool cacheable = (sc.scheme != gemm::WeightScheme::FP16);
 
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto& dev = devices_[d];
@@ -649,31 +652,66 @@ bool Engine::ensure_shard_built(int tensor_index) {
     sycl::queue& q = dev.queue;
     uint32_t N_local = end - start;
 
-    // 1) Build the host-side shard data once (unpack + repack).
-    auto w = shard_weight(model_, t, start, end, q);
+    // 1) Host-side shard data: repack-once cache for non-FP16 schemes.
+    //    shard_weight() is a scalar unpack+repack, immutable per (tensor,
+    //    rank) — run it only on the first build, then memcpy from the cache
+    //    (~8.8GB for the 27B INT4 set). FP16 is memcpy-identity and stays
+    //    resident since Phase 1, so caching it would only waste host RAM
+    //    (it OOMs: +13.5GB). The cacheable gate is computed before the loop.
+    const std::uint8_t* code_ptr;
+    size_t code_bytes;
+    const std::uint16_t* scale_ptr;
+    size_t scale_bytes;
+    const float* global_ptr = nullptr;
+    gemm::GemmWeightBuffers w;
+    if (sc.has_host_cache && cacheable) {
+      code_ptr = sc.code_host[d].data();
+      code_bytes = sc.code_host[d].size();
+      scale_ptr = sc.scale_host[d].data();
+      scale_bytes = sc.scale_host[d].size() * sizeof(uint16_t);
+      if (t.global_bytes > 0) global_ptr = &sc.global_host;
+    } else {
+      w = shard_weight(model_, t, start, end, q);
+      code_ptr = w.code_store.data();
+      code_bytes = w.code_store.size();
+      scale_ptr = w.scale_store.data();
+      scale_bytes = w.scale_store.size() * sizeof(uint16_t);
+      if (t.global_bytes > 0) {
+        float alpha_val = 0.f;
+        std::memcpy(&alpha_val, model_.global_data() + t.global_offset,
+                    std::min<uint32_t>(t.global_bytes, 4u));
+        sc.global_host = alpha_val;
+        global_ptr = &sc.global_host;
+      }
+    }
 
     // 2) Allocate persistent USM on each device and copy weight data.
+    //    On first build, retain the shard_weight() output in the host cache.
     sc.N_local = N_local;
+    if (!sc.has_host_cache && cacheable) {
+      if (sc.code_host.size() != devices_.size()) {
+        sc.code_host.resize(devices_.size());
+        sc.scale_host.resize(devices_.size());
+      }
+      sc.code_host[d] = w.code_store;
+      sc.scale_host[d] = w.scale_store;
+    }
 
     // Code: packed bytes
-    size_t code_bytes = w.code_store.size();
     sc.code_usm[d] = static_cast<std::uint8_t*>(
         sycl::malloc_shared(code_bytes, dev.sycl_device, dev.sycl_context));
-    std::memcpy(sc.code_usm[d], w.code_store.data(), code_bytes);
+    std::memcpy(sc.code_usm[d], code_ptr, code_bytes);
 
     // Scale: N_local * n_groups FP16
-    uint32_t G = t.qcfg.group_size > 0 ? t.qcfg.group_size : t.K;
-    uint32_t n_groups = (t.K + G - 1) / G;
-    size_t scale_bytes = static_cast<size_t>(N_local) * n_groups * sizeof(uint16_t);
     sc.scale_usm[d] = static_cast<std::uint16_t*>(
         sycl::malloc_shared(scale_bytes, dev.sycl_device, dev.sycl_context));
-    std::memcpy(sc.scale_usm[d], w.scale_store.data(), scale_bytes);
+    std::memcpy(sc.scale_usm[d], scale_ptr, scale_bytes);
 
     // Global divisor: 1 float
-    if (t.global_bytes > 0) {
+    if (global_ptr) {
       sc.global_usm[d] = static_cast<float*>(
           sycl::malloc_shared(sizeof(float), dev.sycl_device, dev.sycl_context));
-      std::memcpy(sc.global_usm[d], w.global_store.data(), sizeof(float));
+      std::memcpy(sc.global_usm[d], global_ptr, sizeof(float));
     }
 
     // 3) Allocate persistent activation buffer (K FP16) and output buffer (N_local FP16).
@@ -683,6 +721,7 @@ bool Engine::ensure_shard_built(int tensor_index) {
         sycl::malloc_shared(static_cast<size_t>(N_local) * sizeof(uint16_t),
                            dev.sycl_device, dev.sycl_context));
   }
+  if (cacheable) sc.has_host_cache = true;
 #ifdef INTFER_PROFILE_GPU
   {
     auto t1 = std::chrono::high_resolution_clock::now();

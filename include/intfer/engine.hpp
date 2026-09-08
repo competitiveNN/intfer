@@ -162,6 +162,15 @@ class Engine {
     std::vector<std::uint16_t*> out_usm;    // size = N_local (FP16 gemm output)
     // SYCL event tracking the latest GEMM launch (so host can wait on it).
     sycl::event last_kernel_event;
+    // Phase 2: repack-once host cache. shard_weight() output is immutable
+    // per (tensor, TP rank); retaining it makes evict+rebuild memcpy-speed
+    // (no scalar unpack repetition). ~8.8GB for the 27B INT4 set; populated
+    // on first build, preserved across release_shard(). Bit-identical: the
+    // same bytes feed the same USM buffers.
+    std::vector<std::vector<std::uint8_t>> code_host;    // per device
+    std::vector<std::vector<std::uint16_t>> scale_host;  // per device
+    float global_host = 0.0f;
+    bool has_host_cache = false;
   };
   std::vector<CachedShard> shard_cache_;
   bool ensure_shard_built(int tensor_index);
