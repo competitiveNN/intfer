@@ -2657,7 +2657,7 @@ int main(int argc, char** argv){
       // strip .intifer suffix
       size_t dot = model_name.rfind(".intifer");
       if(dot != std::string::npos) model_name = model_name.substr(0, dot);
-      for(const char* suf : {"-sc", "-full", "-noembed", "-host"}){
+      for(const char* suf : {"-sc", "-full", "-noembed", "-host", "-int2"}){
         size_t s = model_name.rfind(suf);
         if(s != std::string::npos && s + strlen(suf) == model_name.size())
           model_name = model_name.substr(0, s);
@@ -2710,7 +2710,7 @@ int main(int argc, char** argv){
       // Self-contained mode: -m /path/to/Qwen3.5-0.8B-sc.intifer ->
       // config in sibling dirs (same basename minus any -sc/-full suffix).
       std::string base = model_name;
-      for(const char* suf : {"-sc", "-full", "-noembed"}){
+      for(const char* suf : {"-sc", "-full", "-noembed", "-int2"}){
         size_t s = base.rfind(suf);
         if(s != std::string::npos) base = base.substr(0, s);
       }
