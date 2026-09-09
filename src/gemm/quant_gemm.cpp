@@ -867,6 +867,8 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p) {
   const uint32_t nT = N / TN, nOp = K / OP;
   const uint32_t nGA = (K + GA - 1) / GA;
   const uint32_t nG = (K + G - 1) / G;
+  const uint32_t act_stride = (p.act_stride == 0) ? K : p.act_stride;
+  const uint32_t as_stride = (p.as_stride == 0) ? nGA : p.as_stride;
   const uint32_t op_bytes = OP * TN * (uint32_t)p.bits / 8;
   const uint8_t* B = static_cast<const uint8_t*>(p.code_dpas);
   const auto BPrec = (p.bits == 4) ? dpas_argument_type::u4
@@ -894,8 +896,8 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p) {
           if (block >= n_blocks) return;
           const uint32_t m = block / nT;
           const uint32_t t = block % nT;
-          const std::int8_t* Aq = p.act_int8 + (size_t)m * K;
-          const float* As = p.act_scale + (size_t)m * nGA;
+          const std::int8_t* Aq = p.act_int8 + (size_t)m * act_stride;
+          const float* As = p.act_scale + (size_t)m * as_stride;
           float acc_tile[TN];
           for (uint32_t nl = 0; nl < TN; ++nl) acc_tile[nl] = 0.0f;
           for (uint32_t o = 0; o < nOp; ++o) {

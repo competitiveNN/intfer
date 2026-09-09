@@ -828,8 +828,13 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
       }
     }
   }
-  for (size_t d = 1; d < devices_.size(); ++d)
-    std::memcpy(ws48_[d].act, ws48_[0].act, (size_t)M * K);
+  for (size_t d = 1; d < devices_.size(); ++d) {
+    // Rows live at workspace stride (ws48_[0].K, grown over tensors), so
+    // broadcast row-by-row, not as one M*K blob.
+    for (uint32_t m = 0; m < M; ++m)
+      std::memcpy(ws48_[d].act + (size_t)m * ws48_[d].K,
+                  ws48_[0].act + (size_t)m * ws48_[0].K, K);
+  }
 #ifdef INTFER_PROFILE_GPU
   {
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -860,6 +865,8 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
     p.group_size = sc.group_size;
     p.act_group = GA;
     p.bits = bits;
+    p.act_stride = ws48_[d].K;
+    p.as_stride = ws48_[d].nGA;
 #ifdef INTFER_PROFILE_GPU
     auto t_s0 = std::chrono::high_resolution_clock::now();
 #endif

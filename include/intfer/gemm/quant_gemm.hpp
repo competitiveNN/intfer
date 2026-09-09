@@ -212,7 +212,7 @@ sycl::event quant_gemm_f16_int8w(sycl::queue& q,
 struct Dpas48Params {
   const void* code_dpas = nullptr;  // repacked vertical B (per-device USM)
   const std::uint16_t* scale_usm = nullptr;  // FP16 per (row, w-group)
-  const std::int8_t* act_int8 = nullptr;     // M*K INT8 acts (device USM)
+  const std::int8_t* act_int8 = nullptr;     // M rows of INT8 acts (device USM)
   const float* act_scale = nullptr;          // per GA-slice FP32 (device USM)
   float alpha = 1.0f;               // global divisor (host, by value)
   std::uint16_t* out_usm = nullptr; // M*N FP16 bits
@@ -220,6 +220,12 @@ struct Dpas48Params {
   uint32_t group_size = 0;          // weight K-group (64/32/16)
   uint32_t act_group = 64;          // activation quant group
   int bits = 4;                     // 8/4/2
+  // Row strides (elements) for the act workspaces. The engine workspaces
+  // are grow-only, so a call's K/nGA can be SMALLER than the workspace
+  // dims: rows must be addressed by workspace stride, not call shape
+  // (M=1 never noticed; M>1 read garbage scales/acts for rows >= 1).
+  uint32_t act_stride = 0;          // 0 => K (tight); else workspace K
+  uint32_t as_stride = 0;           // 0 => nGA; else workspace nGA
 };
 
 // Host-side repack: row-major packed codes (n*K+k indices) -> DPAS vertical
