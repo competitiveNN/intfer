@@ -2115,28 +2115,6 @@ static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
 }
 
 // ============================================================================
-// Batched decode helper (runs each token through the full step() sequentially)
-// ============================================================================
-static std::vector<StepOut> step_batch(const std::vector<int>& tokens,
-                                        int pos,
-                                        const std::map<std::string, std::vector<float>>& T,
-                                        const float* embed, const float* final_norm,
-                                        const float* lm_head,
-                                        LinearBackend* backend,
-                                        bool record,
-                                        std::vector<std::vector<float>>& dump){
-  std::vector<StepOut> out;
-  out.reserve(tokens.size());
-  for (size_t i = 0; i < tokens.size(); ++i) {
-    int cur_pos = pos + (int)i;
-    if (cur_pos < 0) cur_pos = 0;
-    out.push_back(step(tokens[i], cur_pos, T, embed, final_norm, lm_head,
-                       backend, record, dump));
-  }
-  return out;
-}
-
-// ============================================================================
 // Sampling
 // ============================================================================
 static int sample(const std::vector<float>& logits, int top_k, float top_p,
@@ -2584,7 +2562,6 @@ int main(int argc, char** argv){
     else                                                detok_py = "/var/home/fra/dev/intfer/scripts/bpe_detokenize.py";
   }
   int max_new = 64;
-  int decode_batch = 1;  // 1 = single-token decode (default), >1 = batch M tokens
   float temperature = 0.0f;
   int top_k = 0;
   float top_p = 0.0f;
@@ -2601,7 +2578,6 @@ int main(int argc, char** argv){
     else if(a=="-p" && i+1<argc) prompt = argv[++i];
     else if(a=="-P" && i+1<argc) prompt_file = argv[++i];
     else if(a=="-n" && i+1<argc) max_new = std::atoi(argv[++i]);
-    else if(a=="--decode-batch" && i+1<argc) decode_batch = std::atoi(argv[++i]);
     else if(a=="-t" && i+1<argc) temperature = std::atof(argv[++i]);
     else if(a=="-k" && i+1<argc) top_k = std::atoi(argv[++i]);
     else if(a=="-T" && i+1<argc) top_p = std::atof(argv[++i]);
@@ -3204,80 +3180,30 @@ int main(int argc, char** argv){
   std::fprintf(stderr, "[intfer] prefill done, generated=%zu max_new=%d\n",
                generated.size(), max_new); std::fflush(stderr);
   auto t_d0 = std::chrono::high_resolution_clock::now();
-  if(decode_batch > 1){
-    // Multi-token decode: process decode_batch tokens in parallel.
-    // This keeps the GPU busy and amortizes kernel launch overhead.
-    // NOTE: current step_batch() runs each token sequentially through step().
-    // A true batched forward (single kernel launch per layer) requires
-    // restructuring step() to accept M>1 hidden states.
-    std::vector<int> batch;
-    batch.reserve(decode_batch);
-    for(int step_i = 0; step_i < max_new; step_i += batch.size()){
-      // Collect a batch of tokens to decode.
-      batch.clear();
-      int remaining = std::min(decode_batch, max_new - step_i);
-      int cur_token = (step_i == 0) ? token : generated.back();
-      batch.push_back(cur_token);
-      // Pre-fill the batch with tokens we'll generate in this step.
-      for(int b = 1; b < remaining; ++b){
-        // For speculative decode, we would run draft tokens here.
-        // For now, just duplicate the current token to fill the batch.
-        batch.push_back(cur_token);
-      }
-      std::fprintf(stderr, "[intfer] decode batch %d-%d: %zu tokens pos=%d\n",
-                   step_i, step_i + (int)batch.size() - 1,
-                   batch.size(), S + step_i);
-      std::fflush(stderr);
-      std::vector<StepOut> batch_out = step_batch(batch, S + step_i, T,
-                                                   embed, final_norm, lm_head,
-                                                   backend.get(), false, dump);
-      // Process each result in the batch.
-      for(size_t b = 0; b < batch_out.size(); ++b){
-        int idx = step_i + (int)b;
-        if(idx >= max_new) break;
-        const StepOut& o = batch_out[b];
-        int next;
-        if(temperature <= 0.f && top_k==0 && top_p<=0.f){
-          next = o.best;
-        } else {
-          next = sample(o.logits, top_k, top_p, temperature, rng);
-        }
-        if(print_ids) std::fprintf(stderr, "  [%d] id=%d\n", idx, next);
-        generated.push_back(next);
-        std::string piece = detokenize_one(next, detok_py, tokenizer_json);
-        if(stream){
-          std::fwrite(piece.data(), 1, piece.size(), stdout);
-          std::fflush(stdout);
-        }
-        output += piece;
-        if(next == 248044 || next == 248046) break;
-      }
-      if(generated.size() >= (size_t)(S + max_new)) break;
+  // Single-token decode (M=1 fast path). Multi-token speculative
+  // verification lives in TODO3.3 (draft + batched verify + KV rollback);
+  // the old --decode-batch flag just duplicated tokens with zero benefit.
+  for(int step_i = 0; step_i < max_new; step_i++){
+    std::fprintf(stderr, "[intfer] decode step %d: token=%d pos=%d\n",
+                 step_i, token, S+step_i); std::fflush(stderr);
+    StepOut o = step(token, S+step_i, T, embed, final_norm, lm_head,
+                     backend.get(), false, dump);
+    int next;
+    if(temperature <= 0.f && top_k==0 && top_p<=0.f){
+      next = o.best;
+    } else {
+      next = sample(o.logits, top_k, top_p, temperature, rng);
     }
-  } else {
-    // Single-token decode path (default, M=1 fast path).
-    for(int step_i = 0; step_i < max_new; step_i++){
-      std::fprintf(stderr, "[intfer] decode step %d: token=%d pos=%d\n",
-                   step_i, token, S+step_i); std::fflush(stderr);
-      StepOut o = step(token, S+step_i, T, embed, final_norm, lm_head,
-                       backend.get(), false, dump);
-      int next;
-      if(temperature <= 0.f && top_k==0 && top_p<=0.f){
-        next = o.best;
-      } else {
-        next = sample(o.logits, top_k, top_p, temperature, rng);
-      }
-      if(print_ids) std::fprintf(stderr, "  [%d] id=%d\n", step_i, next);
-      generated.push_back(next);
-      std::string piece = detokenize_one(next, detok_py, tokenizer_json);
-      if(stream){
-        std::fwrite(piece.data(), 1, piece.size(), stdout);
-        std::fflush(stdout);
-      }
-      output += piece;
-      token = next;
-      if(next == 248044 || next == 248046) break;
+    if(print_ids) std::fprintf(stderr, "  [%d] id=%d\n", step_i, next);
+    generated.push_back(next);
+    std::string piece = detokenize_one(next, detok_py, tokenizer_json);
+    if(stream){
+      std::fwrite(piece.data(), 1, piece.size(), stdout);
+      std::fflush(stdout);
     }
+    output += piece;
+    token = next;
+    if(next == 248044 || next == 248046) break;
   }
   auto t_d1 = std::chrono::high_resolution_clock::now();
   double decode_ms = std::chrono::duration<double, std::milli>(t_d1-t_d0).count();
