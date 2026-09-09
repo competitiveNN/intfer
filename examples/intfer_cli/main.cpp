@@ -1624,7 +1624,8 @@ static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
                      const float* embed, const float* final_norm,
                      const float* lm_head,
                      LinearBackend* backend,
-                     std::vector<std::vector<float>>& dump){
+                     std::vector<std::vector<float>>& dump,
+                     std::vector<StepOut>* all_out = nullptr){
   StepOut out;
   const int M = (int)toks.size();
   const int Hdim = cfg.H;
@@ -2232,15 +2233,17 @@ static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
       }
     }
   }
-  // Final norm + lm_head for the LAST chunk row only (matches old loop,
-  // which kept generated = argmax at pos S-1).
+  // Final norm + lm_head. Default scores the LAST chunk row only (matches
+  // the old loop, which kept generated = argmax at pos S-1). When all_out
+  // is non-null (speculative verifier, TODO3.3), every row is scored and
+  // all_out[m] holds row m's best+logits; out still returns the last row.
   std::vector<float>& fn = g_scratch.fn;
-  rmsnorm(&H[(size_t)(M-1)*Hdim], final_norm, fn.data(), Hdim);
   std::vector<float>& logits = g_scratch.logits;
-  int best=-1; float bestv=-1e30f;
   const float* head = lm_head ? lm_head : embed;
-  if(backend){
-    auto gpu = dynamic_cast<GpuBackend*>(backend);
+  auto gpu = backend ? dynamic_cast<GpuBackend*>(backend) : nullptr;
+  auto score_row = [&](int m, StepOut& o){
+    rmsnorm(&H[(size_t)m*Hdim], final_norm, fn.data(), Hdim);
+    int best=-1; float bestv=-1e30f;
     if(gpu){
       const float* W = lm_head ? lm_head : embed;
       std::vector<float> lm = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
@@ -2253,22 +2256,21 @@ static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
         if(s>bestv){ bestv=s; best=v; }
       }
     }
-  }else{
-    for(int v=0; v<cfg.vocab; v++){
-      const float* er = head + (size_t)v*cfg.H;
-      float s=0; for(int i=0;i<cfg.H;i++) s+=fn[i]*er[i];
-      logits[v]=s;
-      if(s>bestv){ bestv=s; best=v; }
+    if(lm_head==nullptr || !backend || dynamic_cast<CpuBackend*>(backend) || gpu){
+      for(int v=0; v<cfg.vocab; v++){
+        if(logits[v]>bestv){ bestv=logits[v]; best=v; }
+      }
     }
+    o.best = best;
+    o.logits = logits;
+  };
+  if(all_out){
+    all_out->resize(M);
+    for(int m=0; m<M; m++) score_row(m, (*all_out)[m]);
+    out = (*all_out)[M-1];
+  } else {
+    score_row(M-1, out);
   }
-  if(lm_head==nullptr || !backend || dynamic_cast<CpuBackend*>(backend) ||
-     dynamic_cast<GpuBackend*>(backend)){
-    for(int v=0; v<cfg.vocab; v++){
-      if(logits[v]>bestv){ bestv=logits[v]; best=v; }
-    }
-  }
-  out.best = best;
-  out.logits = logits;
   (void)T;
   return out;
 }
