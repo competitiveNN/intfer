@@ -1618,6 +1618,15 @@ static StepOut step(int token, int pos,
 // Returns the last row's greedy id + logits; fills dump rows [pos0,pos0+M).
 // Caller must have sized layers' kvcache/vcache for pos0+M (step() grows
 // them on demand via resize; here we pre-size to keep appends in-bounds).
+// all_out (optional): when set, every row is final-normed + lm_head-scored
+// (speculative verifier needs all M logits); out still returns last row.
+// row_snaps (optional): when set, per-row conv/SSM snapshots are captured
+// for LA layers (speculative partial-accept rollback; full-attn layers use
+// absolute-position KV caches truncated by size, needing no copies).
+struct CacheSnap {
+  size_t ksz = 0, vsz = 0;
+  std::vector<float> conv, ssm;
+};
 static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
                      const std::map<std::string, std::vector<float>>& T,
                      std::vector<float>& H, // [M,H] in/out hidden states
@@ -1625,7 +1634,8 @@ static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
                      const float* lm_head,
                      LinearBackend* backend,
                      std::vector<std::vector<float>>& dump,
-                     std::vector<StepOut>* all_out = nullptr){
+                     std::vector<StepOut>* all_out = nullptr,
+                     std::vector<std::vector<CacheSnap>>* row_snaps = nullptr){
   StepOut out;
   const int M = (int)toks.size();
   const int Hdim = cfg.H;
@@ -1851,6 +1861,19 @@ static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
           float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=x[i]*x[i];
           float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
           for(int i=0;i<cfg.v_head_dim;i++) o[i]=(x[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
+        }
+        // Speculative verifier (TODO3.3, scalar path): same post-row
+        // conv/SSM capture as the batched path below (ring states can't be
+        // truncated like the absolute KV caches). Without this, spec_rows
+        // stays empty when INTFER_BATCH_GEMM is unset and the verifier's
+        // restore indexes an empty vector (SIGSEGV in vector::operator=).
+        if(row_snaps){
+          auto& rws = *row_snaps;
+          if((int)rws.size() != cfg.layers) rws.resize(cfg.layers);
+          if((int)rws[(size_t)L].size() != M) rws[(size_t)L].resize(M);
+          CacheSnap& sn = rws[(size_t)L][m];
+          sn.conv = ly.conv_state;
+          sn.ssm = ly.ssm_state;
         }
         std::vector<float>& o_la = g_scratch.o_la;
         backend->run_linear_into(ln.la_out, normed_core, o_la);
@@ -2182,6 +2205,17 @@ static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
           float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
           float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
           for(int i=0;i<cfg.v_head_dim;i++) oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
+        }
+        // Speculative verifier (TODO3.3): capture post-row conv/SSM state so
+        // a partial accept can restore the exact accepted-boundary state
+        // (ring states can't be truncated like the absolute KV caches).
+        if(row_snaps){
+          auto& rws = *row_snaps;
+          if((int)rws.size() != cfg.layers) rws.resize(cfg.layers);
+          if((int)rws[(size_t)L].size() != M) rws[(size_t)L].resize(M);
+          CacheSnap& sn = rws[(size_t)L][m];
+          sn.conv = ly.conv_state;
+          sn.ssm = ly.ssm_state;
         }
       }
       need_rows(c_y, Hdim);
@@ -3341,30 +3375,146 @@ int main(int argc, char** argv){
   std::fprintf(stderr, "[intfer] prefill done, generated=%zu max_new=%d\n",
                generated.size(), max_new); std::fflush(stderr);
   auto t_d0 = std::chrono::high_resolution_clock::now();
-  // Single-token decode (M=1 fast path). Multi-token speculative
-  // verification lives in TODO3.3 (draft + batched verify + KV rollback);
-  // the old --decode-batch flag just duplicated tokens with zero benefit.
-  for(int step_i = 0; step_i < max_new; step_i++){
+  // Speculative decode (TODO3.3, INTFER_SPEC_K=N): free n-gram drafts from
+  // the context + one batched verify forward. Greedy-only (sampling falls
+  // back to the M=1 loop); default off (K=0). With greedy acceptance the
+  // output is exactly equivalent to the M=1 loop (oracle-gated).
+  int spec_K = 0;
+  if(const char* se = std::getenv("INTFER_SPEC_K")){
+    int v = std::atoi(se); if(v >= 1 && v <= 16) spec_K = v;
+  }
+  bool greedy = (temperature <= 0.f && top_k==0 && top_p<=0.f);
+  bool use_spec = (spec_K > 0 && greedy);
+  // N-gram drafter: last occurrence of the current token in the committed
+  // history; the following tokens are free drafts (no model cost).
+  auto ngram_drafts = [&](int tok, int K){
+    std::vector<int> d;
+    // Search generated first (most recent), then the prompt.
+    for(int occ = (int)generated.size()-1; occ >= 0 && (int)d.size() < K; --occ){
+      if(generated[(size_t)occ] == tok){
+        for(int j = occ+1; j < (int)generated.size() && (int)d.size() < K; ++j)
+          d.push_back(generated[(size_t)j]);
+        if((int)d.size() >= K) break;
+        // Ran off the end of generated: continue into nothing (generated
+        // already includes everything after the prompt). Stop here.
+        break;
+      }
+    }
+    if((int)d.size() < K){
+      for(int occ = (int)prompt_ids.size()-1; occ >= 0 && (int)d.size() < K; --occ){
+        if(prompt_ids[(size_t)occ] == tok){
+          for(int j = occ+1; j < (int)prompt_ids.size() && (int)d.size() < K; ++j)
+            d.push_back(prompt_ids[(size_t)j]);
+          // Prompt followers lead into generated[0..]; append those too.
+          for(int j = 0; j < (int)generated.size() && (int)d.size() < K; ++j)
+            d.push_back(generated[(size_t)j]);
+          break;
+        }
+      }
+    }
+    if((int)d.size() > K) d.resize(K);
+    return d;
+  };
+  auto emit_tok = [&](int step_i, int id){
+    if(print_ids) std::fprintf(stderr, "  [%d] id=%d\n", step_i, id);
+    generated.push_back(id);
+    std::string piece = detokenize_one(id, detok_py, tokenizer_json);
+    if(stream){ std::fwrite(piece.data(), 1, piece.size(), stdout); std::fflush(stdout); }
+    output += piece;
+  };
+  // Per-layer pre-verify snapshots + verify per-row LA snapshots (reused
+  // across rounds; vector assign reuses capacity after the first round).
+  std::vector<std::vector<CacheSnap>> spec_rows;
+  std::vector<float> Hv;
+  std::vector<StepOut> outs;
+  for(int step_i = 0; step_i < max_new;){
     std::fprintf(stderr, "[intfer] decode step %d: token=%d pos=%d\n",
                  step_i, token, S+step_i); std::fflush(stderr);
-    StepOut o = step(token, S+step_i, T, embed, final_norm, lm_head,
-                     backend.get(), false, dump);
-    int next;
-    if(temperature <= 0.f && top_k==0 && top_p<=0.f){
-      next = o.best;
-    } else {
-      next = sample(o.logits, top_k, top_p, temperature, rng);
+    bool spec_round = false;
+    if(use_spec){
+      int p = S + step_i;
+      std::vector<int> drafts = ngram_drafts(token, spec_K);
+      if(!drafts.empty()){
+        // Verify rows: [token @ p, d_1 @ p+1, ..., d_K @ p+K].
+        // Drafts were never run (free n-gram tokens), so live state is
+        // exactly the pre-verify state: no rollback needed before verify.
+        int K = (int)drafts.size();
+        std::vector<int> toks; toks.reserve(K+1);
+        toks.push_back(token);
+        for(int d : drafts) toks.push_back(d);
+        Hv.assign((size_t)(K+1)*cfg.H, 0.f);
+        outs.clear();
+        if((int)spec_rows.size() != cfg.layers) spec_rows.resize(cfg.layers);
+        prefill_layer_outer(toks, p, T, Hv, embed, final_norm, lm_head,
+                            backend.get(), dump, &outs, &spec_rows);
+        // outs[i].best predicts position p+i+1. Accept d_i iff
+        // outs[i-1].best == d_i.
+        int a = 0;
+        while(a < K && outs[(size_t)a].best == drafts[(size_t)a]) a++;
+        int c = outs[(size_t)a].best; // corrected (a<K) or bonus (a==K)
+        // Emission list: accepted drafts up to and including the first EOS,
+        // plus c iff no EOS was emitted.
+        std::vector<int> emit;
+        for(int i=0; i<a; i++){
+          emit.push_back(drafts[(size_t)i]);
+          if(drafts[(size_t)i] == 248044 || drafts[(size_t)i] == 248046) break;
+        }
+        bool stopped = !emit.empty() &&
+          (emit.back() == 248044 || emit.back() == 248046);
+        if(!stopped) emit.push_back(c);
+        // Honor -n: a verify round can emit up to K+1 tokens, overshooting
+        // max_new (the loop only checks step_i < max_new at round start).
+        // Truncate BEFORE the state restore so pend matches what is emitted
+        // (a popped bonus/correction is simply recomputed next round; a
+        // popped EOS just defers stopping to the budget cap). Keep >= 1.
+        {
+          int budget = max_new - step_i;
+          if(budget < 1) budget = 1;
+          while((int)emit.size() > budget) emit.pop_back();
+          stopped = !emit.empty() &&
+            (emit.back() == 248044 || emit.back() == 248046);
+        }
+        // Truncate state to the last emitted position (pend). Verify rows
+        // are u_0=token @ p, u_{i+1}=d_i @ p+i+1; post-row-r snapshots hold
+        // state through position p+r. Last emitted position:
+        // accepted drafts d_0..d_{e-1} then maybe c, where e = #drafts
+        // emitted. pend = p + e (+0 draft rows are u_1..; token row is u_0).
+        int n_draft_emit = (int)emit.size() - (stopped ? 0 : 1);
+        int pend = p + n_draft_emit; // c sits at p+a; drafts at p..p+a-1
+        for(int L=0; L<cfg.layers; L++){
+          Layer& ly = layers[(size_t)L];
+          if(ly.is_full){
+            size_t kwn = (size_t)(pend+1)*cfg.n_kv*cfg.head_dim;
+            if(ly.kcache.size() != kwn) ly.kcache.resize(kwn);
+            if(ly.vcache.size() != kwn) ly.vcache.resize(kwn);
+          } else {
+            // Post-row-r snapshot: r = pend - p (verify row index).
+            const CacheSnap& sn = spec_rows[(size_t)L][(size_t)(pend-p)];
+            ly.conv_state = sn.conv;
+            ly.ssm_state = sn.ssm;
+          }
+        }
+        for(size_t i=0; i<emit.size(); i++) emit_tok(step_i+(int)i, emit[i]);
+        step_i += (int)emit.size();
+        token = generated.back();
+        spec_round = true;
+        if(stopped) break;
+      }
     }
-    if(print_ids) std::fprintf(stderr, "  [%d] id=%d\n", step_i, next);
-    generated.push_back(next);
-    std::string piece = detokenize_one(next, detok_py, tokenizer_json);
-    if(stream){
-      std::fwrite(piece.data(), 1, piece.size(), stdout);
-      std::fflush(stdout);
+    if(!spec_round){
+      StepOut o = step(token, S+step_i, T, embed, final_norm, lm_head,
+                       backend.get(), false, dump);
+      int next;
+      if(greedy){
+        next = o.best;
+      } else {
+        next = sample(o.logits, top_k, top_p, temperature, rng);
+      }
+      emit_tok(step_i, next);
+      token = next;
+      step_i++;
+      if(next == 248044 || next == 248046) break;
     }
-    output += piece;
-    token = next;
-    if(next == 248044 || next == 248046) break;
   }
   auto t_d1 = std::chrono::high_resolution_clock::now();
   double decode_ms = std::chrono::duration<double, std::milli>(t_d1-t_d0).count();
