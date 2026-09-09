@@ -1671,7 +1671,7 @@ static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
     size_t kv_need = (size_t)(pos0+M)*cfg.n_kv*cfg.head_dim;
     if(ly.kcache.size() < kv_need) ly.kcache.resize(kv_need, 0.f);
     if(ly.vcache.size() < kv_need) ly.vcache.resize(kv_need, 0.f);
-    bool batch_this_layer = use_batch && ly.is_full;
+    bool batch_this_layer = use_batch;
     if(!batch_this_layer){
     for(int m=0; m<M; m++){
       int pos = pos0 + m;
@@ -2065,6 +2065,165 @@ static StepOut prefill_layer_outer(const std::vector<int>& toks, int pos0,
         float* mdr = &c_md[(size_t)m*Hdim];
         float* dst = &c_rn2[(size_t)m*Hdim]; // reuse as temp
         if(Rd) rot_left(mdr, *Rd, dst);
+        else memcpy(dst, mdr, (size_t)Hdim*sizeof(float));
+        for(int i=0;i<Hdim;i++) hr[i] += dst[i];
+        int pos = pos0 + m;
+        if((size_t)pos < dump[L].size()/Hdim)
+          memcpy(&dump[L][(size_t)pos*Hdim], hr, (size_t)Hdim*sizeof(float));
+      }
+    }
+    if(use_batch && !ly.is_full){
+      // ---- Batched linear-attention / SSM layer ----
+      // GEMMs (qkv/z/b/a/la_out) run as single M-row launches; the conv +
+      // SSM recurrences stay per-row in token order (sequential state, same
+      // as KV appends in the full-attn path). Bit-identical vs the scalar
+      // loop above: same per-row op sequence, only GEMM rows batched.
+      const float* conv_w = ln.conv_w;
+      const float* A_log  = ln.A_log;
+      const float* dt_bias= ln.dt_bias;
+      static thread_local std::vector<float> c_mqkv, c_z, c_b, c_a;
+      static thread_local std::vector<float> c_ncore;
+      need_rows(c_normed, Hdim);
+      for(int m=0; m<M; m++)
+        rmsnorm(&H[(size_t)m*Hdim], ly.in_ln, &c_normed[(size_t)m*Hdim], Hdim);
+      const Rotation* Rqkv = backend->rot_for(ln.qkv);
+      const Rotation* Rz = backend->rot_for(ln.z);
+      const Rotation* Rb = backend->rot_for(ln.b);
+      const Rotation* Ra = backend->rot_for(ln.a);
+      need_rows(c_x, Hdim);
+      for(int m=0; m<M; m++){
+        const float* nr = &c_normed[(size_t)m*Hdim];
+        float* xr = &c_x[(size_t)m*Hdim];
+        if(Rqkv) rot_apply(nr, *Rqkv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
+      }
+      need_rows(c_mqkv, cfg.conv_dim);
+      backend->run_linear_batch(ln.qkv, c_x, c_mqkv, (uint32_t)M);
+      for(int m=0; m<M; m++){
+        const float* nr = &c_normed[(size_t)m*Hdim];
+        float* xr = &c_x[(size_t)m*Hdim];
+        if(Rz) rot_apply(nr, *Rz, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
+      }
+      std::vector<float> c_z_in = c_x;
+      for(int m=0; m<M; m++){
+        const float* nr = &c_normed[(size_t)m*Hdim];
+        float* xr = &c_x[(size_t)m*Hdim];
+        if(Rb) rot_apply(nr, *Rb, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
+      }
+      std::vector<float> c_b_in = c_x;
+      for(int m=0; m<M; m++){
+        const float* nr = &c_normed[(size_t)m*Hdim];
+        float* xr = &c_x[(size_t)m*Hdim];
+        if(Ra) rot_apply(nr, *Ra, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
+      }
+      size_t zvw = (size_t)cfg.n_v_heads * cfg.v_head_dim;
+      need_rows(c_z, zvw);
+      need_rows(c_b, cfg.n_v_heads);
+      need_rows(c_a, cfg.n_v_heads);
+      backend->run_linear_batch(ln.z, c_z_in, c_z, (uint32_t)M);
+      backend->run_linear_batch(ln.b, c_b_in, c_b, (uint32_t)M);
+      backend->run_linear_batch(ln.a, c_x, c_a, (uint32_t)M);
+      need_rows(c_ncore, zvw);
+      // Per-row conv + SSM recurrence in token order (stateful).
+      std::vector<float> conv_out(cfg.conv_dim);
+      std::vector<float> kv_mem(cfg.v_head_dim), delta(cfg.v_head_dim);
+      std::vector<float> qn(cfg.k_head_dim), kn(cfg.k_head_dim);
+      std::vector<float> core(zvw), gg(cfg.n_v_heads);
+      for(int m=0; m<M; m++){
+        float* mqkvr = &c_mqkv[(size_t)m*cfg.conv_dim];
+        for(int c=0;c<cfg.conv_dim;c++){
+          float s=0;
+          s+=conv_w[c*cfg.conv_k+0]*ly.conv_state[c*3+0];
+          s+=conv_w[c*cfg.conv_k+1]*ly.conv_state[c*3+1];
+          s+=conv_w[c*cfg.conv_k+2]*ly.conv_state[c*3+2];
+          s+=conv_w[c*cfg.conv_k+3]*mqkvr[c];
+          conv_out[c]=silu(s);
+          ly.conv_state[c*3+0]=ly.conv_state[c*3+1];
+          ly.conv_state[c*3+1]=ly.conv_state[c*3+2];
+          ly.conv_state[c*3+2]=mqkvr[c];
+        }
+        float* query=conv_out.data();
+        float* key=conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
+        float* value=conv_out.data()+2*cfg.k_head_dim*cfg.n_k_heads;
+        float* zr = &c_z[(size_t)m*zvw];
+        float* br = &c_b[(size_t)m*cfg.n_v_heads];
+        float* ar = &c_a[(size_t)m*cfg.n_v_heads];
+        for(int hh=0; hh<cfg.n_v_heads; hh++){
+          float sp=log1pf(expf(ar[hh]+dt_bias[hh])); gg[hh]=-expf(A_log[hh])*sp;
+        }
+        for(size_t i=0;i<zvw;i++) core[i] = 0.f;
+        for(int hh=0; hh<cfg.n_v_heads; hh++){
+          int kh = (cfg.n_v_heads > cfg.n_k_heads)
+                   ? (int)((long long)hh * cfg.n_k_heads / cfg.n_v_heads)
+                   : hh;
+          l2norm(&query[kh*cfg.k_head_dim], qn.data(), cfg.k_head_dim);
+          l2norm(&key[kh*cfg.k_head_dim],  kn.data(), cfg.k_head_dim);
+          float scale=1.0f/sqrtf((float)cfg.k_head_dim);
+          for(int d=0;d<cfg.k_head_dim;d++) qn[d]*=scale;
+          float g_t=expf(gg[hh]); float beta=sigmoidf(br[hh]);
+          float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
+          for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
+          for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
+          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
+          { const float* vh=&value[hh*cfg.v_head_dim];
+          for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
+          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
+          for(int c=0;c<cfg.v_head_dim;c++){
+            float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
+            core[hh*cfg.v_head_dim+c]=s;
+          }
+        }
+        const float* ssm_norm_w = ln.ssm_norm_w;
+        float* ncr = &c_ncore[(size_t)m*zvw];
+        for(int hh=0; hh<cfg.n_v_heads; hh++){
+          const float* xx=&core[hh*cfg.v_head_dim];
+          const float* zg=&zr[hh*cfg.v_head_dim];
+          float* oo=&ncr[hh*cfg.v_head_dim];
+          float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
+          float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
+          for(int i=0;i<cfg.v_head_dim;i++) oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
+        }
+      }
+      need_rows(c_y, Hdim);
+      backend->run_linear_batch(ln.la_out, c_ncore, c_y, (uint32_t)M);
+      const Rotation* Ro_la = backend->rot_for(ln.la_out);
+      need_rows(c_mg, cfg.inter); need_rows(c_mu, cfg.inter);
+      static thread_local std::vector<float> c_rn2_la, c_rin_la, c_md_la;
+      need_rows(c_rn2_la, Hdim); need_rows(c_rin_la, Hdim); need_rows(c_md_la, Hdim);
+      for(int m=0; m<M; m++){
+        float* hr = &H[(size_t)m*Hdim];
+        float* orw = &c_y[(size_t)m*Hdim];
+        // Scalar path: h = rot_left(o_la) OVERWRITES h, then h += res.
+        // Stage res through c_rin_la rows (fully rewritten later) so the
+        // overwrite doesn't destroy the residual base.
+        float* tmp = &c_rin_la[(size_t)m*Hdim];
+        float* dst = &c_rn2_la[(size_t)m*Hdim];
+        memcpy(tmp, hr, (size_t)Hdim*sizeof(float));
+        if(Ro_la) rot_left(orw, *Ro_la, dst);
+        else memcpy(dst, orw, (size_t)Hdim*sizeof(float));
+        for(int i=0;i<Hdim;i++) hr[i] = dst[i] + tmp[i];
+      }
+      for(int m=0; m<M; m++)
+        rmsnorm(&H[(size_t)m*Hdim], ly.post_ln, &c_rn2_la[(size_t)m*Hdim], Hdim);
+      const Rotation* Rg_la = backend->rot_for(ln.gate);
+      for(int m=0; m<M; m++){
+        const float* r2 = &c_rn2_la[(size_t)m*Hdim];
+        float* ri = &c_rin_la[(size_t)m*Hdim];
+        if(Rg_la) rot_apply(r2, *Rg_la, ri); else memcpy(ri, r2, (size_t)Hdim*sizeof(float));
+      }
+      backend->run_linear_batch(ln.gate, c_rin_la, c_mg, (uint32_t)M);
+      backend->run_linear_batch(ln.up,   c_rin_la, c_mu, (uint32_t)M);
+      for(int m=0; m<M; m++){
+        float* mgr = &c_mg[(size_t)m*cfg.inter];
+        const float* mur = &c_mu[(size_t)m*cfg.inter];
+        for(int i=0;i<cfg.inter;i++) mgr[i] = silu(mgr[i])*mur[i];
+      }
+      backend->run_linear_batch(ln.down, c_mg, c_md_la, (uint32_t)M);
+      const Rotation* Rd_la = backend->rot_for(ln.down);
+      for(int m=0; m<M; m++){
+        float* hr = &H[(size_t)m*Hdim];
+        float* mdr = &c_md_la[(size_t)m*Hdim];
+        float* dst = &c_rn2_la[(size_t)m*Hdim];
+        if(Rd_la) rot_left(mdr, *Rd_la, dst);
         else memcpy(dst, mdr, (size_t)Hdim*sizeof(float));
         for(int i=0;i<Hdim;i++) hr[i] += dst[i];
         int pos = pos0 + m;
