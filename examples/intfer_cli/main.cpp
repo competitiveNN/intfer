@@ -1717,7 +1717,8 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
   // run_linear_batch; elementwise math stays per-row (bit-identical: each
   // row is an independent GEMM row + the same scalar sequence as step()).
   // NOTE: rot_for() must be resolved per row? No — rotations are static
-  // per tensor name (SpinQuant, fixed after warmup), so one lookup per
+  // per tensor name (SpinQuant; the fallback is an exact per-slot lookup
+  // so resolution is cache-state independent), so one lookup per
   // layer is enough; rows differ only in activations.
   static const bool batch_gemm =
       (std::getenv("INTFER_BATCH_GEMM") != nullptr);
@@ -4376,8 +4377,8 @@ int main(int argc, char** argv){
     }
   }
   // 4b: precompute per-layer names + host pointers (loop-invariant).
-  // NOTE: rotations stay live via backend->rot_for (state-dependent,
-  // must not be resolved before the first GEMM warms the cache).
+  // NOTE: rotations stay live via backend->rot_for (exact per-slot
+  // lookup, so resolution is independent of GEMM/cache state).
   {
     std::vector<char> is_full((size_t)cfg.layers);
     for(int L=0; L<cfg.layers; L++) is_full[(size_t)L] = req.layers[(size_t)L].is_full ? 1 : 0;

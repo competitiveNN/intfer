@@ -98,6 +98,15 @@ the batch.
 
 ## TODO 4 — Host hot path (updated 2026-09-07: detok + 4a + FWHT done, memcpy dead)
 
+> CORRECTION 2026-09-14 (`3eb4e34`): every `854×12` / `369`-loop CPU parity
+> claim below was self-consistency on BUGGY outputs, not HF agreement.
+> `CpuBackend::rot_for`'s cold fallback returned the first rotation in the
+> layer map (e.g. mlp down's R for safetensors-sourced LA weights), so chunk
+> row 0 saw a different rotation than later rows. The fallback is now an
+> exact per-slot lookup; 0.8B CPU matches HF top-1 (11751 / 13 198 760 on
+> the capital prompt). Gate: `scripts/test_cpu_parity.sh`. Do NOT re-baseline
+> against the old numbers.
+
 **Status:**
 - DONE `711000d`: in-process BPE detokenizer (killed 158ms/token python
   spawn). CPU 3.05→5.19 tok/s, GPU 3.3→4.01 tok/s. Byte-identical stdout.
