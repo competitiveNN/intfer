@@ -327,9 +327,9 @@ std::unique_ptr<Engine> Engine::load(const std::string& intfer_path,
   size_t n = (tp_devices == 0) ? dm.size() : std::min(tp_devices, dm.size());
   if (n == 0) { std::cerr << "Engine: no Arc GPU discovered\n"; return nullptr; }
   for (size_t i = 0; i < n; ++i) e->devices_.push_back(dm.at(i));
-  std::cout << "Engine: " << n << " Arc device(s): ";
-  for (auto& d : e->devices_) std::cout << d.name << " ";
-  std::cout << "\n";
+  std::cerr << "Engine: " << n << " Arc device(s): ";
+  for (auto& d : e->devices_) std::cerr << d.name << " ";
+  std::cerr << "\n";
 
   e->build_shards();
   return e;
@@ -444,7 +444,7 @@ void Engine::build_shards() {
     // Per-device footprint ≈ weights + act/out working buffers (small).
     if (total_w < 4ULL * 1024 * 1024 * 1024) {
       layer_tensors_.clear();
-      std::cout << "Engine: streaming disabled (model "
+      std::cerr << "Engine: streaming disabled (model "
                 << total_w / (1024 * 1024) << " MB fits in VRAM)\n";
     }
   }
@@ -652,8 +652,8 @@ void Engine::preload_all() {
     ensure_shard_built((int)ti);
     n_built++;
     if ((n_built % 100) == 0) {
-      std::cout << "Engine: preload " << n_built << " shards...\n";
-      std::cout.flush();
+      std::cerr << "Engine: preload " << n_built << " shards...\n";
+      std::cerr.flush();
     }
     if (const char* pt = std::getenv("INTFER_PRELOAD_TRACE")) {
       // Per-shard trace: cumulative geometry bytes per device + tensor name.
@@ -676,11 +676,11 @@ void Engine::preload_all() {
       }
       auto now = std::chrono::high_resolution_clock::now();
       double el = std::chrono::duration<double>(now - t0).count();
-      std::cout << "Engine: preload #" << n_built << " t=" << (long)el
+      std::cerr << "Engine: preload #" << n_built << " t=" << (long)el
                 << "s dev0=" << trace_acc[0] / (1024*1024) << "MiB dev1="
                 << (devices_.size() > 1 ? trace_acc[1] / (1024*1024) : 0)
                 << "MiB " << t.name << "\n";
-      std::cout.flush();
+      std::cerr.flush();
     }
   }
   // Pin first: any concurrent begin_layer() (none expected — single-threaded
@@ -711,9 +711,9 @@ void Engine::preload_all() {
       // Alpha is host-side (no device global buffer).
     }
     if (d == 0) dev_bytes = per_dev;
-    std::cout << "Engine: preload device " << d << " resident weights: "
+    std::cerr << "Engine: preload device " << d << " resident weights: "
               << per_dev / (1024 * 1024) << " MiB\n";
-    std::cout.flush();
+    std::cerr.flush();
   }
   // Allocator audit: pool contents (should be empty post-preload) + total
   // acquire count, to separate geometry bytes from runtime overhead.
@@ -723,19 +723,19 @@ void Engine::preload_all() {
       for (auto& [bytes, vec] : usm_pool_[d]) {
         pool_n += vec.size(); pool_bytes += bytes * vec.size();
       }
-    std::cout << "Engine: preload audit: pool holds " << pool_n
+    std::cerr << "Engine: preload audit: pool holds " << pool_n
               << " bufs (" << pool_bytes / (1024 * 1024)
               << " MiB), pool_acquire calls=" << pool_acquires_
               << " pool_hits=" << pool_hits_ << "\n";
-    std::cout.flush();
+    std::cerr.flush();
   }
   auto t1 = std::chrono::high_resolution_clock::now();
   double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-  std::cout << "Engine: preload_all built " << n_built << " shards (skipped "
+  std::cerr << "Engine: preload_all built " << n_built << " shards (skipped "
             << n_skip << ", host cache bypassed), dev0 weights "
             << dev_bytes / (1024 * 1024)
             << " MiB in " << (long)ms << " ms; shards pinned (no evict)\n";
-  std::cout.flush();
+  std::cerr.flush();
 }
 
 std::vector<float> Engine::decode_step(const std::vector<float>& token_hidden,
@@ -1290,7 +1290,7 @@ bool Engine::load_language_weights(const std::string& safetensors_path) {
     if (!r.read(t.name, v)) { std::cerr << "Engine: read fail " << t.name << "\n"; return false; }
     lang_[t.name] = std::move(v);
   }
-  std::cout << "Engine: loaded " << lang_.size() << " safetensors tensors\n";
+  std::cerr << "Engine: loaded " << lang_.size() << " safetensors tensors\n";
   return true;
 }
 

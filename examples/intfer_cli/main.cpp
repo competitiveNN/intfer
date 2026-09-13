@@ -53,11 +53,14 @@ static void segv_handler(int sig){
 #include <chrono>
 #include <algorithm>
 #include <random>
+#include <functional>
+#include <iostream>
 #include <memory>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <fcntl.h>
 #include <errno.h>
 
@@ -1167,7 +1170,8 @@ struct StepScratch {
 // Request); the scheduler (3.2) holds one Request per live sequence.
 // Stage 3.2 fields (prompt/generated/token/pos/finished/rng/output) are
 // only used by the scheduler path; the single-request path keeps its own
-// locals and is untouched.
+// locals and is untouched. Stage 3.3 adds id (server-issued request handle)
+// + done_emitted (terminal status already streamed) for the serve loop.
 // ============================================================================
 struct Request {
   std::vector<Layer> layers;
@@ -1178,6 +1182,11 @@ struct Request {
   int pos = 0;      // absolute position `token` sits at (next forward pos)
   int max_new = 0;
   bool finished = false;
+  bool done_emitted = false; // server: {"done"} already emitted for id
+  long id = -1;              // server-issued request handle (-1 = CLI batch)
+  float temperature = 0.f;   // per-request sampling (CLI: copied from globals;
+  int top_k = 0;             // server: per-line overrides or CLI defaults)
+  float top_p = 0.f;
   std::mt19937 rng;
   std::string output; // buffered decoded text (multi-request mode)
 };
@@ -1924,7 +1933,10 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       else memcpy(mlp_out.data(), md.data(), (size_t)Hdim*sizeof(float));
       for(int i=0;i<Hdim;i++) h[i] = h[i] + mlp_out[i];
       memcpy(&H[(size_t)m*Hdim], h.data(), (size_t)Hdim*sizeof(float));
-      if((size_t)pos < dump[L].size()/Hdim)
+      // Empty outer dump = skip recording (server path never records).
+      // The inner guard alone is not enough: dump[L] on an empty outer
+      // vector is UB before the comparison even runs.
+      if(!dump.empty() && (size_t)pos < dump[L].size()/Hdim)
         memcpy(&dump[L][(size_t)pos*Hdim], h.data(), (size_t)Hdim*sizeof(float));
     } // end token loop (scalar path; skipped for batched full-attn layers)
     } // end if(!batch_this_layer)
@@ -2115,7 +2127,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         else memcpy(dst, mdr, (size_t)Hdim*sizeof(float));
         for(int i=0;i<Hdim;i++) hr[i] += dst[i];
         int pos = pos0 + m;
-        if((size_t)pos < dump[L].size()/Hdim)
+        if(!dump.empty() && (size_t)pos < dump[L].size()/Hdim)
           memcpy(&dump[L][(size_t)pos*Hdim], hr, (size_t)Hdim*sizeof(float));
       }
     }
@@ -2285,7 +2297,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         else memcpy(dst, mdr, (size_t)Hdim*sizeof(float));
         for(int i=0;i<Hdim;i++) hr[i] += dst[i];
         int pos = pos0 + m;
-        if((size_t)pos < dump[L].size()/Hdim)
+        if(!dump.empty() && (size_t)pos < dump[L].size()/Hdim)
           memcpy(&dump[L][(size_t)pos*Hdim], hr, (size_t)Hdim*sizeof(float));
       }
     }
@@ -2747,6 +2759,176 @@ static std::vector<StepOut> step_batch(
 }
 
 // ============================================================================
+// Scheduler runtime (Stage 3.3): serve-loop building blocks.
+// ============================================================================
+// Forward declaration (sampling section sits below the scheduler helpers).
+static int sample(const std::vector<float>& logits, int top_k, float top_p,
+                  float temperature, std::mt19937& rng);
+// The 3.2 CLI batch path below is factored through these so --serve shares
+// the exact iteration mechanics (same prefill, same step_batch decode, same
+// finish rules). Emission differs: CLI buffers per-request text; the server
+// streams JSON lines per token.
+//
+// SchedCtx bundles the model-side inputs every iteration needs (avoids a
+// 12-arg helper signature; all pointers outlive the serve loop).
+struct SchedCtx {
+  const std::map<std::string, std::vector<float>>* T = nullptr;
+  const float* embed = nullptr;
+  const float* final_norm = nullptr;
+  const float* lm_head = nullptr;
+  LinearBackend* backend = nullptr;
+  const std::string* detok_py = nullptr;
+  const std::string* tokenizer_json = nullptr;
+  const std::string* tokenizer_py = nullptr; // encode_text script (server)
+  bool print_ids = false;
+};
+// Prefill one request into its own KV/SSM state (sequential; chunked when
+// INTFER_PREFILL_CHUNK is set). Appends the first generated id; sets
+// token/pos. dump is the request's private record buffer (may be empty to
+// skip recording).
+static void sched_prefill(Request& q, SchedCtx& c, std::vector<std::vector<float>>& dump){
+  int Sr = (int)q.prompt_ids.size();
+  static const char* chunk_env = std::getenv("INTFER_PREFILL_CHUNK");
+  bool chunked = (chunk_env != nullptr && std::string(chunk_env) != "0");
+  int chunk_M = 8;
+  if(const char* me = std::getenv("INTFER_PREFILL_CHUNK_M")){
+    int v = std::atoi(me); if(v >= 1 && v <= 1024) chunk_M = v;
+  }
+  std::vector<float> Hbuf;
+  if(chunked && Sr > 1){
+    for(int c0 = 0; c0 < Sr; c0 += chunk_M){
+      int cm = std::min(chunk_M, Sr - c0);
+      std::vector<int> toks(q.prompt_ids.begin() + c0, q.prompt_ids.begin() + c0 + cm);
+      Hbuf.assign((size_t)cm * cfg.H, 0.f);
+      StepOut o = prefill_layer_outer(q, toks, c0, *c.T, Hbuf, c.embed, c.final_norm,
+                                      c.lm_head, c.backend, dump);
+      if(c0 + cm == Sr) q.generated.push_back(o.best);
+    }
+  } else {
+    for(int pos=0; pos<Sr; pos++){
+      StepOut o = step(q, q.prompt_ids[pos], pos, *c.T, c.embed, c.final_norm, c.lm_head,
+                       c.backend, !dump.empty(), dump);
+      if(pos==Sr-1) q.generated.push_back(o.best);
+    }
+  }
+  q.token = q.generated.back();
+  q.pos = Sr; // next forward position (prefill filled [0,Sr))
+}
+// One decode iteration over live requests: build the batch, run step_batch,
+// sample/advance each row. Returns the batch width M (0 = nothing live).
+// Per-row emission (buffer vs stream) is the caller's emit hook.
+static int sched_iteration(std::vector<Request*>& live, SchedCtx& c,
+                           std::vector<float>& Hb,
+                           const std::function<void(Request&, size_t, int)>& emit,
+                           int step_i){
+  std::vector<BatchItem> items; std::vector<size_t> ridx;
+  for(size_t i=0; i<live.size(); i++){
+    Request& q = *live[i];
+    if(q.finished) continue;
+    if((int)q.generated.size() >= q.max_new + 1){ q.finished = true; continue; }
+    items.push_back(BatchItem{&q, q.token, q.pos});
+    ridx.push_back(i);
+  }
+  if(items.empty()) return 0;
+  int M = (int)items.size();
+  Hb.assign((size_t)M * cfg.H, 0.f);
+  std::vector<StepOut> outs = step_batch(items, *c.T, Hb, c.embed, c.final_norm,
+                                         c.lm_head, c.backend);
+  for(int m=0; m<M; m++){
+    Request& q = *items[(size_t)m].req;
+    bool qgreedy = (q.temperature <= 0.f && q.top_k==0 && q.top_p<=0.f);
+    int next = qgreedy ? outs[(size_t)m].best
+                       : sample(outs[(size_t)m].logits, q.top_k, q.top_p,
+                                q.temperature, q.rng);
+    q.generated.push_back(next);
+    q.pos++;
+    emit(q, ridx[(size_t)m], next);
+    q.token = next;
+    if(next == 248044 || next == 248046) q.finished = true;
+    if((int)q.generated.size() >= q.max_new + 1) q.finished = true;
+  }
+  return M;
+}
+// Minimal JSON-string escaper for server lines (prompts/echo only; token
+// pieces go out as ids + BpDecoder text is emission-side decoded).
+static std::string json_escape(const std::string& s){
+  std::string o;
+  for(char ch : s){
+    switch(ch){
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default:
+        if((unsigned char)ch < 0x20){ char b[8]; snprintf(b, sizeof(b), "\\u%04x", ch); o += b; }
+        else o += ch;
+    }
+  }
+  return o;
+}
+// Parse {"prompt":"...","max_new":N,"id":K} (all optional but prompt).
+// Returns false on malformed lines (caller emits {"error":...}).
+static bool parse_serve_line(const std::string& line, std::string& prompt,
+                             int& max_new, long& id, bool& has_id, int dflt_n){
+  prompt.clear(); max_new = dflt_n; id = -1; has_id = false;
+  auto find_key = [&](const char* k) -> size_t {
+    std::string q = std::string("\"") + k + "\"";
+    return line.find(q);
+  };
+  size_t pp = find_key("prompt");
+  if(pp == std::string::npos) return false;
+  size_t colon = line.find(':', pp);
+  if(colon == std::string::npos) return false;
+  size_t q0 = line.find('"', colon);
+  if(q0 == std::string::npos) return false;
+  // Decode \" \\ \n \r \t \uXXXX escapes (prompts may carry quotes).
+  std::string raw;
+  for(size_t i=q0+1; i<line.size(); i++){
+    char ch = line[i];
+    if(ch == '\\' && i+1 < line.size()){
+      char e = line[++i];
+      if(e=='"') raw += '"'; else if(e=='\\') raw += '\\';
+      else if(e=='n') raw += '\n'; else if(e=='r') raw += '\r';
+      else if(e=='t') raw += '\t';
+      else if(e=='u' && i+4 < line.size()){
+        unsigned v = 0;
+        for(int k=1;k<=4;k++){ char h=line[i+k];
+          v <<= 4;
+          if(h>='0'&&h<='9') v += h-'0';
+          else if(h>='a'&&h<='f') v += h-'a'+10;
+          else if(h>='A'&&h<='F') v += h-'A'+10;
+        }
+        i += 4;
+        if(v < 0x80) raw += (char)v;
+        else if(v < 0x800){ raw += (char)(0xC0|(v>>6)); raw += (char)(0x80|(v&0x3F)); }
+        else { raw += (char)(0xE0|(v>>12)); raw += (char)(0x80|((v>>6)&0x3F)); raw += (char)(0x80|(v&0x3F)); }
+      }
+      else raw += e;
+    }
+    else if(ch == '"') break;
+    else raw += ch;
+  }
+  prompt = raw;
+  size_t pn = find_key("max_new");
+  if(pn != std::string::npos){
+    size_t c2 = line.find(':', pn);
+    if(c2 != std::string::npos) max_new = std::atoi(line.c_str()+c2+1);
+  }
+  size_t pi = find_key("id");
+  // "id" must not match inside another key: require the quoted form, and
+  // prefer the LAST occurrence (a prompt string could contain "id").
+  size_t pil = line.rfind("\"id\"");
+  if(pil != std::string::npos && pil != pp){
+    size_t c3 = line.find(':', pil);
+    if(c3 != std::string::npos){ id = std::atol(line.c_str()+c3+1); has_id = true; }
+  }
+  if(max_new < 1) max_new = 1;
+  if(max_new > 4096) max_new = 4096;
+  return true;
+}
+
+// ============================================================================
 // Sampling
 // ============================================================================
 static int sample(const std::vector<float>& logits, int top_k, float top_p,
@@ -3144,6 +3326,124 @@ static std::string detokenize_one(int id, const std::string& detok_py,
 }
 
 // ============================================================================
+// Serve loop (Stage 3.3): stdin JSON-lines continuous batching server.
+// ============================================================================
+// Protocol:
+//   in:  {"prompt":"...","max_new":N,"id":K} per line (id optional; server
+//        assigns when missing; max_new optional, defaults to -n).
+//   out: {"id":K,"token":ID,"text":"..."} per generated token,
+//        {"id":K,"done":true,"generated":N} once per request,
+//        {"error":"..."} on malformed input lines (server keeps running).
+// Mechanics: poll stdin with select() (zero timeout: never stall decode
+// waiting for input); admit pending lines FIFO up to INTFER_SERVE_MAX live
+// (default 8: each Request holds full KV/SSM state, ~hundreds of MB on 27B);
+// prefill each admission immediately (interleaved with live decodes), then
+// run one sched_iteration over all live. EOF drains live to completion.
+// Returns 0 on clean EOF drain (munmap left to the caller).
+static int run_serve(SchedCtx& c,
+                     const std::function<void(Request&)>& wire,
+                     int dflt_max_new, uint32_t seed,
+                     float dflt_temp, int dflt_top_k, float dflt_top_p){
+  std::vector<std::unique_ptr<Request>> pool; // all admitted (live + done)
+  std::vector<Request*> live;                 // points into pool (unfinished)
+  std::vector<std::string> pending;           // FIFO of unadmitted lines
+  int serve_max = 8;
+  if(const char* me = std::getenv("INTFER_SERVE_MAX")){
+    int v = std::atoi(me); if(v >= 1 && v <= 64) serve_max = v;
+  }
+  long next_id = 1;
+  bool eof = false;
+  std::vector<std::vector<float>> no_dump; // server never records
+  std::vector<float> Hb;
+  int step_i = 0;
+  auto emit_stream = [&](Request& q, size_t, int tok){
+    std::string piece = detokenize_one(tok, *c.detok_py, *c.tokenizer_json);
+    std::printf("{\"id\":%ld,\"token\":%d,\"text\":\"%s\"}\n",
+                q.id, tok, json_escape(piece).c_str());
+    std::fflush(stdout);
+  };
+  // Admit one parsed request: tokenize, wire state, prefill immediately.
+  auto admit = [&](const std::string& prompt, int max_new, long id){
+    auto rq = std::make_unique<Request>();
+    wire(*rq);
+    Request& q = *rq;
+    q.id = id;
+    if(!prompt.empty())
+      q.prompt_ids = encode_text(prompt, *c.tokenizer_json, *c.tokenizer_py);
+    if(q.prompt_ids.empty())
+      q.prompt_ids = {760, 6511, 314, 9338, 369};
+    q.max_new = max_new;
+    q.temperature = dflt_temp; q.top_k = dflt_top_k; q.top_p = dflt_top_p;
+    q.rng = std::mt19937(seed + (uint32_t)id);
+    sched_prefill(q, c, no_dump);
+    if(c.print_ids)
+      std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", q.id, q.token);
+    std::fprintf(stderr, "[intfer] serve admit id=%ld prompt=%zu max_new=%d live=%zu\n",
+                 q.id, q.prompt_ids.size(), q.max_new, live.size()+1);
+    live.push_back(rq.get());
+    pool.push_back(std::move(rq));
+  };
+  std::string bufline;
+  while(!eof || !pending.empty() || !live.empty()){
+    // --- Poll stdin (non-blocking): drain all ready lines into pending.
+    if(!eof){
+      for(;;){
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO, &rfds);
+        struct timeval tv{0, 0};
+        int r = select(STDIN_FILENO+1, &rfds, nullptr, nullptr, &tv);
+        if(r <= 0 || !FD_ISSET(STDIN_FILENO, &rfds)) break;
+        if(!std::getline(std::cin, bufline)){ eof = true; break; }
+        if(!bufline.empty() && bufline.back() == '\r') bufline.pop_back();
+        if(bufline.empty()) continue;
+        pending.push_back(bufline);
+      }
+      if(std::cin.eof()) eof = true;
+    }
+    // --- Admit FIFO while under the live cap.
+    while(!pending.empty() && (int)live.size() < serve_max){
+      std::string line = pending.front();
+      pending.erase(pending.begin());
+      std::string prompt; int max_new = dflt_max_new; long id = -1;
+      bool has_id = false;
+      if(!parse_serve_line(line, prompt, max_new, id, has_id, dflt_max_new)){
+        std::printf("{\"error\":\"malformed request line\"}\n");
+        std::fflush(stdout);
+        continue;
+      }
+      if(!has_id) id = next_id++;
+      else if(id >= next_id) next_id = id + 1;
+      admit(prompt, max_new, id);
+    }
+    // --- One decode iteration over all live (dynamic leave inside).
+    if(!live.empty()){
+      int M = sched_iteration(live, c, Hb, emit_stream, step_i++);
+      // Emit {"done"} once per newly finished request; compact live.
+      std::vector<Request*> still;
+      for(Request* qp : live){
+        if(qp->finished && !qp->done_emitted){
+          qp->done_emitted = true;
+          std::printf("{\"id\":%ld,\"done\":true,\"generated\":%zu}\n",
+                      qp->id, qp->generated.size());
+          std::fflush(stdout);
+        }
+        if(!qp->finished) still.push_back(qp);
+      }
+      live.swap(still);
+      if(M == 0 && eof && pending.empty()) break;
+    } else if(eof && pending.empty()){
+      break;
+    } else if(live.empty() && pending.empty() && !eof){
+      // Nothing to do: block for the next line (avoids a hot spin when
+      // idle with the pipe open but no data).
+      if(!std::getline(std::cin, bufline)){ break; }
+      if(!bufline.empty() && bufline.back() == '\r') bufline.pop_back();
+      if(!bufline.empty()) pending.push_back(bufline);
+    }
+  }
+  return 0;
+}
+
+// ============================================================================
 // CLI
 // ============================================================================
 enum class GpuMode { Auto, ForceOn, ForceOff };
@@ -3170,7 +3470,10 @@ static void usage(const char* p){
     "  --tokenizer-py P path to bpe_tokenize.py\n"
     "  --detok-py P   path to bpe_detokenize.py\n"
     "  --no-stream    do not stream tokens (print full output after generation)\n"
-    "  --ids          also print token ids to stderr (debug)\n",
+    "  --ids          also print token ids to stderr (debug)\n"
+    "  --serve        JSON-lines server on stdin/stdout (Stage 3.3): read\n"
+    "                 {\"prompt\":...} per line, stream {\"id\",\"token\"}/\n"
+    "                 {\"id\",\"done\"} lines back as requests finish\n",
     p);
 }
 
@@ -3202,6 +3505,7 @@ int main(int argc, char** argv){
   uint32_t seed = 0;
   bool stream = true;
   bool print_ids = false;
+  bool serve = false;
   GpuMode gpu_mode = GpuMode::Auto;
   size_t tp_devices = 2;  // 2x Arc B580 fleet; Engine::load clamps to discovered
   int i = 1;
@@ -3224,6 +3528,7 @@ int main(int argc, char** argv){
     else if(a=="--detok-py" && i+1<argc) detok_py = argv[++i];
     else if(a=="--no-stream") stream = false;
     else if(a=="--ids") print_ids = true;
+    else if(a=="--serve") serve = true;
     else if(a=="-h" || a=="--help"){ usage(argv[0]); return 0; }
     else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 2; }
     ++i;
@@ -3749,13 +4054,22 @@ int main(int argc, char** argv){
   else
     std::fprintf(stderr, "[intfer] BpDecoder: load failed, using python fallback\n");
   if(prompts.empty()) prompts.emplace_back(""); // default prompt below
+  // Stage 3.3 server: stdin JSON-lines loop (shares sched_* mechanics with
+  // the 3.2 CLI batch path above). Branches before CLI prompt handling.
+  if(serve){
+    SchedCtx sc{&T, embed, final_norm, lm_head, backend.get(),
+                &detok_py, &tokenizer_json, &tokenizer_py, print_ids};
+    int rc = run_serve(sc, wire_request, max_new, seed,
+                       temperature, top_k, top_p);
+    munmap_blob(mblob);
+    return rc;
+  }
   // Stage 3.2 scheduler engages with >1 prompt or INTFER_SCHED=1 (forces
   // the iteration scheduler even for a single prompt; ids must match the
   // scalar loop). Otherwise the single-request path below is untouched.
   bool sched = (prompts.size() > 1) ||
                (std::getenv("INTFER_SCHED") != nullptr);
   std::vector<Request> reqs;
-  std::vector<std::vector<std::vector<float>>> dumps;
   std::vector<int> prompt_ids;
   if(!sched){
     if(!prompts[0].empty()){
@@ -3779,6 +4093,7 @@ int main(int argc, char** argv){
       if(q.prompt_ids.empty())
         q.prompt_ids = {760, 6511, 314, 9338, 369};
       q.max_new = max_new;
+      q.temperature = temperature; q.top_k = top_k; q.top_p = top_p;
       q.rng = std::mt19937(seed + (uint32_t)r);
       std::fprintf(stderr, "[intfer] sched prompt %zu: %zu tokens ->", r, q.prompt_ids.size());
       for(int t : q.prompt_ids) std::fprintf(stderr, " %d", t);
@@ -3790,44 +4105,19 @@ int main(int argc, char** argv){
   // NOTE: S grows as we decode (KV positions are absolute). Size `dump`
   // for prompt + max_new so the decode-time record memcpy never writes
   // out of bounds (fixed a SIGSEGV in __intel_avx_rep_memcpy).
-  // Stage 3.2 scheduler path (multi-prompt or INTFER_SCHED=1): each
-  // request prefills sequentially into its own state, then all live
-  // requests decode together via step_batch (dynamic leave: finished
-  // requests drop out of the batch; join arrives with the 3.3 server).
+  // Stage 3.2 scheduler path (multi-prompt or INTFER_SCHED=1), factored
+  // through the same sched_* helpers the 3.3 server uses (identical
+  // prefill/decode mechanics; emission here buffers per-request text).
+  // Recording is skipped: dumps were write-only debug (never read back).
   // Speculative decode is single-request only (TODO3.3 path below).
   if(sched){
     auto t0 = std::chrono::high_resolution_clock::now();
-    static const char* chunk_env = std::getenv("INTFER_PREFILL_CHUNK");
-    bool chunked = (chunk_env != nullptr && std::string(chunk_env) != "0");
-    int chunk_M = 8;
-    if(const char* me = std::getenv("INTFER_PREFILL_CHUNK_M")){
-      int v = std::atoi(me); if(v >= 1 && v <= 1024) chunk_M = v;
-    }
-    dumps.resize(reqs.size());
-    std::vector<float> Hbuf;
+    SchedCtx sc{&T, embed, final_norm, lm_head, backend.get(),
+                &detok_py, &tokenizer_json, &tokenizer_py, print_ids};
+    std::vector<std::vector<float>> no_dump; // empty => skip recording
     for(size_t r=0; r<reqs.size(); r++){
       Request& q = reqs[r];
-      int Sr = (int)q.prompt_ids.size();
-      dumps[r].assign(cfg.layers,
-          std::vector<float>((size_t)(Sr+max_new)*cfg.H, 0.f));
-      if(chunked && Sr > 1){
-        for(int c0 = 0; c0 < Sr; c0 += chunk_M){
-          int cm = std::min(chunk_M, Sr - c0);
-          std::vector<int> toks(q.prompt_ids.begin() + c0, q.prompt_ids.begin() + c0 + cm);
-          Hbuf.assign((size_t)cm * cfg.H, 0.f);
-          StepOut o = prefill_layer_outer(q, toks, c0, T, Hbuf, embed, final_norm,
-                                          lm_head, backend.get(), dumps[r]);
-          if(c0 + cm == Sr) q.generated.push_back(o.best);
-        }
-      } else {
-        for(int pos=0; pos<Sr; pos++){
-          StepOut o = step(q, q.prompt_ids[pos], pos, T, embed, final_norm, lm_head,
-                           backend.get(), true, dumps[r]);
-          if(pos==Sr-1) q.generated.push_back(o.best);
-        }
-      }
-      q.token = q.generated.back();
-      q.pos = Sr; // next forward position (prefill filled [0,Sr))
+      sched_prefill(q, sc, no_dump);
       if(print_ids) std::fprintf(stderr, "  [req %zu prefill] id=%d\n", r, q.token);
     }
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -3847,40 +4137,21 @@ int main(int argc, char** argv){
       reset_gpu_profile();
     }
 #endif
-    bool greedy = (temperature <= 0.f && top_k==0 && top_p<=0.f);
     auto t_d0 = std::chrono::high_resolution_clock::now();
     std::vector<float> Hb;
-    std::vector<BatchItem> items; std::vector<size_t> ridx;
+    std::vector<Request*> live;
     int step_i = 0, navail = (int)reqs.size();
     // Per-request budget (q.max_new): longest request decides; shorter ones
     // leave the batch when done (dynamic leave; join arrives in 3.3).
+    auto emit_cli = [&](Request& q, size_t r, int next){
+      if(print_ids) std::fprintf(stderr, "  [req %zu step %d] id=%d\n", r, step_i, next);
+      q.output += detokenize_one(next, detok_py, tokenizer_json);
+    };
     for(; navail > 0; step_i++){
-      items.clear(); ridx.clear();
-      for(size_t r=0; r<reqs.size(); r++){
-        Request& q = reqs[r];
-        if(q.finished) continue;
-        if((int)q.generated.size() >= q.max_new + 1){ q.finished = true; continue; }
-        items.push_back(BatchItem{&q, q.token, q.pos});
-        ridx.push_back(r);
-      }
-      if(items.empty()) break;
-      int M = (int)items.size();
-      Hb.assign((size_t)M * cfg.H, 0.f);
-      std::vector<StepOut> outs = step_batch(items, T, Hb, embed, final_norm,
-                                             lm_head, backend.get());
-      for(int m=0; m<M; m++){
-        Request& q = *items[(size_t)m].req;
-        size_t r = ridx[(size_t)m];
-        int next = greedy ? outs[(size_t)m].best
-                          : sample(outs[(size_t)m].logits, top_k, top_p, temperature, q.rng);
-        q.generated.push_back(next);
-        q.pos++;
-        if(print_ids) std::fprintf(stderr, "  [req %zu step %d] id=%d\n", r, step_i, next);
-        q.output += detokenize_one(next, detok_py, tokenizer_json);
-        q.token = next;
-        if(next == 248044 || next == 248046) q.finished = true;
-        if((int)q.generated.size() >= q.max_new + 1) q.finished = true;
-      }
+      live.clear();
+      for(size_t r=0; r<reqs.size(); r++) live.push_back(&reqs[r]);
+      int M = sched_iteration(live, sc, Hb, emit_cli, step_i);
+      if(M == 0) break;
       navail = 0;
       for(auto& q : reqs) if(!q.finished) navail++;
       if(step_i==0 || (step_i & 15) == 0)
