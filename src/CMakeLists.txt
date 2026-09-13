@@ -66,9 +66,6 @@ endif()
 if(INTFER_PROFILE_GPU)
   target_compile_definitions(intfer_engine PUBLIC INTFER_PROFILE_GPU)
 endif()
-if(INTFER_GRAPH_CAPTURE)
-  target_compile_definitions(intfer_engine PUBLIC INTFER_GRAPH_CAPTURE=1)
-endif()
 add_sycl_to_target(TARGET intfer_engine SOURCES engine/engine.cpp)
 
 # ---------------------------------------------------------------------------

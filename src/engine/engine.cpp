@@ -21,7 +21,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sycl/sycl.hpp>
-#include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <chrono>
 #include <vector>
 // ...
@@ -35,12 +34,6 @@
 #include "intfer/device/device_manager.hpp"
 
 #include "intfer/spinquant.hpp"  // for canonical_codebook + unpack_nibble
-
-// Command-graph capture over sycl::buffer is disallowed by the SYCL graph
-// extension (buffers are write-back accessors). The graph-capturable fast path
-// must use raw USM pointers (quant_gemm_dpas_int8). Off by default so the
-// buffer-based decode path runs; enable only when graph_ compiled in.
-#define INTFER_CAPTURE_GRAPH 1
 
 namespace intfer {
 
@@ -1295,66 +1288,5 @@ bool Engine::load_language_weights(const std::string& safetensors_path) {
 }
 
 }  // namespace intfer
-
-#if INTFER_GRAPH_CAPTURE
-#include <sycl/ext/oneapi/experimental/graph.hpp>
-
-bool intfer::Engine::build_usm_buffers_for_tensor(int tensor_index) {
-  if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size()) return false;
-  const auto& t = model_.tensors[tensor_index];
-  if ((int)usm_.size() != (int)devices_.size()) usm_.resize(devices_.size());
-  for (size_t d = 0; d < devices_.size(); ++d) {
-    auto& dev = devices_[d];
-    auto [start, end] = shards_[tensor_index].ranges[d];
-    auto& u = usm_[d];
-    u.q = dev.queue;
-    auto w = shard_weight(model_, t, start, end, u.q);
-    u.code_store = std::move(w.code_store);
-    u.scale_store = std::move(w.scale_store);
-    u.global_store = std::move(w.global_store);
-    u.code.emplace(u.code_store.data(), sycl::range<1>(u.code_store.size()));
-    u.scale.emplace(u.scale_store.data(), sycl::range<1>(u.scale_store.size()));
-    u.global.emplace(u.global_store.data(), sycl::range<1>(u.global_store.size()));
-    u.act_store.assign(t.K, 0);
-    u.act.emplace(u.act_store.data(), sycl::range<1>(u.act_store.size()));
-    u.out_store.assign(end - start, 0);
-    u.out.emplace(u.out_store.data(), sycl::range<1>(u.out_store.size()));
-    u.c_store.assign(end - start, 0);
-    u.c.emplace(u.c_store.data(), sycl::range<1>(u.c_store.size()));
-  }
-  return true;
-}
-
-void intfer::Engine::build_decode_graph() {
-  if (graph_built_ || model_.tensors.empty()) return;
-  using namespace sycl::ext::oneapi::experimental;
-  build_usm_buffers_for_tensor(0);
-  for (size_t d = 0; d < devices_.size(); ++d) {
-    auto& u = usm_[d];
-    auto [start, end] = shards_[0].ranges[d];
-    command_graph<graph_state::modifiable> g(u.q.get_context(), u.q.get_device());
-    // act and c are persistent optional buffers allocated by build_usm_buffers_for_tensor
-    gemm::GemmActBuffers a;
-    a.scheme = gemm::ActScheme::FP16;
-    a.M = 1; a.K = model_.tensors[0].K;
-    a.fp16 = *u.act;   // act buffer is persistent
-    gemm::QuantGemmOptions opt;
-    opt.use_dpas = false;
-    gemm::GemmWeightBuffers w;
-    w.scheme = gemm::WeightScheme::INT8;
-    w.group_size = model_.tensors[0].qcfg.group_size;
-    w.has_global_divisor = model_.tensors[0].qcfg.has_global_divisor;
-    w.N = end - start;
-    w.K = model_.tensors[0].K;
-    w.code = *u.code;
-    w.scale = *u.scale;
-    w.global = *u.global;
-    quant_gemm_forward(u.q, a, w, *u.c, opt);
-    g.end_recording();
-    u.graph = std::make_unique<command_graph<graph_state::executable>>(g.finalize());
-  }
-  graph_built_ = true;
-}
-#endif
 
 

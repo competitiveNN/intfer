@@ -45,7 +45,8 @@ proved it is the dequant kernel body itself (fixed by TODO 1 → a173efe).
 Remaining per-submit host cost (~150-250µs in-engine) exceeds kernel time,
 but graphs cannot reduce it. If pursued at all, the lever is launch-COUNT
 reduction (fusion), not launch-cost reduction. Scaffold
-(`INTFER_GRAPH_CAPTURE` + `build_decode_graph`) left untouched.
+(`INTFER_GRAPH_CAPTURE` + `build_decode_graph`) REMOVED 2026-09-13
+(dead code, zero callers, default-off; measurement above is the record).
 
 **Why (original, superseded):** Every `run_linear_tp` call currently goes through:
   host pre-convert FP32→FP16 → direct USM write → `q.submit()` → kernel
@@ -56,19 +57,13 @@ overhead alone is non-trivial.
 **Where:** `src/engine/engine.cpp` `run_linear_tp` + `examples/intfer_cli/main.cpp`
 forward step.
 
-**Next step:**
-- Pre-allocate the per-step activation USM buffer once and let it stay
-  resident (already done).
-- Replace per-call `q.submit()` with the SYCL command-graph capture
-  (`sycl::ext::oneapi::experimental::command_graph`) — record the full
-  forward pass once, then replay it each step.
-- Backed by the `INTFER_GRAPH_CAPTURE` machinery already in `engine.cpp`
-  (see `build_decode_graph` / `DeviceUSM` struct).
-- The graph is currently restricted to a single tensor; extend it to cover
-  all 7 Linears per layer × 24 layers for the full decode step.
+**Next step:** SUPERSEDED by the measurement above — graphs are slower
+than plain submit on B580, so this path is closed. The lever (if any) is
+launch-COUNT reduction (fusion), not launch-cost reduction. Machinery
+removed 2026-09-13.
 
 **Expected gain:** 2–3× launch-overhead reduction → 10–30% wall-time on
-decode.
+decode. (Not pursued: premise invalidated by measurement.)
 
 ---
 

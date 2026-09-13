@@ -258,33 +258,6 @@ class Engine {
   std::vector<int> layer_of_;
   bool pinned_ = false;
   bool skip_host_cache_ = false;
-
-  // Command-graph capture state (experimental; requires INTFER_GRAPH_CAPTURE=1).
-#if INTFER_GRAPH_CAPTURE
-  struct DeviceUSM {
-    sycl::queue q;
-    std::vector<std::uint8_t> code_store;
-    std::vector<std::uint16_t> scale_store;
-    std::vector<float> global_store;
-    std::vector<std::uint16_t> act_store;
-    std::vector<std::uint16_t> out_store;
-    std::vector<std::uint16_t> c_store;     // persistent output accumulator
-    // SYCL buffers — wrapped in std::optional so DeviceUSM is default-constructible
-    std::optional<sycl::buffer<std::uint8_t>> code;
-    std::optional<sycl::buffer<std::uint16_t>> scale;
-    std::optional<sycl::buffer<float>> global;
-    std::optional<sycl::buffer<std::uint16_t>> act;
-    std::optional<sycl::buffer<std::uint16_t>> out;
-    std::optional<sycl::buffer<std::uint16_t>> c;
-    // compiled executable graph
-    std::unique_ptr<sycl::ext::oneapi::experimental::command_graph<
-        sycl::ext::oneapi::experimental::graph_state::executable>> graph;
-  };
-  std::vector<DeviceUSM> usm_;
-  bool graph_built_ = false;
-  bool build_usm_buffers_for_tensor(int tensor_index);
-  void build_decode_graph();
-#endif
 };
 
 

@@ -19,7 +19,6 @@ endif()
 option(INTFER_ENABLE_L0      "Enable the Intel Level-Zero native layer" ON)
 option(INTFER_BUILD_EXAMPLES "Build example programs"                   ON)
 option(INTFER_BUILD_QUANT    "Build Stage-1 quantization core (experimental)" OFF)
-option(INTFER_GRAPH_CAPTURE  "Capture SYCL command graph for decode (experimental)" OFF)
 option(INTFER_PROFILE_GPU    "Enable GPU timing instrumentation (experimental)" ON)
 
 set(INTFER_SYCL_TARGET "spir64" CACHE STRING "SYCL offload target triple")
