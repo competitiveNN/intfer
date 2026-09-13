@@ -561,29 +561,40 @@ struct CpuBackend : public LinearBackend {
         return nullptr;
       }
     }
-    // Fall back to per-layer maps.
+    // Fall back to per-layer maps with an EXACT per-slot lookup (mirrors
+    // ensure_cached's dispatch). The old first-hit scan returned whatever
+    // rotation sorted first in the layer map — e.g. mlp down's R for LA
+    // tensors served raw from safetensors (eager population never fills
+    // la_q when the .intifer lacks LA tensors) — disagreeing with the
+    // per-slot rotation ensure_cached stores after the first GEMM. Cold
+    // (pre-GEMM) and warm (post-GEMM) resolutions then differed, so row 0
+    // of a chunk saw a different rotation than later rows and step_batch
+    // (one lookup per layer, pre-GEMM) diverged from the chunk path.
     size_t p = name.find("model.language_model.layers.");
     if(p == std::string::npos) return nullptr;
     int L = std::atoi(name.c_str()+p+28);
     std::string suf = name.substr(p+28);
     while(!suf.empty() && suf[0]>='0' && suf[0]<='9') suf=suf.substr(1);
-    if(suf.find("self_attn.q_proj")!=std::string::npos || suf.find("self_attn.k_proj")!=std::string::npos ||
-       suf.find("self_attn.v_proj")!=std::string::npos || suf.find("self_attn.o_proj")!=std::string::npos ||
-       suf.find("mlp.gate_proj")!=std::string::npos || suf.find("mlp.up_proj")!=std::string::npos ||
-       suf.find("mlp.down_proj")!=std::string::npos || suf.find("linear_attn.in_proj_qkv")!=std::string::npos ||
-       suf.find("linear_attn.in_proj_z")!=std::string::npos || suf.find("linear_attn.in_proj_b")!=std::string::npos ||
-       suf.find("linear_attn.in_proj_a")!=std::string::npos || suf.find("linear_attn.out_proj")!=std::string::npos){
-      // Check all maps.
-      auto check = [&](const std::map<int, std::map<std::string, QLinear>>& mp) -> const Rotation* {
-        auto itL = mp.find(L);
-        if(itL == mp.end()) return nullptr;
-        for(auto& kv : itL->second) if(kv.second.R) return kv.second.R;
-        return nullptr;
-      };
-      if(const Rotation* r = check(attn_q)) return r;
-      if(const Rotation* r = check(mlp_q)) return r;
-      if(const Rotation* r = check(la_q)) return r;
-    }
+    auto slot = [&](const std::map<int, std::map<std::string, QLinear>>& mp,
+                    const char* key) -> const Rotation* {
+      auto itL = mp.find(L);
+      if(itL == mp.end()) return nullptr;
+      auto itS = itL->second.find(key);
+      if(itS == itL->second.end()) return nullptr;
+      return itS->second.R;
+    };
+    if(suf.find("self_attn.q_proj")!=std::string::npos) return slot(attn_q, "q");
+    if(suf.find("self_attn.k_proj")!=std::string::npos) return slot(attn_q, "k");
+    if(suf.find("self_attn.v_proj")!=std::string::npos) return slot(attn_q, "v");
+    if(suf.find("self_attn.o_proj")!=std::string::npos) return slot(attn_q, "o");
+    if(suf.find("mlp.gate_proj")!=std::string::npos) return slot(mlp_q, "gate");
+    if(suf.find("mlp.up_proj")!=std::string::npos) return slot(mlp_q, "up");
+    if(suf.find("mlp.down_proj")!=std::string::npos) return slot(mlp_q, "down");
+    if(suf.find("linear_attn.in_proj_qkv")!=std::string::npos) return slot(la_q, "qkv");
+    if(suf.find("linear_attn.in_proj_z")!=std::string::npos) return slot(la_q, "z");
+    if(suf.find("linear_attn.in_proj_b")!=std::string::npos) return slot(la_q, "b");
+    if(suf.find("linear_attn.in_proj_a")!=std::string::npos) return slot(la_q, "a");
+    if(suf.find("linear_attn.out_proj")!=std::string::npos) return slot(la_q, "out");
     return nullptr;
   }
 };
@@ -1050,11 +1061,13 @@ struct GpuBackend : public LinearBackend {
 // snprintf (~366/token) plus per-call get() map finds for SSM params.
 // All loop-invariant: build once after backend selection, use by
 // reference. ROTATIONS ARE DELIBERATELY NOT HOISTED: CpuBackend::rot_for
-// is state-dependent — cold (pre-GEMM) it falls through to a per-layer
-// first-hit scan, warm (post-ensure_cached) it returns the per-slot
-// rotation from cache_R. Resolving up front froze wrong pointers and
-// broke output (854 -> 13104 on prefill). rot_for itself is cheap
-// (a few map finds); the snprintf+malloc was the cost.
+// used to be state-dependent — cold (pre-GEMM) it fell through to a
+// per-layer first-hit scan while warm (post-ensure_cached) it returned
+// the per-slot rotation from cache_R, and resolving up front froze wrong
+// pointers (854 -> 13104 on prefill). The fallback is now an exact
+// per-slot lookup mirroring ensure_cached, so cold == warm; the
+// no-hoist policy stays as cheap insurance (rot_for is a few map finds;
+// the snprintf+malloc was the cost).
 struct LayerNames {
   std::string q, k, v, o;          // full-attn linears
   std::string qkv, z, b, a, la_out;// LA linears
@@ -2920,15 +2933,10 @@ static int sched_iteration_joint(std::vector<Request*>& live,
   // M>1) is known-divergent on 27B/GPU (pre-existing: reproduces on the
   // pristine tree without this change), so joint batches carry at most ONE
   // prefill row under BATCH_GEMM and the caller falls back to the split
-  // path for wider chunks.
-  // Correctness cap (CPU): step_batch advances recurrent (conv/SSM) state
-  // correctly for multi-row SAME-request batches, but its M-row attention
-  // path is only verified for one row per request (decode batches). Until
-  // the batched full-attention path is fixed for same-request multi-row
-  // chunks, joint batches carry at most ONE prefill row and the caller
-  // falls back to the split path (identical outputs, gated) for wider
-  // chunks. Single-row joint still fuses that prefill token with the live
-  // decode rows (the common case: short prompts + ongoing decodes).
+  // path for wider chunks. The CPU step_batch path is fixed for
+  // same-request multi-row chunks (rot_for fallback now resolves the exact
+  // per-slot rotation, so cold == warm and all rows agree with the split
+  // path), hence no P cap outside BATCH_GEMM.
   Request* pq = prefill_q.empty() ? nullptr : prefill_q.front();
   static const bool batch_gemm_env = (std::getenv("INTFER_BATCH_GEMM") != nullptr);
   static const bool rr_off = (std::getenv("INTFER_PREFILL_RR") != nullptr &&
@@ -2937,7 +2945,10 @@ static int sched_iteration_joint(std::vector<Request*>& live,
   if(pq){
     int Sr = (int)pq->prompt_ids.size();
     P = std::min(chunk_M, Sr - pq->fill);
-    if(P > 1) return -1; // caller runs the split path (same mechanics)
+    // Wide same-request chunks ride the joint forward except under the
+    // GPU batched-GEMM path (known-divergent there, pre-existing).
+    bool wide_ok = !(batch_gemm_env && c.backend && c.backend->is_distributed());
+    if(P > 1 && !wide_ok) return -1; // caller runs the split path (same mechanics)
     for(int k=0; k<P; k++){
       BatchItem b{pq, -1, pq->fill + k, true};
       items.push_back(b);
@@ -2974,8 +2985,8 @@ static int sched_iteration_joint(std::vector<Request*>& live,
   // chunk-final row's prediction matters. A filled request joins live.
   // Unfilled queue heads rotate to the back (round-robin fairness) unless
   // disabled; a filled request leaves via pop_front above. Rotation also
-  // runs on the decline path (P>1 early return above skips it — the
-  // caller rotates there instead; see split_chunk).
+  // runs on the decline path (BATCH_GEMM P>1 early return above skips it —
+  // the caller rotates there instead; see split_chunk).
   if(pq){
     int Sr = (int)pq->prompt_ids.size();
     pq->fill += P;
@@ -3667,14 +3678,12 @@ static int run_serve(SchedCtx& c,
       else if(o.id >= next_id) next_id = o.id + 1;
       admit(prompt, o);
     }
-    // --- Joint iteration: one forward carries decode rows + one prefill
-    // token for the queue head (or the split path under INTFER_SPLIT_ITER=1,
-    // or when the joint helper declines). Wide chunks (chunk_M > 1) go
-    // through the split path in BOTH modes: split_chunk fills up to chunk_M
-    // prompt tokens, then decodes live — so joint and split differ only in
-    // whether the single prefill token shares its forward with the decodes.
-    // The split chunk block is factored as a lambda so both the explicit
-    // split mode and the joint-decline fallback share it verbatim.
+    // --- Joint iteration: one forward carries decode rows + up to chunk_M
+    // prefill rows for the queue head (or the split path under
+    // INTFER_SPLIT_ITER=1, or when the joint helper declines under
+    // BATCH_GEMM). The split chunk block is factored as a lambda so both
+    // the explicit split mode and the joint-decline fallback share it
+    // verbatim.
     auto split_chunk = [&](){
       auto rotate_unfilled = [&](Request* served){
         // Round-robin: the served head goes to the back unless it filled
@@ -3731,10 +3740,10 @@ static int run_serve(SchedCtx& c,
       int D = sched_iteration_joint(live, prefill_q, chunk_M, c, Hb,
                                     emit_stream, step_i++);
       if(D < 0){
-        // Joint declines P>1 (same-request multi-row cap): run the split
+        // Joint declines (BATCH_GEMM wide-chunk guard): run the split
         // chunk for the head, then rotate so the next iteration serves the
         // next queued request (round-robin; identical rotation in the
-        // joint-P1 path keeps both modes comparable).
+        // joint path keeps both modes comparable).
         split_chunk(); // joint declined: same split mechanics
       }
     }
