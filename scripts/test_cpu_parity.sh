@@ -106,4 +106,21 @@ echo "INT8-KV: prefill=$IPREFILL (expect 11751) decode='$IDECODE' (expect '13 19
 [ "$IPREFILL" = "11751" ] || fail "INT8-KV prefill $IPREFILL != 11751"
 [ "$IDECODE" = "13 198 760" ] || fail "INT8-KV decode '$IDECODE' != '13 198 760'"
 
+# --- 6. Per-token G64 Q8 KV (+ optional Hadamard) is oracle-identical ---
+# INTFER_KV_Q8=1 enables the append-only per-token G64 Q8 mirror (supersedes
+# the legacy token-group mirror on reads); INTFER_KV_HAD=1 adds the
+# self-inverse FWHT smoothing roundtrip. Both must be token-identical to
+# FP32, and INTFER_KV_CAP=262144 must not change short-run outputs.
+for kvmode in "INTFER_INT8_KV=1 INTFER_KV_Q8=1" "INTFER_INT8_KV=1 INTFER_KV_Q8=1 INTFER_KV_HAD=1" "INTFER_KV_CAP=262144" "INTFER_KV_CAP=262144 INTFER_INT8_KV=1 INTFER_KV_Q8=1 INTFER_KV_HAD=1"; do
+  QOUT="$(env $kvmode "$BIN" --no-gpu -m "$MODEL" -p "$PROMPT" -n 4 --no-stream --ids \
+    --tokenizer-py "$SCRIPT_DIR/bpe_tokenize.py" \
+    --detok-py "$SCRIPT_DIR/bpe_detokenize.py" 2>&1 >/dev/null \
+    | grep -a -oE "decode step [0-9]+: token=[0-9]+" | sed -E 's/.*token=//')"
+  QPREFILL="$(echo "$QOUT" | head -1)"
+  QDECODE="$(echo "$QOUT" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  echo "KV[$kvmode]: prefill=$QPREFILL decode='$QDECODE'"
+  [ "$QPREFILL" = "11751" ] || fail "KV[$kvmode] prefill $QPREFILL != 11751"
+  [ "$QDECODE" = "13 198 760" ] || fail "KV[$kvmode] decode '$QDECODE' != '13 198 760'"
+done
+
 if [ "$PASS" = 1 ]; then echo "CPU-PARITY TEST: PASS"; else echo "CPU-PARITY TEST: FAIL" >&2; exit 1; fi

@@ -1177,6 +1177,14 @@ struct Layer {
   std::vector<int8_t> kcache_i8, vcache_i8;
   std::vector<float> kscale, vscale;
   bool kv_int8 = false;
+  // Per-token G64 Q8 KV codec (opt-in via INTFER_KV_Q8=1; switchable
+  // Hadamard via INTFER_KV_HAD=1). Append-only: one FP32 scale per
+  // (token, kv_head, 64-elem dim group), token t quantized once at append.
+  // Supersedes the legacy token-group mirror when both knobs are set.
+  std::vector<int8_t> kcache_q8, vcache_q8;
+  std::vector<float> kscale_q8, vscale_q8;
+  bool kv_q8 = false;
+  bool kv_had = false;
 };
 
 // Groupwise-INT8 KV helpers. One FP32 scale per (kv_head, group) over
@@ -1196,11 +1204,49 @@ static inline bool kv_int8_enabled(){
   static const bool on = (std::getenv("INTFER_INT8_KV") != nullptr);
   return on;
 }
+// KV-cache capacity: hard-coded 1024 historically (kcache/vcache assign).
+// INTFER_KV_CAP raises it (clamped to [1, 262144] = 27B
+// max_position_embeddings) so the 260k context actually fits; allocations
+// are still grow-on-demand via resize, so short runs pay nothing extra.
+static inline int kv_capacity(){
+  static const int cap = []{
+    const char* e = std::getenv("INTFER_KV_CAP");
+    int v = e ? std::atoi(e) : 1024;
+    if(v < 1) return 1024;
+    if(v > 262144) return 262144;
+    return v;
+  }();
+  return cap;
+}
+static inline bool kv_q8_enabled(){
+  static const bool on = (std::getenv("INTFER_KV_Q8") != nullptr);
+  return on;
+}
+static inline bool kv_had_enabled(){
+  static const bool on = (std::getenv("INTFER_KV_HAD") != nullptr);
+  return on;
+}
+// In-place unscaled Walsh-Hadamard transform (hd=256 is a power of two on
+// both known models, so no blockdiag tail). Normalized H/sqrt(n) is
+// symmetric orthogonal, hence self-inverse: the same fwht+scale call
+// serves as both forward (pre-quant smoothing) and inverse (post-dequant).
+static inline void kv_fwht(float* x, int n){
+  for(int len = 2; len <= n; len <<= 1){
+    int half = len >> 1;
+    for(int i = 0; i < n; i += len)
+      for(int j = 0; j < half; ++j){
+        float u = x[i+j], v = x[i+j+half];
+        x[i+j] = u + v; x[i+j+half] = u - v;
+      }
+  }
+  const float inv = 1.0f / sqrtf((float)n);
+  for(int i = 0; i < n; ++i) x[i] *= inv;
+}
 // Requantize the group containing `pos` for all KV heads from the FP32
 // cache (call after appending token `pos`). Retroactively updates earlier
 // tokens in the same group — inherent to the per-group-scale format.
-// Scale layout is (kvh, group) with a FIXED stride smax = 1024/G+1
-// (kcache capacity is 1024 positions): ng must not vary over time, or
+// Scale layout is (kvh, group) with a FIXED stride smax = cap/G+1
+// (cap = kv_capacity()): ng must not vary over time, or
 // earlier groups' indices shift when a new group starts.
 static void kv_i8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
   std::vector<int8_t>& ci = is_k ? ly.kcache_i8 : ly.vcache_i8;
@@ -1210,7 +1256,7 @@ static void kv_i8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
   size_t need_i8 = (size_t)(pos + 1) * kvrow;
   if(ci.size() < need_i8) ci.resize(need_i8, 0);
   int GS = kv_group_size();
-  int smax = 1024 / GS + 1;
+  int smax = kv_capacity() / GS + 1;
   if((int)sc.size() < n_kv * smax) sc.resize((size_t)n_kv * smax, 1.f);
   int g = pos / GS;
   int t0 = g * GS, t1 = pos;
@@ -1233,6 +1279,51 @@ static void kv_i8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
       }
   }
 }
+// Per-token G64 Q8 KV codec (INTFER_KV_Q8=1). Append-only: token `pos` is
+// quantized once at append from the FP32 cache and never touched again
+// (no retroactive group updates, unlike the legacy mirror above).
+// Scale layout is (token, kv_head, dim-group) with hd/64 groups per row
+// (hd=256 -> 4 groups); codes are token-major [pos][n_kv][hd], same as
+// the legacy mirror. Optional Hadamard (INTFER_KV_HAD=1): the row is
+// forward-rotated (H/sqrt(n), self-inverse) before quant to spread
+// outliers, and rotated back after dequant in kv_row_ptr.
+static void kv_q8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
+  std::vector<int8_t>& ci = is_k ? ly.kcache_q8 : ly.vcache_q8;
+  std::vector<float>& sc = is_k ? ly.kscale_q8 : ly.vscale_q8;
+  const std::vector<float>& cf = is_k ? ly.kcache : ly.vcache;
+  const int ng = hd / 64;
+  size_t kvrow = (size_t)n_kv * hd;
+  size_t need_i8 = (size_t)(pos + 1) * kvrow;
+  if(ci.size() < need_i8) ci.resize(need_i8, 0);
+  size_t need_sc = (size_t)(pos + 1) * n_kv * ng;
+  if(sc.size() < need_sc) sc.resize(need_sc, 1.f);
+  static thread_local std::vector<float> work;
+  if((int)work.size() < hd) work.resize(hd);
+  const bool had = ly.kv_had;
+  for(int kvh = 0; kvh < n_kv; kvh++){
+    const float* src = &cf[((size_t)pos * n_kv + kvh) * hd];
+    float* w = work.data();
+    for(int d = 0; d < hd; d++) w[d] = src[d];
+    if(had) kv_fwht(w, hd);
+    int8_t* dst = &ci[((size_t)pos * n_kv + kvh) * hd];
+    for(int dg = 0; dg < ng; dg++){
+      float mx = 0;
+      for(int d = 0; d < 64; d++){
+        float v = std::fabs(w[dg * 64 + d]);
+        if(v > mx) mx = v;
+      }
+      float s = (mx > 0) ? mx / 127.f : 1.f;
+      sc[((size_t)pos * n_kv + kvh) * ng + dg] = s;
+      float inv = 1.f / s;
+      for(int d = 0; d < 64; d++){
+        float v = w[dg * 64 + d] * inv;
+        int q = (int)(v >= 0 ? v + 0.5f : v - 0.5f);
+        if(q > 127) q = 127; else if(q < -127) q = -127;
+        dst[dg * 64 + d] = (int8_t)q;
+      }
+    }
+  }
+}
 // Row pointer for (t, kvh): direct FP32 pointer when INT8 is off, else
 // dequantize into a thread-local scratch (K and V have separate buffers)
 // and return it. Safe: every read site consumes the row (dot/accumulate)
@@ -1240,20 +1331,59 @@ static void kv_i8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
 // live simultaneously.
 static inline const float* kv_row_ptr(const Layer& ly, bool is_k, int t,
                                       int kvh, int n_kv, int hd){
-  if(!ly.kv_int8)
+  if(!ly.kv_int8 && !ly.kv_q8)
     return is_k ? &ly.kcache[((size_t)t * n_kv + kvh) * hd]
                 : &ly.vcache[((size_t)t * n_kv + kvh) * hd];
   static thread_local std::vector<float> tmp_k, tmp_v;
   std::vector<float>& tmp = is_k ? tmp_k : tmp_v;
+  if((int)tmp.size() < hd) tmp.resize(hd);
+  if(ly.kv_q8){
+    // Per-token G64 path (supersedes the legacy mirror when both are on).
+    const std::vector<int8_t>& ci = is_k ? ly.kcache_q8 : ly.vcache_q8;
+    const std::vector<float>& sc = is_k ? ly.kscale_q8 : ly.vscale_q8;
+    const int ng = hd / 64;
+    const int8_t* row = &ci[((size_t)t * n_kv + kvh) * hd];
+    for(int dg = 0; dg < ng; dg++){
+      float s = sc[((size_t)t * n_kv + kvh) * ng + dg];
+      for(int d = 0; d < 64; d++) tmp[dg * 64 + d] = (float)row[dg * 64 + d] * s;
+    }
+    // Inverse Hadamard (self-inverse): undo the forward rotation applied
+    // at append so attention sees the original activation space.
+    if(ly.kv_had) kv_fwht(tmp.data(), hd);
+    return tmp.data();
+  }
+  static thread_local std::vector<float> leg_k, leg_v;
+  std::vector<float>& leg = is_k ? leg_k : leg_v;
   const std::vector<int8_t>& ci = is_k ? ly.kcache_i8 : ly.vcache_i8;
   const std::vector<float>& sc = is_k ? ly.kscale : ly.vscale;
   int GS = kv_group_size();
-  int smax = 1024 / GS + 1;
+  int smax = kv_capacity() / GS + 1;
   float s = sc[((size_t)kvh * smax + (size_t)(t / GS))];
-  if((int)tmp.size() < hd) tmp.resize(hd);
+  if((int)leg.size() < hd) leg.resize(hd);
   const int8_t* row = &ci[((size_t)t * n_kv + kvh) * hd];
-  for(int d = 0; d < hd; d++) tmp[d] = (float)row[d] * s;
-  return tmp.data();
+  for(int d = 0; d < hd; d++) leg[d] = (float)row[d] * s;
+  return leg.data();
+}
+
+// Append dispatcher: quantize token `pos` into whichever INT8 KV mirror(s)
+// are enabled. Q8 (per-token G64) supersedes the legacy token-group mirror
+// on reads when both are on; both mirrors are still maintained so each
+// stays self-consistent.
+// Hard cap guard: pos >= kv_capacity() aborts loudly instead of growing
+// the caches unbounded (or reading OOB). All append + pre-size sites call
+// this before touching the cache.
+static inline void kv_require_cap(int pos){
+  if(pos >= kv_capacity()){
+    std::fprintf(stderr, "[intfer] FATAL: pos %d >= KV capacity %d (raise INTFER_KV_CAP, max 262144)\n",
+                 pos, kv_capacity());
+    std::exit(1);
+  }
+}
+
+static inline void kv_append(Layer& ly, int n_kv, int hd, int pos){
+  kv_require_cap(pos);
+  if(ly.kv_q8){ kv_q8_append(ly, n_kv, hd, pos, true); kv_q8_append(ly, n_kv, hd, pos, false); }
+  if(ly.kv_int8){ kv_i8_append(ly, n_kv, hd, pos, true); kv_i8_append(ly, n_kv, hd, pos, false); }
 }
 
 // ============================================================================
@@ -1469,6 +1599,7 @@ static StepOut step(Request& req, int token, int pos,
         rmsnorm(&k[hh*cfg.head_dim], ly.k_norm_w, &k[hh*cfg.head_dim], cfg.head_dim);
         rope(&k[hh*cfg.head_dim], pos);
       }
+      kv_require_cap(pos);
       int base = pos*(cfg.n_kv*cfg.head_dim);
       // Defensive: k/v lie about their width when a layer is missing from the
       // IR and the fallback path mis-shapes (or the cache is short). Never
@@ -1489,8 +1620,7 @@ static StepOut step(Request& req, int token, int pos,
         if(have_v >= need) memcpy(&ly.vcache[base], v.data(), need*sizeof(float));
         else { memcpy(&ly.vcache[base], v.data(), have_v*sizeof(float));
                memset(&ly.vcache[base]+have_v, 0, (need-have_v)*sizeof(float)); }
-        if(ly.kv_int8){ kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, true);
-                        kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, false); }
+        kv_append(ly, cfg.n_kv, cfg.head_dim, pos);
       }
       // Attention compute, tiled by KV group (4d). Heads sharing a KV
       // head reuse the same K/V cache rows: the old per-head loop loaded
@@ -1868,6 +1998,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
     const LayerNames& ln = g_ln[(size_t)L];
     Layer& ly = req.layers[(size_t)L];
     // Pre-size KV caches for the whole chunk (step() would resize per pos).
+    kv_require_cap(pos0+M-1);
     size_t kv_need = (size_t)(pos0+M)*cfg.n_kv*cfg.head_dim;
     if(ly.kcache.size() < kv_need) ly.kcache.resize(kv_need, 0.f);
     if(ly.vcache.size() < kv_need) ly.vcache.resize(kv_need, 0.f);
@@ -1916,12 +2047,12 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
           rmsnorm(&k[hh*cfg.head_dim], ly.k_norm_w, &k[hh*cfg.head_dim], cfg.head_dim);
           rope(&k[hh*cfg.head_dim], pos);
         }
+        kv_require_cap(pos);
         int base = pos*(cfg.n_kv*cfg.head_dim);
         size_t need = (size_t)cfg.n_kv*cfg.head_dim;
         if(k.size() >= need) memcpy(&ly.kcache[base], k.data(), need*sizeof(float));
         if(v.size() >= need) memcpy(&ly.vcache[base], v.data(), need*sizeof(float));
-        if(ly.kv_int8){ kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, true);
-                        kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, false); }
+        kv_append(ly, cfg.n_kv, cfg.head_dim, pos);
         std::vector<float>& attn = req.scratch.attn;
         const int G = cfg.n_heads / cfg.n_kv;
         float* gs = req.scratch.gscores_for(G, pos);
@@ -2179,11 +2310,11 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
           rmsnorm(&kr[hh*cfg.head_dim], ly.k_norm_w, &kr[hh*cfg.head_dim], cfg.head_dim);
           rope(&kr[hh*cfg.head_dim], pos);
         }
-        int base = pos*(cfg.n_kv*cfg.head_dim);
+        kv_require_cap(pos);
+      int base = pos*(cfg.n_kv*cfg.head_dim);
         memcpy(&ly.kcache[base], kr, kvrows*sizeof(float));
         memcpy(&ly.vcache[base], vr, kvrows*sizeof(float));
-        if(ly.kv_int8){ kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, true);
-                        kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, false); }
+        kv_append(ly, cfg.n_kv, cfg.head_dim, pos);
       }
       // Per-row causal attention (same grouped tiling as scalar path).
       static thread_local std::vector<float> c_attn;
@@ -2579,6 +2710,7 @@ static std::vector<StepOut> step_batch(
     // Pre-size each request's KV caches for its own position.
     for(int m=0; m<M; m++){
       if(!lys[(size_t)m]->is_full) continue;
+      kv_require_cap(pos_of[(size_t)m]);
       size_t kv_need = (size_t)(pos_of[(size_t)m]+1)*cfg.n_kv*cfg.head_dim;
       if(lys[(size_t)m]->kcache.size() < kv_need) lys[(size_t)m]->kcache.resize(kv_need, 0.f);
       if(lys[(size_t)m]->vcache.size() < kv_need) lys[(size_t)m]->vcache.resize(kv_need, 0.f);
@@ -2645,11 +2777,11 @@ static std::vector<StepOut> step_batch(
           rmsnorm(&kr[hh*cfg.head_dim], ly.k_norm_w, &kr[hh*cfg.head_dim], cfg.head_dim);
           rope(&kr[hh*cfg.head_dim], pos);
         }
-        int base = pos*(cfg.n_kv*cfg.head_dim);
+        kv_require_cap(pos);
+      int base = pos*(cfg.n_kv*cfg.head_dim);
         memcpy(&ly.kcache[base], kr, kvrows*sizeof(float));
         memcpy(&ly.vcache[base], vr, kvrows*sizeof(float));
-        if(ly.kv_int8){ kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, true);
-                        kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, false); }
+        kv_append(ly, cfg.n_kv, cfg.head_dim, pos);
       }
       static thread_local std::vector<float> b_attn;
       need_rows(b_attn, qrows);
@@ -4388,8 +4520,14 @@ int main(int argc, char** argv){
       if(ly.is_full){
         ly.q_norm_w = get(p("self_attn.q_norm.weight")).data();
         ly.k_norm_w = get(p("self_attn.k_norm.weight")).data();
-        ly.kcache.assign((size_t)cfg.n_kv*1024*cfg.head_dim, 0.f);
-        ly.vcache.assign((size_t)cfg.n_kv*1024*cfg.head_dim, 0.f);
+        // Grow-on-demand: capacity is a hard cap (pos >= cap aborts at
+        // append), not a pre-allocation. At cap=262144 a full eager assign
+        // would be ~1GB/layer FP32 on the 27B (16 full layers); reserve()
+        // avoids that while keeping appends amortized-O(1).
+        ly.kcache.clear();
+        ly.vcache.clear();
+        ly.kcache.reserve((size_t)cfg.n_kv*(size_t)kv_capacity()*cfg.head_dim);
+        ly.vcache.reserve((size_t)cfg.n_kv*(size_t)kv_capacity()*cfg.head_dim);
         // Groupwise-INT8 KV mirror (INTFER_INT8_KV=1): flag the layer;
         // the i8 buffers + scales grow lazily on first append.
         // NOTE: L0 is a linear-attn layer (is_full=0), so anchor the
@@ -4397,9 +4535,15 @@ int main(int argc, char** argv){
         // index, via the empty-i8-mirror test below in kv_i8_append...
         // (simpler: log here when this is the first full layer seen).
         ly.kv_int8 = kv_int8_enabled();
-        if(ly.kv_int8){
+        // Per-token G64 Q8 KV (INTFER_KV_Q8=1) + switchable Hadamard
+        // (INTFER_KV_HAD=1). Buffers grow lazily on first kv_q8_append.
+        ly.kv_q8 = kv_q8_enabled();
+        ly.kv_had = ly.kv_q8 && kv_had_enabled();
+        if(ly.kv_int8 || ly.kv_q8){
           static bool logged = false;
-          if(!logged){ std::fprintf(stderr, "[intfer] INT8 KV cache on (group %d)\n", kv_group_size()); logged = true; }
+          if(!logged){ std::fprintf(stderr, "[intfer] INT8 KV cache on (group %d, cap %d)%s%s\n",
+                       kv_group_size(), kv_capacity(),
+                       ly.kv_q8 ? " Q8-G64" : "", ly.kv_had ? "+HAD" : ""); logged = true; }
         }
       } else {
         ly.ssm_state.assign(cfg.sdim, 0.f);
