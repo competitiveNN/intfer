@@ -1179,10 +1179,19 @@ struct Layer {
   bool kv_int8 = false;
 };
 
-// Groupwise-INT8 KV helpers. Group = 32 consecutive positions, one FP32
-// scale per (kv_head, group) over group*head_dim elements (symmetric
-// max/127, matching the flash-attention demo's quantize_int8_kv).
-static const int KV_I8_GROUP = 32;
+// Groupwise-INT8 KV helpers. One FP32 scale per (kv_head, group) over
+// group*head_dim elements (symmetric max/127, matching the
+// flash-attention demo's quantize_int8_kv). Group size via
+// INTFER_INT8_KV_G (default 32, kernel-compatible); smaller groups
+// (down to 1 = per-token) trade scale memory for accuracy.
+static inline int kv_group_size(){
+  static const int g = []{
+    const char* e = std::getenv("INTFER_INT8_KV_G");
+    int v = e ? std::atoi(e) : 32;
+    return (v >= 1 && v <= 1024) ? v : 32;
+  }();
+  return g;
+}
 static inline bool kv_int8_enabled(){
   static const bool on = (std::getenv("INTFER_INT8_KV") != nullptr);
   return on;
@@ -1190,6 +1199,9 @@ static inline bool kv_int8_enabled(){
 // Requantize the group containing `pos` for all KV heads from the FP32
 // cache (call after appending token `pos`). Retroactively updates earlier
 // tokens in the same group — inherent to the per-group-scale format.
+// Scale layout is (kvh, group) with a FIXED stride smax = 1024/G+1
+// (kcache capacity is 1024 positions): ng must not vary over time, or
+// earlier groups' indices shift when a new group starts.
 static void kv_i8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
   std::vector<int8_t>& ci = is_k ? ly.kcache_i8 : ly.vcache_i8;
   std::vector<float>& sc = is_k ? ly.kscale : ly.vscale;
@@ -1197,10 +1209,11 @@ static void kv_i8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
   size_t kvrow = (size_t)n_kv * hd;
   size_t need_i8 = (size_t)(pos + 1) * kvrow;
   if(ci.size() < need_i8) ci.resize(need_i8, 0);
-  int ng = pos / KV_I8_GROUP + 1;
-  if((int)sc.size() < n_kv * ng) sc.resize((size_t)n_kv * ng, 1.f);
-  int g = pos / KV_I8_GROUP;
-  int t0 = g * KV_I8_GROUP, t1 = pos;
+  int GS = kv_group_size();
+  int smax = 1024 / GS + 1;
+  if((int)sc.size() < n_kv * smax) sc.resize((size_t)n_kv * smax, 1.f);
+  int g = pos / GS;
+  int t0 = g * GS, t1 = pos;
   for(int kvh = 0; kvh < n_kv; kvh++){
     float mx = 0;
     for(int t = t0; t <= t1; t++)
@@ -1209,7 +1222,7 @@ static void kv_i8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
         if(v > mx) mx = v;
       }
     float s = (mx > 0) ? mx / 127.f : 1.f;
-    sc[(size_t)kvh * ng + g] = s;
+    sc[(size_t)kvh * smax + g] = s;
     float inv = 1.f / s;
     for(int t = t0; t <= t1; t++)
       for(int d = 0; d < hd; d++){
@@ -1227,14 +1240,16 @@ static void kv_i8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
 // live simultaneously.
 static inline const float* kv_row_ptr(const Layer& ly, bool is_k, int t,
                                       int kvh, int n_kv, int hd){
-  if(!ly.kv_int8) return is_k ? &ly.kcache[((size_t)t * n_kv + kvh) * hd]
-                              : &ly.vcache[((size_t)t * n_kv + kvh) * hd];
+  if(!ly.kv_int8)
+    return is_k ? &ly.kcache[((size_t)t * n_kv + kvh) * hd]
+                : &ly.vcache[((size_t)t * n_kv + kvh) * hd];
   static thread_local std::vector<float> tmp_k, tmp_v;
   std::vector<float>& tmp = is_k ? tmp_k : tmp_v;
   const std::vector<int8_t>& ci = is_k ? ly.kcache_i8 : ly.vcache_i8;
   const std::vector<float>& sc = is_k ? ly.kscale : ly.vscale;
-  int ng = t / KV_I8_GROUP + 1;
-  float s = sc[((size_t)kvh * ng + (size_t)(t / KV_I8_GROUP))];
+  int GS = kv_group_size();
+  int smax = 1024 / GS + 1;
+  float s = sc[((size_t)kvh * smax + (size_t)(t / GS))];
   if((int)tmp.size() < hd) tmp.resize(hd);
   const int8_t* row = &ci[((size_t)t * n_kv + kvh) * hd];
   for(int d = 0; d < hd; d++) tmp[d] = (float)row[d] * s;
@@ -4377,8 +4392,15 @@ int main(int argc, char** argv){
         ly.vcache.assign((size_t)cfg.n_kv*1024*cfg.head_dim, 0.f);
         // Groupwise-INT8 KV mirror (INTFER_INT8_KV=1): flag the layer;
         // the i8 buffers + scales grow lazily on first append.
+        // NOTE: L0 is a linear-attn layer (is_full=0), so anchor the
+        // one-time log on the first full-attention layer, whatever its
+        // index, via the empty-i8-mirror test below in kv_i8_append...
+        // (simpler: log here when this is the first full layer seen).
         ly.kv_int8 = kv_int8_enabled();
-        if(ly.kv_int8 && L == 0) std::fprintf(stderr, "[intfer] INT8 KV cache on (group %d)\n", KV_I8_GROUP);
+        if(ly.kv_int8){
+          static bool logged = false;
+          if(!logged){ std::fprintf(stderr, "[intfer] INT8 KV cache on (group %d)\n", kv_group_size()); logged = true; }
+        }
       } else {
         ly.ssm_state.assign(cfg.sdim, 0.f);
         ly.conv_state.assign((size_t)cfg.conv_dim*(cfg.conv_k-1), 0.f);

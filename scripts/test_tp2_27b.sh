@@ -13,6 +13,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 MODEL="${INTFER_27B_SC:-/var/home/fra/data/models/intfer/Qwen3.8-27B-sc.intifer}"
+# Fall back to the merged chunk artifact when the -sc file is absent
+# (same 27B INT2 payload; INTFER_27B_SC still overrides).
+if [ ! -f "$MODEL" ]; then
+  MODEL="/var/home/fra/data/models/intfer/Qwen3.8-27B-int2.intifer"
+fi
 BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/intfer_cli/intfer_cli"
 N=4
 PROMPT="The capital of France is"
