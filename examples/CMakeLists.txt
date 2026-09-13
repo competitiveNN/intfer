@@ -3,6 +3,7 @@
 # via their own targets when INTFER_BUILD_QUANT=ON.
 add_subdirectory(quant_merge)
 add_subdirectory(intfer_fidelity)
+add_subdirectory(intfer_gguf)
 add_subdirectory(hello_sycl)
 add_subdirectory(flash_attention_demo)
 add_subdirectory(spinquant_test)
