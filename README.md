@@ -8,9 +8,9 @@ The project is being built in three stages:
 
 | Stage | Goal | Status |
 | :--- | :--- | :--- |
-| **1** | INT2/low-bit quantization pipeline (SpinQuant → DASH-Q → RCO) | Core implemented (experimental) |
-| **2** | Native SYCL/L0 execution engine (quant GEMM, FlashAttention, tensor-parallel) | Engine scaffolding + kernels implemented |
-| **3** | High-throughput serving (continuous batching, spec decoding) | Planned |
+| **1** | INT2/low-bit quantization pipeline (SpinQuant → DASH-Q → RCO) | Implemented; 0.8B + 27B quantized, `.intfer` + `.gguf` artifacts |
+| **2** | Native SYCL/L0 execution engine (quant GEMM, FlashAttention, tensor-parallel) | Implemented (TP=2 sharded decode on 2× B580; DPAS INT8/W4A8/W2A8; INT8-KV opt-in) |
+| **3** | High-throughput serving (continuous batching, spec decoding) | Implemented (`--serve` server, iteration scheduler, chunked prefill, n-gram speculative decode, serve bench) |
 
 ---
 
@@ -58,9 +58,10 @@ and ninfer analysis are in [`docs/ninfer-quantization-brief.md`](docs/ninfer-qua
 | Common | `src/common/logger.cpp` | Logging / error utilities |
 
 The GEMM kernel issues Intel **XMX** systolic-array `DPAS` instructions directly,
-mirroring ninfer's use of `mma.sync`/`wmma` on NVIDIA. SYCL command graphs
-(`sycl::ext::oneapi::experimental::command_graph`) are the planned replacement for
-CUDA graphs to keep decode-loop launch overhead near zero.
+mirroring ninfer's use of `mma.sync`/`wmma` on NVIDIA. SYCL command graphs were
+evaluated as the CUDA-graph equivalent and rejected: executable-graph launch
+measured *slower* than plain submit on B580 (19.7µs vs 11.9µs), so the lever
+for decode-loop overhead is launch-count reduction (fusion), not graphs.
 
 ---
 
@@ -130,18 +131,23 @@ scripts/             build.sh / run.sh / run_bin.sh
 - Stage-1 quantization core: SpinQuant preprocessing, DASH-Q candidate generation
   with diagonal-Hessian weighting, RCO bit-budget search, and pipeline orchestration
   with native-SYCL / GGUF serialization (`INTFER_BUILD_QUANT=ON`).
-- Stage-2 engine skeleton: device discovery across 2× B580, Level-Zero layer,
-  quantized GEMM with an ESIMD DPAS (XMX) kernel, and a fused FlashAttention kernel.
+- Stage-2 engine: device discovery across 2× B580, Level-Zero layer,
+  quantized GEMM with an ESIMD DPAS (XMX) kernel (INT8 + W4A8/W2A8 via
+  repack), fused FlashAttention kernel, TP=2 sharded decode, and an
+  opt-in groupwise-INT8 KV cache (`INTFER_INT8_KV=1`, oracle-identical).
+- Stage-3 serving: `--serve` JSON-lines server with continuous batching
+  (iteration scheduler, mixed-batch M-row forward, joint prefill+decode,
+  chunked prefill, round-robin fairness), free n-gram speculative decode
+  (`INTFER_SPEC_K=N`), and gates: `scripts/test_cpu_parity.sh`
+  (oracle + split==joint + rotcheck + INT8-KV), `scripts/test_tp2_27b.sh`,
+  `scripts/bench_serve.sh` (req/s, tok/s, latency).
 
 **In progress / next**
-- Wire the quantized GEMM + FlashAttention kernels into an end-to-end decode loop.
-- Tensor-parallel weight sharding across the two GPUs (Stage 2 mandate).
-- SYCL command-graph capture for the generation loop (CUDA-graph equivalent).
-- Groupwise-INT8 KV-cache management.
-
-**Planned (Stage 3)**
-- Continuous batching for concurrent requests.
-- Multi-token prediction / speculative decoding.
-- Throughput-focused serving path.
+- GPU-side attention (today attention runs host-side in both backends;
+  only the 7 linears ride the SYCL engine) and INT8-KV consumption by
+  the SYCL FlashAttention kernel.
+- Launch-count reduction (fusion) for the decode loop — SYCL command
+  graphs were measured *slower* than plain submit on B580 (19.7µs vs
+  11.9µs) and the scaffold was removed; see `REMAINING_TODOS.md`.
 
 See `AGENTS.md` for the full staged task breakdown.

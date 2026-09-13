@@ -101,6 +101,9 @@ Measured (README/`docs/performance.md`), Qwen3.6-27B, INT8-g64 KV + CUDA Graphs 
 3. **Async bulk staging of codes AND scales** is required to feed XMX/DPAS without stalling — layout/swizzle must match the matrix-engine block shape.
 4. **Fuse GEMM with elementwise/attention** to keep data on-chip.
 5. **Capture the decode graph** (SYCL command graph) to kill host overhead.
+   — DISPROVEN 2026-09-13: executable-graph launch 19.7µs vs plain submit
+   11.9µs on B580; scaffold removed, lever is fusion (launch-count), not
+   graphs. See `REMAINING_TODOS.md` TODO 2.
 6. **Speculative decoding (MTP)** is the dominant *throughput* multiplier at concurrency and is hardware-agnostic.
 7. **Mixed precision**: keep a BF16/FP16 escape hatch for outlier-sensitive tensors (early attention, gating) — ninfer does exactly this.
 
