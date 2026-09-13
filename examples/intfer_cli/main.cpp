@@ -4429,16 +4429,25 @@ int main(int argc, char** argv){
     for(int L=0; L<cfg.layers; L++) is_full[(size_t)L] = req.layers[(size_t)L].is_full ? 1 : 0;
     build_layer_names(T, is_full);
   }
-  // INTFER_CHECK_ROT=1: cold==warm rotation invariant. For every layer and
-  // every tensor slot used by the forward, rot_for() before any GEMM (cold:
-  // cache_R empty, IR-index/per-slot fallback) must return the same pointer
-  // as after ensure_cached populates the cache (warm). This is the unit
-  // check behind the 3eb4e34 fix — the old first-hit fallback violated it
-  // for LA/o/down slots. Runs on the CPU backend; GPU rot_for is stateless
-  // (per-tensor engine lookup). Failures print layer/slot and exit 2.
-  if(auto* cpu = dynamic_cast<CpuBackend*>(backend.get())){
-    static const bool check_rot = (std::getenv("INTFER_CHECK_ROT") != nullptr);
-    if(check_rot && !cpu->check_cold_warm()){
+  // INTFER_CHECK_ROT=1: cold==warm rotation invariant (fail-safe). For every
+  // layer and every tensor slot used by the forward, rot_for() before any
+  // GEMM (cold: cache_R empty, IR-index/per-slot fallback) must return the
+  // same pointer as after ensure_cached populates the cache (warm). This is
+  // the unit check behind the 3eb4e34 fix — the old first-hit fallback
+  // violated it for LA/o/down slots. Runs on the CPU backend; GPU rot_for
+  // is stateless (per-tensor engine lookup), so requesting the check on a
+  // non-CPU backend is a fatal error (rc=2), never a silent skip — a skip
+  // would let regressions through looking green. Failures print layer/slot
+  // and exit 2.
+  if(std::getenv("INTFER_CHECK_ROT") != nullptr){
+    auto* cpu = dynamic_cast<CpuBackend*>(backend.get());
+    if(!cpu){
+      std::fprintf(stderr, "[intfer] FATAL: INTFER_CHECK_ROT=1 requires the CPU backend, have '%s'\n",
+                   backend ? backend->name() : "<none>");
+      munmap_blob(mblob);
+      return 2;
+    }
+    if(!cpu->check_cold_warm()){
       std::fprintf(stderr, "[intfer] FATAL: cold==warm rotation invariant violated\n");
       munmap_blob(mblob);
       return 2;
