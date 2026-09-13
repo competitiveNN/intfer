@@ -1181,6 +1181,7 @@ struct Request {
   std::vector<int> generated;
   int token = -1;   // last produced token (= next forward input)
   int pos = 0;      // absolute position `token` sits at (next forward pos)
+  int fill = 0;     // serve: prompt tokens consumed by chunked prefill
   int max_new = 0;
   bool finished = false;
   bool done_emitted = false; // server: {"done"} already emitted for id
@@ -3389,17 +3390,33 @@ static std::string detokenize_one(int id, const std::string& detok_py,
 //        {"error":"..."} on malformed input lines (server keeps running).
 // Mechanics: poll stdin with select() (zero timeout: never stall decode
 // waiting for input); admit pending lines FIFO up to INTFER_SERVE_MAX live
-// (default 8: each Request holds full KV/SSM state, ~hundreds of MB on 27B);
-// prefill each admission immediately (interleaved with live decodes), then
-// run one sched_iteration over all live. EOF drains live to completion.
+// (default computed from per-request state bytes under an 8GB host
+// budget); each iteration fills ONE prompt chunk (INTFER_PREFILL_CHUNK_M,
+// default 8) for the prefill-queue head, then runs one sched_iteration
+// over all live decodes. EOF drains the queue + live to completion.
 // Returns 0 on clean EOF drain (munmap left to the caller).
+// Admission queue (Stage 3.3+ improvement B): tokenized but not yet
+// prefilled. Each scheduler iteration runs ONE prompt chunk (default 8
+// tokens) for the queue head, then the normal decode iteration over live
+// requests — so a long prefill never stalls live decodes, and arrivals
+// overlap with ongoing generation (true continuous batching: prefill and
+// decode share every iteration). Chunk-at-offset is the exact tested
+// sched_prefill mechanism; per-request KV/SSM state + absolute positions
+// make interleaving output-identical to admit-time prefill.
 static int run_serve(SchedCtx& c,
                      const std::function<void(Request&)>& wire,
                      int dflt_max_new, uint32_t seed,
                      float dflt_temp, int dflt_top_k, float dflt_top_p){
-  std::vector<std::unique_ptr<Request>> pool; // all admitted (live + done)
-  std::vector<Request*> live;                 // points into pool (unfinished)
+  std::vector<std::unique_ptr<Request>> pool; // all admitted (owning)
+  std::vector<Request*> live;                 // decoding (into pool)
+  std::deque<Request*> prefill_q;             // admitted, filling (into pool)
   std::deque<std::string> pending;            // FIFO of unadmitted lines
+  int chunk_M = 8;
+  if(const char* me = std::getenv("INTFER_PREFILL_CHUNK_M")){
+    int v = std::atoi(me); if(v >= 1 && v <= 1024) chunk_M = v;
+  }
+  std::vector<float> Hpre; // reused prefill-chunk staging (shared, one chunk
+                           // in flight per iteration)
   // Live cap: VRAM-aware default from per-request state bytes (KV caches +
   // scratch arena + gscores, all host-side FP32; GPU weights are shared).
   // Budget 8GB host for request state; INTFER_SERVE_MAX still overrides.
@@ -3448,9 +3465,9 @@ static int run_serve(SchedCtx& c,
                 q.id, tok, json_escape(piece).c_str());
     std::fflush(stdout);
   };
-  // Admit one parsed request: tokenize, wire state, prefill immediately
-  // (B replaces this with queued chunked prefill; until then the prefill
-  // runs here, interleaved between decode iterations).
+  // Admit one parsed request: tokenize + wire, then queue for chunked
+  // prefill (B: no forward pass here — the loop below fills one chunk per
+  // iteration, so decodes keep flowing while this prompt fills).
   auto admit = [&](const std::string& prompt, const ServeOpts& o){
     auto rq = std::make_unique<Request>();
     wire(*rq);
@@ -3463,16 +3480,14 @@ static int run_serve(SchedCtx& c,
     q.max_new = o.max_new;
     q.temperature = o.temperature; q.top_k = o.top_k; q.top_p = o.top_p;
     q.rng = std::mt19937(o.has_seed ? o.seed : seed + (uint32_t)q.id);
-    sched_prefill(q, c, no_dump);
-    if(c.print_ids)
-      std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", q.id, q.token);
-    std::fprintf(stderr, "[intfer] serve admit id=%ld prompt=%zu max_new=%d live=%zu\n",
-                 q.id, q.prompt_ids.size(), q.max_new, live.size()+1);
-    live.push_back(rq.get());
+    q.fill = 0; q.pos = 0;
+    std::fprintf(stderr, "[intfer] serve admit id=%ld prompt=%zu max_new=%d live=%zu pq=%zu\n",
+                 q.id, q.prompt_ids.size(), q.max_new, live.size(), prefill_q.size()+1);
+    prefill_q.push_back(rq.get());
     pool.push_back(std::move(rq));
   };
   std::string bufline;
-  while(!eof || !pending.empty() || !live.empty()){
+  while(!eof || !pending.empty() || !prefill_q.empty() || !live.empty()){
     // --- Poll stdin (non-blocking): drain all ready lines into pending.
     if(!eof){
       for(;;){
@@ -3502,6 +3517,31 @@ static int run_serve(SchedCtx& c,
       else if(o.id >= next_id) next_id = o.id + 1;
       admit(prompt, o);
     }
+    // --- One prefill chunk for the queue head (bounded: <= chunk_M
+    // tokens, so live decodes stall at most one chunk per iteration).
+    // A filled request joins live with token/pos set exactly as
+    // sched_prefill would (first generated id + pos=Sr).
+    if(!prefill_q.empty()){
+      Request& q = *prefill_q.front();
+      int Sr = (int)q.prompt_ids.size();
+      int cm = std::min(chunk_M, Sr - q.fill);
+      std::vector<int> toks(q.prompt_ids.begin() + q.fill,
+                            q.prompt_ids.begin() + q.fill + cm);
+      Hpre.assign((size_t)cm * cfg.H, 0.f);
+      StepOut o = prefill_layer_outer(q, toks, q.fill, *c.T, Hpre, c.embed,
+                                      c.final_norm, c.lm_head, c.backend,
+                                      no_dump);
+      q.fill += cm;
+      if(q.fill == Sr){
+        q.generated.push_back(o.best);
+        q.token = q.generated.back();
+        q.pos = Sr;
+        if(c.print_ids)
+          std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", q.id, q.token);
+        live.push_back(&q);
+        prefill_q.pop_front();
+      }
+    }
     // --- One decode iteration over all live (dynamic leave inside).
     if(!live.empty()){
       int M = sched_iteration(live, c, Hb, emit_stream, step_i++);
@@ -3517,10 +3557,10 @@ static int run_serve(SchedCtx& c,
         if(!qp->finished) still.push_back(qp);
       }
       live.swap(still);
-      if(M == 0 && eof && pending.empty()) break;
-    } else if(eof && pending.empty()){
+      if(M == 0 && eof && pending.empty() && prefill_q.empty()) break;
+    } else if(eof && pending.empty() && prefill_q.empty()){
       break;
-    } else if(live.empty() && pending.empty() && !eof){
+    } else if(live.empty() && prefill_q.empty() && pending.empty() && !eof){
       // Nothing to do: block for the next line (avoids a hot spin when
       // idle with the pipe open but no data).
       if(!std::getline(std::cin, bufline)){ break; }
