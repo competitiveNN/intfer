@@ -1168,7 +1168,78 @@ struct Layer {
   const float *in_qkv,*in_z,*in_b,*in_a,*conv_w,*A_log,*dt_bias,*ssm_norm_w,*ssm_out;
   std::vector<float> kcache, vcache;
   std::vector<float> ssm_state, conv_state;
+  // Groupwise-INT8 KV mirror (opt-in via INTFER_INT8_KV=1; kernel-compatible
+  // layout: scales are FP32 per (kv_head, 32-token group), token t uses
+  // group t/32 — same contract as flash_attention_forward_int8_kv).
+  // The FP32 kcache/vcache stay authoritative when the knob is off (zero
+  // overhead: one branch per row); when on, appends quantize into the
+  // mirror and reads dequantize on the fly.
+  std::vector<int8_t> kcache_i8, vcache_i8;
+  std::vector<float> kscale, vscale;
+  bool kv_int8 = false;
 };
+
+// Groupwise-INT8 KV helpers. Group = 32 consecutive positions, one FP32
+// scale per (kv_head, group) over group*head_dim elements (symmetric
+// max/127, matching the flash-attention demo's quantize_int8_kv).
+static const int KV_I8_GROUP = 32;
+static inline bool kv_int8_enabled(){
+  static const bool on = (std::getenv("INTFER_INT8_KV") != nullptr);
+  return on;
+}
+// Requantize the group containing `pos` for all KV heads from the FP32
+// cache (call after appending token `pos`). Retroactively updates earlier
+// tokens in the same group — inherent to the per-group-scale format.
+static void kv_i8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
+  std::vector<int8_t>& ci = is_k ? ly.kcache_i8 : ly.vcache_i8;
+  std::vector<float>& sc = is_k ? ly.kscale : ly.vscale;
+  const std::vector<float>& cf = is_k ? ly.kcache : ly.vcache;
+  size_t kvrow = (size_t)n_kv * hd;
+  size_t need_i8 = (size_t)(pos + 1) * kvrow;
+  if(ci.size() < need_i8) ci.resize(need_i8, 0);
+  int ng = pos / KV_I8_GROUP + 1;
+  if((int)sc.size() < n_kv * ng) sc.resize((size_t)n_kv * ng, 1.f);
+  int g = pos / KV_I8_GROUP;
+  int t0 = g * KV_I8_GROUP, t1 = pos;
+  for(int kvh = 0; kvh < n_kv; kvh++){
+    float mx = 0;
+    for(int t = t0; t <= t1; t++)
+      for(int d = 0; d < hd; d++){
+        float v = std::fabs(cf[((size_t)t * n_kv + kvh) * hd + d]);
+        if(v > mx) mx = v;
+      }
+    float s = (mx > 0) ? mx / 127.f : 1.f;
+    sc[(size_t)kvh * ng + g] = s;
+    float inv = 1.f / s;
+    for(int t = t0; t <= t1; t++)
+      for(int d = 0; d < hd; d++){
+        float v = cf[((size_t)t * n_kv + kvh) * hd + d] * inv;
+        int q = (int)(v >= 0 ? v + 0.5f : v - 0.5f);
+        if(q > 127) q = 127; else if(q < -127) q = -127;
+        ci[((size_t)t * n_kv + kvh) * hd + d] = (int8_t)q;
+      }
+  }
+}
+// Row pointer for (t, kvh): direct FP32 pointer when INT8 is off, else
+// dequantize into a thread-local scratch (K and V have separate buffers)
+// and return it. Safe: every read site consumes the row (dot/accumulate)
+// before the next kv_row_ptr call, so no two returned pointers are ever
+// live simultaneously.
+static inline const float* kv_row_ptr(const Layer& ly, bool is_k, int t,
+                                      int kvh, int n_kv, int hd){
+  if(!ly.kv_int8) return is_k ? &ly.kcache[((size_t)t * n_kv + kvh) * hd]
+                              : &ly.vcache[((size_t)t * n_kv + kvh) * hd];
+  static thread_local std::vector<float> tmp_k, tmp_v;
+  std::vector<float>& tmp = is_k ? tmp_k : tmp_v;
+  const std::vector<int8_t>& ci = is_k ? ly.kcache_i8 : ly.vcache_i8;
+  const std::vector<float>& sc = is_k ? ly.kscale : ly.vscale;
+  int ng = t / KV_I8_GROUP + 1;
+  float s = sc[((size_t)kvh * ng + (size_t)(t / KV_I8_GROUP))];
+  if((int)tmp.size() < hd) tmp.resize(hd);
+  const int8_t* row = &ci[((size_t)t * n_kv + kvh) * hd];
+  for(int d = 0; d < hd; d++) tmp[d] = (float)row[d] * s;
+  return tmp.data();
+}
 
 // ============================================================================
 // Step scratch arena (TODO 4a): reusable per-token intermediates.
@@ -1403,6 +1474,8 @@ static StepOut step(Request& req, int token, int pos,
         if(have_v >= need) memcpy(&ly.vcache[base], v.data(), need*sizeof(float));
         else { memcpy(&ly.vcache[base], v.data(), have_v*sizeof(float));
                memset(&ly.vcache[base]+have_v, 0, (need-have_v)*sizeof(float)); }
+        if(ly.kv_int8){ kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, true);
+                        kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, false); }
       }
       // Attention compute, tiled by KV group (4d). Heads sharing a KV
       // head reuse the same K/V cache rows: the old per-head loop loaded
@@ -1421,7 +1494,7 @@ static StepOut step(Request& req, int token, int pos,
         // Score pass: for each t load kh once, dot against every head.
         float mx[64]; for(int j=0;j<G;j++) mx[j]=-1e30f;
         for(int t=0;t<=pos;t++){
-          const float* kh=&ly.kcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+          const float* kh=kv_row_ptr(ly,true,t,kvh,cfg.n_kv,cfg.head_dim);
           for(int j=0;j<G;j++){
             int hh=kvh*G+j;
             const float* qh=&qpart[hh*cfg.head_dim];
@@ -1439,7 +1512,7 @@ static StepOut step(Request& req, int token, int pos,
           float* oh=&attn[(kvh*G+j)*cfg.head_dim]; for(int d=0;d<cfg.head_dim;d++) oh[d]=0;
         }
         for(int t=0;t<=pos;t++){
-          const float* vh=&ly.vcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+          const float* vh=kv_row_ptr(ly,false,t,kvh,cfg.n_kv,cfg.head_dim);
           for(int j=0;j<G;j++){
             float st=gs[j*(pos+1)+t];
             float* oh=&attn[(kvh*G+j)*cfg.head_dim];
@@ -1832,13 +1905,15 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         size_t need = (size_t)cfg.n_kv*cfg.head_dim;
         if(k.size() >= need) memcpy(&ly.kcache[base], k.data(), need*sizeof(float));
         if(v.size() >= need) memcpy(&ly.vcache[base], v.data(), need*sizeof(float));
+        if(ly.kv_int8){ kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, true);
+                        kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, false); }
         std::vector<float>& attn = req.scratch.attn;
         const int G = cfg.n_heads / cfg.n_kv;
         float* gs = req.scratch.gscores_for(G, pos);
         for(int kvh=0; kvh<cfg.n_kv; kvh++){
           float mx[64]; for(int j=0;j<G;j++) mx[j]=-1e30f;
           for(int t=0;t<=pos;t++){
-            const float* kh=&ly.kcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+            const float* kh=kv_row_ptr(ly,true,t,kvh,cfg.n_kv,cfg.head_dim);
             for(int j=0;j<G;j++){
               int hh=kvh*G+j;
               const float* qh=&qpart[hh*cfg.head_dim];
@@ -1855,7 +1930,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
             float* oh=&attn[(kvh*G+j)*cfg.head_dim]; for(int d=0;d<cfg.head_dim;d++) oh[d]=0;
           }
           for(int t=0;t<=pos;t++){
-            const float* vh=&ly.vcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+            const float* vh=kv_row_ptr(ly,false,t,kvh,cfg.n_kv,cfg.head_dim);
             for(int j=0;j<G;j++){
               float st=gs[j*(pos+1)+t];
               float* oh=&attn[(kvh*G+j)*cfg.head_dim];
@@ -2092,6 +2167,8 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         int base = pos*(cfg.n_kv*cfg.head_dim);
         memcpy(&ly.kcache[base], kr, kvrows*sizeof(float));
         memcpy(&ly.vcache[base], vr, kvrows*sizeof(float));
+        if(ly.kv_int8){ kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, true);
+                        kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, false); }
       }
       // Per-row causal attention (same grouped tiling as scalar path).
       static thread_local std::vector<float> c_attn;
@@ -2110,7 +2187,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
           for(int kvh=0; kvh<cfg.n_kv; kvh++){
             float mx[64]; for(int j=0;j<G;j++) mx[j]=-1e30f;
             for(int t=0;t<=pos;t++){
-              const float* kh=&ly.kcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+              const float* kh=kv_row_ptr(ly,true,t,kvh,cfg.n_kv,cfg.head_dim);
               for(int j=0;j<G;j++){
                 int hh=kvh*G+j;
                 const float* qh=&qpr[hh*cfg.head_dim];
@@ -2127,7 +2204,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
               float* oh=&attn[(kvh*G+j)*cfg.head_dim]; for(int d=0;d<cfg.head_dim;d++) oh[d]=0;
             }
             for(int t=0;t<=pos;t++){
-              const float* vh=&ly.vcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+              const float* vh=kv_row_ptr(ly,false,t,kvh,cfg.n_kv,cfg.head_dim);
               for(int j=0;j<G;j++){
                 float st=gs[j*(pos+1)+t];
                 float* oh=&attn[(kvh*G+j)*cfg.head_dim];
@@ -2556,6 +2633,8 @@ static std::vector<StepOut> step_batch(
         int base = pos*(cfg.n_kv*cfg.head_dim);
         memcpy(&ly.kcache[base], kr, kvrows*sizeof(float));
         memcpy(&ly.vcache[base], vr, kvrows*sizeof(float));
+        if(ly.kv_int8){ kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, true);
+                        kv_i8_append(ly, cfg.n_kv, cfg.head_dim, pos, false); }
       }
       static thread_local std::vector<float> b_attn;
       need_rows(b_attn, qrows);
@@ -2572,7 +2651,7 @@ static std::vector<StepOut> step_batch(
           for(int kvh=0; kvh<cfg.n_kv; kvh++){
             float mx[64]; for(int j=0;j<G;j++) mx[j]=-1e30f;
             for(int t=0;t<=pos;t++){
-              const float* kh=&ly.kcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+              const float* kh=kv_row_ptr(ly,true,t,kvh,cfg.n_kv,cfg.head_dim);
               for(int j=0;j<G;j++){
                 int hh=kvh*G+j;
                 const float* qh=&qpr[hh*cfg.head_dim];
@@ -2589,7 +2668,7 @@ static std::vector<StepOut> step_batch(
               float* oh=&attn[(kvh*G+j)*cfg.head_dim]; for(int d=0;d<cfg.head_dim;d++) oh[d]=0;
             }
             for(int t=0;t<=pos;t++){
-              const float* vh=&ly.vcache[(t*cfg.n_kv+kvh)*cfg.head_dim];
+              const float* vh=kv_row_ptr(ly,false,t,kvh,cfg.n_kv,cfg.head_dim);
               for(int j=0;j<G;j++){
                 float st=gs[j*(pos+1)+t];
                 float* oh=&attn[(kvh*G+j)*cfg.head_dim];
@@ -4296,6 +4375,10 @@ int main(int argc, char** argv){
         ly.k_norm_w = get(p("self_attn.k_norm.weight")).data();
         ly.kcache.assign((size_t)cfg.n_kv*1024*cfg.head_dim, 0.f);
         ly.vcache.assign((size_t)cfg.n_kv*1024*cfg.head_dim, 0.f);
+        // Groupwise-INT8 KV mirror (INTFER_INT8_KV=1): flag the layer;
+        // the i8 buffers + scales grow lazily on first append.
+        ly.kv_int8 = kv_int8_enabled();
+        if(ly.kv_int8 && L == 0) std::fprintf(stderr, "[intfer] INT8 KV cache on (group %d)\n", KV_I8_GROUP);
       } else {
         ly.ssm_state.assign(cfg.sdim, 0.f);
         ly.conv_state.assign((size_t)cfg.conv_dim*(cfg.conv_k-1), 0.f);

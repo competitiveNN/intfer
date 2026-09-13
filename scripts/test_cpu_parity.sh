@@ -93,4 +93,17 @@ GOT="$(printf '%s\n' "{\"prompt\":\"$PROMPT\",\"max_new\":3}" \
 echo "serve decode: '$GOT' (expect '13 198 760')"
 [ "$GOT" = "13 198 760" ] || fail "serve decode '$GOT' != '13 198 760'"
 
+# --- 5. Groupwise-INT8 KV cache (INTFER_INT8_KV=1) is oracle-identical ---
+# The INT8 mirror (per kv_head x 32-token group FP32 scale, kernel-compatible
+# layout) must not change a single token: same prefill + decode as FP32.
+IOUT="$(INTFER_INT8_KV=1 "$BIN" --no-gpu -m "$MODEL" -p "$PROMPT" -n 4 --no-stream --ids \
+  --tokenizer-py "$SCRIPT_DIR/bpe_tokenize.py" \
+  --detok-py "$SCRIPT_DIR/bpe_detokenize.py" 2>&1 >/dev/null \
+  | grep -a -oE "decode step [0-9]+: token=[0-9]+" | sed -E 's/.*token=//')"
+IPREFILL="$(echo "$IOUT" | head -1)"
+IDECODE="$(echo "$IOUT" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+echo "INT8-KV: prefill=$IPREFILL (expect 11751) decode='$IDECODE' (expect '13 198 760')"
+[ "$IPREFILL" = "11751" ] || fail "INT8-KV prefill $IPREFILL != 11751"
+[ "$IDECODE" = "13 198 760" ] || fail "INT8-KV decode '$IDECODE' != '13 198 760'"
+
 if [ "$PASS" = 1 ]; then echo "CPU-PARITY TEST: PASS"; else echo "CPU-PARITY TEST: FAIL" >&2; exit 1; fi
