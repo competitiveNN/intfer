@@ -1160,6 +1160,12 @@ struct StepScratch {
     sized = true;
   }
   // Attention scores scratch: grows monotonically with pos (amortized ~zero).
+  // NOTE: shared across rows in step_batch (all rows use items[0]'s arena
+  // via rar.scratch) but NOT across row kinds within one forward: rows are
+  // processed strictly in order and each row's scores are fully consumed
+  // (softmax + V-weighted sum + copy to b_attn) before the next row's
+  // gscores_for call. Safe today; revisit if rows are ever processed
+  // out of order or concurrently.
   float* gscores_for(int gh, int pos){
     if((int)gscores.size() < gh*(pos+1)) gscores.assign((size_t)gh*(pos+1), 0.f);
     return gscores.data();
@@ -1195,8 +1201,10 @@ struct Request {
 
 // One live sequence's contribution to a scheduler iteration: exactly one
 // forward row (its next token at its own absolute position, against its
-// own KV/SSM state).
-struct BatchItem { Request* req; int token; int pos; };
+// own KV/SSM state). A decode row feeds the request's last produced token;
+// a prefill row feeds prompt_ids[pos] (token is resolved from the prompt at
+// forward time, since the prefill token was never "produced").
+struct BatchItem { Request* req; int token; int pos; bool prefill = false; };
 
 // ============================================================================
 // Forward step
@@ -2365,6 +2373,11 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
 // up to the known FP16-act batch rounding (bench-gated 2.4e-4 max diff
 // on gate_proj); the oracle gate is the end-to-end arbiter. Returns one
 // StepOut per row (every row is final-normed + lm_head-scored).
+// Row kinds: a decode row (prefill=false) carries its input token in
+// `token`; a prefill row (prefill=true) resolves its input from
+// req->prompt_ids[pos] at forward time. Both kinds advance the request's
+// own KV/SSM state at their own absolute position, so prefill chunks and
+// decodes can share one M-row forward (joint iteration mechanic).
 // NOTE: no dump/all_out/row_snaps — dump is write-only debug, and the
 // scheduler scores every row directly (speculative verify keeps using
 // prefill_layer_outer on a single request).
@@ -2381,7 +2394,10 @@ static std::vector<StepOut> step_batch(
   if(M <= 0) return outs;
   outs.resize(M);
   for(int i=0;i<M;i++){
-    const float* row = embed + (size_t)items[(size_t)i].token*Hdim;
+    int tok = items[(size_t)i].prefill
+            ? items[(size_t)i].req->prompt_ids[(size_t)items[(size_t)i].pos]
+            : items[(size_t)i].token;
+    const float* row = embed + (size_t)tok*Hdim;
     memcpy(&H[(size_t)i*Hdim], row, (size_t)Hdim*sizeof(float));
   }
   Request& rar = *items[0].req;
@@ -2553,6 +2569,11 @@ static std::vector<StepOut> step_batch(
         else memcpy(dst, orw, (size_t)Hdim*sizeof(float));
         for(int i=0;i<Hdim;i++) hr[i] += dst[i];
       }
+      // NOTE (aliasing): b_rn2 doubles as o_proj residual staging (above)
+      // and post_ln output (below). The loops are separate, so row m's
+      // staging use completes before row m's post_ln overwrite — safe.
+      for(int m=0; m<M; m++)
+        rmsnorm(&H[(size_t)m*Hdim], ly0.post_ln, &b_rn2[(size_t)m*Hdim], Hdim);
       for(int m=0; m<M; m++)
         rmsnorm(&H[(size_t)m*Hdim], ly0.post_ln, &b_rn2[(size_t)m*Hdim], Hdim);
       const Rotation* Rg = backend->rot_for(ln.gate);
@@ -2694,15 +2715,16 @@ static std::vector<StepOut> step_batch(
       for(int m=0; m<M; m++){
         float* hr = &H[(size_t)m*Hdim];
         float* orw = &c_y[(size_t)m*Hdim];
-        float* tmp = &b_rin_la[(size_t)m*Hdim];
         float* dst = &b_rn2_la[(size_t)m*Hdim];
-        memcpy(tmp, hr, (size_t)Hdim*sizeof(float));
+        // Residual add BEFORE the post_ln overwrite below: rot_left into
+        // dst, add the incoming hr (still pre-add here), write back to hr.
+        // Matches the scalar path (rot_left into h, then h += res). The
+        // post_ln output reuses dst only after hr is final for this row.
         if(Ro_la) rot_left(orw, *Ro_la, dst);
         else memcpy(dst, orw, (size_t)Hdim*sizeof(float));
-        for(int i=0;i<Hdim;i++) hr[i] = dst[i] + tmp[i];
+        for(int i=0;i<Hdim;i++) hr[i] = dst[i] + hr[i];
+        rmsnorm(hr, ly0.post_ln, dst, Hdim);
       }
-      for(int m=0; m<M; m++)
-        rmsnorm(&H[(size_t)m*Hdim], ly0.post_ln, &b_rn2_la[(size_t)m*Hdim], Hdim);
       const Rotation* Rg_la = backend->rot_for(ln.gate);
       for(int m=0; m<M; m++){
         const float* r2 = &b_rn2_la[(size_t)m*Hdim];
@@ -2850,6 +2872,118 @@ static int sched_iteration(std::vector<Request*>& live, SchedCtx& c,
     if((int)q.generated.size() >= q.max_new + 1) q.finished = true;
   }
   return M;
+}
+// One JOINT iteration (Stage 3.3+ improvement C): decode rows for all live
+// requests plus up to `chunk_M` prefill rows for the prefill-queue head,
+// in a SINGLE step_batch forward. Batch layout: [D decode rows | P prefill
+// rows] (outs index back into ridx/pidx). Prefill rows append KV/SSM state
+// at their absolute prompt positions; intermediate rows only advance state
+// (their logits are discarded — only the chunk-final row predicts the next
+// token). A filled request joins live exactly as sched_prefill would set
+// it (first generated id + pos=Sr); decode rows advance/sample/emit as in
+// sched_iteration. Returns decode-row count (0 = nothing decoded, -1 =
+// joint batch declined: caller runs the split path for this iteration).
+// Identity: same per-row op sequence as the split path (one chunk forward
+// + one decode forward), only the GEMM rows are fused — so greedy ids must
+// match the split path exactly (gated).
+static int sched_iteration_joint(std::vector<Request*>& live,
+                                 std::deque<Request*>& prefill_q,
+                                 int chunk_M, SchedCtx& c,
+                                 std::vector<float>& Hb,
+                                 const std::function<void(Request&, size_t, int)>& emit,
+                                 int step_i){
+  std::vector<BatchItem> items; std::vector<size_t> ridx;
+  static const bool trace_joint = (std::getenv("INTFER_TRACE_JOINT") != nullptr);
+  if(trace_joint){
+    std::fprintf(stderr, "[joint] ENTER live=%zu pq=%zu\n", live.size(), prefill_q.size());
+    for(size_t i=0;i<live.size();i++)
+      std::fprintf(stderr, "  live[%zu] id=%ld gen=%zu max=%d fin=%d\n",
+                   i, live[i]->id, live[i]->generated.size(),
+                   live[i]->max_new, (int)live[i]->finished);
+    std::fflush(stderr);
+  }
+  for(size_t i=0; i<live.size(); i++){
+    Request& q = *live[i];
+    if(q.finished) continue;
+    if((int)q.generated.size() >= q.max_new + 1){ q.finished = true; continue; }
+    BatchItem b{&q, q.token, q.pos, false};
+    items.push_back(b);
+    ridx.push_back(i);
+  }
+  int D = (int)items.size();
+  // Prefill rows: up to chunk_M unconsumed prompt tokens of the queue head.
+  // (Head-of-line only: one request fills at a time; round-robin is future
+  // work. The bound keeps the joint forward within one chunk of work.)
+  // Chunk width cap: the M-row batched-GEMM chunk path (INTFER_BATCH_GEMM=1,
+  // M>1) is known-divergent on 27B/GPU (pre-existing: reproduces on the
+  // pristine tree without this change), so joint batches carry at most ONE
+  // prefill row under BATCH_GEMM and the caller falls back to the split
+  // path for wider chunks.
+  // Correctness cap (CPU): step_batch advances recurrent (conv/SSM) state
+  // correctly for multi-row SAME-request batches, but its M-row attention
+  // path is only verified for one row per request (decode batches). Until
+  // the batched full-attention path is fixed for same-request multi-row
+  // chunks, joint batches carry at most ONE prefill row and the caller
+  // falls back to the split path (identical outputs, gated) for wider
+  // chunks. Single-row joint still fuses that prefill token with the live
+  // decode rows (the common case: short prompts + ongoing decodes).
+  Request* pq = prefill_q.empty() ? nullptr : prefill_q.front();
+  static const bool batch_gemm_env = (std::getenv("INTFER_BATCH_GEMM") != nullptr);
+  int P = 0;
+  if(pq){
+    int Sr = (int)pq->prompt_ids.size();
+    P = std::min(chunk_M, Sr - pq->fill);
+    if(P > 1) return -1; // caller runs the split path (same mechanics)
+    for(int k=0; k<P; k++){
+      BatchItem b{pq, -1, pq->fill + k, true};
+      items.push_back(b);
+    }
+  }
+  if(items.empty()) return 0;
+  int M = (int)items.size();
+  Hb.assign((size_t)M * cfg.H, 0.f);
+  if(trace_joint){
+    std::fprintf(stderr, "[joint] M=%d D=%d P=%d rows:", M, D, M-D);
+    for(auto& b : items)
+      std::fprintf(stderr, " (id=%ld,%s,pos=%d)", b.req->id,
+                   b.prefill ? "pre" : "dec", b.pos);
+    std::fprintf(stderr, "\n"); std::fflush(stderr);
+  }
+  std::vector<StepOut> outs = step_batch(items, *c.T, Hb, c.embed, c.final_norm,
+                                         c.lm_head, c.backend);
+  // Decode rows first (row order == live order; separate loop so a filled
+  // prefill request joining live below cannot disturb row indexing).
+  for(int m=0; m<D; m++){
+    Request& q = *items[(size_t)m].req;
+    bool qgreedy = (q.temperature <= 0.f && q.top_k==0 && q.top_p<=0.f);
+    int next = qgreedy ? outs[(size_t)m].best
+                       : sample(outs[(size_t)m].logits, q.top_k, q.top_p,
+                                q.temperature, q.rng);
+    q.generated.push_back(next);
+    q.pos++;
+    emit(q, ridx[(size_t)m], next);
+    q.token = next;
+    if(next == 248044 || next == 248046) q.finished = true;
+    if((int)q.generated.size() >= q.max_new + 1) q.finished = true;
+  }
+  // Prefill rows: state already advanced by the forward; only the
+  // chunk-final row's prediction matters. A filled request joins live.
+  if(pq){
+    int Sr = (int)pq->prompt_ids.size();
+    pq->fill += P;
+    if(pq->fill == Sr){
+      int best = outs[(size_t)(D + P - 1)].best;
+      pq->generated.push_back(best);
+      pq->token = best;
+      pq->pos = Sr;
+      if(c.print_ids)
+        std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", pq->id, pq->token);
+      live.push_back(pq);
+      prefill_q.pop_front();
+    }
+  }
+  (void)step_i;
+  return D;
 }
 // Minimal JSON-string escaper for server lines (prompts/echo only; token
 // pieces go out as ids + BpDecoder text is emission-side decoded).
@@ -3459,6 +3593,11 @@ static int run_serve(SchedCtx& c,
   std::vector<std::vector<float>> no_dump; // server never records
   std::vector<float> Hb;
   int step_i = 0;
+  // Joint prefill+decode forward (improvement C): one step_batch carries
+  // decode rows + the head chunk. INTFER_SPLIT_ITER=1 restores the split
+  // path (one chunk forward + one decode forward) for A/B testing; the
+  // joint path is output-identical by construction (gated).
+  static const bool split_iter = (std::getenv("INTFER_SPLIT_ITER") != nullptr);
   auto emit_stream = [&](Request& q, size_t, int tok){
     std::string piece = detokenize_one(tok, *c.detok_py, *c.tokenizer_json);
     std::printf("{\"id\":%ld,\"token\":%d,\"text\":\"%s\"}\n",
@@ -3517,34 +3656,59 @@ static int run_serve(SchedCtx& c,
       else if(o.id >= next_id) next_id = o.id + 1;
       admit(prompt, o);
     }
-    // --- One prefill chunk for the queue head (bounded: <= chunk_M
-    // tokens, so live decodes stall at most one chunk per iteration).
-    // A filled request joins live with token/pos set exactly as
-    // sched_prefill would (first generated id + pos=Sr).
-    if(!prefill_q.empty()){
-      Request& q = *prefill_q.front();
-      int Sr = (int)q.prompt_ids.size();
-      int cm = std::min(chunk_M, Sr - q.fill);
-      std::vector<int> toks(q.prompt_ids.begin() + q.fill,
-                            q.prompt_ids.begin() + q.fill + cm);
-      Hpre.assign((size_t)cm * cfg.H, 0.f);
-      StepOut o = prefill_layer_outer(q, toks, q.fill, *c.T, Hpre, c.embed,
-                                      c.final_norm, c.lm_head, c.backend,
-                                      no_dump);
-      q.fill += cm;
-      if(q.fill == Sr){
-        q.generated.push_back(o.best);
-        q.token = q.generated.back();
-        q.pos = Sr;
-        if(c.print_ids)
-          std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", q.id, q.token);
-        live.push_back(&q);
-        prefill_q.pop_front();
+    // --- Joint iteration: one forward carries decode rows + one prefill
+    // token for the queue head (or the split path under INTFER_SPLIT_ITER=1,
+    // or when the joint helper declines). Wide chunks (chunk_M > 1) go
+    // through the split path in BOTH modes: split_chunk fills up to chunk_M
+    // prompt tokens, then decodes live — so joint and split differ only in
+    // whether the single prefill token shares its forward with the decodes.
+    // The split chunk block is factored as a lambda so both the explicit
+    // split mode and the joint-decline fallback share it verbatim.
+    auto split_chunk = [&](){
+      if(!prefill_q.empty()){
+        Request& q = *prefill_q.front();
+        int Sr = (int)q.prompt_ids.size();
+        int cm = std::min(chunk_M, Sr - q.fill);
+        // Single-token heads ride the joint forward (fused with decodes);
+        // multi-token chunks use the chunked prefill path bit-identically
+        // in both modes (output-identity gate compares per-id streams).
+        if(cm == 1 && !split_iter && !live.empty()){
+          int D = sched_iteration_joint(live, prefill_q, chunk_M, c, Hb,
+                                        emit_stream, step_i++);
+          if(D >= 0) return; // joint carried it; accounting runs below
+          // D < 0: joint declined; fall through to the chunk block.
+        }
+        std::vector<int> toks(q.prompt_ids.begin() + q.fill,
+                              q.prompt_ids.begin() + q.fill + cm);
+        Hpre.assign((size_t)cm * cfg.H, 0.f);
+        StepOut o = prefill_layer_outer(q, toks, q.fill, *c.T, Hpre, c.embed,
+                                        c.final_norm, c.lm_head, c.backend,
+                                        no_dump);
+        q.fill += cm;
+        if(q.fill == Sr){
+          q.generated.push_back(o.best);
+          q.token = q.generated.back();
+          q.pos = Sr;
+          if(c.print_ids)
+            std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", q.id, q.token);
+          live.push_back(&q);
+          prefill_q.pop_front();
+        }
       }
+      if(!live.empty()) sched_iteration(live, c, Hb, emit_stream, step_i++);
+    };
+    if(split_iter){
+      split_chunk();
+    } else if(!prefill_q.empty() || !live.empty()){
+      int D = sched_iteration_joint(live, prefill_q, chunk_M, c, Hb,
+                                    emit_stream, step_i++);
+      if(D < 0) split_chunk(); // joint declined: same split mechanics
     }
-    // --- One decode iteration over all live (dynamic leave inside).
+    // --- Per-iteration accounting: {"done"} emission + live compaction.
+    // Runs whenever live is non-empty after the forward(s) above (a filled
+    // prefill request may have joined). EOF/idle drain when all queues
+    // are empty.
     if(!live.empty()){
-      int M = sched_iteration(live, c, Hb, emit_stream, step_i++);
       // Emit {"done"} once per newly finished request; compact live.
       std::vector<Request*> still;
       for(Request* qp : live){
@@ -3557,15 +3721,16 @@ static int run_serve(SchedCtx& c,
         if(!qp->finished) still.push_back(qp);
       }
       live.swap(still);
-      if(M == 0 && eof && pending.empty() && prefill_q.empty()) break;
-    } else if(eof && pending.empty() && prefill_q.empty()){
-      break;
-    } else if(live.empty() && prefill_q.empty() && pending.empty() && !eof){
-      // Nothing to do: block for the next line (avoids a hot spin when
-      // idle with the pipe open but no data).
-      if(!std::getline(std::cin, bufline)){ break; }
-      if(!bufline.empty() && bufline.back() == '\r') bufline.pop_back();
-      if(!bufline.empty()) pending.push_back(bufline);
+    }
+    if(live.empty() && prefill_q.empty()){
+      if(eof && pending.empty()) break;
+      if(pending.empty() && !eof){
+        // Nothing to do: block for the next line (avoids a hot spin when
+        // idle with the pipe open but no data).
+        if(!std::getline(std::cin, bufline)){ break; }
+        if(!bufline.empty() && bufline.back() == '\r') bufline.pop_back();
+        if(!bufline.empty()) pending.push_back(bufline);
+      }
     }
   }
   return 0;
