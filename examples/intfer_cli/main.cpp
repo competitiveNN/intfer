@@ -597,6 +597,51 @@ struct CpuBackend : public LinearBackend {
     if(suf.find("linear_attn.out_proj")!=std::string::npos) return slot(la_q, "out");
     return nullptr;
   }
+  // Unit check for the cold==warm rotation invariant (INTFER_CHECK_ROT=1):
+  // rot_for() with an empty cache (cold) must agree with rot_for() after
+  // ensure_cached() warms the entry (warm) for every layer x slot the
+  // forward touches. Returns true when all slots agree; prints each
+  // mismatch (layer, slot, cold ptr, warm ptr) to stderr.
+  // NOTE: warm-up runs real GEMM weight resolution (ensure_cached reads
+  // safetensors on miss), so this takes ~seconds on first run; it mutates
+  // only the weight/rotation caches, which inference would populate anyway.
+  bool check_cold_warm(){
+    char b[256];
+    auto nm = [&](int L, const char* slot) -> std::string {
+      snprintf(b, sizeof(b), "model.language_model.layers.%d.%s", L, slot);
+      return std::string(b);
+    };
+    static const char* slots[] = {
+      "self_attn.q_proj.weight", "self_attn.k_proj.weight",
+      "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+      "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
+      "linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight",
+      "linear_attn.in_proj_b.weight", "linear_attn.in_proj_a.weight",
+      "linear_attn.out_proj.weight",
+    };
+    bool ok = true;
+    for(int L=0; L<cfg.layers; L++){
+      for(const char* s : slots){
+        std::string name = nm(L, s);
+        cache_R.erase(name);
+        cache_w.erase(name);
+        const Rotation* cold = rot_for(name);
+        if(!ensure_cached(name)) continue; // tensor absent: nothing to compare
+        auto it = cache_R.find(name);
+        const Rotation* warm = (it != cache_R.end()) ? it->second : nullptr;
+        if(cold != warm){
+          std::fprintf(stderr,
+            "[rotcheck] MISMATCH L=%d %s cold=%p warm=%p\n",
+            L, s, (const void*)cold, (const void*)warm);
+          ok = false;
+        }
+      }
+    }
+    std::fprintf(stderr, "[rotcheck] %s (%d layers x %zu slots)\n",
+                 ok ? "OK" : "FAIL", cfg.layers,
+                 sizeof(slots)/sizeof(slots[0]));
+    return ok;
+  }
 };
 
 #ifdef INTFER_HAS_GPU_BACKEND
@@ -4383,6 +4428,21 @@ int main(int argc, char** argv){
     std::vector<char> is_full((size_t)cfg.layers);
     for(int L=0; L<cfg.layers; L++) is_full[(size_t)L] = req.layers[(size_t)L].is_full ? 1 : 0;
     build_layer_names(T, is_full);
+  }
+  // INTFER_CHECK_ROT=1: cold==warm rotation invariant. For every layer and
+  // every tensor slot used by the forward, rot_for() before any GEMM (cold:
+  // cache_R empty, IR-index/per-slot fallback) must return the same pointer
+  // as after ensure_cached populates the cache (warm). This is the unit
+  // check behind the 3eb4e34 fix — the old first-hit fallback violated it
+  // for LA/o/down slots. Runs on the CPU backend; GPU rot_for is stateless
+  // (per-tensor engine lookup). Failures print layer/slot and exit 2.
+  if(auto* cpu = dynamic_cast<CpuBackend*>(backend.get())){
+    static const bool check_rot = (std::getenv("INTFER_CHECK_ROT") != nullptr);
+    if(check_rot && !cpu->check_cold_warm()){
+      std::fprintf(stderr, "[intfer] FATAL: cold==warm rotation invariant violated\n");
+      munmap_blob(mblob);
+      return 2;
+    }
   }
   std::fprintf(stderr, "[intfer] starting prefill...\n"); std::fflush(stderr);
 

@@ -27,7 +27,21 @@ PROMPT3="Hi"
 
 export TMPDIR="${TMPDIR:-/tmp}"
 PASS=1
+ROTLOG="$(mktemp --tmpdir="$TMPDIR" rotcheck.XXXX.log)"
 fail() { echo "GATE FAIL: $1" >&2; PASS=0; }
+
+# --- 0. Rotation invariant: cold==warm for every layer x slot ---
+# Unit check behind the 3eb4e34 fix (old first-hit fallback violated it
+# for LA/o/down slots). Runs inside the CLI at startup; exits nonzero
+# (rc=2) with [rotcheck] MISMATCH lines on violation.
+echo "--- rotcheck ---"
+INTFER_CHECK_ROT=1 "$BIN" --no-gpu -m "$MODEL" -p "Hi" -n 1 --no-stream \
+  --tokenizer-py "$SCRIPT_DIR/bpe_tokenize.py" \
+  --detok-py "$SCRIPT_DIR/bpe_detokenize.py" >/dev/null 2>"$ROTLOG"; RC=$?
+grep -a "rotcheck" "$ROTLOG"
+[ "$RC" = "0" ] || fail "rotcheck exited rc=$RC (see $ROTLOG)"
+grep -aq "rotcheck. OK" "$ROTLOG" || fail "rotcheck did not report OK"
+rm -f "$ROTLOG"
 
 # --- 1. M=1 step loop: prefill top-1 + decode prefix vs HF oracle ---
 # NOTE: -n counts the prefill token, so -n 4 yields 3 decode steps.
