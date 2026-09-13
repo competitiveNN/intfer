@@ -55,6 +55,7 @@ static void segv_handler(int sig){
 #include <random>
 #include <functional>
 #include <iostream>
+#include <deque>
 #include <memory>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -2867,16 +2868,48 @@ static std::string json_escape(const std::string& s){
   }
   return o;
 }
-// Parse {"prompt":"...","max_new":N,"id":K} (all optional but prompt).
+// Per-line serve options (all optional; sampling keys fall back to the CLI
+// globals passed as dflt_*).
+struct ServeOpts {
+  int max_new = 64;
+  long id = -1; bool has_id = false;
+  float temperature = 0.f; int top_k = 0; float top_p = 0.f;
+  uint32_t seed = 0; bool has_seed = false;
+};
+// Last occurrence of "k" outside the prompt-value span [vs,ve) whose closing
+// quote is followed by ':' (a real key, not prose inside the prompt text).
+static size_t find_json_key(const std::string& line, const char* k,
+                            size_t vs, size_t ve){
+  std::string q = std::string("\"") + k + "\"";
+  size_t best = std::string::npos, p = 0;
+  while((p = line.find(q, p)) != std::string::npos){
+    bool inside = (p > vs && p < ve);
+    size_t e = p + q.size();
+    while(e < line.size() && (line[e]==' '||line[e]=='\t')) e++;
+    if(!inside && e < line.size() && line[e]==':') best = p;
+    p++;
+  }
+  return best;
+}
+static const char* json_val_at(const std::string& line, size_t kp){
+  size_t c2 = line.find(':', kp);
+  if(c2 == std::string::npos) return nullptr;
+  return line.c_str()+c2+1;
+}
+// Parse {"prompt":"...","max_new":N,"id":K,"temperature":T,"top_k":K,
+//        "top_p":P,"seed":S} (all optional but prompt).
+// Numeric keys are matched outside the prompt string, so prompt text
+// containing e.g. "max_new" or "id" cannot spoof overrides (the old search
+// scanned the whole line; "id" even preferred the last occurrence).
 // Returns false on malformed lines (caller emits {"error":...}).
 static bool parse_serve_line(const std::string& line, std::string& prompt,
-                             int& max_new, long& id, bool& has_id, int dflt_n){
-  prompt.clear(); max_new = dflt_n; id = -1; has_id = false;
-  auto find_key = [&](const char* k) -> size_t {
-    std::string q = std::string("\"") + k + "\"";
-    return line.find(q);
-  };
-  size_t pp = find_key("prompt");
+                             ServeOpts& o, int dflt_n,
+                             float dflt_t, int dflt_k, float dflt_p){
+  prompt.clear();
+  o.max_new = dflt_n; o.id = -1; o.has_id = false;
+  o.temperature = dflt_t; o.top_k = dflt_k; o.top_p = dflt_p;
+  o.seed = 0; o.has_seed = false;
+  size_t pp = line.find("\"prompt\"");
   if(pp == std::string::npos) return false;
   size_t colon = line.find(':', pp);
   if(colon == std::string::npos) return false;
@@ -2884,6 +2917,7 @@ static bool parse_serve_line(const std::string& line, std::string& prompt,
   if(q0 == std::string::npos) return false;
   // Decode \" \\ \n \r \t \uXXXX escapes (prompts may carry quotes).
   std::string raw;
+  size_t pe = line.size(); // prompt closing-quote position (key search floor)
   for(size_t i=q0+1; i<line.size(); i++){
     char ch = line[i];
     if(ch == '\\' && i+1 < line.size()){
@@ -2906,25 +2940,41 @@ static bool parse_serve_line(const std::string& line, std::string& prompt,
       }
       else raw += e;
     }
-    else if(ch == '"') break;
+    else if(ch == '"'){ pe = i; break; }
     else raw += ch;
   }
   prompt = raw;
-  size_t pn = find_key("max_new");
+  size_t ve = pe; // numeric keys must sit outside the prompt string
+  size_t pn = find_json_key(line, "max_new", q0, ve);
   if(pn != std::string::npos){
-    size_t c2 = line.find(':', pn);
-    if(c2 != std::string::npos) max_new = std::atoi(line.c_str()+c2+1);
+    if(const char* v = json_val_at(line, pn)) o.max_new = std::atoi(v);
   }
-  size_t pi = find_key("id");
-  // "id" must not match inside another key: require the quoted form, and
-  // prefer the LAST occurrence (a prompt string could contain "id").
-  size_t pil = line.rfind("\"id\"");
-  if(pil != std::string::npos && pil != pp){
-    size_t c3 = line.find(':', pil);
-    if(c3 != std::string::npos){ id = std::atol(line.c_str()+c3+1); has_id = true; }
+  size_t pil = find_json_key(line, "id", q0, ve);
+  if(pil != std::string::npos){
+    if(const char* v = json_val_at(line, pil)){ o.id = std::atol(v); o.has_id = true; }
   }
-  if(max_new < 1) max_new = 1;
-  if(max_new > 4096) max_new = 4096;
+  size_t pt = find_json_key(line, "temperature", q0, ve);
+  if(pt != std::string::npos){
+    if(const char* v = json_val_at(line, pt)) o.temperature = (float)std::atof(v);
+  }
+  size_t pk = find_json_key(line, "top_k", q0, ve);
+  if(pk != std::string::npos){
+    if(const char* v = json_val_at(line, pk)) o.top_k = std::atoi(v);
+  }
+  size_t pp2 = find_json_key(line, "top_p", q0, ve);
+  if(pp2 != std::string::npos){
+    if(const char* v = json_val_at(line, pp2)) o.top_p = (float)std::atof(v);
+  }
+  size_t ps = find_json_key(line, "seed", q0, ve);
+  if(ps != std::string::npos){
+    if(const char* v = json_val_at(line, ps)){
+      o.seed = (uint32_t)std::atol(v); o.has_seed = true;
+    }
+  }
+  if(o.max_new < 1) o.max_new = 1;
+  if(o.max_new > 4096) o.max_new = 4096;
+  if(o.top_k < 0) o.top_k = 0;
+  if(o.top_p < 0.f) o.top_p = 0.f; if(o.top_p > 1.f) o.top_p = 1.f;
   return true;
 }
 
@@ -3329,8 +3379,11 @@ static std::string detokenize_one(int id, const std::string& detok_py,
 // Serve loop (Stage 3.3): stdin JSON-lines continuous batching server.
 // ============================================================================
 // Protocol:
-//   in:  {"prompt":"...","max_new":N,"id":K} per line (id optional; server
-//        assigns when missing; max_new optional, defaults to -n).
+//   in:  {"prompt":"...","max_new":N,"id":K,"temperature":T,"top_k":K,
+//         "top_p":P,"seed":S} per line (only prompt is required; sampling
+//         keys default to the CLI -t/-k/-T/-S values; numeric keys are
+//         matched outside the prompt string so prompt prose cannot spoof
+//         them; missing id is server-assigned).
 //   out: {"id":K,"token":ID,"text":"..."} per generated token,
 //        {"id":K,"done":true,"generated":N} once per request,
 //        {"error":"..."} on malformed input lines (server keeps running).
@@ -3346,8 +3399,41 @@ static int run_serve(SchedCtx& c,
                      float dflt_temp, int dflt_top_k, float dflt_top_p){
   std::vector<std::unique_ptr<Request>> pool; // all admitted (live + done)
   std::vector<Request*> live;                 // points into pool (unfinished)
-  std::vector<std::string> pending;           // FIFO of unadmitted lines
+  std::deque<std::string> pending;            // FIFO of unadmitted lines
+  // Live cap: VRAM-aware default from per-request state bytes (KV caches +
+  // scratch arena + gscores, all host-side FP32; GPU weights are shared).
+  // Budget 8GB host for request state; INTFER_SERVE_MAX still overrides.
+  // Prefill input rows reuse one shared Hbuf (not per-request).
   int serve_max = 8;
+  {
+    size_t per_req = 0;
+    int n_full = 0, n_la = 0;
+    {
+      Request probe; wire(probe);
+      for(auto& ly : probe.layers){
+        if(ly.is_full){ n_full++; per_req += ly.kcache.size() + ly.vcache.size(); }
+        else { n_la++; per_req += ly.ssm_state.size() + ly.conv_state.size(); }
+      }
+    }
+    size_t qrows2 = 2*(size_t)cfg.n_heads*cfg.head_dim;
+    size_t kvrows = (size_t)cfg.n_kv*cfg.head_dim;
+    size_t attnrows = (size_t)cfg.n_heads*cfg.head_dim;
+    size_t nvrows = (size_t)cfg.n_v_heads*cfg.v_head_dim;
+    per_req += 3*cfg.H + cfg.H + qrows2 + 2*attnrows + 2*cfg.H + 2*kvrows
+             + attnrows + 2*attnrows + cfg.H + 3*cfg.H + 2*cfg.conv_dim
+             + cfg.H + 3*cfg.H + nvrows + 2*cfg.n_v_heads + cfg.n_v_heads
+             + 3*nvrows + 2*cfg.v_head_dim + 2*cfg.H + 2*cfg.inter
+             + 2*cfg.H + cfg.H + cfg.vocab; // StepScratch::ensure widths
+    per_req *= sizeof(float);
+    const size_t budget = 8ULL*1024*1024*1024;
+    int computed = (int)(budget / std::max<size_t>(per_req, 1));
+    if(computed < 1) computed = 1;
+    if(computed > 64) computed = 64;
+    serve_max = computed;
+    std::fprintf(stderr, "[intfer] serve cap: %d live (%.1f MB/req state: "
+                 "%d full + %d LA layers)\n",
+                 serve_max, per_req/(1024.0*1024.0), n_full, n_la);
+  }
   if(const char* me = std::getenv("INTFER_SERVE_MAX")){
     int v = std::atoi(me); if(v >= 1 && v <= 64) serve_max = v;
   }
@@ -3362,19 +3448,21 @@ static int run_serve(SchedCtx& c,
                 q.id, tok, json_escape(piece).c_str());
     std::fflush(stdout);
   };
-  // Admit one parsed request: tokenize, wire state, prefill immediately.
-  auto admit = [&](const std::string& prompt, int max_new, long id){
+  // Admit one parsed request: tokenize, wire state, prefill immediately
+  // (B replaces this with queued chunked prefill; until then the prefill
+  // runs here, interleaved between decode iterations).
+  auto admit = [&](const std::string& prompt, const ServeOpts& o){
     auto rq = std::make_unique<Request>();
     wire(*rq);
     Request& q = *rq;
-    q.id = id;
+    q.id = o.id;
     if(!prompt.empty())
       q.prompt_ids = encode_text(prompt, *c.tokenizer_json, *c.tokenizer_py);
     if(q.prompt_ids.empty())
       q.prompt_ids = {760, 6511, 314, 9338, 369};
-    q.max_new = max_new;
-    q.temperature = dflt_temp; q.top_k = dflt_top_k; q.top_p = dflt_top_p;
-    q.rng = std::mt19937(seed + (uint32_t)id);
+    q.max_new = o.max_new;
+    q.temperature = o.temperature; q.top_k = o.top_k; q.top_p = o.top_p;
+    q.rng = std::mt19937(o.has_seed ? o.seed : seed + (uint32_t)q.id);
     sched_prefill(q, c, no_dump);
     if(c.print_ids)
       std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", q.id, q.token);
@@ -3401,18 +3489,18 @@ static int run_serve(SchedCtx& c,
     }
     // --- Admit FIFO while under the live cap.
     while(!pending.empty() && (int)live.size() < serve_max){
-      std::string line = pending.front();
-      pending.erase(pending.begin());
-      std::string prompt; int max_new = dflt_max_new; long id = -1;
-      bool has_id = false;
-      if(!parse_serve_line(line, prompt, max_new, id, has_id, dflt_max_new)){
+      std::string line = std::move(pending.front());
+      pending.pop_front();
+      std::string prompt; ServeOpts o;
+      if(!parse_serve_line(line, prompt, o, dflt_max_new,
+                           dflt_temp, dflt_top_k, dflt_top_p)){
         std::printf("{\"error\":\"malformed request line\"}\n");
         std::fflush(stdout);
         continue;
       }
-      if(!has_id) id = next_id++;
-      else if(id >= next_id) next_id = id + 1;
-      admit(prompt, max_new, id);
+      if(!o.has_id) o.id = next_id++;
+      else if(o.id >= next_id) next_id = o.id + 1;
+      admit(prompt, o);
     }
     // --- One decode iteration over all live (dynamic leave inside).
     if(!live.empty()){
@@ -3473,7 +3561,10 @@ static void usage(const char* p){
     "  --ids          also print token ids to stderr (debug)\n"
     "  --serve        JSON-lines server on stdin/stdout (Stage 3.3): read\n"
     "                 {\"prompt\":...} per line, stream {\"id\",\"token\"}/\n"
-    "                 {\"id\",\"done\"} lines back as requests finish\n",
+    "                 {\"id\",\"done\"} lines back as requests finish.\n"
+    "                 Optional per-request keys: max_new, temperature, top_k,\n"
+    "                 top_p, seed, id (defaults: -n/-t/-k/-T/-S, id assigned).\n"
+    "                 Live cap: INTFER_SERVE_MAX or VRAM-aware default\n",
     p);
 }
 
