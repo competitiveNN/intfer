@@ -2911,9 +2911,11 @@ static int sched_iteration_joint(std::vector<Request*>& live,
     ridx.push_back(i);
   }
   int D = (int)items.size();
-  // Prefill rows: up to chunk_M unconsumed prompt tokens of the queue head.
-  // (Head-of-line only: one request fills at a time; round-robin is future
-  // work. The bound keeps the joint forward within one chunk of work.)
+  // Prefill rows: up to chunk_M unconsumed prompt tokens of the current
+  // rotation target (prefill_q front; the caller rotates the queue so
+  // consecutive iterations serve consecutive requests — round-robin
+  // fairness, no head-of-line stall. Per-request state + absolute
+  // positions make cross-request fill order output-identical).
   // Chunk width cap: the M-row batched-GEMM chunk path (INTFER_BATCH_GEMM=1,
   // M>1) is known-divergent on 27B/GPU (pre-existing: reproduces on the
   // pristine tree without this change), so joint batches carry at most ONE
@@ -2929,6 +2931,8 @@ static int sched_iteration_joint(std::vector<Request*>& live,
   // decode rows (the common case: short prompts + ongoing decodes).
   Request* pq = prefill_q.empty() ? nullptr : prefill_q.front();
   static const bool batch_gemm_env = (std::getenv("INTFER_BATCH_GEMM") != nullptr);
+  static const bool rr_off = (std::getenv("INTFER_PREFILL_RR") != nullptr &&
+                              std::string(std::getenv("INTFER_PREFILL_RR")) == "0");
   int P = 0;
   if(pq){
     int Sr = (int)pq->prompt_ids.size();
@@ -2968,6 +2972,10 @@ static int sched_iteration_joint(std::vector<Request*>& live,
   }
   // Prefill rows: state already advanced by the forward; only the
   // chunk-final row's prediction matters. A filled request joins live.
+  // Unfilled queue heads rotate to the back (round-robin fairness) unless
+  // disabled; a filled request leaves via pop_front above. Rotation also
+  // runs on the decline path (P>1 early return above skips it — the
+  // caller rotates there instead; see split_chunk).
   if(pq){
     int Sr = (int)pq->prompt_ids.size();
     pq->fill += P;
@@ -2980,6 +2988,9 @@ static int sched_iteration_joint(std::vector<Request*>& live,
         std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", pq->id, pq->token);
       live.push_back(pq);
       prefill_q.pop_front();
+    } else if(!rr_off && prefill_q.size() > 1){
+      prefill_q.pop_front();
+      prefill_q.push_back(pq);
     }
   }
   (void)step_i;
@@ -3665,6 +3676,21 @@ static int run_serve(SchedCtx& c,
     // The split chunk block is factored as a lambda so both the explicit
     // split mode and the joint-decline fallback share it verbatim.
     auto split_chunk = [&](){
+      auto rotate_unfilled = [&](Request* served){
+        // Round-robin: the served head goes to the back unless it filled
+        // (filled requests leave via pop_front at their fill site). Runs
+        // for every split-path chunk AND every joint decline so the two
+        // paths rotate identically (output-identity gate compares per-id
+        // streams, but identical rotation also keeps scheduling comparable).
+        // INTFER_PREFILL_RR=0 restores head-of-line (FIFO) behavior.
+        static const bool rr_off2 = (std::getenv("INTFER_PREFILL_RR") != nullptr &&
+                                     std::string(std::getenv("INTFER_PREFILL_RR")) == "0");
+        if(rr_off2 || prefill_q.empty() || prefill_q.size() < 2) return;
+        if(prefill_q.front() == served && served->fill < (int)served->prompt_ids.size()){
+          prefill_q.pop_front();
+          prefill_q.push_back(served);
+        }
+      };
       if(!prefill_q.empty()){
         Request& q = *prefill_q.front();
         int Sr = (int)q.prompt_ids.size();
@@ -3693,6 +3719,8 @@ static int run_serve(SchedCtx& c,
             std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", q.id, q.token);
           live.push_back(&q);
           prefill_q.pop_front();
+        } else {
+          rotate_unfilled(&q);
         }
       }
       if(!live.empty()) sched_iteration(live, c, Hb, emit_stream, step_i++);
@@ -3702,7 +3730,13 @@ static int run_serve(SchedCtx& c,
     } else if(!prefill_q.empty() || !live.empty()){
       int D = sched_iteration_joint(live, prefill_q, chunk_M, c, Hb,
                                     emit_stream, step_i++);
-      if(D < 0) split_chunk(); // joint declined: same split mechanics
+      if(D < 0){
+        // Joint declines P>1 (same-request multi-row cap): run the split
+        // chunk for the head, then rotate so the next iteration serves the
+        // next queued request (round-robin; identical rotation in the
+        // joint-P1 path keeps both modes comparable).
+        split_chunk(); // joint declined: same split mechanics
+      }
     }
     // --- Per-iteration accounting: {"done"} emission + live compaction.
     // Runs whenever live is non-empty after the forward(s) above (a filled
