@@ -57,6 +57,9 @@ static void segv_handler(int sig){
 #include <iostream>
 #include <deque>
 #include <memory>
+#include <mutex>
+#include <atomic>
+#include <ctime>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -69,6 +72,8 @@ static void segv_handler(int sig){
 #include "intfer/output.hpp"
 #include "intfer/quant/dashq.hpp"
 #include "intfer/spinquant.hpp"
+#include "http.hpp"
+#include "openai.hpp"
 
 #ifdef INTFER_HAS_GPU_BACKEND
 #include "intfer/engine.hpp"
@@ -4056,6 +4061,456 @@ static int run_serve(SchedCtx& c,
 // ============================================================================
 enum class GpuMode { Auto, ForceOn, ForceOff };
 
+// ============================================================================
+// OpenAI-compatible HTTP server (--serve-http).
+// ============================================================================
+// Same engine, new skin: this section bridges the dependency-free HTTP layer
+// (http.hpp) + OpenAI request parsing (openai.hpp) to the exact tested
+// forward mechanics (sched_prefill + sched_iteration over a single-request
+// batch). Token ids are byte-identical to the --serve path for the same
+// prompt/seed/sampling settings; only the transport differs (HTTP+SSE
+// instead of stdin/stdout JSON-lines).
+//
+// Concurrency model: the HTTP layer is thread-per-connection, but ALL engine
+// work (encode is process-spawned python, prefill+decode touch the backend)
+// runs under one global mutex. The forward path is not thread-safe
+// (thread_local KV scratch in kv_row_ptr, shared backend weight caches,
+// SYCL queue state), so concurrent HTTP requests queue on the mutex —
+// connection-level parallelism with serialized generation. This matches the
+// --serve scheduler's single-threaded forward; cross-request continuous
+// batching over HTTP is future work.
+//
+// Token accounting (verified against the HF oracle + test_cpu_parity.sh):
+// sched_prefill appends the prefill-predicted first token to q.generated,
+// then each sched_iteration appends one decode token. So q.generated holds
+// the FULL output stream including the prefill token, and every element is
+// emitted exactly once (EOS id itself is never emitted as text).
+static std::mutex g_engine_mu;
+static std::atomic<long> g_completion_seq{1};
+
+struct HttpGenOpts {
+  int max_new = 64;
+  float temperature = 0.f;
+  int top_k = 0;
+  float top_p = 0.f;
+  uint32_t seed = 0;
+  bool has_seed = false;
+  std::vector<std::string> stop;
+};
+
+struct HttpGenOut {
+  std::vector<int> ids;  // full output stream (incl. prefill token), EOS excluded
+  std::string text;      // decoded text, stop-truncated, EOS excluded
+  std::string finish;    // "stop" | "length"
+  int prompt_tokens = 0;
+};
+
+// Run one completion under the engine mutex. on_token(piece, id) is invoked
+// per emitted token (used for SSE streaming); when null, tokens are only
+// accumulated into the returned HttpGenOut.
+static HttpGenOut http_generate(
+    const std::string& prompt, const HttpGenOpts& o,
+    SchedCtx& c, const std::function<void(Request&)>& wire,
+    uint32_t seed_base,
+    const std::function<void(const std::string&, int)>& on_token = {}) {
+  HttpGenOut out;
+  std::lock_guard<std::mutex> lk(g_engine_mu);
+  Request q;
+  wire(q);
+  if(!prompt.empty())
+    q.prompt_ids = encode_text(prompt, *c.tokenizer_json, *c.tokenizer_py);
+  if(q.prompt_ids.empty())
+    q.prompt_ids = {760, 6511, 314, 9338, 369};  // same default as --serve
+  out.prompt_tokens = (int)q.prompt_ids.size();
+  // OpenAI max_tokens caps TOTAL completion tokens (prefill token included:
+  // sched_* counts generated[0] as output). The scheduler stops decoding
+  // when generated.size() >= max_new+1, so subtract one here.
+  q.max_new = std::max(0, o.max_new - 1);
+  q.temperature = o.temperature;
+  q.top_k = o.top_k;
+  q.top_p = o.top_p;
+  q.rng = std::mt19937(o.has_seed ? o.seed : seed_base + (uint32_t)(g_completion_seq.load() & 0xffffff));
+  q.fill = 0;
+  q.pos = 0;
+  std::vector<std::vector<float>> no_dump;  // server never records
+  std::vector<float> Hb;
+  sched_prefill(q, c, no_dump);
+  // Prefill token: first element of the output stream.
+  bool stopped = false;
+  size_t streamed = 0;  // out.text prefix already handed to on_token
+  auto emit_one = [&](int tok) {
+    if(tok == 248044 || tok == 248046) { stopped = true; return; }  // EOS: end, never text
+    std::string piece = detokenize_one(tok, *c.detok_py, *c.tokenizer_json);
+    out.ids.push_back(tok);
+    out.text += piece;
+    // OpenAI stop semantics: cut at the first occurrence of any stop
+    // string (stop text itself excluded); boundary-spanning stops are
+    // caught because the full accumulated text is searched each time.
+    for(auto& st : o.stop){
+      if(st.empty()) continue;
+      size_t p = out.text.find(st);
+      if(p != std::string::npos){
+        out.text.resize(p);
+        stopped = true;
+        break;
+      }
+    }
+    // Stream exactly the kept delta: previously-streamed text is never
+    // re-sent, and a stop-hit piece contributes only its kept prefix
+    // (possibly empty — then nothing is sent for this token).
+    if(on_token && out.text.size() > streamed){
+      on_token(out.text.substr(streamed), tok);
+      streamed = out.text.size();
+    } else if(on_token){
+      streamed = out.text.size();
+    }
+  };
+  emit_one(q.token);
+  std::vector<Request*> live;
+  int step_i = 0;
+  auto emit_stream = [&](Request&, size_t, int tok){ emit_one(tok); };
+  while(!q.finished && !stopped){
+    live.clear();
+    live.push_back(&q);
+    int M = sched_iteration(live, c, Hb, emit_stream, step_i++);
+    if(M == 0) break;
+  }
+  // ids keep every generated token (vLLM-style usage counting); text alone
+  // is stop-truncated. finish: EOS/stop-string => "stop", else the request
+  // ended because sched_iteration hit the max_new budget => "length".
+  // (EOS always funnels through emit_one above, so stopped covers it.)
+  out.finish = stopped ? "stop" : "length";
+  return out;
+}
+
+// --serve-http request routing. All /v1/* completions funnel into
+// http_generate above; /health and /v1/models never touch the engine.
+static int run_serve_http(SchedCtx& c,
+                          const std::function<void(Request&)>& wire,
+                          int dflt_max_new, uint32_t seed_base,
+                          float dflt_temp, int dflt_top_k, float dflt_top_p,
+                          const std::string& host, int port,
+                          const std::string& model_id) {
+  using namespace intfer_openai;
+  intfer_http::HttpServer srv;
+  // max_new clamp mirrors ServeOpts ([1,4096]).
+  auto clamp_max = [](int n, int dflt){
+    if(n <= 0) return dflt;
+    if(n < 1) return 1;
+    if(n > 4096) return 4096;
+    return n;
+  };
+  srv.on_log([](const std::string& m, const std::string& p, int, long ms){
+    std::fprintf(stderr, "[http] %s %s %ldms\n", m.c_str(), p.c_str(), ms);
+  });
+  srv.on_request([&](const intfer_http::HttpRequest& req, intfer_http::Responder& rsp){
+    auto err = [&](int code, const std::string& msg, const std::string& type){
+      JVal e = make_error(msg, type);
+      rsp.send_json(code, json_dump(e));
+    };
+    std::string path = req.path;
+    // CORS preflight.
+    if(req.method == "OPTIONS"){
+      rsp.send_response(200, "text/plain", "",
+                        {{"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+                         {"Access-Control-Allow-Headers", "Content-Type, Authorization"}});
+      return;
+    }
+    if(req.method == "GET" && (path == "/health" || path == "/v1/health")){
+      JVal o = JVal::obj();
+      o.set("status", JVal::str("ok"));
+      o.set("model", JVal::str(model_id));
+      rsp.send_json(200, json_dump(o));
+      return;
+    }
+    // GET /v1/models (+ trailing-slash + single-id forms).
+    if(req.method == "GET" && (path == "/v1/models" || path == "/v1/models/")){
+      JVal o = JVal::obj();
+      o.set("object", JVal::str("list"));
+      JVal arr = JVal::arr();
+      JVal m = JVal::obj();
+      m.set("id", JVal::str(model_id));
+      m.set("object", JVal::str("model"));
+      m.set("created", JVal::number((double)std::time(nullptr)));
+      m.set("owned_by", JVal::str("intfer"));
+      arr.push(m);
+      o.set("data", arr);
+      rsp.send_json(200, json_dump(o));
+      return;
+    }
+    if(req.method == "GET" && path.rfind("/v1/models/", 0) == 0){
+      JVal m = JVal::obj();
+      m.set("id", JVal::str(model_id));
+      m.set("object", JVal::str("model"));
+      m.set("created", JVal::number((double)std::time(nullptr)));
+      m.set("owned_by", JVal::str("intfer"));
+      rsp.send_json(200, json_dump(m));
+      return;
+    }
+    if(path == "/v1/chat/completions" || path == "/v1/completions"){
+      bool is_chat = (path == "/v1/chat/completions");
+      if(req.method != "POST"){ err(405, "method not allowed, use POST", "invalid_request_error"); return; }
+      JVal body;
+      JParser parser(req.body);
+      if(!parser.parse(body) || !body.is_obj()){
+        err(400, "request body is not valid JSON", "invalid_request_error");
+        return;
+      }
+      // --- legacy /v1/completions fields ---
+      std::vector<std::string> legacy_prompts;
+      bool has_legacy_prompt = false, legacy_echo = false;
+      if(!is_chat){
+        const JVal* pr = body.find("prompt");
+        if(!pr){ err(400, "prompt must be a string or array of strings", "invalid_request_error"); return; }
+        has_legacy_prompt = true;
+        if(pr->is_str()) legacy_prompts.push_back(pr->s);
+        else if(pr->is_arr()){
+          for(auto& e : pr->a){
+            if(!e.is_str()){ err(400, "prompt array must contain strings", "invalid_request_error"); return; }
+            legacy_prompts.push_back(e.s);
+          }
+        } else { err(400, "prompt must be a string or array of strings", "invalid_request_error"); return; }
+        const JVal* ec = body.find("echo");
+        if(ec && ec->t == JVal::T::Bool) legacy_echo = ec->b;
+        const JVal* n = body.find("n");
+        if(n && n->is_num() && (int)n->num != 1){
+          err(400, "n > 1 is not supported (single completion only)", "invalid_request_error");
+          return;
+        }
+        for(const char* k : {"logit_bias", "logprobs", "best_of", "functions", "suffix"}){
+          const JVal* v = body.find(k);
+          if(v && v->t != JVal::T::Null){
+            if(v->t == JVal::T::Bool && !v->b) continue;
+            if(v->t == JVal::T::Arr && v->a.empty()) continue;
+            if(v->t == JVal::T::Num && v->num == 0) continue;
+            err(400, std::string(k) + " is not supported by this server", "invalid_request_error");
+            return;
+          }
+        }
+        (void)has_legacy_prompt;
+      }
+      // --- shared sampling fields ---
+      ChatRequest cr;
+      std::string prompt_text;
+      std::string req_model;
+      if(is_chat){
+        if(!parse_chat_request(body, cr)){
+          err(400, cr.validation_error.empty() ? "invalid request" : cr.validation_error,
+              "invalid_request_error");
+          return;
+        }
+        req_model = cr.model.empty() ? model_id : cr.model;
+        prompt_text = render_chat_prompt(cr.messages, true);
+      } else {
+        req_model = model_id;
+        const JVal* m = body.find("model");
+        if(m && m->is_str() && !m->s.empty()) req_model = m->s;
+      }
+      HttpGenOpts o;
+      o.max_new = dflt_max_new;
+      o.temperature = dflt_temp; o.top_k = dflt_top_k; o.top_p = dflt_top_p;
+      const JVal* mt = body.find("max_tokens");
+      if(!mt) mt = body.find("max_completion_tokens");
+      if(mt && mt->is_num()) o.max_new = clamp_max((int)mt->num, dflt_max_new);
+      const JVal* tp = body.find("temperature");
+      if(tp && tp->is_num()) o.temperature = (float)tp->num;
+      const JVal* pp = body.find("top_p");
+      if(pp && pp->is_num()) o.top_p = (float)pp->num;
+      const JVal* tk = body.find("top_k");
+      if(tk && tk->is_num()) o.top_k = (int)tk->num;
+      const JVal* sd = body.find("seed");
+      if(sd && sd->is_num()){ o.seed = (uint32_t)(int)sd->num; o.has_seed = true; }
+      const JVal* sp = body.find("stop");
+      if(sp){
+        if(sp->is_str()) o.stop.push_back(sp->s);
+        else if(sp->is_arr()){
+          for(auto& e : sp->a){
+            if(!e.is_str()){ err(400, "stop must be a string or array of strings", "invalid_request_error"); return; }
+            o.stop.push_back(e.s);
+          }
+        } else if(sp->t != JVal::T::Null){
+          err(400, "stop must be a string or array of strings", "invalid_request_error");
+          return;
+        }
+      } else if(is_chat){
+        o.stop = cr.stop;
+      }
+      bool stream_out = false;
+      const JVal* st = body.find("stream");
+      if(st && st->t == JVal::T::Bool) stream_out = st->b;
+      bool want_usage = false;
+      const JVal* so = body.find("stream_options");
+      if(so && so->is_obj()){
+        const JVal* iu = so->find("include_usage");
+        if(iu && iu->t == JVal::T::Bool) want_usage = iu->b;
+      }
+      long long created = (long long)std::time(nullptr);
+      auto usage_obj = [](int pt, int ct){
+        JVal u = JVal::obj();
+        u.set("prompt_tokens", JVal::number((double)pt));
+        u.set("completion_tokens", JVal::number((double)ct));
+        u.set("total_tokens", JVal::number((double)(pt + ct)));
+        return u;
+      };
+      if(!is_chat && legacy_prompts.size() > 1 && !stream_out){
+        // Batch legacy form: one choice per prompt (OpenAI returns one
+        // completion per prompt string when prompt is an array).
+        JVal resp = JVal::obj();
+        long long seq = g_completion_seq.fetch_add(1);
+        char idb[64]; snprintf(idb, sizeof(idb), "cmpl-%lld", seq);
+        resp.set("id", JVal::str(idb));
+        resp.set("object", JVal::str("text_completion"));
+        resp.set("created", JVal::number((double)created));
+        resp.set("model", JVal::str(req_model));
+        JVal ch = JVal::arr();
+        int pt = 0, ct = 0;
+        for(size_t pi = 0; pi < legacy_prompts.size(); pi++){
+          HttpGenOut g = http_generate(legacy_prompts[pi], o, c, wire, seed_base);
+          std::string txt = legacy_echo ? legacy_prompts[pi] + g.text : g.text;
+          JVal c0 = JVal::obj();
+          c0.set("text", JVal::str(txt));
+          c0.set("index", JVal::number((double)pi));
+          c0.set("finish_reason", JVal::str(g.finish));
+          ch.push(c0);
+          pt += g.prompt_tokens; ct += (int)g.ids.size();
+        }
+        resp.set("choices", ch);
+        resp.set("usage", usage_obj(pt, ct));
+        rsp.send_json(200, json_dump(resp));
+        return;
+      }
+      if(!is_chat && legacy_prompts.size() > 1 && stream_out){
+        err(400, "streaming with a prompt array is not supported (send one prompt per request)",
+            "invalid_request_error");
+        return;
+      }
+      std::string prompt_in = is_chat ? prompt_text : legacy_prompts[0];
+      if(stream_out){
+        if(!rsp.begin_stream("text/event-stream")) return;
+        long long seq = g_completion_seq.fetch_add(1);
+        char idb[64];
+        snprintf(idb, sizeof(idb), is_chat ? "chatcmpl-%lld" : "cmpl-%lld", seq);
+        std::string cid = idb;
+        std::string obj = is_chat ? "chat.completion.chunk" : "text_completion";
+        int prompt_toks = 0, comp_toks = 0;
+        std::string finish = "stop";
+        bool first = true;
+        HttpGenOpts oo = o;
+        auto on_tok = [&](const std::string& piece, int){
+          JVal chunk = JVal::obj();
+          chunk.set("id", JVal::str(cid));
+          chunk.set("object", JVal::str(obj));
+          chunk.set("created", JVal::number((double)created));
+          chunk.set("model", JVal::str(req_model));
+          JVal ch = JVal::arr();
+          JVal c0 = JVal::obj();
+          c0.set("index", JVal::number(0));
+          if(is_chat){
+            JVal delta = JVal::obj();
+            if(first) delta.set("role", JVal::str("assistant"));
+            delta.set("content", JVal::str(piece));
+            c0.set("delta", delta);
+          } else {
+            c0.set("text", JVal::str(piece));
+          }
+          c0.set("finish_reason", JVal::null());
+          ch.push(c0);
+          chunk.set("choices", ch);
+          comp_toks++;
+          if(!rsp.chunk("data: " + json_dump(chunk) + "\n\n")) return;
+          first = false;
+        };
+        HttpGenOut g = http_generate(prompt_in, oo, c, wire, seed_base, on_tok);
+        prompt_toks = g.prompt_tokens;
+        comp_toks = (int)g.ids.size();
+        finish = g.finish;
+        // Terminal chunk (finish reason; usage only when requested).
+        {
+          JVal chunk = JVal::obj();
+          chunk.set("id", JVal::str(cid));
+          chunk.set("object", JVal::str(obj));
+          chunk.set("created", JVal::number((double)created));
+          chunk.set("model", JVal::str(req_model));
+          JVal ch = JVal::arr();
+          JVal c0 = JVal::obj();
+          c0.set("index", JVal::number(0));
+          if(is_chat){
+            c0.set("delta", JVal::obj());
+          } else {
+            c0.set("text", JVal::str(""));
+          }
+          c0.set("finish_reason", JVal::str(finish));
+          ch.push(c0);
+          chunk.set("choices", ch);
+          if(want_usage) chunk.set("usage", usage_obj(prompt_toks, comp_toks));
+          rsp.chunk("data: " + json_dump(chunk) + "\n\n");
+        }
+        rsp.chunk("data: [DONE]\n\n");
+        rsp.finish();
+        return;
+      }
+      // Non-streaming.
+      HttpGenOut g = http_generate(prompt_in, o, c, wire, seed_base);
+      if(is_chat){
+        JVal resp = JVal::obj();
+        long long seq = g_completion_seq.fetch_add(1);
+        char idb[64]; snprintf(idb, sizeof(idb), "chatcmpl-%lld", seq);
+        resp.set("id", JVal::str(idb));
+        resp.set("object", JVal::str("chat.completion"));
+        resp.set("created", JVal::number((double)created));
+        resp.set("model", JVal::str(req_model));
+        JVal ch = JVal::arr();
+        JVal c0 = JVal::obj();
+        c0.set("index", JVal::number(0));
+        JVal msg = JVal::obj();
+        msg.set("role", JVal::str("assistant"));
+        msg.set("content", JVal::str(g.text));
+        c0.set("message", msg);
+        c0.set("finish_reason", JVal::str(g.finish));
+        ch.push(c0);
+        resp.set("choices", ch);
+        resp.set("usage", usage_obj(g.prompt_tokens, (int)g.ids.size()));
+        rsp.send_json(200, json_dump(resp));
+      } else {
+        JVal resp = JVal::obj();
+        long long seq = g_completion_seq.fetch_add(1);
+        char idb[64]; snprintf(idb, sizeof(idb), "cmpl-%lld", seq);
+        resp.set("id", JVal::str(idb));
+        resp.set("object", JVal::str("text_completion"));
+        resp.set("created", JVal::number((double)created));
+        resp.set("model", JVal::str(req_model));
+        JVal ch = JVal::arr();
+        JVal c0 = JVal::obj();
+        std::string txt = legacy_echo ? legacy_prompts[0] + g.text : g.text;
+        c0.set("text", JVal::str(txt));
+        c0.set("index", JVal::number(0));
+        c0.set("finish_reason", JVal::str(g.finish));
+        ch.push(c0);
+        resp.set("choices", ch);
+        resp.set("usage", usage_obj(g.prompt_tokens, (int)g.ids.size()));
+        rsp.send_json(200, json_dump(resp));
+      }
+      return;
+    }
+    err(404, std::string("unknown endpoint: ") + path, "invalid_request_error");
+  });
+  if(!srv.listen(host, port)){
+    std::fprintf(stderr, "[intfer] FATAL: cannot bind %s:%d\n", host.c_str(), port);
+    return 1;
+  }
+  std::fprintf(stderr, "[intfer] OpenAI-compatible server on http://%s:%d (model=%s)\n",
+               (host.empty() ? "127.0.0.1" : host).c_str(), srv.bound_port(), model_id.c_str());
+  std::fflush(stderr);
+  // Graceful Ctrl-C: stop the accept loop so main() returns through munmap.
+  static intfer_http::HttpServer* g_srv = nullptr;
+  g_srv = &srv;
+  std::signal(SIGINT, [](int){ if(g_srv) g_srv->stop(); });
+  std::signal(SIGTERM, [](int){ if(g_srv) g_srv->stop(); });
+  srv.run();
+  g_srv = nullptr;
+  return 0;
+}
+
 static void usage(const char* p){
   std::fprintf(stderr,
     "intfer — low-bit LLM inference (Stage-1 quantized .intifer, host or SYCL GPU)\n"
@@ -4084,7 +4539,14 @@ static void usage(const char* p){
     "                 {\"id\",\"done\"} lines back as requests finish.\n"
     "                 Optional per-request keys: max_new, temperature, top_k,\n"
     "                 top_p, seed, id (defaults: -n/-t/-k/-T/-S, id assigned).\n"
-    "                 Live cap: INTFER_SERVE_MAX or VRAM-aware default\n",
+    "                 Live cap: INTFER_SERVE_MAX or VRAM-aware default\n"
+    "  --serve-http     OpenAI-compatible HTTP server (same engine as --serve):\n"
+    "                 GET /health, GET /v1/models,\n"
+    "                 POST /v1/chat/completions (stream + non-stream),\n"
+    "                 POST /v1/completions (legacy prompt form + echo).\n"
+    "                 Requires --port (binds 127.0.0.1; --host overrides).\n"
+    "  --port N       HTTP port for --serve-http (required with it)\n"
+    "  --host ADDR    HTTP bind address (default: 127.0.0.1)\n",
     p);
 }
 
@@ -4117,6 +4579,9 @@ int main(int argc, char** argv){
   bool stream = true;
   bool print_ids = false;
   bool serve = false;
+  bool serve_http = false;
+  int http_port = 0;
+  std::string http_host = "127.0.0.1";
   GpuMode gpu_mode = GpuMode::Auto;
   size_t tp_devices = 2;  // 2x Arc B580 fleet; Engine::load clamps to discovered
   int i = 1;
@@ -4140,11 +4605,22 @@ int main(int argc, char** argv){
     else if(a=="--no-stream") stream = false;
     else if(a=="--ids") print_ids = true;
     else if(a=="--serve") serve = true;
+    else if(a=="--serve-http") serve_http = true;
+    else if(a=="--port" && i+1<argc) http_port = std::atoi(argv[++i]);
+    else if(a=="--host" && i+1<argc) http_host = argv[++i];
     else if(a=="-h" || a=="--help"){ usage(argv[0]); return 0; }
     else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 2; }
     ++i;
   }
   if(intfer_path.empty()){ usage(argv[0]); return 2; }
+  if(serve && serve_http){
+    std::fprintf(stderr, "intfer: --serve and --serve-http are mutually exclusive\n");
+    return 2;
+  }
+  if(serve_http && http_port <= 0){
+    std::fprintf(stderr, "intfer: --serve-http requires --port N\n");
+    return 2;
+  }
   if(!prompt_file.empty()){
     FILE* f = fopen(prompt_file.c_str(), "r");
     if(!f){ std::fprintf(stderr, "cannot read -P %s\n", prompt_file.c_str()); return 1; }
@@ -4714,6 +5190,16 @@ int main(int argc, char** argv){
   if(prompts.empty()) prompts.emplace_back(""); // default prompt below
   // Stage 3.3 server: stdin JSON-lines loop (shares sched_* mechanics with
   // the 3.2 CLI batch path above). Branches before CLI prompt handling.
+  // --serve-http: same engine behind OpenAI-compatible HTTP endpoints.
+  if(serve_http){
+    SchedCtx sc{&T, embed, final_norm, lm_head, backend.get(),
+                &detok_py, &tokenizer_json, &tokenizer_py, print_ids};
+    int rc = run_serve_http(sc, wire_request, max_new, seed,
+                            temperature, top_k, top_p,
+                            http_host, http_port, cfg.model_id);
+    munmap_blob(mblob);
+    return rc;
+  }
   if(serve){
     SchedCtx sc{&T, embed, final_norm, lm_head, backend.get(),
                 &detok_py, &tokenizer_json, &tokenizer_py, print_ids};
