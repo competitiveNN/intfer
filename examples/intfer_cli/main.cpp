@@ -4083,26 +4083,28 @@ enum class GpuMode { Auto, ForceOn, ForceOff };
 // ============================================================================
 // Same engine, new skin: this section bridges the dependency-free HTTP layer
 // (http.hpp) + OpenAI request parsing (openai.hpp) to the exact tested
-// forward mechanics (sched_prefill + sched_iteration over a single-request
-// batch). Token ids are byte-identical to the --serve path for the same
+// --serve forward mechanics (chunked prefill + joint decode iterations over
+// a live batch). Token ids match the --serve path for the same
 // prompt/seed/sampling settings; only the transport differs (HTTP+SSE
 // instead of stdin/stdout JSON-lines).
 //
 // Concurrency model: the HTTP layer is thread-per-connection, but ALL engine
-// work (encode is process-spawned python, prefill+decode touch the backend)
-// runs under one global mutex. The forward path is not thread-safe
-// (thread_local KV scratch in kv_row_ptr, shared backend weight caches,
-// SYCL queue state), so concurrent HTTP requests queue on the mutex —
-// connection-level parallelism with serialized generation. This matches the
-// --serve scheduler's single-threaded forward; cross-request continuous
-// batching over HTTP is future work.
+// work runs on ONE dispatcher thread (the forward path is not thread-safe:
+// thread_local KV scratch in kv_row_ptr, shared backend weight caches, SYCL
+// queue state). Handler threads tokenize (process-spawned python, parallel)
+// then enqueue jobs; the dispatcher admits them into prefill_q/live and runs
+// the shared serve_iteration, so concurrent HTTP requests share M-row
+// forwards (cross-request continuous batching). SSE pieces flow
+// dispatcher -> per-job queue -> handler thread -> socket, so the engine
+// thread never touches sockets. INTFER_HTTP_SERIAL=1 restores the old
+// one-request-at-a-time http_generate path (A/B + rollback lever).
 //
 // Token accounting (verified against the HF oracle + test_cpu_parity.sh):
-// sched_prefill appends the prefill-predicted first token to q.generated,
-// then each sched_iteration appends one decode token. So q.generated holds
-// the FULL output stream including the prefill token, and every element is
-// emitted exactly once (EOS id itself is never emitted as text).
-static std::mutex g_engine_mu;
+// the prefill-predicted first token is emitted as generated[0], then each
+// decode iteration appends one token. So acc.ids holds the FULL output
+// stream including the prefill token, and every element is emitted exactly
+// once (EOS id itself is never emitted as text).
+static std::mutex g_engine_mu; // serial fallback only (INTFER_HTTP_SERIAL=1)
 static std::atomic<long> g_completion_seq{1};
 
 struct HttpGenOpts {
@@ -4122,9 +4124,234 @@ struct HttpGenOut {
   int prompt_tokens = 0;
 };
 
-// Run one completion under the engine mutex. on_token(piece, id) is invoked
-// per emitted token (used for SSE streaming); when null, tokens are only
-// accumulated into the returned HttpGenOut.
+// One HTTP completion as seen by the dispatcher: tokenized prompt +
+// sampling opts in, accumulated output stream + SSE piece queue out.
+// The Request (KV/SSM state) is dispatcher-owned; the handler thread only
+// touches mu/cv/pieces/done/cancelled.
+struct HttpJob {
+  std::vector<int> prompt_ids;
+  HttpGenOpts opts;
+  bool streaming = false;
+  long long seq = 0;             // completion id sequence (seed derivation)
+  Request req;                   // wired + filled by the dispatcher
+  HttpGenOut acc;                // accumulated ids/text/finish
+  size_t streamed = 0;           // acc.text prefix already queued as pieces
+  bool stopped = false;          // EOS/stop-string hit (finish => "stop")
+  bool prefill_emitted = false;  // generated[0] already emitted
+  std::atomic<bool> cancelled{false}; // handler: SSE socket died
+  // Handoff to the handler thread:
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<std::pair<std::string,int>> pieces; // (text delta, tok)
+  bool done = false;
+};
+
+// Dispatcher: single engine thread running serve_iteration over admitted
+// HTTP jobs. Handler threads submit() pre-tokenized jobs and wait; the
+// dispatcher loop admits (wire + prefill_q), iterates, emits per-row
+// tokens into job accumulators (+ SSE piece queues), and completes jobs.
+struct HttpDispatcher {
+  SchedCtx* c = nullptr;
+  const std::function<void(Request&)>* wire = nullptr;
+  uint32_t seed_base = 0;
+  int chunk_M = 8;
+  int serve_max = 8;
+  bool split_iter = false;
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<std::shared_ptr<HttpJob>> incoming; // handler -> dispatcher
+  std::atomic<bool> stop{false};
+  std::atomic<int> active{0}; // admitted-not-released jobs (for the 429 cap)
+  std::thread thr;
+  // Dispatcher-thread-only state:
+  std::list<std::shared_ptr<HttpJob>> jobs;      // admitted (stable addrs)
+  std::vector<Request*> live;                    // decoding (into jobs)
+  std::deque<Request*> prefill_q;                // admitted, filling
+  std::unordered_map<Request*, HttpJob*> r2j;
+  std::vector<float> Hb, Hpre;
+  std::vector<std::vector<float>> no_dump;       // server never records
+  int step_i = 0;
+
+  void start(SchedCtx& cc, const std::function<void(Request&)>& w,
+             uint32_t sb){
+    c = &cc; wire = &w; seed_base = sb;
+    if(const char* me = std::getenv("INTFER_PREFILL_CHUNK_M")){
+      int v = std::atoi(me); if(v >= 1 && v <= 1024) chunk_M = v;
+    }
+    serve_max = serve_live_cap(*wire);
+    split_iter = (std::getenv("INTFER_SPLIT_ITER") != nullptr);
+    thr = std::thread([this]{ loop(); });
+  }
+  void shutdown(){
+    stop = true;
+    cv.notify_all();
+    if(thr.joinable()) thr.join();
+  }
+  // Handler side: enqueue a pre-tokenized job (tokens already encoded off
+  // the engine thread). Returns null when the live cap is hit (caller
+  // answers 429); otherwise the job is admitted on the next iteration.
+  std::shared_ptr<HttpJob> submit(std::vector<int> prompt_ids,
+                                  const HttpGenOpts& o, bool streaming){
+    auto j = std::make_shared<HttpJob>();
+    j->prompt_ids = std::move(prompt_ids);
+    if(j->prompt_ids.empty())
+      j->prompt_ids = {760, 6511, 314, 9338, 369}; // same default as --serve
+    j->opts = o;
+    j->streaming = streaming;
+    j->seq = g_completion_seq.fetch_add(1);
+    j->acc.prompt_tokens = (int)j->prompt_ids.size();
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      if(active.load() + (int)incoming.size() >= serve_max)
+        return nullptr;
+      incoming.push_back(j);
+      active.fetch_add(1);
+    }
+    cv.notify_one();
+    return j;
+  }
+  // Handler side: wait for completion (non-streaming). Returns acc.
+  HttpGenOut await_done(const std::shared_ptr<HttpJob>& j){
+    std::unique_lock<std::mutex> lk(j->mu);
+    j->cv.wait(lk, [&]{ return j->done; });
+    return j->acc;
+  }
+ private:
+
+  // Dispatcher side: per-token emission into a job accumulator (mirrors
+  // the serial http_generate emit_one: EOS never text, stop strings cut
+  // the text, streaming jobs get exactly the kept delta as pieces).
+  void emit_one(HttpJob& j, int tok){
+    if(tok == 248044 || tok == 248046){ j.stopped = true; return; }
+    std::string piece = detokenize_one(tok, *c->detok_py, *c->tokenizer_json);
+    j.acc.ids.push_back(tok);
+    j.acc.text += piece;
+    for(auto& st : j.opts.stop){
+      if(st.empty()) continue;
+      size_t p = j.acc.text.find(st);
+      if(p != std::string::npos){
+        j.acc.text.resize(p);
+        j.stopped = true;
+        break;
+      }
+    }
+    if(j.streaming){
+      std::lock_guard<std::mutex> lk(j.mu);
+      if(j.acc.text.size() > j.streamed)
+        j.pieces.emplace_back(j.acc.text.substr(j.streamed), tok);
+      j.streamed = j.acc.text.size();
+      j.cv.notify_one();
+    }
+    if(j.stopped) j.req.finished = true;
+  }
+  void finish_job(const std::shared_ptr<HttpJob>& j){
+    {
+      std::lock_guard<std::mutex> lk(j->mu);
+      // ids keep every generated token (vLLM-style usage counting); text
+      // alone is stop-truncated. EOS/stop-string => "stop", else the
+      // request ended on the max_new budget => "length".
+      j->acc.finish = j->stopped ? "stop" : "length";
+      j->done = true;
+    }
+    j->cv.notify_all();
+  }
+  void loop(){
+    auto emit = [&](Request& q, size_t, int tok){
+      auto it = r2j.find(&q);
+      if(it != r2j.end()) emit_one(*it->second, tok);
+    };
+    for(;;){
+      // --- Admit FIFO while under the live cap (non-blocking drain).
+      {
+        std::unique_lock<std::mutex> lk(mu);
+        while(!incoming.empty() &&
+              (int)(live.size() + prefill_q.size()) < serve_max){
+          auto j = incoming.front();
+          incoming.pop_front();
+          lk.unlock(); // wire() touches only the job's own Request
+          (*wire)(j->req);
+          Request& q = j->req;
+          q.prompt_ids = j->prompt_ids;
+          // OpenAI max_tokens caps TOTAL completion tokens (prefill token
+          // included): the scheduler stops when generated.size() >=
+          // max_new+1, so subtract one here (same as serial path).
+          q.max_new = std::max(0, j->opts.max_new - 1);
+          q.temperature = j->opts.temperature;
+          q.top_k = j->opts.top_k;
+          q.top_p = j->opts.top_p;
+          q.rng = std::mt19937(j->opts.has_seed ? j->opts.seed
+                               : seed_base + (uint32_t)(j->seq & 0xffffff));
+          q.fill = 0; q.pos = 0;
+          q.id = (long)j->seq;
+          std::fprintf(stderr, "[intfer] http admit seq=%lld prompt=%zu max_new=%d live=%zu pq=%zu\n",
+                       j->seq, q.prompt_ids.size(), q.max_new,
+                       live.size(), prefill_q.size()+1);
+          prefill_q.push_back(&q);
+          r2j[&q] = j.get();
+          jobs.push_back(std::move(j));
+          lk.lock();
+        }
+      }
+      if(live.empty() && prefill_q.empty()){
+        if(stop.load()) break;
+        // Nothing to do: park until arrivals (avoids a hot spin when
+        // idle with the listener open but no work).
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&]{ return stop.load() || !incoming.empty(); });
+        if(stop.load() && incoming.empty()) break;
+        continue;
+      }
+      // Snapshot live membership: requests joining live below have just
+      // filled — their prefill token (generated[0]) is emitted after.
+      std::unordered_map<Request*, char> was_live;
+      for(Request* qp : live) was_live[qp] = 1;
+      serve_iteration(live, prefill_q, chunk_M, *c, Hb, Hpre, no_dump,
+                      emit, step_i, split_iter);
+      // Newly filled: emit the prefill token first in their stream.
+      for(Request* qp : live){
+        if(was_live.count(qp)) continue;
+        auto it = r2j.find(qp);
+        if(it == r2j.end()) continue;
+        HttpJob& j = *it->second;
+        if(!j.prefill_emitted){
+          j.prefill_emitted = true;
+          emit_one(j, qp->token);
+        }
+      }
+      // Compact live: drop finished/cancelled, complete their jobs.
+      std::vector<Request*> still;
+      for(Request* qp : live){
+        auto it = r2j.find(qp);
+        HttpJob* j = (it == r2j.end()) ? nullptr : it->second;
+        bool cancel = j && j->cancelled.load();
+        if(qp->finished || cancel){
+          if(j){
+            // Find the owning shared_ptr to finish + release state.
+            for(auto it2 = jobs.begin(); it2 != jobs.end(); ++it2){
+              if(it2->get() == j){
+                if(cancel && !qp->finished) qp->finished = true;
+                finish_job(*it2);
+                r2j.erase(qp);
+                jobs.erase(it2);
+                active.fetch_sub(1);
+                break;
+              }
+            }
+          }
+        } else {
+          still.push_back(qp);
+        }
+      }
+      live.swap(still);
+    }
+  }
+};
+
+// Run one completion under the engine mutex (serial fallback for
+// INTFER_HTTP_SERIAL=1, and the A/B reference for the dispatcher).
+// on_token(piece, id) is invoked per emitted token (used for SSE
+// streaming); when null, tokens are only accumulated into the returned
+// HttpGenOut.
 static HttpGenOut http_generate(
     const std::string& prompt, const HttpGenOpts& o,
     SchedCtx& c, const std::function<void(Request&)>& wire,
@@ -4200,8 +4427,9 @@ static HttpGenOut http_generate(
   return out;
 }
 
-// --serve-http request routing. All /v1/* completions funnel into
-// http_generate above; /health and /v1/models never touch the engine.
+// --serve-http request routing. All /v1/* completions funnel into the
+// dispatcher (or the serial http_generate under INTFER_HTTP_SERIAL=1);
+// /health and /v1/models never touch the engine.
 static int run_serve_http(SchedCtx& c,
                           const std::function<void(Request&)>& wire,
                           int dflt_max_new, uint32_t seed_base,
@@ -4210,6 +4438,24 @@ static int run_serve_http(SchedCtx& c,
                           const std::string& model_id) {
   using namespace intfer_openai;
   intfer_http::HttpServer srv;
+  static const bool http_serial = (std::getenv("INTFER_HTTP_SERIAL") != nullptr);
+  HttpDispatcher disp;
+  if(!http_serial) disp.start(c, wire, seed_base);
+  // Tokenize off the engine thread (process-spawned python, parallel
+  // across connections), then enqueue. Null => live cap hit (429).
+  auto submit_text = [&](const std::string& prompt, const HttpGenOpts& o,
+                         bool streaming) -> std::shared_ptr<HttpJob> {
+    std::vector<int> ids;
+    if(!prompt.empty())
+      ids = encode_text(prompt, *c.tokenizer_json, *c.tokenizer_py);
+    return disp.submit(std::move(ids), o, streaming);
+  };
+  // Serial fallback: identical opts handling to the dispatcher submit
+  // path (same defaults, same max_tokens accounting).
+  auto serial_gen = [&](const std::string& prompt, const HttpGenOpts& o,
+                        const std::function<void(const std::string&, int)>& on_token = {}) {
+    return http_generate(prompt, o, c, wire, seed_base, on_token);
+  };
   // max_new clamp mirrors ServeOpts ([1,4096]).
   auto clamp_max = [](int n, int dflt){
     if(n <= 0) return dflt;
@@ -4381,15 +4627,37 @@ static int run_serve_http(SchedCtx& c,
         resp.set("model", JVal::str(req_model));
         JVal ch = JVal::arr();
         int pt = 0, ct = 0;
-        for(size_t pi = 0; pi < legacy_prompts.size(); pi++){
-          HttpGenOut g = http_generate(legacy_prompts[pi], o, c, wire, seed_base);
-          std::string txt = legacy_echo ? legacy_prompts[pi] + g.text : g.text;
-          JVal c0 = JVal::obj();
-          c0.set("text", JVal::str(txt));
-          c0.set("index", JVal::number((double)pi));
-          c0.set("finish_reason", JVal::str(g.finish));
-          ch.push(c0);
-          pt += g.prompt_tokens; ct += (int)g.ids.size();
+        if(http_serial){
+          for(size_t pi = 0; pi < legacy_prompts.size(); pi++){
+            HttpGenOut g = serial_gen(legacy_prompts[pi], o);
+            std::string txt = legacy_echo ? legacy_prompts[pi] + g.text : g.text;
+            JVal c0 = JVal::obj();
+            c0.set("text", JVal::str(txt));
+            c0.set("index", JVal::number((double)pi));
+            c0.set("finish_reason", JVal::str(g.finish));
+            ch.push(c0);
+            pt += g.prompt_tokens; ct += (int)g.ids.size();
+          }
+        } else {
+          // Submit all prompts first so their decodes share M-row
+          // forwards, then await each in order.
+          std::vector<std::shared_ptr<HttpJob>> bjobs;
+          bjobs.reserve(legacy_prompts.size());
+          for(auto& pr : legacy_prompts){
+            auto j = submit_text(pr, o, false);
+            if(!j){ err(429, "server busy, all decode slots full", "server_error"); return; }
+            bjobs.push_back(std::move(j));
+          }
+          for(size_t pi = 0; pi < bjobs.size(); pi++){
+            HttpGenOut g = disp.await_done(bjobs[pi]);
+            std::string txt = legacy_echo ? legacy_prompts[pi] + g.text : g.text;
+            JVal c0 = JVal::obj();
+            c0.set("text", JVal::str(txt));
+            c0.set("index", JVal::number((double)pi));
+            c0.set("finish_reason", JVal::str(g.finish));
+            ch.push(c0);
+            pt += g.prompt_tokens; ct += (int)g.ids.size();
+          }
         }
         resp.set("choices", ch);
         resp.set("usage", usage_obj(pt, ct));
@@ -4413,7 +4681,7 @@ static int run_serve_http(SchedCtx& c,
         std::string finish = "stop";
         bool first = true;
         HttpGenOpts oo = o;
-        auto on_tok = [&](const std::string& piece, int){
+        auto send_piece = [&](const std::string& piece, int){
           JVal chunk = JVal::obj();
           chunk.set("id", JVal::str(cid));
           chunk.set("object", JVal::str(obj));
@@ -4437,10 +4705,48 @@ static int run_serve_http(SchedCtx& c,
           if(!rsp.chunk("data: " + json_dump(chunk) + "\n\n")) return;
           first = false;
         };
-        HttpGenOut g = http_generate(prompt_in, oo, c, wire, seed_base, on_tok);
-        prompt_toks = g.prompt_tokens;
-        comp_toks = (int)g.ids.size();
-        finish = g.finish;
+        HttpGenOut g;
+        if(http_serial){
+          auto on_tok = [&](const std::string& piece, int id){ send_piece(piece, id); };
+          g = serial_gen(prompt_in, oo, on_tok);
+          prompt_toks = g.prompt_tokens;
+          comp_toks = (int)g.ids.size();
+          finish = g.finish;
+        } else {
+          auto j = submit_text(prompt_in, oo, true);
+          if(!j){ err(429, "server busy, all decode slots full", "server_error"); return; }
+          prompt_toks = j->acc.prompt_tokens;
+          // Pump SSE pieces as the dispatcher produces them; a dead
+          // socket cancels the job (frees its KV/SSM state next iter).
+          bool dead = false;
+          for(;;){
+            std::pair<std::string,int> pc;
+            bool have = false, is_done = false;
+            {
+              std::unique_lock<std::mutex> lk(j->mu);
+              j->cv.wait(lk, [&]{ return !j->pieces.empty() || j->done; });
+              if(!j->pieces.empty()){
+                pc = std::move(j->pieces.front());
+                j->pieces.pop_front();
+                have = true;
+              }
+              is_done = j->done && j->pieces.empty();
+            }
+            if(have){
+              size_t before = comp_toks;
+              send_piece(pc.first, pc.second);
+              if(comp_toks == before){ dead = true; break; } // chunk() failed
+            }
+            if(is_done) break;
+          }
+          if(dead){ j->cancelled = true; return; }
+          {
+            std::lock_guard<std::mutex> lk(j->mu);
+            g = j->acc;
+          }
+          comp_toks = (int)g.ids.size();
+          finish = g.finish;
+        }
         // Terminal chunk (finish reason; usage only when requested).
         {
           JVal chunk = JVal::obj();
@@ -4467,7 +4773,14 @@ static int run_serve_http(SchedCtx& c,
         return;
       }
       // Non-streaming.
-      HttpGenOut g = http_generate(prompt_in, o, c, wire, seed_base);
+      HttpGenOut g;
+      if(http_serial){
+        g = serial_gen(prompt_in, o);
+      } else {
+        auto j = submit_text(prompt_in, o, false);
+        if(!j){ err(429, "server busy, all decode slots full", "server_error"); return; }
+        g = disp.await_done(j);
+      }
       if(is_chat){
         JVal resp = JVal::obj();
         long long seq = g_completion_seq.fetch_add(1);
@@ -4525,6 +4838,7 @@ static int run_serve_http(SchedCtx& c,
   std::signal(SIGTERM, [](int){ if(g_srv) g_srv->stop(); });
   srv.run();
   g_srv = nullptr;
+  if(!http_serial) disp.shutdown();
   return 0;
 }
 
