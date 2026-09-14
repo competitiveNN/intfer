@@ -973,14 +973,13 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     sycl::queue& q = dev.queue;
     auto N_local = end - start;
  
-    // 1) Write FP16 activation into the shared per-device workspace.
+    // 1) Write FP16 activation into the shared per-device workspace
+    // (one wide memcpy, not scalar half-stores into malloc_shared).
     std::uint16_t* const act_ptr = ws_[d].act;
 #ifdef INTFER_PROFILE_GPU
     auto t_w0 = std::chrono::high_resolution_clock::now();
 #endif
-    for (uint32_t m = 0; m < M; ++m)
-      for (uint32_t k = 0; k < t.K; ++k)
-        act_ptr[(size_t)m * t.K + k] = act_fp16[(size_t)m * t.K + k];
+    std::memcpy(act_ptr, act_fp16.data(), (size_t)M * t.K * sizeof(std::uint16_t));
 #ifdef INTFER_PROFILE_GPU
     {
       auto t1 = std::chrono::high_resolution_clock::now();

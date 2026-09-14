@@ -9,6 +9,7 @@ compile_commands.json
 
 # Generated quantized-model artifacts (large binaries; rebuild via scripts)
 *.intfer
+*.intifer
 *.dequant.bin
 *.unrot.dump
 *.noembed.intfer

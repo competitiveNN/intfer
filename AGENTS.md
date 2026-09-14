@@ -43,6 +43,29 @@ SYCL Command Graphs: Replace CUDA Graphs with sycl::ext::oneapi::experimental::c
 Stage 3.
 Implement features for maximizing throughput for concurrent requests, starting from continuous batching.
 
+## Performance targets (2x Arc Pro B580)
+
+- Token generation (decode): **40 tok/s** (per-stream, 0.8B model)
+- Prefill: **4000 tok/s**
+- Current (2026-09-14): 0.8B GPU decode ~11 tok/s TP=2, ~17 tok/s TP=1
+  (TP=1 wins 1.7x: 2x submits/transfers/readbacks outweigh halved kernel
+  time at tiny shapes). 27B GPU decode ~2.8 tok/s pinned TP=2
+  (kernel 66% of decode — TP tradeoff reverses vs 0.8B); TP=1 OOMs on 27B
+  (lm_head INT8 tile alloc fails: ~19GB on one ~12GB B580).
+  Per-token profile (0.8B TP=2): submit ~34%, host act/copy ~33%,
+  kernel ~20%, wait ~11%; run-to-run variance is +/-10%.
+- Dead ends (measured, do not retry as-is): device-side act-quant
+  (bit-exact probe passed but fused kernel slower: one-WI-per-16N-tile
+  layout replicates O(K) quant work nT x), host-private staging of DPAS
+  writes (neutral), staged readback (neutral), SYCL graphs on B580
+  (19.7us vs 11.9us plain submit).
+- Path to target: single-stream ceiling is ~17-20 tok/s (submit floor:
+  ~120us x ~2300 launches/token); 40 tok/s must come from aggregate
+  batching (--serve scheduler already M-row batches; cross-request HTTP
+  batching is the highest-value lever). Structural options: native L0
+  immediate command lists (bypass UR submit overhead, multi-day),
+  device-side SSM/attention (host O(pos) attention dominates long ctx).
+
 
 # guidelines
 
