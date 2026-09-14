@@ -56,8 +56,10 @@ static void segv_handler(int sig){
 #include <functional>
 #include <iostream>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <ctime>
 #include <unistd.h>
@@ -3836,24 +3838,11 @@ static std::string detokenize_one(int id, const std::string& detok_py,
 // decode share every iteration). Chunk-at-offset is the exact tested
 // sched_prefill mechanism; per-request KV/SSM state + absolute positions
 // make interleaving output-identical to admit-time prefill.
-static int run_serve(SchedCtx& c,
-                     const std::function<void(Request&)>& wire,
-                     int dflt_max_new, uint32_t seed,
-                     float dflt_temp, int dflt_top_k, float dflt_top_p){
-  std::vector<std::unique_ptr<Request>> pool; // all admitted (owning)
-  std::vector<Request*> live;                 // decoding (into pool)
-  std::deque<Request*> prefill_q;             // admitted, filling (into pool)
-  std::deque<std::string> pending;            // FIFO of unadmitted lines
-  int chunk_M = 8;
-  if(const char* me = std::getenv("INTFER_PREFILL_CHUNK_M")){
-    int v = std::atoi(me); if(v >= 1 && v <= 1024) chunk_M = v;
-  }
-  std::vector<float> Hpre; // reused prefill-chunk staging (shared, one chunk
-                           // in flight per iteration)
-  // Live cap: VRAM-aware default from per-request state bytes (KV caches +
-  // scratch arena + gscores, all host-side FP32; GPU weights are shared).
-  // Budget 8GB host for request state; INTFER_SERVE_MAX still overrides.
-  // Prefill input rows reuse one shared Hbuf (not per-request).
+// Live cap shared by --serve and the --serve-http dispatcher: VRAM-aware
+// default from per-request state bytes (KV caches + scratch arena +
+// gscores, all host-side FP32; GPU weights are shared). Budget 8GB host
+// for request state; INTFER_SERVE_MAX still overrides.
+static int serve_live_cap(const std::function<void(Request&)>& wire){
   int serve_max = 8;
   {
     size_t per_req = 0;
@@ -3887,16 +3876,109 @@ static int run_serve(SchedCtx& c,
   if(const char* me = std::getenv("INTFER_SERVE_MAX")){
     int v = std::atoi(me); if(v >= 1 && v <= 64) serve_max = v;
   }
-  long next_id = 1;
-  bool eof = false;
-  std::vector<std::vector<float>> no_dump; // server never records
-  std::vector<float> Hb;
-  int step_i = 0;
+  return serve_max;
+}
+
+// Round-robin rotation for the split prefill path: the served head goes to
+// the back unless it filled (filled requests leave via pop_front at their
+// fill site). INTFER_PREFILL_RR=0 restores head-of-line (FIFO) behavior.
+static void serve_rotate_unfilled(std::deque<Request*>& prefill_q, Request* served){
+  static const bool rr_off2 = (std::getenv("INTFER_PREFILL_RR") != nullptr &&
+                               std::string(std::getenv("INTFER_PREFILL_RR")) == "0");
+  if(rr_off2 || prefill_q.empty() || prefill_q.size() < 2) return;
+  if(prefill_q.front() == served && served->fill < (int)served->prompt_ids.size()){
+    prefill_q.pop_front();
+    prefill_q.push_back(served);
+  }
+}
+
+// One scheduler iteration over (live, prefill_q), shared verbatim by
+// --serve and the --serve-http dispatcher (identical forward mechanics):
+// joint forward (decode rows + head prefill chunk in one step_batch) when
+// possible, else the split chunk + decode forward. INTFER_SPLIT_ITER=1
+// forces the split path for A/B. Per-row token emission is the caller's
+// emit hook; live compaction / {"done"} accounting stays with callers.
+static void serve_iteration(std::vector<Request*>& live,
+                            std::deque<Request*>& prefill_q,
+                            int chunk_M, SchedCtx& c,
+                            std::vector<float>& Hb, std::vector<float>& Hpre,
+                            std::vector<std::vector<float>>& no_dump,
+                            const std::function<void(Request&, size_t, int)>& emit,
+                            int& step_i, bool split_iter){
+  auto split_chunk = [&](){
+    if(!prefill_q.empty()){
+      Request& q = *prefill_q.front();
+      int Sr = (int)q.prompt_ids.size();
+      int cm = std::min(chunk_M, Sr - q.fill);
+      // Single-token heads ride the joint forward (fused with decodes);
+      // multi-token chunks use the chunked prefill path bit-identically
+      // in both modes (output-identity gate compares per-id streams).
+      if(cm == 1 && !split_iter && !live.empty()){
+        int D = sched_iteration_joint(live, prefill_q, chunk_M, c, Hb,
+                                      emit, step_i++);
+        if(D >= 0) return; // joint carried it; accounting runs below
+        // D < 0: joint declined; fall through to the chunk block.
+      }
+      std::vector<int> toks(q.prompt_ids.begin() + q.fill,
+                            q.prompt_ids.begin() + q.fill + cm);
+      Hpre.assign((size_t)cm * cfg.H, 0.f);
+      StepOut o = prefill_layer_outer(q, toks, q.fill, *c.T, Hpre, c.embed,
+                                      c.final_norm, c.lm_head, c.backend,
+                                      no_dump);
+      q.fill += cm;
+      if(q.fill == Sr){
+        q.generated.push_back(o.best);
+        q.token = q.generated.back();
+        q.pos = Sr;
+        if(c.print_ids)
+          std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", q.id, q.token);
+        live.push_back(&q);
+        prefill_q.pop_front();
+      } else {
+        serve_rotate_unfilled(prefill_q, &q);
+      }
+    }
+    if(!live.empty()) sched_iteration(live, c, Hb, emit, step_i++);
+  };
+  if(split_iter){
+    split_chunk();
+  } else if(!prefill_q.empty() || !live.empty()){
+    int D = sched_iteration_joint(live, prefill_q, chunk_M, c, Hb,
+                                  emit, step_i++);
+    if(D < 0){
+      // Joint declines (BATCH_GEMM wide-chunk guard): run the split
+      // chunk for the head, then rotate so the next iteration serves the
+      // next queued request (round-robin; identical rotation in the
+      // joint path keeps both modes comparable).
+      split_chunk(); // joint declined: same split mechanics
+    }
+  }
+}
+static int run_serve(SchedCtx& c,
+                     const std::function<void(Request&)>& wire,
+                     int dflt_max_new, uint32_t seed,
+                     float dflt_temp, int dflt_top_k, float dflt_top_p){
+  std::vector<std::unique_ptr<Request>> pool; // all admitted (owning)
+  std::vector<Request*> live;                 // decoding (into pool)
+  std::deque<Request*> prefill_q;             // admitted, filling (into pool)
+  std::deque<std::string> pending;            // FIFO of unadmitted lines
+  int chunk_M = 8;
+  if(const char* me = std::getenv("INTFER_PREFILL_CHUNK_M")){
+    int v = std::atoi(me); if(v >= 1 && v <= 1024) chunk_M = v;
+  }
+  std::vector<float> Hpre; // reused prefill-chunk staging (shared, one chunk
+                           // in flight per iteration)
+  int serve_max = serve_live_cap(wire);
   // Joint prefill+decode forward (improvement C): one step_batch carries
   // decode rows + the head chunk. INTFER_SPLIT_ITER=1 restores the split
   // path (one chunk forward + one decode forward) for A/B testing; the
   // joint path is output-identical by construction (gated).
   static const bool split_iter = (std::getenv("INTFER_SPLIT_ITER") != nullptr);
+  long next_id = 1;
+  bool eof = false;
+  std::vector<std::vector<float>> no_dump; // server never records
+  std::vector<float> Hb;
+  int step_i = 0;
   auto emit_stream = [&](Request& q, size_t, int tok){
     std::string piece = detokenize_one(tok, *c.detok_py, *c.tokenizer_json);
     std::printf("{\"id\":%ld,\"token\":%d,\"text\":\"%s\"}\n",
@@ -3955,75 +4037,10 @@ static int run_serve(SchedCtx& c,
       else if(o.id >= next_id) next_id = o.id + 1;
       admit(prompt, o);
     }
-    // --- Joint iteration: one forward carries decode rows + up to chunk_M
-    // prefill rows for the queue head (or the split path under
-    // INTFER_SPLIT_ITER=1, or when the joint helper declines under
-    // BATCH_GEMM). The split chunk block is factored as a lambda so both
-    // the explicit split mode and the joint-decline fallback share it
-    // verbatim.
-    auto split_chunk = [&](){
-      auto rotate_unfilled = [&](Request* served){
-        // Round-robin: the served head goes to the back unless it filled
-        // (filled requests leave via pop_front at their fill site). Runs
-        // for every split-path chunk AND every joint decline so the two
-        // paths rotate identically (output-identity gate compares per-id
-        // streams, but identical rotation also keeps scheduling comparable).
-        // INTFER_PREFILL_RR=0 restores head-of-line (FIFO) behavior.
-        static const bool rr_off2 = (std::getenv("INTFER_PREFILL_RR") != nullptr &&
-                                     std::string(std::getenv("INTFER_PREFILL_RR")) == "0");
-        if(rr_off2 || prefill_q.empty() || prefill_q.size() < 2) return;
-        if(prefill_q.front() == served && served->fill < (int)served->prompt_ids.size()){
-          prefill_q.pop_front();
-          prefill_q.push_back(served);
-        }
-      };
-      if(!prefill_q.empty()){
-        Request& q = *prefill_q.front();
-        int Sr = (int)q.prompt_ids.size();
-        int cm = std::min(chunk_M, Sr - q.fill);
-        // Single-token heads ride the joint forward (fused with decodes);
-        // multi-token chunks use the chunked prefill path bit-identically
-        // in both modes (output-identity gate compares per-id streams).
-        if(cm == 1 && !split_iter && !live.empty()){
-          int D = sched_iteration_joint(live, prefill_q, chunk_M, c, Hb,
-                                        emit_stream, step_i++);
-          if(D >= 0) return; // joint carried it; accounting runs below
-          // D < 0: joint declined; fall through to the chunk block.
-        }
-        std::vector<int> toks(q.prompt_ids.begin() + q.fill,
-                              q.prompt_ids.begin() + q.fill + cm);
-        Hpre.assign((size_t)cm * cfg.H, 0.f);
-        StepOut o = prefill_layer_outer(q, toks, q.fill, *c.T, Hpre, c.embed,
-                                        c.final_norm, c.lm_head, c.backend,
-                                        no_dump);
-        q.fill += cm;
-        if(q.fill == Sr){
-          q.generated.push_back(o.best);
-          q.token = q.generated.back();
-          q.pos = Sr;
-          if(c.print_ids)
-            std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", q.id, q.token);
-          live.push_back(&q);
-          prefill_q.pop_front();
-        } else {
-          rotate_unfilled(&q);
-        }
-      }
-      if(!live.empty()) sched_iteration(live, c, Hb, emit_stream, step_i++);
-    };
-    if(split_iter){
-      split_chunk();
-    } else if(!prefill_q.empty() || !live.empty()){
-      int D = sched_iteration_joint(live, prefill_q, chunk_M, c, Hb,
-                                    emit_stream, step_i++);
-      if(D < 0){
-        // Joint declines (BATCH_GEMM wide-chunk guard): run the split
-        // chunk for the head, then rotate so the next iteration serves the
-        // next queued request (round-robin; identical rotation in the
-        // joint path keeps both modes comparable).
-        split_chunk(); // joint declined: same split mechanics
-      }
-    }
+    // --- One scheduler iteration: joint forward (decode rows + head
+    // prefill chunk) or the split path; shared verbatim with --serve-http.
+    serve_iteration(live, prefill_q, chunk_M, c, Hb, Hpre, no_dump,
+                    emit_stream, step_i, split_iter);
     // --- Per-iteration accounting: {"done"} emission + live compaction.
     // Runs whenever live is non-empty after the forward(s) above (a filled
     // prefill request may have joined). EOF/idle drain when all queues
