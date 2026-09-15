@@ -798,9 +798,9 @@ struct GpuBackend : public LinearBackend {
       // Alloc failure (VRAM pressure) must not leave a half-initialized
       // cache: the next call would GEMM from nullptr (DEVICE_LOST). Free
       // partials and reset so the next call retries cleanly (caller gets
-      // {} -> zero logits for this token).
-      for(size_t dd=0; dd<x_devs.size(); ++dd)
-        if(x_devs[dd]) sycl::free(x_devs[dd], eng->device_queue((int)dd));
+      // {} -> zero logits for this token). x_devs entries are aliases of
+      // the persistent lm_head_x_dev_ buffers — clear the list but do NOT
+      // free them here (freed with the rest of the cache below).
       x_devs.clear();
       for(size_t d=0; d<ndev; ++d){
         for(size_t t=0; t<lm_head_q_dev_[d].size(); ++t){
@@ -812,10 +812,22 @@ struct GpuBackend : public LinearBackend {
             sycl::free(lm_head_s_dev_[d][t], eng->device_queue((int)d));
             lm_head_s_dev_[d][t] = nullptr;
           }
+          if(t<lm_head_b_dev_[d].size() && lm_head_b_dev_[d][t]){
+            sycl::free(lm_head_b_dev_[d][t], eng->device_queue((int)d));
+            lm_head_b_dev_[d][t] = nullptr;
+          }
           if(t<lm_head_c_dev_[d].size() && lm_head_c_dev_[d][t]){
             sycl::free(lm_head_c_dev_[d][t], eng->device_queue((int)d));
             lm_head_c_dev_[d][t] = nullptr;
           }
+        }
+        if(d < lm_head_aq_dev_.size() && lm_head_aq_dev_[d]){
+          sycl::free(lm_head_aq_dev_[d], eng->device_queue((int)d));
+          lm_head_aq_dev_[d] = nullptr;
+        }
+        if(d < lm_head_as_dev_.size() && lm_head_as_dev_[d]){
+          sycl::free(lm_head_as_dev_[d], eng->device_queue((int)d));
+          lm_head_as_dev_[d] = nullptr;
         }
         for(size_t t=0; t<lm_head_w_dev_[d].size(); ++t){
           if(lm_head_w_dev_[d][t]){
@@ -823,9 +835,16 @@ struct GpuBackend : public LinearBackend {
             lm_head_w_dev_[d][t] = nullptr;
           }
         }
+        if(d < lm_head_x_dev_.size() && lm_head_x_dev_[d]){
+          sycl::free(lm_head_x_dev_[d], eng->device_queue((int)d));
+          lm_head_x_dev_[d] = nullptr;
+        }
       }
       lm_head_q_dev_.clear(); lm_head_s_dev_.clear();
+      lm_head_b_dev_.clear();
       lm_head_w_dev_.clear(); lm_head_c_dev_.clear();
+      lm_head_aq_dev_.clear(); lm_head_as_dev_.clear();
+      lm_head_x_dev_.clear();
       lm_head_ranges_.clear(); lm_head_tiles_.clear();
       lm_head_N_ = 0; lm_head_K_ = 0;
     };
@@ -839,7 +858,10 @@ struct GpuBackend : public LinearBackend {
       } else {
         lm_head_q_dev_.resize(ndev);
         lm_head_s_dev_.resize(ndev);
+        lm_head_b_dev_.resize(ndev);
         lm_head_c_dev_.resize(ndev);
+        lm_head_aq_dev_.resize(ndev, nullptr);
+        lm_head_as_dev_.resize(ndev, nullptr);
       }
       if(ndev == 1){
         lm_head_ranges_[0] = {0, N};
@@ -882,6 +904,13 @@ struct GpuBackend : public LinearBackend {
           }
         }
         if(split0 == 0 || split0 >= N) split0 = N / (uint32_t)ndev;
+        // DPAS s8-weight path needs N_local % 16 == 0 per device (repack
+        // gate): round dev0's split down to a multiple of 16. N (vocab)
+        // is itself %16==0, so dev1's shard stays %16==0 too. Rows are
+        // independent — any partition concatenates to the same logits.
+        split0 = (split0 / 16) * 16;
+        if(split0 < 16) split0 = 16;
+        if(split0 >= N) split0 = (N / 16 - 1) * 16;
         lm_head_ranges_[0] = {0, split0};
         if(ndev > 1) lm_head_ranges_[1] = {split0, N};
         for(size_t d=2; d<ndev; ++d) lm_head_ranges_[d] = {N, N};
@@ -892,8 +921,12 @@ struct GpuBackend : public LinearBackend {
       // Rows per tile: cap tile weight bytes at 128MB so the upload fits
       // alongside the preloaded engine. >=1 row. (INT8 tiles are 2x smaller
       // than the FP16 ones this formula was sized for — conservative.)
+      // Rounded down to %16==0 so DPAS tiles repack (same %16 logic as the
+      // TP split above; tile remainders of a %16 range stay %16).
       uint32_t tile_rows = (uint32_t)std::max<size_t>(
           1, (128u * 1024u * 1024u) / ((size_t)K * sizeof(sycl::half)));
+      tile_rows = (tile_rows / 16) * 16;
+      if(tile_rows < 16) tile_rows = 16;
       for(size_t d=0; d<ndev; ++d){
         uint32_t start = lm_head_ranges_[d].first, end = lm_head_ranges_[d].second;
         if(end <= start) continue;
@@ -991,6 +1024,45 @@ struct GpuBackend : public LinearBackend {
             q.memcpy(lm_head_s_dev_[d][t_idx], q_sc.data(),
                      (size_t)Nl * sizeof(sycl::half));
             q.wait();
+            // DPAS s8-weight path: repack row-major codes to vertical-B
+            // tiles once (same bytes: Nl*K s8 = nT*nOp*512). Shape-gated:
+            // Nl%16==0 && K%32==0, else the per-token path falls back to
+            // the scalar INT8 kernel for that tile.
+            std::vector<std::uint8_t> dpas_tiles;
+            std::int8_t* b_tile = nullptr;
+            if(gemm::repack_dpas412(
+                   reinterpret_cast<const std::uint8_t*>(q_i8.data()),
+                   Nl, K, 8, dpas_tiles)){
+              try {
+                b_tile = static_cast<std::int8_t*>(sycl::malloc_device(
+                    dpas_tiles.size(), q.get_device(), q.get_context()));
+              } catch (...) { b_tile = nullptr; }
+              if(b_tile){
+                q.memcpy(b_tile, dpas_tiles.data(), dpas_tiles.size());
+                q.wait();
+              }
+            }
+            // b_tile==nullptr marks "DPAS refused": scalar fallback.
+            lm_head_b_dev_[d].push_back(b_tile);
+          }
+        }
+        // Per-device INT8 act-quant workspaces for the DPAS s8-weight path:
+        // M=1 row of INT8 acts (K bytes) + ceil(K/64) FP32 GA-slice scales.
+        // Lazily (re)allocated here — K is fixed after the first upload.
+        if(!force_fp16 && !lm_head_tiles_[d].empty()){
+          uint32_t nGA = (K + 63) / 64;
+          if(!lm_head_aq_dev_[d]){
+            try {
+              lm_head_aq_dev_[d] = static_cast<std::int8_t*>(sycl::malloc_device(
+                  K, q.get_device(), q.get_context()));
+              lm_head_as_dev_[d] = static_cast<float*>(sycl::malloc_device(
+                  (size_t)nGA * sizeof(float), q.get_device(), q.get_context()));
+            } catch (...) {
+              if(lm_head_aq_dev_[d]){ sycl::free(lm_head_aq_dev_[d], q); lm_head_aq_dev_[d] = nullptr; }
+              if(lm_head_as_dev_[d]){ sycl::free(lm_head_as_dev_[d], q); lm_head_as_dev_[d] = nullptr; }
+            }
+            // Workspaces are best-effort: nullptr just disables the DPAS
+            // path per token (scalar fallback), like b_tile==nullptr above.
           }
         }
       }
@@ -1004,10 +1076,25 @@ struct GpuBackend : public LinearBackend {
     }
     // Upload activation as FP16 and run GEMM. Read back halves and
     // convert on the host (device buffer holds N halves, not N floats).
-    // x_dev frees are deferred until after the kernel events complete
-    // (sycl::free acts on the host immediately; freeing in-loop is a
-    // use-after-free race against the not-yet-run kernel).
+    // x_dev buffers are persistent per device (K fixed = lm_head_K_): the
+    // per-token malloc_device in the hot loop cost a UR alloc round-trip
+    // each call. x_devs still tracks this call's buffers only (frees are
+    // deferred until after the kernel events complete — sycl::free acts on
+    // the host immediately; freeing in-loop is a use-after-free race
+    // against the not-yet-run kernel).
+    //
+    // GEMM dispatch (INT8 path): the DPAS s8-weight kernel
+    // (gemm::quant_gemm_dpas_s8w) runs when the tile repacked at upload
+    // (lm_head_b_dev_) AND the act-quant workspaces exist. It needs INT8
+    // acts + FP32 GA=64 scales, quantized on the host per token (the cost
+    // the device-side layout was rejected for is O(K) per token — the same
+    // O(K) the H2D upload already pays; the win is the XMX kernel replacing
+    // the 64x64x64 scalar emulation). INTFER_LMHEAD_DPAS=0 force-disables
+    // (bisection). Missing tiles/workspaces fall back to
+    // quant_gemm_f16_int8w per tile.
     static const bool trace_lm = (std::getenv("INTFER_TRACE_LMHEAD") != nullptr);
+    static const bool no_dpas = (std::getenv("INTFER_LMHEAD_DPAS") &&
+                                 std::getenv("INTFER_LMHEAD_DPAS")[0] == '0');
     auto t_lm0 = std::chrono::high_resolution_clock::now();
     std::vector<sycl::half> x_fp16(K);
     for(uint32_t i=0;i<K;i++) x_fp16[i] = sycl::half(fn[i]);
@@ -1022,17 +1109,62 @@ struct GpuBackend : public LinearBackend {
       uint32_t Nl = end - start;
       out_seg[d].resize(Nl);
       sycl::queue& q = eng->device_queue((int)d);
-      // x_dev alloc can throw under VRAM pressure (submit path throws
-      // UR_RESULT_ERROR_OUT_OF_RESOURCES too — see below): degrade to {}
-      // via fail_reset instead of SIGABRT.
-      sycl::half* x_dev = nullptr;
-      try {
-        x_dev = static_cast<sycl::half*>(
-            sycl::malloc_device((size_t)K * sizeof(sycl::half), q.get_device(), q.get_context()));
-      } catch (...) { x_dev = nullptr; }
-      if(!x_dev){ fail_reset(); return {}; }
+      // Persistent per-device activation buffer (K fixed for this head).
+      // Reused across tokens; resized only if K changes (never in steady
+      // state — lm_head_N_/K_ are fixed after the first upload).
+      sycl::half* x_dev = (d < lm_head_x_dev_.size()) ? lm_head_x_dev_[d] : nullptr;
+      if(!x_dev){
+        // x_dev alloc can throw under VRAM pressure (submit path throws
+        // UR_RESULT_ERROR_OUT_OF_RESOURCES too — see below): degrade to {}
+        // via fail_reset instead of SIGABRT.
+        try {
+          x_dev = static_cast<sycl::half*>(
+              sycl::malloc_device((size_t)K * sizeof(sycl::half), q.get_device(), q.get_context()));
+        } catch (...) { x_dev = nullptr; }
+        if(!x_dev){ fail_reset(); return {}; }
+        if(d >= lm_head_x_dev_.size()) lm_head_x_dev_.resize(d + 1, nullptr);
+        lm_head_x_dev_[d] = x_dev;
+      }
       x_devs.push_back(x_dev);
-      q.memcpy(x_dev, x_fp16.data(), (size_t)K * sizeof(sycl::half));
+      // DPAS path quantizes FP32->INT8 on the host (per GA=64 slice) and
+      // uploads the small INT8 row + scales; the scalar path uploads FP16.
+      // Only pay for the path we will actually take on this device.
+      bool use_dpas = !force_fp16 && !no_dpas && d < lm_head_aq_dev_.size() &&
+                      lm_head_aq_dev_[d] && lm_head_as_dev_[d] &&
+                      !lm_head_tiles_[d].empty();
+      if(use_dpas){
+        for(size_t t=0; t<lm_head_tiles_[d].size(); ++t){
+          if(t >= lm_head_b_dev_[d].size() || !lm_head_b_dev_[d][t]){
+            use_dpas = false;
+            break;
+          }
+        }
+      }
+      if(use_dpas){
+        uint32_t nGA = (K + 63) / 64;
+        std::vector<std::int8_t> aq(K);
+        std::vector<float> as(nGA);
+        for(uint32_t g=0; g<nGA; ++g){
+          uint32_t k0 = g * 64, k1 = std::min(k0 + 64, K);
+          float mx = 1e-6f;
+          for(uint32_t k=k0;k<k1;k++){
+            float v = fn[k] >= 0 ? fn[k] : -fn[k];
+            if(v > mx) mx = v;
+          }
+          float s = mx / 127.0f, inv = 1.0f / s;
+          as[g] = s;
+          for(uint32_t k=k0;k<k1;k++){
+            float v = fn[k] * inv;
+            if(v > 127.0f) v = 127.0f;
+            else if(v < -127.0f) v = -127.0f;
+            aq[k] = (std::int8_t)std::lrint(v);
+          }
+        }
+        q.memcpy(lm_head_aq_dev_[d], aq.data(), K);
+        q.memcpy(lm_head_as_dev_[d], as.data(), (size_t)nGA * sizeof(float));
+      } else {
+        q.memcpy(x_dev, x_fp16.data(), (size_t)K * sizeof(sycl::half));
+      }
       // One GEMM per resident tile; tiles concatenate in row order.
       // The submit itself can throw when the device is full — catch per
       // tile so a shortfall degrades to {} (fail_reset frees everything
@@ -1042,12 +1174,33 @@ struct GpuBackend : public LinearBackend {
         uint32_t Nlt = te - ts;
         sycl::event evt;
         try {
-          evt = force_fp16
-              ? gemm::quant_gemm_f16(q, x_dev, lm_head_w_dev_[d][t],
-                                     lm_head_c_dev_[d][t], 1, Nlt, K)
-              : gemm::quant_gemm_f16_int8w(q, x_dev, lm_head_q_dev_[d][t],
-                                           lm_head_s_dev_[d][t],
-                                           lm_head_c_dev_[d][t], 1, Nlt, K);
+          if(force_fp16){
+            evt = gemm::quant_gemm_f16(q, x_dev, lm_head_w_dev_[d][t],
+                                       lm_head_c_dev_[d][t], 1, Nlt, K);
+          } else if(use_dpas){
+            gemm::Dpas48Params p;
+            p.code_dpas = lm_head_b_dev_[d][t];
+            // Tile rows are contiguous in N: tile row r == global row ts+r
+            // (tiles partition [start,end) in order), so the scale pointer
+            // is s_tile + (ts - start).
+            p.scale_usm = reinterpret_cast<const std::uint16_t*>(
+                lm_head_s_dev_[d][t]) + (ts - start);
+            p.act_int8 = lm_head_aq_dev_[d];
+            p.act_scale = lm_head_as_dev_[d];
+            p.alpha = 1.0f;
+            p.out_usm = reinterpret_cast<std::uint16_t*>(lm_head_c_dev_[d][t]);
+            p.M = 1;
+            p.N = Nlt;
+            p.K = K;
+            p.group_size = K;  // per-row scales => one w-group per row
+            p.act_group = 64;
+            p.bits = 8;
+            evt = gemm::quant_gemm_dpas_s8w(q, p);
+          } else {
+            evt = gemm::quant_gemm_f16_int8w(q, x_dev, lm_head_q_dev_[d][t],
+                                             lm_head_s_dev_[d][t],
+                                             lm_head_c_dev_[d][t], 1, Nlt, K);
+          }
         } catch (...) {
           std::fprintf(stderr, "[intfer] FATAL: lm_head GEMM submit failed "
                        "on device %zu tile %zu (VRAM pressure?)\n", d, t);
@@ -1071,8 +1224,9 @@ struct GpuBackend : public LinearBackend {
       }
     }
     for(auto& e : evts) e.wait();
-    for(size_t d=0; d<eng->num_devices(); ++d)
-      sycl::free(x_devs[d], eng->device_queue((int)d));
+    // x_dev buffers are persistent (see above): do NOT free here.
+    // (Old code freed + reallocated per token.)
+    x_devs.clear();
     // Concatenate the TP row shards into full-vocab order.
     for(size_t d=0; d<eng->num_devices(); ++d){
       uint32_t start = lm_head_ranges_[d].first;
@@ -1091,11 +1245,17 @@ struct GpuBackend : public LinearBackend {
 
   // Cache state for lm_head upload (tiled per device).
   // INT8 path (default): per-tile INT8 codes + FP16 row scales + FP16 out.
+  // DPAS s8w sub-path: per-tile repacked vertical-B codes (lm_head_b_dev_)
+  // + persistent INT8 act / FP32 GA-scale workspaces (lm_head_aq_/as_dev_).
   // FP16 path (INTFER_LMHEAD_FP16=1, bisection only): per-tile FP16 weights.
   std::vector<std::vector<sycl::half*>> lm_head_w_dev_;  // fp16 weights (fp16 path)
   std::vector<std::vector<std::int8_t*>> lm_head_q_dev_;  // int8 codes (int8 path)
   std::vector<std::vector<sycl::half*>> lm_head_s_dev_;  // fp16 row scales (int8 path)
+  std::vector<std::vector<std::int8_t*>> lm_head_b_dev_;  // repacked s8 tiles (dpas path)
+  std::vector<std::int8_t*> lm_head_aq_dev_;  // persistent INT8 act rows (1/device)
+  std::vector<float*> lm_head_as_dev_;  // persistent FP32 GA scales (1/device)
   std::vector<std::vector<sycl::half*>> lm_head_c_dev_;  // fp16 outputs (both)
+  std::vector<sycl::half*> lm_head_x_dev_;  // persistent act buffers (1/device)
   std::vector<std::pair<uint32_t,uint32_t>> lm_head_ranges_;  // TP row shard per device
   std::vector<std::vector<std::pair<uint32_t,uint32_t>>> lm_head_tiles_;  // upload/GEMM tiles per device
   uint32_t lm_head_N_ = 0, lm_head_K_ = 0;
