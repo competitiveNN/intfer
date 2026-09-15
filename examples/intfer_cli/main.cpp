@@ -513,6 +513,8 @@ struct CpuBackend : public LinearBackend {
     if(xn < (size_t)K) K = (int)xn; // tolerate over-wide x (attn+gate probe)
     std::vector<float> y(N, 0.f);
     const float* xp = x.data();
+    // Same OpenMP row-split as run_linear_into (bit-identical scalar rows).
+#pragma omp parallel for schedule(static) if(N >= 2048)
     for(int i=0;i<N;i++){ const float* wr=W+(size_t)i*cache_K[name]; float s=0;
       for(int k=0;k<K;k++) s+=wr[k]*xp[k]; y[i]=s; }
     if(!keep_cached){
@@ -543,6 +545,12 @@ struct CpuBackend : public LinearBackend {
     if(out.size() != (size_t)N) out.assign(N, 0.f);
     float* yp = out.data();
     const float* xp = x.data();
+    // Thread over independent output rows for large GEMMs (N>=2048: gate/up
+    // at 3584, lm_head at 248K). Row loop is unchanged scalar FP32 (same
+    // order, same rounding -> bit-identical); OpenMP only splits rows.
+    // if() keeps small GEMMs serial (fork ~50-170us would dominate).
+    // Microbench (20 threads): gate/up 1684->~320us, lm_head 104ms->15.6ms.
+#pragma omp parallel for schedule(static) if(N >= 2048)
     for(int i=0;i<N;i++){ const float* wr=W+(size_t)i*cache_K[name]; float s=0;
       for(int k=0;k<K;k++) s+=wr[k]*xp[k]; yp[i]=s; }
     if(!keep_cached){
@@ -714,6 +722,8 @@ struct GpuBackend : public LinearBackend {
               int Kw = (int)W.size() / N;
               int actual_K = std::min(K, Kw);
               std::vector<float> y(N, 0.f);
+              // Same OpenMP row-split (bit-identical scalar rows).
+#pragma omp parallel for schedule(static) if(N >= 2048)
               for(int i=0;i<N;i++){ const float* wr=&W[i*actual_K]; float s=0;
                 for(int k=0;k<actual_K;k++) s+=wr[k]*x[k]; y[i]=s; }
               return y;

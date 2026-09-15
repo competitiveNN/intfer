@@ -62,6 +62,19 @@ if(EXISTS "${_sycl_lib_dir}/libsycl.so")
   add_link_options("-Wl,-rpath,${_sycl_lib_dir}")
 endif()
 
+# OpenMP (shared-memory row-parallel GEMM on the CPU backend + host
+# elementwise): icpx needs -qopenmp at compile AND link; libiomp5 lives in
+# the same oneAPI lib dir already on the RPATH, so no loader path changes.
+# GCC builds use -fopenmp. Scoped to host code only (SYCL device code must
+# never see OMP pragmas — none of the kernel TUs use them).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+  add_compile_options(-qopenmp)
+  add_link_options(-qopenmp)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  add_compile_options(-fopenmp)
+  add_link_options(-fopenmp)
+endif()
+
 if(INTFER_ENABLE_L0)
   find_library(ZE_LOADER NAMES ze_loader)
   if(NOT ZE_LOADER)
