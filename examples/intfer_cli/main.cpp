@@ -1303,11 +1303,15 @@ struct GpuBackend : public LinearBackend {
           } else if(use_dpas){
             gemm::Dpas48Params p;
             p.code_dpas = lm_head_b_dev_[d][t];
-            // Tile rows are contiguous in N: tile row r == global row ts+r
-            // (tiles partition [start,end) in order), so the scale pointer
-            // is s_tile + (ts - start).
+            // Scale buffer is PER-TILE (Nlt entries, uploaded from this
+            // tile's q_sc): the kernel indexes it tile-locally (n = t*TN+nl
+            // in [0,Nlt)), so pass the tile base with NO offset. The old
+            // `+ (ts - start)` treated it as a shard base and read OOB
+            // garbage scales for every tile past the first (0.8B TP=1 has
+            // 4 tiles: 75% of vocab rows got garbage scales -> argmax
+            // flipped 11751 -> 196618; FP16/nodpas paths were unaffected).
             p.scale_usm = reinterpret_cast<const std::uint16_t*>(
-                lm_head_s_dev_[d][t]) + (ts - start);
+                lm_head_s_dev_[d][t]);
             p.act_int8 = lm_head_aq_dev_[d];
             p.act_scale = lm_head_as_dev_[d];
             p.alpha = 1.0f;
