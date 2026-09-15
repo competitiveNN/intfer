@@ -900,9 +900,9 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
     const std::uint16_t* out_ptr = ws_[d].out;
     const uint32_t N_local_rb = static_cast<uint32_t>(end - start);
     for (uint32_t m = 0; m < M; ++m)
-      for (uint32_t r = 0; r < N_local_rb; ++r)
-        out[(size_t)m * t.N + (start + r)] =
-            dashq::half_to_float(out_ptr[(size_t)m * N_local_rb + r]);
+      dashq::half_to_float_batch(out_ptr + (size_t)m * N_local_rb,
+                                 out.data() + (size_t)m * t.N + start,
+                                 N_local_rb);
   }
 #ifdef INTFER_PROFILE_GPU
   {
@@ -952,9 +952,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
 #endif
   if (act_staging_.size() != (size_t)M * t.K) act_staging_.resize((size_t)M * t.K);
   std::vector<std::uint16_t>& act_fp16 = act_staging_;
-  for (uint32_t m = 0; m < M; ++m)
-    for (uint32_t k = 0; k < t.K; ++k)
-      act_fp16[(size_t)m * t.K + k] = dashq::float_to_half(x[(size_t)m * t.K + k]);
+  dashq::float_to_half_batch(x.data(), act_fp16.data(), (size_t)M * t.K);
 #ifdef INTFER_PROFILE_GPU
   {
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -1052,8 +1050,9 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     const std::uint16_t* out_ptr = ws_[d].out;
     const uint32_t N_local_rb = static_cast<uint32_t>(end - start);
     for (uint32_t m = 0; m < M; ++m)
-      for (uint32_t r = 0; r < N_local_rb; ++r)
-        out[(size_t)m * t.N + (start + r)] = dashq::half_to_float(out_ptr[(size_t)m * N_local_rb + r]);
+      dashq::half_to_float_batch(out_ptr + (size_t)m * N_local_rb,
+                                 out.data() + (size_t)m * t.N + start,
+                                 N_local_rb);
   }
 #ifdef INTFER_PROFILE_GPU
   {

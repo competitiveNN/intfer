@@ -8,12 +8,85 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 namespace intfer {
 namespace dashq {
+
+#if defined(__x86_64__) || defined(_M_X64)
+// F16C probe: _mm256_cvtps_ph faults with #UD without F16C. cpuid leaf 1,
+// ECX bit 29.
+bool f16c_available() {
+  static const bool ok = [] {
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+#if defined(_MSC_VER)
+    int regs[4];
+    __cpuid(regs, 1);
+    ecx = (unsigned int)regs[2];
+#else
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(1u), "c"(0u));
+#endif
+    return (ecx & (1u << 29)) != 0;
+  }();
+  return ok;
+}
+
+// 8-wide F16C kernels. Function-target keeps AVX2/F16C codegen local to
+// these routines (supported by GCC, Clang, and icpx).
+__attribute__((target("f16c,avx2")))
+static void f32_to_h16_f16c(const float* x, uint16_t* y, size_t n) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256 v = _mm256_loadu_ps(x + i);
+    __m128i h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    // Full 128-bit store: cvtps_ph packs all 8 halves into the __m128i;
+    // storel_epi64 would write only the low 4.
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(y + i), h);
+  }
+  for (; i < n; ++i) {
+    __m128 s = _mm_load_ss(x + i);
+    __m128i h = _mm_cvtps_ph(s, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    y[i] = (uint16_t)_mm_cvtsi128_si32(h);
+  }
+}
+
+__attribute__((target("f16c,avx2")))
+static void h16_to_f32_f16c(const uint16_t* x, float* y, size_t n) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + i));
+    __m256 v = _mm256_cvtph_ps(h);
+    _mm256_storeu_ps(y + i, v);
+  }
+  for (; i < n; ++i) {
+    __m128i h = _mm_cvtsi32_si128(x[i]);
+    __m128 s = _mm_cvtph_ps(h);
+    _mm_store_ss(y + i, s);
+  }
+}
+#endif
+
+void float_to_half_batch(const float* x, uint16_t* y, size_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+  if (f16c_available()) { f32_to_h16_f16c(x, y, n); return; }
+#endif
+  for (size_t i = 0; i < n; ++i) y[i] = float_to_half(x[i]);
+}
+
+void half_to_float_batch(const uint16_t* x, float* y, size_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+  if (f16c_available()) { h16_to_f32_f16c(x, y, n); return; }
+#endif
+  for (size_t i = 0; i < n; ++i) y[i] = half_to_float(x[i]);
+}
 
 // ---- IEEE-754 binary16 helpers -------------------------------------------
 uint16_t float_to_half(float v) {

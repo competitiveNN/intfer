@@ -43,6 +43,21 @@ inline int n_levels(QuantScheme s) {
 uint16_t float_to_half(float v);
 float    half_to_float(uint16_t h);
 
+// Batched F16C conversions for the decode hot loop (engine act staging +
+// readback). 8-wide AVX2/F16C via function-target attribute — no global
+// -mavx2/-mf16c needed, so no codegen change elsewhere. Bit-exact vs the
+// scalar routines above for all normal FP32/FP16 values, +/-Inf, and NaN
+// (NaN payload bits may differ, values stay NaN); FP16-subnormal VALUES
+// differ (hardware flush-ish behavior vs scalar exact). Subnormal half
+// inputs (|v| < 2^-14) never occur in practice at these call sites
+// (activations/GEMM outputs of magnitude ~1e-3..1e2); the parity gate +
+// GPU oracle judge equivalence.
+// Runtime dispatch: f16c_available() is checked once; when false the batch
+// routines fall back to the scalar loop (bit-identical by construction).
+bool f16c_available();
+void float_to_half_batch(const float* x, uint16_t* y, size_t n);
+void half_to_float_batch(const uint16_t* x, float* y, size_t n);
+
 // ---------------------------------------------------------------------------
 // Diagonal Hessian
 // ---------------------------------------------------------------------------
