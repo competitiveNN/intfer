@@ -5060,7 +5060,13 @@ int main(int argc, char** argv){
   int http_port = 0;
   std::string http_host = "127.0.0.1";
   GpuMode gpu_mode = GpuMode::Auto;
-  size_t tp_devices = 2;  // 2x Arc B580 fleet; Engine::load clamps to discovered
+  int tp_devices = 2;  // 2x Arc B580 fleet; Engine::load clamps to discovered.
+  // TP default is resolved after .intifer load (auto-TP below) from the
+  // measured 2026-09-14 verdict: small models -> TP=1 (~1.7x faster
+  // decode; 2x submits/transfers/readbacks outweigh halved kernel time
+  // at tiny shapes), 27B scale -> TP=2 (mandatory: one ~12GB B580 OOMs
+  // on the ~19GB lm_head tile).
+  bool tp_explicit = false;
   int i = 1;
   while(i < argc){
     std::string a = argv[i];
@@ -5075,7 +5081,7 @@ int main(int argc, char** argv){
     else if(a=="-S" && i+1<argc) seed = (uint32_t)std::atoi(argv[++i]);
     else if(a=="--gpu") gpu_mode = GpuMode::ForceOn;
     else if(a=="--no-gpu") gpu_mode = GpuMode::ForceOff;
-    else if(a=="--tp" && i+1<argc) tp_devices = (size_t)std::max(1, std::atoi(argv[++i]));
+    else if(a=="--tp" && i+1<argc){ tp_devices = (size_t)std::max(1, std::atoi(argv[++i])); tp_explicit = true; }
     else if(a=="--tokenizer" && i+1<argc) tokenizer_json = argv[++i];
     else if(a=="--tokenizer-py" && i+1<argc) tokenizer_py = argv[++i];
     else if(a=="--detok-py" && i+1<argc) detok_py = argv[++i];
@@ -5229,6 +5235,20 @@ int main(int argc, char** argv){
   }
   std::fprintf(stderr, "[intfer] deserialize_intfer done: %zu tensors, %zu rotations (borrowed)\n",
                m.tensors.size(), rs.rotations.size()); std::fflush(stderr);
+  // Default TP from the measured 2026-09-14 verdict: TP=1 wins ~1.7x on
+  // small models (submit/transfer/readback dominate tiny shapes), TP=2 is
+  // mandatory at 27B scale (single ~12GB B580 OOMs). Heuristic on the
+  // quantized weight footprint: <= 4GB -> TP=1 (0.8B file is ~1.2GB),
+  // above -> TP=2. Explicit --tp always wins. Logged so A/B stays honest.
+  if(!tp_explicit){
+    uint64_t wb = m.total_weight_bytes();
+    size_t want = (wb <= 4ULL*1024*1024*1024) ? 1 : 2;
+    if(want != tp_devices){
+      std::fprintf(stderr, "[intfer] auto-TP: weight footprint %.2f GB -> TP=%zu (default %d; --tp overrides)\n",
+                   (double)wb/(1024.0*1024.0*1024.0), want, 2);
+      tp_devices = want;
+    }
+  }
   std::map<uint8_t, const Rotation*> rid_map;
   for(auto& R : rs.rotations){
     // The serializer does not persist is_hadamard: re-detect it empirically
