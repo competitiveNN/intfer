@@ -525,6 +525,46 @@ struct CpuBackend : public LinearBackend {
     }
     return y;
   }
+  // CPU override of the batched GEMM: one parallel-for over M*N output rows
+  // (row (m,i) is fully independent). Forks ONCE per linear (not per row:
+  // the default base impl would fork M times inside run_linear_into), and
+  // the N>=2048 serial gate must not apply — M*N rows amortize the fork
+  // (e.g. M=8 x N=1024 q/o: 8192 rows). Bit-identical: same scalar row
+  // loop as run_linear_into, rows concatenated in order.
+  void run_linear_batch(const std::string& tensor_name,
+                        const std::vector<float>& X,
+                        std::vector<float>& Y, uint32_t M) override {
+    size_t K = (M > 0) ? X.size() / M : 0;
+    auto it = cache_w.find(tensor_name);
+    if(it == cache_w.end()){
+      if(!ensure_cached(tensor_name)){ Y.clear(); return; }
+      it = cache_w.find(tensor_name);
+    }
+    int N = cache_N[tensor_name];
+    int Kk = cache_K[tensor_name];
+    if((size_t)Kk < K) K = (size_t)Kk;
+    if(K == 0 || N == 0 || M == 0){ Y.clear(); return; }
+    const float* W = it->second.data();
+    const float* Xp = X.data();
+    const int strideK = cache_K[tensor_name];
+    const size_t Kloc = K;
+    Y.assign((size_t)M * N, 0.f);
+    float* Yp = Y.data();
+#pragma omp parallel for schedule(static) if((size_t)M * N >= 2048)
+    for(size_t r = 0; r < (size_t)M * N; r++){
+      size_t m = r / (size_t)N;
+      int i = (int)(r % (size_t)N);
+      const float* wr = W + (size_t)i * strideK;
+      const float* xr = Xp + m * Kloc;
+      float s = 0;
+      for(size_t k = 0; k < Kloc; k++) s += wr[k] * xr[k];
+      Yp[r] = s;
+    }
+    if(!keep_cached){
+      cache_w.erase(it);
+      cache_R.erase(tensor_name);
+    }
+  }
   void run_linear_into(const std::string& name,
                        const std::vector<float>& x,
                        std::vector<float>& out) override {
@@ -2148,7 +2188,9 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
   // layer is enough; rows differ only in activations.
   static const bool batch_gemm =
       (std::getenv("INTFER_BATCH_GEMM") != nullptr);
-  bool use_batch = batch_gemm && backend && backend->is_distributed();
+  // CPU batch override exists (single fork over M*N rows), so the M-row
+  // chunk path pays off on the CPU backend too — not just distributed.
+  bool use_batch = batch_gemm && backend;
   // M-row activation staging: H rows -> normed -> rotated inputs.
   // Sized lazily on first chunk (chunk_M may exceed the M=1 arena widths
   // for q/k/v/o intermediates, so these live in dedicated chunk buffers).
@@ -3381,7 +3423,8 @@ static int sched_iteration_joint(std::vector<Request*>& live,
     int Sr = (int)pq->prompt_ids.size();
     P = std::min(chunk_M, Sr - pq->fill);
     // Wide same-request chunks ride the joint forward except under the
-    // GPU batched-GEMM path (known-divergent there, pre-existing).
+    // GPU batched-GEMM path (known-divergent there, pre-existing). CPU
+    // batch override is fixed (bit-identical single-fork rows), so no cap.
     bool wide_ok = !(batch_gemm_env && c.backend && c.backend->is_distributed());
     if(P > 1 && !wide_ok) return -1; // caller runs the split path (same mechanics)
     for(int k=0; k<P; k++){
