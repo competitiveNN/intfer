@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <immintrin.h>
 #include <csignal>
 #include <execinfo.h>
 #include <unistd.h>
@@ -297,6 +298,65 @@ static void rope(float* h, int pos){
     h[d+cfg.rotary_dim/2]  = a*s + b*c;
   }
 }
+// CPU GEMM time accumulator (INTFER_TIME_GEMM=1): microseconds spent inside
+// the three CpuBackend GEMM entry points, summed thread-safely. Printed next
+// to the prefill/decode tok/s lines to split GEMM math vs everything else.
+static long long g_cpu_gemm_us = 0;
+struct CpuGemmTimer {
+  std::chrono::high_resolution_clock::time_point t0;
+  bool on;
+  CpuGemmTimer(): t0(std::chrono::high_resolution_clock::now()),
+    on(std::getenv("INTFER_TIME_GEMM") != nullptr) {}
+  ~CpuGemmTimer(){
+    if(!on) return;
+    auto t1 = std::chrono::high_resolution_clock::now();
+    long long us = std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();
+    __sync_fetch_and_add(&g_cpu_gemm_us, us);
+  }
+};
+// AVX2+FMA dot product for the CPU GEMM hot loop. 8-wide FMA over k with a
+// single vector accumulator, scalar tail. Deterministic (fixed row order,
+// fixed reduction order) but NOT bit-identical to the scalar loop (FMA
+// contraction + vector reduction reorder FP rounding). Oracle-gated: greedy
+// token stream must match (see scripts/test_oracle_equiv.sh); the bit-exact
+// parity gate does not apply while INTFER_CPU_FMA_DOT=1.
+// Function-target keeps AVX2/FMA codegen local (same pattern as dashq.cpp);
+// runtime-gated on intfer::dashq::avx2_available() — FMA is baseline on all
+// AVX2 CPUs that matter here (checked via /proc/cpuinfo: fma present).
+__attribute__((target("avx2,fma")))
+static float dot_fma_avx2(const float* a, const float* b, size_t n){
+  __m256 acc = _mm256_setzero_ps();
+  size_t i = 0;
+  for(; i + 8 <= n; i += 8){
+    __m256 va = _mm256_loadu_ps(a + i);
+    __m256 vb = _mm256_loadu_ps(b + i);
+    acc = _mm256_fmadd_ps(va, vb, acc);
+  }
+  __m128 lo = _mm256_castps256_ps128(acc);
+  __m128 hi = _mm256_extractf128_ps(acc, 1);
+  __m128 s = _mm_add_ps(lo, hi);
+  s = _mm_hadd_ps(s, s);
+  s = _mm_hadd_ps(s, s);
+  float out = _mm_cvtss_f32(s);
+  for(; i < n; i++) out += a[i] * b[i];
+  return out;
+}
+// Full row-loop in the target region: the OpenMP parallel-for lives INSIDE
+// the avx2/fma function so the FMA dot inlines per row (a non-inline
+// dot_fma_avx2 call costs ~25ns/row x 1.3M rows/GEMM — slower than scalar).
+// `single_x` selects shared-x (run_linear/run_linear_into) vs M-row X
+// (run_linear_batch: xr = Xp + (r/N)*Kloc) layout.
+__attribute__((target("avx2,fma")))
+static void gemm_rows_fma(const float* W, const float* Xp, float* Yp,
+                          size_t rows, int N, size_t Kloc, int strideK,
+                          bool single_x, long omp_floor){
+#pragma omp parallel for schedule(static) if(rows >= (size_t)omp_floor)
+  for(size_t r = 0; r < rows; r++){
+    size_t m = single_x ? 0 : r / (size_t)N;
+    int i = single_x ? (int)r : (int)(r % (size_t)N);
+    Yp[r] = dot_fma_avx2(W + (size_t)i * strideK, Xp + m * Kloc, Kloc);
+  }
+}
 // SpinQuant online rotation helpers. Hadamard rotations (the only kind the
 // quantizer emits) take the O(n log n) FWHT path; anything else keeps the
 // dense O(n^2) matvec. Both compute the same map up to summation order.
@@ -498,6 +558,7 @@ struct CpuBackend : public LinearBackend {
 
   std::vector<float> run_linear(const std::string& name,
                                 const std::vector<float>& x) override {
+    CpuGemmTimer tmgm;
     // Fast path: cached entry (both eager models and post-warmup JIT).
     // NOTE: std::map::count + operator[] does TWO tree lookups per GEMM;
     // use a single find() — this loop runs ~7×layers times per token.
@@ -514,9 +575,18 @@ struct CpuBackend : public LinearBackend {
     std::vector<float> y(N, 0.f);
     const float* xp = x.data();
     // Same OpenMP row-split as run_linear_into (bit-identical scalar rows).
+    // INTFER_CPU_FMA_DOT=1 selects the AVX2+FMA dot (8x math throughput;
+    // oracle-gated, not bit-identical — see dot_fma_avx2).
+    static const bool fma_dot = (std::getenv("INTFER_CPU_FMA_DOT") != nullptr)
+        && intfer::dashq::avx2_available();
+    if(fma_dot){
+      gemm_rows_fma(W, xp, y.data(), (size_t)N, N, (size_t)K, cache_K[name],
+                    true, 2048);
+    } else {
 #pragma omp parallel for schedule(static) if(N >= 2048)
-    for(int i=0;i<N;i++){ const float* wr=W+(size_t)i*cache_K[name]; float s=0;
-      for(int k=0;k<K;k++) s+=wr[k]*xp[k]; y[i]=s; }
+      for(int i=0;i<N;i++){ const float* wr=W+(size_t)i*cache_K[name]; float s=0;
+        for(int k=0;k<K;k++) s+=wr[k]*xp[k]; y[i]=s; }
+    }
     if(!keep_cached){
       // JIT path (27B): free the weight right after its GEMM so peak RAM
       // stays at ~one tensor instead of the full ~109 GB FP32 model.
@@ -534,6 +604,7 @@ struct CpuBackend : public LinearBackend {
   void run_linear_batch(const std::string& tensor_name,
                         const std::vector<float>& X,
                         std::vector<float>& Y, uint32_t M) override {
+    CpuGemmTimer tmgm;
     size_t K = (M > 0) ? X.size() / M : 0;
     auto it = cache_w.find(tensor_name);
     if(it == cache_w.end()){
@@ -550,15 +621,22 @@ struct CpuBackend : public LinearBackend {
     const size_t Kloc = K;
     Y.assign((size_t)M * N, 0.f);
     float* Yp = Y.data();
+    static const bool fma_dot_b = (std::getenv("INTFER_CPU_FMA_DOT") != nullptr)
+        && intfer::dashq::avx2_available();
+    if(fma_dot_b){
+      gemm_rows_fma(W, Xp, Yp, (size_t)M * (size_t)N, N, Kloc, strideK,
+                    false, 2048);
+    } else {
 #pragma omp parallel for schedule(static) if((size_t)M * N >= 2048)
-    for(size_t r = 0; r < (size_t)M * N; r++){
-      size_t m = r / (size_t)N;
-      int i = (int)(r % (size_t)N);
-      const float* wr = W + (size_t)i * strideK;
-      const float* xr = Xp + m * Kloc;
-      float s = 0;
-      for(size_t k = 0; k < Kloc; k++) s += wr[k] * xr[k];
-      Yp[r] = s;
+      for(size_t r = 0; r < (size_t)M * N; r++){
+        size_t m = r / (size_t)N;
+        int i = (int)(r % (size_t)N);
+        const float* wr = W + (size_t)i * strideK;
+        const float* xr = Xp + m * Kloc;
+        float s = 0;
+        for(size_t k = 0; k < Kloc; k++) s += wr[k] * xr[k];
+        Yp[r] = s;
+      }
     }
     if(!keep_cached){
       cache_w.erase(it);
@@ -568,6 +646,7 @@ struct CpuBackend : public LinearBackend {
   void run_linear_into(const std::string& name,
                        const std::vector<float>& x,
                        std::vector<float>& out) override {
+    CpuGemmTimer tmgm;
     // Same math as run_linear, but writes into the caller's buffer.
     // out keeps its capacity across tokens: steady-state zero mallocs.
     // NOTE: the JIT (!keep_cached) path is unchanged — weights are still
@@ -590,9 +669,17 @@ struct CpuBackend : public LinearBackend {
     // order, same rounding -> bit-identical); OpenMP only splits rows.
     // if() keeps small GEMMs serial (fork ~50-170us would dominate).
     // Microbench (20 threads): gate/up 1684->~320us, lm_head 104ms->15.6ms.
+    // INTFER_CPU_FMA_DOT=1 selects the AVX2+FMA dot (oracle-gated).
+    static const bool fma_dot_i = (std::getenv("INTFER_CPU_FMA_DOT") != nullptr)
+        && intfer::dashq::avx2_available();
+    if(fma_dot_i){
+      gemm_rows_fma(W, xp, yp, (size_t)N, N, (size_t)K, cache_K[name],
+                    true, 2048);
+    } else {
 #pragma omp parallel for schedule(static) if(N >= 2048)
-    for(int i=0;i<N;i++){ const float* wr=W+(size_t)i*cache_K[name]; float s=0;
-      for(int k=0;k<K;k++) s+=wr[k]*xp[k]; yp[i]=s; }
+      for(int i=0;i<N;i++){ const float* wr=W+(size_t)i*cache_K[name]; float s=0;
+        for(int k=0;k<K;k++) s+=wr[k]*xp[k]; yp[i]=s; }
+    }
     if(!keep_cached){
       cache_w.erase(it);
       cache_R.erase(name);
@@ -5923,6 +6010,9 @@ int main(int argc, char** argv){
   double prefill_ms = std::chrono::duration<double, std::milli>(t1-t0).count();
   std::fprintf(stderr, "[intfer] prefill: %d tokens in %.1f ms (%.1f tok/s)\n",
                S, prefill_ms, S*1000.0/std::max(1.0, prefill_ms));
+  if(std::getenv("INTFER_TIME_GEMM") != nullptr)
+    std::fprintf(stderr, "[intfer] cpu-gemm: %.1f ms of %.1f ms prefill (%.0f%%)\n",
+                 g_cpu_gemm_us/1000.0, prefill_ms, 100.0*g_cpu_gemm_us/1000.0/std::max(1.0,prefill_ms));
 #ifdef INTFER_PROFILE_GPU
   {
     auto p = get_gpu_profile();
