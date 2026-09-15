@@ -1144,22 +1144,8 @@ struct GpuBackend : public LinearBackend {
         uint32_t nGA = (K + 63) / 64;
         std::vector<std::int8_t> aq(K);
         std::vector<float> as(nGA);
-        for(uint32_t g=0; g<nGA; ++g){
-          uint32_t k0 = g * 64, k1 = std::min(k0 + 64, K);
-          float mx = 1e-6f;
-          for(uint32_t k=k0;k<k1;k++){
-            float v = fn[k] >= 0 ? fn[k] : -fn[k];
-            if(v > mx) mx = v;
-          }
-          float s = mx / 127.0f, inv = 1.0f / s;
-          as[g] = s;
-          for(uint32_t k=k0;k<k1;k++){
-            float v = fn[k] * inv;
-            if(v > 127.0f) v = 127.0f;
-            else if(v < -127.0f) v = -127.0f;
-            aq[k] = (std::int8_t)std::lrint(v);
-          }
-        }
+        dashq::act_quant_ga64_batch(fn, aq.data(), as.data(), K,
+                                     dashq::ActQuantRound::RoundNear);
         q.memcpy(lm_head_aq_dev_[d], aq.data(), K);
         q.memcpy(lm_head_as_dev_[d], as.data(), (size_t)nGA * sizeof(float));
       } else {

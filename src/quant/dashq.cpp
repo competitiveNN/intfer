@@ -39,6 +39,33 @@ bool f16c_available() {
   return ok;
 }
 
+// AVX2 + AVX-OS-support probe (leaf 7 EBX bit 5; leaf 1 ECX AVX/OSXSAVE;
+// XCR0 SSE+YMM state). _mm256_* faults with #UD without all three.
+bool avx2_available() {
+  static const bool ok = [] {
+#if defined(_MSC_VER)
+    return true;  // x86-64 Windows toolchains target AVX2-capable CPUs here
+#else
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(1u), "c"(0u));
+    const bool avx = (ecx & (1u << 28)) != 0;
+    const bool osxsave = (ecx & (1u << 27)) != 0;
+    if (!avx || !osxsave) return false;
+    // XCR0: XMM (bit 1) + YMM (bit 2) state enabled by the OS.
+    unsigned int xcr0_lo = 0, xcr0_hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0u));
+    if (((xcr0_lo & 0x6u) != 0x6u)) return false;
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(7u), "c"(0u));
+    return (ebx & (1u << 5)) != 0;
+#endif
+  }();
+  return ok;
+}
+
 // 8-wide F16C kernels. Function-target keeps AVX2/F16C codegen local to
 // these routines (supported by GCC, Clang, and icpx).
 __attribute__((target("f16c,avx2")))
@@ -86,6 +113,132 @@ void half_to_float_batch(const uint16_t* x, float* y, size_t n) {
   if (f16c_available()) { h16_to_f32_f16c(x, y, n); return; }
 #endif
   for (size_t i = 0; i < n; ++i) y[i] = half_to_float(x[i]);
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+// 8-wide AVX2 GA=64 act quant. Per slice: horizontal max-abs (SIMD tree +
+// scalar tail), then scale/broadcast/quantize.
+// HalfAway: q = trunc(v*inv + copysign(0.5, v*inv)) via cvttps (truncation,
+// immune to MXCSR) — lround-exact, incl. exact x.5 away from zero.
+// RoundNear: q = (int8_t)cvtps_epi32(v*inv), which rounds per MXCSR exactly
+// like lrint does (RNE by default) — lrint-exact, incl. exact x.5 to even.
+// The two modes genuinely differ (82.5 -> 83 vs 82); shared max-abs + tail
+// take the mode as a template param to keep both paths in one place.
+template <ActQuantRound kRound>
+__attribute__((target("avx2")))
+static void act_quant_ga64_avx2(const float* x, int8_t* q, float* scales,
+                                size_t K) {
+  constexpr size_t GA = 64;
+  const __m256 signbit = _mm256_set1_ps(-0.0f);
+  const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+  const __m256 v127 = _mm256_set1_ps(127.0f);
+  const __m256 vn127 = _mm256_set1_ps(-127.0f);
+  const __m256 half = _mm256_set1_ps(0.5f);
+  const size_t nGA = (K + GA - 1) / GA;
+  for (size_t g = 0; g < nGA; ++g) {
+    const size_t k0 = g * GA;
+    size_t k1 = k0 + GA;
+    if (k1 > K) k1 = K;
+    // Max-abs over the slice.
+    __m256 mx8 = _mm256_set1_ps(1e-6f);
+    size_t k = k0;
+    for (; k + 8 <= k1; k += 8) {
+      __m256 v = _mm256_loadu_ps(x + k);
+      mx8 = _mm256_max_ps(mx8, _mm256_and_ps(v, absmask));
+    }
+    // Horizontal max of the 8 lanes.
+    __m128 lo = _mm256_castps256_ps128(mx8);
+    __m128 hi = _mm256_extractf128_ps(mx8, 1);
+    __m128 m4 = _mm_max_ps(lo, hi);
+    m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+    m4 = _mm_max_ps(m4, _mm_shuffle_ps(m4, m4, 0x55));
+    float mx = _mm_cvtss_f32(m4);
+    for (; k < k1; ++k) {
+      float v = x[k] >= 0 ? x[k] : -x[k];
+      if (v > mx) mx = v;
+    }
+    const float s = mx / 127.0f;
+    const float inv = 1.0f / s;
+    scales[g] = s;
+    // Quantize: clamp, then round per mode.
+    const __m256 vinv = _mm256_set1_ps(inv);
+    k = k0;
+    for (; k + 8 <= k1; k += 8) {
+      __m256 v = _mm256_mul_ps(_mm256_loadu_ps(x + k), vinv);
+      v = _mm256_min_ps(_mm256_max_ps(v, vn127), v127);
+      __m256i q32;
+      if constexpr (kRound == ActQuantRound::HalfAway) {
+        __m256 adj = _mm256_or_ps(_mm256_and_ps(v, signbit), half);
+        q32 = _mm256_cvttps_epi32(_mm256_add_ps(v, adj));
+      } else {
+        q32 = _mm256_cvtps_epi32(v);
+      }
+      // Pack 8x i32 -> 8x i8 (values in [-127,127]; saturation identity).
+      // NOTE: 256-bit packs operate in 128-bit lanes (lanes 4-7 would land
+      // in the high half), so pack in 128-bit: lo=lanes 0-3, hi=lanes 4-7.
+      __m128i lo32 = _mm256_castsi256_si128(q32);
+      __m128i hi32 = _mm256_extracti128_si256(q32, 1);
+      __m128i p16 = _mm_packs_epi32(lo32, hi32);
+      __m128i p8 = _mm_packs_epi16(p16, _mm_setzero_si128());
+      _mm_storel_epi64(reinterpret_cast<__m128i*>(q + k), p8);
+    }
+    for (; k < k1; ++k) {
+      float v = x[k] * inv;
+      if (v > 127.0f) v = 127.0f;
+      else if (v < -127.0f) v = -127.0f;
+      if constexpr (kRound == ActQuantRound::HalfAway)
+        q[k] = (int8_t)std::lround(v);
+      else
+        q[k] = (int8_t)std::lrint(v);
+    }
+  }
+}
+#endif
+
+template <ActQuantRound kRound>
+static void act_quant_ga64_scalar(const float* x, int8_t* q, float* scales,
+                                  size_t K) {
+  constexpr size_t GA = 64;
+  const size_t nGA = (K + GA - 1) / GA;
+  for (size_t g = 0; g < nGA; ++g) {
+    const size_t k0 = g * GA;
+    size_t k1 = k0 + GA;
+    if (k1 > K) k1 = K;
+    float mx = 1e-6f;
+    for (size_t k = k0; k < k1; ++k) {
+      float v = x[k] >= 0 ? x[k] : -x[k];
+      if (v > mx) mx = v;
+    }
+    const float s = mx / 127.0f;
+    const float inv = 1.0f / s;
+    scales[g] = s;
+    for (size_t k = k0; k < k1; ++k) {
+      float v = x[k] * inv;
+      if (v > 127.0f) v = 127.0f;
+      else if (v < -127.0f) v = -127.0f;
+      if constexpr (kRound == ActQuantRound::HalfAway)
+        q[k] = (int8_t)std::lround(v);
+      else
+        q[k] = (int8_t)std::lrint(v);
+    }
+  }
+}
+
+void act_quant_ga64_batch(const float* x, int8_t* q, float* scales,
+                          size_t K, ActQuantRound round) {
+#if defined(__x86_64__) || defined(_M_X64)
+  if (avx2_available()) {
+    if (round == ActQuantRound::HalfAway)
+      act_quant_ga64_avx2<ActQuantRound::HalfAway>(x, q, scales, K);
+    else
+      act_quant_ga64_avx2<ActQuantRound::RoundNear>(x, q, scales, K);
+    return;
+  }
+#endif
+  if (round == ActQuantRound::HalfAway)
+    act_quant_ga64_scalar<ActQuantRound::HalfAway>(x, q, scales, K);
+  else
+    act_quant_ga64_scalar<ActQuantRound::RoundNear>(x, q, scales, K);
 }
 
 // ---- IEEE-754 binary16 helpers -------------------------------------------

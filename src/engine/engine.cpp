@@ -797,36 +797,26 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
 #endif
   for (uint32_t m = 0; m < M; ++m) {
     const float* xr = x.data() + (size_t)m * K;
-    for (uint32_t g = 0; g < nGA; ++g) {
-      const uint32_t k0 = g * GA;
-      uint32_t k1 = k0 + GA;
-      if (k1 > K) k1 = K;
-      float mx = 1e-6f;
-      for (uint32_t k = k0; k < k1; ++k) {
-        float v = xr[k] >= 0 ? xr[k] : -xr[k];
-        if (v > mx) mx = v;
-      }
-      const float s = mx / 127.0f;
-      const float inv = 1.0f / s;
-      for (size_t d = 0; d < devices_.size(); ++d)
-        ws48_[d].as[(size_t)m * ws48_[d].nGA + g] = s;
-      // INT8 codes identical for all ranks: quantize once into rank 0's
-      // buffer, memcpy to the others (K <= 17408, trivial cost).
-      std::int8_t* q0 = ws48_[0].act + (size_t)m * ws48_[0].K;
-      for (uint32_t k = k0; k < k1; ++k) {
-        float v = xr[k] * inv;
-        if (v > 127.0f) v = 127.0f;
-        else if (v < -127.0f) v = -127.0f;
-        q0[k] = (std::int8_t)std::lround(v);
-      }
+    // Vectorized GA=64 quant into HOST staging (bit-exact vs the old scalar
+    // loop, incl. the trunk's original lround half-away-from-zero); then one memcpy per device
+    // row into the shared workspace. Scalar stores straight into
+    // malloc_shared are ~100x slower (copy bucket 96ms/7tok); memcpy emits
+    // wide vectorized stores. Staging is grow-only (zero steady-state
+    // allocs); rows are tight here, workspace rows strided — copy per row.
+    if (act48_staging_.size() != (size_t)M * K)
+      act48_staging_.resize((size_t)M * K);
+    if (as48_staging_.size() != (size_t)M * nGA)
+      as48_staging_.resize((size_t)M * nGA);
+    std::int8_t* qrow = act48_staging_.data() + (size_t)m * K;
+    float* srow = as48_staging_.data() + (size_t)m * nGA;
+    // Trunk's original loop used std::lround (half away from zero).
+    dashq::act_quant_ga64_batch(xr, qrow, srow, K,
+                                dashq::ActQuantRound::HalfAway);
+    for (size_t d = 0; d < devices_.size(); ++d) {
+      std::memcpy(ws48_[d].act + (size_t)m * ws48_[d].K, qrow, K);
+      std::memcpy(ws48_[d].as + (size_t)m * ws48_[d].nGA, srow,
+                  (size_t)nGA * sizeof(float));
     }
-  }
-  for (size_t d = 1; d < devices_.size(); ++d) {
-    // Rows live at workspace stride (ws48_[0].K, grown over tensors), so
-    // broadcast row-by-row, not as one M*K blob.
-    for (uint32_t m = 0; m < M; ++m)
-      std::memcpy(ws48_[d].act + (size_t)m * ws48_[d].K,
-                  ws48_[0].act + (size_t)m * ws48_[0].K, K);
   }
 #ifdef INTFER_PROFILE_GPU
   {

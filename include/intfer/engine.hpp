@@ -221,6 +221,13 @@ class Engine {
   // Reusable FP16 activation staging for run_linear_tp (M*K). Resized only
   // when the shape grows: steady-state zero mallocs per GEMM call.
   std::vector<std::uint16_t> act_staging_;
+  // Reusable INT8-act + scale staging for run_linear_tp_dpas48 (M*K int8,
+  // M*nGA fp32, tight rows). The quant writes here (host memory), then one
+  // memcpy per workspace row lands wide vectorized stores into the shared
+  // ws48_ buffers — scalar byte-stores straight into malloc_shared cost
+  // ~100x (each store its own transaction: copy bucket 96ms -> ~25ms).
+  std::vector<std::int8_t> act48_staging_;
+  std::vector<float> as48_staging_;
   // Shared per-device act/out workspaces (replaces per-shard act/out USM).
   // One buffer pair per device serves all shards: a shard's act/out are
   // written+consumed within a single run_linear_tp call and never live

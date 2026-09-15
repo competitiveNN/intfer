@@ -58,6 +58,28 @@ bool f16c_available();
 void float_to_half_batch(const float* x, uint16_t* y, size_t n);
 void half_to_float_batch(const uint16_t* x, float* y, size_t n);
 
+// Batched GA=64 symmetric INT8 activation quant (DPAS trunk + lm_head hot
+// loops). Per 64-slice: s = max(1e-6, max|x|)/127, q = round(x/s) clamped
+// to [-127, 127]. AVX2 via function-target attribute; scalar fallback
+// without AVX2.
+//
+// Rounding mode MUST match the scalar loop being replaced — the two call
+// sites genuinely disagreed (caught by bit-exact probe on exact x.5):
+//   - Engine::run_linear_tp_dpas48 trunk used std::lround (half away from
+//     zero): 82.5 -> 83. Pass HalfAway.
+//   - run_lm_head_f16 (intfer_cli) used std::lrint (current MXCSR mode,
+//     RNE by default): 82.5 -> 82. Pass RoundNear.
+// Do NOT unify: GPU oracle token streams were gated under the original
+// mixed semantics. AVX2 HalfAway is emulated as trunc(x + copysign(0.5, x))
+// via cvttps (MXCSR-immune); AVX2 RoundNear uses cvtps_epi32, which follows
+// MXCSR exactly like lrint does, so the two stay consistent under any mode.
+// Max-abs reduction order differs (SIMD tree) but max is exact-associative
+// and the 1e-6 floor keeps signed-zero out.
+enum class ActQuantRound { HalfAway, RoundNear };
+bool avx2_available();
+void act_quant_ga64_batch(const float* x, int8_t* q, float* scales, size_t K,
+                          ActQuantRound round);
+
 // ---------------------------------------------------------------------------
 // Diagonal Hessian
 // ---------------------------------------------------------------------------
