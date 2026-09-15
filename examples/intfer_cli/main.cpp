@@ -1335,19 +1335,26 @@ struct GpuBackend : public LinearBackend {
           fail_reset();
           return {};
         }
-        q.memcpy(out_seg[d].data() + (ts - start), lm_head_c_dev_[d][t],
+        // The D2H chains on the kernel event; its own event is waited once
+        // after the tile loop (see evts), so tiles overlap while host
+        // consumption stays safe.
+        sycl::event cp_evt = q.memcpy(out_seg[d].data() + (ts - start),
+                 lm_head_c_dev_[d][t],
                  (size_t)Nlt * sizeof(sycl::half), evt);
         // Load-bearing: waiting only on the kernel event leaves the D2H
         // readback in flight while the host consumes out_seg (and frees x_dev).
-        // Under full-model device pressure that race kills the device; the
-        // queue wait makes host consumption safe.
-        q.wait();
+        // Under full-model device pressure that race kills the device. The
+        // D2H event wait (collected below, waited once after the tile loop)
+        // makes host consumption safe — WITHOUT a per-tile q.wait(), which
+        // drained the whole queue per tile and serialized the 4 tiles
+        // (~80ms/token of host block on TP=1; tiles now overlap).
         try {
           auto tss = evt.get_profiling_info<sycl::info::event_profiling::command_start>();
           auto tee = evt.get_profiling_info<sycl::info::event_profiling::command_end>();
           lm_kernel_us += (double)(tee - tss) / 1000.0;
         } catch (...) {}
         evts.push_back(evt);
+        evts.push_back(cp_evt);  // D2H completion (covers the old per-tile q.wait)
       }
     }
     for(auto& e : evts) e.wait();
