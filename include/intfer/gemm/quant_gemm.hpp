@@ -237,4 +237,20 @@ bool repack_dpas412(const std::uint8_t* row_codes, uint32_t N, uint32_t K,
 // M=1 W4A8/W2A8 decode kernel. Returns the kernel event.
 sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p);
 
+// ---------------------------------------------------------------------------
+// FP16-act-equivalent s8-weight DPAS GEMM for the VRAM-resident lm_head.
+//
+// Same Dpas48Params contract (repacked vertical-B tiles from repack_dpas412
+// with bits=8, FP16 per-row weight scales, INT8 acts + FP32 GA-slice scales),
+// but the B operand is SIGNED int8 (raw symmetric codes, not DASH-Q codebook
+// indices), so no (2*T - C*S)/C fold is needed: the s8 x s8 DPAS integer dot
+// is exact and the output is
+//   out = act_scale * w_scale * alpha * DPAS(a_q, w_q)
+// accumulated in FP32 over K-ops, then rounded once to FP16.
+//
+// Validity: N % 16 == 0, K % 32 == 0 (caller guarantees via repack success;
+// the kernel assumes it). M=1 decode; general M works via M*nT blocks.
+// ---------------------------------------------------------------------------
+sycl::event quant_gemm_dpas_s8w(sycl::queue& q, const Dpas48Params& p);
+
 }  // namespace intfer::gemm

@@ -1006,4 +1006,70 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// FP16-act-equivalent s8-weight DPAS GEMM (lm_head decode).
+// ---------------------------------------------------------------------------
+sycl::event quant_gemm_dpas_s8w(sycl::queue& q, const Dpas48Params& p) {
+  using namespace sycl::ext::intel::esimd;
+  using namespace sycl::ext::intel::esimd::xmx;
+  constexpr uint32_t TN = 16, OP = 32;
+  const uint32_t M = p.M, N = p.N, K = p.K;
+  const uint32_t GA = (p.act_group == 0) ? K : p.act_group;
+  const uint32_t nT = N / TN, nOp = K / OP;
+  const uint32_t nGA = (K + GA - 1) / GA;
+  const uint32_t act_stride = (p.act_stride == 0) ? K : p.act_stride;
+  const uint32_t as_stride = (p.as_stride == 0) ? nGA : p.as_stride;
+  const uint32_t op_bytes = OP * TN;  // s8: 1 code/byte
+  const int8_t* B = static_cast<const int8_t*>(p.code_dpas);
+  const float alpha = p.alpha;
+
+  // One WI per (row m, 16-N tile t). s8 x s8 DPAS: exact integer dot of the
+  // raw symmetric codes; fold is a single scale multiply. Same launch
+  // shape as quant_gemm_dpas48.
+  const uint32_t nWG = 16;
+  const uint32_t n_blocks = M * nT;
+  const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
+
+  return q.submit([&](sycl::handler& h) {
+    h.parallel_for<class gemm_dpas_s8w_lmhead_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+          const uint32_t block = it.get_global_id(0);
+          if (block >= n_blocks) return;
+          const uint32_t m = block / nT;
+          const uint32_t t = block % nT;
+          const std::int8_t* Aq = p.act_int8 + (size_t)m * act_stride;
+          const float* As = p.act_scale + (size_t)m * as_stride;
+          float acc_tile[TN];
+          for (uint32_t nl = 0; nl < TN; ++nl) acc_tile[nl] = 0.0f;
+          for (uint32_t o = 0; o < nOp; ++o) {
+            const uint32_t k0 = o * OP;
+            simd<std::int8_t, OP> va;
+            va.copy_from(Aq + k0);
+            const float as = As[k0 / GA];
+            // Vertical-B layout: op-tile (t, o) holds 32 K of 16-N rows;
+            // raw s8 codes are VNNI-compatible for the s8 DPAS B operand.
+            const int8_t* bop = B + ((size_t)t * nOp + o) * op_bytes;
+            simd<int8_t, 512> vb;
+            vb.copy_from(bop);
+            simd<int, TN> c;
+            c = dpas<8, 1, int, int8_t, std::int8_t,
+                     dpas_argument_type::s8, dpas_argument_type::s8>(vb, va);
+            for (uint32_t nl = 0; nl < TN; ++nl) {
+              const uint32_t n = t * TN + nl;
+              const float ws = static_cast<float>(
+                  sycl::bit_cast<sycl::half>(p.scale_usm[n]));
+              acc_tile[nl] += as * ws * alpha * (float)c[nl];
+            }
+          }
+          std::uint16_t oh[TN];
+          for (uint32_t nl = 0; nl < TN; ++nl)
+            oh[nl] = to_half_bits(acc_tile[nl]);
+          simd<std::uint16_t, TN> oc;
+          oc.copy_from(oh);
+          oc.copy_to(p.out_usm + (size_t)m * N + (size_t)t * TN);
+        });
+  });
+}
+
 }  // namespace intfer::gemm
