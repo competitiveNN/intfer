@@ -58,7 +58,15 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (bit-exact probe passed but fused kernel slower: one-WI-per-16N-tile
   layout replicates O(K) quant work nT x), host-private staging of DPAS
   writes (neutral), staged readback (neutral), SYCL graphs on B580
-  (19.7us vs 11.9us plain submit).
+  (19.7us vs 11.9us plain submit), device-side SSM recurrence M=1
+  (2026-09-16, INTFER_SSM_GPU=1, parity-clean incl. step_batch +
+  spec-rollback resync: -9% decode, 7.4->6.7 tok/s pinned 3x3
+  interleaved. Per-LA-layer attribution: prep ~4us, H2D ~15-130us,
+  kernel-submit ~25us, D2H+wait ~150-550us vs replaced host loop
+  ~0.1-0.2ms — the blocking wait is structural: host norm needs
+  core on-host same-layer. Revisit only with fused device-side
+  SSM+norm feeding la_out GEMM from device buffers, or M>>1 where
+  the single wait/layer amortizes; M=8 estimate still loses).
 - Path to target: single-stream ceiling is ~17-20 tok/s (submit floor:
   ~120us x ~2300 launches/token); 40 tok/s must come from aggregate
   batching (--serve scheduler already M-row batches; cross-request HTTP
