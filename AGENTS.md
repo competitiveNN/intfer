@@ -58,7 +58,13 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (bit-exact probe passed but fused kernel slower: one-WI-per-16N-tile
   layout replicates O(K) quant work nT x), host-private staging of DPAS
   writes (neutral), staged readback (neutral), SYCL graphs on B580
-  (19.7us vs 11.9us plain submit), device-side SSM recurrence M=1
+  (19.7us vs 11.9us plain submit), LA-branch run-parallel OMP in
+  step_batch (2026-09-16, parity-clean incl. segfault fix for TLS reads
+  inside OMP workers, but zero gain: CPU C=8 batch WIP 10.5s vs HEAD
+  10.8s @20T, 16.18s vs 16.34s @1T; GPU serve-load C=8 3.86 vs 3.89
+  tok/s. LA host recurrence is a negligible share — GEMMs dominate.
+  Revisit only if profiling shows recurrence >10% of a step),
+  device-side SSM recurrence M=1
   (2026-09-16, INTFER_SSM_GPU=1, parity-clean incl. step_batch +
   spec-rollback resync: -9% decode, 7.4->6.7 tok/s pinned 3x3
   interleaved. Per-LA-layer attribution: prep ~4us, H2D ~15-130us,
