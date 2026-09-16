@@ -3735,8 +3735,6 @@ static std::vector<StepOut> step_batch(
       // staging use completes before row m's post_ln overwrite — safe.
       for(int m=0; m<M; m++)
         rmsnorm(&H[(size_t)m*Hdim], ly0.post_ln, &b_rn2[(size_t)m*Hdim], Hdim);
-      for(int m=0; m<M; m++)
-        rmsnorm(&H[(size_t)m*Hdim], ly0.post_ln, &b_rn2[(size_t)m*Hdim], Hdim);
       const Rotation* Rg = backend->rot_for(ln.gate);
       for(int m=0; m<M; m++){
         const float* r2 = &b_rn2[(size_t)m*Hdim];
