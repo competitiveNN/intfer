@@ -3811,6 +3811,32 @@ static std::vector<StepOut> step_batch(
       std::vector<float> kv_mem(cfg.v_head_dim), delta(cfg.v_head_dim);
       std::vector<float> qn(cfg.k_head_dim), kn(cfg.k_head_dim);
       std::vector<float> core(zvw), gg(cfg.n_v_heads);
+      // Device-side SSM (INTFER_SSM_GPU=1, serve hot path): the conv loop
+      // below stores one conv_out copy per row (conv_state still advances
+      // on the host in row order — per-request state, order preserved);
+      // a single M-row ssm_rows call then replaces the host recurrence.
+      // ssm_rows partitions rows itself: decode rows (distinct (req,layer)
+      // states) share one ssm_forward launch, same-request prefill runs
+      // use ssm_forward_chain each. No snapshots in step_batch, so no
+      // mirror sync. ssm_rows false => host loop over stored rows
+      // (identical math, same order).
+      static thread_local std::vector<SsmRow> b_ssm_rows;
+      static thread_local std::vector<float> b_ssm_conv;  // [M*conv_dim]
+      bool b_ssm_on = false;
+#ifdef INTFER_HAS_GPU_BACKEND
+      {
+        static const bool ssm_gpu_env =
+            (std::getenv("INTFER_SSM_GPU") != nullptr);
+        if(ssm_gpu_env) {
+          if(auto* gpu_be0 = dynamic_cast<GpuBackend*>(backend))
+            b_ssm_on = (gpu_be0->eng != nullptr);
+        }
+      }
+#endif
+      if(b_ssm_on) {
+        b_ssm_rows.assign(M, SsmRow());
+        b_ssm_conv.assign((size_t)M * cfg.conv_dim, 0.f);
+      }
       for(int m=0; m<M; m++){
         Layer& ly = *lys[(size_t)m];
         float* mqkvr = &b_mqkv[(size_t)m*cfg.conv_dim];
@@ -3824,6 +3850,11 @@ static std::vector<StepOut> step_batch(
           ly.conv_state[c*3+0]=ly.conv_state[c*3+1];
           ly.conv_state[c*3+1]=ly.conv_state[c*3+2];
           ly.conv_state[c*3+2]=mqkvr[c];
+        }
+        if(b_ssm_on) {
+          memcpy(&b_ssm_conv[(size_t)m*cfg.conv_dim], conv_out.data(),
+                 (size_t)cfg.conv_dim*sizeof(float));
+          continue;
         }
         float* query=conv_out.data();
         float* key=conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
@@ -3865,6 +3896,98 @@ static std::vector<StepOut> step_batch(
           float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
           float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
           for(int i=0;i<cfg.v_head_dim;i++) oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
+        }
+      }
+      if(b_ssm_on) {
+        // Device step over all rows (per-row keys; runs partition inside).
+        // Core rows land directly in b_ncore; the norm below reads them.
+        for(int m=0; m<M; m++){
+          SsmRow& sr = b_ssm_rows[(size_t)m];
+          const float* cq = &b_ssm_conv[(size_t)m * cfg.conv_dim];
+          sr.req = items[(size_t)m].req;
+          sr.mirror = &lys[(size_t)m]->ssm_state;
+          sr.query = cq;
+          sr.key = cq + cfg.k_head_dim * cfg.n_k_heads;
+          sr.value = cq + 2 * cfg.k_head_dim * cfg.n_k_heads;
+          sr.b_row = &b_b[(size_t)m * cfg.n_v_heads];
+          sr.a_row = &b_a[(size_t)m * cfg.n_v_heads];
+          sr.core_out = &b_ncore[(size_t)m * zvw];
+        }
+        bool ok = false;
+#ifdef INTFER_HAS_GPU_BACKEND
+        if(auto* gpu_be = dynamic_cast<GpuBackend*>(backend)) {
+          if(gpu_be->eng)
+            ok = gpu_be->ssm_rows(b_ssm_rows.data(), (uint32_t)M, L,
+                                  dt_bias, A_log,
+                                  /*sync_mirror=*/false);
+        }
+#endif
+        if(ok) {
+          // Norm tail over device cores (mirrors host loop; core_out rows
+          // already sit in b_ncore, so read xx from ncr in place —
+          // elementwise-safe, no cross terms).
+          const float* ssm_norm_w = ln.ssm_norm_w;
+          for(int m=0; m<M; m++){
+            float* ncr = &b_ncore[(size_t)m*zvw];
+            float* zr = &b_z[(size_t)m*zvw];
+            for(int hh=0; hh<cfg.n_v_heads; hh++){
+              float* xx=&ncr[hh*cfg.v_head_dim];
+              const float* zg=&zr[hh*cfg.v_head_dim];
+              float* oo=&ncr[hh*cfg.v_head_dim];
+              float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
+              float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
+              for(int i=0;i<cfg.v_head_dim;i++)
+                oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
+            }
+          }
+        } else {
+          // Device declined: host recurrence over the stored conv rows
+          // (same math/order as the env-off loop above).
+          const float* ssm_norm_w = ln.ssm_norm_w;
+          for(int m=0; m<M; m++){
+            Layer& ly = *lys[(size_t)m];
+            const float* cq = &b_ssm_conv[(size_t)m * cfg.conv_dim];
+            const float* query = cq;
+            const float* key = cq + cfg.k_head_dim * cfg.n_k_heads;
+            const float* value = cq + 2 * cfg.k_head_dim * cfg.n_k_heads;
+            float* zr = &b_z[(size_t)m*zvw];
+            float* br = &b_b[(size_t)m*cfg.n_v_heads];
+            float* ar = &b_a[(size_t)m*cfg.n_v_heads];
+            for(int hh=0; hh<cfg.n_v_heads; hh++){
+              float sp=log1pf(expf(ar[hh]+dt_bias[hh])); gg[hh]=-expf(A_log[hh])*sp;
+            }
+            for(size_t i=0;i<zvw;i++) core[i] = 0.f;
+            for(int hh=0; hh<cfg.n_v_heads; hh++){
+              int kh = (cfg.n_v_heads > cfg.n_k_heads)
+                       ? (int)((long long)hh * cfg.n_k_heads / cfg.n_v_heads)
+                       : hh;
+              l2norm(&query[kh*cfg.k_head_dim], qn.data(), cfg.k_head_dim);
+              l2norm(&key[kh*cfg.k_head_dim],  kn.data(), cfg.k_head_dim);
+              float scale=1.0f/sqrtf((float)cfg.k_head_dim);
+              for(int d=0;d<cfg.k_head_dim;d++) qn[d]*=scale;
+              float g_t=expf(gg[hh]); float beta=sigmoidf(br[hh]);
+              float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
+              for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
+              for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
+              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
+              { const float* vh=&value[hh*cfg.v_head_dim];
+              for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
+              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
+              for(int c=0;c<cfg.v_head_dim;c++){
+                float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
+                core[hh*cfg.v_head_dim+c]=s;
+              }
+            }
+            float* ncr = &b_ncore[(size_t)m*zvw];
+            for(int hh=0; hh<cfg.n_v_heads; hh++){
+              const float* xx=&core[hh*cfg.v_head_dim];
+              const float* zg=&zr[hh*cfg.v_head_dim];
+              float* oo=&ncr[hh*cfg.v_head_dim];
+              float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
+              float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
+              for(int i=0;i<cfg.v_head_dim;i++) oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
+            }
+          }
         }
       }
       need_rows(c_y, Hdim);
@@ -6735,6 +6858,16 @@ int main(int argc, char** argv){
             ly.ssm_state = sn.ssm;
           }
         }
+#ifdef INTFER_HAS_GPU_BACKEND
+        // Device-side SSM (INTFER_SSM_GPU=1): the restore above replaced
+        // host ssm_state vectors under the resident device states — push
+        // the mirrors back to the device so the next step() sees the
+        // rolled-back state. No-op when the device path was never used.
+        if(std::getenv("INTFER_SSM_GPU") != nullptr) {
+          if(auto* gpu_rb = dynamic_cast<GpuBackend*>(backend.get()))
+            gpu_rb->ssm_resync_all();
+        }
+#endif
         for(size_t i=0; i<emit.size(); i++) emit_tok(step_i+(int)i, emit[i]);
         step_i += (int)emit.size();
         token = generated.back();
