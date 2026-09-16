@@ -253,4 +253,70 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p);
 // ---------------------------------------------------------------------------
 sycl::event quant_gemm_dpas_s8w(sycl::queue& q, const Dpas48Params& p);
 
+// ---------------------------------------------------------------------------
+// Device-side Gated-DeltaNet SSM recurrent update (Stage 3 GPU offload).
+//
+// Offloads the per-token LA-branch recurrence (host scalar loop over
+// n_v_heads x k_head_dim x v_head_dim, ~1M FLOP/token/layer on 0.8B) to a
+// plain FP32 SYCL kernel with device-resident state. Per head hh (key head
+// kh = hh*n_k/n_v grouping when n_v > n_k):
+//   g_t = exp(g[hh]); beta = sigmoid(b[hh])
+//   S[hh] *= g_t
+//   kv = S[hh]^T @ kn; delta = (v - kv) * beta
+//   S[hh] += kn outer delta
+//   core[hh] = S[hh]^T @ qn
+// All FP32, same element order as the host loop (bit-identical output up
+// to FMA contraction differences; the oracle token stream is the arbiter).
+// State S lives in caller-owned device USM (n_v*kd*vd floats), persistent
+// across tokens; the kernel never allocates. qn/kn are L2-normalized +
+// q-scaled on the host (cheap O(kd) per head) and uploaded per call with
+// the other small per-token inputs; core (n_v*vd) is read back per call.
+// M rows (batched requests x positions) share one launch: each row has its
+// own S state pointer (rows may belong to different requests or layers),
+// passed as a device-pointer array.
+struct SsmParams {
+  const float* const* qn_rows;  // [M] device pointers to [kd] qn rows
+  const float* const* kn_rows;  // [M] device pointers to [kd] kn rows
+  const float* const* v_rows;   // [M] device pointers to [vd] value rows
+  const float* const* g_rows;   // [M] device pointers to [n_v] g logits
+  const float* const* b_rows;   // [M] device pointers to [n_v] b logits
+  float* const* s_rows;         // [M] device pointers to [n_v*kd*vd] states
+  float* const* core_rows;      // [M] device pointers to [n_v*vd] outputs
+  uint32_t M;                   // batch rows
+  uint32_t n_v;                 // value heads
+  uint32_t n_k;                 // key heads (grouping when n_v > n_k)
+  uint32_t kd;                  // k head dim
+  uint32_t vd;                  // v head dim
+};
+
+// One WI per (row m, head hh, v-col c): kd-serial inner reductions.
+// State stays resident; only small per-token vectors transfer.
+// Rows MUST have distinct states (decode rows of different requests, or
+// single rows); rows sharing one state must use ssm_forward_chain.
+sycl::event ssm_forward(sycl::queue& q, const SsmParams& p);
+
+// Chained variant: all M rows share ONE state (single pointer, not an
+// array) and run sequentially in row order (prefill-chunk rows of one
+// request: the recurrence is order-dependent, so one WI per (head, col)
+// loops rows innermost-to-outermost over m). Same math as the host
+// per-row loop; the oracle token stream is the arbiter.
+struct SsmChainParams {
+  const float* qn_rows;  // row m qn at qn_rows + m*row_stride ([n_k*kd])
+  const float* kn_rows;  // row m kn at kn_rows + m*row_stride ([n_k*kd])
+  const float* v_rows;   // row m v at v_rows + m*row_stride ([n_v*vd])
+  const float* g_rows;   // row m g at g_rows + m*row_stride ([n_v])
+  const float* b_rows;   // row m b at b_rows + m*row_stride ([n_v])
+  float* state;          // [n_v*kd*vd] resident, updated in place
+  float* core_rows;      // [M*n_v*vd] outputs (contiguous)
+  uint32_t M;
+  uint32_t n_v;
+  uint32_t n_k;
+  uint32_t kd;
+  uint32_t vd;
+  uint32_t row_stride;   // float stride between consecutive rows in *_rows
+};
+
+// One WI per (head hh, v-col c), kd-serial, m-sequential inner loop.
+sycl::event ssm_forward_chain(sycl::queue& q, const SsmChainParams& p);
+
 }  // namespace intfer::gemm

@@ -1072,4 +1072,113 @@ sycl::event quant_gemm_dpas_s8w(sycl::queue& q, const Dpas48Params& p) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Device-side Gated-DeltaNet SSM recurrent update (Stage 3 GPU offload).
+// ---------------------------------------------------------------------------
+sycl::event ssm_forward(sycl::queue& q, const SsmParams& p) {
+  const uint32_t M = p.M, n_v = p.n_v, n_k = p.n_k;
+  const uint32_t kd = p.kd, vd = p.vd;
+  const uint32_t nWG = 32;
+  const uint32_t n_blocks = M * n_v * vd;
+  const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
+  // Capture row-pointer arrays by value (device USM pointers; the arrays
+  // themselves live in device USM and are indexed on-device).
+  const float* const* qn_rows = p.qn_rows;
+  const float* const* kn_rows = p.kn_rows;
+  const float* const* v_rows = p.v_rows;
+  const float* const* g_rows = p.g_rows;
+  const float* const* b_rows = p.b_rows;
+  float* const* s_rows = p.s_rows;
+  float* const* core_rows = p.core_rows;
+
+  return q.submit([&](sycl::handler& h) {
+    h.parallel_for<class ssm_forward_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) {
+          const uint32_t block = it.get_global_id(0);
+          if (block >= n_blocks) return;
+          const uint32_t c = block % vd;
+          const uint32_t hh = (block / vd) % n_v;
+          const uint32_t m = block / (vd * n_v);
+          // Key-head grouping (matches host): value head hh shares key
+          // head kh when n_v > n_k. kh selects the qn/kn row section;
+          // value/g/b/S/core rows are indexed by hh directly.
+          const uint32_t kh = (n_v > n_k)
+              ? (uint32_t)(((uint64_t)hh * n_k) / n_v) : hh;
+          const float* qn = qn_rows[m] + (size_t)kh * kd;
+          const float* kn = kn_rows[m] + (size_t)kh * kd;
+          const float* vv = v_rows[m] + (size_t)hh * vd;
+          const float g_t = sycl::exp(g_rows[m][hh]);
+          // sigmoid(b) = 1/(1+exp(-b)), same as host sigmoidf.
+          const float bb = b_rows[m][hh];
+          const float beta = 1.0f / (1.0f + sycl::exp(-bb));
+          float* S = s_rows[m] + ((size_t)hh * kd) * vd;
+          // 1) decay this head's state column block: S[d,c] *= g_t.
+          for (uint32_t d = 0; d < kd; ++d) S[(size_t)d * vd + c] *= g_t;
+          // 2) kv[c] = sum_d S[d,c]*kn[d]; delta = (v-kv)*beta.
+          float kv = 0.0f;
+          for (uint32_t d = 0; d < kd; ++d) kv += S[(size_t)d * vd + c] * kn[d];
+          const float delta = (vv[c] - kv) * beta;
+          // 3) rank-1 update: S[d,c] += kn[d]*delta.
+          for (uint32_t d = 0; d < kd; ++d)
+            S[(size_t)d * vd + c] += kn[d] * delta;
+          // 4) readout: core = sum_d S[d,c]*qn[d].
+          float s = 0.0f;
+          for (uint32_t d = 0; d < kd; ++d) s += S[(size_t)d * vd + c] * qn[d];
+          core_rows[m][(size_t)hh * vd + c] = s;
+        });
+  });
+}
+
+// Chained variant: one WI per (head hh, v-col c); the M rows share one
+// state and run sequentially in row order (order-dependent recurrence).
+sycl::event ssm_forward_chain(sycl::queue& q, const SsmChainParams& p) {
+  const uint32_t M = p.M, n_v = p.n_v, n_k = p.n_k;
+  const uint32_t kd = p.kd, vd = p.vd, rs = p.row_stride;
+  const uint32_t nWG = 32;
+  const uint32_t n_blocks = n_v * vd;
+  const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
+  // Packed row-major inputs (single H2D upload); captured by value.
+  const float* qn_all = p.qn_rows;
+  const float* kn_all = p.kn_rows;
+  const float* v_all = p.v_rows;
+  const float* g_all = p.g_rows;
+  const float* b_all = p.b_rows;
+  float* S0 = p.state;
+  float* core_all = p.core_rows;
+
+  return q.submit([&](sycl::handler& h) {
+    h.parallel_for<class ssm_forward_chain_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) {
+          const uint32_t block = it.get_global_id(0);
+          if (block >= n_blocks) return;
+          const uint32_t c = block % vd;
+          const uint32_t hh = block / vd;
+          const uint32_t kh = (n_v > n_k)
+              ? (uint32_t)(((uint64_t)hh * n_k) / n_v) : hh;
+          float* S = S0 + ((size_t)hh * kd) * vd;
+          for (uint32_t m = 0; m < M; ++m) {
+            const float* qn = qn_all + (size_t)m * rs + (size_t)kh * kd;
+            const float* kn = kn_all + (size_t)m * rs + (size_t)kh * kd;
+            const float vv = v_all[(size_t)m * rs + (size_t)hh * vd + c];
+            const float g_t = sycl::exp(g_all[(size_t)m * rs + hh]);
+            const float bb = b_all[(size_t)m * rs + hh];
+            const float beta = 1.0f / (1.0f + sycl::exp(-bb));
+            for (uint32_t d = 0; d < kd; ++d) S[(size_t)d * vd + c] *= g_t;
+            float kv = 0.0f;
+            for (uint32_t d = 0; d < kd; ++d)
+              kv += S[(size_t)d * vd + c] * kn[d];
+            const float delta = (vv - kv) * beta;
+            for (uint32_t d = 0; d < kd; ++d)
+              S[(size_t)d * vd + c] += kn[d] * delta;
+            float s = 0.0f;
+            for (uint32_t d = 0; d < kd; ++d)
+              s += S[(size_t)d * vd + c] * qn[d];
+            core_all[((size_t)m * n_v + hh) * vd + c] = s;
+          }
+        });
+  });
+}
+
 }  // namespace intfer::gemm

@@ -10,7 +10,7 @@ The project is being built in three stages:
 | :--- | :--- | :--- |
 | **1** | INT2/low-bit quantization pipeline (SpinQuant → DASH-Q → RCO) | Implemented; 0.8B + 27B quantized, `.intfer` + `.gguf` artifacts |
 | **2** | Native SYCL/L0 execution engine (quant GEMM, FlashAttention, tensor-parallel) | Implemented (TP=2 sharded decode on 2× B580; DPAS INT8/W4A8/W2A8; INT8-KV opt-in) |
-| **3** | High-throughput serving (continuous batching, spec decoding) | Implemented (`--serve` server, iteration scheduler, chunked prefill, n-gram speculative decode, serve bench) |
+| **3** | High-throughput serving (continuous batching, spec decoding) | Done (`--serve`/`--serve-http` servers, iteration scheduler, mixed-batch M-row forward, joint prefill+decode, chunked prefill, round-robin fairness, n-gram speculative decode). Gates: `scripts/test_cpu_parity.sh` (oracle + split==joint), `scripts/test_http_batch.sh` (cross-request batch parity), `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8: req/s, tok/s, P50/P99 latency, solo-vs-loaded parity). Measured 2026-09-16 (0.8B INT2, GPU TP=1, max_tokens=8): C=1 2.59 tok/s / P50 3.1s, C=4 3.42 tok/s / P50 9.0s, C=8 2.83 tok/s / P50 21.8s (aggregate ~flat: single-stream launch-bound, batching holds throughput) |
 
 ---
 
@@ -135,12 +135,17 @@ scripts/             build.sh / run.sh / run_bin.sh
   quantized GEMM with an ESIMD DPAS (XMX) kernel (INT8 + W4A8/W2A8 via
   repack), fused FlashAttention kernel, TP=2 sharded decode, and an
   opt-in groupwise-INT8 KV cache (`INTFER_INT8_KV=1`, oracle-identical).
-- Stage-3 serving: `--serve` JSON-lines server with continuous batching
+- Stage-3 serving: `--serve` JSON-lines server + `--serve-http`
+  OpenAI-compatible server with continuous batching
   (iteration scheduler, mixed-batch M-row forward, joint prefill+decode,
   chunked prefill, round-robin fairness), free n-gram speculative decode
   (`INTFER_SPEC_K=N`), and gates: `scripts/test_cpu_parity.sh`
   (oracle + split==joint + rotcheck + INT8-KV), `scripts/test_tp2_27b.sh`,
-  `scripts/bench_serve.sh` (req/s, tok/s, latency).
+  `scripts/bench_serve.sh` (req/s, tok/s, latency),
+  `scripts/test_http_batch.sh` (cross-request batch parity over HTTP),
+  `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8 with req/s,
+  tok/s, P50/P99 latency + solo-vs-loaded parity; 2026-09-16: C=1
+  2.59 tok/s/P50 3.1s, C=4 3.42 tok/s/P50 9.0s, C=8 2.83 tok/s/P50 21.8s).
 
 **In progress / next**
 - GPU-side attention (today attention runs host-side in both backends;

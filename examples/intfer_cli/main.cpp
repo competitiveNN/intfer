@@ -787,6 +787,45 @@ struct CpuBackend : public LinearBackend {
 };
 
 #ifdef INTFER_HAS_GPU_BACKEND
+#ifdef INTFER_HAS_GPU_BACKEND
+// Forward declarations: Request/Layer are defined below (Sections: Layer,
+// Request); the SSM device path needs them for keying per-(request,layer)
+// resident state.
+struct Request;
+struct Layer;
+struct GpuBackend;
+// One LA-branch recurrent step's inputs. query/key/value point at the conv
+// rows ([n_k*kd],[n_k*kd],[n_v*vd]); b_row/a_row are gate rows ([n_v] each);
+// mirror is the request's host SSM state vector (&ly->ssm_state, complete
+// at call sites — the impl only needs pointer identity for req and the
+// mirror vector, so Layer/Request stay incomplete here); core_out
+// ([n_v*vd]) receives the readout.
+struct SsmRow {
+  const Request* req = nullptr;
+  std::vector<float>* mirror = nullptr;
+  const float* query = nullptr;
+  const float* key = nullptr;
+  const float* value = nullptr;
+  const float* b_row = nullptr;
+  const float* a_row = nullptr;
+  float* core_out = nullptr;
+};
+// M-row device-side SSM step (M>=1). Rows are partitioned into runs of
+// consecutive rows sharing one (request, layer) state: runs of length 1
+// (decode rows, distinct states) share one ssm_forward launch; longer
+// runs (prefill-chunk rows of one request) use ssm_forward_chain each.
+// sync_mirror: also write each touched resident state back to the host
+// mirror (needed when snapshots may capture ly.ssm_state afterwards).
+// Returns false when unavailable so the caller keeps the host path.
+static bool gpu_ssm_rows(GpuBackend& be, const SsmRow* rows, uint32_t M, int L,
+                         const float* dt_bias, const float* A_log,
+                         bool sync_mirror);
+// Re-upload all host SSM mirrors to the device (speculative partial-accept
+// rollback replaced ly.ssm_state vectors under the device; the side map
+// holds the host mirror pointers so no Request access is needed here).
+static void gpu_ssm_resync_all(GpuBackend& be);
+#endif
+
 // ----------------------------------------------------------------------------
 // GpuBackend — SYCL tensor-parallel via intfer::Engine
 // ----------------------------------------------------------------------------
@@ -1393,6 +1432,55 @@ struct GpuBackend : public LinearBackend {
   std::vector<std::pair<uint32_t,uint32_t>> lm_head_ranges_;  // TP row shard per device
   std::vector<std::vector<std::pair<uint32_t,uint32_t>>> lm_head_tiles_;  // upload/GEMM tiles per device
   uint32_t lm_head_N_ = 0, lm_head_K_ = 0;
+  // Device-side SSM state (INTFER_SSM_GPU=1): per-(request,layer) resident
+  // S state (n_v*kd*vd FP32) on device 0 + per-key staging (packed H2D
+  // inputs, core output, row-pointer arrays sized to the max M seen).
+  // Lazily allocated on first use; the host mirror is uploaded (never
+  // zeroed — first use may be mid-run with evolved state). Host mirrors
+  // stay authoritative for snapshots/rollback: each call optionally syncs
+  // device->host, and gpu_ssm_resync re-uploads after a host-side restore.
+  // FIFO eviction past 256 keys is always safe: eviction writes a dirty
+  // entry back before freeing, and any use re-uploads from the mirror.
+  struct SsmDev {
+    float* S = nullptr;       // resident [nv*kd*vd]
+    float* in = nullptr;      // packed staging H2D [Mcap*(2*nk*kd+nv*vd+2*nv)]
+    float* core = nullptr;    // staging out [Mcap*nv*vd]
+    float* ptrs = nullptr;    // device row-pointer array [7*Mcap] (as floats bits)
+    uint32_t nv = 0, nk = 0, kd = 0, vd = 0, Mcap = 0;
+    bool dirty = false;       // resident newer than host mirror
+    bool ok = false;
+  };
+  // Insertion-ordered map for FIFO eviction (std::map + order deque).
+  std::map<std::pair<const Request*,int>, SsmDev> ssm_dev_;
+  std::deque<std::pair<const Request*,int>> ssm_dev_order_;
+  // Layer* per key for eviction writeback (host mirror destination).
+  // Stored as the mirror vector pointer: the impl never needs complete
+  // Layer/Request (req is pointer-identity only, mirror is a complete
+  // std::vector<float>), so the gpu_ssm_rows definition can stay here,
+  // ahead of struct Layer/Request.
+  std::map<std::pair<const Request*,int>, std::vector<float>*> ssm_dev_mirror_;
+  // M-row device-side SSM step; false keeps the host path. Defined after
+  // struct Request (needs complete Layer for ly->ssm_state).
+  bool ssm_rows(const SsmRow* rows, uint32_t M, int L,
+                const float* dt_bias, const float* A_log, bool sync_mirror) {
+    return gpu_ssm_rows(*this, rows, M, L, dt_bias, A_log, sync_mirror);
+  }
+  void ssm_resync_all() { gpu_ssm_resync_all(*this); }
+  ~GpuBackend() {
+    if(!eng || ssm_dev_.empty()) return;
+    sycl::queue& q = eng->device_queue(0);
+    for(auto& kv : ssm_dev_) {
+      SsmDev& sd = kv.second;
+      if(sd.S) sycl::free(sd.S, q);
+      if(sd.in) sycl::free(sd.in, q);
+      if(sd.core) sycl::free(sd.core, q);
+      if(sd.ptrs) sycl::free(sd.ptrs, q);
+      sd = SsmDev();
+    }
+    ssm_dev_.clear();
+    ssm_dev_order_.clear();
+    ssm_dev_mirror_.clear();
+  }
   const Rotation* rot_for(const std::string& name) override {
     if(!eng) return nullptr;
     auto it = ti_cache.find(name);
@@ -1400,6 +1488,305 @@ struct GpuBackend : public LinearBackend {
     return eng->rotation_for(it->second);
   }
 };
+
+// Closes the #ifdef INTFER_HAS_GPU_BACKEND opened at struct GpuBackend.
+#endif
+
+#ifdef INTFER_HAS_GPU_BACKEND
+// M-row device-side SSM step (GpuBackend::ssm_rows impl). Defined here
+// (after Layer/Request are complete) rather than at the struct because it
+// touches ly->ssm_state.
+static bool gpu_ssm_rows(GpuBackend& be, const SsmRow* rows, uint32_t M, int L,
+                         const float* dt_bias, const float* A_log,
+                         bool sync_mirror) {
+  if(!be.eng || !rows || M == 0 || !dt_bias || !A_log) return false;
+  const uint32_t nv = (uint32_t)cfg.n_v_heads;
+  const uint32_t nk = (uint32_t)cfg.n_k_heads;
+  const uint32_t kd = (uint32_t)cfg.k_head_dim;
+  const uint32_t vd = (uint32_t)cfg.v_head_dim;
+  if(nv == 0 || nk == 0 || kd == 0 || vd == 0) return false;
+  const size_t sdim = (size_t)nv * kd * vd;
+  const size_t zvw = (size_t)nv * vd;
+  for(uint32_t m = 0; m < M; ++m) {
+    const SsmRow& r = rows[m];
+    if(!r.req || !r.mirror || !r.query || !r.key || !r.value ||
+       !r.b_row || !r.a_row || !r.core_out) return false;
+    if(r.mirror->size() != sdim) return false;  // keep host path
+  }
+  sycl::queue& q = be.eng->device_queue(0);
+  auto dev = q.get_device();
+  auto ctx = q.get_context();
+  auto malloc_f = [&](size_t n) -> float* {
+    try {
+      return static_cast<float*>(sycl::malloc_device(n * sizeof(float), dev, ctx));
+    } catch (...) { return nullptr; }
+  };
+  auto malloc_b = [&](size_t nbytes) -> float* {
+    try {
+      return static_cast<float*>(sycl::malloc_device(nbytes, dev, ctx));
+    } catch (...) { return nullptr; }
+  };
+  // Partition rows into runs of consecutive rows sharing one (req, layer)
+  // state. Single-row runs (distinct states) batch into one ssm_forward;
+  // longer runs (one request's prefill chunk) use ssm_forward_chain each.
+  // Run leaders carry the key; solo[] flags length-1 runs.
+  static thread_local std::vector<uint32_t> run_start, run_len;
+  run_start.clear(); run_len.clear();
+  for(uint32_t m = 0; m < M;) {
+    uint32_t e = m + 1;
+    while(e < M && rows[e].req == rows[m].req && rows[e].mirror == rows[m].mirror) ++e;
+    run_start.push_back(m); run_len.push_back(e - m);
+    m = e;
+  }
+  const uint32_t nRuns = (uint32_t)run_start.size();
+  // Resolve (alloc/upload on first use) each touched key. Staging sized to
+  // the run length (chain: full run; solo: gathered below into key K0).
+  struct KeyRef { std::pair<const Request*,int> key; GpuBackend::SsmDev* sd; };
+  static thread_local std::vector<KeyRef> keys;
+  keys.clear();
+  auto get_sd = [&](const Request* req, std::vector<float>* mirror, uint32_t need,
+                    bool& fresh) -> GpuBackend::SsmDev* {
+    std::pair<const Request*,int> key(req, L);
+    auto it = be.ssm_dev_.find(key);
+    if(it == be.ssm_dev_.end()) {
+      if(be.ssm_dev_.size() >= 256 && !be.ssm_dev_order_.empty()) {
+        // FIFO evict: write a dirty entry back first (host mirror is the
+        // re-upload source), then free.
+        auto ek = be.ssm_dev_order_.front(); be.ssm_dev_order_.pop_front();
+        auto eit = be.ssm_dev_.find(ek);
+        if(eit != be.ssm_dev_.end()) {
+          GpuBackend::SsmDev& esd = eit->second;
+          auto mit = be.ssm_dev_mirror_.find(ek);
+          if(esd.dirty && esd.ok && mit != be.ssm_dev_mirror_.end() &&
+             mit->second && mit->second->size() == sdim) {
+            try {
+              q.memcpy(mit->second->data(), esd.S, sdim * sizeof(float)).wait();
+            } catch (...) {}
+          }
+          if(esd.S) sycl::free(esd.S, q);
+          if(esd.in) sycl::free(esd.in, q);
+          if(esd.core) sycl::free(esd.core, q);
+          if(esd.ptrs) sycl::free(esd.ptrs, q);
+          be.ssm_dev_.erase(eit);
+          be.ssm_dev_mirror_.erase(ek);
+        }
+      }
+      GpuBackend::SsmDev sd;
+      sd.S = malloc_f(sdim);
+      if(!sd.S) return nullptr;
+      // Upload the CURRENT host mirror (first use may be mid-run).
+      try {
+        q.memcpy(sd.S, mirror->data(), sdim * sizeof(float)).wait();
+      } catch (...) { sycl::free(sd.S, q); return nullptr; }
+      sd.nv = nv; sd.nk = nk; sd.kd = kd; sd.vd = vd;
+      sd.ok = true; sd.dirty = false;
+      be.ssm_dev_[key] = sd;
+      be.ssm_dev_order_.push_back(key);
+      be.ssm_dev_mirror_[key] = mirror;
+      fresh = true;
+      return &be.ssm_dev_[key];
+    }
+    GpuBackend::SsmDev& sd = it->second;
+    if(!sd.ok || sd.nv != nv || sd.nk != nk || sd.kd != kd || sd.vd != vd)
+      return nullptr;
+    // Refresh the mirror pointer (same host vector for a key's lifetime,
+    // but refresh is harmless and keeps eviction writeback correct).
+    be.ssm_dev_mirror_[key] = mirror;
+    // Grow staging to the run length.
+    fresh = false;
+    if(sd.Mcap < need) {
+      float* nin = malloc_f((size_t)need * (2*(size_t)nk*kd + zvw + 2*nv));
+      float* ncore = malloc_f((size_t)need * zvw);
+      float* nptrs = malloc_b(7 * (size_t)need * sizeof(void*));
+      if(!nin || !ncore || !nptrs) {
+        if(nin) sycl::free(nin, q);
+        if(ncore) sycl::free(ncore, q);
+        if(nptrs) sycl::free(nptrs, q);
+        return nullptr;
+      }
+      if(sd.in) sycl::free(sd.in, q);
+      if(sd.core) sycl::free(sd.core, q);
+      if(sd.ptrs) sycl::free(sd.ptrs, q);
+      sd.in = nin; sd.core = ncore; sd.ptrs = nptrs;
+      sd.Mcap = need;
+    }
+    return &sd;
+  };
+  // Host-side O(kd) per-head prep (identical to the host loop): L2-norm
+  // q/k rows, scale q, form g logits. Packed per-row layout in staging:
+  // [qn(nk*kd) | kn(nk*kd) | v(nv*vd) | g(nv) | b(nv)].
+  const float qscale = 1.0f / sqrtf((float)kd);
+  const size_t row_in = 2*(size_t)nk*kd + zvw + 2*nv;
+  static thread_local std::vector<float> hin;
+  static thread_local std::vector<void*> hptrs;  // pointer-sized slots
+  static thread_local std::vector<float> hcore;
+  try {
+    // Resolve keys first (alloc may wait on upload).
+    for(uint32_t r = 0; r < nRuns; ++r) {
+      const SsmRow& lr = rows[run_start[r]];
+      bool fresh = false;
+      GpuBackend::SsmDev* sd = get_sd(lr.req, lr.mirror, run_len[r], fresh);
+      if(!sd) return false;
+      if(fresh && sd->Mcap < run_len[r]) {
+        sd->in = malloc_f((size_t)run_len[r] * row_in);
+        sd->core = malloc_f((size_t)run_len[r] * zvw);
+        sd->ptrs = malloc_b(7 * (size_t)run_len[r] * sizeof(void*));
+        if(!sd->in || !sd->core || !sd->ptrs) {
+          if(sd->in) sycl::free(sd->in, q);
+          if(sd->core) sycl::free(sd->core, q);
+          if(sd->ptrs) sycl::free(sd->ptrs, q);
+          *sd = GpuBackend::SsmDev();
+          // Drop the broken key so a retry re-allocates.
+          auto key = std::make_pair(lr.req, L);
+          be.ssm_dev_.erase(key);
+          be.ssm_dev_mirror_.erase(key);
+          return false;
+        }
+        sd->Mcap = run_len[r];
+      }
+      keys.push_back({std::make_pair(lr.req, L), sd});
+    }
+    sycl::event dep;
+    bool have_dep = false;
+    static thread_local std::vector<sycl::event> deps;
+    deps.clear();
+    // Chained-core staging: one host buffer for ALL chained runs (per-run
+    // offsets), scattered to per-row outputs after the single wait below.
+    static thread_local std::vector<uint32_t> chain_off;
+    chain_off.assign(nRuns, 0);
+    {
+      size_t total = 0;
+      for(uint32_t r = 0; r < nRuns; ++r)
+        if(run_len[r] > 1) { chain_off[r] = (uint32_t)total; total += run_len[r]; }
+      if(hcore.size() < total * zvw) hcore.assign(total * zvw, 0.f);
+    }
+    for(uint32_t r = 0; r < nRuns; ++r) {
+      const uint32_t rs = run_start[r], rl = run_len[r];
+      GpuBackend::SsmDev* sd = keys[r].sd;
+      if(hin.size() < (size_t)rl * row_in) hin.assign((size_t)rl * row_in, 0.f);
+      for(uint32_t i = 0; i < rl; ++i) {
+        const SsmRow& rr = rows[rs + i];
+        float* dst = &hin[(size_t)i * row_in];
+        float* hqn = dst;
+        float* hkn = dst + (size_t)nk * kd;
+        float* hv = hkn + (size_t)nk * kd;
+        float* hg = hv + zvw;
+        float* hb = hg + nv;
+        for(uint32_t kh = 0; kh < nk; ++kh) {
+          l2norm(&rr.query[(size_t)kh * kd], &hqn[(size_t)kh * kd], (int)kd);
+          l2norm(&rr.key[(size_t)kh * kd], &hkn[(size_t)kh * kd], (int)kd);
+          for(uint32_t d = 0; d < kd; ++d) hqn[(size_t)kh * kd + d] *= qscale;
+        }
+        memcpy(hv, rr.value, zvw * sizeof(float));
+        memcpy(hb, rr.b_row, (size_t)nv * sizeof(float));
+        for(uint32_t hh = 0; hh < nv; ++hh) {
+          float sp = log1pf(expf(rr.a_row[hh] + dt_bias[hh]));
+          hg[hh] = -expf(A_log[hh]) * sp;
+        }
+      }
+      // One H2D for the packed inputs; queue is in-order so the kernel
+      // below observes it without explicit depends (same for e1).
+      q.memcpy(sd->in, hin.data(), (size_t)rl * row_in * sizeof(float));
+      if(rl == 1) {
+        // Solo run: single-row ssm_forward via the device pointer array.
+        // NOTE: solo runs of DIFFERENT keys cannot share one launch (one
+        // state pointer array per key) — each solo run is its own launch.
+        // (Batching solos across keys would need a gathered state table;
+        // decode M is small; one launch/layer/token each is fine.)
+        if(hptrs.size() < 7) hptrs.assign(7, nullptr);
+        float* base = sd->in;
+        hptrs[0] = base;                            // qn at row offset 0
+        hptrs[1] = base + (size_t)nk * kd;          // kn
+        hptrs[2] = base + 2 * (size_t)nk * kd;      // v
+        hptrs[3] = base + 2 * (size_t)nk * kd + zvw;  // g
+        hptrs[4] = base + 2 * (size_t)nk * kd + zvw + nv;  // b
+        hptrs[5] = sd->S;                           // state
+        hptrs[6] = sd->core;                        // core out
+        q.memcpy(sd->ptrs, hptrs.data(), 7 * sizeof(void*));
+        gemm::SsmParams p;
+        const float* const* dptrs = reinterpret_cast<const float* const*>(sd->ptrs);
+        float* const* dptrs_m = reinterpret_cast<float* const*>(sd->ptrs);
+        p.qn_rows = dptrs + 0; p.kn_rows = dptrs + 1; p.v_rows = dptrs + 2;
+        p.g_rows = dptrs + 3; p.b_rows = dptrs + 4;
+        p.s_rows = dptrs_m + 5; p.core_rows = dptrs_m + 6;
+        p.M = 1; p.n_v = nv; p.n_k = nk; p.kd = kd; p.vd = vd;
+        sycl::event ke = gemm::ssm_forward(q, p);
+        sycl::event e2 = q.memcpy(rows[rs].core_out, sd->core,
+                                  zvw * sizeof(float), ke);
+        deps.push_back(e2);
+        if(sync_mirror) {
+          sycl::event e3 = q.memcpy(rows[rs].mirror->data(), sd->S,
+                                    sdim * sizeof(float), ke);
+          deps.push_back(e3);
+        }
+      } else {
+        // Chained run: packed per-row inputs feed ssm_forward_chain
+        // directly (row_stride = packed row width).
+        gemm::SsmChainParams p;
+        p.qn_rows = sd->in;
+        p.kn_rows = sd->in + (size_t)nk * kd;
+        p.v_rows = sd->in + 2 * (size_t)nk * kd;
+        p.g_rows = sd->in + 2 * (size_t)nk * kd + zvw;
+        p.b_rows = sd->in + 2 * (size_t)nk * kd + zvw + nv;
+        p.state = sd->S;
+        p.core_rows = sd->core;
+        p.M = rl; p.n_v = nv; p.n_k = nk; p.kd = kd; p.vd = vd;
+        p.row_stride = (uint32_t)row_in;
+        sycl::event ke = gemm::ssm_forward_chain(q, p);
+        sycl::event e2 = q.memcpy(&hcore[(size_t)chain_off[r] * zvw], sd->core,
+                                  (size_t)rl * zvw * sizeof(float), ke);
+        deps.push_back(e2);
+        if(sync_mirror) {
+          // State mirror sync piggybacks on the same dependency.
+          sycl::event e3 = q.memcpy(rows[rs].mirror->data(), sd->S,
+                                    sdim * sizeof(float), ke);
+          deps.push_back(e3);
+        }
+      }
+      (void)have_dep; (void)dep;
+    }
+    for(auto& e : deps) e.wait();
+    // Scatter chained cores to per-row outputs (host memcpy, device work
+    // complete after the waits above). Solos wrote direct; skip them.
+    for(uint32_t r = 0; r < nRuns; ++r) {
+      const uint32_t rs = run_start[r], rl = run_len[r];
+      if(rl == 1) continue;
+      for(uint32_t i = 0; i < rl; ++i)
+        memcpy(rows[rs + i].core_out, &hcore[((size_t)chain_off[r] + i) * zvw],
+               zvw * sizeof(float));
+    }
+    for(uint32_t r = 0; r < nRuns; ++r) {
+      GpuBackend::SsmDev* sd = keys[r].sd;
+      sd->dirty = !sync_mirror;
+    }
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
+
+// Re-upload all host SSM mirrors to the device (speculative partial-accept
+// rollback replaced ly.ssm_state vectors under the device; the side map
+// holds the host mirror pointers so no Request access is needed here).
+// Missing/undersized mirrors are skipped (their keys re-upload lazily).
+static void gpu_ssm_resync_all(GpuBackend& be) {
+  if(!be.eng) return;
+  const size_t sdim = (size_t)cfg.n_v_heads * cfg.k_head_dim * cfg.v_head_dim;
+  if(sdim == 0) return;
+  sycl::queue& q = be.eng->device_queue(0);
+  try {
+    for(auto& kv : be.ssm_dev_) {
+      GpuBackend::SsmDev& sd = kv.second;
+      if(!sd.ok) continue;
+      auto mit = be.ssm_dev_mirror_.find(kv.first);
+      if(mit == be.ssm_dev_mirror_.end() || !mit->second) continue;
+      std::vector<float>& mirror = *mit->second;
+      if(mirror.size() != sdim) continue;
+      q.memcpy(sd.S, mirror.data(), sdim * sizeof(float)).wait();
+      sd.dirty = false;
+    }
+  } catch (...) {}
+}
 #endif
 
 // Per-layer precomputed tensor names + host pointers (TODO 4b). step()
@@ -2053,10 +2440,34 @@ static StepOut step(Request& req, int token, int pos,
         backend->run_linear_into(ln.a, xa, a);
         ckpt("la.z", L, z); ckpt("la.b", L, b); ckpt("la.a", L, a);
         std::vector<float>& g = req.scratch.g;
+        std::vector<float>& core = req.scratch.core;
+      // ---- Device-side SSM (INTFER_SSM_GPU=1, GPU backend only) ----
+      // Replaces the host scalar recurrence below with one FP32 SYCL
+      // kernel over (n_v_heads x vd) work-items against the request's
+      // resident device state. Bit-identical math, same element order;
+      // the oracle token stream is the arbiter. Env-off (default) keeps
+      // the exact host path. No snapshots in step() => no mirror sync.
+      static const bool ssm_gpu_env =
+          (std::getenv("INTFER_SSM_GPU") != nullptr);
+      bool ssm_done = false;
+#ifdef INTFER_HAS_GPU_BACKEND
+      if(ssm_gpu_env) {
+        if(auto* gpu_be_ssm = dynamic_cast<GpuBackend*>(backend)) {
+          if(gpu_be_ssm->eng) {
+            SsmRow srow{&req, &ly.ssm_state, query, key, value,
+                        b.data(), a.data(), core.data()};
+            ssm_done = gpu_be_ssm->ssm_rows(&srow, 1, L, dt_bias, A_log,
+                                            /*sync_mirror=*/false);
+          }
+        }
+      }
+#else
+      (void)ssm_gpu_env;
+#endif
+      if(!ssm_done) {
       for(int hh=0; hh<cfg.n_v_heads; hh++){
         float sp=log1pf(expf(a[hh]+dt_bias[hh])); g[hh]=-expf(A_log[hh])*sp;
       }
-        std::vector<float>& core = req.scratch.core;
         for(int i=0;i<cfg.n_v_heads*cfg.v_head_dim;i++) core[i] = 0.f;
       float qn[cfg.k_head_dim], kn[cfg.k_head_dim];
         // HF Qwen3NextGatedDeltaNet.fix_query_key_value_ordering: the conv
@@ -2088,6 +2499,7 @@ static StepOut step(Request& req, int token, int pos,
           core[hh*cfg.v_head_dim+c]=s;
         }
       }
+      } // end host-SSM fallback (device path sets ssm_done)
         const float* ssm_norm_w = ln.ssm_norm_w;
       std::vector<float>& normed_core = req.scratch.normed_core;
       for(int hh=0; hh<cfg.n_v_heads; hh++){
@@ -2448,10 +2860,34 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         backend->run_linear_into(ln.b, xb, b);
         backend->run_linear_into(ln.a, xa, a);
         std::vector<float>& g = req.scratch.g;
+        std::vector<float>& core = req.scratch.core;
+      // ---- Device-side SSM (INTFER_SSM_GPU=1; scalar prefill row) ----
+      // Same contract as the step() hook; sync_mirror follows row_snaps
+      // (the speculative verifier captures ly.ssm_state below when set).
+      // NOTE: M=1 per row here — conv_state evolves sequentially per row,
+      // so rows cannot batch; the kernel still removes the O(nv*kd*vd)
+      // host recurrence per row.
+      bool ssm_done = false;
+#ifdef INTFER_HAS_GPU_BACKEND
+      {
+        static const bool ssm_gpu_env =
+            (std::getenv("INTFER_SSM_GPU") != nullptr);
+        if(ssm_gpu_env) {
+          if(auto* gpu_be = dynamic_cast<GpuBackend*>(backend)) {
+            if(gpu_be->eng) {
+              SsmRow srow{&req, &ly.ssm_state, query, key, value,
+                          b.data(), a.data(), core.data()};
+              ssm_done = gpu_be->ssm_rows(&srow, 1, L, dt_bias, A_log,
+                                          /*sync_mirror=*/row_snaps != nullptr);
+            }
+          }
+        }
+      }
+#endif
+      if(!ssm_done) {
         for(int hh=0; hh<cfg.n_v_heads; hh++){
           float sp=log1pf(expf(a[hh]+dt_bias[hh])); g[hh]=-expf(A_log[hh])*sp;
         }
-        std::vector<float>& core = req.scratch.core;
         for(int i=0;i<cfg.n_v_heads*cfg.v_head_dim;i++) core[i] = 0.f;
         float qn[cfg.k_head_dim], kn[cfg.k_head_dim];
         for(int hh=0; hh<cfg.n_v_heads; hh++){
@@ -2477,6 +2913,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
             core[hh*cfg.v_head_dim+c]=s;
           }
         }
+      } // end device/host SSM (scalar prefill row)
         const float* ssm_norm_w = ln.ssm_norm_w;
         std::vector<float>& normed_core = req.scratch.normed_core;
         for(int hh=0; hh<cfg.n_v_heads; hh++){
@@ -2782,6 +3219,28 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       std::vector<float> kv_mem(cfg.v_head_dim), delta(cfg.v_head_dim);
       std::vector<float> qn(cfg.k_head_dim), kn(cfg.k_head_dim);
       std::vector<float> core(zvw), gg(cfg.n_v_heads);
+      // Device-side SSM (INTFER_SSM_GPU=1): the conv loop below stores one
+      // row copy per chunk row; a single M-row device step then replaces
+      // the host recurrence (the whole chunk shares one (req, layer)
+      // state => one chained run). ssm_rows false => host loop over the
+      // stored rows (identical math, same order).
+      static thread_local std::vector<SsmRow> c_ssm_rows;
+      static thread_local std::vector<float> c_ssm_conv;  // [M*conv_dim]
+      bool c_ssm_on = false;
+#ifdef INTFER_HAS_GPU_BACKEND
+      {
+        static const bool ssm_gpu_env =
+            (std::getenv("INTFER_SSM_GPU") != nullptr);
+        if(ssm_gpu_env) {
+          if(auto* gpu_be0 = dynamic_cast<GpuBackend*>(backend))
+            c_ssm_on = (gpu_be0->eng != nullptr);
+        }
+      }
+#endif
+      if(c_ssm_on) {
+        c_ssm_rows.assign(M, SsmRow());
+        c_ssm_conv.assign((size_t)M * cfg.conv_dim, 0.f);
+      }
       for(int m=0; m<M; m++){
         float* mqkvr = &c_mqkv[(size_t)m*cfg.conv_dim];
         for(int c=0;c<cfg.conv_dim;c++){
@@ -2794,6 +3253,11 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
           ly.conv_state[c*3+0]=ly.conv_state[c*3+1];
           ly.conv_state[c*3+1]=ly.conv_state[c*3+2];
           ly.conv_state[c*3+2]=mqkvr[c];
+        }
+        if(c_ssm_on) {
+          memcpy(&c_ssm_conv[(size_t)m*cfg.conv_dim], conv_out.data(),
+                 (size_t)cfg.conv_dim*sizeof(float));
+          continue;
         }
         float* query=conv_out.data();
         float* key=conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
@@ -2846,6 +3310,115 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
           CacheSnap& sn = rws[(size_t)L][m];
           sn.conv = ly.conv_state;
           sn.ssm = ly.ssm_state;
+        }
+      }
+      if(c_ssm_on) {
+        // Device step over the whole chunk (one chained run: same key).
+        // core rows land directly in c_ncore; the norm below reads them.
+        for(int m=0; m<M; m++){
+          SsmRow& sr = c_ssm_rows[(size_t)m];
+          const float* cq = &c_ssm_conv[(size_t)m * cfg.conv_dim];
+          sr.req = &req; sr.mirror = &ly.ssm_state;
+          sr.query = cq;
+          sr.key = cq + cfg.k_head_dim * cfg.n_k_heads;
+          sr.value = cq + 2 * cfg.k_head_dim * cfg.n_k_heads;
+          sr.b_row = &c_b[(size_t)m * cfg.n_v_heads];
+          sr.a_row = &c_a[(size_t)m * cfg.n_v_heads];
+          sr.core_out = &c_ncore[(size_t)m * zvw];
+        }
+        bool ok = false;
+#ifdef INTFER_HAS_GPU_BACKEND
+        if(auto* gpu_be = dynamic_cast<GpuBackend*>(backend)) {
+          if(gpu_be->eng)
+            ok = gpu_be->ssm_rows(c_ssm_rows.data(), (uint32_t)M, L,
+                                  dt_bias, A_log,
+                                  /*sync_mirror=*/row_snaps != nullptr);
+        }
+#endif
+        if(ok) {
+          // Norm + snapshot tail over device cores (mirrors host loop).
+          const float* ssm_norm_w = ln.ssm_norm_w;
+          for(int m=0; m<M; m++){
+            float* ncr = &c_ncore[(size_t)m*zvw];
+            float* zr = &c_z[(size_t)m*zvw];
+            for(int hh=0; hh<cfg.n_v_heads; hh++){
+              float* xx=&ncr[hh*cfg.v_head_dim];
+              const float* zg=&zr[hh*cfg.v_head_dim];
+              float* oo=&ncr[hh*cfg.v_head_dim];
+              float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
+              float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
+              // In-place norm: xx and oo alias (ncr row) — matches the
+              // host loop, where core[] is read into ncr[] distinctly...
+              // host reads core[] and writes ncr[]; here xx IS ncr. The
+              // per-element update uses only xx[i] (no cross terms), so
+              // in-place is elementwise-safe.
+              for(int i=0;i<cfg.v_head_dim;i++)
+                oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
+            }
+            if(row_snaps){
+              auto& rws = *row_snaps;
+              if((int)rws.size() != cfg.layers) rws.resize(cfg.layers);
+              if((int)rws[(size_t)L].size() != M) rws[(size_t)L].resize(M);
+              CacheSnap& sn = rws[(size_t)L][m];
+              sn.conv = ly.conv_state;
+              sn.ssm = ly.ssm_state;
+            }
+          }
+        } else {
+          // Device declined: host recurrence over the stored conv rows
+          // (same math/order as the env-off loop above).
+          const float* ssm_norm_w = ln.ssm_norm_w;
+          for(int m=0; m<M; m++){
+            const float* cq = &c_ssm_conv[(size_t)m * cfg.conv_dim];
+            const float* query = cq;
+            const float* key = cq + cfg.k_head_dim * cfg.n_k_heads;
+            const float* value = cq + 2 * cfg.k_head_dim * cfg.n_k_heads;
+            float* zr = &c_z[(size_t)m*zvw];
+            float* br = &c_b[(size_t)m*cfg.n_v_heads];
+            float* ar = &c_a[(size_t)m*cfg.n_v_heads];
+            for(int hh=0; hh<cfg.n_v_heads; hh++){
+              float sp=log1pf(expf(ar[hh]+dt_bias[hh])); gg[hh]=-expf(A_log[hh])*sp;
+            }
+            for(size_t i=0;i<zvw;i++) core[i] = 0.f;
+            for(int hh=0; hh<cfg.n_v_heads; hh++){
+              int kh = (cfg.n_v_heads > cfg.n_k_heads)
+                       ? (int)((long long)hh * cfg.n_k_heads / cfg.n_v_heads)
+                       : hh;
+              l2norm(&query[kh*cfg.k_head_dim], qn.data(), cfg.k_head_dim);
+              l2norm(&key[kh*cfg.k_head_dim],  kn.data(), cfg.k_head_dim);
+              float scale=1.0f/sqrtf((float)cfg.k_head_dim);
+              for(int d=0;d<cfg.k_head_dim;d++) qn[d]*=scale;
+              float g_t=expf(gg[hh]); float beta=sigmoidf(br[hh]);
+              float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
+              for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
+              for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
+              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
+              { const float* vh=&value[hh*cfg.v_head_dim];
+              for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
+              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
+              for(int c=0;c<cfg.v_head_dim;c++){
+                float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
+                core[hh*cfg.v_head_dim+c]=s;
+              }
+            }
+            float* ncr = &c_ncore[(size_t)m*zvw];
+            for(int hh=0; hh<cfg.n_v_heads; hh++){
+              const float* xx=&core[hh*cfg.v_head_dim];
+              const float* zg=&zr[hh*cfg.v_head_dim];
+              float* oo=&ncr[hh*cfg.v_head_dim];
+              float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
+              float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
+              for(int i=0;i<cfg.v_head_dim;i++) oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
+            }
+            if(row_snaps){
+              auto& rws = *row_snaps;
+              if((int)rws.size() != cfg.layers) rws.resize(cfg.layers);
+              if((int)rws[(size_t)L].size() != M) rws[(size_t)L].resize(M);
+              CacheSnap& sn = rws[(size_t)L][m];
+              sn.conv = ly.conv_state;
+              sn.ssm = ly.ssm_state;
+            }
+          }
         }
       }
       need_rows(c_y, Hdim);
