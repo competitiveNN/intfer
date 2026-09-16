@@ -10,7 +10,7 @@ The project is being built in three stages:
 | :--- | :--- | :--- |
 | **1** | INT2/low-bit quantization pipeline (SpinQuant → DASH-Q → RCO) | Implemented; 0.8B + 27B quantized, `.intfer` + `.gguf` artifacts |
 | **2** | Native SYCL/L0 execution engine (quant GEMM, FlashAttention, tensor-parallel) | Implemented (TP=2 sharded decode on 2× B580; DPAS INT8/W4A8/W2A8; INT8-KV opt-in) |
-| **3** | High-throughput serving (continuous batching, spec decoding) | Done (`--serve`/`--serve-http` servers, iteration scheduler, mixed-batch M-row forward, joint prefill+decode, chunked prefill, round-robin fairness, n-gram speculative decode). Gates: `scripts/test_cpu_parity.sh` (oracle + split==joint), `scripts/test_http_batch.sh` (cross-request batch parity), `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8: req/s, tok/s, P50/P99 latency, solo-vs-loaded parity). Measured 2026-09-16 (0.8B INT2, GPU TP=1, max_tokens=8): C=1 2.85 tok/s / P50 2.8s, C=4 3.62 tok/s / P50 8.4s, C=8 3.80 tok/s / P50 16.0s (x1.34 C=1->C=8; batching adds throughput while latency scales with queueing) |
+| **3** | High-throughput serving (continuous batching, spec decoding) | Done (`--serve`/`--serve-http` servers, iteration scheduler, mixed-batch M-row forward, joint prefill+decode, chunked prefill, round-robin fairness, n-gram speculative decode). Gates: `scripts/test_cpu_parity.sh` (oracle + split==joint), `scripts/test_http_batch.sh` (cross-request batch parity), `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8: req/s, tok/s, P50/P99 latency, solo-vs-loaded parity). Measured 2026-09-16 (0.8B INT2, GPU TP=1, max_tokens=8): C=1 2.93 tok/s / P50 2.7s, C=4 4.06 tok/s / P50 7.5s, C=8 3.89 tok/s / P50 15.7s (x1.33 C=1->C=8; batching adds throughput while latency scales with queueing) |
 
 ---
 
@@ -145,8 +145,8 @@ scripts/             build.sh / run.sh / run_bin.sh
   `scripts/test_http_batch.sh` (cross-request batch parity over HTTP),
   `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8 with req/s,
   tok/s, P50/P99 latency + solo-vs-loaded parity; 2026-09-16: C=1
-  2.85 tok/s/P50 2.8s, C=4 3.62 tok/s/P50 8.4s, C=8 3.80 tok/s/P50 16.0s,
-  x1.34 C=1->C=8).
+  2.93 tok/s/P50 2.7s, C=4 4.06 tok/s/P50 7.5s, C=8 3.89 tok/s/P50 15.7s,
+  x1.33 C=1->C=8).
 
 **In progress / next**
 - GPU-side attention (today attention runs host-side in both backends;
