@@ -2660,8 +2660,17 @@ static StepOut step(Request& req, int token, int pos,
       else for(int i=0;i<cfg.H;i++) xv[i] = normed[i];
       std::vector<float>& k = req.scratch.k;
       std::vector<float>& v = req.scratch.v;
-      backend->run_linear_into(ln.k, xk, k);
-      backend->run_linear_into(ln.v, xv, v);
+      // Wave: k/v share the normed input (distinct rotations pre-applied)
+      // and are independent — one engine call, one host round-trip.
+      // Bit-identical to two run_linear_into (same kernels, same buffers).
+      // (q stays sequential: its split/norm/rope consumers run above.)
+      {
+        LinearBackend::LinearWaveItem items[2] = {
+          {ln.k, &xk, &k},
+          {ln.v, &xv, &v},
+        };
+        backend->run_linear_wave(items, 2);
+      }
       ckpt("attn.k_proj", L, k); ckpt("attn.v_proj", L, v);
       for(int hh=0; hh<cfg.n_kv; hh++){
         // Fusion: in-place rmsnorm is bit-identical (see q_norm above).
@@ -3152,6 +3161,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         else memcpy(xk.data(), normed.data(), (size_t)Hdim*sizeof(float));
         if(Rv) rot_apply(normed.data(), *Rv, xv.data());
         else memcpy(xv.data(), normed.data(), (size_t)Hdim*sizeof(float));
+        std::vector<float>& qp = req.scratch.qp;
         std::vector<float>& k = req.scratch.k;
         std::vector<float>& v = req.scratch.v;
         backend->run_linear_into(ln.k, xk, k);
@@ -3430,8 +3440,15 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         if(Rv) rot_apply(nr, *Rv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       std::vector<float> c_v_in = c_x; // copy of rotated-v inputs
-      backend->run_linear_batch(ln.k, c_kv_in, c_k, (uint32_t)M);
-      backend->run_linear_batch(ln.v, c_v_in, c_v, (uint32_t)M);
+      // Wave-batch: k/v independent (q already ran above) — one engine
+      // call, one host round-trip. Bit-identical to two run_linear_batch.
+      {
+        LinearBackend::LinearWaveBatchItem items[2] = {
+          {ln.k, &c_kv_in, &c_k},
+          {ln.v, &c_v_in, &c_v},
+        };
+        backend->run_linear_wave_batch(items, 2, (uint32_t)M);
+      }
       // Per-row q split / norms / ropes + KV appends (token order).
       // NOTE: q/k/v GEMM outputs are FP16-quantized on device (to_half_bits
       // per element) while the M=1 path goes through the same device
@@ -3554,8 +3571,16 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         float* ri = &c_rin[(size_t)m*Hdim];
         if(Rg) rot_apply(r2, *Rg, ri); else memcpy(ri, r2, (size_t)Hdim*sizeof(float));
       }
-      backend->run_linear_batch(ln.gate, c_rin, c_mg, (uint32_t)M);
-      backend->run_linear_batch(ln.up,   c_rin, c_mu, (uint32_t)M);
+      // Wave-batch: gate/up share c_rin and are independent — one
+      // engine call, one host round-trip. Bit-identical to two
+      // run_linear_batch.
+      {
+        LinearBackend::LinearWaveBatchItem items[2] = {
+          {ln.gate, &c_rin, &c_mg},
+          {ln.up,   &c_rin, &c_mu},
+        };
+        backend->run_linear_wave_batch(items, 2, (uint32_t)M);
+      }
       for(int m=0; m<M; m++){
         float* mgr = &c_mg[(size_t)m*cfg.inter];
         const float* mur = &c_mu[(size_t)m*cfg.inter];
@@ -3868,8 +3893,16 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         float* ri = &c_rin_la[(size_t)m*Hdim];
         if(Rg_la) rot_apply(r2, *Rg_la, ri); else memcpy(ri, r2, (size_t)Hdim*sizeof(float));
       }
-      backend->run_linear_batch(ln.gate, c_rin_la, c_mg, (uint32_t)M);
-      backend->run_linear_batch(ln.up,   c_rin_la, c_mu, (uint32_t)M);
+      // Wave-batch: gate/up share c_rin_la and are independent — one
+      // engine call, one host round-trip. Bit-identical to two
+      // run_linear_batch.
+      {
+        LinearBackend::LinearWaveBatchItem items[2] = {
+          {ln.gate, &c_rin_la, &c_mg},
+          {ln.up,   &c_rin_la, &c_mu},
+        };
+        backend->run_linear_wave_batch(items, 2, (uint32_t)M);
+      }
       for(int m=0; m<M; m++){
         float* mgr = &c_mg[(size_t)m*cfg.inter];
         const float* mur = &c_mu[(size_t)m*cfg.inter];
@@ -4161,8 +4194,16 @@ static std::vector<StepOut> step_batch(
         float* ri = &b_rin[(size_t)m*Hdim];
         if(Rg) rot_apply(r2, *Rg, ri); else memcpy(ri, r2, (size_t)Hdim*sizeof(float));
       }
-      backend->run_linear_batch(ln.gate, b_rin, c_mg, (uint32_t)M);
-      backend->run_linear_batch(ln.up,   b_rin, c_mu, (uint32_t)M);
+      // Wave-batch: gate/up share b_rin and are independent — one
+      // engine call, one host round-trip. Bit-identical to two
+      // run_linear_batch.
+      {
+        LinearBackend::LinearWaveBatchItem items[2] = {
+          {ln.gate, &b_rin, &c_mg},
+          {ln.up,   &b_rin, &c_mu},
+        };
+        backend->run_linear_wave_batch(items, 2, (uint32_t)M);
+      }
       for(int m=0; m<M; m++){
         float* mgr = &c_mg[(size_t)m*cfg.inter];
         const float* mur = &c_mu[(size_t)m*cfg.inter];
