@@ -92,13 +92,23 @@ Implement features for maximizing throughput for concurrent requests, starting f
   ~0.1-0.2ms — the blocking wait is structural: host norm needs
   core on-host same-layer. Revisit only with fused device-side
   SSM+norm feeding la_out GEMM from device buffers, or M>>1 where
-  the single wait/layer amortizes; M=8 estimate still loses).
+  the single wait/layer amortizes; M=8 estimate still loses),
+  native L0 immediate submit (2026-09-18, examples/l0_submit_probe spike,
+  since removed: native immediate append+host-sync 27.6us vs UR
+  submit+event.wait 25.2us per launch on a trivial kernel, correctness
+  PASS — same floor, not a UR-adapter artifact. Revisit only with a batched
+  multi-launch list amortizing one sync over many kernels),
+  INTFER_NO_PROF queue without enable_profiling (2026-09-18: 19.21 vs
+  18.75 tok/s TP1 decode under box contention — within run variance;
+  per-event L0 timestamping is not the submit tax).
 - Path to target: single-stream ceiling is ~26 tok/s (TP1, DPAS-off);
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +
   transfers most of the rest). 40 tok/s must come from aggregate
   batching (--serve scheduler already M-row batches; cross-request HTTP
-  batching is the highest-value lever). Structural options: native L0
-  immediate command lists (bypass UR submit overhead, multi-day),
+  batching is the highest-value lever). Structural options: batched
+  multi-launch L0 lists amortizing one sync over many kernels (single
+  immediate append+sync measured no faster than UR submit+wait, so the
+  win must come from fewer syncs, not a faster submit),
   device-side SSM/attention (host O(pos) attention dominates long ctx).
 
 
