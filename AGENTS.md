@@ -107,10 +107,16 @@ Implement features for maximizing throughput for concurrent requests, starting f
   18.75 tok/s TP1 decode under box contention — within run variance;
   per-event L0 timestamping is not the submit tax).
 - Wave-submit + vectorized host math (2026-09-18, wave 7d7ca72, AVX2
-  5285b47, quantified on quiet box loadavg<2): z/b/a + gate/up GEMMs
-  convert+submit back-to-back, one wait per wave (scalar + M-row paths;
-  INTFER_NO_WAVE=1 restores sequential); AVX2/FMA rmsnorm/l2norm
-  (INTFER_HOST_AVX2=0 restores scalar). Both oracle-certified: CPU
+  5285b47, extended a78e99f, quantified on quiet box loadavg<2): z/b/a +
+  gate/up + full-attn k/v GEMMs convert+submit back-to-back, one wait
+  per wave (scalar + M-row paths; INTFER_NO_WAVE=1 restores sequential).
+  a78e99f adds: scalar full-attn k/v wave-2 (q stays sequential — its
+  split/norm/rope consumers precede k/v input prep), M-row wave-batch
+  for full-attn k/v + gate/up at all three batch sites. Precision:
+  wave does NOT reduce kernel-launch count (nk identical 1674/10tok
+  both ways — engine still issues one kernel per item); it groups
+  convert+submit back-to-back for queue depth and one wait per wave.
+  AVX2/FMA rmsnorm/l2norm (INTFER_HOST_AVX2=0 restores scalar). Both oracle-certified: CPU
   parity + HTTP batch PASS, scalar-vs-AVX2 streams identical on CPU
   AND GPU paths. Wave: +0.6-0.7% decode, 3/3 interleaved rounds
   (TP1 24.61->24.78, 25.03->25.17, 24.94->25.09) — real but small:
