@@ -51,7 +51,10 @@ Implement features for maximizing throughput for concurrent requests, starting f
   ~12 tok/s TP=2, ~21.5 tok/s TP=1 (TP=1 still wins ~1.8x: 2x
   submits/transfers/readbacks outweigh halved kernel time at tiny
   shapes). Prefill (361-tok, chunked): TP=1 ~135 tok/s, TP=2 ~113 tok/s
-  (chunk_M=128; far from target — prefill is the wider gap). Prefill
+  (chunk_M=128; far from target — prefill is the wider gap). Chunk 361
+  (whole prompt, one pass) beats chunked 128 by ~5% (140 vs 133 tok/s:
+  fewer layer passes → fewer submits); bench matrix now covers 361.
+  Prefill
   attribution (2026-09-18, chunk128 TP=1, 361 tok in 2800ms): rebuild
   924ms = preload_all one-time (186 shards, amortized to zero in
   serving); steady-state ~195 tok/s = kernel 475 + waitblock 504 +

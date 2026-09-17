@@ -35,7 +35,9 @@ for tp in 1 2; do
 done
 echo "== prefill tok/s (361-tok prompt, -n 5) =="
 for tp in 1 2; do
-  for m in 8 32 128; do
+  # 361 = whole prompt in one chunk (no chunking overhead; best throughput,
+  # worst TTFT — chunked widths stay for the serving tradeoff).
+  for m in 8 32 128 361; do
     echo "--- TP=$tp chunk_M=$m ---"
     INTFER_PREFILL_CHUNK=1 INTFER_PREFILL_CHUNK_M="$m" INTFER_BATCH_GEMM=1 \
       "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$P361" -n 5 --no-stream $TOK 2>&1 \
