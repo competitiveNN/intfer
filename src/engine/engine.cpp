@@ -54,6 +54,16 @@ Engine::~Engine() {
     if (ws_[d].out) sycl::free(ws_[d].out, devices_[d].queue);
     ws_[d].act = nullptr; ws_[d].out = nullptr;
   }
+  // Free the wave workspaces (2*W live allocs per device max).
+  for (size_t i = 0; i < wv_.size(); ++i) {
+    const size_t dd = wv_W_ > 0 ? i / wv_W_ : 0;
+    if (dd < devices_.size()) {
+      if (wv_[i].act) sycl::free(wv_[i].act, devices_[dd].queue);
+      if (wv_[i].out) sycl::free(wv_[i].out, devices_[dd].queue);
+      wv_[i].act = nullptr; wv_[i].out = nullptr;
+    }
+  }
+  wv_.clear(); wv_W_ = 0; wv_M_ = wv_K_ = wv_Nl_ = 0;
 }
 
 void* Engine::pool_acquire(size_t device, size_t bytes) {
@@ -512,6 +522,53 @@ void Engine::release_shard(int tensor_index) {
   }
   sc.code_usm.clear(); sc.scale_usm.clear();
   sc.built = false;
+}
+
+// Wave workspaces for run_linear_wave (see engine.hpp): per-device slot
+// pairs, one slot per live wave item. Grow-only; queue-wait before
+// realloc (same aliasing contract as ensure_workspace: slots never live
+// across calls, every wave event is waited before readback).
+void Engine::ensure_wave_workspace(uint32_t M, uint32_t W, uint32_t K,
+                                   uint32_t Nl) {
+  if (M == 0) M = 1;
+  if (W == 0) W = 1;
+  if (wv_.size() == devices_.size() * (size_t)wv_W_ && wv_W_ > 0 &&
+      M <= wv_M_ && W <= wv_W_ && K <= wv_K_ && Nl <= wv_Nl_)
+    return;
+  for (size_t d = 0; d < devices_.size(); ++d) devices_[d].queue.wait();
+  const uint32_t nM = std::max(M, wv_M_);
+  const uint32_t nW = std::max(W, wv_W_);
+  const uint32_t nK = std::max(K, wv_K_);
+  const uint32_t nNl = std::max(Nl, wv_Nl_);
+  std::vector<WaveSlot> nwv(devices_.size() * (size_t)nW);
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto& dev = devices_[d];
+    for (uint32_t i = 0; i < nW; ++i) {
+      WaveSlot s;
+      s.act = static_cast<std::uint16_t*>(sycl::malloc_shared(
+          (size_t)nM * nK * sizeof(uint16_t), dev.sycl_device, dev.sycl_context));
+      s.out = static_cast<std::uint16_t*>(sycl::malloc_shared(
+          (size_t)nM * nNl * sizeof(uint16_t), dev.sycl_device, dev.sycl_context));
+      if (!s.act || !s.out) {
+        std::fprintf(stderr,
+                     "[intfer] FATAL: wave workspace alloc failed on device %zu "
+                     "(M=%u W=%u K=%u Nl=%u)\n", d, nM, nW, nK, nNl);
+        std::fflush(stderr);
+        std::abort();
+      }
+      nwv[d * nW + i] = s;
+    }
+  }
+  // Free old slots after the new ones are live (queues already waited).
+  for (size_t i = 0; i < wv_.size(); ++i) {
+    const size_t dd = wv_W_ > 0 ? i / wv_W_ : 0;
+    if (dd < devices_.size()) {
+      if (wv_[i].act) sycl::free(wv_[i].act, devices_[dd].queue);
+      if (wv_[i].out) sycl::free(wv_[i].out, devices_[dd].queue);
+    }
+  }
+  wv_ = std::move(nwv);
+  wv_W_ = nW; wv_M_ = nM; wv_K_ = nK; wv_Nl_ = nNl;
 }
 
 // Shared per-device act/out workspaces (replaces per-shard act/out USM).
@@ -1047,6 +1104,171 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
       dashq::half_to_float_batch(out_ptr + (size_t)m * N_local_rb,
                                  out.data() + (size_t)m * t.N + start,
                                  N_local_rb);
+  }
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_readback_us += std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
+    g_gpu_profile.readback_count++;
+  }
+#endif
+}
+
+// Wave variant: one independent GEMM per item (see engine.hpp). Phases:
+// (1) per item: lazy shard build + FP32->FP16 convert + per-device act
+// memcpy into that item's wave slot; (2) per device: submit all items'
+// kernels back-to-back; (3) wait once for the whole wave; (4) per item:
+// read back. Bit-identical to sequential run_linear_tp calls: same shard
+// bytes, same convert, same kernel args, same output assembly — only the
+// submit/wait grouping changes, so the device runs the wave back-to-back
+// and the host pays one round-trip per wave instead of per GEMM.
+// DPAS48-flagged items fall back to sequential run_linear_tp (rare:
+// DPAS is default-off; the wave's shared-slot layout targets the FP16-act
+// path). Items with tensor_index < 0 are skipped.
+void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
+                             uint32_t M) {
+  if (!items || n == 0) return;
+  if (M == 0) M = 1;
+  // Compact out skipped items (stable order = call order).
+  const LinearWaveItem* live[16];
+  size_t nl = 0;
+  for (size_t i = 0; i < n && nl < 16; ++i)
+    if (items[i].tensor_index >= 0 &&
+        (size_t)items[i].tensor_index < model_.tensors.size() &&
+        items[i].x && items[i].out)
+      live[nl++] = &items[i];
+  if (nl == 0) return;
+  // DPAS48 fallback: keep the wave contract (same outputs) via the
+  // sequential path. Bit-identical by construction.
+  for (size_t i = 0; i < nl; ++i) {
+    if (!shard_cache_[(size_t)live[i]->tensor_index].built)
+      ensure_shard_built(live[i]->tensor_index);
+    if (shard_cache_[(size_t)live[i]->tensor_index].dpas48) {
+      for (size_t j = 0; j < nl; ++j)
+        run_linear_tp(live[j]->tensor_index, *live[j]->x, *live[j]->out, M);
+      return;
+    }
+  }
+  // Phase 0: the wave workspace must cover every item's (M, K, Nl) shape
+  // plus one slot per live item. Nl_max is over TP ranks AND items; K is
+  // the max over items (K varies per tensor: H vs inter vs conv_dim...).
+  uint32_t Nl_max = 0, K_max = 0;
+  for (size_t i = 0; i < nl; ++i) {
+    const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
+    K_max = std::max(K_max, t.K);
+    const auto& ranges = shards_[live[i]->tensor_index].ranges;
+    for (size_t d = 0; d < ranges.size(); ++d)
+      Nl_max = std::max(Nl_max, ranges[d].second - ranges[d].first);
+  }
+  ensure_wave_workspace(M, (uint32_t)nl, K_max, Nl_max);
+
+  // Phase 1: per item — convert + write each device's wave slot.
+  for (size_t i = 0; i < nl; ++i) {
+    const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
+    const std::vector<float>& x = *live[i]->x;
+    std::vector<float>& out = *live[i]->out;
+    const uint32_t out_elems = M * t.N;
+    if (out.size() != out_elems) out.resize(out_elems);
+#ifdef INTFER_PROFILE_GPU
+    auto t_copy0 = std::chrono::high_resolution_clock::now();
+#endif
+    const size_t need = (size_t)M * t.K;
+    if (act_staging_.size() != need) act_staging_.resize(need);
+    dashq::float_to_half_batch(x.data(), act_staging_.data(), need);
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_copy_us += std::chrono::duration<double, std::micro>(t1 - t_copy0).count();
+      g_gpu_profile.copy_count++;
+    }
+    auto t_w0 = std::chrono::high_resolution_clock::now();
+#endif
+    for (size_t d = 0; d < devices_.size(); ++d)
+      std::memcpy(wv_[d * wv_W_ + i].act, act_staging_.data(),
+                  (size_t)M * t.K * sizeof(std::uint16_t));
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_usm_write_us += std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+    }
+#endif
+  }
+
+  // Phase 2: per device — submit all items' kernels back-to-back.
+  std::vector<sycl::event> kernel_events;
+  kernel_events.reserve(devices_.size() * nl);
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto& dev = devices_[d];
+    sycl::queue& q = dev.queue;
+    for (size_t i = 0; i < nl; ++i) {
+      const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
+      const auto& sc = shard_cache_[(size_t)live[i]->tensor_index];
+      const auto& ranges = shards_[live[i]->tensor_index].ranges;
+      auto [start, end] = ranges[d];
+      auto N_local = end - start;
+      float alpha = sc.has_global_divisor ? sc.global_host : 1.0f;
+#ifdef INTFER_PROFILE_GPU
+      auto t_s0 = std::chrono::high_resolution_clock::now();
+#endif
+      sycl::event kernel_evt = gemm::quant_gemm_forward_usm(q,
+                                    wv_[d * wv_W_ + i].act,
+                                    sc.code_usm[d],
+                                    sc.scale_usm[d],
+                                    alpha,
+                                    wv_[d * wv_W_ + i].out,
+                                    M, N_local, t.K,
+                                    sc.group_size,
+                                    sc.scheme,
+                                    sycl::event{});
+#ifdef INTFER_PROFILE_GPU
+      {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        g_gpu_profile.total_submit_us += std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+      }
+      if (kernel_events.size() + 1 > g_gpu_profile.peak_wait_depth)
+        g_gpu_profile.peak_wait_depth = kernel_events.size() + 1;
+#endif
+      kernel_events.push_back(kernel_evt);
+    }
+  }
+
+  // Phase 3: wait once for the whole wave (load-bearing: host must not
+  // read wave outputs before the kernels run).
+#ifdef INTFER_PROFILE_GPU
+  auto t_wb0 = std::chrono::high_resolution_clock::now();
+#endif
+  for (auto& e : kernel_events) e.wait();
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_waitblock_us += std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
+  }
+  g_gpu_profile.wait_count += kernel_events.size();
+  for (auto& e : kernel_events) {
+    try {
+      auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
+      auto t1 = e.get_profiling_info<sycl::info::event_profiling::command_end>();
+      g_gpu_profile.total_kernel_us += (double)(t1 - t0) / 1000.0;
+      g_gpu_profile.kernel_count++;
+    } catch (...) {}
+  }
+  auto t_rb0 = std::chrono::high_resolution_clock::now();
+#endif
+
+  // Phase 4: per item — read back from that item's wave slot.
+  for (size_t i = 0; i < nl; ++i) {
+    const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
+    std::vector<float>& out = *live[i]->out;
+    const auto& ranges = shards_[live[i]->tensor_index].ranges;
+    for (size_t d = 0; d < devices_.size(); ++d) {
+      auto [start, end] = ranges[d];
+      const std::uint16_t* out_ptr = wv_[d * wv_W_ + i].out;
+      const uint32_t N_local_rb = static_cast<uint32_t>(end - start);
+      for (uint32_t m = 0; m < M; ++m)
+        dashq::half_to_float_batch(out_ptr + (size_t)m * N_local_rb,
+                                   out.data() + (size_t)m * t.N + start,
+                                   N_local_rb);
+    }
   }
 #ifdef INTFER_PROFILE_GPU
   {

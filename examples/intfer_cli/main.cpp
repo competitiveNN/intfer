@@ -412,6 +412,38 @@ struct LinearBackend {
       Y.insert(Y.end(), y1.begin(), y1.end());
     }
   }
+  // Wave variant: one independent GEMM per item (distinct tensors, distinct
+  // inputs/outputs, no data dependencies between items). Default loops over
+  // run_linear_into in order (bit-identical to sequential calls: each item
+  // is an independent GEMM with its own output buffer). Backends whose
+  // submit path can keep the device busy across launches (e.g. GPU: convert
+  // all inputs, submit all kernels, wait once, read back all) override this
+  // to amortize per-launch dispatch latency. Items MUST be independent:
+  // item i's input/output buffers must not alias any other item's output.
+  struct LinearWaveItem {
+    std::string name;
+    const std::vector<float>* x = nullptr;
+    std::vector<float>* out = nullptr;
+  };
+  virtual void run_linear_wave(const LinearWaveItem* items, size_t n) {
+    for (size_t i = 0; i < n; ++i)
+      run_linear_into(items[i].name, *items[i].x, *items[i].out);
+  }
+  // M-row wave variant: items share one M-row input staging layout —
+  // item i reads its (M x K_i) rows from a caller-owned staging vector.
+  // Same independence contract as the scalar wave; the engine converts +
+  // submits every item back-to-back and waits once. Bit-identical to
+  // sequential run_linear_batch calls. INTFER_NO_WAVE=1 restores the loop.
+  struct LinearWaveBatchItem {
+    std::string name;
+    const std::vector<float>* X = nullptr;  // M*K row-major
+    std::vector<float>* Y = nullptr;        // M*N row-major
+  };
+  virtual void run_linear_wave_batch(const LinearWaveBatchItem* items,
+                                     size_t n, uint32_t M) {
+    for (size_t i = 0; i < n; ++i)
+      run_linear_batch(items[i].name, *items[i].X, *items[i].Y, M);
+  }
   // SpinQuant rotation for this tensor (right-site for q/k/v/gate/up;
   // left-site for o/down; nullptr if no rotation).
   virtual const Rotation* rot_for(const std::string& tensor_name) = 0;
@@ -939,6 +971,80 @@ struct GpuBackend : public LinearBackend {
     int L = Engine::layer_of_name(name);
     if(L >= 0 && L != cur_layer_){ eng->begin_layer(L); cur_layer_ = L; }
     eng->run_linear_tp(it->second, X, Y, M);
+  }
+  // Wave of independent GEMMs (see LinearBackend::run_linear_wave): one
+  // engine call converts + submits every item back-to-back and waits once.
+  // Env INTFER_NO_WAVE=1 restores sequential run_linear_into (bisection).
+  // Layer tracking: all wave items must belong to the same layer (callers
+  // group per-layer independent GEMMs); the first valid item's layer wins.
+  void run_linear_wave(const LinearWaveItem* items, size_t n) override {
+    if(!eng || !items || n == 0) return;
+    static const bool no_wave =
+        (std::getenv("INTFER_NO_WAVE") != nullptr);
+    build_index();
+    if (no_wave) {
+      LinearBackend::run_linear_wave(items, n);
+      return;
+    }
+    Engine::LinearWaveItem eitems[16];
+    size_t ne = 0;
+    int wave_layer = -2;
+    for (size_t i = 0; i < n && ne < 16; ++i) {
+      auto it = ti_cache.find(items[i].name);
+      if (it == ti_cache.end()) {
+        // Cold fallback for this item only; other items still wave.
+        LinearBackend::run_linear_wave(items + i, 1);
+        continue;
+      }
+      int L = Engine::layer_of_name(items[i].name);
+      if (wave_layer == -2) wave_layer = L;
+      eitems[ne].tensor_index = it->second;
+      eitems[ne].x = items[i].x;
+      eitems[ne].out = items[i].out;
+      ++ne;
+    }
+    if (ne == 0) return;
+    if (wave_layer >= 0 && wave_layer != cur_layer_) {
+      eng->begin_layer(wave_layer);
+      cur_layer_ = wave_layer;
+    }
+    eng->run_linear_wave(eitems, ne, 1);
+  }
+  // M-row wave (see LinearBackend::run_linear_wave_batch): same grouping
+  // as the scalar wave, but each item carries M rows. INTFER_NO_WAVE=1
+  // restores sequential run_linear_batch.
+  void run_linear_wave_batch(const LinearWaveBatchItem* items, size_t n,
+                             uint32_t M) override {
+    if(!eng || !items || n == 0 || M == 0) return;
+    static const bool no_wave =
+        (std::getenv("INTFER_NO_WAVE") != nullptr);
+    build_index();
+    if (no_wave) {
+      LinearBackend::run_linear_wave_batch(items, n, M);
+      return;
+    }
+    Engine::LinearWaveItem eitems[16];
+    size_t ne = 0;
+    int wave_layer = -2;
+    for (size_t i = 0; i < n && ne < 16; ++i) {
+      auto it = ti_cache.find(items[i].name);
+      if (it == ti_cache.end()) {
+        LinearBackend::run_linear_wave_batch(items + i, 1, M);
+        continue;
+      }
+      int L = Engine::layer_of_name(items[i].name);
+      if (wave_layer == -2) wave_layer = L;
+      eitems[ne].tensor_index = it->second;
+      eitems[ne].x = items[i].X;
+      eitems[ne].out = items[i].Y;
+      ++ne;
+    }
+    if (ne == 0) return;
+    if (wave_layer >= 0 && wave_layer != cur_layer_) {
+      eng->begin_layer(wave_layer);
+      cur_layer_ = wave_layer;
+    }
+    eng->run_linear_wave(eitems, ne, M);
   }
 
   // Cached lm_head INT8 upload + per-row-symmetric INT8 GEMM on device.
@@ -2654,9 +2760,19 @@ static StepOut step(Request& req, int token, int pos,
         std::vector<float>& z = req.scratch.z;
         std::vector<float>& b = req.scratch.b;
         std::vector<float>& a = req.scratch.a;
-        backend->run_linear_into(ln.z, xz, z);
-        backend->run_linear_into(ln.b, xb, b);
-        backend->run_linear_into(ln.a, xa, a);
+        // Wave: z/b/a are independent (all derive from normed; qkv ran
+        // above and feeds conv_state, so it cannot join the wave) — one
+        // engine call converts + submits all three back-to-back and waits
+        // once. Bit-identical to three run_linear_into calls (same kernels,
+        // same buffers). INTFER_NO_WAVE=1 restores sequential calls.
+        {
+          LinearBackend::LinearWaveItem items[3] = {
+            {ln.z, &xz, &z},
+            {ln.b, &xb, &b},
+            {ln.a, &xa, &a},
+          };
+          backend->run_linear_wave(items, 3);
+        }
         ckpt("la.z", L, z); ckpt("la.b", L, b); ckpt("la.a", L, a);
         std::vector<float>& g = req.scratch.g;
         std::vector<float>& core = req.scratch.core;
@@ -2760,10 +2876,17 @@ static StepOut step(Request& req, int token, int pos,
     if(Rg) rot_apply(rn2.data(), *Rg, rin.data());
     else for(int i=0;i<cfg.H;i++) rin[i] = rn2[i];
     std::vector<float>& mg = req.scratch.mg;
-    backend->run_linear_into(ln.gate, rin, mg);
-    ckpt("mlp.gate", L, mg);
     std::vector<float>& mu = req.scratch.mu;
-    backend->run_linear_into(ln.up,   rin, mu);
+    // Wave: gate/up share the rin input and are independent — one engine
+    // call, one host round-trip. Bit-identical to two run_linear_into.
+    {
+      LinearBackend::LinearWaveItem items[2] = {
+        {ln.gate, &rin, &mg},
+        {ln.up, &rin, &mu},
+      };
+      backend->run_linear_wave(items, 2);
+    }
+    ckpt("mlp.gate", L, mg);
     ckpt("mlp.up", L, mu);
     for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
     std::vector<float>& md = req.scratch.md;
@@ -3075,9 +3198,17 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         std::vector<float>& z = req.scratch.z;
         std::vector<float>& b = req.scratch.b;
         std::vector<float>& a = req.scratch.a;
-        backend->run_linear_into(ln.z, xz, z);
-        backend->run_linear_into(ln.b, xb, b);
-        backend->run_linear_into(ln.a, xa, a);
+        // Wave: z/b/a are independent (all derive from normed) — one
+        // engine call, one host round-trip. Bit-identical to three
+        // run_linear_into calls.
+        {
+          LinearBackend::LinearWaveItem items[3] = {
+            {ln.z, &xz, &z},
+            {ln.b, &xb, &b},
+            {ln.a, &xa, &a},
+          };
+          backend->run_linear_wave(items, 3);
+        }
         std::vector<float>& g = req.scratch.g;
         std::vector<float>& core = req.scratch.core;
       // ---- Device-side SSM (INTFER_SSM_GPU=1; scalar prefill row) ----
@@ -3170,9 +3301,15 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       if(Rg) rot_apply(rn2.data(), *Rg, rin.data());
       else memcpy(rin.data(), rn2.data(), (size_t)Hdim*sizeof(float));
       std::vector<float>& mg = req.scratch.mg;
-      backend->run_linear_into(ln.gate, rin, mg);
       std::vector<float>& mu = req.scratch.mu;
-      backend->run_linear_into(ln.up,   rin, mu);
+      // Wave: gate/up share rin and are independent — one host round-trip.
+      {
+        LinearBackend::LinearWaveItem items[2] = {
+          {ln.gate, &rin, &mg},
+          {ln.up, &rin, &mu},
+        };
+        backend->run_linear_wave(items, 2);
+      }
       for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
       std::vector<float>& md = req.scratch.md;
       backend->run_linear_into(ln.down, mg, md);
@@ -3429,9 +3566,17 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       need_rows(c_z, zvw);
       need_rows(c_b, cfg.n_v_heads);
       need_rows(c_a, cfg.n_v_heads);
-      backend->run_linear_batch(ln.z, c_z_in, c_z, (uint32_t)M);
-      backend->run_linear_batch(ln.b, c_b_in, c_b, (uint32_t)M);
-      backend->run_linear_batch(ln.a, c_x, c_a, (uint32_t)M);
+      // Wave: z/b/a are independent M-row GEMMs — one engine call converts
+      // + submits all three back-to-back and waits once. Bit-identical to
+      // three sequential run_linear_batch calls.
+      {
+        LinearBackend::LinearWaveBatchItem items[3] = {
+          {ln.z, &c_z_in, &c_z},
+          {ln.b, &c_b_in, &c_b},
+          {ln.a, &c_x, &c_a},
+        };
+        backend->run_linear_wave_batch(items, 3, (uint32_t)M);
+      }
       need_rows(c_ncore, zvw);
       // Per-row conv + SSM recurrence in token order (stateful).
       std::vector<float> conv_out(cfg.conv_dim);

@@ -68,6 +68,21 @@ class Engine {
   // Batched variant: x is M*K row-major; out is M*N row-major.
   void run_linear_tp(int tensor_index, const std::vector<float>& x,
                      std::vector<float>& out, uint32_t M);
+
+  // Wave variant: one independent GEMM per item (distinct tensors, distinct
+  // inputs/outputs, no data dependencies between items). Converts + writes
+  // every item's activation, submits every kernel, waits once, then reads
+  // back every output — so the device runs the wave back-to-back and pays
+  // one host round-trip per wave instead of per GEMM. Bit-identical to
+  // sequential run_linear_tp calls (same kernels, same per-item buffers).
+  // Items with tensor_index < 0 are skipped (lets callers pass optional
+  // slots without branching). M is the row count shared by all items.
+  struct LinearWaveItem {
+    int tensor_index = -1;
+    const std::vector<float>* x = nullptr;
+    std::vector<float>* out = nullptr;
+  };
+  void run_linear_wave(const LinearWaveItem* items, size_t n, uint32_t M);
   
   // FP16 x FP16 GEMM for non-quantized final heads (lm_head/embed).
   // C[1,N] = x[1,K] * W[N,K]^T. All row-major. Outputs FP32 logits.
@@ -240,6 +255,16 @@ class Engine {
     uint32_t M = 0, K = 0, Nl = 0;
   };
   std::vector<Workspace> ws_;
+  // Wave workspaces for run_linear_wave: one (M*K / M*Nl) slot pair per
+  // live wave item per device, so independent GEMMs can be converted,
+  // submitted back-to-back, and read back without aliasing. Same
+  // grow-only single-threaded contract as ws_: slots are written+consumed
+  // within one run_linear_wave call. Sized for the max wave width seen
+  // (steady state: LA qkv/z/b/a = 4 slots).
+  struct WaveSlot { std::uint16_t* act = nullptr; std::uint16_t* out = nullptr; };
+  std::vector<WaveSlot> wv_;  // [device * wv_W_ + slot]
+  uint32_t wv_M_ = 0, wv_K_ = 0, wv_Nl_ = 0, wv_W_ = 0;
+  void ensure_wave_workspace(uint32_t M, uint32_t W, uint32_t K, uint32_t Nl);
   // TODO 6 (W4A8/W2A8): per-device INT8-act + act-scale workspaces for the
   // DPAS path (M*K int8, M*nGA fp32). Same grow-only aliasing contract as
   // ws_: written+consumed within one run_linear_tp call.
