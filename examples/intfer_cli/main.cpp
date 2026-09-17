@@ -6854,10 +6854,12 @@ int main(int argc, char** argv){
       auto p = get_gpu_profile();
       std::fprintf(stderr,
         "[GPU profile @prefill] kernel=%.1fms submit=%.1fms waitblock=%.1fms "
-        "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms\n",
+        "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms "
+        "nk=%lu nw=%lu nr=%lu\n",
         p.kernel_us/1000.0, p.submit_us/1000.0, p.waitblock_us/1000.0,
         p.rebuild_us/1000.0, p.rebuild_count,
-        p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0);
+        p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0,
+        p.kernel_count, p.wait_count, p.readback_count);
       reset_gpu_profile();
     }
 #endif
@@ -6892,10 +6894,12 @@ int main(int argc, char** argv){
       auto p = get_gpu_profile();
       std::fprintf(stderr,
         "[GPU profile @decode] kernel=%.1fms submit=%.1fms waitblock=%.1fms "
-        "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms\n",
+        "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms "
+        "nk=%lu nw=%lu nr=%lu\n",
         p.kernel_us/1000.0, p.submit_us/1000.0, p.waitblock_us/1000.0,
         p.rebuild_us/1000.0, p.rebuild_count,
-        p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0);
+        p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0,
+        p.kernel_count, p.wait_count, p.readback_count);
     }
 #endif
     // Single-prompt scheduler runs keep the exact stdout contract (prompt
@@ -6961,10 +6965,12 @@ int main(int argc, char** argv){
     auto p = get_gpu_profile();
     std::fprintf(stderr,
       "[GPU profile @prefill] kernel=%.1fms submit=%.1fms waitblock=%.1fms "
-      "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms\n",
+      "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms "
+      "nk=%lu nw=%lu nr=%lu\n",
       p.kernel_us/1000.0, p.submit_us/1000.0, p.waitblock_us/1000.0,
       p.rebuild_us/1000.0, p.rebuild_count,
-      p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0);
+      p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0,
+      p.kernel_count, p.wait_count, p.readback_count);
     reset_gpu_profile();
   }
 #endif
@@ -7136,10 +7142,12 @@ int main(int argc, char** argv){
     auto p = get_gpu_profile();
     std::fprintf(stderr,
       "[GPU profile @decode] kernel=%.1fms submit=%.1fms waitblock=%.1fms "
-      "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms\n",
+      "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms "
+      "nk=%lu nw=%lu nr=%lu\n",
       p.kernel_us/1000.0, p.submit_us/1000.0, p.waitblock_us/1000.0,
       p.rebuild_us/1000.0, p.rebuild_count,
-      p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0);
+      p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0,
+      p.kernel_count, p.wait_count, p.readback_count);
   }
 #endif
 #ifdef INTFER_PROFILE_GPU
