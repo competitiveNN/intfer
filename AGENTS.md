@@ -47,16 +47,21 @@ Implement features for maximizing throughput for concurrent requests, starting f
 
 - Token generation (decode): **40 tok/s** (per-stream, 0.8B model)
 - Prefill: **4000 tok/s**
-- Current (2026-09-18, scripts/bench_gpu_ab.sh, DPAS48 default OFF):
-  0.8B GPU decode ~13.9 tok/s TP=2, ~24.0 tok/s TP=1 (TP=1 still
-  wins ~1.7x: 2x submits/transfers/readbacks outweigh halved kernel
-  time at tiny shapes). DPAS48 fast path defaulted OFF (was default
+- Current (2026-09-18, scripts/bench_gpu_ab.sh, DPAS48 default OFF,
+  re-benched quiet box loadavg<2):
+  0.8B GPU decode TP=1 ~24.4 tok/s (3x 24.37/24.41/24.45, stable),
+  TP=2 ~14.3 tok/s (3x 14.24/14.34/14.24). TP=1 still wins ~1.7x:
+  2x submits/transfers/readbacks outweigh halved kernel
+  time at tiny shapes. DPAS48 fast path defaulted OFF (was default
   ON): host GA64 act-quant ~6ms/token dominated, XMX kernel no faster
   than tiled legacy at M=1/128; greedy streams bit-identical either
   way (opt back in with INTFER_DPAS48=1). Decode +16-18%, prefill
-  +5% vs DPAS-on. Prefill (361-tok): TP=1 ~147 tok/s (chunk 361),
-  TP=2 ~121 tok/s (chunk 361); chunk 361 (whole prompt, one pass)
-  still best (fewer layer passes → fewer submits).
+  +5% vs DPAS-on. Prefill TP=1 (361-tok, 2026-09-18 quiet box):
+  chunk8 52.8, chunk32 108.6, chunk128 145.9, chunk361 152.2 tok/s;
+  TP=2: 42.4 / 89.1 / 122.3 / 129.5 tok/s. Chunk 361 (whole prompt,
+  one pass) still best (fewer layer passes → fewer submits).
+  Steady-state chunk128 TP=1 ~= 176 tok/s excluding the one-time 466ms
+  rebuild (186 shards); recorded ~195 was lower-load.
   Prefill
   attribution (2026-09-18, chunk128 TP=1, 361 tok in 2800ms): rebuild
   924ms = preload_all one-time (186 shards, amortized to zero in
@@ -102,20 +107,47 @@ Implement features for maximizing throughput for concurrent requests, starting f
   18.75 tok/s TP1 decode under box contention — within run variance;
   per-event L0 timestamping is not the submit tax).
 - Wave-submit + vectorized host math (2026-09-18, wave 7d7ca72, AVX2
-  uncommitted-then-committed): z/b/a + gate/up GEMMs convert+submit
-  back-to-back, one wait per wave (scalar + M-row paths;
+  5285b47, quantified on quiet box loadavg<2): z/b/a + gate/up GEMMs
+  convert+submit back-to-back, one wait per wave (scalar + M-row paths;
   INTFER_NO_WAVE=1 restores sequential); AVX2/FMA rmsnorm/l2norm
   (INTFER_HOST_AVX2=0 restores scalar). Both oracle-certified: CPU
   parity + HTTP batch PASS, scalar-vs-AVX2 streams identical on CPU
-  AND GPU paths. Gain NOT quantifiable yet: interleaved A/Bs under box
-  contention (loadavg 3-8) land within +/-3% run noise (wave +3% one
-  round, combined flat-to-negative the next; per-component profiles
-  overlap). Do NOT quote a number until re-benched at loadavg<2.
-- Path to target: single-stream ceiling is ~26 tok/s (TP1, DPAS-off);
+  AND GPU paths. Wave: +0.6-0.7% decode, 3/3 interleaved rounds
+  (TP1 24.61->24.78, 25.03->25.17, 24.94->25.09) — real but small:
+  wave saves waits, submit (~830ms/65tok) is the wall. AVX2 norms:
+  NEUTRAL (+0.7/-1.3/+0.4%, mean ~0) — host rmsnorm/l2norm is not on
+  the decode critical path (the ~33% host share is GEMM act
+  convert+memcpy, not norms). Keep both (correct, default-on, free),
+  but quote no big win; remaining gap needs submit-side work.
+- L4 design verdict (2026-09-18, investigated, NOT implemented):
+  fused device-side SSM+norm feeding la_out GEMM from device buffers.
+  Data flow per LA layer today (18/24 layers on 0.8B): ssm_rows kernel
+  -> D2H core (2048 floats) + blocking wait -> host ssm-norm+silu(z)
+  -> H2D normed_core via run_linear_into -> la_out GEMM (engine.cpp
+  converts FP32->FP16 host-side, memcpy to ws act, submit, wait, D2H).
+  Fusion would kill per-LA-layer: 1 D2H + 1 wait + 1 H2D + 1 FP32->FP16
+  host convert (la_out act 1024 FP32 = 4KB). BUT the old -9% stands and
+  the reason is now precise: ssm_rows itself already pays H2D inputs
+  (~15-130us/layer) + kernel-submit (~25us) + D2H+wait (~150-550us);
+  fused norm+FP16-convert on device saves only the core round-trip and
+  the host norm (~0.05ms), while the la_out engine seam
+  (run_linear_tp: host FP32 in -> FP16 convert -> ws memcpy -> submit)
+  has NO device-pointer entry — feeding it from a device buffer needs
+  a new Engine method (device-act GEMM: skip convert+ws-write, submit
+  with USM dep on the fused event). Net estimate: saves ~0.2-0.3ms of
+  ~1.7ms/LA-layer (submit+waitblock dominate) over 18 layers =
+  ~4-5ms/token of ~41ms = ~+10% IF the new seam costs zero extra
+  submits. Verdict: viable but engine-invasive (new device-act GEMM
+  entry + fused ssm_forward_norm_convert kernel + oracle gate on the
+  fused FP16-convert rounding); do it only together with batched
+  multi-launch L0 lists (same seam work amortizes both). Standalone
+  INTFER_SSM_GPU=1 stays default-off.
+- Path to target: single-stream is ~24.4 tok/s TP1 (was ~26 ceiling
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +
   transfers most of the rest). 40 tok/s must come from aggregate
   batching (--serve scheduler already M-row batches; cross-request HTTP
-  batching is the highest-value lever). Structural options: batched
+  batching is the highest-value lever, C=8/MT=64 probe 36.3 tok/s
+  aggregate on clean box). Structural options: batched
   multi-launch L0 lists amortizing one sync over many kernels (single
   immediate append+sync measured no faster than UR submit+wait, so the
   win must come from fewer syncs, not a faster submit),
