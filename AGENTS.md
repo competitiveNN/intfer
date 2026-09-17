@@ -93,8 +93,9 @@ Implement features for maximizing throughput for concurrent requests, starting f
   core on-host same-layer. Revisit only with fused device-side
   SSM+norm feeding la_out GEMM from device buffers, or M>>1 where
   the single wait/layer amortizes; M=8 estimate still loses).
-- Path to target: single-stream ceiling is ~17-20 tok/s (submit floor:
-  ~120us x ~2300 launches/token); 40 tok/s must come from aggregate
+- Path to target: single-stream ceiling is ~26 tok/s (TP1, DPAS-off);
+  ~169 launches/token (~80us submit each: submit ~30%, waitblock +
+  transfers most of the rest). 40 tok/s must come from aggregate
   batching (--serve scheduler already M-row batches; cross-request HTTP
   batching is the highest-value lever). Structural options: native L0
   immediate command lists (bypass UR submit overhead, multi-day),
