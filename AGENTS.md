@@ -101,6 +101,16 @@ Implement features for maximizing throughput for concurrent requests, starting f
   INTFER_NO_PROF queue without enable_profiling (2026-09-18: 19.21 vs
   18.75 tok/s TP1 decode under box contention — within run variance;
   per-event L0 timestamping is not the submit tax).
+- Wave-submit + vectorized host math (2026-09-18, wave 7d7ca72, AVX2
+  uncommitted-then-committed): z/b/a + gate/up GEMMs convert+submit
+  back-to-back, one wait per wave (scalar + M-row paths;
+  INTFER_NO_WAVE=1 restores sequential); AVX2/FMA rmsnorm/l2norm
+  (INTFER_HOST_AVX2=0 restores scalar). Both oracle-certified: CPU
+  parity + HTTP batch PASS, scalar-vs-AVX2 streams identical on CPU
+  AND GPU paths. Gain NOT quantifiable yet: interleaved A/Bs under box
+  contention (loadavg 3-8) land within +/-3% run noise (wave +3% one
+  round, combined flat-to-negative the next; per-component profiles
+  overlap). Do NOT quote a number until re-benched at loadavg<2.
 - Path to target: single-stream ceiling is ~26 tok/s (TP1, DPAS-off);
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +
   transfers most of the rest). 40 tok/s must come from aggregate

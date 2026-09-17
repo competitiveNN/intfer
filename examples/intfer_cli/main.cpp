@@ -279,13 +279,69 @@ static inline float sigmoidf(float x){ return 1.0f/(1.0f+expf(-x)); }
 // ============================================================================
 // Shared host primitives
 // ============================================================================
+// Vectorized host math for the per-token elementwise hot loop (rmsnorm,
+// l2norm, silu-mul). 8-wide AVX2/FMA with scalar tails via function-target
+// (same pattern as dashq.cpp/gemm_rows_fma); runtime-gated on
+// intfer::dashq::avx2_available(). These change FP rounding vs the scalar
+// loop (vector reduction order + FMA contraction), so they are
+// ORACLE-gated, not bit-gated: greedy token stream must match
+// (scripts/test_oracle_equiv.sh). INTFER_HOST_AVX2=0 restores scalar.
+__attribute__((target("avx2,fma")))
+static float vsumsq_avx2(const float* x, int n) {
+  __m256 acc = _mm256_setzero_ps();
+  int i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256 v = _mm256_loadu_ps(x + i);
+    acc = _mm256_fmadd_ps(v, v, acc);
+  }
+  __m128 lo = _mm256_castps256_ps128(acc);
+  __m128 hi = _mm256_extractf128_ps(acc, 1);
+  __m128 s = _mm_add_ps(lo, hi);
+  s = _mm_hadd_ps(s, s);
+  s = _mm_hadd_ps(s, s);
+  float out = _mm_cvtss_f32(s);
+  for (; i < n; i++) out += x[i] * x[i];
+  return out;
+}
+__attribute__((target("avx2,fma")))
+static void vscale_add1_avx2(const float* x, const float* w, float* out,
+                             float v, int n) {
+  __m256 vv = _mm256_set1_ps(v);
+  __m256 one = _mm256_set1_ps(1.0f);
+  int i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256 xv = _mm256_loadu_ps(x + i);
+    __m256 wv = _mm256_loadu_ps(w + i);
+    _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_mul_ps(xv, vv),
+                                            _mm256_add_ps(one, wv)));
+  }
+  for (; i < n; i++) out[i] = (x[i]*v)*(1.0f+w[i]);
+}
 static void rmsnorm(const float* x, const float* w, float* out, int dim){
-  float v=0; for(int i=0;i<dim;i++) v+=x[i]*x[i];
+  static const bool avx2_ok = intfer::dashq::avx2_available();
+  static const bool no_avx2 = (std::getenv("INTFER_HOST_AVX2") != nullptr &&
+                               std::string(std::getenv("INTFER_HOST_AVX2")) == "0");
+  float v;
+  if (avx2_ok && !no_avx2 && dim >= 32) {
+    v = vsumsq_avx2(x, dim);
+    v = 1.0f/sqrtf(v/dim + cfg.rms_eps);
+    vscale_add1_avx2(x, w, out, v, dim);
+    return;
+  }
+  v=0; for(int i=0;i<dim;i++) v+=x[i]*x[i];
   v = 1.0f/sqrtf(v/dim + cfg.rms_eps);
   for(int i=0;i<dim;i++) out[i] = (x[i]*v)*(1.0f+w[i]);
 }
 static void l2norm(const float* x, float* out, int dim){
-  float s=0; for(int i=0;i<dim;i++) s+=x[i]*x[i];
+  static const bool avx2_ok = intfer::dashq::avx2_available();
+  static const bool no_avx2 = (std::getenv("INTFER_HOST_AVX2") != nullptr &&
+                               std::string(std::getenv("INTFER_HOST_AVX2")) == "0");
+  float s;
+  if (avx2_ok && !no_avx2 && dim >= 32) {
+    s = vsumsq_avx2(x, dim);
+  } else {
+    s=0; for(int i=0;i<dim;i++) s+=x[i]*x[i];
+  }
   float inv=1.0f/sqrtf(s+1e-6f);
   for(int i=0;i<dim;i++) out[i]=x[i]*inv;
 }
