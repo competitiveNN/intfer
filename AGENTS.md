@@ -47,13 +47,16 @@ Implement features for maximizing throughput for concurrent requests, starting f
 
 - Token generation (decode): **40 tok/s** (per-stream, 0.8B model)
 - Prefill: **4000 tok/s**
-- Current (2026-09-17, scripts/bench_gpu_ab.sh): 0.8B GPU decode
-  ~12 tok/s TP=2, ~21.5 tok/s TP=1 (TP=1 still wins ~1.8x: 2x
-  submits/transfers/readbacks outweigh halved kernel time at tiny
-  shapes). Prefill (361-tok, chunked): TP=1 ~135 tok/s, TP=2 ~113 tok/s
-  (chunk_M=128; far from target — prefill is the wider gap). Chunk 361
-  (whole prompt, one pass) beats chunked 128 by ~5% (140 vs 133 tok/s:
-  fewer layer passes → fewer submits); bench matrix now covers 361.
+- Current (2026-09-18, scripts/bench_gpu_ab.sh, DPAS48 default OFF):
+  0.8B GPU decode ~13.9 tok/s TP=2, ~24.0 tok/s TP=1 (TP=1 still
+  wins ~1.7x: 2x submits/transfers/readbacks outweigh halved kernel
+  time at tiny shapes). DPAS48 fast path defaulted OFF (was default
+  ON): host GA64 act-quant ~6ms/token dominated, XMX kernel no faster
+  than tiled legacy at M=1/128; greedy streams bit-identical either
+  way (opt back in with INTFER_DPAS48=1). Decode +16-18%, prefill
+  +5% vs DPAS-on. Prefill (361-tok): TP=1 ~147 tok/s (chunk 361),
+  TP=2 ~121 tok/s (chunk 361); chunk 361 (whole prompt, one pass)
+  still best (fewer layer passes → fewer submits).
   Prefill
   attribution (2026-09-18, chunk128 TP=1, 361 tok in 2800ms): rebuild
   924ms = preload_all one-time (186 shards, amortized to zero in
