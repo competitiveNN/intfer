@@ -10,7 +10,7 @@ The project is being built in three stages:
 | :--- | :--- | :--- |
 | **1** | INT2/low-bit quantization pipeline (SpinQuant → DASH-Q → RCO) | Implemented; 0.8B + 27B quantized, `.intfer` + `.gguf` artifacts |
 | **2** | Native SYCL/L0 execution engine (quant GEMM, FlashAttention, tensor-parallel) | Implemented (TP=2 sharded decode on 2× B580; DPAS INT8/W4A8/W2A8; INT8-KV opt-in) |
-| **3** | High-throughput serving (continuous batching, spec decoding) | Done (`--serve`/`--serve-http` servers, iteration scheduler, mixed-batch M-row forward, joint prefill+decode, chunked prefill, round-robin fairness, n-gram speculative decode). Gates: `scripts/test_cpu_parity.sh` (oracle + split==joint), `scripts/test_http_batch.sh` (cross-request batch parity), `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8: req/s, tok/s, P50/P99 latency, solo-vs-loaded parity). Measured 2026-09-16 (0.8B INT2, GPU TP=1, max_tokens=8): C=1 2.93 tok/s / P50 2.7s, C=4 4.06 tok/s / P50 7.5s, C=8 3.89 tok/s / P50 15.7s (x1.33 C=1->C=8; batching adds throughput while latency scales with queueing) |
+| **3** | High-throughput serving (continuous batching, spec decoding) | Done (`--serve`/`--serve-http` servers, iteration scheduler, mixed-batch M-row forward, joint prefill+decode, chunked prefill, round-robin fairness, n-gram speculative decode). Gates: `scripts/test_cpu_parity.sh` (oracle + split==joint), `scripts/test_http_batch.sh` (cross-request batch parity), `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8: req/s, tok/s, P50/P99 latency, solo-vs-loaded parity). Measured 2026-09-17 (0.8B INT2, GPU TP=1, max_tokens=8, idle box): C=1 8.16 tok/s / P50 1.0s, C=4 15.33 tok/s / P50 2.0s, C=8 17.98 tok/s / P50 3.3s (x2.20 C=1->C=8; batch-full probe C=8/MT=64: 36.3 tok/s aggregate, near the 40 target; the 2026-09-16 run was 4-5x lower under box contention) |
 
 ---
 
@@ -144,9 +144,10 @@ scripts/             build.sh / run.sh / run_bin.sh
   `scripts/bench_serve.sh` (req/s, tok/s, latency),
   `scripts/test_http_batch.sh` (cross-request batch parity over HTTP),
   `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8 with req/s,
-  tok/s, P50/P99 latency + solo-vs-loaded parity; 2026-09-16: C=1
-  2.93 tok/s/P50 2.7s, C=4 4.06 tok/s/P50 7.5s, C=8 3.89 tok/s/P50 15.7s,
-  x1.33 C=1->C=8).
+  tok/s, P50/P99 latency + solo-vs-loaded parity; 2026-09-17
+  (idle box): C=1 8.16 tok/s/P50 1.0s, C=4 15.33 tok/s/P50 2.0s,
+  C=8 17.98 tok/s/P50 3.3s, x2.20 C=1->C=8; batch-full C=8/MT=64 probe:
+  36.3 tok/s aggregate).
 
 **In progress / next**
 - GPU-side attention (today attention runs host-side in both backends;

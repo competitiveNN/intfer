@@ -65,7 +65,12 @@ Implement features for maximizing throughput for concurrent requests, starting f
   inside OMP workers, but zero gain: CPU C=8 batch WIP 10.5s vs HEAD
   10.8s @20T, 16.18s vs 16.34s @1T; GPU serve-load C=8 3.86 vs 3.89
   tok/s. LA host recurrence is a negligible share — GEMMs dominate.
-  Revisit only if profiling shows recurrence >10% of a step),
+  Revisit only if profiling shows recurrence >10% of a step. NOTE
+  2026-09-17: the 2026-09-16 serve-load numbers (C=8 3.86-3.89 tok/s)
+  were measured under box contention; clean re-run gives C=1 8.16,
+  C=4 15.33, C=8 17.98 tok/s (x2.20), and a batch-full C=8/MT=64
+  probe hits 36.3 tok/s aggregate — batching works, short MT=8
+  requests drain the batch. Dead-end verdict on OMP stands),
   device-side SSM recurrence M=1
   (2026-09-16, INTFER_SSM_GPU=1, parity-clean incl. step_batch +
   spec-rollback resync: -9% decode, 7.4->6.7 tok/s pinned 3x3
