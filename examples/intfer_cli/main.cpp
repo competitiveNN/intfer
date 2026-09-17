@@ -960,6 +960,195 @@ struct GpuBackend : public LinearBackend {
   // Bit-considerations: GEMM rows are independent (row-blocked over N with
   // bounds guards), so any row partition concatenates to the same logits
   // up to INT8 rounding (argmax-gated, not bit-identical vs FP32).
+  std::vector<float> run_lm_head_batch(const float* FN, // final norms [M,K]
+                                       const float* W,  // lm_head weight [N,K]
+                                       uint32_t M, uint32_t N, uint32_t K){
+    if(!eng) return {};
+    if(M == 0) return {};
+    if(M == 1) return run_lm_head_f16(FN, W, N, K);
+    size_t ndev = eng->num_devices();
+    static const bool force_fp16_b = (std::getenv("INTFER_LMHEAD_FP16") != nullptr);
+    static const bool no_dpas_b = (std::getenv("INTFER_LMHEAD_DPAS") &&
+                                   std::getenv("INTFER_LMHEAD_DPAS")[0] == '0');
+    // Ensure the upload cache exists via the scalar path (FN row 0 is a
+    // valid M=1 activation). Adds a small one-time upload on first use.
+    if(lm_head_q_dev_.empty() && lm_head_w_dev_.empty()){
+      std::vector<float> probe = run_lm_head_f16(FN, W, N, K);
+      if(probe.empty()) return {};
+    }
+    if(lm_head_N_ != N || lm_head_K_ != K) return {};
+    const uint32_t nGA = (K + 63) / 64;
+    auto seq_fallback = [&]() -> std::vector<float> {
+      std::vector<float> seq;
+      seq.reserve((size_t)M * N);
+      for(uint32_t m = 0; m < M; ++m){
+        std::vector<float> lm = run_lm_head_f16(FN + (size_t)m * K, W, N, K);
+        if((int)lm.size() != (int)N) return {};
+        seq.insert(seq.end(), lm.begin(), lm.end());
+      }
+      return seq;
+    };
+    // M-row host staging: FP16 acts (scalar paths) + INT8 acts/scales (DPAS).
+    std::vector<sycl::half> x_fp16((size_t)M * K);
+    for(uint32_t m = 0; m < M; ++m)
+      for(uint32_t i = 0; i < K; ++i)
+        x_fp16[(size_t)m * K + i] = sycl::half(FN[(size_t)m * K + i]);
+    std::vector<std::int8_t> aq((size_t)M * K);
+    std::vector<float> as((size_t)M * nGA);
+    std::vector<float> out((size_t)M * N, 0.f);
+    std::vector<sycl::event> evts;
+    evts.reserve(ndev * 8);
+    // Persistent per-device M-row buffers (grow-only, like the scalar path's
+    // M=1 x_dev/aq/as + per-tile c_dev): act inputs, act-quant workspaces,
+    // and one tile-tight M*Nlt output staging per tile.
+    if(lm_head_xM_dev_.size() != ndev) lm_head_xM_dev_.assign(ndev, nullptr);
+    if(lm_head_xM_cap_.size() != ndev) lm_head_xM_cap_.assign(ndev, 0);
+    if(lm_head_aqM_dev_.size() != ndev) lm_head_aqM_dev_.assign(ndev, nullptr);
+    if(lm_head_asM_dev_.size() != ndev) lm_head_asM_dev_.assign(ndev, nullptr);
+    if(lm_head_aqM_cap_.size() != ndev) lm_head_aqM_cap_.assign(ndev, 0);
+    if(lm_head_cM_dev_.size() != ndev) lm_head_cM_dev_.resize(ndev);
+    if(lm_head_cM_cap_.size() != ndev) lm_head_cM_cap_.resize(ndev);
+    if(lm_head_tM_host_.size() != ndev) lm_head_tM_host_.resize(ndev);
+    struct TileD2H { size_t d; size_t t; sycl::event evt; };
+    std::vector<TileD2H> d2hs;
+    for(size_t d = 0; d < ndev; ++d){
+      uint32_t start = (d < lm_head_ranges_.size()) ? lm_head_ranges_[d].first : N;
+      uint32_t end = (d < lm_head_ranges_.size()) ? lm_head_ranges_[d].second : N;
+      uint32_t Nl = (end > start) ? end - start : 0;
+      if(Nl == 0 || d >= lm_head_tiles_.size() || lm_head_tiles_[d].empty()) continue;
+      sycl::queue& q = eng->device_queue((int)d);
+      bool use_dpas = !force_fp16_b && !no_dpas_b &&
+                      d < lm_head_aq_dev_.size() && lm_head_aq_dev_[d] &&
+                      d < lm_head_as_dev_.size() && lm_head_as_dev_[d];
+      if(use_dpas){
+        for(size_t t = 0; t < lm_head_tiles_[d].size(); ++t){
+          if(t >= lm_head_b_dev_[d].size() || !lm_head_b_dev_[d][t]){
+            use_dpas = false;
+            break;
+          }
+        }
+      }
+      if(use_dpas){
+        if(!lm_head_aqM_dev_[d] || !lm_head_asM_dev_[d] || lm_head_aqM_cap_[d] < M){
+          try {
+            if(lm_head_aqM_dev_[d]){ sycl::free(lm_head_aqM_dev_[d], q); lm_head_aqM_dev_[d] = nullptr; }
+            if(lm_head_asM_dev_[d]){ sycl::free(lm_head_asM_dev_[d], q); lm_head_asM_dev_[d] = nullptr; }
+            lm_head_aqM_dev_[d] = static_cast<std::int8_t*>(sycl::malloc_device(
+                (size_t)M * K, q.get_device(), q.get_context()));
+            lm_head_asM_dev_[d] = static_cast<float*>(sycl::malloc_device(
+                (size_t)M * nGA * sizeof(float), q.get_device(), q.get_context()));
+            lm_head_aqM_cap_[d] = M;
+          } catch (...) {
+            lm_head_aqM_dev_[d] = nullptr; lm_head_asM_dev_[d] = nullptr;
+            lm_head_aqM_cap_[d] = 0;
+          }
+        }
+        if(!lm_head_aqM_dev_[d] || !lm_head_asM_dev_[d]) use_dpas = false;
+      }
+      if(use_dpas){
+        for(uint32_t m = 0; m < M; ++m)
+          dashq::act_quant_ga64_batch(FN + (size_t)m * K,
+                                      aq.data() + (size_t)m * K,
+                                      as.data() + (size_t)m * nGA, K,
+                                      dashq::ActQuantRound::RoundNear);
+        q.memcpy(lm_head_aqM_dev_[d], aq.data(), (size_t)M * K);
+        q.memcpy(lm_head_asM_dev_[d], as.data(), (size_t)M * nGA * sizeof(float));
+      } else {
+        if(!lm_head_xM_dev_[d] || lm_head_xM_cap_[d] < M){
+          try {
+            if(lm_head_xM_dev_[d]){ sycl::free(lm_head_xM_dev_[d], q); lm_head_xM_dev_[d] = nullptr; }
+            lm_head_xM_dev_[d] = static_cast<sycl::half*>(sycl::malloc_device(
+                (size_t)M * K * sizeof(sycl::half), q.get_device(), q.get_context()));
+            lm_head_xM_cap_[d] = M;
+          } catch (...) {
+            lm_head_xM_dev_[d] = nullptr; lm_head_xM_cap_[d] = 0;
+          }
+        }
+        if(!lm_head_xM_dev_[d]) return seq_fallback();
+        q.memcpy(lm_head_xM_dev_[d], x_fp16.data(), (size_t)M * K * sizeof(sycl::half));
+      }
+      // Per-tile M-row output staging (grow-only): kernels write c[mg*Nlt
+      // + ng] tile-tight (Nlt stride), so each tile needs its own M*Nlt
+      // device buffer + host mirror; rows are scattered into out below.
+      if(lm_head_cM_dev_[d].size() != lm_head_tiles_[d].size()){
+        lm_head_cM_dev_[d].assign(lm_head_tiles_[d].size(), nullptr);
+        lm_head_cM_cap_[d].assign(lm_head_tiles_[d].size(), 0);
+        lm_head_tM_host_[d].assign(lm_head_tiles_[d].size(), {});
+      }
+      const sycl::half* x_row = use_dpas ? nullptr : lm_head_xM_dev_[d];
+      for(size_t t = 0; t < lm_head_tiles_[d].size(); ++t){
+        uint32_t Nlt = lm_head_tiles_[d][t].second - lm_head_tiles_[d][t].first;
+        if(Nlt == 0) continue;
+        if(!lm_head_cM_dev_[d][t] || lm_head_cM_cap_[d][t] < (size_t)M * Nlt){
+          try {
+            if(lm_head_cM_dev_[d][t]){ sycl::free(lm_head_cM_dev_[d][t], q); lm_head_cM_dev_[d][t] = nullptr; }
+            lm_head_cM_dev_[d][t] = static_cast<sycl::half*>(sycl::malloc_device(
+                (size_t)M * Nlt * sizeof(sycl::half), q.get_device(), q.get_context()));
+            lm_head_cM_cap_[d][t] = (size_t)M * Nlt;
+          } catch (...) {
+            lm_head_cM_dev_[d][t] = nullptr; lm_head_cM_cap_[d][t] = 0;
+          }
+        }
+        if(!lm_head_cM_dev_[d][t]) return seq_fallback();
+        if(lm_head_tM_host_[d][t].size() != (size_t)M * Nlt)
+          lm_head_tM_host_[d][t].resize((size_t)M * Nlt);
+        sycl::event evt;
+        try {
+          if(force_fp16_b){
+            evt = gemm::quant_gemm_f16(q, x_row, lm_head_w_dev_[d][t],
+                                       lm_head_cM_dev_[d][t], M, Nlt, K);
+          } else if(use_dpas){
+            gemm::Dpas48Params p;
+            p.code_dpas = lm_head_b_dev_[d][t];
+            p.scale_usm = reinterpret_cast<const std::uint16_t*>(
+                lm_head_s_dev_[d][t]);
+            p.act_int8 = lm_head_aqM_dev_[d];
+            p.act_scale = lm_head_asM_dev_[d];
+            p.alpha = 1.0f;
+            p.out_usm = reinterpret_cast<std::uint16_t*>(lm_head_cM_dev_[d][t]);
+            p.M = M;
+            p.N = Nlt;
+            p.K = K;
+            p.group_size = K;
+            p.act_group = 64;
+            p.bits = 8;
+            p.act_stride = K;
+            p.as_stride = nGA;
+            evt = gemm::quant_gemm_dpas_s8w(q, p);
+          } else {
+            evt = gemm::quant_gemm_f16_int8w(q, x_row, lm_head_q_dev_[d][t],
+                                             lm_head_s_dev_[d][t],
+                                             lm_head_cM_dev_[d][t], M, Nlt, K);
+          }
+        } catch (...) {
+          return seq_fallback();
+        }
+        sycl::event cp = q.memcpy(lm_head_tM_host_[d][t].data(), lm_head_cM_dev_[d][t],
+                 (size_t)M * Nlt * sizeof(sycl::half), evt);
+        evts.push_back(evt);
+        d2hs.push_back({d, t, cp});
+      }
+    }
+    for(auto& e : evts) e.wait();
+    for(auto& r : d2hs) r.evt.wait();
+    // Scatter tile-tight rows into full-vocab order.
+    for(size_t d = 0; d < ndev; ++d){
+      if(d >= lm_head_ranges_.size() || d >= lm_head_tiles_.size()) continue;
+      uint32_t start = lm_head_ranges_[d].first;
+      for(size_t t = 0; t < lm_head_tiles_[d].size(); ++t){
+        uint32_t ts = lm_head_tiles_[d][t].first;
+        uint32_t Nlt = lm_head_tiles_[d][t].second - ts;
+        if(Nlt == 0 || t >= lm_head_tM_host_[d].size()) continue;
+        const std::vector<sycl::half>& tile = lm_head_tM_host_[d][t];
+        if(tile.size() != (size_t)M * Nlt) continue;
+        for(uint32_t m = 0; m < M; ++m)
+          for(uint32_t i = 0; i < Nlt; ++i)
+            out[(size_t)m * N + (ts + i)] = static_cast<float>(tile[(size_t)m * Nlt + i]);
+      }
+    }
+    return out;
+  }
+
   std::vector<float> run_lm_head_f16(const float* fn, // final norm hidden [K]
                                      const float* W,   // lm_head weight [N,K]
                                      uint32_t N, uint32_t K){
@@ -1015,13 +1204,30 @@ struct GpuBackend : public LinearBackend {
           sycl::free(lm_head_x_dev_[d], eng->device_queue((int)d));
           lm_head_x_dev_[d] = nullptr;
         }
+        if(d < lm_head_xM_dev_.size() && lm_head_xM_dev_[d]){
+          sycl::free(lm_head_xM_dev_[d], eng->device_queue((int)d));
+          lm_head_xM_dev_[d] = nullptr;
+        }
+        if(d < lm_head_aqM_dev_.size() && lm_head_aqM_dev_[d]){
+          sycl::free(lm_head_aqM_dev_[d], eng->device_queue((int)d));
+          lm_head_aqM_dev_[d] = nullptr;
+        }
+        if(d < lm_head_asM_dev_.size() && lm_head_asM_dev_[d]){
+          sycl::free(lm_head_asM_dev_[d], eng->device_queue((int)d));
+          lm_head_asM_dev_[d] = nullptr;
+        }
+        for(auto cMv : lm_head_cM_dev_[d]){
+          if(cMv) sycl::free(cMv, eng->device_queue((int)d));
+        }
       }
+      lm_head_xM_dev_.clear(); lm_head_xM_cap_.clear();
+      lm_head_aqM_dev_.clear(); lm_head_asM_dev_.clear(); lm_head_aqM_cap_.clear();
+      lm_head_cM_dev_.clear(); lm_head_cM_cap_.clear(); lm_head_tM_host_.clear();
       lm_head_q_dev_.clear(); lm_head_s_dev_.clear();
       lm_head_b_dev_.clear();
       lm_head_w_dev_.clear(); lm_head_c_dev_.clear();
       lm_head_aq_dev_.clear(); lm_head_as_dev_.clear();
       lm_head_x_dev_.clear();
-      lm_head_ranges_.clear(); lm_head_tiles_.clear();
       lm_head_N_ = 0; lm_head_K_ = 0;
     };
     if(lm_head_q_dev_.empty() && lm_head_w_dev_.empty()){
@@ -1429,6 +1635,19 @@ struct GpuBackend : public LinearBackend {
   std::vector<float*> lm_head_as_dev_;  // persistent FP32 GA scales (1/device)
   std::vector<std::vector<sycl::half*>> lm_head_c_dev_;  // fp16 outputs (both)
   std::vector<sycl::half*> lm_head_x_dev_;  // persistent act buffers (1/device)
+  // M-row batch state for run_lm_head_batch (Lever 1): per-device M-row act
+  // buffers + act-quant workspaces (grow-only), per-tile M*Nlt-tight device
+  // output staging (kernels write tile stride Nlt) + host mirrors. Freed in
+  // fail_reset alongside the scalar cache; the scalar path never touches
+  // these, so A/B is clean.
+  std::vector<sycl::half*> lm_head_xM_dev_;
+  std::vector<uint32_t> lm_head_xM_cap_;
+  std::vector<std::int8_t*> lm_head_aqM_dev_;
+  std::vector<float*> lm_head_asM_dev_;
+  std::vector<uint32_t> lm_head_aqM_cap_;
+  std::vector<std::vector<sycl::half*>> lm_head_cM_dev_;
+  std::vector<std::vector<size_t>> lm_head_cM_cap_;
+  std::vector<std::vector<std::vector<sycl::half>>> lm_head_tM_host_;
   std::vector<std::pair<uint32_t,uint32_t>> lm_head_ranges_;  // TP row shard per device
   std::vector<std::vector<std::pair<uint32_t,uint32_t>>> lm_head_tiles_;  // upload/GEMM tiles per device
   uint32_t lm_head_N_ = 0, lm_head_K_ = 0;
@@ -4033,17 +4252,36 @@ static std::vector<StepOut> step_batch(
     }
   }
   // Final norm + lm_head for EVERY row (scheduler needs all logits).
+  // GPU: one M-row batched lm_head (run_lm_head_batch) instead of M scalar
+  // calls — one launch per device tile instead of M (Lever 1). Rows are
+  // independent GEMM rows (argmax-gated vs sequential; INTFER_LMHEAD_BATCH=0
+  // restores the old per-row path for bisection).
   std::vector<float>& fn = rar.scratch.fn;
   std::vector<float>& logits = rar.scratch.logits;
   const float* head = lm_head ? lm_head : embed;
   auto gpu = backend ? dynamic_cast<GpuBackend*>(backend) : nullptr;
+  static const bool lm_batch_off = (std::getenv("INTFER_LMHEAD_BATCH") &&
+                                    std::getenv("INTFER_LMHEAD_BATCH")[0] == '0');
+  std::vector<float> lm_all;
+  if(gpu && !lm_batch_off && M > 1){
+    std::vector<float> fn_all((size_t)M * Hdim);
+    for(int m = 0; m < M; ++m)
+      rmsnorm(&H[(size_t)m*Hdim], final_norm, fn_all.data() + (size_t)m * Hdim, Hdim);
+    const float* W = lm_head ? lm_head : embed;
+    lm_all = gpu->run_lm_head_batch(fn_all.data(), W, (uint32_t)M,
+                                    (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+  }
   for(int m=0; m<M; m++){
     rmsnorm(&H[(size_t)m*Hdim], final_norm, fn.data(), Hdim);
     int best=-1; float bestv=-1e30f;
     if(gpu){
-      const float* W = lm_head ? lm_head : embed;
-      std::vector<float> lm = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
-      if((int)lm.size() == cfg.vocab) for(int i=0;i<cfg.vocab;i++) logits[i] = lm[i];
+      if(!lm_all.empty() && (int)lm_all.size() == M * cfg.vocab){
+        for(int i=0;i<cfg.vocab;i++) logits[i] = lm_all[(size_t)m * cfg.vocab + i];
+      } else {
+        const float* W = lm_head ? lm_head : embed;
+        std::vector<float> lm = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+        if((int)lm.size() == cfg.vocab) for(int i=0;i<cfg.vocab;i++) logits[i] = lm[i];
+      }
     }else{
       for(int v=0; v<cfg.vocab; v++){
         const float* er = head + (size_t)v*cfg.H;
