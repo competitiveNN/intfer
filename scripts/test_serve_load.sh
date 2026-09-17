@@ -12,11 +12,17 @@
 #   3. aggregate tok/s at C=8 >= C=1 (batching must not lose throughput;
 #      guard floor 0.5 tok/s far below the ~3 tok/s rate — stalls, not
 #      records; scaling numbers are logged for the record, not gated).
+#   4. (opt-in) batch-full probe: INTFER_LOAD_BIGMT=N re-runs the top
+#      concurrency level with max_tokens=N and reports aggregate tok/s.
+#      Short MT=8 requests drain the batch, so the sweep under-measures
+#      the batching ceiling (2026-09-17: C=8/MT=8 18 tok/s vs C=8/MT=64
+#      36.3 tok/s). Informational only — completion-gated, no floor.
 #
 # Usage: scripts/test_serve_load.sh [--port P]
 #   INTFER_HTTP_URL: reuse an already-running server (script won't kill it).
 #   INTFER_LOAD_LEVELS: space-separated concurrency levels (default "1 4 8").
 #   INTFER_LOAD_MAXTOK: max_tokens per request (default 8).
+#   INTFER_LOAD_BIGMT: batch-full probe max_tokens (default unset = skip).
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +32,7 @@ BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/intfer_cli/intfer_cli"
 PORT="${INTFER_HTTP_PORT:-18312}"
 LEVELS="${INTFER_LOAD_LEVELS:-1 4 8}"
 MAXTOK="${INTFER_LOAD_MAXTOK:-8}"
+BIGMT="${INTFER_LOAD_BIGMT:-}"
 
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }
@@ -52,12 +59,20 @@ fi
 cleanup() { [ "$STARTED" = 1 ] && kill "$SRV_PID" 2>/dev/null; }
 trap cleanup EXIT
 
-export INTFER_HTTP_URL="$URL" INTFER_LOAD_LEVELS="$LEVELS" INTFER_LOAD_MAXTOK="$MAXTOK"
+# Absolute tok/s numbers are contention-sensitive (GPU + host compete with
+# whatever else runs on the box); log the 1-min load average alongside so
+# runs are comparable. 2026-09-16 vs 2026-09-17 differed 4-5x on load ~17
+# vs ~3 with identical code/flags.
+cat /proc/loadavg 2>/dev/null | sed 's/^/box loadavg: /' || true
+
+export INTFER_HTTP_URL="$URL" INTFER_LOAD_LEVELS="$LEVELS" INTFER_LOAD_MAXTOK="$MAXTOK" INTFER_LOAD_BIGMT="$BIGMT"
 python3 - <<'EOF'
 import json, os, sys, urllib.request, time, concurrent.futures, statistics
 URL = os.environ["INTFER_HTTP_URL"]
 LEVELS = [int(x) for x in os.environ["INTFER_LOAD_LEVELS"].split()]
 MT = int(os.environ["INTFER_LOAD_MAXTOK"])
+BIGMT = os.environ.get("INTFER_LOAD_BIGMT", "").strip()
+BIGMT = int(BIGMT) if BIGMT else 0
 PROMPTS = ["The capital of France is",
            "The quick brown fox jumps over the lazy dog.",
            "Hi", "Hello world",
@@ -117,6 +132,18 @@ top = agg_by_level.get(LEVELS[-1], 0.0)
 print(f"scaling: c{LEVELS[0]}={base:.2f} tok/s -> c{LEVELS[-1]}={top:.2f} tok/s "
       f"(x{top/max(base,1e-6):.2f})")
 gate("floor", top >= 0.5, f"{top:.2f} tok/s")
+if BIGMT > 0:
+    C = LEVELS[-1]
+    prompts = [PROMPTS[i % len(PROMPTS)] for i in range(C)]
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=C) as ex:
+        res = list(ex.map(lambda p: post(p, BIGMT), prompts))
+    wall = time.time() - t0
+    ok = len(res) == C and all(r[1] in ("stop", "length") for r in res)
+    gate(f"c{C}.bigmt{MT}", ok, f"{len(res)}/{C} finish_ok")
+    ctoks = sum(r[0]["completion_tokens"] for r in res)
+    print(f"c{C}.bigmt{MT}: wall={wall:.1f}s tok/s={ctoks/max(wall,1e-6):.2f} "
+          f"ctoks={ctoks}")
 sys.exit(1 if fails else 0)
 EOF
 PY_RC=$?
