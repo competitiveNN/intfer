@@ -87,11 +87,20 @@ Implement features for maximizing throughput for concurrent requests, starting f
   10.8s @20T, 16.18s vs 16.34s @1T; GPU serve-load C=8 3.86 vs 3.89
   tok/s. LA host recurrence is a negligible share — GEMMs dominate.
   Revisit only if profiling shows recurrence >10% of a step. NOTE
-  2026-09-17: the 2026-09-16 serve-load numbers (C=8 3.86-3.89 tok/s)
-  were measured under box contention; clean re-run gives C=1 8.16,
-  C=4 15.33, C=8 17.98 tok/s (x2.20), and a batch-full C=8/MT=64
-  probe hits 36.3 tok/s aggregate — batching works, short MT=8
-  requests drain the batch. Dead-end verdict on OMP stands),
+  2026-09-18: the 8.16/15.33/17.98 (C=1/4/8) + 36.3 (MT=64 probe)
+  numbers claimed 2026-09-17 are WITHDRAWN as unreproducible. Four
+  independent C=1/MT=8 sweeps (incl. quiet-box start-load 0.69 and
+  1.57) all land 3.27-3.53 tok/s; only docs commits separate the
+  3.89 (09-16) and 8.16 (09-17) readings, i.e. same code. Bisect
+  (single warm req, quiet box): fused ON 1.78s vs OFF 1.77s (neutral),
+  joint 1.78s vs split 2.01s (joint helps, active), dispatcher 1.78s
+  vs serial 2.07s (dispatcher active), chunk361 1.68s (chunking minor).
+  The MT=64 batch-full probe (9.02 tok/s over 338 ctoks) proves the
+  path batches — MT=8 is prefill-dominated, not contention. C=8
+  scaling inversions under rising box load are a sweep-harness
+  artifact (load 2.5→10+ mid-run). Quoting rule retired (C=1>=7 never
+  fires): quote the MT=8 sweep AND the MT=64 probe from the same run.
+  Dead-end verdict on OMP stands),
   device-side SSM recurrence M=1
   (2026-09-16, INTFER_SSM_GPU=1, parity-clean incl. step_batch +
   spec-rollback resync: -9% decode, 7.4->6.7 tok/s pinned 3x3
@@ -232,11 +241,13 @@ Implement features for maximizing throughput for concurrent requests, starting f
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +
   transfers most of the rest). 40 tok/s must come from aggregate
   batching (--serve scheduler already M-row batches; cross-request HTTP
-  batching is the highest-value lever, C=8/MT=64 probe 36.3 tok/s
-  aggregate on clean box). 2026-09-18: gate re-verified PASS on HEAD
-  (wave+AVX2 serving-certified), but box contended (C=1 3.2-3.5 vs 8.16
-  idle; batch-full 7.6 vs 36.3) — rule: quote serve-load tok/s only
-  when C=1 >= 7 tok/s. Structural options: batched
+  batching is the highest-value lever, C=8/MT=64 probe 9.02 tok/s
+  aggregate on quiet box 2026-09-18 (338 ctoks, proves batching; the
+  old 36.3 figure is withdrawn with the 8.16 line above). Gate
+  re-verified PASS on HEAD (wave+AVX2+fused serving-certified) — the
+  C=1 3.27-3.53 tok/s across four independent sweeps is structural
+  (MT=8 prefill-dominated), not contention; quoting rule retired.
+  Structural options: batched
   multi-launch L0 lists amortizing one sync over many kernels (single
   immediate append+sync measured no faster than UR submit+wait, so the
   win must come from fewer syncs, not a faster submit),

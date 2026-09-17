@@ -144,15 +144,16 @@ scripts/             build.sh / run.sh / run_bin.sh
   `scripts/bench_serve.sh` (req/s, tok/s, latency),
   `scripts/test_http_batch.sh` (cross-request batch parity over HTTP),
   `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8 with req/s,
-  tok/s, P50/P99 latency + solo-vs-loaded parity; 2026-09-17
-  (idle box): C=1 8.16 tok/s/P50 1.0s, C=4 15.33 tok/s/P50 2.0s,
-  C=8 17.98 tok/s/P50 3.3s, x2.20 C=1->C=8; batch-full C=8/MT=64 probe:
-  36.3 tok/s aggregate. Re-verified 2026-09-18 on HEAD (wave+AVX2):
-  gate PASSES (completion + solo-vs-loaded parity + floor) but absolute
-  numbers NOT quotable — box under contention (updatedb + agent load,
-  C=1 3.2-3.5 vs 8.16 idle; batch-full probe 7.6 vs 36.3). Rule: quote
-  serve-load tok/s only from runs with C=1 >= 7 tok/s (idle-box check);
-  anything lower is contention, not code).
+  tok/s, P50/P99 latency + solo-vs-loaded parity; 2026-09-18
+  (quiet-box start, fused default-ON): MT=8 sweep C=1 3.3, C=4 4.2,
+  C=8 3.1 tok/s (prefill-dominated short requests; C=8 scaling inverts
+  when box load rises mid-run — sweep-harness artifact); batch-full
+  C=8/MT=64 probe: 9.02 tok/s over 338 ctoks (proves the path batches).
+  The 2026-09-17 8.16/15.33/17.98 + 36.3 figures are withdrawn as
+  unreproducible (four independent C=1 sweeps land 3.27-3.53; only docs
+  commits separate the 3.89 and 8.16 readings, i.e. same code; fused
+  ON/OFF bisect neutral at 1.78/1.77s). Gate-verified PASS repeatedly
+  (completion + solo-vs-loaded parity + floor).
 
 **In progress / next**
 - GPU-side attention (today attention runs host-side in both backends;
