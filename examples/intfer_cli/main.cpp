@@ -500,6 +500,22 @@ struct LinearBackend {
     for (size_t i = 0; i < n; ++i)
       run_linear_batch(items[i].name, *items[i].X, *items[i].Y, M);
   }
+  // Fused MLP down-projection: gate/up GEMMs + silu-mul + down GEMM in one
+  // backend call. Default returns false (caller runs its inline host
+  // path: wave + silu-mul + down, mg/mu filled, trace ckpts live); GPU
+  // overrides with the device-chained version when legal and returns
+  // true (md filled, mg/mu NOT filled — their only consumers are the
+  // silu-mul folded into the chain and trace-gated ckpts, which force
+  // the host path).
+  virtual bool run_mlp_fused(const std::string& gate, const std::string& up,
+                             const std::string& down,
+                             const std::vector<float>& rin,
+                             std::vector<float>& mg, std::vector<float>& mu,
+                             std::vector<float>& md, uint32_t M) {
+    (void)gate; (void)up; (void)down; (void)rin;
+    (void)mg; (void)mu; (void)md; (void)M;
+    return false;
+  }
   // SpinQuant rotation for this tensor (right-site for q/k/v/gate/up;
   // left-site for o/down; nullptr if no rotation).
   virtual const Rotation* rot_for(const std::string& tensor_name) = 0;
@@ -1101,6 +1117,39 @@ struct GpuBackend : public LinearBackend {
       cur_layer_ = wave_layer;
     }
     eng->run_linear_wave(eitems, ne, M);
+  }
+  // Fused MLP down-projection (TP=1 device chain: gate/up wave-submit ->
+  // device silu-mul + convert -> down GEMM, one wait + one D2H).
+  // INTFER_NO_FUSE_SILUMUL=1 restores wave + host silu-mul (bisection).
+  // Returns true when the fused path ran (md filled, mg/mu NOT filled);
+  // false keeps the caller's host path. Trace runs (NaN/H debug) always
+  // take the host path so ckpts see real mg/mu.
+  bool run_mlp_fused(const std::string& gate, const std::string& up,
+                     const std::string& down, const std::vector<float>& rin,
+                     std::vector<float>& mg, std::vector<float>& mu,
+                     std::vector<float>& md, uint32_t M) override {
+    static const bool no_fuse =
+        (std::getenv("INTFER_NO_FUSE_SILUMUL") != nullptr) ||
+        (std::getenv("INTFER_TRACE_NAN") != nullptr) ||
+        (std::getenv("INTFER_TRACE_H") != nullptr);
+    if (!eng || no_fuse) return false;
+    build_index();
+    auto itg = ti_cache.find(gate);
+    auto itu = ti_cache.find(up);
+    auto itd = ti_cache.find(down);
+    if (itg == ti_cache.end() || itu == ti_cache.end() ||
+        itd == ti_cache.end())
+      return false;
+    int L = Engine::layer_of_name(gate);
+    if (L >= 0 && L != cur_layer_) { eng->begin_layer(L); cur_layer_ = L; }
+    if (!eng->run_mlp_fused(itg->second, itu->second, itd->second,
+                            rin, md, M))
+      return false;
+    // Fused path ran: mg/mu host vectors intentionally NOT filled (their
+    // only consumers are the silu-mul folded into the device chain and
+    // trace-gated ckpts, which route to the host path above).
+    (void)mg; (void)mu;
+    return true;
   }
 
   // Cached lm_head INT8 upload + per-row-symmetric INT8 GEMM on device.
@@ -2942,20 +2991,26 @@ static StepOut step(Request& req, int token, int pos,
     else for(int i=0;i<cfg.H;i++) rin[i] = rn2[i];
     std::vector<float>& mg = req.scratch.mg;
     std::vector<float>& mu = req.scratch.mu;
-    // Wave: gate/up share the rin input and are independent — one engine
-    // call, one host round-trip. Bit-identical to two run_linear_into.
-    {
-      LinearBackend::LinearWaveItem items[2] = {
-        {ln.gate, &rin, &mg},
-        {ln.up, &rin, &mu},
-      };
-      backend->run_linear_wave(items, 2);
-    }
-    ckpt("mlp.gate", L, mg);
-    ckpt("mlp.up", L, mu);
-    for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
     std::vector<float>& md = req.scratch.md;
-    backend->run_linear_into(ln.down, mg, md);
+    // Fused MLP: device chains gate/up wave -> silu-mul -> down (TP=1);
+    // otherwise the default runs wave + host silu-mul + down (mg/mu
+    // filled). Fused path leaves mg/mu unfilled — their only consumers
+    // below are trace-gated (which force the host path).
+    if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, rin, mg, mu, md, 1)){
+      // Wave: gate/up share the rin input and are independent — one engine
+      // call, one host round-trip. Bit-identical to two run_linear_into.
+      {
+        LinearBackend::LinearWaveItem items[2] = {
+          {ln.gate, &rin, &mg},
+          {ln.up, &rin, &mu},
+        };
+        backend->run_linear_wave(items, 2);
+      }
+      ckpt("mlp.gate", L, mg);
+      ckpt("mlp.up", L, mu);
+      for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
+      backend->run_linear_into(ln.down, mg, md);
+    }
     ckpt("mlp.down", L, md);
     const Rotation* Rd = backend->rot_for(ln.down);
     if(trace_h && pos==0 && L==0){
@@ -3368,6 +3423,9 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       else memcpy(rin.data(), rn2.data(), (size_t)Hdim*sizeof(float));
       std::vector<float>& mg = req.scratch.mg;
       std::vector<float>& mu = req.scratch.mu;
+      std::vector<float>& md = req.scratch.md;
+      // Fused MLP (device chain on TP=1, else host path below).
+      if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, rin, mg, mu, md, 1)){
       // Wave: gate/up share rin and are independent — one host round-trip.
       {
         LinearBackend::LinearWaveItem items[2] = {
@@ -3377,8 +3435,8 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         backend->run_linear_wave(items, 2);
       }
       for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
-      std::vector<float>& md = req.scratch.md;
       backend->run_linear_into(ln.down, mg, md);
+      }
       const Rotation* Rd = backend->rot_for(ln.down);
       std::vector<float>& mlp_out = req.scratch.mlp_out;
       if(Rd) rot_left(md.data(), *Rd, mlp_out.data());
@@ -3574,6 +3632,8 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       // Wave-batch: gate/up share c_rin and are independent — one
       // engine call, one host round-trip. Bit-identical to two
       // run_linear_batch.
+      // Fused MLP (device chain on TP=1, else host path below).
+      if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, c_rin, c_mg, c_mu, c_md, (uint32_t)M)){
       {
         LinearBackend::LinearWaveBatchItem items[2] = {
           {ln.gate, &c_rin, &c_mg},
@@ -3587,6 +3647,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         for(int i=0;i<cfg.inter;i++) mgr[i] = silu(mgr[i])*mur[i];
       }
       backend->run_linear_batch(ln.down, c_mg, c_md, (uint32_t)M);
+      }
       const Rotation* Rd = backend->rot_for(ln.down);
       for(int m=0; m<M; m++){
         float* hr = &H[(size_t)m*Hdim];
@@ -3893,6 +3954,8 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         float* ri = &c_rin_la[(size_t)m*Hdim];
         if(Rg_la) rot_apply(r2, *Rg_la, ri); else memcpy(ri, r2, (size_t)Hdim*sizeof(float));
       }
+      // Fused MLP (device chain on TP=1, else host path below).
+      if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, c_rin_la, c_mg, c_mu, c_md_la, (uint32_t)M)){
       // Wave-batch: gate/up share c_rin_la and are independent — one
       // engine call, one host round-trip. Bit-identical to two
       // run_linear_batch.
@@ -3909,6 +3972,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         for(int i=0;i<cfg.inter;i++) mgr[i] = silu(mgr[i])*mur[i];
       }
       backend->run_linear_batch(ln.down, c_mg, c_md_la, (uint32_t)M);
+      }
       const Rotation* Rd_la = backend->rot_for(ln.down);
       for(int m=0; m<M; m++){
         float* hr = &H[(size_t)m*Hdim];
@@ -4194,6 +4258,8 @@ static std::vector<StepOut> step_batch(
         float* ri = &b_rin[(size_t)m*Hdim];
         if(Rg) rot_apply(r2, *Rg, ri); else memcpy(ri, r2, (size_t)Hdim*sizeof(float));
       }
+      // Fused MLP (device chain on TP=1, else host path below).
+      if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, b_rin, c_mg, c_mu, b_md, (uint32_t)M)){
       // Wave-batch: gate/up share b_rin and are independent — one
       // engine call, one host round-trip. Bit-identical to two
       // run_linear_batch.
@@ -4210,6 +4276,7 @@ static std::vector<StepOut> step_batch(
         for(int i=0;i<cfg.inter;i++) mgr[i] = silu(mgr[i])*mur[i];
       }
       backend->run_linear_batch(ln.down, c_mg, b_md, (uint32_t)M);
+      }
       const Rotation* Rd = backend->rot_for(ln.down);
       for(int m=0; m<M; m++){
         float* hr = &H[(size_t)m*Hdim];

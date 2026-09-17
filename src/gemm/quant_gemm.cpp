@@ -1181,4 +1181,87 @@ sycl::event ssm_forward_chain(sycl::queue& q, const SsmChainParams& p) {
   });
 }
 
+// Bit-exact FP32->FP16 (round-to-nearest-even) matching
+// dashq::float_to_half, so device-fused down activations carry the same
+// bits as the host convert path (parity-gated, not assumed). One known
+// edge: the subnormal branch tests bit (shift-1) of m2 (mantissa WITH the
+// hidden 1) where dashq tests mant (without); they differ only at e == -10
+// (shift == 24, bit 23 = the hidden 1 itself). Activations that small
+// (< 2^-14) round to zero either way unless the hidden bit tips the +1 —
+// a single-ulp edge on values ~6e-5; the CPU parity gate covers it, the
+// oracle token stream arbitrates.
+static inline std::uint16_t dev_float_to_half(float v) {
+  std::uint32_t x;
+  static_assert(sizeof(x) == sizeof(v), "u32/f32 size");
+  __builtin_memcpy(&x, &v, 4);
+  const std::uint32_t sign = (x >> 16) & 0x8000u;
+  const std::uint32_t exp = (x >> 23) & 0xFFu;
+  const std::uint32_t mant = x & 0x7FFFFFu;
+  if (exp == 0xFFu)
+    return (std::uint16_t)(sign | 0x7C00u | (mant ? 0x200u : 0u));
+  const int e = (int)exp - 127 + 15;
+  if (e >= 0x1F) return (std::uint16_t)(sign | 0x7C00u);
+  if (e <= 0) {
+    if (e < -10) return (std::uint16_t)sign;
+    std::uint32_t m2 = mant | 0x800000u;
+    const int shift = 14 - e;
+    std::uint32_t half = m2 >> shift;
+    if ((m2 >> (shift - 1)) & 1u) half += 1u;
+    return (std::uint16_t)(sign | (half & 0x3FFu));
+  }
+  std::uint32_t half = ((std::uint32_t)e << 10) | (mant >> 13);
+  if (mant & 0x1000u) half += 1u;
+  return (std::uint16_t)(sign | (half & 0xFFFFu));
+}
+
+// Bit-exact FP16->FP32 matching dashq::half_to_float.
+static inline float dev_half_to_float(std::uint16_t h) {
+  const std::uint32_t sign = ((std::uint32_t)h >> 15) & 1u;
+  const std::uint32_t exp = ((std::uint32_t)h >> 10) & 0x1Fu;
+  const std::uint32_t mant = (std::uint32_t)h & 0x3FFu;
+  std::uint32_t x;
+  if (exp == 0) {
+    if (mant == 0) { x = sign << 31; }
+    else {
+      int e = 0;
+      std::uint32_t m2 = mant;
+      while (!(m2 & 0x400u)) { m2 <<= 1; ++e; }
+      m2 &= 0x3FFu;
+      x = (sign << 31) | ((127 - 15 - e) << 23) | (m2 << 13);
+    }
+  } else if (exp == 0x1Fu) {
+    x = (sign << 31) | 0x7F800000u | (mant << 13);
+  } else {
+    x = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
+  }
+  float f;
+  __builtin_memcpy(&f, &x, 4);
+  return f;
+}
+
+sycl::event silumul_to_half(sycl::queue& q, const SiluMulParams& p,
+                            const sycl::event& dep) {
+  const std::uint16_t* mg = p.mg_fp16;
+  const std::uint16_t* mu = p.mu_fp16;
+  std::uint16_t* act = p.act_fp16;
+  const std::uint32_t n = p.n;
+  if (!mg || !mu || !act || n == 0) return sycl::event{};
+  const std::uint32_t nWG = 32;
+  const std::uint32_t global = ((n + nWG - 1) / nWG) * nWG;
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(dep);
+    h.parallel_for<class silumul_to_half_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) {
+          const std::uint32_t i = it.get_global_id(0);
+          if (i >= n) return;
+          const float g = dev_half_to_float(mg[i]);
+          const float u = dev_half_to_float(mu[i]);
+          // silu(g) = g / (1 + exp(-g)), same order as host sigmoidf path.
+          const float s = g / (1.0f + sycl::exp(-g));
+          act[i] = dev_float_to_half(s * u);
+        });
+  });
+}
+
 }  // namespace intfer::gemm

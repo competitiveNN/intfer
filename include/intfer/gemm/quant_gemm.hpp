@@ -319,4 +319,30 @@ struct SsmChainParams {
 // One WI per (head hh, v-col c), kd-serial, m-sequential inner loop.
 sycl::event ssm_forward_chain(sycl::queue& q, const SsmChainParams& p);
 
+// ---------------------------------------------------------------------------
+// Device-side fused silu-mul + FP32->FP16 convert (MLP down-act fusion).
+//
+// Reads two FP16 gate/up GEMM outputs (mg_fp16[i], mu_fp16[i]), computes
+//   fused[i] = silu((float)mg[i]) * (float)mu[i],  silu(x) = x/(1+exp(-x))
+// in FP32, and writes round-to-nearest-even FP16 bits to act_fp16[i].
+// One WI per element; no cross-element dependencies.
+//
+// Bit-identity contract: half->float is exact; the FP32 silu/mul uses the
+// same element order as the host loop (sycl::exp may differ from host
+// expf by ~1ulp on rare elements; the oracle token stream is the
+// arbiter — same standing as the AVX2 host-math change). The FP16
+// down-convert matches dashq::float_to_half RNE bit-for-bit (verified by
+// the CPU parity gate when it passes; oracle gate otherwise).
+// dep chains after the gate/up wave kernels (in-order queue also
+// observes it; the explicit dep keeps out-of-order queues correct).
+// ---------------------------------------------------------------------------
+struct SiluMulParams {
+  const std::uint16_t* mg_fp16;  // [n] gate GEMM output (device FP16 bits)
+  const std::uint16_t* mu_fp16;  // [n] up GEMM output (device FP16 bits)
+  std::uint16_t* act_fp16;       // [n] fused down activation (device FP16 bits)
+  uint32_t n;                    // element count (M * inter)
+};
+sycl::event silumul_to_half(sycl::queue& q, const SiluMulParams& p,
+                            const sycl::event& dep = {});
+
 }  // namespace intfer::gemm

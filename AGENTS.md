@@ -125,7 +125,77 @@ Implement features for maximizing throughput for concurrent requests, starting f
   the decode critical path (the ~33% host share is GEMM act
   convert+memcpy, not norms). Keep both (correct, default-on, free),
   but quote no big win; remaining gap needs submit-side work.
-- L4 design verdict (2026-09-18, investigated, NOT implemented):
+- L4 design verdict (2026-09-18, investigated; MLP half IMPLEMENTED):
+  PART A (done, fused MLP): the device-act GEMM seam now EXISTS —
+  run_mlp_fused feeds the down GEMM straight from a device buffer
+  (fused silu-mul output), skipping host convert + ws memcpy.
+  PART B (not done): fused device-side SSM+norm feeding la_out GEMM.
+  Data flow per LA layer today (18/24 layers on 0.8B): ssm_rows kernel
+  -> D2H core (2048 floats) + blocking wait -> host ssm-norm+silu(z)
+  -> H2D normed_core via run_linear_into -> la_out GEMM (engine.cpp
+  converts FP32->FP16 host-side, memcpy to ws act, submit, wait, D2H).
+  Fusion would kill per-LA-layer: 1 D2H + 1 wait + 1 H2D + 1 FP32->FP16
+  host convert (la_out act 1024 FP32 = 4KB). BUT the old -9% stands and
+  the reason is now precise: ssm_rows itself already pays H2D inputs
+  (~15-130us/layer) + kernel-submit (~25us) + D2H+wait (~150-550us);
+  fused norm+FP16-convert on device saves only the core round-trip and
+  the host norm (~0.05ms), while the la_out engine seam
+  (run_linear_tp: host FP32 in -> FP16 convert -> ws memcpy -> submit)
+  has NO device-pointer entry — feeding it from a device buffer needs
+  a new Engine method (device-act GEMM: skip convert+ws-write, submit
+  with USM dep on the fused event). Net estimate: saves ~0.2-0.3ms of
+  ~1.7ms/LA-layer (submit+waitblock dominate) over 18 layers =
+  ~4-5ms/token of ~41ms = ~+10% IF the new seam costs zero extra
+  submits. Verdict: viable but engine-invasive (new device-act GEMM
+  entry + fused ssm_forward_norm_convert kernel + oracle gate on the
+  fused FP16-convert rounding); do it only together with batched
+  multi-launch L0 lists (same seam work amortizes both). Standalone
+  INTFER_SSM_GPU=1 stays default-off. NOTE: the SAME device-act seam
+  pattern was just proven by the fused MLP below (+13% decode) — the
+  L4 SSM fusion is now a second application of a working technique,
+  not a new invention; the remaining L4-specific risk is only the
+  fused norm+silu(z) numerics.
+  Data flow per LA layer today (18/24 layers on 0.8B): ssm_rows kernel
+  -> D2H core (2048 floats) + blocking wait -> host ssm-norm+silu(z)
+  -> H2D normed_core via run_linear_into -> la_out GEMM (engine.cpp
+  converts FP32->FP16 host-side, memcpy to ws act, submit, wait, D2H).
+  Fusion would kill per-LA-layer: 1 D2H + 1 wait + 1 H2D + 1 FP32->FP16
+  host convert (la_out act 1024 FP32 = 4KB). BUT the old -9% stands and
+  the reason is now precise: ssm_rows itself already pays H2D inputs
+  (~15-130us/layer) + kernel-submit (~25us) + D2H+wait (~150-550us);
+  fused norm+FP16-convert on device saves only the core round-trip and
+  the host norm (~0.05ms), while the la_out engine seam
+  (run_linear_tp: host FP32 in -> FP16 convert -> ws memcpy -> submit)
+  has NO device-pointer entry — feeding it from a device buffer needs
+  a new Engine method (device-act GEMM: skip convert+ws-write, submit
+  with USM dep on the fused event). Net estimate: saves ~0.2-0.3ms of
+  ~1.7ms/LA-layer (submit+waitblock dominate) over 18 layers =
+  ~4-5ms/token of ~41ms = ~+10% IF the new seam costs zero extra
+  submits. Verdict: viable but engine-invasive (new device-act GEMM
+  entry + fused ssm_forward_norm_convert kernel + oracle gate on the
+  fused FP16-convert rounding); do it only together with batched
+  multi-launch L0 lists (same seam work amortizes both). Standalone
+  INTFER_SSM_GPU=1 stays default-off.
+- Fused MLP down-projection (2026-09-18, IMPLEMENTED, TP=1 only):
+  Engine::run_mlp_fused chains gate/up wave-submit on-device through a
+  fused silu-mul + RNE FP16-convert kernel (gemm::silumul_to_half) straight
+  into the down GEMM: one host wait + one D2H per MLP instead of wave-wait
+  + 2 D2H (gate/up) + host silu-mul + convert + H2D + down-wait.
+  TP>1 / DPAS48 / trace (NaN/H) / bad shapes return false and the caller
+  keeps the host path (mg/mu consumers are trace-gated). Kill switch:
+  INTFER_NO_FUSE_SILUMUL=1 restores wave + host silu-mul (bisection).
+  Bit-contract: FP32 op order matches the host loop; sycl::exp may differ
+  ~1ulp on rare elements; dev_float_to_half is RNE bit-identical to
+  dashq::float_to_half except a single-ulp subnormal edge at e == -10
+  (values ~6e-5; CPU parity covers, oracle arbitrates). Measured
+  (box contended loadavg 5-11, interleaved A/B 2 rounds, TP=1 decode
+  -n 32): 28.06/27.81 vs 24.77/24.48 = +13.3%/+13.6% (~+3.2 tok/s);
+  prefill chunk361: 158.3 vs 154.2 = +2.7%. GPU streams bit-identical
+  ON vs OFF (279 6511 314 279 3046 13 198 760) and vs TP2; all gates
+  PASS with fused default-ON (cpu parity, http batch, serve-load).
+  NOT yet re-benched on quiet box (loadavg<2) — do not quote 28 tok/s
+  as the new ceiling until then; the +13% relative gain is the durable
+  claim (waits/round-trips removed, submit wall untouched).
   fused device-side SSM+norm feeding la_out GEMM from device buffers.
   Data flow per LA layer today (18/24 layers on 0.8B): ssm_rows kernel
   -> D2H core (2048 floats) + blocking wait -> host ssm-norm+silu(z)

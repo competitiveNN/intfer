@@ -1114,6 +1114,145 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
 #endif
 }
 
+// Fused MLP down-projection (TP=1 only): gate/up convert + submit
+// back-to-back, chain on-device through the fused silu-mul + FP16 convert
+// straight into the down GEMM, then ONE host wait + ONE D2H. Saves vs the
+// wave + host path: 1 wait, 2 D2H readbacks (gate/up), the host silu-mul
+// + convert, and 1 H2D (down act). Bit-contract: the fused kernel is the
+// same FP32 op order as the host loop; sycl::exp may differ from host
+// expf by ~1ulp on rare elements, so the oracle token stream is the
+// arbiter (same standing as the AVX2 host-math change). The FP16
+// down-convert is RNE bit-identical to dashq::float_to_half by
+// construction (dev_float_to_half); the CPU parity gate verifies it, the
+// oracle gate otherwise. False (caller keeps host path) on TP>1, DPAS48
+// items, bad shapes, or any missing index — never partial work.
+bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
+                           const std::vector<float>& rin,
+                           std::vector<float>& md, uint32_t M) {
+  if (devices_.size() != 1) return false;
+  if (M == 0) M = 1;
+  for (int ti : {gate_ti, up_ti, down_ti}) {
+    if (ti < 0 || (size_t)ti >= model_.tensors.size()) return false;
+    if (!shard_cache_[(size_t)ti].built && !ensure_shard_built(ti))
+      return false;
+    if (shard_cache_[(size_t)ti].dpas48) return false;
+  }
+  const auto& tg = model_.tensors[(size_t)gate_ti];
+  const auto& tu = model_.tensors[(size_t)up_ti];
+  const auto& td = model_.tensors[(size_t)down_ti];
+  const auto& scg = shard_cache_[(size_t)gate_ti];
+  const auto& scu = shard_cache_[(size_t)up_ti];
+  const auto& scd = shard_cache_[(size_t)down_ti];
+  // Geometry: gate/up share rin (K) and inter (N); down maps inter -> H.
+  // Range-split sanity: TP=1 so each shard covers the full N.
+  const uint32_t inter = tg.N;
+  if (tu.N != inter || tu.K != tg.K) return false;
+  if (td.K != inter) return false;
+  if (rin.size() != (size_t)M * tg.K) return false;
+  if (shards_[gate_ti].ranges[0].first != 0 ||
+      shards_[gate_ti].ranges[0].second != inter) return false;
+  if (shards_[up_ti].ranges[0].first != 0 ||
+      shards_[up_ti].ranges[0].second != inter) return false;
+  if (shards_[down_ti].ranges[0].first != 0 ||
+      shards_[down_ti].ranges[0].second != td.N) return false;
+  if (md.size() != (size_t)M * td.N) md.resize((size_t)M * td.N);
+
+  sycl::queue& q = devices_[0].queue;
+  // Phase 1: convert rin once per item into the wave slots (same convert as
+  // run_linear_wave phase 1; two slots, K_max = tg.K).
+  ensure_wave_workspace(M, 2, tg.K, std::max(inter, td.N));
+#ifdef INTFER_PROFILE_GPU
+  auto t_copy0 = std::chrono::high_resolution_clock::now();
+#endif
+  const size_t need = (size_t)M * tg.K;
+  if (act_staging_.size() != need) act_staging_.resize(need);
+  dashq::float_to_half_batch(rin.data(), act_staging_.data(), need);
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_copy_us += std::chrono::duration<double, std::micro>(t1 - t_copy0).count();
+    g_gpu_profile.copy_count++;
+  }
+  auto t_w0 = std::chrono::high_resolution_clock::now();
+#endif
+  std::memcpy(wv_[0].act, act_staging_.data(), need * sizeof(std::uint16_t));
+  std::memcpy(wv_[1].act, act_staging_.data(), need * sizeof(std::uint16_t));
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_usm_write_us += std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+  }
+#endif
+
+  // Phase 2: submit gate + up back-to-back (in-order queue serializes;
+  // explicit deps keep out-of-order queues correct too).
+  const float ag = scg.has_global_divisor ? scg.global_host : 1.0f;
+  const float au = scu.has_global_divisor ? scu.global_host : 1.0f;
+  const float ad = scd.has_global_divisor ? scd.global_host : 1.0f;
+#ifdef INTFER_PROFILE_GPU
+  auto t_s0 = std::chrono::high_resolution_clock::now();
+#endif
+  sycl::event e_gate = gemm::quant_gemm_forward_usm(q, wv_[0].act,
+      scg.code_usm[0], scg.scale_usm[0], ag, wv_[0].out,
+      M, inter, tg.K, scg.group_size, scg.scheme, sycl::event{});
+  sycl::event e_up = gemm::quant_gemm_forward_usm(q, wv_[1].act,
+      scu.code_usm[0], scu.scale_usm[0], au, wv_[1].out,
+      M, inter, tu.K, scu.group_size, scu.scheme, e_gate);
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_submit_us += std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+  }
+#endif
+
+  // Phase 3: fused silu-mul + convert into the shared down-act workspace.
+  ensure_workspace(M, td.K, td.N);
+  gemm::SiluMulParams sp;
+  sp.mg_fp16 = wv_[0].out;
+  sp.mu_fp16 = wv_[1].out;
+  sp.act_fp16 = ws_[0].act;
+  sp.n = M * inter;
+  sycl::event e_fused = gemm::silumul_to_half(q, sp, e_up);
+
+  // Phase 4: down GEMM straight from the device act buffer, then the
+  // single host wait + D2H of this whole chain.
+  sycl::event e_down = gemm::quant_gemm_forward_usm(q, ws_[0].act,
+      scd.code_usm[0], scd.scale_usm[0], ad, ws_[0].out,
+      M, td.N, td.K, scd.group_size, scd.scheme, e_fused);
+#ifdef INTFER_PROFILE_GPU
+  auto t_wb0 = std::chrono::high_resolution_clock::now();
+#endif
+  e_down.wait();
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_waitblock_us += std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
+  }
+  g_gpu_profile.wait_count += 1;
+  for (sycl::event* e : {&e_gate, &e_up, &e_fused, &e_down}) {
+    try {
+      auto t0 = e->get_profiling_info<sycl::info::event_profiling::command_start>();
+      auto t1 = e->get_profiling_info<sycl::info::event_profiling::command_end>();
+      g_gpu_profile.total_kernel_us += (double)(t1 - t0) / 1000.0;
+      g_gpu_profile.kernel_count++;
+    } catch (...) {}
+  }
+  auto t_rb0 = std::chrono::high_resolution_clock::now();
+#endif
+  const std::uint16_t* out_ptr = ws_[0].out;
+  for (uint32_t m = 0; m < M; ++m)
+    dashq::half_to_float_batch(out_ptr + (size_t)m * td.N,
+                               md.data() + (size_t)m * td.N, td.N);
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_readback_us += std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
+    g_gpu_profile.readback_count++;
+  }
+#endif
+  return true;
+}
+
 // Wave variant: one independent GEMM per item (see engine.hpp). Phases:
 // (1) per item: lazy shard build + FP32->FP16 convert + per-device act
 // memcpy into that item's wave slot; (2) per device: submit all items'
@@ -1278,6 +1417,7 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
   }
 #endif
 }
+
 
 #ifdef INTFER_PROFILE_GPU
   GpuProfileSnapshot get_gpu_profile() {

@@ -83,6 +83,16 @@ class Engine {
     std::vector<float>* out = nullptr;
   };
   void run_linear_wave(const LinearWaveItem* items, size_t n, uint32_t M);
+
+  // Fused MLP down-projection (TP=1 only): gate/up wave-submit chained
+  // on-device through silu-mul + FP16 convert straight into the down
+  // GEMM — one host wait + one D2H per MLP instead of wave-wait +
+  // readbacks + host math + convert + H2D + down-wait. Returns false
+  // (caller keeps host path) on TP>1, DPAS48 items, or bad shapes.
+  // md is resized to M*down.N. mg/mu host vectors are NOT filled.
+  bool run_mlp_fused(int gate_ti, int up_ti, int down_ti,
+                     const std::vector<float>& rin,
+                     std::vector<float>& md, uint32_t M);
   
   // FP16 x FP16 GEMM for non-quantized final heads (lm_head/embed).
   // C[1,N] = x[1,K] * W[N,K]^T. All row-major. Outputs FP32 logits.
