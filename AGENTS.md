@@ -147,7 +147,10 @@ Implement features for maximizing throughput for concurrent requests, starting f
   transfers most of the rest). 40 tok/s must come from aggregate
   batching (--serve scheduler already M-row batches; cross-request HTTP
   batching is the highest-value lever, C=8/MT=64 probe 36.3 tok/s
-  aggregate on clean box). Structural options: batched
+  aggregate on clean box). 2026-09-18: gate re-verified PASS on HEAD
+  (wave+AVX2 serving-certified), but box contended (C=1 3.2-3.5 vs 8.16
+  idle; batch-full 7.6 vs 36.3) — rule: quote serve-load tok/s only
+  when C=1 >= 7 tok/s. Structural options: batched
   multi-launch L0 lists amortizing one sync over many kernels (single
   immediate append+sync measured no faster than UR submit+wait, so the
   win must come from fewer syncs, not a faster submit),

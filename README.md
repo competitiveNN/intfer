@@ -147,7 +147,12 @@ scripts/             build.sh / run.sh / run_bin.sh
   tok/s, P50/P99 latency + solo-vs-loaded parity; 2026-09-17
   (idle box): C=1 8.16 tok/s/P50 1.0s, C=4 15.33 tok/s/P50 2.0s,
   C=8 17.98 tok/s/P50 3.3s, x2.20 C=1->C=8; batch-full C=8/MT=64 probe:
-  36.3 tok/s aggregate).
+  36.3 tok/s aggregate. Re-verified 2026-09-18 on HEAD (wave+AVX2):
+  gate PASSES (completion + solo-vs-loaded parity + floor) but absolute
+  numbers NOT quotable — box under contention (updatedb + agent load,
+  C=1 3.2-3.5 vs 8.16 idle; batch-full probe 7.6 vs 36.3). Rule: quote
+  serve-load tok/s only from runs with C=1 >= 7 tok/s (idle-box check);
+  anything lower is contention, not code).
 
 **In progress / next**
 - GPU-side attention (today attention runs host-side in both backends;
