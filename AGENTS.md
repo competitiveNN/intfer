@@ -186,8 +186,10 @@ Implement features for maximizing throughput for concurrent requests, starting f
   INTFER_NO_FUSE_SILUMUL=1 restores wave + host silu-mul (bisection).
   Bit-contract: FP32 op order matches the host loop; sycl::exp may differ
   ~1ulp on rare elements; dev_float_to_half is RNE bit-identical to
-  dashq::float_to_half except a single-ulp subnormal edge at e == -10
-  (values ~6e-5; CPU parity covers, oracle arbitrates). Measured
+  dashq::float_to_half (verified exhaustively over e in [-10,0], 2M
+  random + boundary mantissas, zero mismatches — the AGENTS.md "e == -10
+  edge" note was wrong: dashq mutates mant with the hidden bit BEFORE
+  the round test, so host and device test the same bit).
   (box contended loadavg 5-11, interleaved A/B 2 rounds, TP=1 decode
   -n 32): 28.06/27.81 vs 24.77/24.48 = +13.3%/+13.6% (~+3.2 tok/s);
   prefill chunk361: 158.3 vs 154.2 = +2.7%. GPU streams bit-identical
