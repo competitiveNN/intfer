@@ -128,12 +128,16 @@ gemm::WeightScheme to_ws(QuantScheme s) {
 //   * N_local % 16 == 0, K % 32 == 0 (all 27B/0.8B tensors post-TP-split)
 //   * per-tensor global divisor only via host alpha (already the case)
 // Activation quant (INT8/GA64) and repack happen at shard build; dispatch
-// is then a flag check in run_linear_tp. INTFER_DPAS48=0 force-disables.
+// is then a flag check in run_linear_tp. Default OFF (2026-09-18: the DPAS
+// path is a net loss on 0.8B at every tested shape — host GA64 act-quant
+// ~6ms/token dominates, XMX kernel no faster than the tiled legacy kernel
+// at M=1/128; greedy streams bit-identical either way). INTFER_DPAS48=1
+// opts back in (bisection / future shapes where XMX wins).
 bool dpas48_eligible(QuantScheme scheme, uint32_t group_size,
                      uint32_t N_local, uint32_t K) {
   const char* env = std::getenv("INTFER_DPAS48");
-  static const bool disabled = (env && env[0] == '0' && env[1] == '\0');
-  if (disabled) return false;
+  static const bool enabled = (env && env[0] == '1' && env[1] == '\0');
+  if (!enabled) return false;
   int bits = (scheme == QuantScheme::INT2)    ? 2
              : (scheme == QuantScheme::INT4)  ? 4
              : (scheme == QuantScheme::INT8)  ? 8
