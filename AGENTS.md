@@ -51,7 +51,14 @@ Implement features for maximizing throughput for concurrent requests, starting f
   ~12 tok/s TP=2, ~21.5 tok/s TP=1 (TP=1 still wins ~1.8x: 2x
   submits/transfers/readbacks outweigh halved kernel time at tiny
   shapes). Prefill (361-tok, chunked): TP=1 ~135 tok/s, TP=2 ~113 tok/s
-  (chunk_M=128; far from target — prefill is the wider gap). 27B GPU decode ~2.8 tok/s pinned TP=2
+  (chunk_M=128; far from target — prefill is the wider gap). Prefill
+  attribution (2026-09-18, chunk128 TP=1, 361 tok in 2800ms): rebuild
+  924ms = preload_all one-time (186 shards, amortized to zero in
+  serving); steady-state ~195 tok/s = kernel 475 + waitblock 504 +
+  submit 303 + transfers ~214 + host ~380ms. Submit inflates
+  84us/launch (M=1) to ~600us/launch (M=128): UR submit blocks when
+  the device is saturated — same serialization wall as decode, only
+  L0 immediate lists or cross-call fusion move it. 27B GPU decode ~2.8 tok/s pinned TP=2
   (kernel 66% of decode — TP tradeoff reverses vs 0.8B); TP=1 OOMs on 27B
   (lm_head INT8 tile alloc fails: ~19GB on one ~12GB B580).
   Per-token profile (0.8B TP=2): submit ~34%, host act/copy ~33%,
