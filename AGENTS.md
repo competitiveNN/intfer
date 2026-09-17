@@ -47,9 +47,11 @@ Implement features for maximizing throughput for concurrent requests, starting f
 
 - Token generation (decode): **40 tok/s** (per-stream, 0.8B model)
 - Prefill: **4000 tok/s**
-- Current (2026-09-14): 0.8B GPU decode ~11 tok/s TP=2, ~17 tok/s TP=1
-  (TP=1 wins 1.7x: 2x submits/transfers/readbacks outweigh halved kernel
-  time at tiny shapes). 27B GPU decode ~2.8 tok/s pinned TP=2
+- Current (2026-09-17, scripts/bench_gpu_ab.sh): 0.8B GPU decode
+  ~12 tok/s TP=2, ~21.5 tok/s TP=1 (TP=1 still wins ~1.8x: 2x
+  submits/transfers/readbacks outweigh halved kernel time at tiny
+  shapes). Prefill (361-tok, chunked): TP=1 ~135 tok/s, TP=2 ~113 tok/s
+  (chunk_M=128; far from target — prefill is the wider gap). 27B GPU decode ~2.8 tok/s pinned TP=2
   (kernel 66% of decode — TP tradeoff reverses vs 0.8B); TP=1 OOMs on 27B
   (lm_head INT8 tile alloc fails: ~19GB on one ~12GB B580).
   Per-token profile (0.8B TP=2): submit ~34%, host act/copy ~33%,
