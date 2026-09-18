@@ -133,6 +133,15 @@ Implement features for maximizing throughput for concurrent requests, starting f
   vs 100+ peak — no XMX unlock) and M=1 1.2ms vs our ~50us (20x worse,
   framework overhead). Native SYCL stays; XMX win must come from our
   own DPAS kernels with device-resident act-quant.
+- Wave shared-input convert-once (2026-09-18, f12f76b): run_linear_wave
+  Phase 1 converts each distinct (pointer, bytes) input once, reuses
+  staging bytes for duplicates (gate/up share rin; M-row batch gate/up
+  share c_rin). Bit-identical, slots stay per-item, call-local scope.
+  Dormant for distinct inputs (k/v, z/b/a) and fused path. Measured
+  load-immune copy counts (NO_FUSE -n 6): 1116->972 converts (-13%);
+  fused TP=1 unchanged (276=276). Streams identical TP1/NO_FUSE/TP2.
+  Gates: cpu parity + http batch PASS. Open: 6 full-attn layers don't
+  fire the dedup (route MLPs outside wave?) — 48 of ~192 expected.
 - Dead ends (measured, do not retry as-is): device-side act-quant
   (bit-exact probe passed but fused kernel slower: one-WI-per-16N-tile
   layout replicates O(K) quant work nT x), host-private staging of DPAS
