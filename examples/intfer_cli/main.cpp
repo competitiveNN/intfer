@@ -3158,8 +3158,11 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
   // per tensor name (SpinQuant; the fallback is an exact per-slot lookup
   // so resolution is cache-state independent), so one lookup per
   // layer is enough; rows differ only in activations.
+  // Default ON (2026-09-18: M-row launches halve prefill submits,
+  // bit-identical rows); INTFER_BATCH_GEMM=0 forces the per-row path.
+  static const char* batch_env = std::getenv("INTFER_BATCH_GEMM");
   static const bool batch_gemm =
-      (std::getenv("INTFER_BATCH_GEMM") != nullptr);
+      (batch_env == nullptr || std::string(batch_env) != "0");
   // CPU batch override exists (single fork over M*N rows), so the M-row
   // chunk path pays off on the CPU backend too — not just distributed.
   bool use_batch = batch_gemm && backend;
@@ -3398,8 +3401,8 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         // Speculative verifier (TODO3.3, scalar path): same post-row
         // conv/SSM capture as the batched path below (ring states can't be
         // truncated like the absolute KV caches). Without this, spec_rows
-        // stays empty when INTFER_BATCH_GEMM is unset and the verifier's
-        // restore indexes an empty vector (SIGSEGV in vector::operator=).
+        // stays empty on the per-row path (INTFER_BATCH_GEMM=0) and the
+        // verifier's restore indexes an empty vector (SIGSEGV).
         if(row_snaps){
           auto& rws = *row_snaps;
           if((int)rws.size() != cfg.layers) rws.resize(cfg.layers);
@@ -4635,15 +4638,16 @@ struct SchedCtx {
   const std::string* tokenizer_py = nullptr; // encode_text script (server)
   bool print_ids = false;
 };
-// Prefill one request into its own KV/SSM state (sequential; chunked when
-// INTFER_PREFILL_CHUNK is set). Appends the first generated id; sets
+// Prefill one request into its own KV/SSM state (sequential; chunked by
+// default, INTFER_PREFILL_CHUNK=0 forces the step loop). Appends the first
+// generated id; sets
 // token/pos. dump is the request's private record buffer (may be empty to
 // skip recording).
 static void sched_prefill(Request& q, SchedCtx& c, std::vector<std::vector<float>>& dump){
   int Sr = (int)q.prompt_ids.size();
   static const char* chunk_env = std::getenv("INTFER_PREFILL_CHUNK");
-  bool chunked = (chunk_env != nullptr && std::string(chunk_env) != "0");
-  int chunk_M = 8;
+  bool chunked = (chunk_env == nullptr || std::string(chunk_env) != "0");
+  int chunk_M = 128;
   if(const char* me = std::getenv("INTFER_PREFILL_CHUNK_M")){
     int v = std::atoi(me); if(v >= 1 && v <= 1024) chunk_M = v;
   }
@@ -4754,7 +4758,13 @@ static int sched_iteration_joint(std::vector<Request*>& live,
   // per-slot rotation, so cold == warm and all rows agree with the split
   // path), hence no P cap outside BATCH_GEMM.
   Request* pq = prefill_q.empty() ? nullptr : prefill_q.front();
-  static const bool batch_gemm_env = (std::getenv("INTFER_BATCH_GEMM") != nullptr);
+  // Same default-ON semantics as the chunk path (batch_gemm above):
+  // INTFER_BATCH_GEMM=0 forces per-row. The wide-chunk cap below must see
+  // M-row as active whenever the chunk path uses it, or the 27B/GPU
+  // joint-batch guard silently disarms.
+  static const char* bg_env = std::getenv("INTFER_BATCH_GEMM");
+  static const bool batch_gemm_env =
+      (bg_env == nullptr || std::string(bg_env) != "0");
   static const bool rr_off = (std::getenv("INTFER_PREFILL_RR") != nullptr &&
                               std::string(std::getenv("INTFER_PREFILL_RR")) == "0");
   int P = 0;
@@ -5500,7 +5510,7 @@ static int run_serve(SchedCtx& c,
   std::vector<Request*> live;                 // decoding (into pool)
   std::deque<Request*> prefill_q;             // admitted, filling (into pool)
   std::deque<std::string> pending;            // FIFO of unadmitted lines
-  int chunk_M = 8;
+  int chunk_M = 128;
   if(const char* me = std::getenv("INTFER_PREFILL_CHUNK_M")){
     int v = std::atoi(me); if(v >= 1 && v <= 1024) chunk_M = v;
   }
@@ -7235,13 +7245,15 @@ int main(int argc, char** argv){
   auto t0 = std::chrono::high_resolution_clock::now();
   // Chunked prefill (Phase B): INTFER_PREFILL_CHUNK=1 selects the
   // layer-outer path (one layer residency per chunk instead of per token).
-  // Default (unset) keeps the M=1 step() loop as the parity oracle.
-  // INTFER_PREFILL_CHUNK=0 explicitly forces the old path.
+  // Chunked is the default (2026-09-18: 7x prefill win, streams
+  // bit-identical vs the step loop); INTFER_PREFILL_CHUNK=0 explicitly
+  // forces the old M=1 step() path (parity oracle / bisection).
   static const char* chunk_env = std::getenv("INTFER_PREFILL_CHUNK");
-  bool chunked = (chunk_env != nullptr && std::string(chunk_env) != "0");
-  // Chunk size: tokens per layer-resident pass. Small default keeps the
-  // parity gate tight; raised via INTFER_PREFILL_CHUNK_M for long prompts.
-  int chunk_M = 8;
+  bool chunked = (chunk_env == nullptr || std::string(chunk_env) != "0");
+  // Chunk size: tokens per layer-resident pass. 128 captures ~95% of the
+  // whole-prompt gain (quiet-box chunk128 149.2 vs chunk361 156.6 tok/s)
+  // while keeping serve TTFT granularity; INTFER_PREFILL_CHUNK_M overrides.
+  int chunk_M = 128;
   if(const char* me = std::getenv("INTFER_PREFILL_CHUNK_M")){
     int v = std::atoi(me); if(v >= 1 && v <= 1024) chunk_M = v;
   }
