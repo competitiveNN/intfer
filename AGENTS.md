@@ -77,6 +77,25 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (lm_head INT8 tile alloc fails: ~19GB on one ~12GB B580).
   Per-token profile (0.8B TP=2): submit ~34%, host act/copy ~33%,
   kernel ~20%, wait ~11%; run-to-run variance is +/-10%.
+- XMX verdict (2026-09-18, source-level + xmxmon runbook): **zero DPAS
+  instructions execute in the default path** — decode M=1
+  (gemm_usm_decode1_vec, quant_gemm.cpp:388) and prefill M>1 tiled
+  (quant_gemm.cpp:526) are pure EU/ALU dot-products (dequant-on-the-fly
+  + FP32 FMA); xmxmon would read all-zero XVE_INST_EXECUTED_XMX_* on
+  every workload. Matrix engines 100% idle. Only DPAS-issuing kernels
+  in the tree: quant_gemm_dpas48 (u4/u2/u8, opt-in INTFER_DPAS48=1,
+  default OFF — host GA64 act-quant dominated) and quant_gemm_dpas_s8w
+  (lm_head-only). Per xmxmon docs, mixed-precision DPAS counts under
+  the WIDER operand (W2A8 -> INT8 counter, not INT2). Blocker:
+  metric streamer needs `sudo sysctl -w dev.xe.observation_paranoid=0`
+  (this box: paranoid=1, no sudo — zetMetricStreamerOpen 0x7ffffffe on
+  both GPUs; counters verified present via --list-metrics).
+  Harness: scripts/xmx_profile.sh joins xmxmon capture + internal
+  [GPU profile] buckets, degrades gracefully to buckets-only when the
+  streamer is blocked. Implication: prefill 4000 tok/s needs XMX (EU
+  pipes are the whole prefill story today); decode 40 tok/s needs
+  launch-count/transfer reduction (XMX at M=1 barely helps — shapes
+  are memory-bound).
 - Dead ends (measured, do not retry as-is): device-side act-quant
   (bit-exact probe passed but fused kernel slower: one-WI-per-16N-tile
   layout replicates O(K) quant work nT x), host-private staging of DPAS
