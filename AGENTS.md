@@ -118,6 +118,21 @@ Implement features for maximizing throughput for concurrent requests, starting f
   Decode -n64 unchanged (26.90->26.14, run variance). 27B/GPU joint-batch
   wide-chunk guard synced to default-ON semantics (would have disarmed).
   Gates: cpu parity + http batch PASS, GPU streams identical.
+  Serve re-baseline on new defaults (2026-09-18, contended load ~9):
+  sweep PASS (C=1 2.46 / C=4 3.59 / C=8 2.27 tok/s MT=8; parity held);
+  MT=64 probe 7.66 tok/s over 338 ctoks — same-run pair with MT=8 C=8
+  2.27 (short requests prefill-dominated, batch drains).
+- 40 tok/s recipe (2026-09-18, per-token arithmetic @25.9 tok/s =
+  38.6ms: kernel 9.6 / submit 11.7 / waitblock 9.5 / transfers 10.4ms,
+  194 launches): device-act seams kill transfers (->35 tok/s), batched
+  L0 multi-launch halves submit (->31), both = 22.2ms = 45 tok/s.
+  Engine-invasive; needs quiet box (load<2) + gates. Not attempted
+  under load. (memory: path_to_target_40_4000.md)
+- OpenVINO evaluated, NOT adopted (2026-09-18 spike): OV 2026.3 sees
+  both B580s, but FP16 matmul M=361 2.6ms (~our EU kernel, 1.0 TFLOPS
+  vs 100+ peak — no XMX unlock) and M=1 1.2ms vs our ~50us (20x worse,
+  framework overhead). Native SYCL stays; XMX win must come from our
+  own DPAS kernels with device-resident act-quant.
 - Dead ends (measured, do not retry as-is): device-side act-quant
   (bit-exact probe passed but fused kernel slower: one-WI-per-16N-tile
   layout replicates O(K) quant work nT x), host-private staging of DPAS
