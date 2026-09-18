@@ -96,6 +96,28 @@ Implement features for maximizing throughput for concurrent requests, starting f
   pipes are the whole prefill story today); decode 40 tok/s needs
   launch-count/transfer reduction (XMX at M=1 barely helps — shapes
   are memory-bound).
+- XMX CORRECTION (2026-09-18, empirical via xmxmon after sysctl unlock):
+  the "zero DPAS" verdict above is WRONG for lm_head — lm_head runs
+  INT8 DPAS (quant_gemm_dpas_s8w, main.cpp:1231 use_dpas, default-ON
+  whenever the repack exists, no env gate). Measured: prefill-only
+  361tok capture = 180M INT8 slots; decode-only M=1 = 5.5M INT8 slots
+  (~0.8M/token, consistent with vocab/16 tiles x K/32 ops). Layer GEMMs
+  (99% of launches) remain EU/ALU, XMX idle there — that half stands.
+  DPAS48 re-exam at M=361 (interleaved A/B, contended box, 2/2 rounds):
+  OFF wins prefill 147.8/146.3 vs 132.7/131.0 (~11%) AND decode
+  6.70/6.87 vs 5.13/5.06 (~30%); kernel 318->496ms (one-WI-per-16N-tile
+  replicates O(K) fold work nT x), rebuild 500->964ms (DPAS repack),
+  copy 12.6->48.4ms (host act-quant). Streams bit-identical. Default-OFF
+  stands at ALL shapes (M=1/128/361).
+- Prefill defaults flipped (2026-09-18, a52715f): chunked M-row prefill
+  is now default-ON (chunk_M 8->128, batch_gemm default-ON; opt-outs
+  INTFER_PREFILL_CHUNK=0 / INTFER_BATCH_GEMM=0 reproduce old path
+  bit-identically). Defaults previously ran the token-by-token step loop
+  (20-25 tok/s on 361tok); new defaults 148.2 tok/s (6x, contended box).
+  chunk128 ~= 95% of chunk361 gain (quiet-box 149.2 vs 156.6).
+  Decode -n64 unchanged (26.90->26.14, run variance). 27B/GPU joint-batch
+  wide-chunk guard synced to default-ON semantics (would have disarmed).
+  Gates: cpu parity + http batch PASS, GPU streams identical.
 - Dead ends (measured, do not retry as-is): device-side act-quant
   (bit-exact probe passed but fused kernel slower: one-WI-per-16N-tile
   layout replicates O(K) quant work nT x), host-private staging of DPAS
