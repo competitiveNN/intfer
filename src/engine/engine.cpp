@@ -1302,35 +1302,79 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
   ensure_wave_workspace(M, (uint32_t)nl, K_max, Nl_max);
 
   // Phase 1: per item — convert + write each device's wave slot.
+  // Shared-input fast path: wave items often share one input vector
+  // (gate/up share rin; M-row batch gate/up share X). The FP32->FP16
+  // convert is a pure function of immutable wave inputs, so convert each
+  // DISTINCT (pointer, bytes) input once and reuse the bytes for
+  // duplicates — bit-identical (same input bytes by construction), one
+  // convert + one host-side staging copy saved per duplicate. Slots stay
+  // per-item (kernels read their own slot); only the convert dedupes.
+  // Scope is this call only (local map — no cross-call staleness).
+  std::vector<std::uint16_t> shared_staging;
+  const float* shared_ptr = nullptr;
+  size_t shared_need = 0;
+  bool shared_valid = false;
   for (size_t i = 0; i < nl; ++i) {
     const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
     const std::vector<float>& x = *live[i]->x;
     std::vector<float>& out = *live[i]->out;
     const uint32_t out_elems = M * t.N;
     if (out.size() != out_elems) out.resize(out_elems);
-#ifdef INTFER_PROFILE_GPU
-    auto t_copy0 = std::chrono::high_resolution_clock::now();
-#endif
     const size_t need = (size_t)M * t.K;
-    if (act_staging_.size() != need) act_staging_.resize(need);
-    dashq::float_to_half_batch(x.data(), act_staging_.data(), need);
+    const bool dup = shared_valid && x.data() == shared_ptr && need == shared_need;
+    if (!dup) {
+      // Is this input reused by a later item? Only then is staging worth saving.
+      bool reused = false;
+      for (size_t j = i + 1; j < nl; ++j) {
+        const auto& tj = model_.tensors[(size_t)live[j]->tensor_index];
+        if (live[j]->x->data() == x.data() && (size_t)M * tj.K == need) { reused = true; break; }
+      }
 #ifdef INTFER_PROFILE_GPU
-    {
-      auto t1 = std::chrono::high_resolution_clock::now();
-      g_gpu_profile.total_copy_us += std::chrono::duration<double, std::micro>(t1 - t_copy0).count();
-      g_gpu_profile.copy_count++;
-    }
-    auto t_w0 = std::chrono::high_resolution_clock::now();
+      auto t_copy0 = std::chrono::high_resolution_clock::now();
 #endif
-    for (size_t d = 0; d < devices_.size(); ++d)
-      std::memcpy(wv_[d * wv_W_ + i].act, act_staging_.data(),
-                  (size_t)M * t.K * sizeof(std::uint16_t));
+      if (act_staging_.size() != need) act_staging_.resize(need);
+      dashq::float_to_half_batch(x.data(), act_staging_.data(), need);
+      if (reused) {
+        if (shared_staging.size() != need) shared_staging.resize(need);
+        std::memcpy(shared_staging.data(), act_staging_.data(), need * sizeof(std::uint16_t));
+        shared_ptr = x.data();
+        shared_need = need;
+        shared_valid = true;
+      } else {
+        shared_valid = false;
+      }
 #ifdef INTFER_PROFILE_GPU
-    {
-      auto t1 = std::chrono::high_resolution_clock::now();
-      g_gpu_profile.total_usm_write_us += std::chrono::duration<double, std::micro>(t1 - t_w0).count();
-    }
+      {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        g_gpu_profile.total_copy_us += std::chrono::duration<double, std::micro>(t1 - t_copy0).count();
+        g_gpu_profile.copy_count++;
+      }
+      auto t_w0 = std::chrono::high_resolution_clock::now();
 #endif
+      for (size_t d = 0; d < devices_.size(); ++d)
+        std::memcpy(wv_[d * wv_W_ + i].act, act_staging_.data(),
+                    (size_t)M * t.K * sizeof(std::uint16_t));
+#ifdef INTFER_PROFILE_GPU
+      {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        g_gpu_profile.total_usm_write_us += std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+      }
+#endif
+    } else {
+      // Duplicate: slots get the saved staging bytes (no convert).
+#ifdef INTFER_PROFILE_GPU
+      auto t_w0 = std::chrono::high_resolution_clock::now();
+#endif
+      for (size_t d = 0; d < devices_.size(); ++d)
+        std::memcpy(wv_[d * wv_W_ + i].act, shared_staging.data(),
+                    (size_t)M * t.K * sizeof(std::uint16_t));
+#ifdef INTFER_PROFILE_GPU
+      {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        g_gpu_profile.total_usm_write_us += std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+      }
+#endif
+    }
   }
 
   // Phase 2: per device — submit all items' kernels back-to-back.
