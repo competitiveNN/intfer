@@ -204,7 +204,14 @@ Implement features for maximizing throughput for concurrent requests, starting f
   per wave (scalar + M-row paths; INTFER_NO_WAVE=1 restores sequential).
   a78e99f adds: scalar full-attn k/v wave-2 (q stays sequential — its
   split/norm/rope consumers precede k/v input prep), M-row wave-batch
-  for full-attn k/v + gate/up at all three batch sites. Precision:
+  for full-attn k/v + gate/up at all three batch sites. 8bce85c
+  (2026-09-19) joins q into the k/v wave-3 and qkv into the z/b/a
+  wave-4 in step() decode: both GEMMs' consumers (q split/norm/rope,
+  qkv conv) run after, so the joins are pure regrouping, bit-identical
+  by the wave contract. Saves 1 host wait/layer (24/token). Measured
+  load-immune (TP1 fused -n 6): decode nr 828->432 readback groups,
+  streams identical TP1/TP2/NOWAVE; cpu parity + http batch + gpu-optin
+  PASS. Wall-time A/B deferred (load rose past 2 during gates). Precision:
   wave does NOT reduce kernel-launch count (nk identical 1674/10tok
   both ways — engine still issues one kernel per item); it groups
   convert+submit back-to-back for queue depth and one wait per wave.
