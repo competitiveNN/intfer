@@ -3487,8 +3487,9 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         if(Rq) rot_apply(nr, *Rq, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       need_rows(c_qp, qrows2);
-      backend->run_linear_batch(ln.q, c_x, c_qp, (uint32_t)M);
-      bool packed_gate = (c_qp.size() >= (size_t)M * qrows2);
+      std::vector<float> c_q_in = c_x; // copy of rotated-q inputs
+      // (c_x is reused for k/v staging below). q joins the k/v wave
+      // below (wave-3); packed_gate is resolved after the wave fills c_qp.
       // Per-row q/gate split + q_norm + rope, staged into c_qpart rows.
       need_rows(c_k, kvrows); need_rows(c_v, kvrows);
       static thread_local std::vector<float> c_qpart, c_gate;
@@ -3506,15 +3507,21 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         if(Rv) rot_apply(nr, *Rv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       std::vector<float> c_v_in = c_x; // copy of rotated-v inputs
-      // Wave-batch: k/v independent (q already ran above) — one engine
-      // call, one host round-trip. Bit-identical to two run_linear_batch.
+      // Wave-3 batch: q/k/v are independent (all derive from normed;
+      // q's split/norm/rope consumers run below, after the wave) — one
+      // engine call converts + submits all three back-to-back with one
+      // wait-loop + one readback pass. Bit-identical to run_linear_batch
+      // + 2-wave (same kernels, same buffers, only submit/wait grouping
+      // changes).
       {
-        LinearBackend::LinearWaveBatchItem items[2] = {
+        LinearBackend::LinearWaveBatchItem items[3] = {
+          {ln.q, &c_q_in, &c_qp},
           {ln.k, &c_kv_in, &c_k},
           {ln.v, &c_v_in, &c_v},
         };
-        backend->run_linear_wave_batch(items, 2, (uint32_t)M);
+        backend->run_linear_wave_batch(items, 3, (uint32_t)M);
       }
+      bool packed_gate = (c_qp.size() >= (size_t)M * qrows2);
       // Per-row q split / norms / ropes + KV appends (token order).
       // NOTE: q/k/v GEMM outputs are FP16-quantized on device (to_half_bits
       // per element) while the M=1 path goes through the same device
@@ -3694,7 +3701,9 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         if(Rqkv) rot_apply(nr, *Rqkv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       need_rows(c_mqkv, cfg.conv_dim);
-      backend->run_linear_batch(ln.qkv, c_x, c_mqkv, (uint32_t)M);
+      std::vector<float> c_qkv_in = c_x; // copy of rotated-qkv inputs
+      // (c_x is reused for z/b/a staging below). qkv joins the z/b/a
+      // wave below (wave-4).
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
         float* xr = &c_x[(size_t)m*Hdim];
@@ -3716,16 +3725,20 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       need_rows(c_z, zvw);
       need_rows(c_b, cfg.n_v_heads);
       need_rows(c_a, cfg.n_v_heads);
-      // Wave: z/b/a are independent M-row GEMMs — one engine call converts
-      // + submits all three back-to-back and waits once. Bit-identical to
-      // three sequential run_linear_batch calls.
+      // Wave-4: qkv/z/b/a are independent M-row GEMMs (all derive from
+      // normed; mqkv's conv consumer runs below, after the wave) — one
+      // engine call converts + submits all four back-to-back with one
+      // wait-loop + one readback pass. Bit-identical to run_linear_batch
+      // + 3-wave (same kernels, same buffers, only submit/wait grouping
+      // changes).
       {
-        LinearBackend::LinearWaveBatchItem items[3] = {
+        LinearBackend::LinearWaveBatchItem items[4] = {
+          {ln.qkv, &c_qkv_in, &c_mqkv},
           {ln.z, &c_z_in, &c_z},
           {ln.b, &c_b_in, &c_b},
           {ln.a, &c_x, &c_a},
         };
-        backend->run_linear_wave_batch(items, 3, (uint32_t)M);
+        backend->run_linear_wave_batch(items, 4, (uint32_t)M);
       }
       need_rows(c_ncore, zvw);
       // Per-row conv + SSM recurrence in token order (stateful).
@@ -4134,8 +4147,9 @@ static std::vector<StepOut> step_batch(
         if(Rq) rot_apply(nr, *Rq, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       need_rows(c_qp, qrows2);
-      backend->run_linear_batch(ln.q, c_x, c_qp, (uint32_t)M);
-      bool packed_gate = (c_qp.size() >= (size_t)M * qrows2);
+      std::vector<float> b_q_in = c_x; // copy of rotated-q inputs
+      // (c_x is reused for k/v staging below). q joins the k/v wave
+      // below (wave-3); packed_gate is resolved after the wave fills c_qp.
       need_rows(c_k, kvrows); need_rows(c_v, kvrows);
       static thread_local std::vector<float> b_qpart, b_gate;
       need_rows(b_qpart, qrows); need_rows(b_gate, qrows);
@@ -4151,8 +4165,19 @@ static std::vector<StepOut> step_batch(
         if(Rv) rot_apply(nr, *Rv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       std::vector<float> c_v_in = c_x;
-      backend->run_linear_batch(ln.k, c_kv_in, c_k, (uint32_t)M);
-      backend->run_linear_batch(ln.v, c_v_in, c_v, (uint32_t)M);
+      // Wave-3 batch: q/k/v are independent (all derive from normed;
+      // q's split/norm/rope consumers run below, after the wave) — one
+      // engine call, one host round-trip. Bit-identical to three
+      // sequential run_linear_batch calls.
+      {
+        LinearBackend::LinearWaveBatchItem items[3] = {
+          {ln.q, &b_q_in, &c_qp},
+          {ln.k, &c_kv_in, &c_k},
+          {ln.v, &c_v_in, &c_v},
+        };
+        backend->run_linear_wave_batch(items, 3, (uint32_t)M);
+      }
+      bool packed_gate = (c_qp.size() >= (size_t)M * qrows2);
       for(int m=0; m<M; m++){
         int pos = pos_of[(size_t)m];
         Layer& ly = *lys[(size_t)m];
@@ -4315,7 +4340,9 @@ static std::vector<StepOut> step_batch(
         if(Rqkv) rot_apply(nr, *Rqkv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       need_rows(b_mqkv, cfg.conv_dim);
-      backend->run_linear_batch(ln.qkv, c_x, b_mqkv, (uint32_t)M);
+      std::vector<float> b_qkv_in = c_x; // copy of rotated-qkv inputs
+      // (c_x is reused for z/b/a staging below). qkv joins the z/b/a
+      // wave below (wave-4).
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
         float* xr = &c_x[(size_t)m*Hdim];
@@ -4337,9 +4364,19 @@ static std::vector<StepOut> step_batch(
       need_rows(b_z, zvw);
       need_rows(b_b, cfg.n_v_heads);
       need_rows(b_a, cfg.n_v_heads);
-      backend->run_linear_batch(ln.z, c_z_in, b_z, (uint32_t)M);
-      backend->run_linear_batch(ln.b, c_b_in, b_b, (uint32_t)M);
-      backend->run_linear_batch(ln.a, c_x, b_a, (uint32_t)M);
+      // Wave-4: qkv/z/b/a are independent M-row GEMMs (all derive from
+      // normed; mqkv's conv consumer runs below, after the wave) — one
+      // engine call, one host round-trip. Bit-identical to four
+      // sequential run_linear_batch calls.
+      {
+        LinearBackend::LinearWaveBatchItem items[4] = {
+          {ln.qkv, &b_qkv_in, &b_mqkv},
+          {ln.z, &c_z_in, &b_z},
+          {ln.b, &c_b_in, &b_b},
+          {ln.a, &c_x, &b_a},
+        };
+        backend->run_linear_wave_batch(items, 4, (uint32_t)M);
+      }
       need_rows(b_ncore, zvw);
       std::vector<float> conv_out(cfg.conv_dim);
       std::vector<float> kv_mem(cfg.v_head_dim), delta(cfg.v_head_dim);

@@ -212,7 +212,16 @@ Implement features for maximizing throughput for concurrent requests, starting f
   count (nw 828 = 828 — wait_count increments per kernel event, and
   grouping changes no event count). What they halve is host round-trip
   phases: one wait-loop + one readback pass per wave instead of per
-  GEMM (decode nr 828->432). Each saved phase removes a blocking
+  GEMM (decode nr 828->432). M-row joins (2026-09-19, this session):
+  the same q/qkv joins applied to the M-row paths — prefill-chunk
+  full-attn q+k/v wave-3 and qkv+z/b/a wave-4, plus step_batch (serve)
+  full-attn wave-3 and LA wave-4 (4 sites; q/qkv inputs staged into
+  c_q_in/c_qkv_in/b_q_in/b_qkv_in copies since c_x is reused for k/v/z/b/a
+  staging). INTFER_NO_WAVE=1 still restores sequential at all sites.
+  Verified load-immune: prefill nr 138->72 (25-tok prompt), decode
+  streams identical TP1/TP2/NOWAVE (279 6511 314 279 ...); cpu parity +
+  http batch + gpu-optin PASS. Wall-time A/B deferred (box load >2).
+  Each saved phase removes a blocking
   event-wait loop + host readback-loop setup (~24/layer-pass pairs per
   token). Measured load-immune (TP1 fused -n 6),
   streams identical TP1/TP2/NOWAVE; cpu parity + http batch + gpu-optin
