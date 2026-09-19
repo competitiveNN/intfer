@@ -374,6 +374,25 @@ Implement features for maximizing throughput for concurrent requests, starting f
   25.2us), so no L0 scaffolding was built — the multi-submit-single-wait
   chain IS the achievable amortization on in-order UR queues, and the
   devact seam is the prep a future batched launcher needs.
+- L4 serve M==1 fast path IMPLEMENTED, default-off (2026-09-19, same
+  INTFER_L4_FUSE=1 flag): single-row step_batch serve batches route each
+  LA layer through the certified gpu_la_out_fused (conv loop advances
+  conv_state first, matching scalar order; success skips the ssm_rows +
+  host-norm + M-row la_out sections for that layer; any false falls
+  through to the standard path with eligibility cleared for the layer).
+  M>1 deliberately NOT fused: run_linear_batch(la_out) is already one
+  M-row GEMM (single submit+wait), so a thin norm offload would only trade
+  host convert for M norm submits — wash or loss; the M>1 win needs
+  device-resident cores (same precondition as the L4 verdict above).
+  Gates (all PASS, load-insensitive): serve C=1 L4-vs-base byte-identical
+  ([l4] fires on the serve path, BASE counter 0), TP2 flag/no-flag
+  identical (silent no-op), SSM_GPU x L4 4-way CLI identical, SSM_GPU+L4
+  serve stream identical to base (shared SsmDev residency consistent when
+  mixing), cpu parity + http batch (with L4 ON: single/batch/SSE/serial
+  all PASS, oracle Paris) + gpu-optin 10/10. Wall-time A/B NOT run (box
+  load 5.58 — quiet rule load1<2): run scripts/bench_quiet_l4_ab.sh on a
+  quiet box before any perf claim (new script; covers CLI decode TP1 -n64
+  + chunk361 no-op guard).
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +

@@ -4577,6 +4577,7 @@ static std::vector<StepOut> step_batch(
       const float* dt_bias= ln.dt_bias;
       static thread_local std::vector<float> b_mqkv, b_z, b_b, b_a;
       static thread_local std::vector<float> b_ncore;
+      static thread_local std::vector<float> b_l4_o;  // L4 M==1 fused o_la row
       need_rows(c_normed, Hdim);
       for(int m=0; m<M; m++)
         rmsnorm(&H[(size_t)m*Hdim], ly0.in_ln, &c_normed[(size_t)m*Hdim], Hdim);
@@ -4630,6 +4631,28 @@ static std::vector<StepOut> step_batch(
         backend->run_linear_wave_batch(items, 4, (uint32_t)M);
       }
       need_rows(b_ncore, zvw);
+      // ---- L4 la_out fusion M==1 fast path (INTFER_L4_FUSE=1) ----
+      // A single-row serve batch takes the certified scalar fused path
+      // (gpu_la_out_fused: device SSM -> fused norm+silu(z)+convert ->
+      // la_out GEMM, one wait + one D2H) instead of ssm_rows + host norm
+      // + M-row la_out below. M>1 keeps the batched path: run_linear_batch
+      // is already one M-row GEMM (single submit+wait), so a thin M-row
+      // norm offload would only trade host convert for M norm submits —
+      // judged not worth it; the win needs device-resident cores (same
+      // precondition as the AGENTS.md L4 verdict). False keeps the host
+      // path (TP>1, DPAS48 la_out, bad shapes — all inside the callee).
+      bool l4_m1_done = false;
+      bool l4_m1_elig = false;
+      GpuBackend* gpu_be_l4m = nullptr;
+      {
+        static const bool l4_env = (std::getenv("INTFER_L4_FUSE") != nullptr);
+        if(l4_env && M == 1) {
+#ifdef INTFER_HAS_GPU_BACKEND
+          gpu_be_l4m = dynamic_cast<GpuBackend*>(backend);
+          l4_m1_elig = (gpu_be_l4m && gpu_be_l4m->eng);
+#endif
+        }
+      }
       std::vector<float> conv_out(cfg.conv_dim);
       std::vector<float> kv_mem(cfg.v_head_dim), delta(cfg.v_head_dim);
       std::vector<float> qn(cfg.k_head_dim), kn(cfg.k_head_dim);
@@ -4656,7 +4679,7 @@ static std::vector<StepOut> step_batch(
         }
       }
 #endif
-      if(b_ssm_on) {
+      if(!l4_m1_done && b_ssm_on) {
         b_ssm_rows.assign(M, SsmRow());
         b_ssm_conv.assign((size_t)M * cfg.conv_dim, 0.f);
       }
@@ -4673,6 +4696,26 @@ static std::vector<StepOut> step_batch(
           ly.conv_state[c*3+0]=ly.conv_state[c*3+1];
           ly.conv_state[c*3+1]=ly.conv_state[c*3+2];
           ly.conv_state[c*3+2]=mqkvr[c];
+        }
+        // L4 M==1 attempt (conv_state already advanced above, matching the
+        // scalar path order). Success skips the stash + host/SSM sections
+        // below for this layer; failure falls through to the standard path.
+        if(l4_m1_elig && !l4_m1_done) {
+#ifdef INTFER_HAS_GPU_BACKEND
+          if(b_l4_o.size() != (size_t)Hdim) b_l4_o.assign(Hdim, 0.f);
+          float* l4q = conv_out.data();
+          float* l4k = conv_out.data() + cfg.k_head_dim * cfg.n_k_heads;
+          float* l4v = l4k + cfg.k_head_dim * cfg.n_k_heads;
+          if(gpu_be_l4m && gpu_la_out_fused(*gpu_be_l4m, items[0].req,
+              &lys[0]->ssm_state, L, l4q, l4k, l4v,
+              &b_b[0], &b_a[0], &b_z[0],
+              ln.ssm_norm_w, dt_bias, A_log,
+              gpu_be_l4m->ti_of(ln.la_out), b_l4_o)) {
+            l4_m1_done = true;
+            continue;
+          }
+#endif
+          l4_m1_elig = false;
         }
         if(b_ssm_on) {
           memcpy(&b_ssm_conv[(size_t)m*cfg.conv_dim], conv_out.data(),
@@ -4721,7 +4764,7 @@ static std::vector<StepOut> step_batch(
           for(int i=0;i<cfg.v_head_dim;i++) oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
         }
       }
-      if(b_ssm_on) {
+      if(!l4_m1_done && b_ssm_on) {
         // Device step over all rows (per-row keys; runs partition inside).
         // Core rows land directly in b_ncore; the norm below reads them.
         for(int m=0; m<M; m++){
@@ -4814,7 +4857,11 @@ static std::vector<StepOut> step_batch(
         }
       }
       need_rows(c_y, Hdim);
-      backend->run_linear_batch(ln.la_out, b_ncore, c_y, (uint32_t)M);
+      if(l4_m1_done) {
+        memcpy(&c_y[0], b_l4_o.data(), (size_t)Hdim * sizeof(float));
+      } else {
+        backend->run_linear_batch(ln.la_out, b_ncore, c_y, (uint32_t)M);
+      }
       const Rotation* Ro_la = backend->rot_for(ln.la_out);
       need_rows(c_mg, cfg.inter); need_rows(c_mu, cfg.inter);
       static thread_local std::vector<float> b_rn2_la, b_rin_la, b_md_la;
