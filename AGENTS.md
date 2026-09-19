@@ -494,7 +494,10 @@ Implement features for maximizing throughput for concurrent requests, starting f
   arbitrates); stream-identity gates are load-insensitive (build+gate now,
   wall-time later). Kill switch: INTFER_L5_FRONT=1 (default OFF); any false
   keeps the L4/host path. REMAINING: conv_state mirror sync points
-  (evict/resync/rollback), step() hook, gates.
+  (evict/resync/rollback), step() hook, gates. UPDATE 2026-09-19: SsmDev
+  resident conv fields (conv/conv_cap/conv_dirty) + free sites in dtor +
+  FIFO-evict landed (cpu parity + gpu-optin PASS); alloc/upload/sync/step
+  hook still pending.
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +

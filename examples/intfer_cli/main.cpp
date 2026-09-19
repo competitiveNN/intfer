@@ -1903,6 +1903,9 @@ struct GpuBackend : public LinearBackend {
     float* in = nullptr;      // packed staging H2D [Mcap*(2*nk*kd+nv*vd+2*nv)]
     float* core = nullptr;    // staging out [Mcap*nv*vd]
     float* ptrs = nullptr;    // device row-pointer array [7*Mcap] (as floats bits)
+    float* conv = nullptr;    // L5: resident conv history [conv_dim*3]
+    size_t conv_cap = 0;      // L5: conv floats allocated
+    bool conv_dirty = false;  // L5: resident newer than ly.conv_state
     uint32_t nv = 0, nk = 0, kd = 0, vd = 0, Mcap = 0;
     bool dirty = false;       // resident newer than host mirror
     bool ok = false;
@@ -1961,6 +1964,7 @@ struct GpuBackend : public LinearBackend {
       if(sd.in) sycl::free(sd.in, q);
       if(sd.core) sycl::free(sd.core, q);
       if(sd.ptrs) sycl::free(sd.ptrs, q);
+      if(sd.conv) sycl::free(sd.conv, q);
       sd = SsmDev();
     }
     ssm_dev_.clear();
@@ -2028,6 +2032,7 @@ static GpuBackend::SsmDev* gpu_ssm_resolve(GpuBackend& be, sycl::queue& q,
         if(esd.in) sycl::free(esd.in, q);
         if(esd.core) sycl::free(esd.core, q);
         if(esd.ptrs) sycl::free(esd.ptrs, q);
+        if(esd.conv) sycl::free(esd.conv, q);
         be.ssm_dev_.erase(eit);
         be.ssm_dev_mirror_.erase(ek);
       }
