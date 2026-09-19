@@ -24,6 +24,14 @@
 #include <sycl/ext/intel/esimd.hpp>
 
 namespace intfer::gemm {
+
+#ifdef INTFER_PROFILE_GPU
+// Weak default: targets linking intfer_gemm without intfer_engine (e.g.
+// gemm_demo) still link. intfer_engine provides the strong definition that
+// counts into g_gpu_profile; the linker prefers it whenever both are linked.
+__attribute__((weak)) void profile_note_launch() {}
+#endif
+
 namespace {
 
 inline float lf(sycl::half h) { return static_cast<float>(h); }
@@ -1296,6 +1304,49 @@ sycl::event ssm_norm_silu_to_half(sycl::queue& q, const SsmNormParams& p,
           std::uint16_t* oo = act + (size_t)hh * vd;
           // Same order as the host LA norm loop: sum squares, then
           // elementwise normalize * norm_w * silu(z).
+          float v = 0.0f;
+          for (std::uint32_t i = 0; i < vd; ++i) v += xx[i] * xx[i];
+          const float inv = 1.0f / sycl::sqrt(v / (float)vd + eps);
+          for (std::uint32_t i = 0; i < vd; ++i) {
+            const float s = zg[i] / (1.0f + sycl::exp(-zg[i]));
+            oo[i] = dev_float_to_half((xx[i] * inv) * w[i] * s);
+          }
+        });
+  });
+}
+
+sycl::event ssm_norm_silu_to_half_m(sycl::queue& q, const SsmNormMParams& p,
+                                    const sycl::event& dep) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
+  const float* core = p.core_fp32;
+  const float* z = p.z_fp32;
+  const float* w = p.norm_w_fp32;
+  std::uint16_t* act = p.act_fp16;
+  const std::uint32_t M = p.M, n_v = p.n_v, vd = p.vd;
+  const float eps = p.rms_eps;
+  if (!core || !z || !w || !act || M == 0 || n_v == 0 || vd == 0)
+    return sycl::event{};
+  const std::uint32_t nWG = 32;
+  const std::uint32_t n_blocks = M * n_v;
+  const std::uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
+  const size_t zvw = (size_t)n_v * vd;
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(dep);
+    h.parallel_for<class ssm_norm_silu_to_half_m_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) {
+          const std::uint32_t b = it.get_global_id(0);
+          if (b >= n_blocks) return;
+          const std::uint32_t hh = b % n_v;
+          const std::uint32_t m = b / n_v;
+          // Same order as the host LA norm loop: sum squares, then
+          // elementwise normalize * norm_w * silu(z). Row m's slice of
+          // the contiguous [M*zvw] core/z/act buffers.
+          const float* xx = core + (size_t)m * zvw + (size_t)hh * vd;
+          const float* zg = z + (size_t)m * zvw + (size_t)hh * vd;
+          std::uint16_t* oo = act + (size_t)m * zvw + (size_t)hh * vd;
           float v = 0.0f;
           for (std::uint32_t i = 0; i < vd; ++i) v += xx[i] * xx[i];
           const float inv = 1.0f / sycl::sqrt(v / (float)vd + eps);

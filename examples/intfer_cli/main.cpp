@@ -941,6 +941,20 @@ static bool gpu_la_out_fused(GpuBackend& be, const Request* req,
                              const float* ssm_norm_w, const float* dt_bias,
                              const float* A_log, int la_out_ti,
                              std::vector<float>& o_la);
+// L4 la_out fusion, M-row serve variant (INTFER_L4_FUSE=1, TP=1 only):
+// same chain as gpu_la_out_fused but over M rows with distinct (req,layer)
+// states in one ssm_forward launch + one M-row norm kernel + one M-row
+// devact la_out GEMM. rows[m] carries the conv-derived q/k/v + b/a rows
+// (core_out unused — cores stay device-resident in L4 staging); z_all is
+// the contiguous [M*n_v*vd] z-gate block; c_y ([M*H]) receives the GEMM
+// output rows. Rows sharing one state (same-request prefill runs) are
+// rejected (ssm_forward needs distinct states) so the caller keeps the
+// host/ssm_rows path. Returns false when unavailable.
+static bool gpu_la_out_fused_batch(GpuBackend& be, const SsmRow* rows,
+                                   uint32_t M, int L, const float* z_all,
+                                   const float* ssm_norm_w,
+                                   const float* dt_bias, const float* A_log,
+                                   int la_out_ti, std::vector<float>& c_y);
 #endif
 
 // ----------------------------------------------------------------------------
@@ -1909,17 +1923,29 @@ struct GpuBackend : public LinearBackend {
     return gpu_ssm_rows(*this, rows, M, L, dt_bias, A_log, sync_mirror);
   }
   void ssm_resync_all() { gpu_ssm_resync_all(*this); }
-  // L4 la_out fusion (INTFER_L4_FUSE=1, TP=1 scalar decode): persistent
+  // L4 la_out fusion (INTFER_L4_FUSE=1, TP=1 decode): persistent
   // device staging on device 0 — z row + norm weights in FP32, fused
   // norm+silu(z) FP16 act out. Grow-only; sized to the max zvw/vd seen.
-  // Freed in the dtor below alongside the SSM map. The SSM core buffer
-  // itself is reused from the SsmDev entry (no extra alloc).
+  // Freed in the dtor below alongside the SSM map. The M==1 path reuses
+  // the SsmDev entry's core buffer (no extra alloc); the M>1 batch keeps
+  // a contiguous M-row core block + gathered pointer table below.
   float* l4_z_dev_ = nullptr;        // [l4_z_cap_] FP32 z row staging
   size_t l4_z_cap_ = 0;
   float* l4_nw_dev_ = nullptr;       // [l4_nw_cap_] FP32 norm weights
   size_t l4_nw_cap_ = 0;
   std::uint16_t* l4_act_dev_ = nullptr;  // [l4_act_cap_] FP16 fused act
   size_t l4_act_cap_ = 0;
+  // L4 M-row batch staging (gpu_la_out_fused_batch, TP=1 only): contiguous
+  // M-row core block (the per-row SsmDev cores are scattered, but the M-row
+  // norm kernel + devact GEMM need contiguous rows) + one gathered
+  // device-pointer table (7 segments x M: qn/kn/v/g/b/S/core). Grow-only
+  // in elements (rows); the row width (zvw) is model-fixed after first use
+  // (a width change fails the batch and keeps the host path).
+  float* l4_core_dev_ = nullptr;     // [l4_core_cap_*l4_core_zvw_] FP32 cores
+  size_t l4_core_cap_ = 0;           // rows
+  size_t l4_core_zvw_ = 0;           // row width at alloc time
+  void** l4_ptrs_dev_ = nullptr;     // [l4_ptrs_cap_*7] row-pointer slots
+  size_t l4_ptrs_cap_ = 0;           // rows
   int ti_of(const std::string& name) {
     if(!eng) return -1;
     build_index();
@@ -1944,6 +1970,9 @@ struct GpuBackend : public LinearBackend {
     if(l4_nw_dev_) { sycl::free(l4_nw_dev_, q); l4_nw_dev_ = nullptr; }
     if(l4_act_dev_) { sycl::free(l4_act_dev_, q); l4_act_dev_ = nullptr; }
     l4_z_cap_ = l4_nw_cap_ = l4_act_cap_ = 0;
+    if(l4_core_dev_) { sycl::free(l4_core_dev_, q); l4_core_dev_ = nullptr; }
+    if(l4_ptrs_dev_) { sycl::free(l4_ptrs_dev_, q); l4_ptrs_dev_ = nullptr; }
+    l4_core_cap_ = l4_core_zvw_ = l4_ptrs_cap_ = 0;
   }
   const Rotation* rot_for(const std::string& name) override {
     if(!eng) return nullptr;
@@ -2414,6 +2443,457 @@ static bool gpu_la_out_fused(GpuBackend& be, const Request* req,
   } catch (...) {
     return false;
   }
+}
+
+// L4 la_out fusion, M-row serve variant. Chains one cross-key ssm_forward
+// launch (M distinct (req,layer) states, gathered pointer table) through
+// the M-row fused norm+silu(z)+FP16-convert kernel straight into the M-row
+// la_out GEMM via the Engine device-act seam — one host wait (inside the
+// seam) + no per-row D2H/H2D of cores or normed acts. Host work per layer:
+// M x O(kd) q/k prep (same as gpu_ssm_rows) + 2 small H2D (packed inputs
+// are per-key in SsmDev staging; z block + norm weights in L4 staging).
+// Costs: 1 SSM submit + 1 norm submit + the seam GEMM submit per LA layer
+// (vs ssm_rows solos + host norm + host convert + H2D + la_out-wait).
+// Bit-contract: SSM math is the certified ssm_forward kernel (same as
+// gpu_ssm_rows solo section, same element order); the M-row norm loop
+// matches the host LA norm loop per row (silu via sycl::exp ~1ulp, same
+// standing as the M1 fused path); the FP16 convert is RNE bit-identical
+// to dashq::float_to_half. The L4-vs-base stream A/B arbitrates. False
+// keeps the host/ssm_rows path (TP>1, DPAS48 la_out, bad shapes, shared
+// states, missing ti).
+static bool gpu_la_out_fused_batch(GpuBackend& be, const SsmRow* rows,
+                                   uint32_t M, int L, const float* z_all,
+                                   const float* ssm_norm_w,
+                                   const float* dt_bias, const float* A_log,
+                                   int la_out_ti, std::vector<float>& c_y) {
+  if(!be.eng || !rows || M == 0 || !z_all || !ssm_norm_w || !dt_bias ||
+     !A_log || la_out_ti < 0)
+    return false;
+  const uint32_t nv = (uint32_t)cfg.n_v_heads;
+  const uint32_t nk = (uint32_t)cfg.n_k_heads;
+  const uint32_t kd = (uint32_t)cfg.k_head_dim;
+  const uint32_t vd = (uint32_t)cfg.v_head_dim;
+  if(nv == 0 || nk == 0 || kd == 0 || vd == 0) return false;
+  const size_t sdim = (size_t)nv * kd * vd;
+  const size_t zvw = (size_t)nv * vd;
+  const uint32_t H = (uint32_t)cfg.H;
+  if(H == 0 || c_y.size() != (size_t)M * H) return false;
+  static const bool l4_why =
+      (std::getenv("INTFER_L4_WHY") != nullptr);
+#define L4_DECLINE(code)                                          \
+  do {                                                            \
+    if (l4_why)                                                   \
+      std::fprintf(stderr, "[l4-why] batch M=%u L=%d decline %s\n", \
+                   M, L, code);                                   \
+    return false;                                                 \
+  } while (0)
+  // TP=1 only (device acts are not cross-visible; same rule as the M1
+  // path and run_mlp_fused). The devact seam re-checks; fail fast here
+  // to avoid touching device state on TP>1.
+  if(be.num_devices_ != 1) L4_DECLINE("tp");
+  // Distinct states only: ssm_forward rows must not share one state
+  // (shared-state rows need ssm_forward_chain, which writes contiguous
+  // cores but updates one state — incompatible with the fused batch).
+  for(uint32_t m = 0; m < M; ++m) {
+    const SsmRow& r = rows[m];
+    if(!r.req || !r.mirror || !r.query || !r.key || !r.value ||
+       !r.b_row || !r.a_row) L4_DECLINE("null-row");
+    if(r.mirror->size() != sdim) L4_DECLINE("mirror-size");  // keep host path
+  }
+  for(uint32_t a = 0; a < M; ++a)
+    for(uint32_t b = a + 1; b < M; ++b)
+      if(rows[a].req == rows[b].req && rows[a].mirror == rows[b].mirror)
+        L4_DECLINE("shared-state");
+  sycl::queue& q = be.eng->device_queue(0);
+  try {
+    // 1) Resolve the resident state entry per row (shared map protocol
+    // with gpu_ssm_rows: same eviction writeback + dirty tracking).
+    // Staging sized to 1 row each (solo pattern); the batch pointer
+    // table below gathers across keys.
+    static thread_local std::vector<GpuBackend::SsmDev*> sds;
+    sds.clear();
+    const size_t row_in = 2*(size_t)nk*kd + zvw + 2*nv;
+    for(uint32_t m = 0; m < M; ++m) {
+      bool fresh = false;
+      GpuBackend::SsmDev* sd = gpu_ssm_resolve(be, q, rows[m].req,
+          rows[m].mirror, L, nv, nk, kd, vd, sdim, zvw, /*need=*/1, fresh);
+      if(!sd) L4_DECLINE("resolve-null");
+      if(fresh && sd->Mcap < 1) {
+        sd->in = static_cast<float*>(sycl::malloc_device(row_in * sizeof(float),
+              q.get_device(), q.get_context()));
+        sd->core = static_cast<float*>(sycl::malloc_device(zvw * sizeof(float),
+              q.get_device(), q.get_context()));
+        sd->ptrs = static_cast<float*>(sycl::malloc_device(7 * sizeof(void*),
+              q.get_device(), q.get_context()));
+        if(!sd->in || !sd->core || !sd->ptrs) {
+          if(sd->in) sycl::free(sd->in, q);
+          if(sd->core) sycl::free(sd->core, q);
+          if(sd->ptrs) sycl::free(sd->ptrs, q);
+          *sd = GpuBackend::SsmDev();
+          auto key = std::make_pair(rows[m].req, L);
+          be.ssm_dev_.erase(key);
+          be.ssm_dev_mirror_.erase(key);
+          return false;
+        }
+        sd->Mcap = 1;
+      }
+      sds.push_back(sd);
+    }
+    // 2) Host-side O(kd) prep per row (identical to the gpu_ssm_rows solo
+    // section): L2-norm q/k rows, scale q, form g logits; packed layout
+    // [qn(nk*kd) | kn(nk*kd) | v(nv*vd) | g(nv) | b(nv)] per key staging.
+    const float qscale = 1.0f / sqrtf((float)kd);
+    static thread_local std::vector<float> hin;
+    // Per-row offsets: q.memcpy only enqueues on the in-order queue, so a
+    // shared single-row scratch would be overwritten by later rows before
+    // earlier copies execute (all rows would read the last row's prep).
+    // Same pattern as gpu_ssm_rows (dst = &hin[i*row_in]).
+    if(hin.size() < (size_t)M * row_in) hin.assign((size_t)M * row_in, 0.f);
+    for(uint32_t m = 0; m < M; ++m) {
+      float* dst = &hin[(size_t)m * row_in];
+      float* hqn = dst;
+      float* hkn = dst + (size_t)nk * kd;
+      float* hv = hkn + (size_t)nk * kd;
+      float* hg = hv + zvw;
+      float* hb = hg + nv;
+      for(uint32_t kh = 0; kh < nk; ++kh) {
+        l2norm(&rows[m].query[(size_t)kh * kd], &hqn[(size_t)kh * kd], (int)kd);
+        l2norm(&rows[m].key[(size_t)kh * kd], &hkn[(size_t)kh * kd], (int)kd);
+        for(uint32_t d = 0; d < kd; ++d) hqn[(size_t)kh * kd + d] *= qscale;
+      }
+      memcpy(hv, rows[m].value, zvw * sizeof(float));
+      memcpy(hb, rows[m].b_row, (size_t)nv * sizeof(float));
+      for(uint32_t hh = 0; hh < nv; ++hh) {
+        float sp = log1pf(expf(rows[m].a_row[hh] + dt_bias[hh]));
+        hg[hh] = -expf(A_log[hh]) * sp;
+      }
+      q.memcpy(sds[m]->in, dst, row_in * sizeof(float));
+    }
+    // 3) Grow L4 batch staging: M-row z block + norm weights in FP32,
+    // M-row contiguous core block + gathered pointer table, M-row FP16
+    // act block out. Grow-only in rows; a zvw change fails the batch
+    // (model-fixed in practice — first use sizes it).
+    auto ensure_dev = [&](float*& ptr, size_t& cap, size_t need) -> bool {
+      if(cap >= need && ptr) return true;
+      float* n = static_cast<float*>(sycl::malloc_device(need * sizeof(float),
+            q.get_device(), q.get_context()));
+      if(!n) return false;
+      if(ptr) sycl::free(ptr, q);
+      ptr = n; cap = need;
+      return true;
+    };
+    if(!ensure_dev(be.l4_z_dev_, be.l4_z_cap_, (size_t)M * zvw)) return false;
+    if(!ensure_dev(be.l4_nw_dev_, be.l4_nw_cap_, vd)) return false;
+    if(be.l4_core_zvw_ != zvw) {
+      // Width change (or first use): realloc the core block + pointer
+      // table view. A live mismatch fails safe to the host path.
+      if(be.l4_core_zvw_ != 0) return false;
+      be.l4_core_zvw_ = zvw;
+    }
+    if(!ensure_dev(be.l4_core_dev_, be.l4_core_cap_, (size_t)M * zvw))
+      return false;
+    if(be.l4_ptrs_cap_ < M || !be.l4_ptrs_dev_) {
+      void** n = static_cast<void**>(sycl::malloc_device(
+            (size_t)M * 7 * sizeof(void*),
+            q.get_device(), q.get_context()));
+      if(!n) return false;
+      if(be.l4_ptrs_dev_) sycl::free(be.l4_ptrs_dev_, q);
+      be.l4_ptrs_dev_ = n; be.l4_ptrs_cap_ = M;
+    }
+    if(be.l4_act_cap_ < (size_t)M * zvw || !be.l4_act_dev_) {
+      std::uint16_t* n = static_cast<std::uint16_t*>(
+          sycl::malloc_device((size_t)M * zvw * sizeof(std::uint16_t),
+            q.get_device(), q.get_context()));
+      if(!n) return false;
+      if(be.l4_act_dev_) sycl::free(be.l4_act_dev_, q);
+      be.l4_act_dev_ = n; be.l4_act_cap_ = (size_t)M * zvw;
+    }
+    // 4) Gather the cross-key pointer table on the host (7 segments of M
+    // pointers: qn/kn/v/g/b into per-key staging, S state, contiguous
+    // core block slices), one H2D, then chain: ssm_forward -> M-row norm
+    // kernel -> devact la_out GEMM. In-order queue observes submission
+    // order; explicit deps keep out-of-order queues correct.
+    q.memcpy(be.l4_z_dev_, z_all, (size_t)M * zvw * sizeof(float));
+    q.memcpy(be.l4_nw_dev_, ssm_norm_w, (size_t)vd * sizeof(float));
+    static thread_local std::vector<void*> hptrs;
+    if(hptrs.size() < (size_t)M * 7) hptrs.assign((size_t)M * 7, nullptr);
+    // Segmented layout (7 segments of M pointers): segment s holds all
+    // rows' s-th pointer, so dqn[m] etc. index the m-th row. Matches the
+    // kernel's qn_rows[m] / s_rows[m] / core_rows[m] row indexing.
+    for(uint32_t m = 0; m < M; ++m) {
+      float* base = sds[m]->in;
+      hptrs[(size_t)0 * M + m] = base;                                // qn
+      hptrs[(size_t)1 * M + m] = base + (size_t)nk * kd;              // kn
+      hptrs[(size_t)2 * M + m] = base + 2 * (size_t)nk * kd;          // v
+      hptrs[(size_t)3 * M + m] = base + 2 * (size_t)nk * kd + zvw;    // g
+      hptrs[(size_t)4 * M + m] = base + 2 * (size_t)nk * kd + zvw + nv; // b
+      hptrs[(size_t)5 * M + m] = sds[m]->S;                           // state
+      hptrs[(size_t)6 * M + m] = be.l4_core_dev_ + (size_t)m * zvw;   // core
+    }
+    q.memcpy(be.l4_ptrs_dev_, hptrs.data(), (size_t)M * 7 * sizeof(void*));
+    const float* const* dqn =
+        reinterpret_cast<const float* const*>(be.l4_ptrs_dev_) + 0 * M;
+    const float* const* dkn =
+        reinterpret_cast<const float* const*>(be.l4_ptrs_dev_) + 1 * M;
+    const float* const* dvv =
+        reinterpret_cast<const float* const*>(be.l4_ptrs_dev_) + 2 * M;
+    const float* const* dgg =
+        reinterpret_cast<const float* const*>(be.l4_ptrs_dev_) + 3 * M;
+    const float* const* dbb =
+        reinterpret_cast<const float* const*>(be.l4_ptrs_dev_) + 4 * M;
+    float* const* dss =
+        reinterpret_cast<float* const*>(be.l4_ptrs_dev_) + 5 * M;
+    float* const* dcc =
+        reinterpret_cast<float* const*>(be.l4_ptrs_dev_) + 6 * M;
+    gemm::SsmParams sp;
+    sp.qn_rows = dqn; sp.kn_rows = dkn; sp.v_rows = dvv;
+    sp.g_rows = dgg; sp.b_rows = dbb;
+    sp.s_rows = dss; sp.core_rows = dcc;
+    sp.M = M; sp.n_v = nv; sp.n_k = nk; sp.kd = kd; sp.vd = vd;
+    sycl::event e_ssm = gemm::ssm_forward(q, sp);
+    gemm::SsmNormMParams np;
+    np.core_fp32 = be.l4_core_dev_;
+    np.z_fp32 = be.l4_z_dev_;
+    np.norm_w_fp32 = be.l4_nw_dev_;
+    np.act_fp16 = be.l4_act_dev_;
+    np.M = M; np.n_v = nv; np.vd = vd; np.rms_eps = (float)cfg.rms_eps;
+    sycl::event e_norm = gemm::ssm_norm_silu_to_half_m(q, np, e_ssm);
+    if(!be.eng->run_linear_tp_devact(la_out_ti, be.l4_act_dev_, c_y, M,
+                                     e_norm))
+      L4_DECLINE("devact");
+    // Row-fidelity hashes (INTFER_L4_ROWS): FNV over every batch input
+    // row (q/k/v/b/a conv-derived, z, resident S) + every output row.
+    // Twins (identical prompts) must hash identically per row; whatever
+    // differs between rows is the contamination source.
+    {
+      static const bool l4_rows =
+          (std::getenv("INTFER_L4_ROWS") != nullptr);
+      static int rows_done = 0;
+      if(l4_rows && rows_done < 6) {
+        ++rows_done;
+        auto fnv = [](const float* p, size_t n, uint64_t h) {
+          for(size_t i = 0; i < n; ++i) {
+            uint32_t u;
+            std::memcpy(&u, &p[i], 4);
+            h ^= u;
+            h *= 1099511628211ULL;
+          }
+          return h;
+        };
+        std::vector<float> hS(sdim);
+        for(uint32_t m = 0; m < M; ++m) {
+          uint64_t h = 1469598103934665603ULL;
+          uint64_t hq = fnv(rows[m].query, (size_t)nk * kd, h);
+          uint64_t hk = fnv(rows[m].key, (size_t)nk * kd, h);
+          uint64_t hv = fnv(rows[m].value, zvw, h);
+          uint64_t hb = fnv(rows[m].b_row, nv, h);
+          uint64_t ha = fnv(rows[m].a_row, nv, h);
+          uint64_t hz = fnv(z_all + (size_t)m * zvw, zvw, h);
+          try {
+            q.memcpy(hS.data(), sds[m]->S, sdim * sizeof(float)).wait();
+          } catch (...) {}
+          uint64_t hs = fnv(hS.data(), sdim, h);
+          h = fnv(rows[m].query, (size_t)nk * kd, h);
+          h = fnv(rows[m].key, (size_t)nk * kd, h);
+          h = fnv(rows[m].value, zvw, h);
+          h = fnv(rows[m].b_row, nv, h);
+          h = fnv(rows[m].a_row, nv, h);
+          h = fnv(z_all + (size_t)m * zvw, zvw, h);
+          h = fnv(hS.data(), sdim, h);
+          uint64_t ho = 1469598103934665603ULL;
+          ho = fnv(&c_y[(size_t)m * H], H, ho);
+          std::fprintf(stderr,
+              "[l4-rows#%d] M=%u L=%d row%u in=%016llx out=%016llx\n"
+              "    q=%016llx k=%016llx v=%016llx b=%016llx a=%016llx z=%016llx S=%016llx\n",
+              rows_done, M, L, m, (unsigned long long)h,
+              (unsigned long long)ho, (unsigned long long)hq,
+              (unsigned long long)hk, (unsigned long long)hv,
+              (unsigned long long)hb, (unsigned long long)ha,
+              (unsigned long long)hz, (unsigned long long)hs);
+        }
+      }
+    }
+    // Bisect INTFER_L4_CHECK: re-run the same GEMM as M per-row M=1
+    // devacts (pure — no state change) and compare against the M-row
+    // result. Differences isolate run_linear_tp_devact@M>1; identity
+    // points at the M-row norm kernel (core already cleared above).
+    {
+      static const bool l4_check =
+          (std::getenv("INTFER_L4_CHECK") != nullptr);
+      static int cmp_done = 0;
+      if(l4_check && cmp_done < 18) {
+        const int seq = cmp_done++;
+        std::vector<float> one(H, 0.f);
+        double omax = 0;
+        for(uint32_t m = 0; m < M; ++m) {
+          std::fill(one.begin(), one.end(), 0.f);
+          bool ok = be.eng->run_linear_tp_devact(
+              la_out_ti, be.l4_act_dev_ + (size_t)m * zvw, one, 1,
+              sycl::event{});
+          if(!ok) {
+            std::fprintf(stderr, "[l4-cmp#%d] M=%u L=%d row%u M1 declined\n",
+                         seq, M, L, m);
+            continue;
+          }
+          for(uint32_t i = 0; i < H; ++i) {
+            double d = (double)std::abs(
+                one[i] - c_y[(size_t)m * H + i]);
+            omax = std::max(omax, d);
+          }
+        }
+        std::fprintf(stderr,
+            "[l4-cmp#%d] M=%u L=%d mrow_vs_m1_outmax=%.3g\n",
+            seq, M, L, omax);
+      }
+    }
+    // Temporary first-success host recompute (INTFER_L4_CHECK): recompute
+    // the SSM core + norm rows on the host from the (untouched-by-fusion)
+    // mirrors and compare against the device core/act blocks. Isolates an
+    // SSM-input bug (prep/z/S mapping) from a norm/GEMM bug.
+    {
+      static const bool l4_check =
+          (std::getenv("INTFER_L4_CHECK") != nullptr);
+      static int check_done = 0;
+      if(l4_check && check_done < 18) {
+        const int check_seq = check_done++;  // first 18 succ. ~= step-1 LA set
+        std::vector<float> hcore((size_t)M * zvw), hz((size_t)M * zvw);
+        try {
+          q.memcpy(hcore.data(), be.l4_core_dev_,
+                   (size_t)M * zvw * sizeof(float)).wait();
+          q.memcpy(hz.data(), be.l4_z_dev_,
+                   (size_t)M * zvw * sizeof(float)).wait();
+        } catch (...) {}
+        // z block must equal the caller rows.
+        double zmax = 0;
+        for(size_t i = 0; i < (size_t)M * zvw; ++i)
+          zmax = std::max(zmax, (double)std::abs(hz[i] - z_all[i]));
+        // Host SSM from mirrors (pre-update snapshots — fusion never
+        // touches them) + the same row inputs.
+        double cmax = 0;
+        for(uint32_t m = 0; m < M; ++m) {
+          std::vector<float> S = *rows[m].mirror;  // pre-update state
+          const float* query = rows[m].query;
+          const float* key = rows[m].key;
+          const float* value = rows[m].value;
+          const float* br = rows[m].b_row;
+          const float* ar = rows[m].a_row;
+          std::vector<float> qn((size_t)nk * kd), kn((size_t)nk * kd);
+          std::vector<float> gg(nv);
+          for(uint32_t hh = 0; hh < nv; ++hh) {
+            float sp = log1pf(expf(ar[hh] + dt_bias[hh]));
+            gg[hh] = -expf(A_log[hh]) * sp;
+          }
+          std::vector<float> core(zvw, 0.f);
+          float scale = 1.0f / sqrtf((float)kd);
+          for(uint32_t hh = 0; hh < nv; ++hh) {
+            uint32_t kh = (nv > nk)
+                ? (uint32_t)(((uint64_t)hh * nk) / nv) : hh;
+            l2norm(&query[(size_t)kh * kd], qn.data(), (int)kd);
+            l2norm(&key[(size_t)kh * kd], kn.data(), (int)kd);
+            for(uint32_t d = 0; d < kd; ++d) qn[d] *= scale;
+            float g_t = expf(gg[hh]);
+            float beta = 1.0f / (1.0f + expf(-br[hh]));
+            float* Sp = &S[(size_t)hh * kd * vd];
+            for(uint32_t i = 0; i < kd * vd; ++i) Sp[i] *= g_t;
+            for(uint32_t c = 0; c < vd; ++c) {
+              float kv = 0;
+              for(uint32_t d = 0; d < kd; ++d)
+                kv += Sp[(size_t)d * vd + c] * kn[d];
+              float delta = (value[(size_t)hh * vd + c] - kv) * beta;
+              for(uint32_t d = 0; d < kd; ++d)
+                Sp[(size_t)d * vd + c] += kn[d] * delta;
+              float s = 0;
+              for(uint32_t d = 0; d < kd; ++d)
+                s += Sp[(size_t)d * vd + c] * qn[d];
+              core[(size_t)hh * vd + c] = s;
+            }
+          }
+          for(size_t i = 0; i < zvw; ++i) {
+            double d = (double)std::abs(
+                hcore[(size_t)m * zvw + i] - core[i]);
+            cmax = std::max(cmax, d);
+          }
+        }
+        std::fprintf(stderr,
+            "[l4-check#%d] M=%u L=%d zmax_vs_host=%.3g coremax_vs_host=%.3g\n",
+            check_seq, M, L, zmax, cmax);
+        // Norm-output check (D2H act -> FP32, vs host FP32 norm from the
+        // verified hcore/hz above; tol 1e-3 covers FP16 rounding, row
+        // swaps/strides would read O(1)). Catches a wrong act block that
+        // the M-row-vs-M1 GEMM cmp cannot see (same block both sides).
+        {
+          std::vector<std::uint16_t> hact((size_t)M * zvw, 0);
+          try {
+            q.memcpy(hact.data(), be.l4_act_dev_,
+                     (size_t)M * zvw * sizeof(std::uint16_t)).wait();
+          } catch (...) {}
+          double amax = 0;
+          for(uint32_t m = 0; m < M; ++m) {
+            for(uint32_t hh = 0; hh < nv; ++hh) {
+              const float* xx =
+                  &hcore[(size_t)m * zvw + (size_t)hh * vd];
+              const float* zg =
+                  &hz[(size_t)m * zvw + (size_t)hh * vd];
+              float v = 0;
+              for(uint32_t i = 0; i < vd; ++i) v += xx[i] * xx[i];
+              float inv = 1.0f / sqrtf(v / (float)vd + (float)cfg.rms_eps);
+              for(uint32_t i = 0; i < vd; ++i) {
+                float s = zg[i] / (1.0f + expf(-zg[i]));
+                float want = (xx[i] * inv) * ssm_norm_w[i] * s;
+                float got = dashq::half_to_float(
+                    hact[(size_t)m * zvw + (size_t)hh * vd + i]);
+                amax = std::max(amax, (double)std::abs(got - want));
+              }
+            }
+          }
+          std::fprintf(stderr,
+              "[l4-act#%d] M=%u L=%d actmax_vs_host=%.3g\n",
+              check_seq, M, L, amax);
+        }
+        // Devact-seam check: host FP32 reference GEMM over the D2H'd act
+        // block vs the fused devact output. Isolates the GEMM seam
+        // (weight/shard/stride) from upstream (core/act cleared above).
+        {
+          std::vector<std::uint16_t> hact2((size_t)M * zvw, 0);
+          try {
+            q.memcpy(hact2.data(), be.l4_act_dev_,
+                     (size_t)M * zvw * sizeof(std::uint16_t)).wait();
+          } catch (...) {}
+          std::vector<float> act32((size_t)M * zvw, 0.f);
+          for(size_t i = 0; i < act32.size(); ++i)
+            act32[i] = dashq::half_to_float(hact2[i]);
+          std::vector<float> ref((size_t)M * H, 0.f);
+          be.eng->run_linear_tp(la_out_ti, act32, ref, M);
+          double dmax = 0;
+          if(ref.size() == (size_t)M * H) {
+            for(size_t i = 0; i < (size_t)M * H; ++i)
+              dmax = std::max(dmax, (double)std::abs(ref[i] - c_y[i]));
+          } else {
+            dmax = -1;
+          }
+          std::fprintf(stderr,
+              "[l4-dev#%d] M=%u L=%d devactmax_vs_hostgemm=%.3g\n",
+              check_seq, M, L, dmax);
+        }
+        // NOTE: host core[] above is per-row recompute; extend to norm+GEMM
+        // below once the SSM stage is cleared (it is: all <1e-7).
+      }
+    }
+    for(auto* sd : sds) sd->dirty = true;  // residents newer than mirrors
+    static const bool l4_dbg = (std::getenv("INTFER_L4_DBG") != nullptr);
+    if(l4_dbg) {
+      static thread_local int n = 0;
+      if((++n % 24) == 1)
+        std::fprintf(stderr, "[l4] fused batch la_out M=%u x%d\n", M, n);
+    }
+    return true;
+  } catch (...) {
+    if (l4_why)
+      std::fprintf(stderr, "[l4-why] batch M=%u L=%d decline exception\n",
+                   M, L);
+    return false;
+  }
+#undef L4_DECLINE
 }
 
 // Re-upload all host SSM mirrors to the device (speculative partial-accept
@@ -4631,25 +5111,29 @@ static std::vector<StepOut> step_batch(
         backend->run_linear_wave_batch(items, 4, (uint32_t)M);
       }
       need_rows(b_ncore, zvw);
-      // ---- L4 la_out fusion M==1 fast path (INTFER_L4_FUSE=1) ----
-      // A single-row serve batch takes the certified scalar fused path
-      // (gpu_la_out_fused: device SSM -> fused norm+silu(z)+convert ->
-      // la_out GEMM, one wait + one D2H) instead of ssm_rows + host norm
-      // + M-row la_out below. M>1 keeps the batched path: run_linear_batch
-      // is already one M-row GEMM (single submit+wait), so a thin M-row
-      // norm offload would only trade host convert for M norm submits —
-      // judged not worth it; the win needs device-resident cores (same
-      // precondition as the AGENTS.md L4 verdict). False keeps the host
-      // path (TP>1, DPAS48 la_out, bad shapes — all inside the callee).
+      // ---- L4 la_out fusion (INTFER_L4_FUSE=1, TP=1) ----
+      // M==1 takes the certified scalar fused path below (gpu_la_out_fused:
+      // device SSM -> fused norm+silu(z)+convert -> la_out GEMM, one wait +
+      // one D2H). M>1 takes the fused batch path (gpu_la_out_fused_batch:
+      // one cross-key ssm_forward + one M-row norm kernel + one M-row
+      // devact la_out GEMM) instead of ssm_rows + host norm + M-row la_out
+      // below. Shared-state rows (same-request prefill runs in joint
+      // batches) decline inside the callee and keep the standard path.
+      // False keeps the host path (TP>1, DPAS48 la_out, bad shapes — all
+      // inside the callee).
       bool l4_m1_done = false;
       bool l4_m1_elig = false;
+      bool l4_m_elig = false;
+      bool l4_batch_done = false;
+      bool l4_batch_tried = false;  // batch attempted but declined (host redo)
       GpuBackend* gpu_be_l4m = nullptr;
       {
         static const bool l4_env = (std::getenv("INTFER_L4_FUSE") != nullptr);
-        if(l4_env && M == 1) {
+        if(l4_env && M >= 1) {
 #ifdef INTFER_HAS_GPU_BACKEND
           gpu_be_l4m = dynamic_cast<GpuBackend*>(backend);
-          l4_m1_elig = (gpu_be_l4m && gpu_be_l4m->eng);
+          l4_m_elig = (gpu_be_l4m && gpu_be_l4m->eng);
+          l4_m1_elig = (l4_m_elig && M == 1);
 #endif
         }
       }
@@ -4679,7 +5163,7 @@ static std::vector<StepOut> step_batch(
         }
       }
 #endif
-      if(!l4_m1_done && b_ssm_on) {
+      if(!l4_m1_done && !l4_batch_done && (b_ssm_on || (l4_m_elig && M > 1))) {
         b_ssm_rows.assign(M, SsmRow());
         b_ssm_conv.assign((size_t)M * cfg.conv_dim, 0.f);
       }
@@ -4717,7 +5201,7 @@ static std::vector<StepOut> step_batch(
 #endif
           l4_m1_elig = false;
         }
-        if(b_ssm_on) {
+        if(b_ssm_on || (l4_m_elig && !l4_batch_done && M > 1)) {
           memcpy(&b_ssm_conv[(size_t)m*cfg.conv_dim], conv_out.data(),
                  (size_t)cfg.conv_dim*sizeof(float));
           continue;
@@ -4764,7 +5248,99 @@ static std::vector<StepOut> step_batch(
           for(int i=0;i<cfg.v_head_dim;i++) oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
         }
       }
-      if(!l4_m1_done && b_ssm_on) {
+      // L4 M>1 attempt (conv_state already advanced above for every row,
+      // matching the scalar path order; b_ssm_conv holds one conv row per
+      // request in row order). Success fills c_y-equivalent rows in b_l4_m
+      // and skips the ssm_rows + host/SSM sections below for this layer;
+      // failure falls through to the standard path.
+      static thread_local std::vector<float> b_l4_m;  // L4 M-row fused o_la
+      if(l4_m_elig && !l4_m1_done && !l4_batch_done && M > 1) {
+#ifdef INTFER_HAS_GPU_BACKEND
+        // b_ncore doubles as nothing here: the fused path writes c_y
+        // rows directly, so size it now (need_rows(c_y) runs below).
+        if(b_l4_m.size() != (size_t)M * (size_t)Hdim)
+          b_l4_m.assign((size_t)M * (size_t)Hdim, 0.f);
+        if((int)b_ssm_rows.size() != M) b_ssm_rows.assign(M, SsmRow());
+        if(b_ssm_conv.size() != (size_t)M * cfg.conv_dim)
+          b_ssm_conv.assign((size_t)M * cfg.conv_dim, 0.f);
+        for(int m = 0; m < M; ++m) {
+          SsmRow& sr = b_ssm_rows[(size_t)m];
+          const float* cq = &b_ssm_conv[(size_t)m * cfg.conv_dim];
+          sr.req = items[(size_t)m].req;
+          sr.mirror = &lys[(size_t)m]->ssm_state;
+          sr.query = cq;
+          sr.key = cq + cfg.k_head_dim * cfg.n_k_heads;
+          sr.value = cq + 2 * cfg.k_head_dim * cfg.n_k_heads;
+          sr.b_row = &b_b[(size_t)m * cfg.n_v_heads];
+          sr.a_row = &b_a[(size_t)m * cfg.n_v_heads];
+          sr.core_out = nullptr;  // fused path keeps cores on-device
+        }
+        if(gpu_be_l4m && gpu_la_out_fused_batch(*gpu_be_l4m,
+            b_ssm_rows.data(), (uint32_t)M, L, &b_z[0],
+            ln.ssm_norm_w, dt_bias, A_log,
+            gpu_be_l4m->ti_of(ln.la_out), b_l4_m)) {
+          l4_batch_done = true;
+        } else {
+          l4_m_elig = false;
+          l4_batch_tried = true;
+        }
+#endif
+      }
+      // Batch declined after stashing (TP>1 / DPAS48 la_out / shared-state
+      // joint rows / bad shapes — all inside the callee) with SSM_GPU off:
+      // the conv loop above stashed instead of running the host recurrence,
+      // so run it here over the stored conv rows (same math/order as the
+      // ssm_rows-else branch below). b_ncore then feeds the standard la_out.
+      bool l4_batch_host_fallback = false;
+      if(l4_batch_tried && !l4_batch_done && !b_ssm_on) {
+        const float* ssm_norm_w = ln.ssm_norm_w;
+        for(int m = 0; m < M; m++){
+          Layer& ly = *lys[(size_t)m];
+          const float* cq = &b_ssm_conv[(size_t)m * cfg.conv_dim];
+          const float* query = cq;
+          const float* key = cq + cfg.k_head_dim * cfg.n_k_heads;
+          const float* value = cq + 2 * cfg.k_head_dim * cfg.n_k_heads;
+          float* zr = &b_z[(size_t)m*zvw];
+          float* br = &b_b[(size_t)m*cfg.n_v_heads];
+          float* ar = &b_a[(size_t)m*cfg.n_v_heads];
+          for(int hh=0; hh<cfg.n_v_heads; hh++){
+            float sp=log1pf(expf(ar[hh]+dt_bias[hh])); gg[hh]=-expf(A_log[hh])*sp;
+          }
+          for(size_t i=0;i<zvw;i++) core[i] = 0.f;
+          for(int hh=0; hh<cfg.n_v_heads; hh++){
+            int kh = (cfg.n_v_heads > cfg.n_k_heads)
+                     ? (int)((long long)hh * cfg.n_k_heads / cfg.n_v_heads)
+                     : hh;
+            l2norm(&query[kh*cfg.k_head_dim], qn.data(), cfg.k_head_dim);
+            l2norm(&key[kh*cfg.k_head_dim],  kn.data(), cfg.k_head_dim);
+            float scale=1.0f/sqrtf((float)cfg.k_head_dim);
+            for(int d=0;d<cfg.k_head_dim;d++) qn[d]*=scale;
+            float g_t=expf(gg[hh]); float beta=sigmoidf(br[hh]);
+            float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
+            for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
+            for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
+            for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
+            { const float* vh=&value[hh*cfg.v_head_dim];
+            for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
+            for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
+            for(int c=0;c<cfg.v_head_dim;c++){
+              float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
+              core[hh*cfg.v_head_dim+c]=s;
+            }
+          }
+          float* ncr = &b_ncore[(size_t)m*zvw];
+          for(int hh=0; hh<cfg.n_v_heads; hh++){
+            const float* xx=&core[hh*cfg.v_head_dim];
+            const float* zg=&zr[hh*cfg.v_head_dim];
+            float* oo=&ncr[hh*cfg.v_head_dim];
+            float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
+            float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
+            for(int i=0;i<cfg.v_head_dim;i++) oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
+          }
+        }
+        l4_batch_host_fallback = true;
+      }
+      if(!l4_m1_done && !l4_batch_done && !l4_batch_host_fallback && b_ssm_on) {
         // Device step over all rows (per-row keys; runs partition inside).
         // Core rows land directly in b_ncore; the norm below reads them.
         for(int m=0; m<M; m++){
@@ -4859,6 +5435,8 @@ static std::vector<StepOut> step_batch(
       need_rows(c_y, Hdim);
       if(l4_m1_done) {
         memcpy(&c_y[0], b_l4_o.data(), (size_t)Hdim * sizeof(float));
+      } else if(l4_batch_done) {
+        memcpy(&c_y[0], b_l4_m.data(), (size_t)M * (size_t)Hdim * sizeof(float));
       } else {
         backend->run_linear_batch(ln.la_out, b_ncore, c_y, (uint32_t)M);
       }

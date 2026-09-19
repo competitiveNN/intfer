@@ -380,5 +380,22 @@ struct SsmNormParams {
 };
 sycl::event ssm_norm_silu_to_half(sycl::queue& q, const SsmNormParams& p,
                                   const sycl::event& dep = {});
+// M-row variant (L4 M>1 serve fusion): M contiguous core/z rows in,
+// M contiguous FP16 act rows out. One WI per (row m, head hh); same
+// per-element math/order as the single-row kernel (host-loop identical,
+// silu via sycl::exp, RNE convert). norm_w is shared across rows.
+// dep chains after the M-row SSM kernel.
+struct SsmNormMParams {
+  const float* core_fp32;      // [M*n_v*vd] SSM core rows (device FP32)
+  const float* z_fp32;         // [M*n_v*vd] z gate rows (device FP32)
+  const float* norm_w_fp32;    // [vd] ssm norm weights (device FP32, shared)
+  std::uint16_t* act_fp16;     // [M*n_v*vd] fused la_out acts (device FP16)
+  uint32_t M;                  // batch rows
+  uint32_t n_v;                // value heads
+  uint32_t vd;                 // v head dim
+  float rms_eps;
+};
+sycl::event ssm_norm_silu_to_half_m(sycl::queue& q, const SsmNormMParams& p,
+                                    const sycl::event& dep = {});
 
 }  // namespace intfer::gemm
