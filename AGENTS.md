@@ -140,8 +140,13 @@ Implement features for maximizing throughput for concurrent requests, starting f
   Dormant for distinct inputs (k/v, z/b/a) and fused path. Measured
   load-immune copy counts (NO_FUSE -n 6): 1116->972 converts (-13%);
   fused TP=1 unchanged (276=276). Streams identical TP1/NO_FUSE/TP2.
-  Gates: cpu parity + http batch PASS. Open: 6 full-attn layers don't
-  fire the dedup (route MLPs outside wave?) — 48 of ~192 expected.
+  Gates: cpu parity + http batch PASS. Attribution CLOSED (2026-09-19,
+  INTFER_WAVE_DBG probe, since reverted): the "6 full-attn skip" note was
+  wrong — layers 3,7,11,15,19,23 fire the gate/up dedup-hit like every
+  other layer (168 hits = 24 prefill + 144 decode = 24 layers x 7 passes).
+  Dedup fires only on 2-item shared-input gate/up waves; never on z/b/a
+  (3 distinct rotated inputs) or k/v (2 distinct). -n6 wall +2.8% (run
+  variance — convert is not the wall, submit is).
 - Dead ends (measured, do not retry as-is): device-side act-quant
   (bit-exact probe passed but fused kernel slower: one-WI-per-16N-tile
   layout replicates O(K) quant work nT x), host-private staging of DPAS
@@ -183,6 +188,15 @@ Implement features for maximizing throughput for concurrent requests, starting f
   INTFER_NO_PROF queue without enable_profiling (2026-09-18: 19.21 vs
   18.75 tok/s TP1 decode under box contention — within run variance;
   per-event L0 timestamping is not the submit tax).
+- PLAN.md triage (2026-09-19, grounded vs tree): preload_all/USM-pool /
+  fused-MLP already DONE (preload log: 186 shards pinned, 534MiB dev0,
+  no evict; pool_acquire routed, pool holds 0 bufs post-preload as
+  designed — grow-only workspaces). DPAS-enforce + SYCL-graphs + L0-P2P
+  are measured dead-ends above (do not retry as-is). INT8-KV
+  (INTFER_INT8_KV / INTFER_KV_Q8) + SSM-chain (ssm_forward_chain via
+  INTFER_SSM_GPU) exist as opt-in paths but serve UNVERIFIED vs oracle —
+  next lever candidates; need quiet box (load<2) + cpu parity + http
+  batch gates before any wall-time claim.
 - Wave-submit + vectorized host math (2026-09-18, wave 7d7ca72, AVX2
   5285b47, extended a78e99f, quantified on quiet box loadavg<2): z/b/a +
   gate/up + full-attn k/v GEMMs convert+submit back-to-back, one wait
