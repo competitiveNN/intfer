@@ -439,6 +439,19 @@ Implement features for maximizing throughput for concurrent requests, starting f
   la_out / fused batch la_out M=%u). Wall-time A/B NOT run (box load
   ~6 — quiet rule load1<2): scripts/bench_quiet_l4_ab.sh running in
   background, gated on quiet.
+- L4 M>1 measured on M=3 sched batch (2026-09-19, 3/3 BASE/L4 pairs,
+  near-quiet load 2-3.8, 27 toks/3 reqs, -n8): submit −24% systematic
+  (110.8/112.6/112.0 -> 84.4/84.7/85.2ms, variance <2ms — real), nk
+  1536->1824 (+288, fused chain fires), usm_write −5ms, BUT waitblock
+  +21ms (597->618ms) eats nearly all of it: net wall −1.5% (946-948 ->
+  929-935ms, consistent sign 3/3). Mechanism: at M=3 the device is
+  saturated (kernel 597ms dominates the 940ms wall), so fewer host gaps
+  just deepen the device queue — submit savings only convert to tok/s
+  where the device has idle gaps (scalar M=1, kernel ~26% of decode).
+  Implication for 40 tok/s: the M>1 L4 batch is correctness-certified
+  infrastructure (streams identical, fewer host round-trips), NOT a
+  wall-time lever under saturation. The scalar M=1 L4 A/B
+  (bench_quiet_l4_ab.sh) remains the decisive measurement.
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +
