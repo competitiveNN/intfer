@@ -216,7 +216,13 @@ Implement features for maximizing throughput for concurrent requests, starting f
   event-wait loop + host readback-loop setup (~24/layer-pass pairs per
   token). Measured load-immune (TP1 fused -n 6),
   streams identical TP1/TP2/NOWAVE; cpu parity + http batch + gpu-optin
-  PASS. Wall-time A/B deferred (load rose past 2 during gates). Precision:
+  PASS. A/B CLOSED (2026-09-19, quiet box load~1.6, -n64 TP1 interleaved
+  2 rounds + 3 JOIN-only): JOIN 25.97/25.99, PARENT 26.09/25.97 = NEUTRAL
+  (-0.2%, run variance). Buckets: kernel/submit/waitblock/usm_write
+  identical; readback +8-12ms (bigger wave-3/4 readback loops cost what
+  the saved loop setups save); nr 4608 vs 6144 confirms grouping.
+  Keep (fewer phases, same streams) but quote NO tok/s gain — submit
+  (~745ms) + kernel (~645ms) dominate unchanged. Precision:
   wave does NOT reduce kernel-launch count (nk identical 1674/10tok
   both ways — engine still issues one kernel per item); it groups
   convert+submit back-to-back for queue depth and one wait per wave.
