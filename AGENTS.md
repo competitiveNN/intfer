@@ -208,8 +208,13 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (2026-09-19) joins q into the k/v wave-3 and qkv into the z/b/a
   wave-4 in step() decode: both GEMMs' consumers (q split/norm/rope,
   qkv conv) run after, so the joins are pure regrouping, bit-identical
-  by the wave contract. Saves 1 host wait/layer (24/token). Measured
-  load-immune (TP1 fused -n 6): decode nr 828->432 readback groups,
+  by the wave contract. CORRECTION: the joins do NOT reduce kernel-wait
+  count (nw 828 = 828 — wait_count increments per kernel event, and
+  grouping changes no event count). What they halve is host round-trip
+  phases: one wait-loop + one readback pass per wave instead of per
+  GEMM (decode nr 828->432). Each saved phase removes a blocking
+  event-wait loop + host readback-loop setup (~24/layer-pass pairs per
+  token). Measured load-immune (TP1 fused -n 6),
   streams identical TP1/TP2/NOWAVE; cpu parity + http batch + gpu-optin
   PASS. Wall-time A/B deferred (load rose past 2 during gates). Precision:
   wave does NOT reduce kernel-launch count (nk identical 1674/10tok

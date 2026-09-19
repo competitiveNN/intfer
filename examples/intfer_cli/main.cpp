@@ -2680,10 +2680,11 @@ static StepOut step(Request& req, int token, int pos,
       size_t qrows = (size_t)cfg.n_heads * cfg.head_dim;
       // Wave-3: q/k/v are independent (all derive from normed + rotations;
       // qp's split/norm/rope consumers run below, after the wave) — one
-      // engine call converts + submits all three back-to-back and waits
-      // once. Bit-identical to run_linear_into + 2-wave (same kernels,
-      // same buffers, only submit/wait grouping changes). Saves 1 host
-      // wait per full-attn layer vs q-sequential + k/v wave.
+      // engine call converts + submits all three back-to-back with one
+      // wait-loop + one readback pass. Bit-identical to run_linear_into +
+      // 2-wave (same kernels, same buffers, only submit/wait grouping
+      // changes). Halves host round-trip phases vs q-sequential + k/v wave
+      // (one wait-loop + readback pass instead of two).
       {
         LinearBackend::LinearWaveItem items[3] = {
           {ln.q, &xq, &qp},
@@ -2862,10 +2863,11 @@ static StepOut step(Request& req, int token, int pos,
         std::vector<float>& a = req.scratch.a;
         // Wave-4: qkv/z/b/a are independent (all derive from normed;
         // mqkv's conv consumer runs below, after the wave) — one engine
-        // call converts + submits all four back-to-back and waits once.
-        // Bit-identical to run_linear_into + 3-wave (same kernels, same
-        // buffers, only submit/wait grouping changes). Saves 1 host wait
-        // per LA layer vs qkv-sequential + z/b/a wave.
+        // call converts + submits all four back-to-back with one wait-loop +
+        // one readback pass. Bit-identical to run_linear_into + 3-wave (same
+        // kernels, same buffers, only submit/wait grouping changes). Halves
+        // host round-trip phases vs qkv-sequential + z/b/a wave (one
+        // wait-loop + readback pass instead of two).
         {
           LinearBackend::LinearWaveItem items[4] = {
             {ln.qkv, &xqkv, &mqkv},
