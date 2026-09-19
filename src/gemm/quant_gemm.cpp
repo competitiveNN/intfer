@@ -1358,4 +1358,165 @@ sycl::event ssm_norm_silu_to_half_m(sycl::queue& q, const SsmNormMParams& p,
   });
 }
 
+// L5 kernel 1: FWHT online rotations + RNE FP16 convert. One WI per tensor
+// (sequential FWHT = exact host loop order in fwht(), bit-identical, no
+// SLM/ordering risk). kind 0 = null rotation (copy); kind 1 = hadamard
+// (FWHT over prefix p + /sqrt scale, tail passthrough — matches
+// apply_rotation_fwht incl. the blockdiag path); kind 2 = dense (WI writes
+// nothing; the caller must decline to the host path). N rows (qkv/z/b/a
+// widths) may exceed H (packed-gate qkv: N=2*n_heads*hd); the rotation
+// covers the first H elements, the tail copies through (host GEMM reads
+// min(x.size,K)... no: the GEMM reads K=H inputs; outputs beyond H are the
+// packed gate rows produced BY the GEMM. So the act row IS H wide —
+// N here is informational; each act row is exactly H FP16 out).
+sycl::event fwht_rot_to_half(sycl::queue& q, const FwhtRotParams& p,
+                             const sycl::event& dep) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
+  const float* xn = p.normed_fp32;
+  const uint8_t* kind = p.rot_kind;
+  const std::uint32_t H = p.H, pr = p.rot_p;
+  const float inv = p.rot_inv_sqrt;
+  if (!xn || !kind || H == 0 || pr == 0) return sycl::event{};
+  std::uint16_t* a0 = p.acts_fp16[0];
+  std::uint16_t* a1 = p.acts_fp16[1];
+  std::uint16_t* a2 = p.acts_fp16[2];
+  std::uint16_t* a3 = p.acts_fp16[3];
+  if (!a0 || !a1 || !a2 || !a3) return sycl::event{};
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(dep);
+    h.parallel_for<class fwht_rot_to_half_kernel>(
+        sycl::range<1>(4), [=](sycl::item<1> it) {
+          const std::uint32_t t = (std::uint32_t)it.get_id(0);
+          const uint8_t k = kind[t];
+          if (k == 2) return;  // dense: caller declines
+          std::uint16_t* oo = (t == 0) ? a0 : (t == 1) ? a1
+                             : (t == 2)            ? a2
+                                                   : a3;
+          if (k == 0) {
+            for (std::uint32_t i = 0; i < H; ++i)
+              oo[i] = dev_float_to_half(xn[i]);
+            return;
+          }
+          // Hadamard: exact host order (fwht len=2..p ascending, then
+          // scale; blockdiag tail passthrough). Private array sized to the
+          // max H (27B H=5120); larger H declines at the caller.
+          float tmp[5120];
+          if (H > 5120) return;  // caller guards; never partial work
+          for (std::uint32_t i = 0; i < H; ++i) tmp[i] = xn[i];
+          for (std::uint32_t len = 2; len <= pr; len <<= 1) {
+            const std::uint32_t half = len >> 1;
+            for (std::uint32_t i = 0; i < pr; i += len)
+              for (std::uint32_t j = 0; j < half; ++j) {
+                const float u = tmp[i + j], v = tmp[i + j + half];
+                tmp[i + j] = u + v;
+                tmp[i + j + half] = u - v;
+              }
+          }
+          for (std::uint32_t i = 0; i < pr; ++i)
+            oo[i] = dev_float_to_half(tmp[i] * inv);
+          for (std::uint32_t i = pr; i < H; ++i)
+            oo[i] = dev_float_to_half(tmp[i]);
+        });
+  });
+}
+
+// L5 kernel 2: conv FIR + silu + q/k/v/g/b prep pack. One WI, sequential,
+// host loop order. conv (host step order: c outer over conv_dim, k inner
+// over conv_k taps against conv_state[c*3+k...] layout with state shift);
+// silu via sycl::exp (~1ulp vs host expf — same standing as L4); q/k
+// l2norm reductions sequential (same order as host l2norm — check its loop
+// before claiming exact); g via sycl exp/log1p analogs of host
+// expf/log1pf (~1ulp). v/b are memcpy-order packs (exact).
+sycl::event la_conv_prep(sycl::queue& q, const LaConvPrepParams& p,
+                         const sycl::event& dep) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
+  const float* mqkv = p.mqkv_fp32;
+  float* cst = p.conv_state;
+  const float* cw = p.conv_w;
+  const float* brow = p.b_row;
+  const float* arow = p.a_row;
+  float* packed = p.packed_in;
+  const float* dtb = p.dt_bias;
+  const float* Alog = p.A_log;
+  const std::uint32_t cdim = p.conv_dim, ck = p.conv_k;
+  const std::uint32_t nv = p.nv, nk = p.nk, kd = p.kd, vd = p.vd;
+  const float qscale = p.qscale;
+  if (!mqkv || !cst || !cw || !packed || !dtb || !Alog) return sycl::event{};
+  if (!brow || !arow) return sycl::event{};
+  if (cdim == 0 || ck == 0 || nv == 0 || nk == 0 || kd == 0 || vd == 0)
+    return sycl::event{};
+  const size_t zvw = (size_t)nv * vd;
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(dep);
+    h.single_task<class la_conv_prep_kernel>([=]() {
+      // conv section layout inside mqkv (host step order, conv_k==4):
+      // query [0,nk*kd), key [nk*kd,2*nk*kd), value [2*nk*kd,2*nk*kd+zvw).
+      // Taps 0..2 read conv_state[c*3+0..2], tap 3 reads mqkv[c] — exactly
+      // the 4 host lines. conv_state shifts in place (host order).
+      const size_t qk = (size_t)nk * kd;
+      // query/key/value section base offsets in conv_out space
+      for (std::uint32_t c = 0; c < cdim; ++c) {
+        float s = 0.0f;
+        if (ck == 4) {
+          s = cw[(size_t)c * ck + 0] * cst[(size_t)c * 3 + 0] +
+              cw[(size_t)c * ck + 1] * cst[(size_t)c * 3 + 1] +
+              cw[(size_t)c * ck + 2] * cst[(size_t)c * 3 + 2] +
+              cw[(size_t)c * ck + 3] * mqkv[c];
+        } else {
+          for (std::uint32_t k = 0; k + 1 < ck; ++k)
+            s += cw[(size_t)c * ck + k] * cst[(size_t)c * 3 + k];
+          s += cw[(size_t)c * ck + ck - 1] * mqkv[c];
+        }
+        const float es = sycl::exp(-s);
+        const float silu = s / (1.0f + es);
+        // shift history, append mqkv (host order)
+        cst[(size_t)c * 3 + 0] = cst[(size_t)c * 3 + 1];
+        cst[(size_t)c * 3 + 1] = cst[(size_t)c * 3 + 2];
+        cst[(size_t)c * 3 + 2] = mqkv[c];
+        // stash conv_out[c] = silu into packed's v section layout later;
+        // first write to a scratch area past the packed tail (caller sizes
+        // packed_in + cdim floats of scratch).
+        packed[(2 * qk + zvw + 2 * (size_t)nv) + c] = silu;
+      }
+      const float* cout = packed + (2 * qk + zvw + 2 * (size_t)nv);
+      const float* query = cout;
+      const float* key = cout + qk;
+      const float* value = cout + 2 * qk;
+      float* hqn = packed;
+      float* hkn = packed + qk;
+      float* hv = packed + 2 * qk;
+      float* hg = hv + zvw;
+      float* hb = hg + nv;
+      for (std::uint32_t kh = 0; kh < nk; ++kh) {
+        // l2norm sequential (host l2norm order: sum squares ascending,
+        // then divide — verify host l2norm before certifying exact).
+        float sq = 0.0f, sk = 0.0f;
+        for (std::uint32_t d = 0; d < kd; ++d) {
+          sq += query[(size_t)kh * kd + d] * query[(size_t)kh * kd + d];
+          sk += key[(size_t)kh * kd + d] * key[(size_t)kh * kd + d];
+        }
+        const float iq = 1.0f / sycl::sqrt(sq);
+        const float ik = 1.0f / sycl::sqrt(sk);
+        for (std::uint32_t d = 0; d < kd; ++d) {
+          hqn[(size_t)kh * kd + d] = query[(size_t)kh * kd + d] * iq * qscale;
+          hkn[(size_t)kh * kd + d] = key[(size_t)kh * kd + d] * ik;
+        }
+      }
+      for (size_t i = 0; i < zvw; ++i) hv[i] = value[i];
+      for (std::uint32_t i = 0; i < nv; ++i) hb[i] = brow[i];
+      for (std::uint32_t hh = 0; hh < nv; ++hh) {
+        // host: sp=log1pf(expf(a+dt)); g=-expf(A_log)*sp. sycl exp/log1p
+        // analogs (~1ulp vs host expf/log1pf — oracle arbitrates, L4 norm).
+        const float sp =
+            sycl::log1p(sycl::exp(arow[hh] + dtb[hh]));
+        hg[hh] = -sycl::exp(Alog[hh]) * sp;
+      }
+    });
+  });
+}
+
 }  // namespace intfer::gemm

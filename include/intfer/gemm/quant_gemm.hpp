@@ -398,4 +398,49 @@ struct SsmNormMParams {
 sycl::event ssm_norm_silu_to_half_m(sycl::queue& q, const SsmNormMParams& p,
                                     const sycl::event& dep = {});
 
+// ---------------------------------------------------------------------------
+// L5 LA-front chain (device-resident LA input path, TP=1 scalar decode):
+// two kernels that replace the host wave-4 + conv + q/k prep ahead of the
+// certified L4 tail (ssm_forward -> ssm_norm_silu_to_half -> devact la_out).
+//
+// Kernel 1 (fwht_rot_to_half): normed[H] FP32 in (one H2D per layer), 4x
+// FWHT online rotations (null = copy, hadamard = exact host-order FWHT +
+// /sqrt(p), dense = WI writes nothing, caller declines) + RNE FP16
+// convert, 4x device act rows out. One WI per tensor (sequential FWHT =
+// host loop order, bit-identical, no SLM/ordering risk).
+// Kernel 2 (la_conv_prep): mqkv[conv_dim] FP32 (device GEMM out) +
+// conv_state (device mirror, updated in place) + conv_w[conv_dim*conv_k]
+// -> conv FIR + silu (host loop order, silu via sycl::exp ~1ulp) ->
+// conv_out slices + q/k l2norm+scale (sycl::sqrt, IEEE exact) + g logits
+// (sycl::exp/log1p analogs of host expf/log1pf ~1ulp) + v/b pack into the
+// L4 sd->in packed layout [qn(nk*kd)|kn(nk*kd)|v(zvw)|g(nv)|b(nv)].
+// One WI (sequential, host order). dep chains after the conv-input GEMM.
+// ---------------------------------------------------------------------------
+struct FwhtRotParams {
+  const float* normed_fp32;     // [H] normalized hidden (device FP32)
+  std::uint16_t* acts_fp16[4];  // 4x [Nmax] device FP16 act rows (qkv/z/b/a)
+  const uint8_t* rot_kind;      // 4x kind: 0=null(copy) 1=hadamard(FWHT) 2=dense(decline)
+  uint32_t rot_p;               // FWHT prefix (floor_pow2(dim); dim when pow2)
+  float rot_inv_sqrt;           // 1/sqrt(p) FWHT scale (host-identical value)
+  uint32_t H;                   // hidden dim (= tensor K)
+};
+sycl::event fwht_rot_to_half(sycl::queue& q, const FwhtRotParams& p,
+                             const sycl::event& dep = {});
+struct LaConvPrepParams {
+  const float* mqkv_fp32;    // [conv_dim] qkv GEMM out (device FP32)
+  float* conv_state;         // [conv_dim*3] device mirror (updated in place)
+  const float* conv_w;       // [conv_dim*conv_k] conv weights (device FP32)
+  const float* b_row;        // [nv] b GEMM row (device FP32)
+  const float* a_row;        // [nv] a GEMM row (device FP32)
+  float* packed_in;          // [2*nk*kd+zvw+2*nv+conv_dim] L4 sd->in layout
+                             // (device FP32) + conv_dim scratch tail
+  const float* dt_bias;      // [nv] (device FP32)
+  const float* A_log;        // [nv] (device FP32)
+  uint32_t conv_dim, conv_k;
+  uint32_t nv, nk, kd, vd;
+  float qscale;              // 1/sqrt(kd) (host-identical value)
+};
+sycl::event la_conv_prep(sycl::queue& q, const LaConvPrepParams& p,
+                         const sycl::event& dep = {});
+
 }  // namespace intfer::gemm

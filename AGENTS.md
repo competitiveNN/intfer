@@ -109,6 +109,24 @@ Implement features for maximizing throughput for concurrent requests, starting f
   replicates O(K) fold work nT x), rebuild 500->964ms (DPAS repack),
   copy 12.6->48.4ms (host act-quant). Streams bit-identical. Default-OFF
   stands at ALL shapes (M=1/128/361).
+  DPAS48 M=1 device-side breakdown (2026-09-19, -n8 TP1 decode buckets —
+  kernel_us is device event time, LOAD-IMMUNE, box load ~7): legacy
+  kernel 138.0 / submit 136.4 / waitblock 154.9 / copy 0.1 / readback 65.6
+  nk=1680 vs DPAS48 kernel 203.5 (+48% DEVICE-SIDE — the M=1 DPAS kernel
+  itself is slower, not just its host quant) / submit 235.6 (+73% at LOWER
+  nk=1488: UR submit blocks when the device is saturated by the longer
+  kernels) / copy 91.8 (host GA64) / readback 100.2 (nr 1056 vs 576, ~2x
+  readbacks). DPAS48 loses on EVERY bucket at M=1. Consequence: a
+  standalone device-side GA64 act-quant kernel (row-parallel pre-pass —
+  feasible, no replication, HalfAway rounding verifiable like the RNE
+  convert) canNOT save DPAS48 alone (would fix only the 92ms copy of a
+  path already +65ms kernel / +100ms submit underwater). XMX prefill
+  needs FIRST a rewritten 2D-tiled DPAS kernel (proper subgroup DPAS, no
+  one-WI-per-16N-tile K-fold replication); device act-quant is the
+  complement AFTER, not the lever. Neither is a session-scale build —
+  scoped, not started. Do NOT retry device-quant-into-DPAS (dead end
+  stands) and do NOT build standalone device-quant expecting a DPAS48
+  win without the kernel rewrite.
 - Prefill defaults flipped (2026-09-18, a52715f): chunked M-row prefill
   is now default-ON (chunk_M 8->128, batch_gemm default-ON; opt-outs
   INTFER_PREFILL_CHUNK=0 / INTFER_BATCH_GEMM=0 reproduce old path
@@ -450,8 +468,34 @@ Implement features for maximizing throughput for concurrent requests, starting f
   where the device has idle gaps (scalar M=1, kernel ~26% of decode).
   Implication for 40 tok/s: the M>1 L4 batch is correctness-certified
   infrastructure (streams identical, fewer host round-trips), NOT a
-  wall-time lever under saturation. The scalar M=1 L4 A/B
-  (bench_quiet_l4_ab.sh) remains the decisive measurement.
+  wall-time lever under saturation. UPDATE 2026-09-19 (bench_quiet_l4_ab.sh
+  3 rounds DONE, box never quiet — load 1.91/2.24/2.55/2.78/3.04/3.17):
+  scalar A/B is a VARIANCE WASH, no promotion. -n64 TP1 decode L4 vs BASE
+  = 17.19/19.52, 19.63/16.28, 15.32/26.45 (round-3 BASE 26.45 at load 3.17
+  beats round-1 L4 17.19 at load 1.91 — the box, not the code, decides).
+  Buckets: submit L4 wins 2/3 (716/955, 665/1186, 845/726) but
+  kernel/waitblock flip randomly with load; nk=15744 vs 13440 every round
+  (+2304 = 18 LA x 64 x 2, chain fires). Prefill guard clean (152-155 both,
+  L4 no-op confirmed). L4 STAYS default-OFF opt-in (certified infra, no
+  tok/s claim either way). Do NOT re-run hoping for a better number —
+  re-run ONLY on a sustained-quiet box (load1<2). Both A/Bs point the same
+  way: submit-side savings convert only where the device has idle gaps.
+- L5 LA-front chain (2026-09-19, IN PROGRESS — kernels built, orchestration
+  pending): extends the device-act pattern FORWARD from la_out to the whole
+  LA input path. Per LA layer scalar path today = host wave-4 (4 GEMM
+  round-trips) + host conv + host prep + L4 tail. L5 replaces with: H2D
+  normed (1x) -> fwht_rot_to_half kernel (4x FWHT rot + RNE convert, NEW,
+  built) -> 4x devact GEMM (existing seam) -> la_conv_prep kernel (conv
+  FIR+silu + qk-prep pack into sd->in, NEW, built) -> certified L4 tail
+  (ssm_forward + norm + devact la_out). conv_state goes device-resident in
+  SsmDev (dirty-tracked, host resyncs). Saves per LA layer vs L4 path: 4
+  converts + ~6 transfers + 1-2 waits (x18 layers). Bit-contracts:
+  FWHT/conv-FIR/packs exact host order; silu/exp/log1p ~1ulp (oracle
+  arbitrates); stream-identity gates are load-insensitive (build+gate now,
+  wall-time later). Kill switch: INTFER_L5_FRONT=1 (default OFF); any false
+  keeps the L4/host path. REMAINING: conv_state mirror sync points
+  (evict/resync/rollback), step() hook, gates.
+- DPAS48 M=1 device-side breakdown (2026-09-19, -n8 TP1 decode buckets —
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +
