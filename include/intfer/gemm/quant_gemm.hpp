@@ -345,4 +345,30 @@ struct SiluMulParams {
 sycl::event silumul_to_half(sycl::queue& q, const SiluMulParams& p,
                             const sycl::event& dep = {});
 
+// ---------------------------------------------------------------------------
+// Device-side fused SSM-norm + silu(z) + FP32->FP16 convert (L4 la_out seam).
+//
+// Reads one FP32 SSM core row (core[n_v*vd]), the z gate row (z[n_v*vd])
+// and the per-dim norm weights (w[vd], shared across heads), computes per
+// head hh the same math as the host LA norm loop:
+//   v = sum_i core[hh,i]^2; inv = 1/sqrt(v/vd + eps)
+//   out[hh,i] = RNE_FP16((core[hh,i]*inv) * w[i] * silu(z[hh,i]))
+// One WI per head (vd-serial inner loops, same element order as host).
+// silu uses sycl::exp (~1ulp vs host expf on rare elements; the oracle
+// token stream is the arbiter — same standing as silumul_to_half). The
+// FP16 convert is dev_float_to_half (RNE bit-identical to
+// dashq::float_to_half). dep chains after the SSM kernel.
+// ---------------------------------------------------------------------------
+struct SsmNormParams {
+  const float* core_fp32;      // [n_v*vd] SSM core row (device FP32)
+  const float* z_fp32;         // [n_v*vd] z gate row (device FP32)
+  const float* norm_w_fp32;    // [vd] ssm norm weights (device FP32)
+  std::uint16_t* act_fp16;     // [n_v*vd] fused la_out activation (device FP16)
+  uint32_t n_v;                // value heads
+  uint32_t vd;                 // v head dim
+  float rms_eps;
+};
+sycl::event ssm_norm_silu_to_half(sycl::queue& q, const SsmNormParams& p,
+                                  const sycl::event& dep = {});
+
 }  // namespace intfer::gemm

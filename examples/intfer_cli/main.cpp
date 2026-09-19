@@ -928,6 +928,19 @@ static bool gpu_ssm_rows(GpuBackend& be, const SsmRow* rows, uint32_t M, int L,
 // rollback replaced ly.ssm_state vectors under the device; the side map
 // holds the host mirror pointers so no Request access is needed here).
 static void gpu_ssm_resync_all(GpuBackend& be);
+// L4 la_out fusion (scalar decode, TP=1): SSM recurrence + norm + silu(z) +
+// FP16 convert chained on-device straight into the la_out GEMM, one host
+// wait + one D2H. z ([n_v*vd]) and ssm_norm_w ([vd]) are host rows;
+// o_la ([H]) receives the GEMM output. Returns false when unavailable so
+// the caller keeps the host path. INTFER_L4_FUSE=1 opts in (default off).
+static bool gpu_la_out_fused(GpuBackend& be, const Request* req,
+                             std::vector<float>* mirror, int L,
+                             const float* query, const float* key,
+                             const float* value, const float* b_row,
+                             const float* a_row, const float* z,
+                             const float* ssm_norm_w, const float* dt_bias,
+                             const float* A_log, int la_out_ti,
+                             std::vector<float>& o_la);
 #endif
 
 // ----------------------------------------------------------------------------
@@ -1896,8 +1909,25 @@ struct GpuBackend : public LinearBackend {
     return gpu_ssm_rows(*this, rows, M, L, dt_bias, A_log, sync_mirror);
   }
   void ssm_resync_all() { gpu_ssm_resync_all(*this); }
+  // L4 la_out fusion (INTFER_L4_FUSE=1, TP=1 scalar decode): persistent
+  // device staging on device 0 — z row + norm weights in FP32, fused
+  // norm+silu(z) FP16 act out. Grow-only; sized to the max zvw/vd seen.
+  // Freed in the dtor below alongside the SSM map. The SSM core buffer
+  // itself is reused from the SsmDev entry (no extra alloc).
+  float* l4_z_dev_ = nullptr;        // [l4_z_cap_] FP32 z row staging
+  size_t l4_z_cap_ = 0;
+  float* l4_nw_dev_ = nullptr;       // [l4_nw_cap_] FP32 norm weights
+  size_t l4_nw_cap_ = 0;
+  std::uint16_t* l4_act_dev_ = nullptr;  // [l4_act_cap_] FP16 fused act
+  size_t l4_act_cap_ = 0;
+  int ti_of(const std::string& name) {
+    if(!eng) return -1;
+    build_index();
+    auto it = ti_cache.find(name);
+    return (it == ti_cache.end()) ? -1 : it->second;
+  }
   ~GpuBackend() {
-    if(!eng || ssm_dev_.empty()) return;
+    if(!eng) return;
     sycl::queue& q = eng->device_queue(0);
     for(auto& kv : ssm_dev_) {
       SsmDev& sd = kv.second;
@@ -1910,6 +1940,10 @@ struct GpuBackend : public LinearBackend {
     ssm_dev_.clear();
     ssm_dev_order_.clear();
     ssm_dev_mirror_.clear();
+    if(l4_z_dev_) { sycl::free(l4_z_dev_, q); l4_z_dev_ = nullptr; }
+    if(l4_nw_dev_) { sycl::free(l4_nw_dev_, q); l4_nw_dev_ = nullptr; }
+    if(l4_act_dev_) { sycl::free(l4_act_dev_, q); l4_act_dev_ = nullptr; }
+    l4_z_cap_ = l4_nw_cap_ = l4_act_cap_ = 0;
   }
   const Rotation* rot_for(const std::string& name) override {
     if(!eng) return nullptr;
@@ -1923,6 +1957,93 @@ struct GpuBackend : public LinearBackend {
 #endif
 
 #ifdef INTFER_HAS_GPU_BACKEND
+// Shared SsmDev resolver for gpu_ssm_rows and the L4 fused path below:
+// resolve (alloc/upload on first use) the resident state entry for
+// (req, L), growing staging to `need` rows. Pure move of the logic that
+// lived inline in gpu_ssm_rows (same code, same order) so both callers
+// share one map protocol (eviction writeback, dirty tracking, mirror).
+static GpuBackend::SsmDev* gpu_ssm_resolve(GpuBackend& be, sycl::queue& q,
+    const Request* req, std::vector<float>* mirror, int L,
+    uint32_t nv, uint32_t nk, uint32_t kd, uint32_t vd,
+    size_t sdim, size_t zvw, uint32_t need, bool& fresh) {
+  auto malloc_f = [&](size_t n) -> float* {
+    try {
+      return static_cast<float*>(sycl::malloc_device(n * sizeof(float),
+            q.get_device(), q.get_context()));
+    } catch (...) { return nullptr; }
+  };
+  auto malloc_b = [&](size_t nbytes) -> float* {
+    try {
+      return static_cast<float*>(sycl::malloc_device(nbytes,
+            q.get_device(), q.get_context()));
+    } catch (...) { return nullptr; }
+  };
+  std::pair<const Request*,int> key(req, L);
+  auto it = be.ssm_dev_.find(key);
+  if(it == be.ssm_dev_.end()) {
+    if(be.ssm_dev_.size() >= 256 && !be.ssm_dev_order_.empty()) {
+      // FIFO evict: write a dirty entry back first (host mirror is the
+      // re-upload source), then free.
+      auto ek = be.ssm_dev_order_.front(); be.ssm_dev_order_.pop_front();
+      auto eit = be.ssm_dev_.find(ek);
+      if(eit != be.ssm_dev_.end()) {
+        GpuBackend::SsmDev& esd = eit->second;
+        auto mit = be.ssm_dev_mirror_.find(ek);
+        if(esd.dirty && esd.ok && mit != be.ssm_dev_mirror_.end() &&
+           mit->second && mit->second->size() == sdim) {
+          try {
+            q.memcpy(mit->second->data(), esd.S, sdim * sizeof(float)).wait();
+          } catch (...) {}
+        }
+        if(esd.S) sycl::free(esd.S, q);
+        if(esd.in) sycl::free(esd.in, q);
+        if(esd.core) sycl::free(esd.core, q);
+        if(esd.ptrs) sycl::free(esd.ptrs, q);
+        be.ssm_dev_.erase(eit);
+        be.ssm_dev_mirror_.erase(ek);
+      }
+    }
+    GpuBackend::SsmDev sd;
+    sd.S = malloc_f(sdim);
+    if(!sd.S) return nullptr;
+    // Upload the CURRENT host mirror (first use may be mid-run).
+    try {
+      q.memcpy(sd.S, mirror->data(), sdim * sizeof(float)).wait();
+    } catch (...) { sycl::free(sd.S, q); return nullptr; }
+    sd.nv = nv; sd.nk = nk; sd.kd = kd; sd.vd = vd;
+    sd.ok = true; sd.dirty = false;
+    be.ssm_dev_[key] = sd;
+    be.ssm_dev_order_.push_back(key);
+    be.ssm_dev_mirror_[key] = mirror;
+    fresh = true;
+    return &be.ssm_dev_[key];
+  }
+  GpuBackend::SsmDev& sd = it->second;
+  if(!sd.ok || sd.nv != nv || sd.nk != nk || sd.kd != kd || sd.vd != vd)
+    return nullptr;
+  // Refresh the mirror pointer (same host vector for a key's lifetime,
+  // but refresh is harmless and keeps eviction writeback correct).
+  be.ssm_dev_mirror_[key] = mirror;
+  // Grow staging to the run length.
+  fresh = false;
+  if(sd.Mcap < need) {
+    float* nin = malloc_f((size_t)need * (2*(size_t)nk*kd + zvw + 2*nv));
+    float* ncore = malloc_f((size_t)need * zvw);
+    float* nptrs = malloc_b(7 * (size_t)need * sizeof(void*));
+    if(!nin || !ncore || !nptrs) {
+      if(nin) sycl::free(nin, q);
+      if(ncore) sycl::free(ncore, q);
+      if(nptrs) sycl::free(nptrs, q);
+      return nullptr;
+    }
+    if(sd.in) sycl::free(sd.in, q);
+    if(sd.core) sycl::free(sd.core, q);
+    if(sd.ptrs) sycl::free(sd.ptrs, q);
+    sd.in = nin; sd.core = ncore; sd.ptrs = nptrs;
+    sd.Mcap = need;
+  }
+  return &sd;
+}
 // M-row device-side SSM step (GpuBackend::ssm_rows impl). Defined here
 // (after Layer/Request are complete) rather than at the struct because it
 // touches ly->ssm_state.
@@ -1976,71 +2097,8 @@ static bool gpu_ssm_rows(GpuBackend& be, const SsmRow* rows, uint32_t M, int L,
   keys.clear();
   auto get_sd = [&](const Request* req, std::vector<float>* mirror, uint32_t need,
                     bool& fresh) -> GpuBackend::SsmDev* {
-    std::pair<const Request*,int> key(req, L);
-    auto it = be.ssm_dev_.find(key);
-    if(it == be.ssm_dev_.end()) {
-      if(be.ssm_dev_.size() >= 256 && !be.ssm_dev_order_.empty()) {
-        // FIFO evict: write a dirty entry back first (host mirror is the
-        // re-upload source), then free.
-        auto ek = be.ssm_dev_order_.front(); be.ssm_dev_order_.pop_front();
-        auto eit = be.ssm_dev_.find(ek);
-        if(eit != be.ssm_dev_.end()) {
-          GpuBackend::SsmDev& esd = eit->second;
-          auto mit = be.ssm_dev_mirror_.find(ek);
-          if(esd.dirty && esd.ok && mit != be.ssm_dev_mirror_.end() &&
-             mit->second && mit->second->size() == sdim) {
-            try {
-              q.memcpy(mit->second->data(), esd.S, sdim * sizeof(float)).wait();
-            } catch (...) {}
-          }
-          if(esd.S) sycl::free(esd.S, q);
-          if(esd.in) sycl::free(esd.in, q);
-          if(esd.core) sycl::free(esd.core, q);
-          if(esd.ptrs) sycl::free(esd.ptrs, q);
-          be.ssm_dev_.erase(eit);
-          be.ssm_dev_mirror_.erase(ek);
-        }
-      }
-      GpuBackend::SsmDev sd;
-      sd.S = malloc_f(sdim);
-      if(!sd.S) return nullptr;
-      // Upload the CURRENT host mirror (first use may be mid-run).
-      try {
-        q.memcpy(sd.S, mirror->data(), sdim * sizeof(float)).wait();
-      } catch (...) { sycl::free(sd.S, q); return nullptr; }
-      sd.nv = nv; sd.nk = nk; sd.kd = kd; sd.vd = vd;
-      sd.ok = true; sd.dirty = false;
-      be.ssm_dev_[key] = sd;
-      be.ssm_dev_order_.push_back(key);
-      be.ssm_dev_mirror_[key] = mirror;
-      fresh = true;
-      return &be.ssm_dev_[key];
-    }
-    GpuBackend::SsmDev& sd = it->second;
-    if(!sd.ok || sd.nv != nv || sd.nk != nk || sd.kd != kd || sd.vd != vd)
-      return nullptr;
-    // Refresh the mirror pointer (same host vector for a key's lifetime,
-    // but refresh is harmless and keeps eviction writeback correct).
-    be.ssm_dev_mirror_[key] = mirror;
-    // Grow staging to the run length.
-    fresh = false;
-    if(sd.Mcap < need) {
-      float* nin = malloc_f((size_t)need * (2*(size_t)nk*kd + zvw + 2*nv));
-      float* ncore = malloc_f((size_t)need * zvw);
-      float* nptrs = malloc_b(7 * (size_t)need * sizeof(void*));
-      if(!nin || !ncore || !nptrs) {
-        if(nin) sycl::free(nin, q);
-        if(ncore) sycl::free(ncore, q);
-        if(nptrs) sycl::free(nptrs, q);
-        return nullptr;
-      }
-      if(sd.in) sycl::free(sd.in, q);
-      if(sd.core) sycl::free(sd.core, q);
-      if(sd.ptrs) sycl::free(sd.ptrs, q);
-      sd.in = nin; sd.core = ncore; sd.ptrs = nptrs;
-      sd.Mcap = need;
-    }
-    return &sd;
+    return gpu_ssm_resolve(be, q, req, mirror, L, nv, nk, kd, vd,
+                           sdim, zvw, need, fresh);
   };
   // Host-side O(kd) per-head prep (identical to the host loop): L2-norm
   // q/k rows, scale q, form g logits. Packed per-row layout in staging:
@@ -2193,6 +2251,169 @@ static bool gpu_ssm_rows(GpuBackend& be, const SsmRow* rows, uint32_t M, int L,
     return false;
   }
   return true;
+}
+
+// L4 la_out fusion (INTFER_L4_FUSE=1, TP=1 scalar decode only): chains the
+// solo-run device SSM (ssm_forward over one row's resident state) through
+// the fused norm+silu(z)+FP16-convert kernel straight into the la_out GEMM
+// via the Engine device-act seam — one host wait + one D2H per LA layer
+// instead of SSM-wait + core D2H + host norm + convert + H2D + la_out-wait.
+// Saves vs the ssm_rows + host path: 1 D2H (core), 1 H2D (normed act), the
+// host norm + FP32->FP16 convert, and 1 wait. Costs: 1 norm-kernel submit
+// + 2 small H2D (z row, norm weights) per layer.
+// Bit-contract: SSM math is the certified ssm_forward kernel; the norm loop
+// order matches the host loop; silu uses sycl::exp (~1ulp vs host expf on
+// rare elements — same standing as the fused-MLP silu); the FP16 convert
+// is RNE bit-identical to dashq::float_to_half. The L4-vs-base stream A/B
+// in the gate section arbitrates. False keeps the host path (TP>1,
+// DPAS48 la_out, bad shapes, missing ti, trace runs).
+static bool gpu_la_out_fused(GpuBackend& be, const Request* req,
+                             std::vector<float>* mirror, int L,
+                             const float* query, const float* key,
+                             const float* value, const float* b_row,
+                             const float* a_row, const float* z,
+                             const float* ssm_norm_w, const float* dt_bias,
+                             const float* A_log, int la_out_ti,
+                             std::vector<float>& o_la) {
+  if(!be.eng || !req || !mirror || !query || !key || !value || !b_row ||
+     !a_row || !z || !ssm_norm_w || !dt_bias || !A_log || la_out_ti < 0)
+    return false;  const uint32_t nv = (uint32_t)cfg.n_v_heads;
+  const uint32_t nk = (uint32_t)cfg.n_k_heads;
+  const uint32_t kd = (uint32_t)cfg.k_head_dim;
+  const uint32_t vd = (uint32_t)cfg.v_head_dim;
+  if(nv == 0 || nk == 0 || kd == 0 || vd == 0) return false;
+  const size_t sdim = (size_t)nv * kd * vd;
+  const size_t zvw = (size_t)nv * vd;
+  if(mirror->size() != sdim) return false;
+  const uint32_t H = (uint32_t)cfg.H;
+  if(H == 0 || o_la.size() != (size_t)H) return false;
+  // TP=1 only (device acts are not cross-visible; same rule as
+  // run_mlp_fused). The devact seam re-checks; fail fast here to avoid
+  // touching device state on TP>1.
+  if(be.num_devices_ != 1) return false;
+  sycl::queue& q = be.eng->device_queue(0);
+  try {
+    // 1) Resolve the resident state entry (shared map protocol with
+    // gpu_ssm_rows: same eviction writeback + dirty tracking).
+    bool fresh = false;
+    GpuBackend::SsmDev* sd = gpu_ssm_resolve(be, q, req, mirror, L,
+        nv, nk, kd, vd, sdim, zvw, /*need=*/1, fresh);
+    if(!sd) return false;
+    if(fresh && sd->Mcap < 1) {
+      const size_t row_in = 2*(size_t)nk*kd + zvw + 2*nv;
+      sd->in = static_cast<float*>(sycl::malloc_device(row_in * sizeof(float),
+            q.get_device(), q.get_context()));
+      sd->core = static_cast<float*>(sycl::malloc_device(zvw * sizeof(float),
+            q.get_device(), q.get_context()));
+      sd->ptrs = static_cast<float*>(sycl::malloc_device(7 * sizeof(void*),
+            q.get_device(), q.get_context()));
+      if(!sd->in || !sd->core || !sd->ptrs) {
+        if(sd->in) sycl::free(sd->in, q);
+        if(sd->core) sycl::free(sd->core, q);
+        if(sd->ptrs) sycl::free(sd->ptrs, q);
+        *sd = GpuBackend::SsmDev();
+        auto key = std::make_pair(req, L);
+        be.ssm_dev_.erase(key);
+        be.ssm_dev_mirror_.erase(key);
+        return false;
+      }
+      sd->Mcap = 1;
+    }
+    // 2) Host-side O(kd) prep (identical to gpu_ssm_rows solo section):
+    // L2-norm q/k rows, scale q, form g logits; packed layout
+    // [qn(nk*kd) | kn(nk*kd) | v(nv*vd) | g(nv) | b(nv)].
+    const float qscale = 1.0f / sqrtf((float)kd);
+    const size_t row_in = 2*(size_t)nk*kd + zvw + 2*nv;
+    static thread_local std::vector<float> hin;
+    if(hin.size() < row_in) hin.assign(row_in, 0.f);
+    {
+      float* hqn = hin.data();
+      float* hkn = hin.data() + (size_t)nk * kd;
+      float* hv = hkn + (size_t)nk * kd;
+      float* hg = hv + zvw;
+      float* hb = hg + nv;
+      for(uint32_t kh = 0; kh < nk; ++kh) {
+        l2norm(&query[(size_t)kh * kd], &hqn[(size_t)kh * kd], (int)kd);
+        l2norm(&key[(size_t)kh * kd], &hkn[(size_t)kh * kd], (int)kd);
+        for(uint32_t d = 0; d < kd; ++d) hqn[(size_t)kh * kd + d] *= qscale;
+      }
+      memcpy(hv, value, zvw * sizeof(float));
+      memcpy(hb, b_row, (size_t)nv * sizeof(float));
+      for(uint32_t hh = 0; hh < nv; ++hh) {
+        float sp = log1pf(expf(a_row[hh] + dt_bias[hh]));
+        hg[hh] = -expf(A_log[hh]) * sp;
+      }
+    }
+    // 3) Grow L4 staging (z + norm weights FP32 in, fused FP16 act out).
+    auto ensure_dev = [&](float*& ptr, size_t& cap, size_t need) -> bool {
+      if(cap >= need && ptr) return true;
+      float* n = static_cast<float*>(sycl::malloc_device(need * sizeof(float),
+            q.get_device(), q.get_context()));
+      if(!n) return false;
+      if(ptr) sycl::free(ptr, q);
+      ptr = n; cap = need;
+      return true;
+    };
+    if(!ensure_dev(be.l4_z_dev_, be.l4_z_cap_, zvw)) return false;
+    if(!ensure_dev(be.l4_nw_dev_, be.l4_nw_cap_, vd)) return false;
+    if(be.l4_act_cap_ < zvw || !be.l4_act_dev_) {
+      std::uint16_t* n = static_cast<std::uint16_t*>(
+          sycl::malloc_device(zvw * sizeof(std::uint16_t),
+            q.get_device(), q.get_context()));
+      if(!n) return false;
+      if(be.l4_act_dev_) sycl::free(be.l4_act_dev_, q);
+      be.l4_act_dev_ = n; be.l4_act_cap_ = zvw;
+    }
+    // 4) Chain on-device: H2D inputs -> ssm_forward -> fused norm kernel
+    // -> la_out GEMM from the device act buffer. In-order queue observes
+    // submission order; explicit deps keep out-of-order queues correct.
+    // The devact seam performs the single host wait + D2H of o_la.
+    q.memcpy(sd->in, hin.data(), row_in * sizeof(float));
+    q.memcpy(be.l4_z_dev_, z, zvw * sizeof(float));
+    q.memcpy(be.l4_nw_dev_, ssm_norm_w, (size_t)vd * sizeof(float));
+    static thread_local std::vector<void*> hptrs;
+    if(hptrs.size() < 7) hptrs.assign(7, nullptr);
+    {
+      float* base = sd->in;
+      hptrs[0] = base;                                          // qn
+      hptrs[1] = base + (size_t)nk * kd;                        // kn
+      hptrs[2] = base + 2 * (size_t)nk * kd;                    // v
+      hptrs[3] = base + 2 * (size_t)nk * kd + zvw;              // g
+      hptrs[4] = base + 2 * (size_t)nk * kd + zvw + nv;         // b
+      hptrs[5] = sd->S;                                         // state
+      hptrs[6] = sd->core;                                      // core out
+    }
+    q.memcpy(sd->ptrs, hptrs.data(), 7 * sizeof(void*));
+    gemm::SsmParams sp;
+    const float* const* dptrs =
+        reinterpret_cast<const float* const*>(sd->ptrs);
+    float* const* dptrs_m = reinterpret_cast<float* const*>(sd->ptrs);
+    sp.qn_rows = dptrs + 0; sp.kn_rows = dptrs + 1; sp.v_rows = dptrs + 2;
+    sp.g_rows = dptrs + 3; sp.b_rows = dptrs + 4;
+    sp.s_rows = dptrs_m + 5; sp.core_rows = dptrs_m + 6;
+    sp.M = 1; sp.n_v = nv; sp.n_k = nk; sp.kd = kd; sp.vd = vd;
+    sycl::event e_ssm = gemm::ssm_forward(q, sp);
+    gemm::SsmNormParams np;
+    np.core_fp32 = sd->core;
+    np.z_fp32 = be.l4_z_dev_;
+    np.norm_w_fp32 = be.l4_nw_dev_;
+    np.act_fp16 = be.l4_act_dev_;
+    np.n_v = nv; np.vd = vd; np.rms_eps = (float)cfg.rms_eps;
+    sycl::event e_norm = gemm::ssm_norm_silu_to_half(q, np, e_ssm);
+    if(!be.eng->run_linear_tp_devact(la_out_ti, be.l4_act_dev_, o_la, 1,
+                                     e_norm))
+      return false;
+    sd->dirty = true;  // resident newer than host mirror (step: no sync)
+    static const bool l4_dbg = (std::getenv("INTFER_L4_DBG") != nullptr);
+    if(l4_dbg) {
+      static thread_local int n = 0;
+      if((++n % 24) == 1)
+        std::fprintf(stderr, "[l4] fused la_out x%d\n", n);
+    }
+    return true;
+  } catch (...) {
+    return false;
+  }
 }
 
 // Re-upload all host SSM mirrors to the device (speculative partial-accept
@@ -2895,6 +3116,30 @@ static StepOut step(Request& req, int token, int pos,
         ckpt("la.z", L, z); ckpt("la.b", L, b); ckpt("la.a", L, a);
         std::vector<float>& g = req.scratch.g;
         std::vector<float>& core = req.scratch.core;
+      // ---- L4 la_out fusion (INTFER_L4_FUSE=1, GPU TP=1 scalar decode)
+      // Chains device SSM -> fused norm+silu(z)+convert -> la_out GEMM
+      // on-device (one wait + one D2H), filling o_la directly. False keeps
+      // the ssm/host path below. Trace runs force the host path (debug
+      // diffs stay on the exact host math).
+      bool l4_done = false;
+#ifdef INTFER_HAS_GPU_BACKEND
+      {
+        static const bool l4_env = (std::getenv("INTFER_L4_FUSE") != nullptr);
+        if(l4_env && !trace_h) {
+          if(auto* gpu_be_l4 = dynamic_cast<GpuBackend*>(backend)) {
+            if(gpu_be_l4->eng) {
+              std::vector<float>& o_la_l4 = req.scratch.o_la;
+              if((int)o_la_l4.size() != cfg.H) o_la_l4.assign(cfg.H, 0.f);
+              l4_done = gpu_la_out_fused(*gpu_be_l4, &req, &ly.ssm_state, L,
+                  query, key, value, b.data(), a.data(), z.data(),
+                  ln.ssm_norm_w, dt_bias, A_log,
+                  gpu_be_l4->ti_of(ln.la_out), o_la_l4);
+            }
+          }
+        }
+      }
+#endif
+      if(!l4_done) {
       // ---- Device-side SSM (INTFER_SSM_GPU=1, GPU backend only) ----
       // Replaces the host scalar recurrence below with one FP32 SYCL
       // kernel over (n_v_heads x vd) work-items against the request's
@@ -2964,8 +3209,11 @@ static StepOut step(Request& req, int token, int pos,
         float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
         for(int i=0;i<cfg.v_head_dim;i++) o[i]=(x[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
       }
+      } // end if(!l4_done): host SSM + norm (L4 fills o_la on-device)
       std::vector<float>& o_la = req.scratch.o_la;
-      backend->run_linear_into(ln.la_out, normed_core, o_la);
+      if(!l4_done)
+        backend->run_linear_into(ln.la_out, req.scratch.normed_core, o_la);
+      // else: L4 already filled o_la on-device (normed_core/core untouched).
       const Rotation* Ro_la = backend->rot_for(ln.la_out);
       if(Ro_la){ for(int i=0;i<cfg.H;i++) h[i] = 0.f; rot_left(o_la.data(), *Ro_la, h.data()); }
       else for(int i=0;i<cfg.H;i++) h[i] = o_la[i];

@@ -349,6 +349,31 @@ Implement features for maximizing throughput for concurrent requests, starting f
   per-row for bisection. Nothing to implement; todo item cancelled.
   Verified on HEAD: cpu parity + http batch + gpu-optin (10/10) PASS,
   WAVE vs NOWAVE GPU streams identical TP1/TP2 (279 6511 314 279).
+- L4-lite IMPLEMENTED, default-off (2026-09-19, INTFER_L4_FUSE=1 opt-in):
+  second application of the fused-MLP device-act pattern, scoped to TP=1
+  scalar decode (the 40 tok/s target). Per LA layer it chains solo-run
+  ssm_forward -> fused ssm_norm_silu_to_half kernel (rms-norm + silu(z) +
+  RNE FP16 convert, same loop order as host) -> la_out GEMM via the new
+  Engine::run_linear_tp_devact seam (device FP16 act, no host convert/H2D,
+  dep-chained, single wait + single D2H). New files touched:
+  quant_gemm.hpp/cpp (SsmNormParams + kernel), engine.hpp/cpp
+  (run_linear_tp_devact: TP=1-only, FP16-act-only, no-mutation-on-false,
+  ws_[0].out alias guard), main.cpp (gpu_ssm_resolve extracted from
+  gpu_ssm_rows as a shared helper — pure move; GpuBackend L4 staging
+  buffers + ti_of; gpu_la_out_fused; step() hook with trace_h forcing the
+  host path; INTFER_L4_DBG=1 debug counter). Saves vs ssm+host path: 1
+  D2H (core) + 1 H2D (normed) + host norm/convert + 1 wait per LA layer;
+  costs 1 norm submit + 2 small H2D (z, norm-w). Correctness-gated NOW
+  (load-insensitive): L4-vs-base streams IDENTICAL TP1 n=4/16/32 (279 6511
+  314 ...), TP2 flag-vs-noflag identical (L4 silent no-op TP>1), SSM_GPU x
+  L4 4-way identical, cpu parity + http batch + gpu-optin (10/10) PASS on
+  the final binary; [l4] counter proves the path fires (72 calls/run).
+  Wall-time A/B NOT run (box load 8.78, rising — quiet rule load1<2):
+  run scripts/bench_quiet_ab.sh on a quiet box before any perf claim.
+  L0 verdict stands: raw command lists measured same-floor (27.6 vs
+  25.2us), so no L0 scaffolding was built — the multi-submit-single-wait
+  chain IS the achievable amortization on in-order UR queues, and the
+  devact seam is the prep a future batched launcher needs.
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +

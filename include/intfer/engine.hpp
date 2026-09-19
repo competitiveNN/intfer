@@ -93,6 +93,19 @@ class Engine {
   bool run_mlp_fused(int gate_ti, int up_ti, int down_ti,
                      const std::vector<float>& rin,
                      std::vector<float>& md, uint32_t M);
+
+  // Device-act GEMM seam (L4 la_out fusion): run tensor ti reading M*K FP16
+  // activation bits from a caller-owned device buffer (no host convert, no
+  // H2D), dep-chained after the producer kernel; waits once and reads back
+  // M*N FP32 rows to out. Returns false (caller keeps host path) on TP>1
+  // (device acts are not cross-visible), DPAS48 shards, or bad shapes —
+  // never partial work. The buffer must outlive the call (the wait is
+  // inside). Output staging reuses ws_[0].out, so dev_act must not alias
+  // it; otherwise any dedicated caller-owned device buffer works (same
+  // pattern as run_mlp_fused feeding ws_[0].act into the down GEMM).
+  bool run_linear_tp_devact(int tensor_index, const std::uint16_t* dev_act,
+                            std::vector<float>& out, uint32_t M,
+                            const sycl::event& dep = {});
   
   // FP16 x FP16 GEMM for non-quantized final heads (lm_head/embed).
   // C[1,N] = x[1,K] * W[N,K]^T. All row-major. Outputs FP32 logits.

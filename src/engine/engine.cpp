@@ -1253,6 +1253,90 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
   return true;
 }
 
+// Device-act GEMM seam (see engine.hpp): same FP16-act kernel as
+// run_linear_tp but the M*K activation bits come from a caller-owned device
+// buffer. Skips host FP32->FP16 convert + H2D; the dep chains after the
+// producer kernel so a device-side chain pays one host wait total.
+bool Engine::run_linear_tp_devact(int tensor_index,
+                                  const std::uint16_t* dev_act,
+                                  std::vector<float>& out, uint32_t M,
+                                  const sycl::event& dep) {
+  if (devices_.size() != 1) return false;
+  if (!dev_act || M == 0) return false;
+  if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size())
+    return false;
+  const auto& t = model_.tensors[(size_t)tensor_index];
+  const auto& ranges = shards_[tensor_index].ranges;
+  if (ranges.size() != 1) return false;
+  if (ranges[0].first != 0) return false;
+  if (t.N == 0 || t.K == 0) return false;
+  // No mutation on failure: the caller reuses its output buffer on the
+  // host fallback path, so a shape mismatch must not resize it.
+  if (out.size() != (size_t)M * t.N) return false;
+  if (!shard_cache_[(size_t)tensor_index].built &&
+      !ensure_shard_built(tensor_index))
+    return false;
+  const auto& sc = shard_cache_[(size_t)tensor_index];
+  if (sc.dpas48) return false;  // FP16-act path only; host path covers DPAS
+  if (sc.code_usm.empty() || !sc.code_usm[0]) return false;
+  if (sc.scale_usm.empty() || !sc.scale_usm[0]) return false;
+  {
+    uint32_t Nl = ranges[0].second - ranges[0].first;
+    if (Nl != t.N) return false;  // TP=1 full-row sanity
+    ensure_workspace(M, t.K, Nl);
+  }
+  // Output staging reuses ws_[0].out: reject a dev_act that aliases it
+  // (a caller chaining through the shared workspace would corrupt its own
+  // input; dedicated buffers — the L4 pattern — never hit this). Checked
+  // after ensure_workspace so the pointer is final.
+  if (ws_[0].out && dev_act >= ws_[0].out &&
+      dev_act < ws_[0].out + (size_t)ws_[0].M * ws_[0].Nl)
+    return false;
+  sycl::queue& q = devices_[0].queue;
+  float alpha = sc.has_global_divisor ? sc.global_host : 1.0f;
+#ifdef INTFER_PROFILE_GPU
+  auto t_s0 = std::chrono::high_resolution_clock::now();
+#endif
+  sycl::event e = gemm::quant_gemm_forward_usm(q,
+      const_cast<std::uint16_t*>(dev_act),
+      sc.code_usm[0], sc.scale_usm[0], alpha, ws_[0].out,
+      M, t.N, t.K, sc.group_size, sc.scheme, dep);
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_submit_us += std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+  }
+  auto t_wb0 = std::chrono::high_resolution_clock::now();
+#endif
+  e.wait();
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_waitblock_us += std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
+  }
+  g_gpu_profile.wait_count += 1;
+  try {
+    auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
+    auto t1 = e.get_profiling_info<sycl::info::event_profiling::command_end>();
+    g_gpu_profile.total_kernel_us += (double)(t1 - t0) / 1000.0;
+    g_gpu_profile.kernel_count++;
+  } catch (...) {}
+  auto t_rb0 = std::chrono::high_resolution_clock::now();
+#endif
+  const std::uint16_t* out_ptr = ws_[0].out;
+  for (uint32_t m = 0; m < M; ++m)
+    dashq::half_to_float_batch(out_ptr + (size_t)m * t.N,
+                               out.data() + (size_t)m * t.N, t.N);
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_readback_us += std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
+    g_gpu_profile.readback_count++;
+  }
+#endif
+  return true;
+}
+
 // Wave variant: one independent GEMM per item (see engine.hpp). Phases:
 // (1) per item: lazy shard build + FP32->FP16 convert + per-device act
 // memcpy into that item's wave slot; (2) per device: submit all items'

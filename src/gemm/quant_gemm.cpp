@@ -1264,4 +1264,39 @@ sycl::event silumul_to_half(sycl::queue& q, const SiluMulParams& p,
   });
 }
 
+sycl::event ssm_norm_silu_to_half(sycl::queue& q, const SsmNormParams& p,
+                                   const sycl::event& dep) {
+  const float* core = p.core_fp32;
+  const float* z = p.z_fp32;
+  const float* w = p.norm_w_fp32;
+  std::uint16_t* act = p.act_fp16;
+  const std::uint32_t n_v = p.n_v, vd = p.vd;
+  const float eps = p.rms_eps;
+  if (!core || !z || !w || !act || n_v == 0 || vd == 0)
+    return sycl::event{};
+  const std::uint32_t nWG = 32;
+  const std::uint32_t global = ((n_v + nWG - 1) / nWG) * nWG;
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(dep);
+    h.parallel_for<class ssm_norm_silu_to_half_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) {
+          const std::uint32_t hh = it.get_global_id(0);
+          if (hh >= n_v) return;
+          const float* xx = core + (size_t)hh * vd;
+          const float* zg = z + (size_t)hh * vd;
+          std::uint16_t* oo = act + (size_t)hh * vd;
+          // Same order as the host LA norm loop: sum squares, then
+          // elementwise normalize * norm_w * silu(z).
+          float v = 0.0f;
+          for (std::uint32_t i = 0; i < vd; ++i) v += xx[i] * xx[i];
+          const float inv = 1.0f / sycl::sqrt(v / (float)vd + eps);
+          for (std::uint32_t i = 0; i < vd; ++i) {
+            const float s = zg[i] / (1.0f + sycl::exp(-zg[i]));
+            oo[i] = dev_float_to_half((xx[i] * inv) * w[i] * s);
+          }
+        });
+  });
+}
+
 }  // namespace intfer::gemm
