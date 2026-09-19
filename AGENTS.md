@@ -406,6 +406,17 @@ Implement features for maximizing throughput for concurrent requests, starting f
   decode fires the fused chain; the -n64 quiet A/B will show whether the
   submit/usm_write savings (-30%/-12% in buckets, contention noise aside)
   convert to tok/s.
+- nk accounting matrix VALIDATED (2026-09-19, TP1/TP2 x BASE/SSM/L4/BOTH,
+  -n8 decode, counters only — load 4-5, no wall-time read): all 8 streams
+  identical (6511 314 279 3046 13 198 760 6511). TP1: BASE 1680, SSM 1824
+  (+144 = 18 LA x 8 tok x 1 SSM), L4 1968 (+288 = x2, SSM+norm), BOTH 1968
+  (L4 subsumes the SSM launch — no double-SSM, shared SsmDev residency
+  confirmed in counters). TP2: BASE 2976 (= 2 x 1488? — per-device GEMM
+  launches counted per shard while SSM stays single-queue; do NOT read
+  TP2 nk as 2x work), SSM 3120 (+144, same single-queue SSM delta),
+  L4/BOTH 2976/3120 (L4 silent no-op TP>1 — zero fused launches, the
+  TP=1-only guard proven in the counter, not just in streams). The
+  counters now decompose every launch source on the decode path.
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +
