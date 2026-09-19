@@ -417,6 +417,28 @@ Implement features for maximizing throughput for concurrent requests, starting f
   L4/BOTH 2976/3120 (L4 silent no-op TP>1 — zero fused launches, the
   TP=1-only guard proven in the counter, not just in streams). The
   counters now decompose every launch source on the decode path.
+- L4 M-row serve fusion IMPLEMENTED, default-off (2026-09-19, fcbade9,
+  same INTFER_L4_FUSE=1 flag, TP1 only): supersedes the "M>1 deliberately
+  NOT fused" note above — step_batch LA layers with M>1 now route through
+  gpu_la_out_fused_batch (one cross-key ssm_forward over M distinct
+  (req,layer) states via a gathered pointer table + one M-row
+  ssm_norm_silu_to_half_m kernel + one M-row devact la_out GEMM) instead
+  of ssm_rows + host norm + M-row la_out. Shared-state rows (same-request
+  prefill runs in joint batches) and TP>1/DPAS48/bad shapes decline
+  inside the callee to the standard path. The M>1 precondition that made
+  the old verdict ("needs device-resident cores") is met by staging a
+  contiguous M-row core block + pointer table in GpuBackend L4 buffers
+  (grow-only, freed in dtor). Cost per LA layer: 1 SSM submit + 1 norm
+  submit + seam GEMM submits (vs ssm_rows solos + host norm/convert +
+  H2D + la_out-wait); host work unchanged (M x O(kd) q/k prep + 2 small
+  H2D). Gates (all PASS, load-insensitive): 3-way concurrent serve batch
+  L4-vs-base byte-identical (M=2/M=3 fused-batch fired in [l4] counters),
+  scalar streams identical TP1/TP2 (279 6511 314 279 3046 13 198 760),
+  cpu parity + http batch (4.12 tok/s) + gpu-optin 10/10 on the final
+  binary. Debug: INTFER_L4_DBG=1 prints per-path counters ([l4] fused
+  la_out / fused batch la_out M=%u). Wall-time A/B NOT run (box load
+  ~6 — quiet rule load1<2): scripts/bench_quiet_l4_ab.sh running in
+  background, gated on quiet.
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +
