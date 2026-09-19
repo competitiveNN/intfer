@@ -3481,15 +3481,18 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       const Rotation* Rk = backend->rot_for(ln.k);
       const Rotation* Rv = backend->rot_for(ln.v);
       need_rows(c_x, Hdim);
+      // Rotate directly into each wave input (no staging copy: c_x was
+      // only a scratch relay and rot_apply fully overwrites its target).
+      std::vector<float> c_q_in, c_kv_in, c_v_in;
+      need_rows(c_q_in, Hdim); need_rows(c_kv_in, Hdim); need_rows(c_v_in, Hdim);
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &c_q_in[(size_t)m*Hdim];
         if(Rq) rot_apply(nr, *Rq, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       need_rows(c_qp, qrows2);
-      std::vector<float> c_q_in = c_x; // copy of rotated-q inputs
-      // (c_x is reused for k/v staging below). q joins the k/v wave
-      // below (wave-3); packed_gate is resolved after the wave fills c_qp.
+      // (q joins the k/v wave below (wave-3); packed_gate is resolved
+      // after the wave fills c_qp.
       // Per-row q/gate split + q_norm + rope, staged into c_qpart rows.
       need_rows(c_k, kvrows); need_rows(c_v, kvrows);
       static thread_local std::vector<float> c_qpart, c_gate;
@@ -3497,16 +3500,14 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       // k/v rotated inputs share one staging buffer (consumed per GEMM).
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &c_kv_in[(size_t)m*Hdim];
         if(Rk) rot_apply(nr, *Rk, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
-      std::vector<float> c_kv_in = c_x; // copy of rotated-k inputs
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &c_v_in[(size_t)m*Hdim];
         if(Rv) rot_apply(nr, *Rv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
-      std::vector<float> c_v_in = c_x; // copy of rotated-v inputs
       // Wave-3 batch: q/k/v are independent (all derive from normed;
       // q's split/norm/rope consumers run below, after the wave) — one
       // engine call converts + submits all three back-to-back with one
@@ -3695,27 +3696,28 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       const Rotation* Rb = backend->rot_for(ln.b);
       const Rotation* Ra = backend->rot_for(ln.a);
       need_rows(c_x, Hdim);
+      // Rotate directly into each wave input (no staging copy: c_x was
+      // only a scratch relay and rot_apply fully overwrites its target).
+      // The final (a) rotation stays in c_x and feeds the wave directly.
+      std::vector<float> c_qkv_in, c_z_in, c_b_in;
+      need_rows(c_qkv_in, Hdim); need_rows(c_z_in, Hdim); need_rows(c_b_in, Hdim);
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &c_qkv_in[(size_t)m*Hdim];
         if(Rqkv) rot_apply(nr, *Rqkv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       need_rows(c_mqkv, cfg.conv_dim);
-      std::vector<float> c_qkv_in = c_x; // copy of rotated-qkv inputs
-      // (c_x is reused for z/b/a staging below). qkv joins the z/b/a
-      // wave below (wave-4).
+      // (qkv joins the z/b/a wave below (wave-4).
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &c_z_in[(size_t)m*Hdim];
         if(Rz) rot_apply(nr, *Rz, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
-      std::vector<float> c_z_in = c_x;
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &c_b_in[(size_t)m*Hdim];
         if(Rb) rot_apply(nr, *Rb, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
-      std::vector<float> c_b_in = c_x;
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
         float* xr = &c_x[(size_t)m*Hdim];
@@ -4141,30 +4143,31 @@ static std::vector<StepOut> step_batch(
       const Rotation* Rk = backend->rot_for(ln.k);
       const Rotation* Rv = backend->rot_for(ln.v);
       need_rows(c_x, Hdim);
+      // Rotate directly into each wave input (no staging copy: c_x was
+      // only a scratch relay and rot_apply fully overwrites its target).
+      std::vector<float> b_q_in, c_kv_in, c_v_in;
+      need_rows(b_q_in, Hdim); need_rows(c_kv_in, Hdim); need_rows(c_v_in, Hdim);
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &b_q_in[(size_t)m*Hdim];
         if(Rq) rot_apply(nr, *Rq, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       need_rows(c_qp, qrows2);
-      std::vector<float> b_q_in = c_x; // copy of rotated-q inputs
-      // (c_x is reused for k/v staging below). q joins the k/v wave
-      // below (wave-3); packed_gate is resolved after the wave fills c_qp.
+      // (q joins the k/v wave below (wave-3); packed_gate is resolved
+      // after the wave fills c_qp.
       need_rows(c_k, kvrows); need_rows(c_v, kvrows);
       static thread_local std::vector<float> b_qpart, b_gate;
       need_rows(b_qpart, qrows); need_rows(b_gate, qrows);
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &c_kv_in[(size_t)m*Hdim];
         if(Rk) rot_apply(nr, *Rk, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
-      std::vector<float> c_kv_in = c_x;
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &c_v_in[(size_t)m*Hdim];
         if(Rv) rot_apply(nr, *Rv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
-      std::vector<float> c_v_in = c_x;
       // Wave-3 batch: q/k/v are independent (all derive from normed;
       // q's split/norm/rope consumers run below, after the wave) — one
       // engine call, one host round-trip. Bit-identical to three
@@ -4334,27 +4337,28 @@ static std::vector<StepOut> step_batch(
       const Rotation* Rb = backend->rot_for(ln.b);
       const Rotation* Ra = backend->rot_for(ln.a);
       need_rows(c_x, Hdim);
+      // Rotate directly into each wave input (no staging copy: c_x was
+      // only a scratch relay and rot_apply fully overwrites its target).
+      // The final (a) rotation stays in c_x and feeds the wave directly.
+      std::vector<float> b_qkv_in, c_z_in, c_b_in;
+      need_rows(b_qkv_in, Hdim); need_rows(c_z_in, Hdim); need_rows(c_b_in, Hdim);
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &b_qkv_in[(size_t)m*Hdim];
         if(Rqkv) rot_apply(nr, *Rqkv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
       need_rows(b_mqkv, cfg.conv_dim);
-      std::vector<float> b_qkv_in = c_x; // copy of rotated-qkv inputs
-      // (c_x is reused for z/b/a staging below). qkv joins the z/b/a
-      // wave below (wave-4).
+      // (qkv joins the z/b/a wave below (wave-4).
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &c_z_in[(size_t)m*Hdim];
         if(Rz) rot_apply(nr, *Rz, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
-      std::vector<float> c_z_in = c_x;
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_x[(size_t)m*Hdim];
+        float* xr = &c_b_in[(size_t)m*Hdim];
         if(Rb) rot_apply(nr, *Rb, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
       }
-      std::vector<float> c_b_in = c_x;
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
         float* xr = &c_x[(size_t)m*Hdim];
