@@ -55,6 +55,11 @@ add_library(intfer_quant_core STATIC quant_spec.cpp spinquant.cpp
 target_include_directories(intfer_quant_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(intfer_quant_core PUBLIC intfer_common)
 
+# intfer_gemm's fused kernels report launches to the engine profiler.
+if(INTFER_PROFILE_GPU)
+  target_compile_definitions(intfer_gemm PUBLIC INTFER_PROFILE_GPU)
+endif()
+
 add_library(intfer_engine STATIC engine/engine.cpp)
 target_include_directories(intfer_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(intfer_engine PUBLIC intfer_common intfer_device

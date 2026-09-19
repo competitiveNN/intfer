@@ -1559,6 +1559,9 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
             g_gpu_profile.copy_count, g_gpu_profile.readback_count};
   }
   void reset_gpu_profile() { g_gpu_profile = GpuProfile{}; }
+  namespace gemm {
+  void profile_note_launch() { g_gpu_profile.kernel_count++; }
+  }  // namespace gemm
 #endif
 
 void Engine::run_linear_f16_tp(const sycl::half* x, const sycl::half* w,

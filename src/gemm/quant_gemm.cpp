@@ -769,7 +769,7 @@ sycl::event quant_gemm_dpas_int8(sycl::queue& q,
   using namespace sycl;
   using namespace sycl::ext::intel::esimd;
   using namespace sycl::ext::intel::esimd::xmx;
-  using namespace intfer::gemm;
+  using namespace gemm;
 
   constexpr int SD = 8;  // systolic depth
   constexpr int RC = 8;  // repeat count -> _M = 8
@@ -1076,8 +1076,10 @@ sycl::event quant_gemm_dpas_s8w(sycl::queue& q, const Dpas48Params& p) {
 // Device-side Gated-DeltaNet SSM recurrent update (Stage 3 GPU offload).
 // ---------------------------------------------------------------------------
 sycl::event ssm_forward(sycl::queue& q, const SsmParams& p) {
-  const uint32_t M = p.M, n_v = p.n_v, n_k = p.n_k;
-  const uint32_t kd = p.kd, vd = p.vd;
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
+  const uint32_t M = p.M, n_v = p.n_v, n_k = p.n_k;  const uint32_t kd = p.kd, vd = p.vd;
   const uint32_t nWG = 32;
   const uint32_t n_blocks = M * n_v * vd;
   const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
@@ -1133,6 +1135,9 @@ sycl::event ssm_forward(sycl::queue& q, const SsmParams& p) {
 // Chained variant: one WI per (head hh, v-col c); the M rows share one
 // state and run sequentially in row order (order-dependent recurrence).
 sycl::event ssm_forward_chain(sycl::queue& q, const SsmChainParams& p) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
   const uint32_t M = p.M, n_v = p.n_v, n_k = p.n_k;
   const uint32_t kd = p.kd, vd = p.vd, rs = p.row_stride;
   const uint32_t nWG = 32;
@@ -1266,6 +1271,9 @@ sycl::event silumul_to_half(sycl::queue& q, const SiluMulParams& p,
 
 sycl::event ssm_norm_silu_to_half(sycl::queue& q, const SsmNormParams& p,
                                    const sycl::event& dep) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
   const float* core = p.core_fp32;
   const float* z = p.z_fp32;
   const float* w = p.norm_w_fp32;

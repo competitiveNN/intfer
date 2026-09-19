@@ -388,11 +388,24 @@ Implement features for maximizing throughput for concurrent requests, starting f
   ([l4] fires on the serve path, BASE counter 0), TP2 flag/no-flag
   identical (silent no-op), SSM_GPU x L4 4-way CLI identical, SSM_GPU+L4
   serve stream identical to base (shared SsmDev residency consistent when
-  mixing), cpu parity + http batch (with L4 ON: single/batch/SSE/serial
+  mixing),   cpu parity + http batch (with L4 ON: single/batch/SSE/serial
   all PASS, oracle Paris) + gpu-optin 10/10. Wall-time A/B NOT run (box
   load 5.58 — quiet rule load1<2): run scripts/bench_quiet_l4_ab.sh on a
   quiet box before any perf claim (new script; covers CLI decode TP1 -n64
   + chunk361 no-op guard).
+- Profiler blind spot FIXED (2026-09-19, profile_note_launch): SSM/norm
+  kernels submit directly through quant_gemm free functions, so their
+  launches never reached the [GPU profile] nk counter (L4-vs-base decode
+  showed nk=1680 both ways while submit dropped 91->64ms — invisible
+  work). ssm_forward/chain + ssm_norm_silu_to_half now count one launch
+  each via intfer::gemm::profile_note_launch (defined in engine.cpp,
+  zero-cost when profiling is off; intfer_gemm gets INTFER_PROFILE_GPU in
+  src/CMakeLists.txt). Re-run TP1 -n8: prefill nk=210 both (L4 no-op,
+  exact), decode BASE nk=1680 vs L4 nk=1968 = +288 = 18 LA layers x 8
+  tokens x (1 SSM + 1 norm), streams identical. The +288 proves the whole
+  decode fires the fused chain; the -n64 quiet A/B will show whether the
+  submit/usm_write savings (-30%/-12% in buckets, contention noise aside)
+  convert to tok/s.
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +

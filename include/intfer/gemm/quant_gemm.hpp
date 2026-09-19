@@ -319,6 +319,16 @@ struct SsmChainParams {
 // One WI per (head hh, v-col c), kd-serial, m-sequential inner loop.
 sycl::event ssm_forward_chain(sycl::queue& q, const SsmChainParams& p);
 
+// Fused-launch accounting: the quantized GEMM path (engine.cpp) counts its
+// own launches, but SSM/norm kernels submit directly through these free
+// functions, so their launches are invisible to the [GPU profile] nk
+// counter. Any submitter calls this exactly once per q.submit it issues
+// (guarded by INTFER_PROFILE_GPU at the call site; the definition lives in
+// engine.cpp next to g_gpu_profile). Zero-cost when profiling is off.
+#ifdef INTFER_PROFILE_GPU
+void profile_note_launch();
+#endif
+
 // ---------------------------------------------------------------------------
 // Device-side fused silu-mul + FP32->FP16 convert (MLP down-act fusion).
 //
