@@ -2665,8 +2665,33 @@ static StepOut step(Request& req, int token, int pos,
       // when Rq is present (else-branch preserves the no-rotation path).
       if(Rq) rot_apply(normed.data(), *Rq, xq.data());
       else for(int i=0;i<cfg.H;i++) xq[i] = normed[i];
+      const Rotation* Rk = backend->rot_for(ln.k);
+      const Rotation* Rv = backend->rot_for(ln.v);
+      std::vector<float>& xk = req.scratch.xk;
+      std::vector<float>& xv = req.scratch.xv;
+      // Fusion: rot_apply fully overwrites; pre-copy only for !R path.
+      if(Rk) rot_apply(normed.data(), *Rk, xk.data());
+      else for(int i=0;i<cfg.H;i++) xk[i] = normed[i];
+      if(Rv) rot_apply(normed.data(), *Rv, xv.data());
+      else for(int i=0;i<cfg.H;i++) xv[i] = normed[i];
       std::vector<float>& qp = req.scratch.qp;
-      backend->run_linear_into(ln.q, xq, qp);
+      std::vector<float>& k = req.scratch.k;
+      std::vector<float>& v = req.scratch.v;
+      size_t qrows = (size_t)cfg.n_heads * cfg.head_dim;
+      // Wave-3: q/k/v are independent (all derive from normed + rotations;
+      // qp's split/norm/rope consumers run below, after the wave) — one
+      // engine call converts + submits all three back-to-back and waits
+      // once. Bit-identical to run_linear_into + 2-wave (same kernels,
+      // same buffers, only submit/wait grouping changes). Saves 1 host
+      // wait per full-attn layer vs q-sequential + k/v wave.
+      {
+        LinearBackend::LinearWaveItem items[3] = {
+          {ln.q, &xq, &qp},
+          {ln.k, &xk, &k},
+          {ln.v, &xv, &v},
+        };
+        backend->run_linear_wave(items, 3);
+      }
       ckpt("attn.q_proj", L, qp);
       // q/gate split. Both known models pack q+gate per-head interleaved:
       // rows = 2*n_heads*head_dim (0.8B: 2*8*256=4096; 27B: 2*24*256=12288;
@@ -2674,7 +2699,6 @@ static StepOut step(Request& req, int token, int pos,
       // are q, second are gate. The !packed_gate branch is a defensive
       // fallback for q-only layouts (o_proj then takes attn concat gate).
       // Detect by comparing qp.size() against 2*n_heads*head_dim.
-      size_t qrows = (size_t)cfg.n_heads * cfg.head_dim;
       bool packed_gate = (qp.size() >= 2 * qrows);
       if(!packed_gate && qp.size() < qrows){
         std::fprintf(stderr, "[intfer] FATAL L=%d q_proj short: %zu < %zu; aborting\n",
@@ -2697,28 +2721,6 @@ static StepOut step(Request& req, int token, int pos,
         // in-place is bit-identical (kills tmp[] + memcpy per head).
         rmsnorm(&qpart[hh*cfg.head_dim], ly.q_norm_w, &qpart[hh*cfg.head_dim], cfg.head_dim);
         rope(&qpart[hh*cfg.head_dim], pos);
-      }
-      const Rotation* Rk = backend->rot_for(ln.k);
-      const Rotation* Rv = backend->rot_for(ln.v);
-      std::vector<float>& xk = req.scratch.xk;
-      std::vector<float>& xv = req.scratch.xv;
-      // Fusion: rot_apply fully overwrites; pre-copy only for !R path.
-      if(Rk) rot_apply(normed.data(), *Rk, xk.data());
-      else for(int i=0;i<cfg.H;i++) xk[i] = normed[i];
-      if(Rv) rot_apply(normed.data(), *Rv, xv.data());
-      else for(int i=0;i<cfg.H;i++) xv[i] = normed[i];
-      std::vector<float>& k = req.scratch.k;
-      std::vector<float>& v = req.scratch.v;
-      // Wave: k/v share the normed input (distinct rotations pre-applied)
-      // and are independent — one engine call, one host round-trip.
-      // Bit-identical to two run_linear_into (same kernels, same buffers).
-      // (q stays sequential: its split/norm/rope consumers run above.)
-      {
-        LinearBackend::LinearWaveItem items[2] = {
-          {ln.k, &xk, &k},
-          {ln.v, &xv, &v},
-        };
-        backend->run_linear_wave(items, 2);
       }
       ckpt("attn.k_proj", L, k); ckpt("attn.v_proj", L, v);
       for(int hh=0; hh<cfg.n_kv; hh++){
@@ -2841,23 +2843,7 @@ static StepOut step(Request& req, int token, int pos,
         if(Rqkv) rot_apply(normed.data(), *Rqkv, xqkv.data());
         else for(int i=0;i<cfg.H;i++) xqkv[i] = normed[i];
         std::vector<float>& mqkv = req.scratch.mqkv;
-        backend->run_linear_into(ln.qkv, xqkv, mqkv);
-        ckpt("la.qkv", L, mqkv);
         std::vector<float>& conv_out = req.scratch.conv_out;
-      for(int c=0;c<cfg.conv_dim;c++){
-        float s=0;
-        s+=conv_w[c*cfg.conv_k+0]*ly.conv_state[c*3+0];
-        s+=conv_w[c*cfg.conv_k+1]*ly.conv_state[c*3+1];
-        s+=conv_w[c*cfg.conv_k+2]*ly.conv_state[c*3+2];
-        s+=conv_w[c*cfg.conv_k+3]*mqkv[c];
-        conv_out[c]=silu(s);
-        ly.conv_state[c*3+0]=ly.conv_state[c*3+1];
-        ly.conv_state[c*3+1]=ly.conv_state[c*3+2];
-        ly.conv_state[c*3+2]=mqkv[c];
-      }
-      float* query=conv_out.data();
-      float* key=conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
-      float* value=conv_out.data()+2*cfg.k_head_dim*cfg.n_k_heads;
         const Rotation* Rz = backend->rot_for(ln.z);
         const Rotation* Rb = backend->rot_for(ln.b);
         const Rotation* Ra = backend->rot_for(ln.a);
@@ -2874,19 +2860,36 @@ static StepOut step(Request& req, int token, int pos,
         std::vector<float>& z = req.scratch.z;
         std::vector<float>& b = req.scratch.b;
         std::vector<float>& a = req.scratch.a;
-        // Wave: z/b/a are independent (all derive from normed; qkv ran
-        // above and feeds conv_state, so it cannot join the wave) — one
-        // engine call converts + submits all three back-to-back and waits
-        // once. Bit-identical to three run_linear_into calls (same kernels,
-        // same buffers). INTFER_NO_WAVE=1 restores sequential calls.
+        // Wave-4: qkv/z/b/a are independent (all derive from normed;
+        // mqkv's conv consumer runs below, after the wave) — one engine
+        // call converts + submits all four back-to-back and waits once.
+        // Bit-identical to run_linear_into + 3-wave (same kernels, same
+        // buffers, only submit/wait grouping changes). Saves 1 host wait
+        // per LA layer vs qkv-sequential + z/b/a wave.
         {
-          LinearBackend::LinearWaveItem items[3] = {
+          LinearBackend::LinearWaveItem items[4] = {
+            {ln.qkv, &xqkv, &mqkv},
             {ln.z, &xz, &z},
             {ln.b, &xb, &b},
             {ln.a, &xa, &a},
           };
-          backend->run_linear_wave(items, 3);
+          backend->run_linear_wave(items, 4);
         }
+        ckpt("la.qkv", L, mqkv);
+      for(int c=0;c<cfg.conv_dim;c++){
+        float s=0;
+        s+=conv_w[c*cfg.conv_k+0]*ly.conv_state[c*3+0];
+        s+=conv_w[c*cfg.conv_k+1]*ly.conv_state[c*3+1];
+        s+=conv_w[c*cfg.conv_k+2]*ly.conv_state[c*3+2];
+        s+=conv_w[c*cfg.conv_k+3]*mqkv[c];
+        conv_out[c]=silu(s);
+        ly.conv_state[c*3+0]=ly.conv_state[c*3+1];
+        ly.conv_state[c*3+1]=ly.conv_state[c*3+2];
+        ly.conv_state[c*3+2]=mqkv[c];
+      }
+      float* query=conv_out.data();
+      float* key=conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
+      float* value=conv_out.data()+2*cfg.k_head_dim*cfg.n_k_heads;
         ckpt("la.z", L, z); ckpt("la.b", L, b); ckpt("la.a", L, a);
         std::vector<float>& g = req.scratch.g;
         std::vector<float>& core = req.scratch.core;
