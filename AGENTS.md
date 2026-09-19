@@ -194,9 +194,10 @@ Implement features for maximizing throughput for concurrent requests, starting f
   designed — grow-only workspaces). DPAS-enforce + SYCL-graphs + L0-P2P
   are measured dead-ends above (do not retry as-is). INT8-KV
   (INTFER_INT8_KV / INTFER_KV_Q8) + SSM-chain (ssm_forward_chain via
-  INTFER_SSM_GPU) exist as opt-in paths but serve UNVERIFIED vs oracle —
-  next lever candidates; need quiet box (load<2) + cpu parity + http
-  batch gates before any wall-time claim.
+  INTFER_SSM_GPU) exist as opt-in paths, certified stream-identical on
+  GPU by scripts/test_gpu_optin.sh (10/10: base/KV/Q8/Q8+HAD/SSM_GPU x
+  TP1/TP2, .intifer stream 279/6511/314/279) — wall-time comparison
+  still needs quiet box (load<2).
 - Wave-submit + vectorized host math (2026-09-18, wave 7d7ca72, AVX2
   5285b47, extended a78e99f, quantified on quiet box loadavg<2): z/b/a +
   gate/up + full-attn k/v GEMMs convert+submit back-to-back, one wait
