@@ -343,6 +343,12 @@ Implement features for maximizing throughput for concurrent requests, starting f
   fused FP16-convert rounding); do it only together with batched
   multi-launch L0 lists (same seam work amortizes both). Standalone
   INTFER_SSM_GPU=1 stays default-off.
+- lm_head audit (2026-09-19): step_batch/serve scoring is ALREADY M-row
+  batched — run_lm_head_batch (main.cpp:1174, M>1) does one launch per
+  device tile instead of M scalar calls; INTFER_LMHEAD_BATCH=0 restores
+  per-row for bisection. Nothing to implement; todo item cancelled.
+  Verified on HEAD: cpu parity + http batch + gpu-optin (10/10) PASS,
+  WAVE vs NOWAVE GPU streams identical TP1/TP2 (279 6511 314 279).
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +
