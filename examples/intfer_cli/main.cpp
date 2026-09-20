@@ -1981,10 +1981,21 @@ struct GpuBackend : public LinearBackend {
   float* l5_mqkv_dev_ = nullptr;     // [l5_cdim_] FP32 qkv rows (prep in)
   float* l5_b_dev_ = nullptr;        // [l5_nv_] FP32 b row (prep in)
   float* l5_a_dev_ = nullptr;        // [l5_nv_] FP32 a row (prep in)
-  float* l5_cw_dev_ = nullptr;       // [l5_cw_cap_] FP32 conv weights (per layer)
-  size_t l5_cw_cap_ = 0;
-  float* l5_dtb_dev_ = nullptr;      // [l5_nv_] FP32 dt_bias (per layer)
-  float* l5_alog_dev_ = nullptr;     // [l5_nv_] FP32 A_log (per layer)
+  // L5 per-layer constant cache: conv_w/dt_bias/A_log/kinds are model-fixed
+  // per layer but were H2D-uploaded every token (4 submits/layer of pure
+  // resend). Cached per layer, validated by (source pointer, size); a
+  // mismatch re-uploads. Grow-only; freed in the dtor below.
+  struct L5Const {
+    float* cw = nullptr;             // [cw_n] device conv weights
+    float* dtb = nullptr;            // [da_n] device dt_bias
+    float* alog = nullptr;           // [da_n] device A_log
+    const float* cw_src = nullptr;   // host validation
+    const float* dtb_src = nullptr;
+    const float* alog_src = nullptr;
+    size_t cw_n = 0, da_n = 0;
+    std::uint8_t kinds[4] = {9, 9, 9, 9};  // host copy (9 = never uploaded)
+  };
+  std::vector<L5Const> l5c_;         // indexed by layer
   float* l5_pack_dev_ = nullptr;     // [l5_pack_cap_] FP32 prep packed out
   size_t l5_pack_cap_ = 0;           // (row_in + conv_dim scratch tail)
   size_t l5_cdim_ = 0, l5_zvw_ = 0, l5_nv_ = 0;
@@ -2028,12 +2039,16 @@ struct GpuBackend : public LinearBackend {
     if(l5_mqkv_dev_) { sycl::free(l5_mqkv_dev_, q); l5_mqkv_dev_ = nullptr; }
     if(l5_b_dev_) { sycl::free(l5_b_dev_, q); l5_b_dev_ = nullptr; }
     if(l5_a_dev_) { sycl::free(l5_a_dev_, q); l5_a_dev_ = nullptr; }
-    if(l5_cw_dev_) { sycl::free(l5_cw_dev_, q); l5_cw_dev_ = nullptr; }
-    if(l5_dtb_dev_) { sycl::free(l5_dtb_dev_, q); l5_dtb_dev_ = nullptr; }
-    if(l5_alog_dev_) { sycl::free(l5_alog_dev_, q); l5_alog_dev_ = nullptr; }
     if(l5_pack_dev_) { sycl::free(l5_pack_dev_, q); l5_pack_dev_ = nullptr; }
     if(l5_kind_dev_) { sycl::free(l5_kind_dev_, q); l5_kind_dev_ = nullptr; }
-    l5_H_ = l5_cdim_ = l5_zvw_ = l5_nv_ = l5_cw_cap_ = l5_pack_cap_ = 0;
+    for(auto& lc : l5c_) {
+      if(lc.cw) sycl::free(lc.cw, q);
+      if(lc.dtb) sycl::free(lc.dtb, q);
+      if(lc.alog) sycl::free(lc.alog, q);
+      lc = L5Const();
+    }
+    l5c_.clear();
+    l5_H_ = l5_cdim_ = l5_zvw_ = l5_nv_ = l5_pack_cap_ = 0;
     l5_act_cap_ = 0;
   }
   const Rotation* rot_for(const std::string& name) override {
@@ -3601,10 +3616,44 @@ static bool gpu_l5_front(GpuBackend& be, const Request* req, int L,
     if(!ensure_hn(be.l5_a_out_, be.l5_nv_, nv)) L5_DECLINE("alloc");
     if(!ensure_f(be.l5_b_dev_, be.l5_nv_, nv)) L5_DECLINE("alloc");
     if(!ensure_f(be.l5_a_dev_, be.l5_nv_, nv)) L5_DECLINE("alloc");
-    if(!ensure_f(be.l5_cw_dev_, be.l5_cw_cap_, (size_t)cdim * (size_t)ck))
-      L5_DECLINE("alloc");
-    if(!ensure_f(be.l5_dtb_dev_, be.l5_nv_, nv)) L5_DECLINE("alloc");
-    if(!ensure_f(be.l5_alog_dev_, be.l5_nv_, nv)) L5_DECLINE("alloc");
+    // Per-layer constant cache (conv_w/dt_bias/A_log/kinds): model-fixed per
+    // layer, so upload once and skip the 4 resend submits on later tokens.
+    // Validated by (source pointer, size); any mismatch re-uploads. L is the
+    // stable model layer index, so the entry is valid across steps/requests.
+    if(L < 0) L5_DECLINE("layer-range");
+    if((size_t)L >= be.l5c_.size()) be.l5c_.resize((size_t)L + 1);
+    GpuBackend::L5Const& lc = be.l5c_[(size_t)L];
+    const size_t cw_n = (size_t)cdim * (size_t)ck;
+    if(!lc.cw || lc.cw_src != ln.conv_w || lc.cw_n != cw_n) {
+      float* n = static_cast<float*>(sycl::malloc_device(
+            cw_n * sizeof(float), q.get_device(), q.get_context()));
+      if(!n) L5_DECLINE("alloc");
+      try {
+        q.memcpy(n, ln.conv_w, cw_n * sizeof(float)).wait();
+      } catch (...) { sycl::free(n, q); L5_DECLINE("const-upload"); }
+      if(lc.cw) sycl::free(lc.cw, q);
+      lc.cw = n; lc.cw_src = ln.conv_w; lc.cw_n = cw_n;
+    }
+    if(!lc.dtb || lc.dtb_src != ln.dt_bias || lc.da_n != nv) {
+      float* n = static_cast<float*>(sycl::malloc_device(
+            (size_t)nv * sizeof(float), q.get_device(), q.get_context()));
+      if(!n) L5_DECLINE("alloc");
+      try {
+        q.memcpy(n, ln.dt_bias, (size_t)nv * sizeof(float)).wait();
+      } catch (...) { sycl::free(n, q); L5_DECLINE("const-upload"); }
+      if(lc.dtb) sycl::free(lc.dtb, q);
+      lc.dtb = n; lc.dtb_src = ln.dt_bias; lc.da_n = nv;
+    }
+    if(!lc.alog || lc.alog_src != ln.A_log || lc.da_n != nv) {
+      float* n = static_cast<float*>(sycl::malloc_device(
+            (size_t)nv * sizeof(float), q.get_device(), q.get_context()));
+      if(!n) L5_DECLINE("alloc");
+      try {
+        q.memcpy(n, ln.A_log, (size_t)nv * sizeof(float)).wait();
+      } catch (...) { sycl::free(n, q); L5_DECLINE("const-upload"); }
+      if(lc.alog) sycl::free(lc.alog, q);
+      lc.alog = n; lc.alog_src = ln.A_log; lc.da_n = nv;
+    }
     if(!ensure_f(be.l5_pack_dev_, be.l5_pack_cap_, row_in + (size_t)cdim))
       L5_DECLINE("alloc");
     if(!be.l5_kind_dev_) {
@@ -3634,12 +3683,14 @@ static bool gpu_l5_front(GpuBackend& be, const Request* req, int L,
       if(be.l4_act_dev_) sycl::free(be.l4_act_dev_, q);
       be.l4_act_dev_ = n; be.l4_act_cap_ = zvw;
     }
-    // H2D inputs: normed + kinds + per-layer weights.
+    // H2D inputs: normed (dynamic per token) + norm weights (shared with the
+    // L4 tail buffer, uploaded per call). Layer constants (conv_w/dt_bias/
+    // A_log/kinds) come from the per-layer cache above — no resend submits.
     q.memcpy(be.l5_norm_dev_, normed, (size_t)H * sizeof(float));
-    q.memcpy(be.l5_kind_dev_, kinds, 4 * sizeof(std::uint8_t));
-    q.memcpy(be.l5_cw_dev_, ln.conv_w, (size_t)cdim * (size_t)ck * sizeof(float));
-    q.memcpy(be.l5_dtb_dev_, ln.dt_bias, (size_t)nv * sizeof(float));
-    q.memcpy(be.l5_alog_dev_, ln.A_log, (size_t)nv * sizeof(float));
+    if(std::memcmp(lc.kinds, kinds, 4) != 0) {
+      q.memcpy(be.l5_kind_dev_, kinds, 4 * sizeof(std::uint8_t));
+      std::memcpy(lc.kinds, kinds, 4);
+    }
     q.memcpy(be.l4_nw_dev_, ln.ssm_norm_w, (size_t)vd * sizeof(float));
     // FWHT rot + RNE convert: 1 H2D in, 4 FP16 act rows out.
     gemm::FwhtRotParams fp_;
@@ -3740,12 +3791,12 @@ static bool gpu_l5_front(GpuBackend& be, const Request* req, int L,
       gemm::LaConvPrepParams cp;
       cp.mqkv_fp32 = be.l5_mqkv_dev_;
       cp.conv_state = sd->conv;
-      cp.conv_w = be.l5_cw_dev_;
+      cp.conv_w = lc.cw;
       cp.b_row = be.l5_b_dev_;
       cp.a_row = be.l5_a_dev_;
       cp.packed_in = be.l5_pack_dev_;
-      cp.dt_bias = be.l5_dtb_dev_;
-      cp.A_log = be.l5_alog_dev_;
+      cp.dt_bias = lc.dtb;
+      cp.A_log = lc.alog;
       cp.conv_dim = (uint32_t)cdim; cp.conv_k = (uint32_t)ck;
       cp.nv = nv; cp.nk = nk; cp.kd = kd; cp.vd = vd;
       cp.qscale = 1.0f / sqrtf((float)kd);  // host-identical value
@@ -3753,20 +3804,20 @@ static bool gpu_l5_front(GpuBackend& be, const Request* req, int L,
       tail_pack = be.l5_pack_dev_;
     }
     // SPEC SAFETY: write the resident conv back to the host mirror now
-    // (dep-chained after prep; waited after the tail) — the host stays
-    // authoritative for verify snapshots + host-conv paths. HOSTPREP
-    // already advanced ly.conv_state on the host (sd->conv untouched and
-    // unread this call), so the device->host copy must not run there —
-    // it would clobber the fresh host state with a stale resident conv.
-    sycl::event e_conv_wb;
+    // (dep-chained after prep) — the host stays authoritative for verify
+    // snapshots + host-conv paths. HOSTPREP already advanced ly.conv_state
+    // on the host (sd->conv untouched and unread this call), so the
+    // device->host copy must not run there — it would clobber the fresh
+    // host state with a stale resident conv. No explicit wait: the memcpy
+    // is submitted before the tail kernels on the in-order queue, so the
+    // tail's devact wait drains it (the old e_conv_wb.wait() returned
+    // immediately — pure extra round-trip, removed 2026-09-20).
     if(!l5_hostprep)
-      e_conv_wb = q.memcpy(ly.conv_state.data(), sd->conv,
-                           conv_n * sizeof(float), e_prep);
+      q.memcpy(ly.conv_state.data(), sd->conv, conv_n * sizeof(float), e_prep);
     // Certified tail: packed SSM row -> norm -> devact la_out (one wait).
     if(!gpu_l4_tail(be, q, tail_pack, sd->ptrs, sd->S, sd->core,
                     nv, nk, kd, vd, zvw, la_out_ti, o_la, e_prep))
       return false;
-    if(!l5_hostprep) e_conv_wb.wait();
     sd->dirty = true;  // S resident newer than host mirror (step: no sync)
     // L5_CHECK: per-stage host recompute vs device (first 36 successes =
     // two decode steps' LA sets — the L5 flip lands at decode step 1+,
