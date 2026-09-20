@@ -115,6 +115,25 @@ class Engine {
   
   // Which Rotation (SpinQuant) belongs to tensor ti (by its rotation_id).
   const Rotation* rotation_for(int tensor_index) const;
+
+  // Read-only weight-shard view (L5 front chain): lets main.cpp drive
+  // gemm::quant_gemm_forward_usm directly into caller-owned device buffers
+  // (FWHT acts -> GEMM -> la_conv_prep) without a host round-trip. Building
+  // the shard has no numeric effect (same bytes run_linear_tp would use).
+  // TP=1 full-row only (device buffers are not cross-visible); the caller
+  // re-checks num_devices()==1 and declines otherwise. dpas48 shards are
+  // reported with dpas48=true (caller keeps the host path).
+  struct ShardView {
+    bool ok = false;
+    const void* code = nullptr;          // packed codes (device USM)
+    const std::uint16_t* scale = nullptr;// FP16 scales (device USM)
+    float alpha = 1.0f;                  // global divisor (host value)
+    uint32_t N = 0, K = 0;               // full-tensor geometry
+    uint32_t group_size = 0;
+    gemm::WeightScheme scheme = gemm::WeightScheme::INT8;
+    bool dpas48 = true;
+  };
+  ShardView shard_view(int tensor_index);
   
   // Convenience: run a Linear TP GEMM and return the output vector.
   std::vector<float> run_linear_tp_ret(int tensor_index, const std::vector<float>& x) {

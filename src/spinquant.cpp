@@ -262,7 +262,7 @@ float f16_to_f32(uint16_t h) {
       int32_t sh = 1;
       while ((em & 0x400u) == 0) { em <<= 1; --sh; }
       em &= 0x3ffu;
-      f = sign | ((127 - 15 - sh) << 23) | (em << 13);
+      f = sign | ((127 - 15 + sh) << 23) | (em << 13);
     }
   } else if (e == 31) {
     f = sign | 0x7f800000u | (m << 13);

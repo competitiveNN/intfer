@@ -1195,14 +1195,9 @@ sycl::event ssm_forward_chain(sycl::queue& q, const SsmChainParams& p) {
 }
 
 // Bit-exact FP32->FP16 (round-to-nearest-even) matching
-// dashq::float_to_half, so device-fused down activations carry the same
-// bits as the host convert path (parity-gated, not assumed). One known
-// edge: the subnormal branch tests bit (shift-1) of m2 (mantissa WITH the
-// hidden 1) where dashq tests mant (without); they differ only at e == -10
-// (shift == 24, bit 23 = the hidden 1 itself). Activations that small
-// (< 2^-14) round to zero either way unless the hidden bit tips the +1 —
-// a single-ulp edge on values ~6e-5; the CPU parity gate covers it, the
-// oracle token stream arbitrates.
+// dashq::float_to_half and the F16C hardware path, so device-fused down
+// activations carry the same bits as the host convert path (parity-gated,
+// not assumed).
 static inline std::uint16_t dev_float_to_half(float v) {
   std::uint32_t x;
   static_assert(sizeof(x) == sizeof(v), "u32/f32 size");
@@ -1219,11 +1214,15 @@ static inline std::uint16_t dev_float_to_half(float v) {
     std::uint32_t m2 = mant | 0x800000u;
     const int shift = 14 - e;
     std::uint32_t half = m2 >> shift;
-    if ((m2 >> (shift - 1)) & 1u) half += 1u;
+    const std::uint32_t rem = m2 & ((1u << shift) - 1u);
+    const std::uint32_t hbit = 1u << (shift - 1);
+    if (rem > hbit || (rem == hbit && (half & 1u))) half += 1u;
+    if (half & 0x400u) return (std::uint16_t)(sign | 0x0400u);  // to min-normal
     return (std::uint16_t)(sign | (half & 0x3FFu));
   }
   std::uint32_t half = ((std::uint32_t)e << 10) | (mant >> 13);
-  if (mant & 0x1000u) half += 1u;
+  const std::uint32_t rem = mant & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) half += 1u;
   return (std::uint16_t)(sign | (half & 0xFFFFu));
 }
 
@@ -1240,7 +1239,7 @@ static inline float dev_half_to_float(std::uint16_t h) {
       std::uint32_t m2 = mant;
       while (!(m2 & 0x400u)) { m2 <<= 1; ++e; }
       m2 &= 0x3FFu;
-      x = (sign << 31) | ((127 - 15 - e) << 23) | (m2 << 13);
+      x = (sign << 31) | ((127 - 14 - e) << 23) | (m2 << 13);
     }
   } else if (exp == 0x1Fu) {
     x = (sign << 31) | 0x7F800000u | (mant << 13);
@@ -1493,14 +1492,15 @@ sycl::event la_conv_prep(sycl::queue& q, const LaConvPrepParams& p,
       float* hb = hg + nv;
       for (std::uint32_t kh = 0; kh < nk; ++kh) {
         // l2norm sequential (host l2norm order: sum squares ascending,
-        // then divide — verify host l2norm before certifying exact).
+        // inv=1/sqrt(s+1e-6), out=x*inv — matched exactly, then q*qscale
+        // in the same two-rounding order as the host's separate loop).
         float sq = 0.0f, sk = 0.0f;
         for (std::uint32_t d = 0; d < kd; ++d) {
           sq += query[(size_t)kh * kd + d] * query[(size_t)kh * kd + d];
           sk += key[(size_t)kh * kd + d] * key[(size_t)kh * kd + d];
         }
-        const float iq = 1.0f / sycl::sqrt(sq);
-        const float ik = 1.0f / sycl::sqrt(sk);
+        const float iq = 1.0f / sycl::sqrt(sq + 1e-6f);
+        const float ik = 1.0f / sycl::sqrt(sk + 1e-6f);
         for (std::uint32_t d = 0; d < kd; ++d) {
           hqn[(size_t)kh * kd + d] = query[(size_t)kh * kd + d] * iq * qscale;
           hkn[(size_t)kh * kd + d] = key[(size_t)kh * kd + d] * ik;
@@ -1516,6 +1516,26 @@ sycl::event la_conv_prep(sycl::queue& q, const LaConvPrepParams& p,
         hg[hh] = -sycl::exp(Alog[hh]) * sp;
       }
     });
+  });
+}
+
+// L5 helper: FP16->FP32 convert (bit-exact dev_half_to_float per element).
+sycl::event half_to_float(sycl::queue& q, const HalfToFloatParams& p,
+                          const sycl::event& dep) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
+  const std::uint16_t* xin = p.in_fp16;
+  float* xout = p.out_fp32;
+  const std::uint32_t n = p.n;
+  if (!xin || !xout || n == 0) return sycl::event{};
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(dep);
+    h.parallel_for<class half_to_float_kernel>(
+        sycl::range<1>(n), [=](sycl::item<1> it) {
+          const std::uint32_t i = (std::uint32_t)it.get_id(0);
+          xout[i] = dev_half_to_float(xin[i]);
+        });
   });
 }
 

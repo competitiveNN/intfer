@@ -1615,6 +1615,34 @@ const Rotation* Engine::rotation_for(int tensor_index) const {
   return it == rid_.end() ? nullptr : it->second;
 }
 
+Engine::ShardView Engine::shard_view(int tensor_index) {
+  ShardView v;
+  if (devices_.size() != 1) return v;  // TP=1 full-row only
+  if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size())
+    return v;
+  const auto& t = model_.tensors[tensor_index];
+  const auto& ranges = shards_[tensor_index].ranges;
+  if (ranges.size() != 1 || ranges[0].first != 0) return v;
+  if (ranges[0].second - ranges[0].first != t.N) return v;  // full-row sanity
+  if (t.N == 0 || t.K == 0) return v;
+  if (!shard_cache_[(size_t)tensor_index].built &&
+      !ensure_shard_built(tensor_index))
+    return v;
+  const auto& sc = shard_cache_[(size_t)tensor_index];
+  if (sc.code_usm.empty() || !sc.code_usm[0]) return v;
+  if (sc.scale_usm.empty() || !sc.scale_usm[0]) return v;
+  v.ok = true;
+  v.code = sc.code_usm[0];
+  v.scale = sc.scale_usm[0];
+  v.alpha = sc.has_global_divisor ? sc.global_host : 1.0f;
+  v.N = t.N;
+  v.K = t.K;
+  v.group_size = sc.group_size;
+  v.scheme = sc.scheme;
+  v.dpas48 = sc.dpas48;
+  return v;
+}
+
 bool Engine::ensure_shard_built(int tensor_index) {
   if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size()) return false;
   auto& sc = shard_cache_[tensor_index];

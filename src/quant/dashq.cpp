@@ -256,11 +256,15 @@ uint16_t float_to_half(float v) {
     mant |= 0x800000u;
     int shift = 14 - e;
     uint32_t half = mant >> shift;
-    if ((mant >> (shift - 1)) & 1u) half += 1u;       // round-to-nearest-even
+    uint32_t rem = mant & ((1u << shift) - 1u);       // round-to-nearest-even
+    uint32_t hbit = 1u << (shift - 1);
+    if (rem > hbit || (rem == hbit && (half & 1u))) half += 1u;
+    if (half & 0x400u) return (uint16_t)(sign | 0x0400u);  // carry to min-normal
     return (uint16_t)(sign | (half & 0x3FFu));
   }
   uint32_t half = ((uint32_t)e << 10) | (mant >> 13);
-  if (mant & 0x1000u) half += 1u;                     // round-to-nearest-even
+  uint32_t rem = mant & 0x1FFFu;                     // round-to-nearest-even
+  if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) half += 1u;
   return (uint16_t)(sign | (half & 0xFFFFu));
 }
 
@@ -275,7 +279,7 @@ float half_to_float(uint16_t h) {
       int e = 0;
       while (!(mant & 0x400u)) { mant <<= 1; ++e; }
       mant &= 0x3FFu;
-      x = (sign << 31) | ((127 - 15 - e) << 23) | (mant << 13);
+      x = (sign << 31) | ((127 - 14 - e) << 23) | (mant << 13);
     }
   } else if (exp == 0x1Fu) {
     x = (sign << 31) | 0x7F800000u | (mant << 13);

@@ -426,8 +426,7 @@ struct FwhtRotParams {
 };
 sycl::event fwht_rot_to_half(sycl::queue& q, const FwhtRotParams& p,
                              const sycl::event& dep = {});
-struct LaConvPrepParams {
-  const float* mqkv_fp32;    // [conv_dim] qkv GEMM out (device FP32)
+struct LaConvPrepParams {  const float* mqkv_fp32;    // [conv_dim] qkv GEMM out (device FP32)
   float* conv_state;         // [conv_dim*3] device mirror (updated in place)
   const float* conv_w;       // [conv_dim*conv_k] conv weights (device FP32)
   const float* b_row;        // [nv] b GEMM row (device FP32)
@@ -441,6 +440,20 @@ struct LaConvPrepParams {
   float qscale;              // 1/sqrt(kd) (host-identical value)
 };
 sycl::event la_conv_prep(sycl::queue& q, const LaConvPrepParams& p,
+                         const sycl::event& dep = {});
+
+// ---------------------------------------------------------------------------
+// Device-side FP16->FP32 convert (L5 front chain): GEMM FP16 outputs that
+// downstream device kernels consume as FP32 (qkv/b/a rows into la_conv_prep,
+// z row into the L4 norm staging). Bit-exact dev_half_to_float per element
+// (half->float is exact; matches dashq::half_to_float). One WI per element.
+// ---------------------------------------------------------------------------
+struct HalfToFloatParams {
+  const std::uint16_t* in_fp16;  // [n] device FP16 bits
+  float* out_fp32;               // [n] device FP32
+  uint32_t n;
+};
+sycl::event half_to_float(sycl::queue& q, const HalfToFloatParams& p,
                          const sycl::event& dep = {});
 
 }  // namespace intfer::gemm

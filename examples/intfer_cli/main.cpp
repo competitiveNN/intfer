@@ -955,6 +955,18 @@ static bool gpu_la_out_fused_batch(GpuBackend& be, const SsmRow* rows,
                                    const float* ssm_norm_w,
                                    const float* dt_bias, const float* A_log,
                                    int la_out_ti, std::vector<float>& c_y);
+// L5 front chain (INTFER_L5_FRONT=1, TP=1 scalar decode): device-resident LA
+// input path replacing the host wave-4 + conv FIR + q/k prep ahead of the
+// certified L4 tail. normed ([H] host FP32) is the layer's normalized hidden;
+// ln carries the qkv/z/b/a/la_out names + conv/dt/A/norm host pointers
+// (struct LayerNames, defined below with the host state);
+// o_la ([H]) receives the GEMM output (fills it on-device via the L4 tail).
+// z/b/a/conv host rows are NOT filled (downstream LA consumers are skipped
+// when the hook succeeds — same contract as gpu_la_out_fused). Returns
+// false when unavailable so the caller keeps the L4/host path.
+static bool gpu_l5_front(GpuBackend& be, const Request* req, int L,
+                         const float* normed, const struct LayerNames& ln,
+                         std::vector<float>& o_la);
 #endif
 
 // ----------------------------------------------------------------------------
@@ -1919,6 +1931,12 @@ struct GpuBackend : public LinearBackend {
   // std::vector<float>), so the gpu_ssm_rows definition can stay here,
   // ahead of struct Layer/Request.
   std::map<std::pair<const Request*,int>, std::vector<float>*> ssm_dev_mirror_;
+  // L5 conv mirror (INTFER_L5_FRONT=1): host conv_state vector per key, the
+  // re-upload source for the resident sd.conv (rollback may replace
+  // ly.conv_state vectors under the device, same hazard as ssm_state).
+  // Populated/resolved alongside ssm_dev_mirror_; null until the L5 hook
+  // runs for the key.
+  std::map<std::pair<const Request*,int>, std::vector<float>*> ssm_dev_convmirror_;
   // M-row device-side SSM step; false keeps the host path. Defined after
   // struct Request (needs complete Layer for ly->ssm_state).
   bool ssm_rows(const SsmRow* rows, uint32_t M, int L,
@@ -1949,6 +1967,28 @@ struct GpuBackend : public LinearBackend {
   size_t l4_core_zvw_ = 0;           // row width at alloc time
   void** l4_ptrs_dev_ = nullptr;     // [l4_ptrs_cap_*7] row-pointer slots
   size_t l4_ptrs_cap_ = 0;           // rows
+  // L5 front chain (INTFER_L5_FRONT=1, TP=1 scalar decode): grow-only device
+  // staging for FWHT acts + GEMM outputs + FP32 rows + per-layer weights.
+  // Sized to the max H/conv_dim/zvw/nv seen; freed in the dtor below.
+  float* l5_norm_dev_ = nullptr;     // [l5_H_] FP32 normed hidden (H2D)
+  size_t l5_H_ = 0;
+  std::uint16_t* l5_act_dev_[4] = {};  // 4x [l5_act_cap_] FP16 FWHT acts (qkv/z/b/a)
+  size_t l5_act_cap_ = 0;
+  std::uint16_t* l5_qkv_out_ = nullptr;  // [l5_cdim_] FP16 qkv GEMM out
+  std::uint16_t* l5_z_out_ = nullptr;    // [l5_zvw_] FP16 z GEMM out
+  std::uint16_t* l5_b_out_ = nullptr;    // [l5_nv_] FP16 b GEMM out
+  std::uint16_t* l5_a_out_ = nullptr;    // [l5_nv_] FP16 a GEMM out
+  float* l5_mqkv_dev_ = nullptr;     // [l5_cdim_] FP32 qkv rows (prep in)
+  float* l5_b_dev_ = nullptr;        // [l5_nv_] FP32 b row (prep in)
+  float* l5_a_dev_ = nullptr;        // [l5_nv_] FP32 a row (prep in)
+  float* l5_cw_dev_ = nullptr;       // [l5_cw_cap_] FP32 conv weights (per layer)
+  size_t l5_cw_cap_ = 0;
+  float* l5_dtb_dev_ = nullptr;      // [l5_nv_] FP32 dt_bias (per layer)
+  float* l5_alog_dev_ = nullptr;     // [l5_nv_] FP32 A_log (per layer)
+  float* l5_pack_dev_ = nullptr;     // [l5_pack_cap_] FP32 prep packed out
+  size_t l5_pack_cap_ = 0;           // (row_in + conv_dim scratch tail)
+  size_t l5_cdim_ = 0, l5_zvw_ = 0, l5_nv_ = 0;
+  std::uint8_t* l5_kind_dev_ = nullptr;  // [4] FWHT rot kinds (H2D)
   int ti_of(const std::string& name) {
     if(!eng) return -1;
     build_index();
@@ -1970,6 +2010,7 @@ struct GpuBackend : public LinearBackend {
     ssm_dev_.clear();
     ssm_dev_order_.clear();
     ssm_dev_mirror_.clear();
+    ssm_dev_convmirror_.clear();
     if(l4_z_dev_) { sycl::free(l4_z_dev_, q); l4_z_dev_ = nullptr; }
     if(l4_nw_dev_) { sycl::free(l4_nw_dev_, q); l4_nw_dev_ = nullptr; }
     if(l4_act_dev_) { sycl::free(l4_act_dev_, q); l4_act_dev_ = nullptr; }
@@ -1977,6 +2018,23 @@ struct GpuBackend : public LinearBackend {
     if(l4_core_dev_) { sycl::free(l4_core_dev_, q); l4_core_dev_ = nullptr; }
     if(l4_ptrs_dev_) { sycl::free(l4_ptrs_dev_, q); l4_ptrs_dev_ = nullptr; }
     l4_core_cap_ = l4_core_zvw_ = l4_ptrs_cap_ = 0;
+    if(l5_norm_dev_) { sycl::free(l5_norm_dev_, q); l5_norm_dev_ = nullptr; }
+    for(int i = 0; i < 4; ++i)
+      if(l5_act_dev_[i]) { sycl::free(l5_act_dev_[i], q); l5_act_dev_[i] = nullptr; }
+    if(l5_qkv_out_) { sycl::free(l5_qkv_out_, q); l5_qkv_out_ = nullptr; }
+    if(l5_z_out_) { sycl::free(l5_z_out_, q); l5_z_out_ = nullptr; }
+    if(l5_b_out_) { sycl::free(l5_b_out_, q); l5_b_out_ = nullptr; }
+    if(l5_a_out_) { sycl::free(l5_a_out_, q); l5_a_out_ = nullptr; }
+    if(l5_mqkv_dev_) { sycl::free(l5_mqkv_dev_, q); l5_mqkv_dev_ = nullptr; }
+    if(l5_b_dev_) { sycl::free(l5_b_dev_, q); l5_b_dev_ = nullptr; }
+    if(l5_a_dev_) { sycl::free(l5_a_dev_, q); l5_a_dev_ = nullptr; }
+    if(l5_cw_dev_) { sycl::free(l5_cw_dev_, q); l5_cw_dev_ = nullptr; }
+    if(l5_dtb_dev_) { sycl::free(l5_dtb_dev_, q); l5_dtb_dev_ = nullptr; }
+    if(l5_alog_dev_) { sycl::free(l5_alog_dev_, q); l5_alog_dev_ = nullptr; }
+    if(l5_pack_dev_) { sycl::free(l5_pack_dev_, q); l5_pack_dev_ = nullptr; }
+    if(l5_kind_dev_) { sycl::free(l5_kind_dev_, q); l5_kind_dev_ = nullptr; }
+    l5_H_ = l5_cdim_ = l5_zvw_ = l5_nv_ = l5_cw_cap_ = l5_pack_cap_ = 0;
+    l5_act_cap_ = 0;
   }
   const Rotation* rot_for(const std::string& name) override {
     if(!eng) return nullptr;
@@ -1998,7 +2056,8 @@ struct GpuBackend : public LinearBackend {
 static GpuBackend::SsmDev* gpu_ssm_resolve(GpuBackend& be, sycl::queue& q,
     const Request* req, std::vector<float>* mirror, int L,
     uint32_t nv, uint32_t nk, uint32_t kd, uint32_t vd,
-    size_t sdim, size_t zvw, uint32_t need, bool& fresh) {
+    size_t sdim, size_t zvw, uint32_t need, bool& fresh,
+    std::vector<float>* conv_mirror = nullptr, size_t conv_n = 0) {
   auto malloc_f = [&](size_t n) -> float* {
     try {
       return static_cast<float*>(sycl::malloc_device(n * sizeof(float),
@@ -2028,6 +2087,17 @@ static GpuBackend::SsmDev* gpu_ssm_resolve(GpuBackend& be, sycl::queue& q,
             q.memcpy(mit->second->data(), esd.S, sdim * sizeof(float)).wait();
           } catch (...) {}
         }
+        // L5: dirty resident conv writes back to its host mirror first
+        // (conv_n is model-fixed; size-guard against a stale mirror).
+        auto cmit = be.ssm_dev_convmirror_.find(ek);
+        if(esd.conv_dirty && esd.ok && esd.conv &&
+           cmit != be.ssm_dev_convmirror_.end() &&
+           cmit->second && cmit->second->size() == esd.conv_cap) {
+          try {
+            q.memcpy(cmit->second->data(), esd.conv,
+                      esd.conv_cap * sizeof(float)).wait();
+          } catch (...) {}
+        }
         if(esd.S) sycl::free(esd.S, q);
         if(esd.in) sycl::free(esd.in, q);
         if(esd.core) sycl::free(esd.core, q);
@@ -2035,6 +2105,7 @@ static GpuBackend::SsmDev* gpu_ssm_resolve(GpuBackend& be, sycl::queue& q,
         if(esd.conv) sycl::free(esd.conv, q);
         be.ssm_dev_.erase(eit);
         be.ssm_dev_mirror_.erase(ek);
+        be.ssm_dev_convmirror_.erase(ek);
       }
     }
     GpuBackend::SsmDev sd;
@@ -2046,6 +2117,17 @@ static GpuBackend::SsmDev* gpu_ssm_resolve(GpuBackend& be, sycl::queue& q,
     } catch (...) { sycl::free(sd.S, q); return nullptr; }
     sd.nv = nv; sd.nk = nk; sd.kd = kd; sd.vd = vd;
     sd.ok = true; sd.dirty = false;
+    // L5: resident conv history (upload the CURRENT host conv mirror;
+    // first use may be mid-run). Null mirror keeps conv resident-off.
+    if(conv_mirror && conv_n > 0 && conv_mirror->size() == conv_n) {
+      sd.conv = malloc_f(conv_n);
+      if(!sd.conv) { sycl::free(sd.S, q); return nullptr; }
+      try {
+        q.memcpy(sd.conv, conv_mirror->data(), conv_n * sizeof(float)).wait();
+      } catch (...) { sycl::free(sd.conv, q); sycl::free(sd.S, q); return nullptr; }
+      sd.conv_cap = conv_n; sd.conv_dirty = false;
+      be.ssm_dev_convmirror_[key] = conv_mirror;
+    }
     be.ssm_dev_[key] = sd;
     be.ssm_dev_order_.push_back(key);
     be.ssm_dev_mirror_[key] = mirror;
@@ -2058,6 +2140,21 @@ static GpuBackend::SsmDev* gpu_ssm_resolve(GpuBackend& be, sycl::queue& q,
   // Refresh the mirror pointer (same host vector for a key's lifetime,
   // but refresh is harmless and keeps eviction writeback correct).
   be.ssm_dev_mirror_[key] = mirror;
+  // L5: refresh the conv mirror + grow the resident conv on first L5 use
+  // of a pre-L5 entry (allocated by an S-only path). Same-size refresh is
+  // a pointer store; growth re-uploads from the current host mirror.
+  if(conv_mirror && conv_n > 0) {
+    be.ssm_dev_convmirror_[key] = conv_mirror;
+    if(conv_mirror->size() == conv_n && sd.conv_cap < conv_n) {
+      float* nconv = malloc_f(conv_n);
+      if(!nconv) return nullptr;
+      try {
+        q.memcpy(nconv, conv_mirror->data(), conv_n * sizeof(float)).wait();
+      } catch (...) { sycl::free(nconv, q); return nullptr; }
+      if(sd.conv) sycl::free(sd.conv, q);
+      sd.conv = nconv; sd.conv_cap = conv_n; sd.conv_dirty = false;
+    }
+  }
   // Grow staging to the run length.
   fresh = false;
   if(sd.Mcap < need) {
@@ -2287,6 +2384,67 @@ static bool gpu_ssm_rows(GpuBackend& be, const SsmRow* rows, uint32_t M, int L,
   return true;
 }
 
+// L4 tail (shared by the scalar fused path and the L5 front chain): solo
+// ssm_forward over one row's packed inputs -> fused norm+silu(z)+FP16
+// convert -> la_out GEMM via the Engine device-act seam (single host wait
+// + D2H inside the seam). packed_in is the device [qn|kn|v|g|b] row
+// (sd->in from host prep, or l5_pack_dev_ from la_conv_prep); ptrs_dev is
+// the 7-slot device pointer table (overwritten); S_dev/core_dev are the
+// resident state + core row. dep chains after the packed-input producer
+// (empty for host H2D inputs on the in-order queue). False keeps the host
+// path. Pure move of gpu_la_out_fused section 4 (same code, same order).
+static bool gpu_l4_tail(GpuBackend& be, sycl::queue& q,
+                        float* packed_in, float* ptrs_dev,
+                        float* S_dev, float* core_dev,
+                        uint32_t nv, uint32_t nk, uint32_t kd, uint32_t vd,
+                        size_t zvw, int la_out_ti, std::vector<float>& o_la,
+                        const sycl::event& dep) {
+  if(!be.eng || !packed_in || !ptrs_dev || !S_dev || !core_dev ||
+     la_out_ti < 0)
+    return false;
+  try {
+    static thread_local std::vector<void*> hptrs;
+    if(hptrs.size() < 7) hptrs.assign(7, nullptr);
+    {
+      float* base = packed_in;
+      hptrs[0] = base;                                          // qn
+      hptrs[1] = base + (size_t)nk * kd;                        // kn
+      hptrs[2] = base + 2 * (size_t)nk * kd;                    // v
+      hptrs[3] = base + 2 * (size_t)nk * kd + zvw;              // g
+      hptrs[4] = base + 2 * (size_t)nk * kd + zvw + nv;         // b
+      hptrs[5] = S_dev;                                         // state
+      hptrs[6] = core_dev;                                      // core out
+    }
+    q.memcpy(ptrs_dev, hptrs.data(), 7 * sizeof(void*));
+    gemm::SsmParams sp;
+    const float* const* dptrs =
+        reinterpret_cast<const float* const*>(ptrs_dev);
+    float* const* dptrs_m = reinterpret_cast<float* const*>(ptrs_dev);
+    sp.qn_rows = dptrs + 0; sp.kn_rows = dptrs + 1; sp.v_rows = dptrs + 2;
+    sp.g_rows = dptrs + 3; sp.b_rows = dptrs + 4;
+    sp.s_rows = dptrs_m + 5; sp.core_rows = dptrs_m + 6;
+    sp.M = 1; sp.n_v = nv; sp.n_k = nk; sp.kd = kd; sp.vd = vd;
+    // No dep param on ssm_forward: the in-order queue observes submission
+    // order (host H2D inputs need none); the L5 caller submits its prep
+    // kernel before calling the tail, which the queue serializes.
+    (void)dep;
+    sycl::event e_ssm = gemm::ssm_forward(q, sp);
+    gemm::SsmNormParams np;
+    np.core_fp32 = core_dev;
+    np.z_fp32 = be.l4_z_dev_;
+    np.norm_w_fp32 = be.l4_nw_dev_;
+    np.act_fp16 = be.l4_act_dev_;
+    np.n_v = nv; np.vd = vd; np.rms_eps = (float)cfg.rms_eps;
+    sycl::event e_norm = gemm::ssm_norm_silu_to_half(q, np, e_ssm);
+    if(!be.eng->run_linear_tp_devact(la_out_ti, be.l4_act_dev_, o_la, 1,
+                                     e_norm))
+      return false;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 // L4 la_out fusion (INTFER_L4_FUSE=1, TP=1 scalar decode only): chains the
 // solo-run device SSM (ssm_forward over one row's resident state) through
 // the fused norm+silu(z)+FP16-convert kernel straight into the la_out GEMM
@@ -2405,37 +2563,8 @@ static bool gpu_la_out_fused(GpuBackend& be, const Request* req,
     q.memcpy(sd->in, hin.data(), row_in * sizeof(float));
     q.memcpy(be.l4_z_dev_, z, zvw * sizeof(float));
     q.memcpy(be.l4_nw_dev_, ssm_norm_w, (size_t)vd * sizeof(float));
-    static thread_local std::vector<void*> hptrs;
-    if(hptrs.size() < 7) hptrs.assign(7, nullptr);
-    {
-      float* base = sd->in;
-      hptrs[0] = base;                                          // qn
-      hptrs[1] = base + (size_t)nk * kd;                        // kn
-      hptrs[2] = base + 2 * (size_t)nk * kd;                    // v
-      hptrs[3] = base + 2 * (size_t)nk * kd + zvw;              // g
-      hptrs[4] = base + 2 * (size_t)nk * kd + zvw + nv;         // b
-      hptrs[5] = sd->S;                                         // state
-      hptrs[6] = sd->core;                                      // core out
-    }
-    q.memcpy(sd->ptrs, hptrs.data(), 7 * sizeof(void*));
-    gemm::SsmParams sp;
-    const float* const* dptrs =
-        reinterpret_cast<const float* const*>(sd->ptrs);
-    float* const* dptrs_m = reinterpret_cast<float* const*>(sd->ptrs);
-    sp.qn_rows = dptrs + 0; sp.kn_rows = dptrs + 1; sp.v_rows = dptrs + 2;
-    sp.g_rows = dptrs + 3; sp.b_rows = dptrs + 4;
-    sp.s_rows = dptrs_m + 5; sp.core_rows = dptrs_m + 6;
-    sp.M = 1; sp.n_v = nv; sp.n_k = nk; sp.kd = kd; sp.vd = vd;
-    sycl::event e_ssm = gemm::ssm_forward(q, sp);
-    gemm::SsmNormParams np;
-    np.core_fp32 = sd->core;
-    np.z_fp32 = be.l4_z_dev_;
-    np.norm_w_fp32 = be.l4_nw_dev_;
-    np.act_fp16 = be.l4_act_dev_;
-    np.n_v = nv; np.vd = vd; np.rms_eps = (float)cfg.rms_eps;
-    sycl::event e_norm = gemm::ssm_norm_silu_to_half(q, np, e_ssm);
-    if(!be.eng->run_linear_tp_devact(la_out_ti, be.l4_act_dev_, o_la, 1,
-                                     e_norm))
+    if(!gpu_l4_tail(be, q, sd->in, sd->ptrs, sd->S, sd->core,
+                    nv, nk, kd, vd, zvw, la_out_ti, o_la, sycl::event{}))
       return false;
     sd->dirty = true;  // resident newer than host mirror (step: no sync)
     static const bool l4_dbg = (std::getenv("INTFER_L4_DBG") != nullptr);
@@ -2920,6 +3049,18 @@ static void gpu_ssm_resync_all(GpuBackend& be) {
       if(mirror.size() != sdim) continue;
       q.memcpy(sd.S, mirror.data(), sdim * sizeof(float)).wait();
       sd.dirty = false;
+      // L5: the rollback above also replaced ly.conv_state vectors under
+      // the resident conv — push the conv mirror back too (same-size
+      // assignment keeps the vector storage alive, so the map pointer the
+      // hook refreshed each call stays valid). Missing/stale mirrors skip
+      // (their keys re-upload lazily via the resolver growth path).
+      auto cmit = be.ssm_dev_convmirror_.find(kv.first);
+      if(sd.conv && cmit != be.ssm_dev_convmirror_.end() && cmit->second &&
+         cmit->second->size() == sd.conv_cap && sd.conv_cap > 0) {
+        q.memcpy(sd.conv, cmit->second->data(),
+                 sd.conv_cap * sizeof(float)).wait();
+        sd.conv_dirty = false;
+      }
     }
   } catch (...) {}
 }
@@ -3304,6 +3445,598 @@ struct Request {
 // forward time, since the prefill token was never "produced").
 struct BatchItem { Request* req; int token; int pos; bool prefill = false; };
 
+#ifdef INTFER_HAS_GPU_BACKEND
+// L5 front chain (INTFER_L5_FRONT=1, TP=1 scalar decode only). Device-side:
+// H2D normed -> fwht_rot_to_half (4x FWHT rot + RNE convert) -> 4x devact
+// GEMM (qkv/z/b/a, outputs stay on device) -> half_to_float (qkv/b/a rows;
+// z straight into the L4 norm staging) -> la_conv_prep (conv FIR + silu +
+// q/k/v/g/b pack into l5_pack, resident conv updated in place) ->
+// certified gpu_l4_tail (ssm_forward -> norm -> devact la_out, one wait).
+// Host traffic per LA layer: 1x H2D (normed) + per-layer weight H2Ds
+// (conv_w/dt_bias/A_log/norm_w) + the tail's o_la D2H. Saved vs the host
+// path: 4 converts + wave submit/wait/readbacks + host conv FIR + host
+// q/k prep + sd->in H2D. z/b/a/conv_out host rows are NOT filled (same
+// contract as gpu_la_out_fused: downstream LA consumers are skipped).
+// Bit-contract: FWHT exact host order; GEMMs are the certified FP16-act
+// kernels; half<->float exact; conv-FIR/packs host order with silu/exp/
+// log1p ~1ulp (oracle arbitrates, L4 standing). The L5-vs-base stream A/B
+// arbitrates. False keeps the L4/host path (TP>1, dense rotations, dim
+// mismatch, dpas48 shards, bad shapes, trace runs).
+// SPEC SAFETY: the resident conv is written back to ly.conv_state every
+// call (dep-chained after prep, waited after the tail), so the host mirror
+// stays authoritative for speculative-verify snapshots and the prefill/
+// batch paths that run host conv. conv_dirty stays false; the evict/
+// resync conv paths are protocol symmetry for a future batch hook.
+static bool gpu_l5_front(GpuBackend& be, const Request* req, int L,
+                         const float* normed, const LayerNames& ln,
+                         std::vector<float>& o_la) {
+  if(!be.eng || !req || !normed) return false;
+  static const bool l5_dbg = (std::getenv("INTFER_L5_DBG") != nullptr);
+  // Probe stash (L5_CHECK rerun block): loop-gref t=0 for pre-tail vs
+  // post-tail engine consistency. Hook scope so both blocks see it.
+  static std::vector<float> l5_stash_gref_t0;
+  static std::vector<float> l5_stash_x32_t0;
+#define L5_DECLINE(code)                                          \
+  do {                                                            \
+    if (l5_dbg)                                                   \
+      std::fprintf(stderr, "[l5-why] L=%d decline %s\n", L, code); \
+    return false;                                                 \
+  } while (0)
+  const uint32_t H = (uint32_t)cfg.H;
+  const int cdim = cfg.conv_dim, ck = cfg.conv_k;
+  const uint32_t nv = (uint32_t)cfg.n_v_heads;
+  const uint32_t nk = (uint32_t)cfg.n_k_heads;
+  const uint32_t kd = (uint32_t)cfg.k_head_dim;
+  const uint32_t vd = (uint32_t)cfg.v_head_dim;
+  if(H == 0 || H > 5120 || cdim <= 0 || ck <= 0) L5_DECLINE("geom");
+  if(nv == 0 || nk == 0 || kd == 0 || vd == 0) L5_DECLINE("geom2");
+  if(!ln.conv_w || !ln.dt_bias || !ln.A_log || !ln.ssm_norm_w)
+    L5_DECLINE("null-w");
+  if(o_la.size() != (size_t)H) L5_DECLINE("o_la-size");
+  if(be.num_devices_ != 1) L5_DECLINE("tp");
+  const size_t sdim = (size_t)nv * kd * vd;
+  const size_t zvw = (size_t)nv * vd;
+  const size_t conv_n = (size_t)cdim * 3;
+  const size_t row_in = 2*(size_t)nk*kd + zvw + 2*nv;
+  // Rotation kinds: null -> copy(0), hadamard dim==H -> FWHT(1); dense or
+  // dim mismatch -> decline (the kernel writes nothing for kind 2).
+  const char* names[4] = {ln.qkv.c_str(), ln.z.c_str(),
+                          ln.b.c_str(), ln.a.c_str()};
+  std::uint8_t kinds[4];
+  for(int t = 0; t < 4; ++t) {
+    const Rotation* R = be.rot_for(names[t]);
+    if(!R) { kinds[t] = 0; continue; }
+    if(!R->is_hadamard || R->dim != H) L5_DECLINE("rot");
+    kinds[t] = 1;
+  }
+  uint32_t fpp = 1; while(fpp * 2 <= H) fpp *= 2;  // floor_pow2(H)
+  const float finv = 1.0f / sqrtf((float)fpp);   // host-identical value
+  // Weight shards (read-only views; building them is numerically neutral).
+  int tis[4] = {be.ti_of(ln.qkv), be.ti_of(ln.z),
+                be.ti_of(ln.b), be.ti_of(ln.a)};
+  int la_out_ti = be.ti_of(ln.la_out);
+  if(la_out_ti < 0) L5_DECLINE("ti");
+  for(int t = 0; t < 4; ++t) if(tis[t] < 0) L5_DECLINE("ti");
+  Engine::ShardView sv[4];
+  for(int t = 0; t < 4; ++t) {
+    sv[t] = be.eng->shard_view(tis[t]);
+    if(!sv[t].ok || sv[t].dpas48) L5_DECLINE("shard");
+    if(sv[t].K != H) L5_DECLINE("shard-K");
+  }
+  if(sv[0].N != (uint32_t)cdim) L5_DECLINE("shard-N-qkv");
+  if(sv[1].N != zvw) L5_DECLINE("shard-N-z");
+  if(sv[2].N != nv || sv[3].N != nv) L5_DECLINE("shard-N-ba");
+  sycl::queue& q = be.eng->device_queue(0);
+  try {
+    // Resolve the resident state entry WITH the conv mirror (alloc/uploads
+    // the resident conv on first L5 use of the key).
+    if(L < 0 || (size_t)L >= const_cast<Request*>(req)->layers.size())
+      L5_DECLINE("layer-range");
+    Layer& ly = const_cast<Request*>(req)->layers[(size_t)L];
+    if(ly.conv_state.size() != conv_n) L5_DECLINE("conv-size");
+    if(ly.ssm_state.size() != sdim) L5_DECLINE("ssm-size");
+    // L5_CHECK: snapshot the pre-update conv (the prep kernel advances the
+    // resident conv in place; the host reference needs the pre-state).
+    static const bool l5_check_env =
+        (std::getenv("INTFER_L5_CHECK") != nullptr);
+    std::vector<float> pre_conv;
+    if(l5_check_env) pre_conv = ly.conv_state;
+    bool fresh = false;
+    GpuBackend::SsmDev* sd = gpu_ssm_resolve(be, q, req, &ly.ssm_state, L,
+        nv, nk, kd, vd, sdim, zvw, /*need=*/1, fresh,
+        &ly.conv_state, conv_n);
+    if(!sd || !sd->conv) L5_DECLINE("resolve");
+    if(!sd->in || !sd->core || !sd->ptrs || !sd->S) {
+      // S-only entry without staging (allocated by a path that skipped
+      // it): grow one solo row here (same pattern as gpu_la_out_fused).
+      if(sd->Mcap < 1) {
+        float* nin = static_cast<float*>(sycl::malloc_device(
+              row_in * sizeof(float), q.get_device(), q.get_context()));
+        float* ncore = static_cast<float*>(sycl::malloc_device(
+              zvw * sizeof(float), q.get_device(), q.get_context()));
+        float* nptrs = static_cast<float*>(sycl::malloc_device(
+              7 * sizeof(void*), q.get_device(), q.get_context()));
+        if(!nin || !ncore || !nptrs) {
+          if(nin) sycl::free(nin, q);
+          if(ncore) sycl::free(ncore, q);
+          if(nptrs) sycl::free(nptrs, q);
+          L5_DECLINE("staging-alloc");
+        }
+        if(sd->in) sycl::free(sd->in, q);
+        if(sd->core) sycl::free(sd->core, q);
+        if(sd->ptrs) sycl::free(sd->ptrs, q);
+        sd->in = nin; sd->core = ncore; sd->ptrs = nptrs;
+        sd->Mcap = 1;
+      }
+    }
+    // Grow L5 staging (grow-only; model-fixed after first use).
+    auto ensure_f = [&](float*& ptr, size_t& cap, size_t need) -> bool {
+      if(cap >= need && ptr) return true;
+      float* n = static_cast<float*>(sycl::malloc_device(
+            need * sizeof(float), q.get_device(), q.get_context()));
+      if(!n) return false;
+      if(ptr) sycl::free(ptr, q);
+      ptr = n; cap = need;
+      return true;
+    };
+    // (qkv/b/a/z out + fp32 rows + weights + pack: sized together.)
+    auto ensure_hn = [&](std::uint16_t*& ptr, size_t& cur, size_t need) -> bool {
+      if(cur >= need && ptr) return true;
+      std::uint16_t* n = static_cast<std::uint16_t*>(sycl::malloc_device(
+            need * sizeof(std::uint16_t), q.get_device(), q.get_context()));
+      if(!n) return false;
+      if(ptr) sycl::free(ptr, q);
+      ptr = n; cur = need;
+      return true;
+    };
+    if(!ensure_f(be.l5_norm_dev_, be.l5_H_, H)) L5_DECLINE("alloc");
+    for(int t = 0; t < 4; ++t)
+      if(!ensure_hn(be.l5_act_dev_[t], be.l5_act_cap_, H)) L5_DECLINE("alloc");
+    if(!ensure_hn(be.l5_qkv_out_, be.l5_cdim_, (size_t)cdim))
+      L5_DECLINE("alloc");
+    if(!ensure_f(be.l5_mqkv_dev_, be.l5_cdim_, (size_t)cdim))
+      L5_DECLINE("alloc");
+    if(!ensure_hn(be.l5_z_out_, be.l5_zvw_, zvw)) L5_DECLINE("alloc");
+    if(!ensure_hn(be.l5_b_out_, be.l5_nv_, nv)) L5_DECLINE("alloc");
+    if(!ensure_hn(be.l5_a_out_, be.l5_nv_, nv)) L5_DECLINE("alloc");
+    if(!ensure_f(be.l5_b_dev_, be.l5_nv_, nv)) L5_DECLINE("alloc");
+    if(!ensure_f(be.l5_a_dev_, be.l5_nv_, nv)) L5_DECLINE("alloc");
+    if(!ensure_f(be.l5_cw_dev_, be.l5_cw_cap_, (size_t)cdim * (size_t)ck))
+      L5_DECLINE("alloc");
+    if(!ensure_f(be.l5_dtb_dev_, be.l5_nv_, nv)) L5_DECLINE("alloc");
+    if(!ensure_f(be.l5_alog_dev_, be.l5_nv_, nv)) L5_DECLINE("alloc");
+    if(!ensure_f(be.l5_pack_dev_, be.l5_pack_cap_, row_in + (size_t)cdim))
+      L5_DECLINE("alloc");
+    if(!be.l5_kind_dev_) {
+      be.l5_kind_dev_ = static_cast<std::uint8_t*>(sycl::malloc_device(
+            4 * sizeof(std::uint8_t), q.get_device(), q.get_context()));
+      if(!be.l5_kind_dev_) L5_DECLINE("alloc");
+    }
+    // L4 tail staging (z in FP32 from the z GEMM; norm weights host H2D).
+    if(be.l4_z_cap_ < zvw || !be.l4_z_dev_) {
+      float* n = static_cast<float*>(sycl::malloc_device(
+            zvw * sizeof(float), q.get_device(), q.get_context()));
+      if(!n) L5_DECLINE("alloc");
+      if(be.l4_z_dev_) sycl::free(be.l4_z_dev_, q);
+      be.l4_z_dev_ = n; be.l4_z_cap_ = zvw;
+    }
+    if(be.l4_nw_cap_ < (size_t)vd || !be.l4_nw_dev_) {
+      float* n = static_cast<float*>(sycl::malloc_device(
+            (size_t)vd * sizeof(float), q.get_device(), q.get_context()));
+      if(!n) L5_DECLINE("alloc");
+      if(be.l4_nw_dev_) sycl::free(be.l4_nw_dev_, q);
+      be.l4_nw_dev_ = n; be.l4_nw_cap_ = (size_t)vd;
+    }
+    if(be.l4_act_cap_ < zvw || !be.l4_act_dev_) {
+      std::uint16_t* n = static_cast<std::uint16_t*>(sycl::malloc_device(
+            zvw * sizeof(std::uint16_t), q.get_device(), q.get_context()));
+      if(!n) L5_DECLINE("alloc");
+      if(be.l4_act_dev_) sycl::free(be.l4_act_dev_, q);
+      be.l4_act_dev_ = n; be.l4_act_cap_ = zvw;
+    }
+    // H2D inputs: normed + kinds + per-layer weights.
+    q.memcpy(be.l5_norm_dev_, normed, (size_t)H * sizeof(float));
+    q.memcpy(be.l5_kind_dev_, kinds, 4 * sizeof(std::uint8_t));
+    q.memcpy(be.l5_cw_dev_, ln.conv_w, (size_t)cdim * (size_t)ck * sizeof(float));
+    q.memcpy(be.l5_dtb_dev_, ln.dt_bias, (size_t)nv * sizeof(float));
+    q.memcpy(be.l5_alog_dev_, ln.A_log, (size_t)nv * sizeof(float));
+    q.memcpy(be.l4_nw_dev_, ln.ssm_norm_w, (size_t)vd * sizeof(float));
+    // FWHT rot + RNE convert: 1 H2D in, 4 FP16 act rows out.
+    gemm::FwhtRotParams fp_;
+    fp_.normed_fp32 = be.l5_norm_dev_;
+    for(int t = 0; t < 4; ++t) fp_.acts_fp16[t] = be.l5_act_dev_[t];
+    fp_.rot_kind = be.l5_kind_dev_;
+    fp_.rot_p = fpp; fp_.rot_inv_sqrt = finv; fp_.H = H;
+    sycl::event e_fw = gemm::fwht_rot_to_half(q, fp_);
+    // 4x devact GEMM (outputs stay on device; in-order queue serializes).
+    std::uint16_t* outs[4] = {be.l5_qkv_out_, be.l5_z_out_,
+                              be.l5_b_out_, be.l5_a_out_};
+    sycl::event e_last;
+    for(int t = 0; t < 4; ++t) {
+      e_last = gemm::quant_gemm_forward_usm(q, be.l5_act_dev_[t],
+          sv[t].code, sv[t].scale, sv[t].alpha, outs[t],
+          /*M=*/1, sv[t].N, sv[t].K, sv[t].group_size, sv[t].scheme, e_fw);
+    }
+    // FP16->FP32: qkv/b/a rows for prep; z straight into L4 norm staging.
+    gemm::HalfToFloatParams hp;
+    hp.in_fp16 = be.l5_qkv_out_; hp.out_fp32 = be.l5_mqkv_dev_;
+    hp.n = (uint32_t)cdim;
+    sycl::event e_mqkv = gemm::half_to_float(q, hp, e_last);
+    hp.in_fp16 = be.l5_b_out_; hp.out_fp32 = be.l5_b_dev_; hp.n = nv;
+    sycl::event e_b = gemm::half_to_float(q, hp, e_last);
+    hp.in_fp16 = be.l5_a_out_; hp.out_fp32 = be.l5_a_dev_; hp.n = nv;
+    sycl::event e_a = gemm::half_to_float(q, hp, e_last);
+    hp.in_fp16 = be.l5_z_out_; hp.out_fp32 = be.l4_z_dev_;
+    hp.n = (uint32_t)zvw;
+    sycl::event e_z = gemm::half_to_float(q, hp, e_last);
+    (void)e_b; (void)e_a; (void)e_z;
+    // Conv FIR + prep pack (dep on the mqkv convert; b/a/z converts are
+    // ordered by the in-order queue — same standing as the L4 tail).
+    // HOSTPREP DEBUG KNOB (INTFER_L5_HOSTPREP=1): device prep bypassed —
+    // D2H the GEMM rows and run the EXACT host conv+prep loop, H2D the
+    // packed row, then the tail. Bisects device-prep noise (g/silu ~1ulp)
+    // vs device-GEMM anomaly as the stream-flip driver. If HOSTPREP is
+    // stream-identical, device prep is guilty; if it still flips, the
+    // GEMM/tail path is.
+    static const bool l5_hostprep =
+        (std::getenv("INTFER_L5_HOSTPREP") != nullptr);
+    sycl::event e_prep;
+    float* tail_pack = nullptr;
+    // HOSTPREP staging: host conv_out scratch + packed row (function scope
+    // so the L5_CHECK block below can read the conv tail back — sd->in on
+    // device holds only row_in floats in HOSTPREP mode).
+    static thread_local std::vector<float> l5_hcout, l5_hhin;
+    if(l5_hostprep) {
+      std::vector<float> hmqkv((size_t)cdim), hb((size_t)nv), ha((size_t)nv);
+      try {
+        q.memcpy(hmqkv.data(), be.l5_mqkv_dev_,
+                 (size_t)cdim * sizeof(float), e_mqkv).wait();
+        q.memcpy(hb.data(), be.l5_b_dev_, (size_t)nv * sizeof(float),
+                 e_b).wait();
+        q.memcpy(ha.data(), be.l5_a_dev_, (size_t)nv * sizeof(float),
+                 e_a).wait();
+      } catch (...) { L5_DECLINE("hostprep-d2h"); }
+      std::vector<float>& hcout = l5_hcout;
+      std::vector<float>& hhin = l5_hhin;
+      if(hcout.size() < (size_t)cdim) hcout.assign((size_t)cdim, 0.f);
+      for(int c = 0; c < cdim; ++c) {
+        float s = 0;
+        s += ln.conv_w[c*ck+0]*ly.conv_state[(size_t)c*3+0];
+        s += ln.conv_w[c*ck+1]*ly.conv_state[(size_t)c*3+1];
+        s += ln.conv_w[c*ck+2]*ly.conv_state[(size_t)c*3+2];
+        s += ln.conv_w[c*ck+3]*hmqkv[(size_t)c];
+        hcout[(size_t)c] = silu(s);
+        ly.conv_state[(size_t)c*3+0] = ly.conv_state[(size_t)c*3+1];
+        ly.conv_state[(size_t)c*3+1] = ly.conv_state[(size_t)c*3+2];
+        ly.conv_state[(size_t)c*3+2] = hmqkv[(size_t)c];
+      }
+      if(hhin.size() < row_in) hhin.assign(row_in, 0.f);
+      {
+        const float* query = hcout.data();
+        const float* key = hcout.data() + (size_t)nk*kd;
+        const float* value = hcout.data() + 2*(size_t)nk*kd;
+        float* hqn = hhin.data();
+        float* hkn = hhin.data() + (size_t)nk*kd;
+        float* hv = hkn + (size_t)nk*kd;
+        float* hg = hv + zvw;
+        float* hb2 = hg + nv;
+        for(uint32_t kh = 0; kh < nk; ++kh) {
+          l2norm(&query[(size_t)kh*kd], &hqn[(size_t)kh*kd], (int)kd);
+          l2norm(&key[(size_t)kh*kd], &hkn[(size_t)kh*kd], (int)kd);
+          for(uint32_t d = 0; d < kd; ++d) hqn[(size_t)kh*kd+d] *= 1.0f / sqrtf((float)kd);
+        }
+        memcpy(hv, value, zvw * sizeof(float));
+        memcpy(hb2, hb.data(), (size_t)nv * sizeof(float));
+        for(uint32_t hh = 0; hh < nv; ++hh) {
+          float sp = log1pf(expf(ha[hh] + ln.dt_bias[hh]));
+          hg[hh] = -expf(ln.A_log[hh]) * sp;
+        }
+      }
+      try {
+        q.memcpy(sd->in, hhin.data(), row_in * sizeof(float)).wait();
+      } catch (...) { L5_DECLINE("hostprep-h2d"); }
+      tail_pack = sd->in;
+    } else {
+      gemm::LaConvPrepParams cp;
+      cp.mqkv_fp32 = be.l5_mqkv_dev_;
+      cp.conv_state = sd->conv;
+      cp.conv_w = be.l5_cw_dev_;
+      cp.b_row = be.l5_b_dev_;
+      cp.a_row = be.l5_a_dev_;
+      cp.packed_in = be.l5_pack_dev_;
+      cp.dt_bias = be.l5_dtb_dev_;
+      cp.A_log = be.l5_alog_dev_;
+      cp.conv_dim = (uint32_t)cdim; cp.conv_k = (uint32_t)ck;
+      cp.nv = nv; cp.nk = nk; cp.kd = kd; cp.vd = vd;
+      cp.qscale = 1.0f / sqrtf((float)kd);  // host-identical value
+      e_prep = gemm::la_conv_prep(q, cp, e_mqkv);
+      tail_pack = be.l5_pack_dev_;
+    }
+    // SPEC SAFETY: write the resident conv back to the host mirror now
+    // (dep-chained after prep; waited after the tail) — the host stays
+    // authoritative for verify snapshots + host-conv paths. HOSTPREP
+    // already advanced ly.conv_state on the host (sd->conv untouched and
+    // unread this call), so the device->host copy must not run there —
+    // it would clobber the fresh host state with a stale resident conv.
+    sycl::event e_conv_wb;
+    if(!l5_hostprep)
+      e_conv_wb = q.memcpy(ly.conv_state.data(), sd->conv,
+                           conv_n * sizeof(float), e_prep);
+    // Certified tail: packed SSM row -> norm -> devact la_out (one wait).
+    if(!gpu_l4_tail(be, q, tail_pack, sd->ptrs, sd->S, sd->core,
+                    nv, nk, kd, vd, zvw, la_out_ti, o_la, e_prep))
+      return false;
+    if(!l5_hostprep) e_conv_wb.wait();
+    sd->dirty = true;  // S resident newer than host mirror (step: no sync)
+    // L5_CHECK: per-stage host recompute vs device (first 36 successes =
+    // two decode steps' LA sets — the L5 flip lands at decode step 1+,
+    // past the old 18-call prefill-only window). Isolates FWHT acts /
+    // GEMM outs / prep pack. INTFER_L5_CHECK_FROM slides the 36-fire
+    // window (e.g. =36 covers decode steps 1-2) to probe later steps.
+    {
+      static int check_done = 0;
+      static const int check_from = [] {
+        const char* e = std::getenv("INTFER_L5_CHECK_FROM");
+        return e ? std::atoi(e) : 0;
+      }();
+      const int fire = check_done++;
+      if(l5_check_env && fire >= check_from && fire < check_from + 36) {
+        const int seq = fire - check_from;
+        try {
+          // D2H device rows.
+          std::vector<std::uint16_t> hacts((size_t)4 * H, 0);
+          for(int t = 0; t < 4; ++t)
+            q.memcpy(hacts.data() + (size_t)t * H, be.l5_act_dev_[t],
+                     (size_t)H * sizeof(std::uint16_t)).wait();
+          std::vector<std::uint16_t> hqkv_o((size_t)cdim, 0),
+              hz_o(zvw, 0), hb_o((size_t)nv, 0), ha_o((size_t)nv, 0);
+          q.memcpy(hqkv_o.data(), be.l5_qkv_out_,
+                   (size_t)cdim * sizeof(std::uint16_t)).wait();
+          q.memcpy(hz_o.data(), be.l5_z_out_,
+                   zvw * sizeof(std::uint16_t)).wait();
+          q.memcpy(hb_o.data(), be.l5_b_out_,
+                   (size_t)nv * sizeof(std::uint16_t)).wait();
+          q.memcpy(ha_o.data(), be.l5_a_out_,
+                   (size_t)nv * sizeof(std::uint16_t)).wait();
+          std::vector<float> hpack(row_in + (size_t)cdim, 0.f);
+          // HOSTPREP writes only row_in floats into sd->in (no conv_out
+          // scratch tail on device) — read the tail back from the host
+          // hcout instead of over-reading the device buffer.
+          if(l5_hostprep) {
+            q.memcpy(hpack.data(), tail_pack,
+                     row_in * sizeof(float)).wait();
+            for(int i = 0; i < cdim; ++i)
+              hpack[row_in + (size_t)i] = l5_hcout[(size_t)i];
+          } else {
+            q.memcpy(hpack.data(), tail_pack,
+                     (row_in + (size_t)cdim) * sizeof(float)).wait();
+          }
+          // Host act reference: rot_apply + RNE convert (bit space).
+          const float* nrm = normed;
+          long act_mis = 0;
+          double act_max = 0;
+          std::vector<float> xr(H), hact_ref(H);
+          std::vector<std::uint16_t> hbits(H);
+          for(int t = 0; t < 4; ++t) {
+            const Rotation* R = be.rot_for(names[t]);
+            if(R) rot_apply(nrm, *R, xr.data());
+            else for(uint32_t i = 0; i < H; ++i) xr[i] = nrm[i];
+            dashq::float_to_half_batch(xr.data(), hbits.data(), H);
+            for(uint32_t i = 0; i < H; ++i) {
+              std::uint16_t got = hacts[(size_t)t * H + i];
+              if(got != hbits[i]) {
+                ++act_mis;
+                double d = (double)std::abs(
+                    dashq::half_to_float(got) - dashq::half_to_float(hbits[i]));
+                act_max = std::max(act_max, d);
+              }
+            }
+            // Host GEMM reference over the HOST acts (same kernel/weights
+            // the host path uses) vs half_to_float(device out).
+            std::vector<float> x32(H);
+            for(uint32_t i = 0; i < H; ++i) x32[i] = xr[i];
+            std::vector<float> gref;
+            be.run_linear_into(names[t], x32, gref);
+            // ref-vs-ref: same call twice (determinism probe — a nonzero
+            // rmax means the engine path itself is nondeterministic and
+            // gemm_max above is a check artifact, not an L5 divergence).
+            std::vector<float> gref2;
+            be.run_linear_into(names[t], x32, gref2);
+            double rmax = 0;
+            if(gref.size() == gref2.size()) {
+              for(size_t i = 0; i < gref.size(); ++i)
+                rmax = std::max(rmax,
+                    (double)std::abs(gref[i] - gref2[i]));
+            }
+            const std::uint16_t* dout = (t == 0) ? hqkv_o.data() :
+                (t == 1) ? hz_o.data() : (t == 2) ? hb_o.data() : ha_o.data();
+            double gmax = 0;
+            long gcnt = 0;
+            size_t gidx = 0;
+            float ggot = 0, gwant = 0;
+            if(gref.size() > 0) {
+              for(size_t i = 0; i < gref.size(); ++i) {
+                float got = dashq::half_to_float(dout[i]);
+                double d = (double)std::abs(gref[i] - got);
+                if(d > 1e-7) ++gcnt;
+                if(d > gmax) { gmax = d; gidx = i; ggot = got; gwant = gref[i]; }
+              }
+            }
+            std::fprintf(stderr,
+                "[l5-chk#%d] L=%d t=%d act_mis=%ld act_max=%.3g gemm_max=%.3g(gcnt=%ld i=%zu got=%.6g want=%.6g) refmax=%.3g N=%zu\n",
+                seq, L, t, act_mis, act_max, gmax, gcnt, gidx, ggot, gwant,
+                rmax, gref.size());
+            // Stash loop gref t=0 for the seq==0 rerun block (engine
+            // pre-tail vs post-tail consistency; hook-scope holder).
+            if(seq == 0 && t == 0) {
+              l5_stash_gref_t0 = gref;
+              l5_stash_x32_t0 = x32;
+            }
+          }
+          // Host conv + prep reference from the pre-state snapshot.
+          std::vector<float> mqkv_h((size_t)cdim, 0.f);
+          for(int i = 0; i < cdim; ++i)
+            mqkv_h[(size_t)i] = dashq::half_to_float(hqkv_o[(size_t)i]);
+          std::vector<float> cst = pre_conv, cout((size_t)cdim, 0.f);
+          for(int c = 0; c < cdim; ++c) {
+            float s = 0;
+            s += ln.conv_w[c*ck+0]*cst[(size_t)c*3+0];
+            s += ln.conv_w[c*ck+1]*cst[(size_t)c*3+1];
+            s += ln.conv_w[c*ck+2]*cst[(size_t)c*3+2];
+            s += ln.conv_w[c*ck+3]*mqkv_h[(size_t)c];
+            cout[(size_t)c] = silu(s);
+            cst[(size_t)c*3+0] = cst[(size_t)c*3+1];
+            cst[(size_t)c*3+1] = cst[(size_t)c*3+2];
+            cst[(size_t)c*3+2] = mqkv_h[(size_t)c];
+          }
+          const float* query = cout.data();
+          const float* key = cout.data() + (size_t)nk*kd;
+          const float* value = cout.data() + 2*(size_t)nk*kd;
+          std::vector<float> b_h((size_t)nv), a_h((size_t)nv);
+          for(uint32_t i = 0; i < nv; ++i) {
+            b_h[i] = dashq::half_to_float(hb_o[i]);
+            a_h[i] = dashq::half_to_float(ha_o[i]);
+          }
+          std::vector<float> qn((size_t)nk*kd), kn((size_t)nk*kd), gg(nv);
+          const float qs = 1.0f / sqrtf((float)kd);
+          for(uint32_t kh = 0; kh < nk; ++kh) {
+            l2norm(&query[(size_t)kh*kd], &qn[(size_t)kh*kd], (int)kd);
+            l2norm(&key[(size_t)kh*kd], &kn[(size_t)kh*kd], (int)kd);
+            for(uint32_t d = 0; d < kd; ++d) qn[(size_t)kh*kd+d] *= qs;
+          }
+          for(uint32_t hh = 0; hh < nv; ++hh) {
+            float sp = log1pf(expf(a_h[hh] + ln.dt_bias[hh]));
+            gg[hh] = -expf(ln.A_log[hh]) * sp;
+          }
+          // Pack compare: [qn|kn|v|g|b] + conv_out scratch tail.
+          const float* pq = hpack.data();
+          const float* pk = pq + (size_t)nk*kd;
+          const float* pv = pk + (size_t)nk*kd;
+          const float* pg = pv + zvw;
+          const float* pb = pg + nv;
+          const float* pc = pb + nv;
+          double qmax = 0, kmax = 0, vmax = 0, gmax2 = 0, bmax = 0, cmax = 0;
+          for(size_t i = 0; i < (size_t)nk*kd; ++i) {
+            qmax = std::max(qmax, (double)std::abs(pq[i] - qn[i]));
+            kmax = std::max(kmax, (double)std::abs(pk[i] - kn[i]));
+          }
+          for(size_t i = 0; i < zvw; ++i)
+            vmax = std::max(vmax, (double)std::abs(pv[i] - value[i]));
+          for(uint32_t i = 0; i < nv; ++i) {
+            gmax2 = std::max(gmax2, (double)std::abs(pg[i] - gg[i]));
+            bmax = std::max(bmax, (double)std::abs(pb[i] - b_h[i]));
+          }
+          for(int i = 0; i < cdim; ++i)
+            cmax = std::max(cmax, (double)std::abs(pc[i] - cout[(size_t)i]));
+          // Conv writeback check: host mirror must equal post-state cst.
+          double wmax = 0;
+          for(size_t i = 0; i < conv_n; ++i)
+            wmax = std::max(wmax,
+                (double)std::abs(ly.conv_state[i] - cst[i]));
+          std::fprintf(stderr,
+              "[l5-prep#%d] L=%d q=%.3g k=%.3g v=%.3g g=%.3g b=%.3g cout=%.3g wb=%.3g\n",
+              seq, L, qmax, kmax, vmax, gmax2, bmax, cmax, wmax);
+          // RERUN probe (seq==0 only): re-issue GEMM t=0 from the SAME act /
+          // weight pointers into a fresh device buffer, empty dep.
+          // Three-way split: re==hqkv_o!=gr0 => engine path is the odd
+          // one; re==gr0!=hqkv_o => the first (e_fw-dep) call is; re
+          // differs from both => buffer-dependent nondeterminism.
+          // REPLICA: inline clone of run_linear_tp's body (host convert
+          // -> memcpy to fresh shared act -> kernel -> host readback).
+          // replica==gr0!=re => engine STATE (begin_layer/workspace) is
+          // the splitter; replica==re!=gr0 => the ws act/out buffers.
+          if(seq == 0) {
+            std::uint16_t* tmp = static_cast<std::uint16_t*>(
+                sycl::malloc_device((size_t)cdim * sizeof(std::uint16_t),
+                  q.get_device(), q.get_context()));
+            if(tmp) {
+              sycl::event e_re = gemm::quant_gemm_forward_usm(
+                  q, be.l5_act_dev_[0], sv[0].code, sv[0].scale, sv[0].alpha,
+                  tmp, 1, sv[0].N, sv[0].K, sv[0].group_size, sv[0].scheme,
+                  sycl::event{});
+              std::vector<std::uint16_t> hre((size_t)cdim, 0);
+              q.memcpy(hre.data(), tmp, (size_t)cdim * sizeof(std::uint16_t),
+                       e_re).wait();
+              sycl::free(tmp, q);
+              const Rotation* R0 = be.rot_for(names[0]);
+              std::vector<float> xr0(H);
+              if(R0) rot_apply(nrm, *R0, xr0.data());
+              else for(uint32_t i = 0; i < H; ++i) xr0[i] = nrm[i];
+              std::vector<float> gr0;
+              be.run_linear_into(names[0], xr0, gr0);
+              long re_vs_first = 0, re_vs_gref = 0, loop_vs_recompute = 0;
+              double xmax = 0;
+              if(xr0.size() == l5_stash_x32_t0.size()) {
+                for(size_t i = 0; i < xr0.size(); ++i)
+                  xmax = std::max(xmax,
+                      (double)std::abs(xr0[i] - l5_stash_x32_t0[i]));
+              } else xmax = -1;
+              std::fprintf(stderr,
+                  "[l5-xin] L=%d xr0_vs_loopx32_max=%.3g n=%zu/%zu\n",
+                  L, xmax, xr0.size(), l5_stash_x32_t0.size());
+              for(int i = 0; i < cdim; ++i) {
+                float a = dashq::half_to_float(hre[(size_t)i]);
+                float b = dashq::half_to_float(hqkv_o[(size_t)i]);
+                if(std::abs(a - b) > 1e-7) ++re_vs_first;
+                if(i < (int)gr0.size() &&
+                   std::abs(a - gr0[(size_t)i]) > 1e-7) ++re_vs_gref;
+                if(i < (int)gr0.size() && i < (int)l5_stash_gref_t0.size() &&
+                   std::abs(gr0[(size_t)i] - l5_stash_gref_t0[(size_t)i]) > 1e-7)
+                  ++loop_vs_recompute;
+              }
+              std::fprintf(stderr,
+                  "[l5-rerun] L=%d re_vs_first=%ld re_vs_gref=%ld loop_vs_recompute=%ld N=%d\n",
+                  L, re_vs_first, re_vs_gref, loop_vs_recompute, cdim);
+              // REPLICA of run_linear_tp body with private shared buffers.
+              std::uint16_t* ract = static_cast<std::uint16_t*>(
+                  sycl::malloc_shared((size_t)H * sizeof(std::uint16_t),
+                    q.get_device(), q.get_context()));
+              std::uint16_t* rout = static_cast<std::uint16_t*>(
+                  sycl::malloc_shared((size_t)cdim * sizeof(std::uint16_t),
+                    q.get_device(), q.get_context()));
+              if(ract && rout) {
+                std::vector<std::uint16_t> conv(H);
+                dashq::float_to_half_batch(xr0.data(), conv.data(), H);
+                std::memcpy(ract, conv.data(), (size_t)H * sizeof(std::uint16_t));
+                sycl::event e_rp = gemm::quant_gemm_forward_usm(
+                    q, ract, sv[0].code, sv[0].scale, sv[0].alpha,
+                    rout, 1, sv[0].N, sv[0].K, sv[0].group_size, sv[0].scheme,
+                    sycl::event{});
+                e_rp.wait();
+                long rp_vs_first = 0, rp_vs_gref = 0;
+                for(int i = 0; i < cdim; ++i) {
+                  float a = dashq::half_to_float(rout[(size_t)i]);
+                  float b = dashq::half_to_float(hqkv_o[(size_t)i]);
+                  if(std::abs(a - b) > 1e-7) ++rp_vs_first;
+                  if(i < (int)gr0.size() &&
+                     std::abs(a - gr0[(size_t)i]) > 1e-7) ++rp_vs_gref;
+                }
+                std::fprintf(stderr,
+                    "[l5-replica] L=%d rp_vs_first=%ld rp_vs_gref=%ld\n",
+                    L, rp_vs_first, rp_vs_gref);
+              }
+              if(ract) sycl::free(ract, q);
+              if(rout) sycl::free(rout, q);
+            }
+          }
+        } catch (...) {
+          std::fprintf(stderr, "[l5-chk#%d] L=%d exception\n", seq, L);
+        }
+      }
+    }
+    if(l5_dbg) {
+      static thread_local int n = 0;
+      if((++n % 18) == 1)
+        std::fprintf(stderr, "[l5] front chain x%d\n", n);
+    }
+    return true;
+  } catch (...) {
+    return false;
+  }
+#undef L5_DECLINE
+}
+#endif
+
 // ============================================================================
 // Forward step
 // ============================================================================
@@ -3584,6 +4317,31 @@ static StepOut step(Request& req, int token, int pos,
           backend->run_linear_wave(items, 4);
         }
         ckpt("la.qkv", L, mqkv);
+      // ---- L5 front chain (INTFER_L5_FRONT=1, GPU TP=1 scalar only) ----
+      // Attempt BEFORE the host conv FIR: the device prep consumes the
+      // PRE-advance conv history as its resident state (uploaded on first
+      // use) and advances it in place. Running the host FIR first would
+      // leave the resident one step ahead (double advance). On success the
+      // device chain (FWHT acts -> GEMMs -> prep -> L4 tail) fills o_la and
+      // the host conv/prep/SSM/norm/la_out below are skipped (same contract
+      // as the L4 path: z/b/a/conv_out scratch left unfilled).
+      bool l5_done = false;
+#ifdef INTFER_HAS_GPU_BACKEND
+      {
+        static const bool l5_env = (std::getenv("INTFER_L5_FRONT") != nullptr);
+        if(l5_env && !trace_h) {
+          if(auto* gpu_be_l5 = dynamic_cast<GpuBackend*>(backend)) {
+            if(gpu_be_l5->eng) {
+              std::vector<float>& o_la_l5 = req.scratch.o_la;
+              if((int)o_la_l5.size() != cfg.H) o_la_l5.assign(cfg.H, 0.f);
+              l5_done = gpu_l5_front(*gpu_be_l5, &req, L, normed.data(),
+                                    ln, o_la_l5);
+            }
+          }
+        }
+      }
+#endif
+      if(!l5_done) {
       for(int c=0;c<cfg.conv_dim;c++){
         float s=0;
         s+=conv_w[c*cfg.conv_k+0]*ly.conv_state[c*3+0];
@@ -3606,11 +4364,14 @@ static StepOut step(Request& req, int token, int pos,
       // on-device (one wait + one D2H), filling o_la directly. False keeps
       // the ssm/host path below. Trace runs force the host path (debug
       // diffs stay on the exact host math).
-      bool l4_done = false;
+      bool l4_done = l5_done;
 #ifdef INTFER_HAS_GPU_BACKEND
       {
         static const bool l4_env = (std::getenv("INTFER_L4_FUSE") != nullptr);
-        if(l4_env && !trace_h) {
+        // (L5 already attempted pre-conv above; its success skips this
+        // whole host block via l4_done. No second attempt here: the host
+        // conv below would corrupt the resident history the hook needs.)
+        if(!l4_done && l4_env && !trace_h) {
           if(auto* gpu_be_l4 = dynamic_cast<GpuBackend*>(backend)) {
             if(gpu_be_l4->eng) {
               std::vector<float>& o_la_l4 = req.scratch.o_la;
@@ -3695,10 +4456,11 @@ static StepOut step(Request& req, int token, int pos,
         for(int i=0;i<cfg.v_head_dim;i++) o[i]=(x[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
       }
       } // end if(!l4_done): host SSM + norm (L4 fills o_la on-device)
+      } // end if(!l5_done): host conv+SSM+norm (L5 fills o_la on-device)
       std::vector<float>& o_la = req.scratch.o_la;
-      if(!l4_done)
+      if(!l5_done)
         backend->run_linear_into(ln.la_out, req.scratch.normed_core, o_la);
-      // else: L4 already filled o_la on-device (normed_core/core untouched).
+      // else: L5/L4 already filled o_la on-device (normed_core/core untouched).
       const Rotation* Ro_la = backend->rot_for(ln.la_out);
       if(Ro_la){ for(int i=0;i<cfg.H;i++) h[i] = 0.f; rot_left(o_la.data(), *Ro_la, h.data()); }
       else for(int i=0;i<cfg.H;i++) h[i] = o_la[i];
