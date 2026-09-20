@@ -508,9 +508,18 @@ Implement features for maximizing throughput for concurrent requests, starting f
   layer (~4ms) for real risk — not worth it. L5 stays default-OFF; the
   kernels + stream-identity proof are retained for a future fused
   fwht->GEMM->prep kernel or M-row/serve amortization, where launch count
-  amortizes. NOTE: the L4 arm (INTFER_L4_FUSE=1) diverges from base at HEAD
-  (279 279 279 59 198 8 vs 279 6511 314...) — L4 stream-identity needs
-  re-verification before any L4 wall-time claim.
+  amortizes. FIX 2026-09-21: L4 divergence was a scoping bug from the 6c31136
+  L5-hook restructure, NOT a numeric issue — the final la_out dispatch guard
+  was renamed if(!l4_done)->if(!l5_done) when the outer scope was added, but
+  l4_done (init =l5_done) is the flag recording L4 success. L4-on/L5-off:
+  fused path filled o_la on-device, then the host GEMM re-ran over stale
+  normed_core and clobbered it (step-1 divergence). Fixed by hoisting l4_done
+  to l5_done scope and guarding if(!l5_done && !l4_done) (conjunction needed:
+  L5 success skips the block where l4_done=l5_done is assigned). Root cause
+  excluded the RNE-converter changes (shared converters verified neutral —
+  all 8 combos identical). Stream-gated TP1 -n6: base==L4==L5==HOSTPREP==
+  SSM==SSMxL4==TP2-base==TP2-L4 (279 6511 314 279 3046 13); cpu parity +
+  gpu-optin + http batch PASS.
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +

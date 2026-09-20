@@ -4377,6 +4377,9 @@ static StepOut step(Request& req, int token, int pos,
       // the host conv/prep/SSM/norm/la_out below are skipped (same contract
       // as the L4 path: z/b/a/conv_out scratch left unfilled).
       bool l5_done = false;
+      bool l4_done = false;  // mirrors l5_done; set below (L4 runs inside the
+                             // !l5_done block, but the final la_out dispatch
+                             // below must skip on either success)
 #ifdef INTFER_HAS_GPU_BACKEND
       {
         static const bool l5_env = (std::getenv("INTFER_L5_FRONT") != nullptr);
@@ -4415,7 +4418,7 @@ static StepOut step(Request& req, int token, int pos,
       // on-device (one wait + one D2H), filling o_la directly. False keeps
       // the ssm/host path below. Trace runs force the host path (debug
       // diffs stay on the exact host math).
-      bool l4_done = l5_done;
+      l4_done = l5_done;
 #ifdef INTFER_HAS_GPU_BACKEND
       {
         static const bool l4_env = (std::getenv("INTFER_L4_FUSE") != nullptr);
@@ -4509,7 +4512,7 @@ static StepOut step(Request& req, int token, int pos,
       } // end if(!l4_done): host SSM + norm (L4 fills o_la on-device)
       } // end if(!l5_done): host conv+SSM+norm (L5 fills o_la on-device)
       std::vector<float>& o_la = req.scratch.o_la;
-      if(!l5_done)
+      if(!l5_done && !l4_done)
         backend->run_linear_into(ln.la_out, req.scratch.normed_core, o_la);
       // else: L5/L4 already filled o_la on-device (normed_core/core untouched).
       const Rotation* Ro_la = backend->rot_for(ln.la_out);
