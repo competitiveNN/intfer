@@ -480,24 +480,37 @@ Implement features for maximizing throughput for concurrent requests, starting f
   tok/s claim either way). Do NOT re-run hoping for a better number —
   re-run ONLY on a sustained-quiet box (load1<2). Both A/Bs point the same
   way: submit-side savings convert only where the device has idle gaps.
-- L5 LA-front chain (2026-09-19, IN PROGRESS — kernels built, orchestration
-  pending): extends the device-act pattern FORWARD from la_out to the whole
-  LA input path. Per LA layer scalar path today = host wave-4 (4 GEMM
+- L5 LA-front chain (2026-09-19 hooked 6c31136, stream-identical; 2026-09-20
+  op-cut 7a6cee3): extends the device-act pattern FORWARD from la_out to the
+  whole LA input path. Per LA layer scalar path today = host wave-4 (4 GEMM
   round-trips) + host conv + host prep + L4 tail. L5 replaces with: H2D
-  normed (1x) -> fwht_rot_to_half kernel (4x FWHT rot + RNE convert, NEW,
-  built) -> 4x devact GEMM (existing seam) -> la_conv_prep kernel (conv
-  FIR+silu + qk-prep pack into sd->in, NEW, built) -> certified L4 tail
-  (ssm_forward + norm + devact la_out). conv_state goes device-resident in
-  SsmDev (dirty-tracked, host resyncs). Saves per LA layer vs L4 path: 4
-  converts + ~6 transfers + 1-2 waits (x18 layers). Bit-contracts:
-  FWHT/conv-FIR/packs exact host order; silu/exp/log1p ~1ulp (oracle
-  arbitrates); stream-identity gates are load-insensitive (build+gate now,
-  wall-time later). Kill switch: INTFER_L5_FRONT=1 (default OFF); any false
-  keeps the L4/host path. REMAINING: conv_state mirror sync points
-  (evict/resync/rollback), step() hook, gates. UPDATE 2026-09-19: SsmDev
-  resident conv fields (conv/conv_cap/conv_dirty) + free sites in dtor +
-  FIFO-evict landed (cpu parity + gpu-optin PASS); alloc/upload/sync/step
-  hook still pending.
+  normed (1x) -> fwht_rot_to_half kernel (4x FWHT rot + RNE convert)
+  -> 4x devact GEMM (existing seam) -> la_conv_prep kernel (conv FIR+silu +
+  qk-prep pack into sd->in) -> certified L4 tail (ssm_forward + norm +
+  devact la_out). conv_state goes device-resident in SsmDev (dirty-tracked,
+  host resyncs). Bit-contracts: FWHT/conv-FIR/packs exact host order;
+  silu/exp/log1p ~1ulp (oracle arbitrates). Kill switch: INTFER_L5_FRONT=1
+  (default OFF); any false keeps the L4/host path. Stream-gated TP1 -n 6:
+  base == L5 == L5+HOSTPREP == L5-TP2-decline (279 6511 314 279 3046 13).
+  SUBMIT-WALL VERDICT (2026-09-20, structural, load-immune): L5-front scalar
+  decode is a DEAD END as built — do not chase wall-time on it. Buckets
+  (TP1 -n 6): base nk=1260/nw=828/kernel=63.7ms vs L5 nk=2124/nw=828/
+  kernel=61.3ms, waitblock 318 vs 62ms. Same device work, same wait COUNT
+  (the single-wait seam works — devact + dep chains, no extra waits), but
+  +144 launches/token = +8/LA layer (fwht, 4x half_to_float, prep, tail
+  ssm+norm the host path never launches) and ~150 extra UR submits/token
+  serialize the in-order queue: the device starves between host submits and
+  the final wait per layer drains idle time, inflating waitblock 5x. 7a6cee3
+  cut the resend fat (per-layer cw/dtb/alog/kinds const cache l5c_ +
+  dropped the provably-redundant conv-writeback wait, which returned
+  immediately) — nk/nw confirm the remainder is kernel-launch count, not
+  waits or H2Ds. Fusing 4x h2f into 1 kernel would save only ~3 launches/
+  layer (~4ms) for real risk — not worth it. L5 stays default-OFF; the
+  kernels + stream-identity proof are retained for a future fused
+  fwht->GEMM->prep kernel or M-row/serve amortization, where launch count
+  amortizes. NOTE: the L4 arm (INTFER_L4_FUSE=1) diverges from base at HEAD
+  (279 279 279 59 198 8 vs 279 6511 314...) — L4 stream-identity needs
+  re-verification before any L4 wall-time claim.
 - Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
   pre-fusion, was ~26 ceiling pre-DPAS-off):
   ~169 launches/token (~80us submit each: submit ~30%, waitblock +
