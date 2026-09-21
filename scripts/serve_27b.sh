@@ -65,12 +65,24 @@ if [ "$BG" = 1 ]; then
   # TP=2; steady state after exactly one request — see AGENTS.md). One tiny
   # greedy request migrates all pages now so the first REAL request is fast.
   # INTFER_NO_WARMUP=1 skips (e.g. when another process already warmed it).
+  # NOTE: the already-up early exit above also skips warmup — that server was
+  # warmed by whoever started it (or pays migration on its first request;
+  # either way not this invocation's job).
   if [ -z "${INTFER_NO_WARMUP:-}" ]; then
     echo "warmup: one tiny request to migrate USM pages to devices..."
-    curl -s -m 600 "http://$HOST:$PORT/v1/completions" \
+    _w0=$(date +%s)
+    # -f fails on HTTP errors; response must contain a choices array or the
+    # migration is assumed NOT done (fail-open: server still up, first real
+    # request pays migration). Timing goes to the log for attribution.
+    if _wresp=$(curl -s -f -m 600 "http://$HOST:$PORT/v1/completions" \
       -H 'Content-Type: application/json' \
-      -d '{"prompt":"warmup","max_tokens":1,"temperature":0}' >/dev/null 2>&1 \
-      && echo "warmup: done" || echo "warmup: request failed (server still up; first real request pays migration)" >&2
+      -d '{"prompt":"warmup","max_tokens":1,"temperature":0}' 2>/dev/null) \
+      && printf '%s' "$_wresp" | grep -q '"choices"'; then
+      echo "warmup: done in $(($(date +%s) - _w0))s"
+    else
+      echo "warmup: request failed or bad response (server still up; first real request pays migration)" >&2
+    fi
+    unset _w0 _wresp
   fi
 else
   exec "$BIN" -m "$MODEL" --gpu --tp 2 --serve-http \
