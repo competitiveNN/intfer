@@ -216,6 +216,21 @@ Implement features for maximizing throughput for concurrent requests, starting f
   GPU by scripts/test_gpu_optin.sh (10/10: base/KV/Q8/Q8+HAD/SSM_GPU x
   TP1/TP2, .intifer stream 279/6511/314/279) — wall-time comparison
   still needs quiet box (load<2).
+- First-touch migration (2026-09-21, measured on 27B TP=2 serve):
+  preload_all builds 496 shards in ~49s and pins them (zero rebuilds on
+  first request), but shard USM is malloc_shared so pages stay host-resident
+  until first kernel touch: xpu-smi device-local at startup dev0 791MB /
+  dev1 51MB, jumping to 11.27GB / 10.94GB only after the first request.
+  Same-prompt back-to-back (contended box, load ~6): req1 9.28s vs req2/req3
+  2.75s/2.75s — first request pays ~6.5s of migration stalls, steady state
+  reached after exactly one request (streams identical). q.prefetch() over
+  all shards was built, measured (18.7GB "migrated" in 59ms), and REVERTED:
+  device counters unchanged, first-request jump identical — prefetch is a
+  no-op hint for shared USM on this Level Zero driver (do not retry as-is;
+  note in engine.cpp preload_all). Mitigation: one warmup request after
+  /health goes live (scripts/serve_27b.sh does this, INTFER_NO_WARMUP=1
+  skips). A startup touch-kernel over all 496 shards would only move the
+  cost, not eliminate it — unscoped.
 - Wave-submit + vectorized host math (2026-09-18, wave 7d7ca72, AVX2
   5285b47, extended a78e99f, quantified on quiet box loadavg<2): z/b/a +
   gate/up + full-attn k/v GEMMs convert+submit back-to-back, one wait

@@ -60,6 +60,18 @@ if [ "$BG" = 1 ]; then
     [ "$i" = 60 ] && { echo "FAIL: server never came up (see $LOG)" >&2; exit 1; }
   done
   echo "up: http://$HOST:$PORT/health"
+  # Warmup: shard USM is malloc_shared, so pages stay host-resident until
+  # first kernel touch (first request pays ~6.5s of migration stalls on 27B
+  # TP=2; steady state after exactly one request — see AGENTS.md). One tiny
+  # greedy request migrates all pages now so the first REAL request is fast.
+  # INTFER_NO_WARMUP=1 skips (e.g. when another process already warmed it).
+  if [ -z "${INTFER_NO_WARMUP:-}" ]; then
+    echo "warmup: one tiny request to migrate USM pages to devices..."
+    curl -s -m 600 "http://$HOST:$PORT/v1/completions" \
+      -H 'Content-Type: application/json' \
+      -d '{"prompt":"warmup","max_tokens":1,"temperature":0}' >/dev/null 2>&1 \
+      && echo "warmup: done" || echo "warmup: request failed (server still up; first real request pays migration)" >&2
+  fi
 else
   exec "$BIN" -m "$MODEL" --gpu --tp 2 --serve-http \
     --port "$PORT" --host "$HOST"
