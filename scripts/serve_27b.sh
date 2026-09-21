@@ -68,21 +68,33 @@ if [ "$BG" = 1 ]; then
   # NOTE: the already-up early exit above also skips warmup — that server was
   # warmed by whoever started it (or pays migration on its first request;
   # either way not this invocation's job).
+  # NOTE (CPU-only): this script always launches --gpu --tp 2 (both exec
+  # sites hardcode it; TP=1 OOMs on 27B), so a CPU-only run through this
+  # script is impossible — no CPU guard needed. A --no-gpu run would take
+  # the "non-GPU backend" path in main.cpp (no USM, no migration) where a
+  # warmup would be pure waste; if that mode is ever added here, gate this
+  # block on it.
   if [ -z "${INTFER_NO_WARMUP:-}" ]; then
     echo "warmup: one tiny request to migrate USM pages to devices..."
     _w0=$(date +%s)
-    # -f fails on HTTP errors; response must contain a choices array or the
-    # migration is assumed NOT done (fail-open: server still up, first real
-    # request pays migration). Timing goes to the log for attribution.
-    if _wresp=$(curl -s -f -m 600 "http://$HOST:$PORT/v1/completions" \
+    # Timeouts: --connect-timeout for hung TCP (default 10s), --max-time for
+    # the whole request (default 600s; the measured warmup is ~9s, 600 leaves
+    # headroom under load). INTFER_WARMUP_TIMEOUT overrides the max-time
+    # (e.g. small values in CI). -f fails on HTTP errors; response must
+    # contain a choices array or the migration is assumed NOT done
+    # (fail-open: server still up, first real request pays migration).
+    # Timing goes to the log for attribution.
+    _wtimeout="${INTFER_WARMUP_TIMEOUT:-600}"
+    if _wresp=$(curl -s -f --connect-timeout 10 --max-time "$_wtimeout" \
+      "http://$HOST:$PORT/v1/completions" \
       -H 'Content-Type: application/json' \
       -d '{"prompt":"warmup","max_tokens":1,"temperature":0}' 2>/dev/null) \
       && printf '%s' "$_wresp" | grep -q '"choices"'; then
       echo "warmup: done in $(($(date +%s) - _w0))s"
     else
-      echo "warmup: request failed or bad response (server still up; first real request pays migration)" >&2
+      echo "warmup: request failed, timed out, or bad response (server still up; first real request pays migration)" >&2
     fi
-    unset _w0 _wresp
+    unset _w0 _wresp _wtimeout
   fi
 else
   exec "$BIN" -m "$MODEL" --gpu --tp 2 --serve-http \
