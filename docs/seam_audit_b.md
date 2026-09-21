@@ -32,16 +32,17 @@ lm_head (x1/token): run_lm_head_f16, DPAS INT8 path (XMX active here).
 
 ## 3. Seam candidates ranked (devact seam adds ZERO launches by design)
 
-### #1 lm_head input (final-norm out -> head GEMM) — BEST ratio
-Today: host rmsnorm -> FP32 fn -> FP16 convert + H2D (K=1024, tiny) ->
-  DPAS GEMM -> D2H + convert (N=248320, HUGE: ~0.5MB FP16 out/token).
-The output side dominates: vocab-sized readback + half_to_float_batch
-every token. A devact head GEMM fed from a device-resident norm kernel
-kills the vocab-sized D2H-side convert; input H2D is only 2KB.
-Saves/token: 1 H2D (2KB) + 1 D2H-side host convert (~248K elems) +
-  host norm. Costs: 1 norm submit. No new math (rmsnorm exact order).
-Risk: LOW (same pattern as L4 norm kernel; lm_head DPAS path already
-  takes FP16 acts). Note: readback of logits stays (argmax is host).
+### #1 lm_head input (final-norm out -> head GEMM) — REJECTED on scoping
+  (2026-09-21, INTFER_TRACE_LMHEAD): kernel ~700us, wall 1.4-4.7ms. The
+  wall minus kernel is submit + D2H (0.5MB FP16 out) + host vocab convert
+  (248K elems) + wait — and ALL of that stays (host argmax needs float
+  logits). A device-norm seam would save only the 2KB H2D + K=1024 convert
+  + norm (microseconds) while ADDING a ~25us+ norm submit: wash or loss.
+  The audit's "largest single host-side convert" claim was wrong — the
+  vocab-sized convert is on the OUTPUT side, which no input seam removes.
+  The real lm_head lever (if any) is D2H-side: argmax-on-device returning
+  one int (kills 0.5MB D2H + vocab convert), NOT input-side. That needs a
+  new kernel + greedy/top-p contract change — scoped, not started.
 
 ### #2 FA q/k/v -> norm/rope/cache (x6 layers)
 Blocker: consumers are host elementwise (rmsnorm/rope in-place) + cache
@@ -75,12 +76,16 @@ blocker, same reason TP=2 loses ~1.9x overall. NOT recommended.
 
 ## 4. Recommendation
 
-Implement #1 (device-resident final-norm -> devact lm_head) as the next
-seam: only candidate with (a) no new consumer kernels beyond one exact
-rmsnorm, (b) zero added GEMM launches, (c) the largest single host-side
-convert killed per token (vocab-sized). Behind a default-off env flag,
-stream-gated base==flag TP1/TP2, same contract as L4 (trace forces host).
-Wall-time A/B on quiet box only.
+NO input-side seam is recommended: #1 measured as wash/loss (see above),
+#2/#3/#4 need device consumer kernels (L5 verdict stands), #5 is blocked
+on TP2 cross-device visibility. The device-act pattern is EXHAUSTED on the
+scalar decode path — fused MLP + L4 cover every GEMM->GEMM edge with no
+host math between; all remaining edges have host consumers (conv/SSM/norm/
+rope/attention/argmax) that cost more to move than the seam saves.
 
-Deliberately NOT recommended: #2/#3/#4 without fused consumer kernels
-(L5 verdict stands), #5 (TP2 cross-device blocker).
+Remaining levers, in order:
+(a) argmax-on-device for lm_head (kills 0.5MB D2H + vocab convert/token;
+    new kernel + sampler contract — the only unblocked device-side win);
+(b) serve-side aggregate batching (highest documented value, quiet box);
+(c) fused fwht->GEMM->prep single kernel (replaces ~8 launches with 1;
+    session-scale build, only if (a) lands first and the ceiling holds).
