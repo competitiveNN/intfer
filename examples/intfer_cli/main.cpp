@@ -7442,7 +7442,11 @@ struct HttpDispatcher {
   SchedCtx* c = nullptr;
   const std::function<void(Request&)>* wire = nullptr;
   uint32_t seed_base = 0;
-  int chunk_M = 8;
+  int chunk_M = 128;  // match --serve/sched_prefill default (was 8: a 267-tok
+                      // prompt ran 34 sequential M=8 x 64-layer passes = 74s
+                      // prefill on 27B TP=2; 128 does ~3 passes instead).
+                      // INTFER_PREFILL_CHUNK_M still overrides (e.g. small
+                      // chunks for TTFT granularity under concurrent load).
   int serve_max = 8;
   bool split_iter = false;
   std::mutex mu;
