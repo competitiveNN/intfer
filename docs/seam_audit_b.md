@@ -85,7 +85,39 @@ rope/attention/argmax) that cost more to move than the seam saves.
 
 Remaining levers, in order:
 (a) argmax-on-device for lm_head (kills 0.5MB D2H + vocab convert/token;
-    new kernel + sampler contract — the only unblocked device-side win);
+    new kernel + sampler contract — SCOPED 2026-09-21, not started);
 (b) serve-side aggregate batching (highest documented value, quiet box);
 (c) fused fwht->GEMM->prep single kernel (replaces ~8 launches with 1;
     session-scale build, only if (a) lands first and the ceiling holds).
+
+## 5. Sampler-contract scope for (a) (2026-09-21, code-read, no behavior change)
+
+Producers of `StepOut{best, logits}` (main.cpp): scalar `step()` (:4094),
+`prefill_layer_outer()` last-row by default / all-rows via `all_out` (spec
+verifier, :5593), serve `step_batch()` every row (:6306, M-row batched
+lm_head when M>1).
+
+Consumers split exactly on greedy-vs-sampling:
+- Greedy (`temperature<=0 && top_k==0 && top_p<=0`) reads ONLY `.best`:
+  `sched_iteration` (:6437), joint (:6541), CLI loop (:9190), spec-verify
+  accept loop (`outs[i-1].best == drafts[i]`, :9124). Device-argmax
+  returning one int serves all of these — no logits needed.
+- Sampling reads the FULL `.logits`: `sample()` (:6708) runs softmax over
+  the whole vocab + top-k nth_element + top-p full sort + multinomial with
+  the per-request host `mt19937`. Device-argmax does NOT serve sampling
+  rows — they keep the full D2H + host convert path.
+- Spec decode needs `.best` per verify row (accept test) + the corrected/
+  bonus token — greedy-compatible, no logits.
+
+Consequence: device-argmax must be per-row conditional, not a global
+switch. In mixed-temp `step_batch` batches, greedy rows skip the D2H
+(consume the device int) while sampling rows still read back their full
+logits — i.e. per-row masking (or a two-pass: argmax kernel over the
+device logits buffer for greedy rows, D2H only sampling rows). The
+prefill `all_out` spec path is greedy today (accept test on `.best`
+only), so it can ride the int path too; any future sampling spec would
+need full logits there. RNG stays host-side, untouched.
+Bit-contract: device argmax must tie-break identically to the host
+`if(s>bestv)` strict-greater scan (first-max-wins); NaN handling must
+match (host strict-`>` ignores NaN — device kernel must too, else
+spec-verify accept decisions diverge).

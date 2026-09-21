@@ -4138,7 +4138,6 @@ static StepOut step(Request& req, int token, int pos,
 
   // Per-layer names/rotations/host-ptrs are precomputed once (g_ln).
    for(int L=0; L<cfg.layers; L++){
-   if((L & 15) == 0){ std::fprintf(stderr, "[intfer] forward L=%d/%d pos=%d hsize=%zu layers=%zu\n", L, cfg.layers, pos, h.size(), req.layers.size()); std::fflush(stderr); }
    if(L < 0 || (size_t)L >= req.layers.size()){ std::fprintf(stderr, "[intfer] FATAL layer OOB\n"); std::exit(1); }
    const LayerNames& ln = g_ln[(size_t)L];
    Layer& ly = req.layers[L];
@@ -4607,8 +4606,6 @@ static StepOut step(Request& req, int token, int pos,
   std::vector<float>& logits = req.scratch.logits;
   int best=-1; float bestv=-1e30f;
   const float* head = lm_head ? lm_head : embed;
-  std::fprintf(stderr, "[intfer] logits: vocab=%d H=%d head=%p\n", cfg.vocab, cfg.H, (const void*)head);
-  std::fflush(stderr);
   if(backend){
     auto gpu = dynamic_cast<GpuBackend*>(backend);
     if(gpu){
@@ -4728,7 +4725,6 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
     if(v.size() != n) v.assign(n, 0.f);
   };
   for(int L=0; L<cfg.layers; L++){
-    if((L & 15) == 0){ std::fprintf(stderr, "[intfer] prefill-chunk L=%d/%d M=%d\n", L, cfg.layers, M); std::fflush(stderr); }
     const LayerNames& ln = g_ln[(size_t)L];
     Layer& ly = req.layers[(size_t)L];
     // Pre-size KV caches for the whole chunk (step() would resize per pos).
