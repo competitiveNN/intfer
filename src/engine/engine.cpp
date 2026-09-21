@@ -742,6 +742,16 @@ void Engine::preload_all() {
   // (skip_host_cache_ stays on: pinned shards are never rebuilt, and any
   // lazy-built straggler is single-use — caching it would be dead RAM.)
   pinned_ = true;
+  // NOTE (2026-09-21, measured on 27B TP=2): shard USM is malloc_shared and
+  // pages stay host-resident until first kernel touch — xpu-smi shows
+  // dev0 854MB/dev1 115MB at startup, jumping to ~11GB only after the first
+  // request. A q.prefetch(code)+q.prefetch(scale) pass over all shards here
+  // was tried and REVERTED: 18.7GB "migrated" in 59ms per the log, but
+  // xpu-smi was unchanged and the first-request jump identical — prefetch
+  // is a no-op hint for shared allocations on this Level Zero driver.
+  // First-request migration stalls stand; do NOT re-add prefetch as-is.
+  // (A real touch kernel over every shard at startup might migrate pages,
+  // but that is 496 extra launches + waits in the startup path — unscoped.)
   for (size_t d = 0; d < devices_.size(); ++d) {
     devices_[d].queue.wait();
     // Tally resident weight bytes per device (code+scale+global).
