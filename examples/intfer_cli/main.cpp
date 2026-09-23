@@ -1417,68 +1417,7 @@ struct GpuBackend : public LinearBackend {
       // the persistent lm_head_x_dev_ buffers — clear the list but do NOT
       // free them here (freed with the rest of the cache below).
       x_devs.clear();
-      for(size_t d=0; d<ndev; ++d){
-        for(size_t t=0; t<lm_head_q_dev_[d].size(); ++t){
-          if(lm_head_q_dev_[d][t]){
-            sycl::free(lm_head_q_dev_[d][t], eng->device_queue((int)d));
-            lm_head_q_dev_[d][t] = nullptr;
-          }
-          if(t<lm_head_s_dev_[d].size() && lm_head_s_dev_[d][t]){
-            sycl::free(lm_head_s_dev_[d][t], eng->device_queue((int)d));
-            lm_head_s_dev_[d][t] = nullptr;
-          }
-          if(t<lm_head_b_dev_[d].size() && lm_head_b_dev_[d][t]){
-            sycl::free(lm_head_b_dev_[d][t], eng->device_queue((int)d));
-            lm_head_b_dev_[d][t] = nullptr;
-          }
-          if(t<lm_head_c_dev_[d].size() && lm_head_c_dev_[d][t]){
-            sycl::free(lm_head_c_dev_[d][t], eng->device_queue((int)d));
-            lm_head_c_dev_[d][t] = nullptr;
-          }
-        }
-        if(d < lm_head_aq_dev_.size() && lm_head_aq_dev_[d]){
-          sycl::free(lm_head_aq_dev_[d], eng->device_queue((int)d));
-          lm_head_aq_dev_[d] = nullptr;
-        }
-        if(d < lm_head_as_dev_.size() && lm_head_as_dev_[d]){
-          sycl::free(lm_head_as_dev_[d], eng->device_queue((int)d));
-          lm_head_as_dev_[d] = nullptr;
-        }
-        for(size_t t=0; t<lm_head_w_dev_[d].size(); ++t){
-          if(lm_head_w_dev_[d][t]){
-            sycl::free(lm_head_w_dev_[d][t], eng->device_queue((int)d));
-            lm_head_w_dev_[d][t] = nullptr;
-          }
-        }
-        if(d < lm_head_x_dev_.size() && lm_head_x_dev_[d]){
-          sycl::free(lm_head_x_dev_[d], eng->device_queue((int)d));
-          lm_head_x_dev_[d] = nullptr;
-        }
-        if(d < lm_head_xM_dev_.size() && lm_head_xM_dev_[d]){
-          sycl::free(lm_head_xM_dev_[d], eng->device_queue((int)d));
-          lm_head_xM_dev_[d] = nullptr;
-        }
-        if(d < lm_head_aqM_dev_.size() && lm_head_aqM_dev_[d]){
-          sycl::free(lm_head_aqM_dev_[d], eng->device_queue((int)d));
-          lm_head_aqM_dev_[d] = nullptr;
-        }
-        if(d < lm_head_asM_dev_.size() && lm_head_asM_dev_[d]){
-          sycl::free(lm_head_asM_dev_[d], eng->device_queue((int)d));
-          lm_head_asM_dev_[d] = nullptr;
-        }
-        for(auto cMv : lm_head_cM_dev_[d]){
-          if(cMv) sycl::free(cMv, eng->device_queue((int)d));
-        }
-      }
-      lm_head_xM_dev_.clear(); lm_head_xM_cap_.clear();
-      lm_head_aqM_dev_.clear(); lm_head_asM_dev_.clear(); lm_head_aqM_cap_.clear();
-      lm_head_cM_dev_.clear(); lm_head_cM_cap_.clear(); lm_head_tM_host_.clear();
-      lm_head_q_dev_.clear(); lm_head_s_dev_.clear();
-      lm_head_b_dev_.clear();
-      lm_head_w_dev_.clear(); lm_head_c_dev_.clear();
-      lm_head_aq_dev_.clear(); lm_head_as_dev_.clear();
-      lm_head_x_dev_.clear();
-      lm_head_N_ = 0; lm_head_K_ = 0;
+      lm_head_fail_reset();
     };
     if(lm_head_q_dev_.empty() && lm_head_w_dev_.empty()){
       lm_head_N_ = N; lm_head_K_ = K;
@@ -1872,7 +1811,499 @@ struct GpuBackend : public LinearBackend {
     return out;
   }
 
-  // Cache state for lm_head upload (tiled per device).
+  void lm_head_fail_reset(){
+    if(!eng) return;
+    size_t ndev = eng->num_devices();
+    for(size_t d=0; d<ndev; ++d){
+      sycl::queue& q = eng->device_queue((int)d);
+      for(size_t t=0; t<lm_head_q_dev_[d].size(); ++t){
+        if(lm_head_q_dev_[d][t]){
+          sycl::free(lm_head_q_dev_[d][t], q);
+          lm_head_q_dev_[d][t] = nullptr;
+        }
+        if(t<lm_head_s_dev_[d].size() && lm_head_s_dev_[d][t]){
+          sycl::free(lm_head_s_dev_[d][t], q);
+          lm_head_s_dev_[d][t] = nullptr;
+        }
+        if(t<lm_head_b_dev_[d].size() && lm_head_b_dev_[d][t]){
+          sycl::free(lm_head_b_dev_[d][t], q);
+          lm_head_b_dev_[d][t] = nullptr;
+        }
+        if(t<lm_head_c_dev_[d].size() && lm_head_c_dev_[d][t]){
+          sycl::free(lm_head_c_dev_[d][t], q);
+          lm_head_c_dev_[d][t] = nullptr;
+        }
+      }
+      if(d < lm_head_aq_dev_.size() && lm_head_aq_dev_[d]){
+        sycl::free(lm_head_aq_dev_[d], q);
+        lm_head_aq_dev_[d] = nullptr;
+      }
+      if(d < lm_head_as_dev_.size() && lm_head_as_dev_[d]){
+        sycl::free(lm_head_as_dev_[d], q);
+        lm_head_as_dev_[d] = nullptr;
+      }
+      for(size_t t=0; t<lm_head_w_dev_[d].size(); ++t){
+        if(lm_head_w_dev_[d][t]){
+          sycl::free(lm_head_w_dev_[d][t], q);
+          lm_head_w_dev_[d][t] = nullptr;
+        }
+      }
+      if(d < lm_head_x_dev_.size() && lm_head_x_dev_[d]){
+        sycl::free(lm_head_x_dev_[d], q);
+        lm_head_x_dev_[d] = nullptr;
+      }
+      if(d < lm_head_xM_dev_.size() && lm_head_xM_dev_[d]){
+        sycl::free(lm_head_xM_dev_[d], q);
+        lm_head_xM_dev_[d] = nullptr;
+      }
+      if(d < lm_head_aqM_dev_.size() && lm_head_aqM_dev_[d]){
+        sycl::free(lm_head_aqM_dev_[d], q);
+        lm_head_aqM_dev_[d] = nullptr;
+      }
+      if(d < lm_head_asM_dev_.size() && lm_head_asM_dev_[d]){
+        sycl::free(lm_head_asM_dev_[d], q);
+        lm_head_asM_dev_[d] = nullptr;
+      }
+      for(auto cMv : lm_head_cM_dev_[d]){
+        if(cMv) sycl::free(cMv, q);
+      }
+      if(d < lm_head_ax_dev_.size()){
+        for(auto av : lm_head_ax_dev_[d]) if(av) sycl::free(av, q);
+        for(auto av : lm_head_av_dev_[d]) if(av) sycl::free(av, q);
+      }
+      if(d < lm_head_axM_dev_.size()){
+        for(auto av : lm_head_axM_dev_[d]) if(av) sycl::free(av, q);
+        for(auto av : lm_head_avM_dev_[d]) if(av) sycl::free(av, q);
+      }
+    }
+    lm_head_xM_dev_.clear(); lm_head_xM_cap_.clear();
+    lm_head_aqM_dev_.clear(); lm_head_asM_dev_.clear(); lm_head_aqM_cap_.clear();
+    lm_head_cM_dev_.clear(); lm_head_cM_cap_.clear(); lm_head_tM_host_.clear();
+    lm_head_q_dev_.clear(); lm_head_s_dev_.clear();
+    lm_head_b_dev_.clear();
+    lm_head_w_dev_.clear(); lm_head_c_dev_.clear();
+    lm_head_aq_dev_.clear(); lm_head_as_dev_.clear();
+    lm_head_x_dev_.clear();
+    lm_head_ax_dev_.clear(); lm_head_av_dev_.clear();
+    lm_head_axM_dev_.clear(); lm_head_avM_dev_.clear(); lm_head_axM_cap_.clear();
+    lm_head_N_ = 0; lm_head_K_ = 0;
+  }
+
+  // Device-argmax v1, scalar (M=1). INTFER_DEVICE_ARGMAX=1 only; any false
+  // returns false and the caller keeps the full-D2H run_lm_head_f16 path.
+  // On true, best is the global vocab id; no logits are produced (the 0.5MB
+  // FP16 D2H + host convert + concat are skipped — only 8B partials/tile).
+  bool run_lm_head_best(const float* fn, // final norm hidden [K]
+                        const float* W,  // lm_head weight [N,K]
+                        uint32_t N, uint32_t K, int& best){
+    best = -1;
+    static const bool dev_argmax = (std::getenv("INTFER_DEVICE_ARGMAX") != nullptr);
+    static const bool trace_lm = (std::getenv("INTFER_TRACE_LMHEAD") != nullptr);
+    static const bool force_fp16 = (std::getenv("INTFER_LMHEAD_FP16") != nullptr);
+    static const bool no_dpas = (std::getenv("INTFER_LMHEAD_DPAS") &&
+                                 std::getenv("INTFER_LMHEAD_DPAS")[0] == '0');
+    if(!dev_argmax || trace_lm || !eng || !fn || !W || N == 0 || K == 0)
+      return false;
+    if(lm_head_q_dev_.empty() && lm_head_w_dev_.empty()){
+      // First use: run the full path once (builds the upload AND scores this
+      // token); host-argmax its logits. One-time full D2H, amortized.
+      std::vector<float> lm = run_lm_head_f16(fn, W, N, K);
+      if((int)lm.size() != (int)N) return false;
+      float bestv = -1e30f;
+      for(int v=0; v<(int)N; v++) if(lm[(size_t)v]>bestv){ bestv=lm[(size_t)v]; best=v; }
+      return true;
+    }
+    if(lm_head_N_ != N || lm_head_K_ != K) return false;
+    size_t ndev = eng->num_devices();
+    std::vector<sycl::half> x_fp16(K);
+    for(uint32_t i=0;i<K;i++) x_fp16[i] = sycl::half(fn[i]);
+    // Persistent per-(device,tile) 1-int + 1-float partials (grow-only with
+    // the tile layout; freed in lm_head_fail_reset).
+    if(lm_head_ax_dev_.size() != ndev){
+      lm_head_ax_dev_.assign(ndev, {}); lm_head_av_dev_.assign(ndev, {});
+    }
+    struct TilePart { size_t d; size_t t; int idx; float val; sycl::event evt; };
+    std::vector<TilePart> parts;
+    std::vector<sycl::event> evts;
+    {
+      // Reserve the exact tile count up front: partial D2Hs below target
+      // parts.back() in place, and a push_back realloc would relocate the
+      // element out from under the in-flight memcpy.
+      size_t ntiles = 0;
+      for(size_t d=0; d<ndev; ++d){
+        if(d < lm_head_tiles_.size()) ntiles += lm_head_tiles_[d].size();
+      }
+      parts.reserve(ntiles);
+      evts.reserve(ntiles * 4);
+    }
+    for(size_t d=0; d<ndev; ++d){
+      uint32_t start = lm_head_ranges_[d].first, end = lm_head_ranges_[d].second;
+      uint32_t Nl = end - start;
+      if(Nl == 0 || d >= lm_head_tiles_.size() || lm_head_tiles_[d].empty()) continue;
+      sycl::queue& q = eng->device_queue((int)d);
+      sycl::half* x_dev = (d < lm_head_x_dev_.size()) ? lm_head_x_dev_[d] : nullptr;
+      if(!x_dev){ lm_head_fail_reset(); return false; }
+      bool use_dpas = !force_fp16 && !no_dpas && d < lm_head_aq_dev_.size() &&
+                      lm_head_aq_dev_[d] && lm_head_as_dev_[d] &&
+                      !lm_head_tiles_[d].empty();
+      if(use_dpas){
+        for(size_t t=0; t<lm_head_tiles_[d].size(); ++t){
+          if(t >= lm_head_b_dev_[d].size() || !lm_head_b_dev_[d][t]){
+            use_dpas = false;
+            break;
+          }
+        }
+      }
+      if(use_dpas){
+        uint32_t nGA = (K + 63) / 64;
+        std::vector<std::int8_t> aq(K);
+        std::vector<float> as(nGA);
+        dashq::act_quant_ga64_batch(fn, aq.data(), as.data(), K,
+                                    dashq::ActQuantRound::RoundNear);
+        q.memcpy(lm_head_aq_dev_[d], aq.data(), K);
+        q.memcpy(lm_head_as_dev_[d], as.data(), (size_t)nGA * sizeof(float));
+      } else {
+        q.memcpy(x_dev, x_fp16.data(), (size_t)K * sizeof(sycl::half));
+      }
+      if(lm_head_ax_dev_[d].size() != lm_head_tiles_[d].size()){
+        lm_head_ax_dev_[d].assign(lm_head_tiles_[d].size(), nullptr);
+        lm_head_av_dev_[d].assign(lm_head_tiles_[d].size(), nullptr);
+      }
+      for(size_t t=0; t<lm_head_tiles_[d].size(); ++t){
+        uint32_t ts = lm_head_tiles_[d][t].first, te = lm_head_tiles_[d][t].second;
+        uint32_t Nlt = te - ts;
+        if(Nlt == 0) continue;
+        if(t >= lm_head_c_dev_[d].size() || !lm_head_c_dev_[d][t]){
+          lm_head_fail_reset(); return false;
+        }
+        sycl::event evt;
+        try {
+          if(force_fp16){
+            evt = gemm::quant_gemm_f16(q, x_dev, lm_head_w_dev_[d][t],
+                                       lm_head_c_dev_[d][t], 1, Nlt, K);
+          } else if(use_dpas){
+            gemm::Dpas48Params p;
+            p.code_dpas = lm_head_b_dev_[d][t];
+            p.scale_usm = reinterpret_cast<const std::uint16_t*>(
+                lm_head_s_dev_[d][t]);
+            p.act_int8 = lm_head_aq_dev_[d];
+            p.act_scale = lm_head_as_dev_[d];
+            p.alpha = 1.0f;
+            p.out_usm = reinterpret_cast<std::uint16_t*>(lm_head_c_dev_[d][t]);
+            p.M = 1;
+            p.N = Nlt;
+            p.K = K;
+            p.group_size = K;
+            p.act_group = 64;
+            p.bits = 8;
+            evt = gemm::quant_gemm_dpas_s8w(q, p);
+          } else {
+            evt = gemm::quant_gemm_f16_int8w(q, x_dev, lm_head_q_dev_[d][t],
+                                             lm_head_s_dev_[d][t],
+                                             lm_head_c_dev_[d][t], 1, Nlt, K);
+          }
+        } catch (...) {
+          lm_head_fail_reset(); return false;
+        }
+        if(!lm_head_ax_dev_[d][t] || !lm_head_av_dev_[d][t]){
+          try {
+            if(!lm_head_ax_dev_[d][t])
+              lm_head_ax_dev_[d][t] = static_cast<int*>(sycl::malloc_device(
+                  sizeof(int), q.get_device(), q.get_context()));
+            if(!lm_head_av_dev_[d][t])
+              lm_head_av_dev_[d][t] = static_cast<float*>(sycl::malloc_device(
+                  sizeof(float), q.get_device(), q.get_context()));
+          } catch (...) {
+            lm_head_fail_reset(); return false;
+          }
+          if(!lm_head_ax_dev_[d][t] || !lm_head_av_dev_[d][t]){
+            lm_head_fail_reset(); return false;
+          }
+        }
+        gemm::LmArgmaxTileParams ap;
+        ap.tile_fp16 = reinterpret_cast<const std::uint16_t*>(lm_head_c_dev_[d][t]);
+        ap.n = Nlt;
+        ap.M = 1;
+        ap.row_stride = 0;
+        ap.global_col0 = ts;
+        ap.is_greedy = nullptr;
+        ap.out_idx = lm_head_ax_dev_[d][t];
+        ap.out_val = lm_head_av_dev_[d][t];
+        sycl::event aevt;
+        try {
+          aevt = gemm::lm_head_argmax_tile(q, ap, evt);
+        } catch (...) {
+          lm_head_fail_reset(); return false;
+        }
+        // Push first, then target parts.back() in place: the D2H is async
+        // and tp dies at loop end, so the destination must live in parts
+        // (stable: reserved up front, no realloc moves it mid-flight).
+        parts.push_back(TilePart());
+        TilePart& dst = parts.back();
+        dst.d = d; dst.t = t; dst.idx = -1; dst.val = -1e30f;
+        sycl::event cp1, cp2;
+        try {
+          cp1 = q.memcpy(&dst.idx, lm_head_ax_dev_[d][t], sizeof(int), aevt);
+          cp2 = q.memcpy(&dst.val, lm_head_av_dev_[d][t], sizeof(float), aevt);
+        } catch (...) {
+          lm_head_fail_reset(); return false;
+        }
+        // Host-side ints are written by the D2H: waited below before the
+        // host reduce consumes them (same pattern as out_seg).
+        dst.evt = cp2;
+        evts.push_back(evt);
+        evts.push_back(aevt);
+        evts.push_back(cp1);
+        evts.push_back(cp2);
+      }
+    }
+    if(parts.empty()){ lm_head_fail_reset(); return false; }
+    for(auto& e : evts) e.wait();
+    // Host reduce in (device, tile-ts) order with the identical strict->
+    // loop as the replaced host argmax (first-max-wins; kernel already
+    // wrote global vocab ids via global_col0).
+    float bestv = -1e30f;
+    for(auto& tp : parts){
+      if(tp.val > bestv){ bestv = tp.val; best = tp.idx; }
+    }
+    (void)W;
+    return true;
+  }
+
+  // Device-argmax v1, M-row batch. greedy[m] != 0 marks greedy rows; v1
+  // requires ALL rows greedy (any sampling row -> false -> full-D2H path,
+  // since sampling rows need their full logits). On true, best[m] holds
+  // the global vocab ids and no logits are produced.
+  bool run_lm_head_batch_best(const float* FN, const float* W, uint32_t M,
+                              uint32_t N, uint32_t K,
+                              const uint8_t* greedy, std::vector<int>& best){
+    best.assign(M, -1);
+    static const bool dev_argmax = (std::getenv("INTFER_DEVICE_ARGMAX") != nullptr);
+    static const bool trace_lm = (std::getenv("INTFER_TRACE_LMHEAD") != nullptr);
+    static const bool force_fp16_b = (std::getenv("INTFER_LMHEAD_FP16") != nullptr);
+    static const bool no_dpas_b = (std::getenv("INTFER_LMHEAD_DPAS") &&
+                                   std::getenv("INTFER_LMHEAD_DPAS")[0] == '0');
+    if(!dev_argmax || trace_lm || !eng || !FN || !W || !greedy || M == 0 ||
+       N == 0 || K == 0)
+      return false;
+    for(uint32_t m=0; m<M; ++m) if(!greedy[m]) return false;
+    if(M == 1){
+      // Scalar fast path (same single-row contract).
+      return run_lm_head_best(FN, W, N, K, best[0]);
+    }
+    if(lm_head_q_dev_.empty() && lm_head_w_dev_.empty()){
+      // First use: probe row 0 through the full path (builds the upload).
+      std::vector<float> probe = run_lm_head_f16(FN, W, N, K);
+      if(probe.empty()) return false;
+    }
+    if(lm_head_N_ != N || lm_head_K_ != K) return false;
+    size_t ndev = eng->num_devices();
+    const uint32_t nGA = (K + 63) / 64;
+    std::vector<sycl::half> x_fp16((size_t)M * K);
+    for(uint32_t m = 0; m < M; ++m)
+      for(uint32_t i = 0; i < K; ++i)
+        x_fp16[(size_t)m * K + i] = sycl::half(FN[(size_t)m * K + i]);
+    std::vector<std::int8_t> aq((size_t)M * K);
+    std::vector<float> as((size_t)M * nGA);
+    if(lm_head_axM_dev_.size() != ndev){
+      lm_head_axM_dev_.assign(ndev, {});
+      lm_head_avM_dev_.assign(ndev, {});
+      lm_head_axM_cap_.assign(ndev, {});
+    }
+    if(lm_head_xM_dev_.size() != ndev) lm_head_xM_dev_.assign(ndev, nullptr);
+    if(lm_head_xM_cap_.size() != ndev) lm_head_xM_cap_.assign(ndev, 0);
+    if(lm_head_aqM_dev_.size() != ndev) lm_head_aqM_dev_.assign(ndev, nullptr);
+    if(lm_head_asM_dev_.size() != ndev) lm_head_asM_dev_.assign(ndev, nullptr);
+    if(lm_head_aqM_cap_.size() != ndev) lm_head_aqM_cap_.assign(ndev, 0);
+    if(lm_head_cM_dev_.size() != ndev) lm_head_cM_dev_.resize(ndev);
+    if(lm_head_cM_cap_.size() != ndev) lm_head_cM_cap_.resize(ndev);
+    struct TilePartM {
+      size_t d; size_t t;
+      std::vector<int> idx; std::vector<float> val;
+      sycl::event evt;
+    };
+    std::vector<TilePartM> parts;
+    std::vector<sycl::event> evts;
+    for(size_t d = 0; d < ndev; ++d){
+      uint32_t start = (d < lm_head_ranges_.size()) ? lm_head_ranges_[d].first : N;
+      uint32_t end = (d < lm_head_ranges_.size()) ? lm_head_ranges_[d].second : N;
+      uint32_t Nl = (end > start) ? end - start : 0;
+      if(Nl == 0 || d >= lm_head_tiles_.size() || lm_head_tiles_[d].empty()) continue;
+      sycl::queue& q = eng->device_queue((int)d);
+      bool use_dpas = !force_fp16_b && !no_dpas_b &&
+                      d < lm_head_aq_dev_.size() && lm_head_aq_dev_[d] &&
+                      d < lm_head_as_dev_.size() && lm_head_as_dev_[d];
+      if(use_dpas){
+        for(size_t t = 0; t < lm_head_tiles_[d].size(); ++t){
+          if(t >= lm_head_b_dev_[d].size() || !lm_head_b_dev_[d][t]){
+            use_dpas = false;
+            break;
+          }
+        }
+      }
+      if(use_dpas){
+        if(!lm_head_aqM_dev_[d] || !lm_head_asM_dev_[d] || lm_head_aqM_cap_[d] < M){
+          try {
+            if(lm_head_aqM_dev_[d]){ sycl::free(lm_head_aqM_dev_[d], q); lm_head_aqM_dev_[d] = nullptr; }
+            if(lm_head_asM_dev_[d]){ sycl::free(lm_head_asM_dev_[d], q); lm_head_asM_dev_[d] = nullptr; }
+            lm_head_aqM_dev_[d] = static_cast<std::int8_t*>(sycl::malloc_device(
+                (size_t)M * K, q.get_device(), q.get_context()));
+            lm_head_asM_dev_[d] = static_cast<float*>(sycl::malloc_device(
+                (size_t)M * nGA * sizeof(float), q.get_device(), q.get_context()));
+            lm_head_aqM_cap_[d] = M;
+          } catch (...) {
+            lm_head_aqM_dev_[d] = nullptr; lm_head_asM_dev_[d] = nullptr;
+            lm_head_aqM_cap_[d] = 0;
+          }
+        }
+        if(!lm_head_aqM_dev_[d] || !lm_head_asM_dev_[d]) return false;
+      }
+      if(use_dpas){
+        for(uint32_t m = 0; m < M; ++m)
+          dashq::act_quant_ga64_batch(FN + (size_t)m * K,
+                                      aq.data() + (size_t)m * K,
+                                      as.data() + (size_t)m * nGA, K,
+                                      dashq::ActQuantRound::RoundNear);
+        q.memcpy(lm_head_aqM_dev_[d], aq.data(), (size_t)M * K);
+        q.memcpy(lm_head_asM_dev_[d], as.data(), (size_t)M * nGA * sizeof(float));
+      } else {
+        if(!lm_head_xM_dev_[d] || lm_head_xM_cap_[d] < M){
+          try {
+            if(lm_head_xM_dev_[d]){ sycl::free(lm_head_xM_dev_[d], q); lm_head_xM_dev_[d] = nullptr; }
+            lm_head_xM_dev_[d] = static_cast<sycl::half*>(sycl::malloc_device(
+                (size_t)M * K * sizeof(sycl::half), q.get_device(), q.get_context()));
+            lm_head_xM_cap_[d] = M;
+          } catch (...) {
+            lm_head_xM_dev_[d] = nullptr; lm_head_xM_cap_[d] = 0;
+          }
+        }
+        if(!lm_head_xM_dev_[d]) return false;
+        q.memcpy(lm_head_xM_dev_[d], x_fp16.data(), (size_t)M * K * sizeof(sycl::half));
+      }
+      if(lm_head_cM_dev_[d].size() != lm_head_tiles_[d].size()){
+        lm_head_cM_dev_[d].assign(lm_head_tiles_[d].size(), nullptr);
+        lm_head_cM_cap_[d].assign(lm_head_tiles_[d].size(), 0);
+      }
+      if(lm_head_axM_dev_[d].size() != lm_head_tiles_[d].size()){
+        lm_head_axM_dev_[d].assign(lm_head_tiles_[d].size(), nullptr);
+        lm_head_avM_dev_[d].assign(lm_head_tiles_[d].size(), nullptr);
+        lm_head_axM_cap_[d].assign(lm_head_tiles_[d].size(), 0);
+      }
+      const sycl::half* x_row = use_dpas ? nullptr : lm_head_xM_dev_[d];
+      for(size_t t = 0; t < lm_head_tiles_[d].size(); ++t){
+        uint32_t ts = lm_head_tiles_[d][t].first;
+        uint32_t Nlt = lm_head_tiles_[d][t].second - ts;
+        if(Nlt == 0) continue;
+        if(!lm_head_cM_dev_[d][t] || lm_head_cM_cap_[d][t] < (size_t)M * Nlt){
+          try {
+            if(lm_head_cM_dev_[d][t]){ sycl::free(lm_head_cM_dev_[d][t], q); lm_head_cM_dev_[d][t] = nullptr; }
+            lm_head_cM_dev_[d][t] = static_cast<sycl::half*>(sycl::malloc_device(
+                (size_t)M * Nlt * sizeof(sycl::half), q.get_device(), q.get_context()));
+            lm_head_cM_cap_[d][t] = (size_t)M * Nlt;
+          } catch (...) {
+            lm_head_cM_dev_[d][t] = nullptr; lm_head_cM_cap_[d][t] = 0;
+          }
+        }
+        if(!lm_head_cM_dev_[d][t]) return false;
+        if(!lm_head_axM_dev_[d][t] || !lm_head_avM_dev_[d][t] ||
+           lm_head_axM_cap_[d][t] < M){
+          try {
+            if(lm_head_axM_dev_[d][t]){ sycl::free(lm_head_axM_dev_[d][t], q); lm_head_axM_dev_[d][t] = nullptr; }
+            if(lm_head_avM_dev_[d][t]){ sycl::free(lm_head_avM_dev_[d][t], q); lm_head_avM_dev_[d][t] = nullptr; }
+            lm_head_axM_dev_[d][t] = static_cast<int*>(sycl::malloc_device(
+                (size_t)M * sizeof(int), q.get_device(), q.get_context()));
+            lm_head_avM_dev_[d][t] = static_cast<float*>(sycl::malloc_device(
+                (size_t)M * sizeof(float), q.get_device(), q.get_context()));
+            lm_head_axM_cap_[d][t] = M;
+          } catch (...) {
+            lm_head_axM_dev_[d][t] = nullptr; lm_head_avM_dev_[d][t] = nullptr;
+            lm_head_axM_cap_[d][t] = 0;
+          }
+        }
+        if(!lm_head_axM_dev_[d][t] || !lm_head_avM_dev_[d][t]) return false;
+        sycl::event evt;
+        try {
+          if(force_fp16_b){
+            evt = gemm::quant_gemm_f16(q, x_row, lm_head_w_dev_[d][t],
+                                       lm_head_cM_dev_[d][t], M, Nlt, K);
+          } else if(use_dpas){
+            gemm::Dpas48Params p;
+            p.code_dpas = lm_head_b_dev_[d][t];
+            p.scale_usm = reinterpret_cast<const std::uint16_t*>(
+                lm_head_s_dev_[d][t]);
+            p.act_int8 = lm_head_aqM_dev_[d];
+            p.act_scale = lm_head_asM_dev_[d];
+            p.alpha = 1.0f;
+            p.out_usm = reinterpret_cast<std::uint16_t*>(lm_head_cM_dev_[d][t]);
+            p.M = M;
+            p.N = Nlt;
+            p.K = K;
+            p.group_size = K;
+            p.act_group = 64;
+            p.bits = 8;
+            p.act_stride = K;
+            p.as_stride = nGA;
+            evt = gemm::quant_gemm_dpas_s8w(q, p);
+          } else {
+            evt = gemm::quant_gemm_f16_int8w(q, x_row, lm_head_q_dev_[d][t],
+                                             lm_head_s_dev_[d][t],
+                                             lm_head_cM_dev_[d][t], M, Nlt, K);
+          }
+        } catch (...) {
+          return false;
+        }
+        gemm::LmArgmaxTileParams ap;
+        ap.tile_fp16 = reinterpret_cast<const std::uint16_t*>(lm_head_cM_dev_[d][t]);
+        ap.n = Nlt;
+        ap.M = M;
+        ap.row_stride = Nlt;
+        ap.global_col0 = ts;
+        ap.is_greedy = nullptr;  // v1: caller verified all rows greedy
+        ap.out_idx = lm_head_axM_dev_[d][t];
+        ap.out_val = lm_head_avM_dev_[d][t];
+        sycl::event aevt;
+        try {
+          aevt = gemm::lm_head_argmax_tile(q, ap, evt);
+        } catch (...) {
+          return false;
+        }
+        TilePartM tp;
+        tp.d = d; tp.t = t;
+        tp.idx.assign(M, -1);
+        tp.val.assign(M, -1e30f);
+        sycl::event cp1, cp2;
+        try {
+          cp1 = q.memcpy(tp.idx.data(), lm_head_axM_dev_[d][t],
+                         (size_t)M * sizeof(int), aevt);
+          cp2 = q.memcpy(tp.val.data(), lm_head_avM_dev_[d][t],
+                         (size_t)M * sizeof(float), aevt);
+        } catch (...) {
+          return false;
+        }
+        tp.evt = cp2;
+        parts.push_back(std::move(tp));
+        evts.push_back(evt);
+        evts.push_back(aevt);
+        evts.push_back(cp1);
+        evts.push_back(cp2);
+      }
+    }
+    if(parts.empty()) return false;
+    for(auto& e : evts) e.wait();
+    // Per-row host reduce in (device, tile-ts) order, identical strict->
+    // loop (first-max-wins; kernel wrote global vocab ids).
+    std::vector<float> bestv(M, -1e30f);
+    for(auto& tp : parts){
+      for(uint32_t m = 0; m < M; ++m){
+        if(tp.val[(size_t)m] > bestv[(size_t)m]){
+          bestv[(size_t)m] = tp.val[(size_t)m];
+          best[(size_t)m] = tp.idx[(size_t)m];
+        }
+      }
+    }
+    return true;
+  }
+
   // INT8 path (default): per-tile INT8 codes + FP16 row scales + FP16 out.
   // DPAS s8w sub-path: per-tile repacked vertical-B codes (lm_head_b_dev_)
   // + persistent INT8 act / FP32 GA-scale workspaces (lm_head_aq_/as_dev_).
@@ -1898,6 +2329,16 @@ struct GpuBackend : public LinearBackend {
   std::vector<std::vector<sycl::half*>> lm_head_cM_dev_;
   std::vector<std::vector<size_t>> lm_head_cM_cap_;
   std::vector<std::vector<std::vector<sycl::half>>> lm_head_tM_host_;
+  std::vector<std::vector<int*>> lm_head_ax_dev_;  // argmax idx partials (1/tile)
+  std::vector<std::vector<float*>> lm_head_av_dev_;  // argmax val partials (1/tile)
+  std::vector<std::vector<int*>> lm_head_axM_dev_;  // M-row argmax idx partials
+  std::vector<std::vector<float*>> lm_head_avM_dev_;  // M-row argmax val partials
+  std::vector<std::vector<uint32_t>> lm_head_axM_cap_;  // M-cap per (d,t) partial
+  // Device-argmax v1 (INTFER_DEVICE_ARGMAX=1, greedy-only): per-tile argmax
+  // over the resident FP16 GEMM outs, D2H of 8B partials/tile instead of the
+  // full vocab. Defined inline below (after run_lm_head_f16); return false
+  // on any shortfall (caller keeps the full-D2H path); on true, best is the
+  // global vocab id and no logits are produced.
   std::vector<std::pair<uint32_t,uint32_t>> lm_head_ranges_;  // TP row shard per device
   std::vector<std::vector<std::pair<uint32_t,uint32_t>>> lm_head_tiles_;  // upload/GEMM tiles per device
   uint32_t lm_head_N_ = 0, lm_head_K_ = 0;
@@ -4097,7 +4538,8 @@ static StepOut step(Request& req, int token, int pos,
                     const float* embed, const float* final_norm,
                     const float* lm_head, // nullptr => tied embeddings (use embed rows)
                     LinearBackend* backend,
-                    bool record, std::vector<std::vector<float>>& dump){
+                    bool record, std::vector<std::vector<float>>& dump,
+                    bool greedy_only = false){ // device-argmax: caller promises .best-only use
   StepOut out;
   // NaN tracer (INTFER_TRACE_NAN=1): check every GEMM output + hidden state
   // for NaN/Inf and report the first offender. Off by default (hot loop).
@@ -4606,6 +5048,10 @@ static StepOut step(Request& req, int token, int pos,
   std::vector<float>& logits = req.scratch.logits;
   int best=-1; float bestv=-1e30f;
   const float* head = lm_head ? lm_head : embed;
+  // Device-argmax v1 (INTFER_DEVICE_ARGMAX=1, greedy_only): best comes from
+  // the device partials, no vocab D2H. Any false keeps the full path below;
+  // the trailing host argmax loop is skipped only on success (best_done).
+  bool best_done = false;
   if(backend){
     auto gpu = dynamic_cast<GpuBackend*>(backend);
     if(gpu){
@@ -4615,8 +5061,17 @@ static StepOut step(Request& req, int token, int pos,
       // bottleneck per profiling: kernels were 10.6% of decode).
       // The embed table uploads once via the backend's (N,K)-keyed cache.
       const float* W = lm_head ? lm_head : embed;
-      std::vector<float> lm = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
-      if((int)lm.size() == cfg.vocab) for(int i=0;i<cfg.vocab;i++) logits[i] = lm[i];
+      if(greedy_only){
+        int b = -1;
+        if(gpu->run_lm_head_best(fn.data(), W, (uint32_t)cfg.vocab,
+                                 (uint32_t)cfg.H, b)){
+          best = b; best_done = true;
+        }
+      }
+      if(!best_done){
+        std::vector<float> lm = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+        if((int)lm.size() == cfg.vocab) for(int i=0;i<cfg.vocab;i++) logits[i] = lm[i];
+      }
     }else{
       for(int v=0; v<cfg.vocab; v++){
         const float* er = head + (size_t)v*cfg.H;
@@ -4633,8 +5088,9 @@ static StepOut step(Request& req, int token, int pos,
       if(s>bestv){ bestv=s; best=v; }
     }
   }
-  if(lm_head==nullptr || !backend || dynamic_cast<CpuBackend*>(backend) ||
-     dynamic_cast<GpuBackend*>(backend)){
+  if(!best_done &&
+     (lm_head==nullptr || !backend || dynamic_cast<CpuBackend*>(backend) ||
+      dynamic_cast<GpuBackend*>(backend))){
     for(int v=0; v<cfg.vocab; v++){
       if(logits[v]>bestv){ bestv=logits[v]; best=v; }
     }
@@ -6311,24 +6767,56 @@ static std::vector<StepOut> step_batch(
   static const bool lm_batch_off = (std::getenv("INTFER_LMHEAD_BATCH") &&
                                     std::getenv("INTFER_LMHEAD_BATCH")[0] == '0');
   std::vector<float> lm_all;
+  // Device-argmax v1 (INTFER_DEVICE_ARGMAX=1): all-greedy batches score
+  // .best on-device with no vocab D2H. Sampling rows need full logits, so
+  // any non-greedy row keeps the full path (mask checked inside; v1 falls
+  // back unless every row is greedy).
+  std::vector<uint8_t> greedy_mask((size_t)M, 0);
+  for(int m = 0; m < M; ++m){
+    const Request* rq = items[(size_t)m].req;
+    greedy_mask[(size_t)m] =
+        (rq->temperature <= 0.f && rq->top_k == 0 && rq->top_p <= 0.f) ? 1 : 0;
+  }
+  std::vector<int> best_all;
+  bool batch_best_done = false;
   if(gpu && !lm_batch_off && M > 1){
     std::vector<float> fn_all((size_t)M * Hdim);
     for(int m = 0; m < M; ++m)
       rmsnorm(&H[(size_t)m*Hdim], final_norm, fn_all.data() + (size_t)m * Hdim, Hdim);
     const float* W = lm_head ? lm_head : embed;
-    lm_all = gpu->run_lm_head_batch(fn_all.data(), W, (uint32_t)M,
-                                    (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+    if(gpu->run_lm_head_batch_best(fn_all.data(), W, (uint32_t)M,
+                                   (uint32_t)cfg.vocab, (uint32_t)cfg.H,
+                                   greedy_mask.data(), best_all) &&
+       (int)best_all.size() == M){
+      batch_best_done = true;
+    } else {
+      lm_all = gpu->run_lm_head_batch(fn_all.data(), W, (uint32_t)M,
+                                      (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+    }
   }
   for(int m=0; m<M; m++){
     rmsnorm(&H[(size_t)m*Hdim], final_norm, fn.data(), Hdim);
     int best=-1; float bestv=-1e30f;
-    if(gpu){
+    bool row_done = false;
+    if(batch_best_done){
+      best = best_all[(size_t)m];
+      row_done = true;
+    } else if(gpu){
       if(!lm_all.empty() && (int)lm_all.size() == M * cfg.vocab){
         for(int i=0;i<cfg.vocab;i++) logits[i] = lm_all[(size_t)m * cfg.vocab + i];
       } else {
         const float* W = lm_head ? lm_head : embed;
-        std::vector<float> lm = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
-        if((int)lm.size() == cfg.vocab) for(int i=0;i<cfg.vocab;i++) logits[i] = lm[i];
+        if(greedy_mask[(size_t)m]){
+          int b = -1;
+          if(gpu->run_lm_head_best(fn.data(), W, (uint32_t)cfg.vocab,
+                                   (uint32_t)cfg.H, b)){
+            best = b; row_done = true;
+          }
+        }
+        if(!row_done){
+          std::vector<float> lm = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
+          if((int)lm.size() == cfg.vocab) for(int i=0;i<cfg.vocab;i++) logits[i] = lm[i];
+        }
       }
     }else{
       for(int v=0; v<cfg.vocab; v++){
@@ -6338,7 +6826,8 @@ static std::vector<StepOut> step_batch(
         if(s>bestv){ bestv=s; best=v; }
       }
     }
-    if(lm_head==nullptr || !backend || dynamic_cast<CpuBackend*>(backend) || gpu){
+    if(!row_done &&
+       (lm_head==nullptr || !backend || dynamic_cast<CpuBackend*>(backend) || gpu)){
       for(int v=0; v<cfg.vocab; v++){
         if(logits[v]>bestv){ bestv=logits[v]; best=v; }
       }
@@ -9179,8 +9668,10 @@ int main(int argc, char** argv){
       }
     }
     if(!spec_round){
+      // greedy => .best-only use: device-argmax may skip the vocab D2H
+      // (INTFER_DEVICE_ARGMAX=1, else the flag inside declines).
       StepOut o = step(req, token, S+step_i, T, embed, final_norm, lm_head,
-                       backend.get(), false, dump);
+                       backend.get(), false, dump, greedy);
       int next;
       if(greedy){
         next = o.best;

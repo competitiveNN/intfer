@@ -1539,4 +1539,47 @@ sycl::event half_to_float(sycl::queue& q, const HalfToFloatParams& p,
   });
 }
 
+sycl::event lm_head_argmax_tile(sycl::queue& q, const LmArgmaxTileParams& p,
+                                const sycl::event& dep) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
+  const std::uint16_t* tile = p.tile_fp16;
+  int* out_idx = p.out_idx;
+  float* out_val = p.out_val;
+  const std::uint8_t* greedy = p.is_greedy;
+  const std::uint32_t n = p.n, M = p.M;
+  const std::uint32_t stride = p.row_stride == 0 ? n : p.row_stride;
+  const std::uint32_t col0 = p.global_col0;
+  if (!tile || !out_idx || !out_val || n == 0 || M == 0) return sycl::event{};
+  const std::uint32_t nWG = 32;
+  const std::uint32_t global = ((M + nWG - 1) / nWG) * nWG;
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(dep);
+    h.parallel_for<class lm_head_argmax_tile_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) {
+          const std::uint32_t m = it.get_global_id(0);
+          if (m >= M) return;
+          if (greedy && !greedy[m]) {
+            out_idx[m] = -1;
+            out_val[m] = -1e30f;
+            return;
+          }
+          const std::uint16_t* row = tile + (size_t)m * stride;
+          int best = -1;
+          float bestv = -1e30f;
+          for (std::uint32_t i = 0; i < n; ++i) {
+            const float s = dev_half_to_float(row[i]);
+            if (s > bestv) {
+              bestv = s;
+              best = (int)(col0 + i);
+            }
+          }
+          out_idx[m] = best;
+          out_val[m] = bestv;
+        });
+  });
+}
+
 }  // namespace intfer::gemm

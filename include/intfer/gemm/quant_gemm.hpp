@@ -456,4 +456,27 @@ struct HalfToFloatParams {
 sycl::event half_to_float(sycl::queue& q, const HalfToFloatParams& p,
                          const sycl::event& dep = {});
 
+// ---------------------------------------------------------------------------
+// Device-side lm_head argmax (serve scoring seam): per-row argmax over one
+// device-resident FP16 vocab tile [M x n], avoiding the D2H of full logits.
+// Bit-contract: per-row single WI sequential scan, `float s =
+// dev_half_to_float(bits); if (s > bestv)` strict->, init best=-1,
+// bestv=-1e30f (first-max-wins, NaN ignored — identical to the host loops in
+// main.cpp step()/score_row/step_batch). No tree reduction, no fast-math.
+// out_idx gets the global vocab id (global_col0+i) or -1 for skipped rows;
+// out_val gets the winning value or -1e30f.
+// ---------------------------------------------------------------------------
+struct LmArgmaxTileParams {
+  const std::uint16_t* tile_fp16 = nullptr;  // [M x row_stride] device FP16
+  std::uint32_t n = 0;                       // tile width (vocab cols)
+  std::uint32_t M = 1;                       // rows
+  std::uint32_t row_stride = 0;              // 0 => tight (== n)
+  std::uint32_t global_col0 = 0;             // vocab offset of tile col 0
+  const std::uint8_t* is_greedy = nullptr;   // [M] or nullptr (all greedy)
+  int* out_idx = nullptr;                    // [M] device out
+  float* out_val = nullptr;                  // [M] device out
+};
+sycl::event lm_head_argmax_tile(sycl::queue& q, const LmArgmaxTileParams& p,
+                                const sycl::event& dep = {});
+
 }  // namespace intfer::gemm
