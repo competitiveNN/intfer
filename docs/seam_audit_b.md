@@ -147,6 +147,11 @@ tie-order assertion.
 GPU stream-identity gates OWED on the fleet box (dev container has no Arc
 L0 device — only CPU indifference verified: --no-gpu -n6 base==flag
 279 6511 314 279 5364 314, expected since the flag is GPU-only).
-Required before any use: TP1 -n6 base==flag==HOSTPREP==SSM==SSMxflag==
-TP2-base==TP2-flag + mixed-temp step_batch + spec-verify + cpu parity +
-http batch + gpu-optin 10/10. No wall-time claims (quiet rule).
+Required before any use: scripts/test_device_argmax.sh (TP1 -n6 8-way
+matrix base==flag==HOSTPREP==SSM==SSMxflag==FLAG+SSMxHOSTPREP==
+TP2-base==TP2-flag, INTFER_ARGMAX_DBG non-triviality both ways, sampling
+count smoke, spec-verify end-to-end, cpu parity + http batch + gpu-optin
+10/10). NOTE 2026-09-23: spec-verify rows take the full-D2H path BY DESIGN
+(score_row calls run_lm_head_f16 directly — StepOut carries logits), so
+the spec gate covers the end-to-end loop only, not verify rows.
+No wall-time claims (quiet rule).
