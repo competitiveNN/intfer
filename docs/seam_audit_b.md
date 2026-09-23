@@ -85,7 +85,9 @@ rope/attention/argmax) that cost more to move than the seam saves.
 
 Remaining levers, in order:
 (a) argmax-on-device for lm_head (kills 0.5MB D2H + vocab convert/token;
-    new kernel + sampler contract — SCOPED 2026-09-21, not started);
+    new kernel + sampler contract — IMPLEMENTED 2026-09-23, d460eb7,
+    default-off INTFER_DEVICE_ARGMAX=1; bit-contract proven on CPU,
+    GPU stream-gates OWED — see §6);
 (b) serve-side aggregate batching (highest documented value, quiet box);
 (c) fused fwht->GEMM->prep single kernel (replaces ~8 launches with 1;
     session-scale build, only if (a) lands first and the ceiling holds).
@@ -121,3 +123,30 @@ Bit-contract: device argmax must tie-break identically to the host
 `if(s>bestv)` strict-greater scan (first-max-wins); NaN handling must
 match (host strict-`>` ignores NaN — device kernel must too, else
 spec-verify accept decisions diverge).
+
+## 6. Device-argmax v1 status (2026-09-23, d460eb7, default-off)
+
+Kernel `lm_head_argmax_tile` (quant_gemm.cpp:1542, decl quant_gemm.hpp:459):
+per-row single-WI sequential scan, `best=-1/bestv=-1e30f` init, strict-`>`
+compare, global vocab id via `global_col0`. Hooks:
+`run_lm_head_best` (scalar `step()`) + `run_lm_head_batch_best` (M-row,
+v1 requires ALL rows greedy — mixed-temp falls back to full D2H).
+Any false (flag off, trace_lm, null/zero, N/K mismatch, alloc throw,
+sampling row, LMHEAD_BATCH=0) keeps the full-D2H path.
+
+Bit-contract PROVEN on CPU (throwaway harness, since deleted):
+(a) `dev_half_to_float` == `sycl::half` cast over ALL 65536 half patterns;
+(b) kernel scan == host loop on adversarial tiles (all-NaN, ties, NaN
+placement, ±inf, ±0.0, subnormals, tile offsets) + 200k random fuzz tiles;
+(c) multi-tile (65536 + ragged tail, 248320 vocab) ts-order host reduce ==
+flat host loop incl. cross-tile tie -> first tile. Harness quirk found
+during proving (NOT a kernel bug): raw-random fill can contain +inf which
+legitimately beats the planted max — fill was finite-masked before the
+tie-order assertion.
+
+GPU stream-identity gates OWED on the fleet box (dev container has no Arc
+L0 device — only CPU indifference verified: --no-gpu -n6 base==flag
+279 6511 314 279 5364 314, expected since the flag is GPU-only).
+Required before any use: TP1 -n6 base==flag==HOSTPREP==SSM==SSMxflag==
+TP2-base==TP2-flag + mixed-temp step_batch + spec-verify + cpu parity +
+http batch + gpu-optin 10/10. No wall-time claims (quiet rule).
