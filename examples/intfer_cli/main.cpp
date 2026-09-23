@@ -2066,6 +2066,12 @@ struct GpuBackend : public LinearBackend {
     for(auto& tp : parts){
       if(tp.val > bestv){ bestv = tp.val; best = tp.idx; }
     }
+    static const bool argmax_dbg = (std::getenv("INTFER_ARGMAX_DBG") != nullptr);
+    if(argmax_dbg) {
+      static thread_local int n = 0;
+      if((++n % 24) == 1)
+        std::fprintf(stderr, "[argmax] device best x%d\n", n);
+    }
     (void)W;
     return true;
   }
@@ -2300,6 +2306,12 @@ struct GpuBackend : public LinearBackend {
           best[(size_t)m] = tp.idx[(size_t)m];
         }
       }
+    }
+    static const bool argmax_dbg_b = (std::getenv("INTFER_ARGMAX_DBG") != nullptr);
+    if(argmax_dbg_b) {
+      static thread_local int n = 0;
+      if((++n % 24) == 1)
+        std::fprintf(stderr, "[argmax] device batch best M=%u x%d\n", M, n);
     }
     return true;
   }
