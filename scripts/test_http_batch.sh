@@ -98,6 +98,38 @@ gate("batch.floor", agg >= 1.0, f"{agg:.2f} tok/s")
 
 _, _, sse = post(P0, stream=True)
 gate("sse.parity", sse==solo, repr(sse[:50]))
+
+# open-webui compatibility: UI attaches tool lists to every request; the
+# server answers text (no tool calls emitted). tool_choice "auto"/"none"
+# and response_format text are accepted; "required" still 400s.
+def post_raw(payload):
+    req = urllib.request.Request(URL+"/v1/chat/completions",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type":"application/json"})
+    try:
+        r = urllib.request.urlopen(req, timeout=300)
+        return r.status, r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")
+TOOLS = [{"type":"function","function":{"name":"get_weather","description":"weather"}}]
+st, body = post_raw({"model":"Qwen3.5-0.8B",
+                     "messages":[{"role":"user","content":P0}],
+                     "max_tokens":8,"temperature":0,"tools":TOOLS})
+d = json.loads(body) if st == 200 else {}
+gate("tools.ignored", st == 200 and d.get("choices",[{}])[0].get("message",{}).get("content","").startswith(P0), f"http={st} {body[:120]}")
+st, sse_tools = post_raw({"model":"Qwen3.5-0.8B",
+                          "messages":[{"role":"user","content":P0}],
+                          "max_tokens":8,"temperature":0,"stream":True,"tools":TOOLS})
+full = ""
+if st == 200:
+    for line in sse_tools.splitlines():
+        if line.startswith("data: ") and "[DONE]" not in line:
+            full += json.loads(line[6:])["choices"][0].get("delta",{}).get("content","")
+gate("tools.sse", st == 200 and full == solo, f"http={st} {full[:50]!r}")
+st, _ = post_raw({"model":"Qwen3.5-0.8B",
+                  "messages":[{"role":"user","content":"hi"}],
+                  "tool_choice":"required"})
+gate("toolchoice.required.400", st == 400, f"http={st}")
 sys.exit(1 if fails else 0)
 EOF
 PY_RC=$?

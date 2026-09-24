@@ -11,8 +11,10 @@
 // Chat request fields honored: model, messages[{role,content}], max_tokens,
 // max_completion_tokens, temperature, top_p, top_k (extension), seed, stream,
 // stop (string | string[]), n (=1 only), user. Unknown fields are ignored so
-// generic OpenAI clients keep working. `logprobs`/`tools`/`response_format`
-// get a clean 400 (unsupported, stated explicitly — no silent wrong answers).
+// generic OpenAI clients keep working. `logprobs`/`audio`/`modalities` get
+// a clean 400 (unsupported, stated explicitly — no silent wrong answers).
+// `tools` is accepted-but-ignored (text-only model, no tool calls emitted);
+// `tool_choice` is accepted only for "none"/"auto".
 //
 // Roles: system/user/assistant/tool/developer. Content may be a string or a
 // ChatML-style content-part array ([{type:text,text:...}]); image/audio parts
@@ -463,14 +465,44 @@ static inline bool parse_chat_request(const JVal& j, ChatRequest& out) {
     return false;
   }
   // Explicit rejections: silent wrong answers are worse than a 400.
-  for (const char* k : {"logprobs", "top_logprobs", "tools", "tool_choice",
-                        "response_format", "audio", "modalities", "reasoning_effort"}) {
+  // Tool calling is not implemented (text-only model): `tools` is accepted
+  // and ignored (chat UIs like open-webui attach tool lists to every
+  // request; answering text beats a 400), but a `tool_choice` that REQUIRES
+  // a tool call cannot be honored. `response_format` text/null is accepted
+  // (output is plain text anyway); structured formats are rejected.
+  // `reasoning_effort` is accepted and ignored (single fixed pipeline).
+  for (const char* k : {"logprobs", "top_logprobs",
+                        "audio", "modalities"}) {
     const JVal* v = j.find(k);
     if (v && v->t != JVal::T::Null) {
       if (v->t == JVal::T::Bool && !v->b) continue;
       if (v->t == JVal::T::Arr && v->a.empty()) continue;
       out.validation_error = std::string(k) + " is not supported by this server";
       return false;
+    }
+  }
+  {
+    const JVal* tc = j.find("tool_choice");
+    if (tc && tc->t != JVal::T::Null) {
+      bool ok = false;
+      if (tc->is_str())
+        ok = (tc->s == "none" || tc->s == "auto");
+      else if (tc->t == JVal::T::Bool && !tc->b)
+        ok = true;
+      if (!ok) {
+        out.validation_error = "tool_choice requiring a tool call is not supported by this server";
+        return false;
+      }
+    }
+  }
+  {
+    const JVal* rf = j.find("response_format");
+    if (rf && rf->t != JVal::T::Null && rf->is_obj()) {
+      const JVal* t = rf->find("type");
+      if (!t || !t->is_str() || (t->s != "text" && t->s != "json_object")) {
+        out.validation_error = "response_format is not supported by this server (text output only)";
+        return false;
+      }
     }
   }
   if (out.max_tokens < 0) {
