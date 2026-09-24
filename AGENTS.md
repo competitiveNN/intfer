@@ -45,8 +45,13 @@ Implement features for maximizing throughput for concurrent requests, starting f
 
 ## Performance targets (2x Arc Pro B580)
 
-- Token generation (decode): **40 tok/s** (per-stream, 0.8B model)
-- Prefill: **4000 tok/s**
+> FOCUS (2026-09-24): our optimization target is the **27B model** — decode
+> and prefill work, benchmarks, and perf claims are scoped to 27B unless
+> explicitly stated otherwise. The 0.8B numbers below are legacy reference
+> only, not the target.
+
+- Token generation (decode): **40 tok/s** (per-stream, 27B model)
+- Prefill: **4000 tok/s** (27B model)
 - Current (2026-09-18, scripts/bench_gpu_ab.sh, DPAS48 default OFF,
   fused MLP default-ON, quiet box loadavg ~1.9):
   0.8B GPU decode TP=1 27.24 tok/s (-n 64), TP=2 14.14 tok/s.
