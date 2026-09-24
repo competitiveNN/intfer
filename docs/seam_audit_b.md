@@ -176,3 +176,11 @@ CLI matrix + full gate suite PASS (see below). Gate script fixed (2>&1:
 decode lines go to stderr) and now PASSES on this box: TP1/TP2 8-way
 279 6511 314 279 3046 13, counter fires, sampling 6/6, spec
 279 6511 279 3046 13, cpu parity + http batch + gpu-optin PASS.
+
+RE-RUN 2026-09-24 (HEAD 71e878d, binary current, load ~2.5 — stream-identity
+only, no wall-time read): scripts/test_device_argmax.sh DEVICE-ARGMAX TEST:
+PASS — TP1/TP2 8-way matrix all 279 6511 314 279 3046 13, [argmax] counter
+fires 1 line on flag / 0 off, sampling count 6/6, spec base==flag
+279 6511 279 3046 13 with [argmax] firing, cpu parity + http batch +
+gpu-optin all PASS. 27B serve prefill-latency check still owed (needs quiet
+box load1<2; load spiked to ~5-8 during this session — wall-time gated).
