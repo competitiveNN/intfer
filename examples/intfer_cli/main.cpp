@@ -5178,7 +5178,8 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
                      LinearBackend* backend,
                      std::vector<std::vector<float>>& dump,
                      std::vector<StepOut>* all_out = nullptr,
-                     std::vector<std::vector<CacheSnap>>* row_snaps = nullptr){
+                     std::vector<std::vector<CacheSnap>>* row_snaps = nullptr,
+                     bool all_greedy = false){
   StepOut out;
   const int M = (int)toks.size();
   const int Hdim = cfg.H;
@@ -6065,6 +6066,23 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
   auto score_row = [&](int m, StepOut& o){
     rmsnorm(&H[(size_t)m*Hdim], final_norm, fn.data(), Hdim);
     int best=-1; float bestv=-1e30f;
+    // Device-argmax on verify rows (INTFER_DEVICE_ARGMAX=1, all_greedy set
+    // only by the greedy spec-verifier below): verify consumers read .best
+    // only (accept test + corrected/bonus), never .logits, so the scalar
+    // hook's int-only result serves every row. Sequential M=1 calls — the
+    // same launch pattern as scalar decode (prefill-safe: the serve poison
+    // was batch-hook M>1 device work only; serve never sets all_greedy).
+    // Any false keeps the full-D2H path (TP2/trace/CPU/all decline inside).
+    bool row_done = false;
+    if(all_greedy && gpu){
+      const float* W = lm_head ? lm_head : embed;
+      int b = -1;
+      if(gpu->run_lm_head_best(fn.data(), W, (uint32_t)cfg.vocab,
+                               (uint32_t)cfg.H, b)){
+        best = b; row_done = true;
+      }
+    }
+    if(!row_done){
     if(gpu){
       const float* W = lm_head ? lm_head : embed;
       std::vector<float> lm = gpu->run_lm_head_f16(fn.data(), W, (uint32_t)cfg.vocab, (uint32_t)cfg.H);
@@ -6082,6 +6100,8 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         if(logits[v]>bestv){ bestv=logits[v]; best=v; }
       }
     }
+    } // !row_done (device-argmax rows keep best; logits hold stale scratch
+      // copy, unread for greedy rows — same contract as batch_best_done)
     o.best = best;
     o.logits = logits;
   };
@@ -9651,8 +9671,11 @@ int main(int argc, char** argv){
         Hv.assign((size_t)(K+1)*cfg.H, 0.f);
         outs.clear();
         if((int)spec_rows.size() != cfg.layers) spec_rows.resize(cfg.layers);
+        // all_greedy=true: use_spec implies greedy, and verify consumers read
+        // .best only — verify rows ride the scalar device-argmax hook (no
+        // logits D2H per verify row). Any hook decline falls back per-row.
         prefill_layer_outer(req, toks, p, T, Hv, embed, final_norm, lm_head,
-                            backend.get(), dump, &outs, &spec_rows);
+                            backend.get(), dump, &outs, &spec_rows, true);
         // outs[i].best predicts position p+i+1. Accept d_i iff
         // outs[i-1].best == d_i.
         int a = 0;

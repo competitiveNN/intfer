@@ -152,8 +152,21 @@ matrix base==flag==HOSTPREP==SSM==SSMxflag==FLAG+SSMxHOSTPREP==
 TP2-base==TP2-flag, INTFER_ARGMAX_DBG non-triviality both ways, sampling
 count smoke, spec-verify end-to-end, cpu parity + http batch + gpu-optin
 10/10). NOTE 2026-09-23: spec-verify rows take the full-D2H path BY DESIGN
-(score_row calls run_lm_head_f16 directly — StepOut carries logits), so
-the spec gate covers the end-to-end loop only, not verify rows.
+(spec-verify rows in prefill_layer_outer/score_row take the full-D2H path BY
+DESIGN (StepOut carries full logits; the *_best hooks are never called
+there), so the spec gate covers the end-to-end loop only, not verify rows.
+UPDATE 2026-09-24 (v2, spec-verify rows ride the scalar hook): this note is
+SUPERSEDED — score_row now tries run_lm_head_best per row when the caller
+passes all_greedy=true (only the greedy spec-verifier does; use_spec implies
+greedy, and verify consumers read .best only — accept test + corrected/bonus
+— never .logits). Sequential M=1 calls = same launch pattern as scalar
+decode (prefill-safe: the serve poison was batch-hook M>1 work only, and
+serve never sets all_greedy). Any hook false falls back per-row (TP2/trace/
+CPU decline inside). Gate: new §3b (repetitive prompt guarantees n-gram
+verify rounds): spec base==flag streams identical, PARTS 32->40 (+8 = 2
+verify rows x 4 tiles) deterministic 40/40, TP2 PARTS 0, TP2 base==flag.
+The old §3 (non-repetitive prompt) gates only the scalar fallback loop —
+kept as a smoke, §3b is the real verify-row gate.
 No wall-time claims (quiet rule).
 
 UPDATE 2026-09-24 (serve crash found + fixed, this box HAS 2x Arc B580):
@@ -189,3 +202,21 @@ in-transcript DEVICE-ARGMAX TEST: PASS (8-way all 279 6511 314 279 3046 13,
 counter 1/0, sampling 6/6, spec identical, standard gates PASS); 27B
 deferral evidence: load1=6.20 (uptime 6.20/6.10/4.55), model present 19GB,
 both B580 normal, no intfer procs — wall-time check stays blocked.
+
+MIXED-TEMP v2 ANALYZED + REJECTED (2026-09-24, no code — submit arithmetic,
+load-insensitive): extending the batch hook to mixed batches (greedy rows via
+masked argmax kernel — the is_greedy mask field already exists in
+LmArgmaxTileParams — + subset-D2H of sampling rows' tile slices) is a wash at
+best. Tile sizing (main.cpp:1497: 128MB/(K·2B), K=1024 → 64K rows/tile;
+vocab 248320 → T=4 tiles TP1): v2 adds +1 argmax submit + 2 small D2Hs per
+tile (+12 submits ≈ +1ms at M=3) to save the greedy share of the bulk D2H
+(~1MB ≈ 0.5-1ms) + a few host scans. Net ±0.5ms for HIGH complexity (strided
+subset-D2H through the tile scatter, mask plumbing, new bit-contract surface)
+AND it expands the batch-hook device surface just fenced for the serve
+poison. The all-greedy v1 already captures the common case. Do NOT build;
+revisit only if mixed-temp decode batches dominate a profiled workload AND
+the poison root cause is found.
+SPEC-VERIFY-ROW v2 IMPLEMENTED instead (same session, scalar-hook reuse, zero
+new kernels/D2H patterns — see §6 UPDATE above): kills (K+1)×0.5MB D2H per
+spec round for logits nobody reads; gate §3b PASS (PARTS 32->40, deterministic,
+TP2-silent); full suite + serve-load PASS.

@@ -81,6 +81,12 @@ probe 9.02 tok/s aggregate). Requires quiet box for any wall-time claim.
   guard, serve-poison fix (batch hook decode_only — prefill chunks decline),
   scripts/test_device_argmax.sh PASSES (script bug fixed: 2>&1). Serve
   verified: sequential + concurrent mixed + decode-batches survive.
+  UPDATE 2026-09-24 (v2): spec-verify rows ride the scalar hook
+  (prefill_layer_outer all_greedy param, spec site only; serve untouched):
+  gate §3b PASS (repetitive prompt, PARTS 32->40 deterministic, TP2-silent),
+  full suite + serve-load PASS. Mixed-temp batch v2 analyzed + REJECTED
+  (wash: +12 submits vs ~1MB D2H at T=4 tiles; expands fenced poison
+  surface — see seam_audit_b.md tail).
 - B: Audit only — ranked seam-extension list with nk/nw/nr deltas, no code.
 - C: Serve-side — batching/scheduler work (wall-time gated on quiet box).
 

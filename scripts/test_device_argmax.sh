@@ -119,6 +119,49 @@ SPEC_DBG="$(INTFER_DEVICE_ARGMAX=1 INTFER_ARGMAX_DBG=1 INTFER_SPEC_K=4 "$BIN" \
 echo "TP1 spec flag [argmax] lines: $SPEC_DBG (expect >=1: scalar rounds fire)"
 [ "$SPEC_DBG" -ge 1 ] || fail "[argmax] silent on spec run (scalar rounds fell back?)"
 
+echo "--- 3b. spec-verify ROWS ride the hook (repetitive prompt, K=4) ---"
+# N-gram drafts need repeated tokens: the repeated 8-word prompt guarantees
+# verify rounds fire (step jumps >1). Verify consumers read .best only, so
+# with the flag every verify row takes the scalar hook (all_greedy=true):
+# base==flag streams must hold AND [argmax-part] lines must grow by exactly
+# 4/verify-row (TP1 0.8B = 4 lm_head tiles) vs the no-spec flag run.
+SPEC_PROMPT="one two three four five six seven eight one two three four five six seven eight"
+spec_steps() { # $1...=env -- prints decode-step lines (round starts, not tokens)
+  # shellcheck disable=SC2086
+  env "$@" "$BIN" --gpu --tp 1 -m "$MODEL" -p "$SPEC_PROMPT" -n 8 \
+    --no-stream --ids $TOK 2>&1 \
+    | grep -a -E "decode step [0-9]+: token=[0-9]+" | tr '\n' '|'
+}
+spec_parts() { # $1...=env -- prints [argmax-part] line count
+  # shellcheck disable=SC2086
+  env INTFER_ARGMAX_PARTS=1 "$@" "$BIN" --gpu --tp 1 -m "$MODEL" -p "$SPEC_PROMPT" -n 8 \
+    --no-stream --ids $TOK 2>&1 >/dev/null | grep -ac "argmax-part"
+}
+SP_BASE="$(spec_steps INTFER_SPEC_K=4)"
+SP_FLAG="$(spec_steps INTFER_DEVICE_ARGMAX=1 INTFER_SPEC_K=4)"
+echo "spec verify-round starts base: '$SP_BASE'"
+echo "spec verify-round starts flag: '$SP_FLAG'"
+[ -n "$SP_BASE" ] || fail "spec repetitive base empty"
+[ "$SP_FLAG" = "$SP_BASE" ] || fail "spec repetitive flag != base"
+P_NOSPEC="$(spec_parts INTFER_DEVICE_ARGMAX=1)"
+P_SPEC="$(spec_parts INTFER_DEVICE_ARGMAX=1 INTFER_SPEC_K=4)"
+P_SPEC2="$(spec_parts INTFER_DEVICE_ARGMAX=1 INTFER_SPEC_K=4)"
+echo "PARTS no-spec=$P_NOSPEC spec=$P_SPEC spec-rerun=$P_SPEC2"
+[ "$P_SPEC" -gt "$P_NOSPEC" ] || \
+  fail "verify rows did not ride the hook (spec PARTS $P_SPEC <= no-spec $P_NOSPEC)"
+[ "$P_SPEC2" = "$P_SPEC" ] || \
+  fail "verify PARTS not deterministic ($P_SPEC vs rerun $P_SPEC2)"
+P_TP2FLAG="$(env INTFER_DEVICE_ARGMAX=1 INTFER_ARGMAX_PARTS=1 INTFER_SPEC_K=4 "$BIN" \
+  --gpu --tp 2 -m "$MODEL" -p "$SPEC_PROMPT" -n 8 --no-stream --ids $TOK 2>&1 >/dev/null \
+  | grep -ac "argmax-part")"
+echo "PARTS TP2 spec flag: $P_TP2FLAG (expect 0: TP1-only guard)"
+[ "$P_TP2FLAG" = 0 ] || fail "hook fired on TP2 ($P_TP2FLAG lines)"
+SP2_BASE="$(env INTFER_SPEC_K=4 "$BIN" --gpu --tp 2 -m "$MODEL" -p "$SPEC_PROMPT" \
+  -n 8 --no-stream --ids $TOK 2>&1 | grep -a -E "decode step [0-9]+: token=[0-9]+" | tr '\n' '|')"
+SP2_FLAG="$(env INTFER_DEVICE_ARGMAX=1 INTFER_SPEC_K=4 "$BIN" --gpu --tp 2 -m "$MODEL" \
+  -p "$SPEC_PROMPT" -n 8 --no-stream --ids $TOK 2>&1 | grep -a -E "decode step [0-9]+: token=[0-9]+" | tr '\n' '|')"
+[ "$SP2_FLAG" = "$SP2_BASE" ] || fail "TP2 spec repetitive flag != base"
+
 echo "--- 4. standard gates ---"
 if "$SCRIPT_DIR/test_cpu_parity.sh" >/dev/null 2>&1; then echo "cpu parity: PASS"; else fail "cpu parity"; fi
 if "$SCRIPT_DIR/test_http_batch.sh" >/dev/null 2>&1; then echo "http batch: PASS"; else fail "http batch"; fi
