@@ -1904,6 +1904,13 @@ struct GpuBackend : public LinearBackend {
                                  std::getenv("INTFER_LMHEAD_DPAS")[0] == '0');
     if(!dev_argmax || trace_lm || !eng || !fn || !W || N == 0 || K == 0)
       return false;
+    // TP=1 ONLY (2026-09-23): TP2+DPAS flakes intermittently (dev1 tiles
+    // read inf, torn (d,t) partials with idx < global_col0 — a DPAS-GEMM ->
+    // argmax-link ordering flake, load-sensitive ~50% at -n6; NODPAS path
+    // 6/6 clean but under-sampled). TP2 keeps the stable full-D2H path
+    // (itself DPAS-accelerated). Revisit only with a fused GEMM+argmax
+    // kernel or explicit device-side waits + a quiet-box re-gate.
+    if(eng->num_devices() != 1) return false;
     if(lm_head_q_dev_.empty() && lm_head_w_dev_.empty()){
       // First use: run the full path once (builds the upload AND scores this
       // token); host-argmax its logits. One-time full D2H, amortized.
@@ -2067,6 +2074,12 @@ struct GpuBackend : public LinearBackend {
       if(tp.val > bestv){ bestv = tp.val; best = tp.idx; }
     }
     static const bool argmax_dbg = (std::getenv("INTFER_ARGMAX_DBG") != nullptr);
+    static const bool argmax_parts = (std::getenv("INTFER_ARGMAX_PARTS") != nullptr);
+    if(argmax_parts) {
+      for(auto& tp : parts)
+        std::fprintf(stderr, "[argmax-part] d=%zu t=%zu idx=%d val=%f\n",
+                     tp.d, tp.t, tp.idx, (double)tp.val);
+    }
     if(argmax_dbg) {
       static thread_local int n = 0;
       if((++n % 24) == 1)
@@ -2082,7 +2095,8 @@ struct GpuBackend : public LinearBackend {
   // the global vocab ids and no logits are produced.
   bool run_lm_head_batch_best(const float* FN, const float* W, uint32_t M,
                               uint32_t N, uint32_t K,
-                              const uint8_t* greedy, std::vector<int>& best){
+                              const uint8_t* greedy, std::vector<int>& best,
+                              bool decode_only = false){
     best.assign(M, -1);
     static const bool dev_argmax = (std::getenv("INTFER_DEVICE_ARGMAX") != nullptr);
     static const bool trace_lm = (std::getenv("INTFER_TRACE_LMHEAD") != nullptr);
@@ -2092,6 +2106,23 @@ struct GpuBackend : public LinearBackend {
     if(!dev_argmax || trace_lm || !eng || !FN || !W || !greedy || M == 0 ||
        N == 0 || K == 0)
       return false;
+    // TP=1 only (same DPAS-link flake as the scalar hook — see above).
+    if(eng->num_devices() != 1) return false;
+    // PREFILL-SAFETY (serve crash fix, 2026-09-24): the batch hook's M-row
+    // device work poisons a LATER request's submit (SIGSEGV inside
+    // libze_intel_gpu — reproduced 8/8 on sequential + concurrent mixed
+    // probes whenever a prefill chunk fired the hook; scalar-hook-only and
+    // full-path-only runs survive. Driver/UR root cause still open:
+    // exonerated q.wait() sync, DPAS vs non-DPAS GEMM, the argmax submit
+    // itself, the small D2Hs, the unread-bulk-D2H theory, GEMM-only, and
+    // oversize-capped allocs). Prefill scoring never needs the device
+    // (score_row keeps the full-D2H path), and joint prefill chunks +
+    // spec-verify rows are the only non-decode M>1 callers — decline unless
+    // the caller marks a decode batch. INTFER_ARGMAX_PREFILL=1 restores
+    // prefill firing (bisection only).
+    static const bool argmax_prefill =
+        (std::getenv("INTFER_ARGMAX_PREFILL") != nullptr);
+    if(!decode_only && !argmax_prefill) return false;
     for(uint32_t m=0; m<M; ++m) if(!greedy[m]) return false;
     if(M == 1){
       // Scalar fast path (same single-row contract).
@@ -6796,9 +6827,16 @@ static std::vector<StepOut> step_batch(
     for(int m = 0; m < M; ++m)
       rmsnorm(&H[(size_t)m*Hdim], final_norm, fn_all.data() + (size_t)m * Hdim, Hdim);
     const float* W = lm_head ? lm_head : embed;
+    // Decode-only flag: every row here is one live request's next token
+    // (prefill=false by joint-batch construction for decode rows — mixed
+    // batches carry prefill rows too, so require ALL rows non-prefill).
+    // Prefill chunks route to the full-D2H path (logits needed + the batch
+    // hook's M-row device work poisons later requests, see hook).
+    bool all_decode = true;
+    for(int m = 0; m < M; ++m) if(items[(size_t)m].prefill) { all_decode = false; break; }
     if(gpu->run_lm_head_batch_best(fn_all.data(), W, (uint32_t)M,
                                    (uint32_t)cfg.vocab, (uint32_t)cfg.H,
-                                   greedy_mask.data(), best_all) &&
+                                   greedy_mask.data(), best_all, all_decode) &&
        (int)best_all.size() == M){
       batch_best_done = true;
     } else {

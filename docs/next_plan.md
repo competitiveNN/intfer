@@ -77,6 +77,10 @@ probe 9.02 tok/s aggregate). Requires quiet box for any wall-time claim.
   d460eb7, default-off INTFER_DEVICE_ARGMAX=1 — bit-contract proven on CPU
   (65536-pattern convert + adversarial/fuzz tiles + multi-tile reduce, ALL
   PASS), GPU stream-gates OWED on fleet box (see seam_audit_b.md §6).
+  UPDATE 2026-09-24: gated + fixed on THIS box (2x Arc present): TP1-only
+  guard, serve-poison fix (batch hook decode_only — prefill chunks decline),
+  scripts/test_device_argmax.sh PASSES (script bug fixed: 2>&1). Serve
+  verified: sequential + concurrent mixed + decode-batches survive.
 - B: Audit only — ranked seam-extension list with nk/nw/nr deltas, no code.
 - C: Serve-side — batching/scheduler work (wall-time gated on quiet box).
 

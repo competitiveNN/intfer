@@ -155,3 +155,24 @@ count smoke, spec-verify end-to-end, cpu parity + http batch + gpu-optin
 (score_row calls run_lm_head_f16 directly — StepOut carries logits), so
 the spec gate covers the end-to-end loop only, not verify rows.
 No wall-time claims (quiet rule).
+
+UPDATE 2026-09-24 (serve crash found + fixed, this box HAS 2x Arc B580):
+TP1-only guard (2026-09-23): TP2+DPAS flakes intermittently (dev1 tiles
+read +inf, torn partials, load-sensitive ~50% at -n6) — a DPAS-GEMM ->
+argmax-link ordering flake; TP2 keeps the stable full-D2H path.
+SERVE POISON (2026-09-24): ANY batch-hook (M>1) firing poisons a LATER
+request's submit — SIGSEGV inside libze_intel_gpu, 8/8 repro on sequential
+greedy-then-sampling AND concurrent mixed batches, crashing on the FIRST
+all-greedy prefill chunk (M=17/22) in the mixed case. Bisect exonerated:
+q.wait() device sync, DPAS vs non-DPAS GEMM, the argmax submit itself,
+the small D2Hs, the unread-bulk-D2H theory, GEMM-only, oversize-capped
+allocs. Scalar-hook-only and full-path-only runs survive. Driver/UR root
+cause still open. FIX: run_lm_head_batch_best takes decode_only (caller
+passes all-rows-non-prefill from step_batch BatchItem.prefill flags) and
+declines prefill chunks to the full-D2H path; INTFER_ARGMAX_PREFILL=1
+restores prefill firing (bisection only). Verified: sequential + concurrent
+mixed + 4x-long-greedy (decode batches M=3/M=4 fire) all survive, no FATAL;
+CLI matrix + full gate suite PASS (see below). Gate script fixed (2>&1:
+decode lines go to stderr) and now PASSES on this box: TP1/TP2 8-way
+279 6511 314 279 3046 13, counter fires, sampling 6/6, spec
+279 6511 279 3046 13, cpu parity + http batch + gpu-optin PASS.

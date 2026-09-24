@@ -53,7 +53,7 @@ ids_of() { # $1=tp $2...=env -- prints "t0 t1 t2 t3 t4 t5" decode ids
   local tp="$1"; shift
   # shellcheck disable=SC2086
   env "$@" "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" -n 6 \
-    --no-stream --ids $TOK 2>/dev/null \
+    --no-stream --ids $TOK 2>&1 \
     | grep -a -oE "decode step [0-9]+: token=[0-9]+" | sed -E 's/.*token=//' \
     | tr '\n' ' ' | sed 's/ *$//'
 }
@@ -61,7 +61,7 @@ count_of() { # $1=tp $2...=env -- prints decode-token count (sampling: values va
   local tp="$1"; shift
   # shellcheck disable=SC2086
   env "$@" "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" -n 6 -t 0.7 -S 42 \
-    --no-stream --ids $TOK 2>/dev/null \
+    --no-stream --ids $TOK 2>&1 \
     | grep -ac -E "decode step [0-9]+: token=[0-9]+"
 }
 
