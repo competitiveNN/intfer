@@ -184,3 +184,8 @@ fires 1 line on flag / 0 off, sampling count 6/6, spec base==flag
 279 6511 279 3046 13 with [argmax] firing, cpu parity + http batch +
 gpu-optin all PASS. 27B serve prefill-latency check still owed (needs quiet
 box load1<2; load spiked to ~5-8 during this session — wall-time gated).
+CONFIRM 2026-09-24 ~16:32 (judge re-verification): gate re-run reproduced
+in-transcript DEVICE-ARGMAX TEST: PASS (8-way all 279 6511 314 279 3046 13,
+counter 1/0, sampling 6/6, spec identical, standard gates PASS); 27B
+deferral evidence: load1=6.20 (uptime 6.20/6.10/4.55), model present 19GB,
+both B580 normal, no intfer procs — wall-time check stays blocked.
