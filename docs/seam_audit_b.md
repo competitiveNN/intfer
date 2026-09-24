@@ -220,3 +220,33 @@ SPEC-VERIFY-ROW v2 IMPLEMENTED instead (same session, scalar-hook reuse, zero
 new kernels/D2H patterns — see §6 UPDATE above): kills (K+1)×0.5MB D2H per
 spec round for logits nobody reads; gate §3b PASS (PARTS 32->40, deterministic,
 TP2-silent); full suite + serve-load PASS.
+
+V3 AUDIT (2026-09-24, full-D2H site census — TRACK COMPLETE, nothing left to
+build load-insensitively; suite reproduced exactly on HEAD c2be7f5: 8-way
+279 6511 314 279 3046 13, PARTS 32/40/40, TP2 0, DEVICE-ARGMAX TEST: PASS):
+scoring sites = step() scalar (v1) + step() sampling fallback (must stay) +
+score_row all_greedy (v2) + score_row prefill-last-row + step_batch batch_best
+(v1) + step_batch batch-full (must stay: sampling rows need logits) +
+step_batch per-row scalar (v1, M==1/LMHEAD_BATCH=0 only) + one-time upload
+probes (amortized). Devact seam coverage re-checked (fused MLP at all 5 GEMM
+sites, L4 la_out scalar + batch): remaining run_linear_batch sites (o_proj,
+la_out M-row, down-fallbacks) all have host consumers between — audit B
+"exhausted" verdict CONFIRMED, no missed edge. REJECTED with reasons:
+(a) prefill last-row scalar hook — value ~0 (1×0.5MB D2H inside GEMM-dominated
+prefill) vs un-bisected risk (scalar device work inside bulk prefill-chunk
+forwards; the poison involved prefill-chunk device work);
+(b) TP2 / decode_only fence re-scoping — both fences guard load-sensitive
+crash boundaries (DPAS-link flake ~50%, serve SIGSEGV 8/8); narrowing them is
+NOT load-insensitive work;
+(c) poison root-cause probes — zero perf payoff even if solved (prefill chunks
+keep full D2H they mostly need; prefill is GEMM-dominated), and 7 probes
+already failed to narrow it; curiosity only;
+(d) per-row-hook-first in declined M>1 batches — duplicates GEMMs already run
+by the batch path (strictly worse; the saving variant IS the rejected
+mixed-temp v2);
+(e) clearing stale logits on device rows — ~0.1ms memcpy saving for a sampler-
+contract surface change; fail-loud safety noted, not worth the risk.
+REMAINING LEVERS ALL GATED: quiet-box A/B of spec-verify D2H savings +
+27B prefill latency (load1<2), TP2-flake repro (needs quiet), fused
+fwht->GEMM->prep single kernel (session-scale build), serve aggregate
+batching (highest value, quiet box).
