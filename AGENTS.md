@@ -581,7 +581,13 @@ Implement features for maximizing throughput for concurrent requests, starting f
   Divergence-hunt CLOSED same session: claimed HIT/MISS divergence
   does NOT reproduce on clean tree (install() copies bit-exact,
   10/10 + 12/12 identical outputs; earlier "alternation" was a probe
-  history bug). Memory: ~159MB/snap x 16 grid-max ~= 2.5GB host max
+  history bug). TRACE-PROOF 2026-09-26 (INTFER_PCACHE_DBG, CPU serve,
+  identical 17-tok prompts): REQ1 miss records pos=16 + snapshot
+  state_len=24 grid_keys=16,24; REQ2 match hit=17 (capped 16) ->
+  install use=16 pchit=16 -> snapshot grid_keys=24; installed
+  ssm[0]/ssm[-1]/conv[0]/conv[-1] == recorded values on all 18 LA
+  layers (BIT-EXACT 18/18), completions byte-identical
+  ("The capital of France is **Paris**."). Log: build_tmp/pc_trace3.log. Memory: ~159MB/snap x 16 grid-max ~= 2.5GB host max
   (+KV mirrors), CONSTANT single-entry bound (code-bound: harvest
   caps grid at 16 incl. completion-top; cap unstressed at <=100tok
   prompts; no multi-entry LRU). Serve-load cache-ON (27B, load ~8,
