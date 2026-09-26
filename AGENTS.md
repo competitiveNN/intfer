@@ -556,6 +556,23 @@ Implement features for maximizing throughput for concurrent requests, starting f
   immediate append+sync measured no faster than UR submit+wait, so the
   win must come from fewer syncs, not a faster submit),
   device-side SSM/attention (host O(pos) attention dominates long ctx).
+- Prefix-cache TTFT verdict (2026-09-26, ec86808, 27B TP=2 serve,
+  bench_chat.sh --turns 3 --max-tokens 30, outputs in
+  /var/home/fra/build_tmp/chat_{on,off}_run.txt): single-entry
+  last-completed-request snapshot (grid K=16, lowest-4+highest-12,
+  INTFER_NO_PREFIX_CACHE=1 kill switch). ON (load ~3.8): t0 TTFT
+  3.7s, t1 3.9s pchit=16 (prompt=54), t2 4.8s pchit=48 (prompt=100).
+  OFF (load ~5.6, zero pchit, all 3 turns parity OK bit-exact): t0
+  3.7s, t1 4.9s, t2 8.1s. Delta t1 -1.0s (-20%), t2 -3.3s (-41%);
+  use=16/48 are K=16 grid multiples, use=48 on prompt=100 proves
+  mid-stream snaps survive retention (full-stream-only would decline).
+  Sr_old-4 chat divergence absorbed by largest-grid-pos<=hit.
+  q.fill=use -> P=min(chunk_M,Sr-fill) structurally skips `use`
+  prefill rows. Memory: ~159MB/snap x (16 cap + top) ~= 2.7GB host
+  max, CONSTANT single-entry bound (code-bound, cap unstressed at
+  <=100tok prompts; no multi-entry LRU). CAVEAT: box load 3.8-5.6
+  both runs — absolute TTFTs load-inflated; quiet-box (load1<2)
+  re-run needed for clean numbers.
 
 
 # guidelines
