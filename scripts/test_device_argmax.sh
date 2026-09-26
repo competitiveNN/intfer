@@ -137,6 +137,11 @@ spec_parts() { # $1...=env -- prints [argmax-part] line count
   env INTFER_ARGMAX_PARTS=1 "$@" "$BIN" --gpu --tp 1 -m "$MODEL" -p "$SPEC_PROMPT" -n 8 \
     --no-stream --ids $TOK 2>&1 >/dev/null | grep -ac "argmax-part"
 }
+flag_parts() { # $1...=env -- PARTS lines on the STANDARD prompt (-n6 decode)
+  # shellcheck disable=SC2086
+  env INTFER_ARGMAX_PARTS=1 "$@" "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" -n 6 \
+    --no-stream --ids $TOK 2>&1 >/dev/null | grep -ac "argmax-part"
+}
 SP_BASE="$(spec_steps INTFER_SPEC_K=4)"
 SP_FLAG="$(spec_steps INTFER_DEVICE_ARGMAX=1 INTFER_SPEC_K=4)"
 echo "spec verify-round starts base: '$SP_BASE'"
@@ -147,6 +152,11 @@ P_NOSPEC="$(spec_parts INTFER_DEVICE_ARGMAX=1)"
 P_SPEC="$(spec_parts INTFER_DEVICE_ARGMAX=1 INTFER_SPEC_K=4)"
 P_SPEC2="$(spec_parts INTFER_DEVICE_ARGMAX=1 INTFER_SPEC_K=4)"
 echo "PARTS no-spec=$P_NOSPEC spec=$P_SPEC spec-rerun=$P_SPEC2"
+# Exact-count lock (TP1 0.8B = 4 lm_head tiles; -n8 + one 2-row verify round):
+# any silent fallback (fence erosion, first-use-probe drift, hook decline)
+# changes these numbers. If the prompt/model changes, re-baseline here.
+[ "$P_NOSPEC" = 32 ] || fail "PARTS no-spec=$P_NOSPEC != 32 (hook coverage changed?)"
+[ "$P_SPEC" = 40 ] || fail "PARTS spec=$P_SPEC != 40 (verify-row coverage changed?)"
 [ "$P_SPEC" -gt "$P_NOSPEC" ] || \
   fail "verify rows did not ride the hook (spec PARTS $P_SPEC <= no-spec $P_NOSPEC)"
 [ "$P_SPEC2" = "$P_SPEC" ] || \
@@ -166,5 +176,74 @@ echo "--- 4. standard gates ---"
 if "$SCRIPT_DIR/test_cpu_parity.sh" >/dev/null 2>&1; then echo "cpu parity: PASS"; else fail "cpu parity"; fi
 if "$SCRIPT_DIR/test_http_batch.sh" >/dev/null 2>&1; then echo "http batch: PASS"; else fail "http batch"; fi
 if "$SCRIPT_DIR/test_gpu_optin.sh" >/dev/null 2>&1; then echo "gpu-optin: PASS"; else fail "gpu-optin"; fi
+
+echo "--- 5. serve fence lock (flag ON server: no prefill-chunk hook firing) ---"
+# The decode_only fence (batch hook declines prefill chunks — serve-poison
+# fix) erodes silently if a refactor re-fires the hook on prefill: the crash
+# only manifests on a LATER sampling request, so stream gates can't catch it.
+# This section runs the concurrent mixed-temp serve load WITH the flag and
+# asserts (a) no FATAL/crash, (b) greedy parity vs the known-good text.
+# Load-insensitive: finish_reason + text equality only, no timing claims.
+SERVE_PORT="${INTFER_ARGMAX_SERVE_PORT:-18321}"
+SERVE_LOG="${TMPDIR:-/tmp}/argmax_serve_fence.log"
+SERVE_PID=""
+serve_cleanup() {
+  # NOTE: the server may ignore SIGTERM while blocked in GPU calls; fall
+  # back to KILL so the gate can't hang in `wait` (bare `wait` below would
+  # also catch the session-detached server child — always wait on PIDs).
+  [ -n "$SERVE_PID" ] && kill "$SERVE_PID" 2>/dev/null
+  [ -n "$SERVE_PID" ] && sleep 3 && kill -9 "$SERVE_PID" 2>/dev/null
+  [ -n "$SERVE_PID" ] && wait "$SERVE_PID" 2>/dev/null
+  SERVE_PID=""
+}
+trap serve_cleanup EXIT
+setsid nohup env INTFER_DEVICE_ARGMAX=1 "$BIN" -m "$MODEL" --gpu --tp 1 \
+  --serve-http --port "$SERVE_PORT" --host 127.0.0.1 >"$SERVE_LOG" 2>&1 < /dev/null &
+SERVE_PID=$!
+SERVE_UP=0
+for _ in $(seq 1 40); do
+  sleep 5
+  curl -s -m 3 "http://127.0.0.1:$SERVE_PORT/health" >/dev/null 2>&1 && { SERVE_UP=1; break; }
+  kill -0 "$SERVE_PID" 2>/dev/null || break
+done
+if [ "$SERVE_UP" != 1 ]; then
+  fail "flag-ON server never came up (see $SERVE_LOG)"
+else
+  # Sequential greedy-then-sampling (the original 8/8 crash repro shape),
+  # then a concurrent mixed batch (greedy + sampling in flight together).
+  GREEDY_OUT="$(curl -s -m 120 -X POST "http://127.0.0.1:$SERVE_PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":8,"temperature":0}')"
+  echo "$GREEDY_OUT" | grep -q '"finish_reason"' || fail "greedy serve request failed: $GREEDY_OUT"
+  SAMPLING_OUT="$(curl -s -m 120 -X POST "http://127.0.0.1:$SERVE_PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":8,"temperature":0.7}')"
+  echo "$SAMPLING_OUT" | grep -q '"finish_reason"' || fail "post-greedy sampling request failed (fence erosion?): $SAMPLING_OUT"
+  MIXED_OK=1
+  CURLPIDS=""
+  for _ in 1 2 3; do
+    curl -s -m 120 -X POST "http://127.0.0.1:$SERVE_PORT/v1/chat/completions" \
+      -H 'Content-Type: application/json' \
+      -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":8,"temperature":0}' >/dev/null 2>&1 &
+    CURLPIDS="$CURLPIDS $!"
+  done
+  curl -s -m 120 -X POST "http://127.0.0.1:$SERVE_PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"Write a short poem about the sea"}],"max_tokens":8,"temperature":0.7}' \
+    | grep -q '"finish_reason"' || MIXED_OK=0
+  # shellcheck disable=SC2086
+  wait $CURLPIDS # PID-scoped: bare `wait` would also catch the detached
+                 # server child and hang until it exits (gate stuck 11h).
+  [ "$MIXED_OK" = 1 ] || fail "concurrent mixed serve batch failed under flag"
+  if kill -0 "$SERVE_PID" 2>/dev/null; then
+    echo "serve fence: server alive after greedy+sampling+mixed (no SIGSEGV)"
+  else
+    fail "flag-ON server DIED during mixed serve load (poison fence broken?)"
+  fi
+  grep -aiE "FATAL|SIGSEGV|segment" "$SERVE_LOG" | grep -av "no FATAL" | head -3 | \
+    while read -r line; do fail "server log fatal: $line"; done
+fi
+serve_cleanup
+trap - EXIT
 
 if [ "$PASS" = 1 ]; then echo "DEVICE-ARGMAX TEST: PASS"; else echo "DEVICE-ARGMAX TEST: FAIL" >&2; exit 1; fi

@@ -3918,6 +3918,9 @@ struct StepScratch {
 // locals and is untouched. Stage 3.3 adds id (server-issued request handle)
 // + done_emitted (terminal status already streamed) for the serve loop.
 // ============================================================================
+// Prefix-cache grid snapshot: one LA layer's recurrent state (fixed-size
+// ring/snapshot vectors; full-attn KV needs no copy — it truncates).
+struct PcSsm { std::vector<float> ssm, conv; };
 struct Request {
   std::vector<Layer> layers;
   StepScratch scratch;
@@ -3935,6 +3938,13 @@ struct Request {
   float top_p = 0.f;
   std::mt19937 rng;
   std::string output; // buffered decoded text (multi-request mode)
+  // Prefix-cache grid recording (server only): armed at admit, disarmed at
+  // live-join. pc_snaps maps absolute pos_after -> per-layer recurrent
+  // state copies (LA layers only; full-attn KV truncates freely from the
+  // completion snapshot). Recorded by prefill forwards at grid multiples;
+  // harvested by the dispatcher at completion.
+  bool pc_arm = false;
+  std::map<int, std::vector<PcSsm>> pc_snaps; // pos_after -> per-layer state
 };
 
 // One live sequence's contribution to a scheduler iteration: exactly one
@@ -5170,6 +5180,49 @@ struct CacheSnap {
   size_t ksz = 0, vsz = 0;
   std::vector<float> conv, ssm;
 };
+// Prefix-cache grid recording: after a prefill row's host-side LA state
+// advance, copy (ssm, conv) at grid positions into the request's snap map.
+// Call ONLY where host vectors are current (device-SSM/fused paths skip by
+// placement: their `continue`s bypass the hook; completion declines on
+// dirty residents anyway). Grid stride via INTFER_PCACHE_K (default 16);
+// INTFER_PCACHE_SNAP=0 disables recording.
+static inline void pc_note_row(Request& req, int L, int pos_after){
+  if(!req.pc_arm) return;
+  static const bool snap_off = (std::getenv("INTFER_PCACHE_SNAP") != nullptr &&
+                                std::string(std::getenv("INTFER_PCACHE_SNAP")) == "0");
+  if(snap_off) return;
+  static const int K = []{
+    const char* e = std::getenv("INTFER_PCACHE_K");
+    int v = e ? std::atoi(e) : 16;
+    return (v >= 1 && v <= 1024) ? v : 16;
+  }();
+  if(pos_after <= 0 || pos_after % K != 0) return;
+  if(L < 0 || (size_t)L >= req.layers.size()) return;
+  Layer& ly = req.layers[(size_t)L];
+  if(ly.is_full) return;
+  auto& mp = req.pc_snaps;
+  if(mp.find(pos_after) == mp.end())
+    mp[pos_after].resize(cfg.layers);
+  std::vector<PcSsm>& per = mp[pos_after];
+  if((int)per.size() != cfg.layers) per.resize(cfg.layers);
+  per[(size_t)L].ssm = ly.ssm_state;
+  per[(size_t)L].conv = ly.conv_state;
+  // Bound transient memory during long prefills: keep the lowest keep_lo
+  // (early-stable system prefix) + highest keep_hi (near prompt end, where
+  // chat divergence lands); evict middle positions first.
+  static const int keep_lo = 4, keep_hi = 12;
+  while((int)mp.size() > keep_lo + keep_hi){
+    auto lo = mp.begin();
+    std::advance(lo, keep_lo); // first evictable
+    auto hi = mp.end();
+    for(int i = 0; i < keep_hi && hi != lo; i++) --hi; // first kept-high
+    if(lo == hi) break; // only ends remain
+    auto victim = lo; ++victim; // evict just above the low end...
+    if(victim == hi) victim = lo; // ...or lo itself if adjacent
+    if(victim == mp.end()) break;
+    mp.erase(victim);
+  }
+}
 static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, int pos0,
                      const std::map<std::string, std::vector<float>>& T,
                      std::vector<float>& H, // [M,H] in/out hidden states
@@ -5460,6 +5513,10 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
           CacheSnap& sn = rws[(size_t)L][m];
           sn.conv = ly.conv_state;
           sn.ssm = ly.ssm_state;
+        } else if(!ssm_done) {
+          // Prefix-cache grid: host recurrence ran above (the device path
+          // leaves the host mirror stale and skips by this gate).
+          pc_note_row(req, L, pos + 1);
         }
         std::vector<float>& o_la = req.scratch.o_la;
         backend->run_linear_into(ln.la_out, normed_core, o_la);
@@ -5884,6 +5941,12 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
           CacheSnap& sn = rws[(size_t)L][m];
           sn.conv = ly.conv_state;
           sn.ssm = ly.ssm_state;
+        } else if(!c_ssm_on) {
+          // Prefix-cache grid: host recurrence ran above (c_ssm_on stashes
+          // conv rows for a later device step and skips here via `continue`;
+          // the device step leaves host mirrors stale and the completion
+          // dirty-check declines the harvest).
+          pc_note_row(req, L, pos0 + m + 1);
         }
       }
       if(c_ssm_on) {
@@ -6583,6 +6646,10 @@ static std::vector<StepOut> step_batch(
           float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
           for(int i=0;i<cfg.v_head_dim;i++) oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
         }
+        // Prefix-cache grid (host recurrence ran above for this row; the
+        // device-stash and L4-M1 `continue`s above bypass this point).
+        if(items[(size_t)m].prefill)
+          pc_note_row(*items[(size_t)m].req, L, pos_of[(size_t)m] + 1);
       }
       // L4 M>1 attempt (conv_state already advanced above for every row,
       // matching the scalar path order; b_ssm_conv holds one conv row per
@@ -6673,6 +6740,9 @@ static std::vector<StepOut> step_batch(
             float inv=1.0f/sqrtf(v/cfg.v_head_dim+cfg.rms_eps);
             for(int i=0;i<cfg.v_head_dim;i++) oo[i]=(xx[i]*inv)*ssm_norm_w[i]*silu(zg[i]);
           }
+          // Prefix-cache grid (host fallback recurrence ran above).
+          if(items[(size_t)m].prefill)
+            pc_note_row(*items[(size_t)m].req, L, pos_of[(size_t)m] + 1);
         }
         l4_batch_host_fallback = true;
       }
@@ -7119,6 +7189,7 @@ static int sched_iteration_joint(std::vector<Request*>& live,
       pq->pos = Sr;
       if(c.print_ids)
         std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", pq->id, pq->token);
+      pq->pc_arm = false; // prefill done: grid recording stops at live-join
       live.push_back(pq);
       prefill_q.pop_front();
     } else if(!rr_off && prefill_q.size() > 1){
@@ -7775,6 +7846,7 @@ static void serve_iteration(std::vector<Request*>& live,
         q.pos = Sr;
         if(c.print_ids)
           std::fprintf(stderr, "  [serve id=%ld prefill] id=%d\n", q.id, q.token);
+        q.pc_arm = false; // prefill done: grid recording stops at live-join
         live.push_back(&q);
         prefill_q.pop_front();
       } else {
@@ -7989,6 +8061,207 @@ struct HttpJob {
   bool done = false;
 };
 
+// Prefix cache (27B multi-turn TTFT win): single-entry snapshot of the last
+// completed request's full token stream (prompt_ids + generated) and its
+// per-layer KV/SSM state. On admit, a new request whose prompt_ids extend
+// the retained stream reuses the verified prefix: layers are copied
+// truncated to the hit length and fill starts at the hit (only the suffix
+// prefills). Correct by construction:
+// - Token-level compare (BPE is NOT prefix-stable; never textual).
+// - Full-attn KV rows carry absolute-pos RoPE baked at append; truncation
+//   preserves positions (same resize-at-pend+1 precedent as spec rollback).
+// - LA ssm_state/conv_state are fixed-size recurrent snapshots: the copy at
+//   hit length IS the exact state after that prefix (no positional content).
+// - Mirrors copied proportionally (elements-per-token = size/orig_len) so
+//   INT8 group strides stay aligned; per-token Q8 truncates trivially.
+// - Snapshot requires clean device state: any dirty ssm_dev_ resident for
+//   the source key declines the snapshot (host mirror would be stale).
+// Kill switch: INTFER_NO_PREFIX_CACHE=1 restores full-prefill admit.
+struct PrefixCache {
+  bool valid = false;
+  std::vector<int> stream; // prompt_ids + generated of the snapshotted request
+  size_t state_len = 0; // tokens the state covers: stream minus the final
+                        // predicted-but-never-forwarded id (its KV/SSM row
+                        // was never appended). Hits are capped here.
+  struct LayerSnap {
+    bool is_full = true;
+    std::vector<float> kcache, vcache;
+    std::vector<int8_t> kcache_i8, vcache_i8, kcache_q8, vcache_q8;
+    std::vector<float> kscale, vscale, kscale_q8, vscale_q8;
+    bool kv_int8 = false, kv_q8 = false, kv_had = false;
+  };
+  std::vector<LayerSnap> layers;
+  // Grid recurrent states: pos_after -> per-layer (ssm, conv), harvested
+  // from the request's pc_snaps (mid-prefill) plus the completion state at
+  // state_len. Full-attn KV needs no grid (absolute positions truncate).
+  std::map<int, std::vector<PcSsm>> grid;
+  static bool disabled(){
+    static const bool off = (std::getenv("INTFER_NO_PREFIX_CACHE") != nullptr);
+    return off;
+  }
+  void clear(){ valid = false; stream.clear(); state_len = 0; layers.clear(); grid.clear(); }
+  // Snapshot a completed request's stream + state. False = declined (caller
+  // keeps serving without a cache; no state mutated).
+  bool snapshot(const Request& q
+#ifdef INTFER_HAS_GPU_BACKEND
+                , GpuBackend* be
+#endif
+                ){
+    clear();
+    if(disabled()) return false;
+    if(q.prompt_ids.empty() || q.generated.empty()) return false;
+#ifdef INTFER_HAS_GPU_BACKEND
+    // Device residents must not be newer than the host mirrors we copy.
+    if(be && be->eng){
+      for(auto& kv : be->ssm_dev_){
+        if(kv.first.first == &q && kv.second.ok &&
+           (kv.second.dirty || kv.second.conv_dirty))
+          return false;
+      }
+    }
+#else
+    (void)q;
+#endif
+    stream.reserve(q.prompt_ids.size() + q.generated.size());
+    stream.insert(stream.end(), q.prompt_ids.begin(), q.prompt_ids.end());
+    stream.insert(stream.end(), q.generated.begin(), q.generated.end());
+    // State covers every stream token except the final predicted id (never
+    // forwarded, so no KV/SSM row exists for it). Sanity: kcache rows must
+    // agree (full layers all carry the same length).
+    state_len = stream.size() - 1;
+    layers.resize(q.layers.size());
+    for(size_t L = 0; L < q.layers.size(); L++){
+      const Layer& ly = q.layers[L];
+      LayerSnap& sn = layers[L];
+      sn.is_full = ly.is_full;
+      sn.kcache = ly.kcache; sn.vcache = ly.vcache;
+      sn.kcache_i8 = ly.kcache_i8; sn.vcache_i8 = ly.vcache_i8;
+      sn.kcache_q8 = ly.kcache_q8; sn.vcache_q8 = ly.vcache_q8;
+      sn.kscale = ly.kscale; sn.vscale = ly.vscale;
+      sn.kscale_q8 = ly.kscale_q8; sn.vscale_q8 = ly.vscale_q8;
+      sn.kv_int8 = ly.kv_int8; sn.kv_q8 = ly.kv_q8; sn.kv_had = ly.kv_had;
+    }
+    // Grid harvest: mid-prefill recurrent states recorded at grid positions
+    // (pos_after <= state_len only — decode never records, but carried
+    // resume snaps could exceed it; drop those). Plus the completion state
+    // at state_len (the post-stream recurrent state, exact for full hits).
+    grid.clear();
+    for(auto& kv : q.pc_snaps){
+      int p = kv.first;
+      if(p <= 0 || (size_t)p > state_len) continue;
+      if((int)kv.second.size() != cfg.layers) continue;
+      grid[p] = kv.second;
+    }
+    {
+      std::vector<PcSsm> top(cfg.layers);
+      for(size_t L = 0; L < q.layers.size(); L++){
+        const Layer& ly = q.layers[L];
+        if(!ly.is_full){ top[L].ssm = ly.ssm_state; top[L].conv = ly.conv_state; }
+      }
+      grid[(int)state_len] = std::move(top);
+    }
+    // Bound retained memory: lowest-4 + highest-12 (same policy as record).
+    while(grid.size() > 16){
+      auto lo = grid.begin(); std::advance(lo, 4);
+      auto hi = grid.end();
+      for(int i = 0; i < 12 && hi != lo; i++) --hi;
+      if(lo == hi) break;
+      auto victim = lo; ++victim;
+      if(victim == hi) victim = lo;
+      if(victim == grid.end()) break;
+      grid.erase(victim);
+    }
+    valid = true;
+    return true;
+  }
+  // Longest cached-stream prefix matching new_ids, capped at state_len
+  // (0 = miss). NOTE: callers must require hit == state_len (full-state
+  // reuse): LA ssm/conv snapshots are recurrent post-stream states with no
+  // valid truncation to a shorter hit (only full-attn KV truncates). A
+  // shorter hit is reported so the caller can log it, but install()
+  // declines it.
+  int match(const std::vector<int>& new_ids) const {
+    if(!valid || disabled() || new_ids.empty() || stream.empty()) return 0;
+    size_t n = std::min({stream.size(), new_ids.size(), state_len});
+    size_t hit = 0;
+    while(hit < n && stream[hit] == new_ids[hit]) hit++;
+    static const bool pc_dbg = (std::getenv("INTFER_PCACHE_DBG") != nullptr);
+    if(pc_dbg)
+      std::fprintf(stderr, "[pcache] match hit=%zu state_len=%zu Sr_new=%zu\n",
+                   hit, state_len, new_ids.size());
+    return (int)hit;
+  }
+  // Install the [0, use) state into a freshly-wired request, where use is
+  // the largest grid position <= hit. KV truncates freely (absolute
+  // positions); the recurrent state comes from the exact grid snapshot.
+  // Grid snaps below `use` are carried into the request (it keeps recording
+  // above `use`, so future harvests stay dense). Returns use (>0) on
+  // success, 0 on decline (caller keeps fill=0: full prefill, unchanged).
+  int install(Request& q, int hit) const {
+    if(!valid || hit <= 0) return 0;
+    // Largest grid position covered by the hit.
+    auto it = grid.upper_bound(hit);
+    if(it == grid.begin()) return 0;
+    --it;
+    int use = it->first;
+    if(use <= 0 || (size_t)use > state_len) return 0;
+    if(q.layers.size() != layers.size()) return 0;
+    const std::vector<PcSsm>& gs = it->second;
+    if((int)gs.size() != cfg.layers) return 0;
+    for(size_t L = 0; L < q.layers.size(); L++){
+      Layer& ly = q.layers[L];
+      const LayerSnap& sn = layers[L];
+      if(ly.is_full != sn.is_full) return 0;
+      if(ly.is_full){
+        size_t row = (size_t)cfg.n_kv * cfg.head_dim;
+        size_t kwn = (size_t)use * row;
+        if(sn.kcache.size() < kwn || sn.vcache.size() < kwn) return 0;
+        ly.kcache.assign(sn.kcache.begin(), sn.kcache.begin() + kwn);
+        ly.vcache.assign(sn.vcache.begin(), sn.vcache.begin() + kwn);
+        // Mirrors: per-token buffers truncate proportionally
+        // (elements-per-token from state_len, so strides stay aligned);
+        // legacy INT8 scales are fixed-stride (full-copy).
+        size_t src_len = state_len;
+        if(src_len == 0) return 0;
+        auto trunc_prop = [&](auto& dst, const auto& src){
+          if(src.empty()){ dst.clear(); return true; }
+          if(src.size() % src_len != 0) return false;
+          size_t ept = src.size() / src_len;
+          dst.assign(src.begin(), src.begin() + ept * (size_t)use);
+          return true;
+        };
+        if(!trunc_prop(ly.kcache_i8, sn.kcache_i8)) return 0;
+        if(!trunc_prop(ly.vcache_i8, sn.vcache_i8)) return 0;
+        // NOTE: legacy i8 codes are token-major like the FP32 cache, so
+        // proportional truncation holds; only their scales are fixed-stride
+        // (full-copied below).
+        if(!trunc_prop(ly.kcache_q8, sn.kcache_q8)) return 0;
+        if(!trunc_prop(ly.vcache_q8, sn.vcache_q8)) return 0;
+        // Legacy INT8 scales are (kvh, group) with FIXED stride smax =
+        // cap/G+1 (not length-proportional): full-copy so group indices
+        // stay valid. (Q8 scales above are per-token: truncatable.)
+        ly.kscale = sn.kscale; ly.vscale = sn.vscale;
+        if(!trunc_prop(ly.kscale_q8, sn.kscale_q8)) return 0;
+        if(!trunc_prop(ly.vscale_q8, sn.vscale_q8)) return 0;
+        ly.kv_int8 = sn.kv_int8; ly.kv_q8 = sn.kv_q8; ly.kv_had = sn.kv_had;
+      } else {
+        if(gs[L].ssm.size() != ly.ssm_state.size()) return 0;
+        if(gs[L].conv.size() != ly.conv_state.size()) return 0;
+        ly.ssm_state = gs[L].ssm;
+        ly.conv_state = gs[L].conv;
+      }
+    }
+    // Carry grid snaps below `use` so future turns can hit below the
+    // resume point (the request records fresh snaps above it).
+    q.pc_snaps.clear();
+    for(auto& kv : grid){
+      if(kv.first >= use) break;
+      q.pc_snaps[kv.first] = kv.second;
+    }
+    return use;
+  }
+};
+
 // Dispatcher: single engine thread running serve_iteration over admitted
 // HTTP jobs. Handler threads submit() pre-tokenized jobs and wait; the
 // dispatcher loop admits (wire + prefill_q), iterates, emits per-row
@@ -8018,6 +8291,7 @@ struct HttpDispatcher {
   std::vector<float> Hb, Hpre;
   std::vector<std::vector<float>> no_dump;       // server never records
   int step_i = 0;
+  PrefixCache pcache; // last-completed-request prefix state (admit hits)
 
   void start(SchedCtx& cc, const std::function<void(Request&)>& w,
              uint32_t sb){
@@ -8130,9 +8404,32 @@ struct HttpDispatcher {
                                : seed_base + (uint32_t)(j->seq & 0xffffff));
           q.fill = 0; q.pos = 0;
           q.id = (long)j->seq;
-          std::fprintf(stderr, "[intfer] http admit seq=%lld prompt=%zu max_new=%d live=%zu pq=%zu\n",
+          q.pc_arm = true; q.pc_snaps.clear(); // armed until live-join
+          // Prefix-cache hit: the new prompt extends the retained stream.
+          // install() resumes from the largest grid position `use` <= hit
+          // (recurrent state is exact only at grid rows); only the suffix
+          // [use, Sr) prefills. Any decline keeps fill=0 (full prefill).
+          int pchit = 0;
+          if(!PrefixCache::disabled()){
+            int hit = pcache.match(q.prompt_ids);
+            // Cap the hit below the full prompt: fill==Sr at admit would
+            // skip the prefill forward that produces generated[0]; the
+            // resume protocol always forwards at least the final token.
+            if(hit >= (int)q.prompt_ids.size())
+              hit = (int)q.prompt_ids.size() - 1;
+            // install() returns the resume position (largest grid pos <=
+            // hit; recurrent state is exact only at grid rows) or 0 on
+            // decline. Only the suffix [use, Sr) prefills.
+            int use = (hit > 0) ? pcache.install(q, hit) : 0;
+            if(use > 0){
+              q.fill = use;
+              pchit = use;
+            }
+          }
+          std::fprintf(stderr, "[intfer] http admit seq=%lld prompt=%zu max_new=%d live=%zu pq=%zu%s\n",
                        j->seq, q.prompt_ids.size(), q.max_new,
-                       live.size(), prefill_q.size()+1);
+                       live.size(), prefill_q.size()+1,
+                       pchit > 0 ? (" pchit=" + std::to_string(pchit)).c_str() : "");
           prefill_q.push_back(&q);
           r2j[&q] = j.get();
           jobs.push_back(std::move(j));
@@ -8177,6 +8474,24 @@ struct HttpDispatcher {
             for(auto it2 = jobs.begin(); it2 != jobs.end(); ++it2){
               if(it2->get() == j){
                 if(cancel && !qp->finished) qp->finished = true;
+                // Prefix-cache snapshot: retain naturally-finished jobs'
+                // stream + state for the next admit's hit check. Cancelled
+                // or max_new-truncated jobs still hold exact [0,len) state
+                // for their own stream, so they snapshot too — EXCEPT jobs
+                // still in prefill (fill < Sr: state covers only a prompt
+                // prefix, but the stream claims prompt+generated; a hit
+                // would install state short of the matched length).
+                // EOS/stop jobs are the common chat-turn case.
+                if(!cancel && qp->fill == (int)qp->prompt_ids.size()
+                   && !qp->prompt_ids.empty()){
+#ifdef INTFER_HAS_GPU_BACKEND
+                  GpuBackend* gbe =
+                    dynamic_cast<GpuBackend*>(c->backend);
+                  (void)pcache.snapshot(*qp, gbe);
+#else
+                  (void)pcache.snapshot(*qp);
+#endif
+                }
                 finish_job(*it2);
                 r2j.erase(qp);
                 jobs.erase(it2);
