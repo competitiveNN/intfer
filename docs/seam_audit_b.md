@@ -295,3 +295,33 @@ story holds for the big-prefill path too (2-tok warmup does not
 migrate prefill pages; first 361-tok request pays ~19s migration).
 Debt paid; no wall-time claim for the flag anywhere (CLI scalar shows
 -43%, serve shows no-op by guard).
+
+FUSED GEMM+ARGMAX SCOPE (2026-09-26, code-read only, box load ~15 — no
+build; the ONLY redemption path for the -43% scalar verdict above).
+Goal: one kernel producing per-tile (idx,val) without materializing
+c_tile or re-running anything. Design facts grounding it:
+- quant_gemm_dpas_s8w already lays work out as one-WI-per-(row,16N
+  tile) (TN=16, OP=32; src/gemm/quant_gemm.cpp:1020). The argmax needs
+  exactly this tiling — fuse INSIDE it, not after it.
+- Fused op per WI-group: DPAS-accumulate the tile's row outputs in
+  registers/SLM, subgroup-reduce to tile-best (global idx via ts+lane,
+  val), write 1 int + 1 float to the ax/av partials. Kills: the
+  argmax launch per tile, the c_tile buffer + its write traffic, the
+  serial 62K-col scan. Still pays: T GEMM launches (tiles remain), the
+  2 small partial D2Hs per tile (tile bests must come back — that IS
+  the saving vs full D2H), and waits unless restructured to a single
+  wait over all tile events (the full path's one-wait-per-wave pattern
+  is the template).
+- Bit-contract: DPAS integer dot exact; fold scale-multiply order must
+  match host; tie order must reproduce strict-> first-max-wins with the
+  ts-order host reduce retained (same oracle as v1 §6).
+- Guards retained: TP=1-only, decode-only, default-off new flag (e.g.
+  INTFER_ARGMAX_FUSED); any-false falls back to current v1 (which stays
+  as the fallback, itself falling back to full D2H).
+- Effort: session-scale (new kernel coupled to the DPAS tile layout +
+  oracle gate + quiet-box A/B). Do NOT start under load; needs load1<2
+  for the A/B that justifies it. Estimated ceiling: recovers the -43%
+  toward parity with full-D2H, plus the 0.5MB/vocab-D2H saving on top
+  (~0.25ms/token) — i.e. best case a few % over baseline, NOT a 40
+  tok/s lever. The 40 tok/s path stays submit-side (Step 2) + batching
+  (Step 3).

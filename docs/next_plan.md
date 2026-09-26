@@ -1,7 +1,8 @@
 # Next plan: from ~27 tok/s TP1 toward 40 tok/s (0.8B decode)
 
-Date: 2026-09-21. HEAD `15acca2` (L4 stream identity restored).
-Box contended (load ~4.5) — wall-time A/B gated on quiet box (load1<2).
+Date: 2026-09-26. HEAD `34d3c54` (argmax 27B no-op check; prefix-cache
+quiet-box complete; argmax scalar wall-time = measured loss).
+Box contended (load ~19) — wall-time A/B gated on quiet box (load1<2).
 Load-insensitive work (stream-identity + code) can proceed now.
 
 ## 1. Current ceiling (measured)
@@ -76,11 +77,15 @@ probe 9.02 tok/s aggregate). Requires quiet box for any wall-time claim.
   NOTE 2026-09-23: device-argmax v1 (audit B lever (a)) is implemented,
   d460eb7, default-off INTFER_DEVICE_ARGMAX=1 — bit-contract proven on CPU
   (65536-pattern convert + adversarial/fuzz tiles + multi-tile reduce, ALL
-  PASS), GPU stream-gates OWED on fleet box (see seam_audit_b.md §6).
-  UPDATE 2026-09-24: gated + fixed on THIS box (2x Arc present): TP1-only
-  guard, serve-poison fix (batch hook decode_only — prefill chunks decline),
-  scripts/test_device_argmax.sh PASSES (script bug fixed: 2>&1). Serve
-  verified: sequential + concurrent mixed + decode-batches survive.
+  PASS), GPU stream-gates gated + fixed on THIS box 2026-09-24 (TP1-only
+  guard, serve-poison decode_only fence, gate §3b PARTS 32->40; full suite
+  + serve-load PASS). WALL-TIME CLOSED 2026-09-26 (e1e669b, quiet box):
+  M=1 scalar is a MEASURED LOSS (OFF 26.5 vs ON 15.1 tok/s, -43%, buckets
+  identical — GEMM re-run + 4 waits/tile + serial 62K scan). 27B serve is
+  a silent no-op by guard (34d3c54: paired 4.9s vs 4.9s, zero [argmax]
+  lines). Keep default-off; never promote v1. Only redemption path: fused
+  GEMM+argmax single kernel (session-scale; TP2/poison fences stand).
+  Full story: docs/seam_audit_b.md tail.
   UPDATE 2026-09-24 (v2): spec-verify rows ride the scalar hook
   (prefill_layer_outer all_greedy param, spec site only; serve untouched):
   gate §3b PASS (repetitive prompt, PARTS 32->40 deterministic, TP2-silent),
