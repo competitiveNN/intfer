@@ -8061,12 +8061,13 @@ struct HttpJob {
   bool done = false;
 };
 
-// Prefix cache (27B multi-turn TTFT win): single-entry snapshot of the last
-// completed request's full token stream (prompt_ids + generated) and its
-// per-layer KV/SSM state. On admit, a new request whose prompt_ids extend
-// the retained stream reuses the verified prefix: layers are copied
+// Prefix cache (27B multi-turn TTFT win): bounded multi-entry LRU over
+// completed requests' full token streams (prompt_ids + generated) and their
+// per-layer KV/SSM state. On admit, a new request whose prompt_ids extend a
+// retained stream reuses the longest matching prefix: layers are copied
 // truncated to the hit length and fill starts at the hit (only the suffix
-// prefills). Correct by construction:
+// prefills). Single-entry last-completed behavior is the N=1 case
+// (INTFER_PCACHE_N=1); default 4. Correct by construction:
 // - Token-level compare (BPE is NOT prefix-stable; never textual).
 // - Full-attn KV rows carry absolute-pos RoPE baked at append; truncation
 //   preserves positions (same resize-at-pend+1 precedent as spec rollback).
@@ -8078,36 +8079,56 @@ struct HttpJob {
 //   the source key declines the snapshot (host mirror would be stale).
 // Kill switch: INTFER_NO_PREFIX_CACHE=1 restores full-prefill admit.
 struct PrefixCache {
-  bool valid = false;
-  std::vector<int> stream; // prompt_ids + generated of the snapshotted request
-  size_t state_len = 0; // tokens the state covers: stream minus the final
-                        // predicted-but-never-forwarded id (its KV/SSM row
-                        // was never appended). Hits are capped here.
-  struct LayerSnap {
-    bool is_full = true;
-    std::vector<float> kcache, vcache;
-    std::vector<int8_t> kcache_i8, vcache_i8, kcache_q8, vcache_q8;
-    std::vector<float> kscale, vscale, kscale_q8, vscale_q8;
-    bool kv_int8 = false, kv_q8 = false, kv_had = false;
+  // One retained snapshot: the entry key carries the valid flag now (the
+  // cache as a whole is always "present"; entries come and go by LRU).
+  struct Entry {
+    bool valid = false;
+    std::vector<int> stream; // prompt_ids + generated of the snapshotted request
+    size_t state_len = 0; // tokens the state covers: stream minus the final
+                         // predicted-but-never-forwarded id (its KV/SSM row
+                         // was never appended). Hits are capped here.
+    struct LayerSnap {
+      bool is_full = true;
+      std::vector<float> kcache, vcache;
+      std::vector<int8_t> kcache_i8, vcache_i8, kcache_q8, vcache_q8;
+      std::vector<float> kscale, vscale, kscale_q8, vscale_q8;
+      bool kv_int8 = false, kv_q8 = false, kv_had = false;
+    };
+    std::vector<LayerSnap> layers;
+    // Grid recurrent states: pos_after -> per-layer (ssm, conv), harvested
+    // from the request's pc_snaps (mid-prefill) plus the completion state at
+    // state_len. Full-attn KV needs no grid (absolute positions truncate).
+    std::map<int, std::vector<PcSsm>> grid;
   };
-  std::vector<LayerSnap> layers;
-  // Grid recurrent states: pos_after -> per-layer (ssm, conv), harvested
-  // from the request's pc_snaps (mid-prefill) plus the completion state at
-  // state_len. Full-attn KV needs no grid (absolute positions truncate).
-  std::map<int, std::vector<PcSsm>> grid;
+  // Bounded multi-entry LRU, most-recently-used at front. Capacity via
+  // INTFER_PCACHE_N (default 4, clamped to [1, 16]); N=1 reproduces the old
+  // single-entry last-completed behavior exactly. Memory stays code-bounded:
+  // each entry holds one completion snapshot + <=16 grid rows, so the worst
+  // case is N x single-entry cost (0.8B: ~159MB/snap host).
+  std::list<Entry> entries;
+  static int capacity(){
+    static const int n = []{
+      const char* e = std::getenv("INTFER_PCACHE_N");
+      int v = e ? std::atoi(e) : 4;
+      if(v < 1) return 1;
+      if(v > 16) return 16;
+      return v;
+    }();
+    return n;
+  }
   static bool disabled(){
     static const bool off = (std::getenv("INTFER_NO_PREFIX_CACHE") != nullptr);
     return off;
   }
-  void clear(){ valid = false; stream.clear(); state_len = 0; layers.clear(); grid.clear(); }
-  // Snapshot a completed request's stream + state. False = declined (caller
-  // keeps serving without a cache; no state mutated).
+  void clear(){ entries.clear(); }
+  // Snapshot a completed request's stream + state into the MRU slot,
+  // evicting the LRU entry past capacity. False = declined (caller keeps
+  // serving without a cache; no state mutated).
   bool snapshot(const Request& q
 #ifdef INTFER_HAS_GPU_BACKEND
                 , GpuBackend* be
 #endif
                 ){
-    clear();
     if(disabled()) return false;
     if(q.prompt_ids.empty() || q.generated.empty()) return false;
 #ifdef INTFER_HAS_GPU_BACKEND
@@ -8122,17 +8143,18 @@ struct PrefixCache {
 #else
     (void)q;
 #endif
-    stream.reserve(q.prompt_ids.size() + q.generated.size());
-    stream.insert(stream.end(), q.prompt_ids.begin(), q.prompt_ids.end());
-    stream.insert(stream.end(), q.generated.begin(), q.generated.end());
+    Entry e;
+    e.stream.reserve(q.prompt_ids.size() + q.generated.size());
+    e.stream.insert(e.stream.end(), q.prompt_ids.begin(), q.prompt_ids.end());
+    e.stream.insert(e.stream.end(), q.generated.begin(), q.generated.end());
     // State covers every stream token except the final predicted id (never
     // forwarded, so no KV/SSM row exists for it). Sanity: kcache rows must
     // agree (full layers all carry the same length).
-    state_len = stream.size() - 1;
-    layers.resize(q.layers.size());
+    e.state_len = e.stream.size() - 1;
+    e.layers.resize(q.layers.size());
     for(size_t L = 0; L < q.layers.size(); L++){
       const Layer& ly = q.layers[L];
-      LayerSnap& sn = layers[L];
+      Entry::LayerSnap& sn = e.layers[L];
       sn.is_full = ly.is_full;
       sn.kcache = ly.kcache; sn.vcache = ly.vcache;
       sn.kcache_i8 = ly.kcache_i8; sn.vcache_i8 = ly.vcache_i8;
@@ -8145,12 +8167,12 @@ struct PrefixCache {
     // (pos_after <= state_len only — decode never records, but carried
     // resume snaps could exceed it; drop those). Plus the completion state
     // at state_len (the post-stream recurrent state, exact for full hits).
-    grid.clear();
+    e.grid.clear();
     for(auto& kv : q.pc_snaps){
       int p = kv.first;
-      if(p <= 0 || (size_t)p > state_len) continue;
+      if(p <= 0 || (size_t)p > e.state_len) continue;
       if((int)kv.second.size() != cfg.layers) continue;
-      grid[p] = kv.second;
+      e.grid[p] = kv.second;
     }
     {
       std::vector<PcSsm> top(cfg.layers);
@@ -8158,59 +8180,82 @@ struct PrefixCache {
         const Layer& ly = q.layers[L];
         if(!ly.is_full){ top[L].ssm = ly.ssm_state; top[L].conv = ly.conv_state; }
       }
-      grid[(int)state_len] = std::move(top);
+      e.grid[(int)e.state_len] = std::move(top);
     }
     // Bound retained memory: lowest-4 + highest-12 (same policy as record).
-    while(grid.size() > 16){
-      auto lo = grid.begin(); std::advance(lo, 4);
-      auto hi = grid.end();
+    while(e.grid.size() > 16){
+      auto lo = e.grid.begin(); std::advance(lo, 4);
+      auto hi = e.grid.end();
       for(int i = 0; i < 12 && hi != lo; i++) --hi;
       if(lo == hi) break;
       auto victim = lo; ++victim;
       if(victim == hi) victim = lo;
-      if(victim == grid.end()) break;
-      grid.erase(victim);
+      if(victim == e.grid.end()) break;
+      e.grid.erase(victim);
     }
-    valid = true;
+    e.valid = true;
+    entries.push_front(std::move(e));
+    while((int)entries.size() > capacity()) entries.pop_back();
     return true;
   }
-  // Longest cached-stream prefix matching new_ids, capped at state_len
-  // (0 = miss). install() resumes from the largest grid position `use`
-  // <= hit (recurrent state is exact only at grid rows); full-attn KV
-  // truncates freely to `use`. A hit below the lowest grid row (or with
-  // an empty grid) is reported so the caller can log it, but install()
-  // declines it.
-  int match(const std::vector<int>& new_ids) const {
-    if(!valid || disabled() || new_ids.empty() || stream.empty()) return 0;
-    size_t n = std::min({stream.size(), new_ids.size(), state_len});
-    size_t hit = 0;
-    while(hit < n && stream[hit] == new_ids[hit]) hit++;
+  // Longest cached-stream prefix over all entries, capped at each entry's
+  // state_len (0 = miss). On a hit the entry is promoted to MRU (LRU order
+  // tracks reuse, not just recency of completion). install() resumes from
+  // the largest grid position `use` <= hit (recurrent state is exact only
+  // at grid rows); full-attn KV truncates freely to `use`. A hit below the
+  // lowest grid row (or with an empty grid) is reported so the caller can
+  // log it, but install() declines it.
+  // Returns the hit length; hit_entry is the ranked entry index (0 = MRU)
+  // the hit came from, or -1 on miss. Rank (not iterator) stays valid
+  // across the caller's hit-cap adjustment before install().
+  int match(const std::vector<int>& new_ids, int& hit_entry) const {
+    hit_entry = -1;
+    if(disabled() || new_ids.empty()) return 0;
+    int best = 0, best_idx = -1, idx = 0;
+    for(auto it = entries.begin(); it != entries.end(); ++it, ++idx){
+      const Entry& e = *it;
+      if(!e.valid || e.stream.empty()) continue;
+      size_t n = std::min({e.stream.size(), new_ids.size(), e.state_len});
+      size_t hit = 0;
+      while(hit < n && e.stream[hit] == new_ids[hit]) hit++;
+      if((int)hit > best){ best = (int)hit; best_idx = idx; }
+    }
     static const bool pc_dbg = (std::getenv("INTFER_PCACHE_DBG") != nullptr);
     if(pc_dbg)
-      std::fprintf(stderr, "[pcache] match hit=%zu state_len=%zu Sr_new=%zu\n",
-                   hit, state_len, new_ids.size());
-    return (int)hit;
+      std::fprintf(stderr, "[pcache] match hit=%d Sr_new=%zu entries=%zu\n",
+                   best, new_ids.size(), entries.size());
+    hit_entry = best_idx;
+    return best;
   }
-  // Install the [0, use) state into a freshly-wired request, where use is
-  // the largest grid position <= hit. KV truncates freely (absolute
-  // positions); the recurrent state comes from the exact grid snapshot.
+  int match(const std::vector<int>& new_ids) const {
+    int idx = -1;
+    return match(new_ids, idx);
+  }
+  // Install entry-rank hit_entry's [0, use) state into a freshly-wired
+  // request, where use is the largest grid position <= hit. The entry is
+  // promoted to MRU on success. KV truncates freely (absolute positions);
+  // the recurrent state comes from the exact grid snapshot.
   // Grid snaps below `use` are carried into the request (it keeps recording
   // above `use`, so future harvests stay dense). Returns use (>0) on
   // success, 0 on decline (caller keeps fill=0: full prefill, unchanged).
-  int install(Request& q, int hit) const {
-    if(!valid || hit <= 0) return 0;
+  int install(Request& q, int hit, int hit_entry) {
+    if(hit <= 0 || hit_entry < 0 || hit_entry >= (int)entries.size()) return 0;
+    auto it = entries.begin();
+    std::advance(it, hit_entry);
+    Entry& src = *it;
+    if(!src.valid) return 0;
     // Largest grid position covered by the hit.
-    auto it = grid.upper_bound(hit);
-    if(it == grid.begin()) return 0;
-    --it;
-    int use = it->first;
-    if(use <= 0 || (size_t)use > state_len) return 0;
-    if(q.layers.size() != layers.size()) return 0;
-    const std::vector<PcSsm>& gs = it->second;
+    auto git = src.grid.upper_bound(hit);
+    if(git == src.grid.begin()) return 0;
+    --git;
+    int use = git->first;
+    if(use <= 0 || (size_t)use > src.state_len) return 0;
+    if(q.layers.size() != src.layers.size()) return 0;
+    const std::vector<PcSsm>& gs = git->second;
     if((int)gs.size() != cfg.layers) return 0;
     for(size_t L = 0; L < q.layers.size(); L++){
       Layer& ly = q.layers[L];
-      const LayerSnap& sn = layers[L];
+      const Entry::LayerSnap& sn = src.layers[L];
       if(ly.is_full != sn.is_full) return 0;
       if(ly.is_full){
         size_t row = (size_t)cfg.n_kv * cfg.head_dim;
@@ -8221,13 +8266,13 @@ struct PrefixCache {
         // Mirrors: per-token buffers truncate proportionally
         // (elements-per-token from state_len, so strides stay aligned);
         // legacy INT8 scales are fixed-stride (full-copy).
-        size_t src_len = state_len;
+        size_t src_len = src.state_len;
         if(src_len == 0) return 0;
-        auto trunc_prop = [&](auto& dst, const auto& src){
-          if(src.empty()){ dst.clear(); return true; }
-          if(src.size() % src_len != 0) return false;
-          size_t ept = src.size() / src_len;
-          dst.assign(src.begin(), src.begin() + ept * (size_t)use);
+        auto trunc_prop = [&](auto& dst, const auto& srcv){
+          if(srcv.empty()){ dst.clear(); return true; }
+          if(srcv.size() % src_len != 0) return false;
+          size_t ept = srcv.size() / src_len;
+          dst.assign(srcv.begin(), srcv.begin() + ept * (size_t)use);
           return true;
         };
         if(!trunc_prop(ly.kcache_i8, sn.kcache_i8)) return 0;
@@ -8254,11 +8299,17 @@ struct PrefixCache {
     // Carry grid snaps below `use` so future turns can hit below the
     // resume point (the request records fresh snaps above it).
     q.pc_snaps.clear();
-    for(auto& kv : grid){
+    for(auto& kv : src.grid){
       if(kv.first >= use) break;
       q.pc_snaps[kv.first] = kv.second;
     }
+    // Promote the hit entry to MRU (splice is iterator-stable, no copies).
+    entries.splice(entries.begin(), entries, it);
     return use;
+  }
+  int install(Request& q, int hit) const {
+    // Single-entry-compatible shim: rank 0. Prefer the ranked overload.
+    return const_cast<PrefixCache*>(this)->install(q, hit, 0);
   }
 };
 
@@ -8291,7 +8342,7 @@ struct HttpDispatcher {
   std::vector<float> Hb, Hpre;
   std::vector<std::vector<float>> no_dump;       // server never records
   int step_i = 0;
-  PrefixCache pcache; // last-completed-request prefix state (admit hits)
+  PrefixCache pcache; // multi-entry LRU prefix state (admit hits)
 
   void start(SchedCtx& cc, const std::function<void(Request&)>& w,
              uint32_t sb){
@@ -8411,7 +8462,8 @@ struct HttpDispatcher {
           // [use, Sr) prefills. Any decline keeps fill=0 (full prefill).
           int pchit = 0;
           if(!PrefixCache::disabled()){
-            int hit = pcache.match(q.prompt_ids);
+            int hit_entry = -1;
+            int hit = pcache.match(q.prompt_ids, hit_entry);
             // Cap the hit below the full prompt: fill==Sr at admit would
             // skip the prefill forward that produces generated[0]; the
             // resume protocol always forwards at least the final token.
@@ -8420,7 +8472,7 @@ struct HttpDispatcher {
             // install() returns the resume position (largest grid pos <=
             // hit; recurrent state is exact only at grid rows) or 0 on
             // decline. Only the suffix [use, Sr) prefills.
-            int use = (hit > 0) ? pcache.install(q, hit) : 0;
+            int use = (hit > 0) ? pcache.install(q, hit, hit_entry) : 0;
             if(use > 0){
               q.fill = use;
               pchit = use;
