@@ -277,3 +277,21 @@ id per row, fp16-convert loop) — no subgroup parallelism. Saved: one
 redesign (fused GEMM+argmax single kernel, no GEMM re-run, one wait)
 — a session-scale build with the TP2/poison fences still standing.
 Stays default-off; stream-identity certification stands (gates PASS).
+
+27B SERVE PREFILL-LATENCY CHECK DONE (2026-09-26, this box, 27B TP=2
+serve, 361-tok prefill + 5 completion toks, timed TTFT/E2E via SSE):
+INTFER_DEVICE_ARGMAX=1 is a silent no-op on 27B serve, as designed
+(TP=1-only guard: TP2 declines inside the hook; decode_only fence:
+prefill chunks decline to full-D2H). Unflagged warm steady state:
+TTFT 4.9s / E2E 9.6s. Flagged warm steady state: 4.9s/9.5s and
+5.4s/10.0s — identical within run variance, zero `[argmax]` lines in
+either server log (hook never fires). CAVEAT: timed probes ran at
+load ~5-7 (startup + julia), not load1<2 — but the comparison is
+paired (same box, same shape, back-to-back) and the structural guards
+make the no-op claim load-independent; the measurement only confirms
+no surprise path fires. BONUS replication: first-touch 361-tok
+migration cost = 24.1s on BOTH servers to 0.1s — the USM first-touch
+story holds for the big-prefill path too (2-tok warmup does not
+migrate prefill pages; first 361-tok request pays ~19s migration).
+Debt paid; no wall-time claim for the flag anywhere (CLI scalar shows
+-43%, serve shows no-op by guard).
