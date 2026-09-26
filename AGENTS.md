@@ -560,19 +560,23 @@ Implement features for maximizing throughput for concurrent requests, starting f
   bench_chat.sh --turns 3 --max-tokens 30, outputs in
   /var/home/fra/build_tmp/chat_{on,off}_run.txt): single-entry
   last-completed-request snapshot (grid K=16, lowest-4+highest-12,
-  INTFER_NO_PREFIX_CACHE=1 kill switch). ON (load ~3.8): t0 TTFT
-  3.7s, t1 3.9s pchit=16 (prompt=54), t2 4.8s pchit=48 (prompt=100).
-  OFF (load ~5.6, zero pchit, all 3 turns parity OK bit-exact): t0
-  3.7s, t1 4.9s, t2 8.1s. Delta t1 -1.0s (-20%), t2 -3.3s (-41%);
-  use=16/48 are K=16 grid multiples, use=48 on prompt=100 proves
-  mid-stream snaps survive retention (full-stream-only would decline).
-  Sr_old-4 chat divergence absorbed by largest-grid-pos<=hit.
-  q.fill=use -> P=min(chunk_M,Sr-fill) structurally skips `use`
-  prefill rows. Memory: ~159MB/snap x (16 cap + top) ~= 2.7GB host
-  max, CONSTANT single-entry bound (code-bound, cap unstressed at
-  <=100tok prompts; no multi-entry LRU). CAVEAT: box load 3.8-5.6
-  both runs — absolute TTFTs load-inflated; quiet-box (load1<2)
-  re-run needed for clean numbers.
+  INTFER_NO_PREFIX_CACHE=1 kill switch). REPRODUCED 3 consecutive
+  sessions. Latest ON (load ~3.7): t0 TTFT 3.7s, t1 4.0s pchit=16
+  (prompt=54), t2 4.9s pchit=48 (prompt=100). OFF (load ~4.7, zero
+  pchit, all 3 turns parity OK bit-exact): t0 3.7s, t1 4.9s, t2
+  8.0s. Delta t1 -0.9s (-18%), t2 -3.1s (-39%); prior sessions
+  -1.0s/-3.3s and -1.0s/-3.2s (stable direction, ~0.1-0.2s
+  variance). use=16/48 are K=16 grid multiples, use=48 on
+  prompt=100 proves mid-stream snaps survive retention
+  (full-stream-only would decline). Sr_old-4 chat divergence
+  absorbed by largest-grid-pos<=hit. q.fill=use ->
+  P=min(chunk_M,Sr-fill) structurally skips `use` prefill rows.
+  Memory: ~159MB/snap x (16 cap + top) ~= 2.7GB host max,
+  CONSTANT single-entry bound (code-bound, cap unstressed at
+  <=100tok prompts; no multi-entry LRU). CAVEAT: box load 3.6-4.7
+  all runs — absolute TTFTs load-inflated; quiet-box (load1<2)
+  re-run still owed for clean numbers, but 3-session reproduction
+  bounds the claim.
 
 
 # guidelines
