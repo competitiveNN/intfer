@@ -23,6 +23,9 @@
 #   INTFER_LOAD_LEVELS: space-separated concurrency levels (default "1 4 8").
 #   INTFER_LOAD_MAXTOK: max_tokens per request (default 8).
 #   INTFER_LOAD_BIGMT: batch-full probe max_tokens (default unset = skip).
+#   INTFER_LOAD_ORACLE: expected solo-text prefix for PROMPTS[0]
+#     (default "The capital of France is" — the 0.8B echo; override for
+#     other models, e.g. the 27B answer prefix).
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,6 +76,12 @@ LEVELS = [int(x) for x in os.environ["INTFER_LOAD_LEVELS"].split()]
 MT = int(os.environ["INTFER_LOAD_MAXTOK"])
 BIGMT = os.environ.get("INTFER_LOAD_BIGMT", "").strip()
 BIGMT = int(BIGMT) if BIGMT else 0
+# Expected solo prefix for PROMPTS[0]: the 0.8B default echoes the prompt
+# ("The capital of France is..."), but other models (e.g. 27B) answer in
+# their own words. INTFER_LOAD_ORACLE overrides the expectation (prefix
+# match); unset keeps the exact historical gate. c8.parity (solo text ==
+# same prompt under C=8 load) is the model-agnostic determinism gate.
+ORACLE = os.environ.get("INTFER_LOAD_ORACLE", "The capital of France is")
 PROMPTS = ["The capital of France is",
            "The quick brown fox jumps over the lazy dog.",
            "Hi", "Hello world",
@@ -105,7 +114,7 @@ def gate(name, cond, extra=""):
     if not cond: fails.append(name)
 
 _, _, solo, _ = post(PROMPTS[0])
-gate("solo.oracle", solo.startswith("The capital of France is"), repr(solo[:50]))
+gate("solo.oracle", solo.startswith(ORACLE), repr(solo[:50]))
 
 agg_by_level = {}
 for C in LEVELS:
