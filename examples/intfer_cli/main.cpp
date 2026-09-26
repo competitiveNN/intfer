@@ -8175,10 +8175,10 @@ struct PrefixCache {
     return true;
   }
   // Longest cached-stream prefix matching new_ids, capped at state_len
-  // (0 = miss). NOTE: callers must require hit == state_len (full-state
-  // reuse): LA ssm/conv snapshots are recurrent post-stream states with no
-  // valid truncation to a shorter hit (only full-attn KV truncates). A
-  // shorter hit is reported so the caller can log it, but install()
+  // (0 = miss). install() resumes from the largest grid position `use`
+  // <= hit (recurrent state is exact only at grid rows); full-attn KV
+  // truncates freely to `use`. A hit below the lowest grid row (or with
+  // an empty grid) is reported so the caller can log it, but install()
   // declines it.
   int match(const std::vector<int>& new_ids) const {
     if(!valid || disabled() || new_ids.empty() || stream.empty()) return 0;

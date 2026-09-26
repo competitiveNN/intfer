@@ -571,9 +571,17 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (full-stream-only would decline). Sr_old-4 chat divergence
   absorbed by largest-grid-pos<=hit. q.fill=use ->
   P=min(chunk_M,Sr-fill) structurally skips `use` prefill rows.
-  Memory: ~159MB/snap x (16 cap + top) ~= 2.7GB host max,
-  CONSTANT single-entry bound (code-bound, cap unstressed at
-  <=100tok prompts; no multi-entry LRU). CAVEAT: box load 3.6-4.7
+  Memory: ~159MB/snap x 16 grid-max ~= 2.5GB host max (+KV mirrors),
+  CONSTANT single-entry bound (code-bound: harvest caps grid at 16
+  incl. completion-top; cap unstressed at <=100tok prompts; no
+  multi-entry LRU). Serve-load cache-ON (27B, load ~8, MT=8 sweep +
+  MT=64 probe): c1/c4/c8 completion + c8 parity + floor + bigmt all
+  PASS (c1 1.84 -> c8 1.59 tok/s MT=8 prefill-dominated as expected;
+  MT=64 probe 2.45 tok/s over 346 ctoks); solo.oracle FAIL is a
+  pre-existing harness artifact (oracle hardcodes 0.8B text, server
+  runs 27B — c8.parity byte-identical is the real determinism gate).
+  Cache fires under concurrency (pchit=16 at admit with pq=8).
+  CAVEAT: box load 3.6-4.7
   all runs — absolute TTFTs load-inflated; quiet-box (load1<2)
   re-run still owed for clean numbers, but 3-session reproduction
   bounds the claim.
