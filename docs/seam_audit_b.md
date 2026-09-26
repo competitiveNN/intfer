@@ -250,3 +250,30 @@ REMAINING LEVERS ALL GATED: quiet-box A/B of spec-verify D2H savings +
 27B prefill latency (load1<2), TP2-flake repro (needs quiet), fused
 fwht->GEMM->prep single kernel (session-scale build), serve aggregate
 batching (highest value, quiet box).
+
+WALL-TIME VERDICT (2026-09-26, quiet box load 1.1-4.0, 0.8B TP1 -n64 CLI
+decode, 4/4 interleaved rounds OFF/ON, streams identical by gate):
+device-argmax v1 is a MEASURED LOSS at M=1 scalar decode — do NOT
+promote, keep default-off. OFF 26.6/26.6/26.6/26.4 tok/s vs ON
+15.1/15.1/15.2/15.2 tok/s (consistent -43%, both with and without
+INTFER_ARGMAX_DBG — the counter fprintf is not the cost). Prefill
+unchanged (~5.3-5.5 both). NODPAS GEMM inside the hook is even slower
+(13.0 tok/s at -n16), so the GEMM variant is not the lever.
+Mechanism (load-immune buckets, -n16: OFF kernel 163.6/submit 178.6/
+waitblock 159.8/usm_write 88.5/readback 77.5/nk 3360 vs ON kernel
+164.3/submit 183.6/waitblock 160.2/usm_write 93.4/readback 80.8/
+nk 3424): identical everywhere, yet wall +475ms — the cost is
+UNPROFILED submits (profile_note_launch only counts themed kernels)
+plus host-side serialization the buckets never see. Structural causes:
+(1) the hook re-runs the FULL per-tile GEMM set the full path already
+runs (no compute is skipped — the saving is only the vocab D2H), so
+submit count can only grow; (2) 4 blocking waits per tile per token
+(`for(auto& e : evts) e.wait()` — GEMM, argmax, 2x partial-D2H) where
+the full path waits once per wave; (3) the argmax tile kernel is one
+WI scanning 62K cols serially (lm_head_argmax_tile_kernel, 1 global
+id per row, fp16-convert loop) — no subgroup parallelism. Saved: one
+0.5MB vocab D2H (~0.25ms) + host scan. Spent: +64 launches/token,
++4 waits/tile/token, serial scan. Net -43%. Redemption would need a
+redesign (fused GEMM+argmax single kernel, no GEMM re-run, one wait)
+— a session-scale build with the TP2/poison fences still standing.
+Stays default-off; stream-identity certification stands (gates PASS).
