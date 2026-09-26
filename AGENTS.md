@@ -562,13 +562,18 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (ON) + serve_27b_18412 (OFF)): single-entry last-completed-request
   snapshot (grid K=16, lowest-4+highest-12, INTFER_NO_PREFIX_CACHE=1
   kill switch, INTFER_LOAD_ORACLE override for non-0.8B serve-load
-  oracle). REPRODUCED 5 consecutive sessions. Latest ON (box load
-  ~9.2, warmed): t0 TTFT 3.7s/E2E 8.1s, t1 3.9s/23.4s pchit=16
-  (prompt=54), t2 4.8s/28.0s pchit=48 (prompt=100). OFF (load 1.1,
-  zero pchit, all 3 turns parity OK bit-exact, rc=0): t0 3.7s/8.1s,
-  t1 4.8s/28.5s, t2 8.0s/42.9s. Delta t1 -0.9s (-19%), t2 -3.2s
-  (-40%); prior sessions -1.0s/-3.3s, -1.0s/-3.2s, -0.9s/-3.1s,
-  -1.0s/-3.1s (stable direction, ~0.1-0.2s variance). use=16/48 are
+  oracle). REPRODUCED 6 consecutive sessions. Quiet-box A/B (BOTH
+  sides load ~1.1, 27B TP=2, logs serve_27b_18413 ON +
+  serve_27b_18412 OFF, parity chat_quiet_on2.txt == chat_quiet_on.txt
+  bit-identical): ON t0 TTFT 3.6s/E2E 8.0s, t1 3.9s/23.6s pchit=16
+  (prompt=54), t2 4.8s/28.1s pchit=48 (prompt=100). OFF (zero pchit,
+  all 3 turns parity OK, rc=0): t0 3.7s/8.1s, t1 4.8s/28.5s, t2
+  8.0s/42.9s. Delta t1 -0.9s (-19%), t2 -3.2s (-40%); all 6
+  sessions agree within ~0.1-0.2s. The earlier loaded ON run (load
+  ~9.2: t0 3.7/8.1, t1 3.9/23.4, t2 4.8/28.0) matches the quiet ON
+  to ~0.1s — load inflates absolutes far less than feared on the
+  cache-hit path. Quiet-box debt PAID (both sides); numbers above
+  are quotable. use=16/48 are
   K=16 grid multiples, use=48 on prompt=100 proves mid-stream snaps
   survive retention (full-stream-only would decline). Sr_old-4 chat
   divergence absorbed by largest-grid-pos<=hit. q.fill=use ->
@@ -586,9 +591,6 @@ Implement features for maximizing throughput for concurrent requests, starting f
   gate now has INTFER_LOAD_ORACLE override (249d3f8) for non-0.8B
   models — c8.parity byte-identical stays the real determinism gate.
   Cache fires under concurrency (pchit=16 at admit with pq=8).
-  CAVEAT: ON side ran at load ~9.2 (quiet window closed mid-run);
-  OFF at 1.1 is the cleanest baseline yet. Direction is structural
-  (5 sessions agree); clean quiet-ON absolute numbers still owed.
 
 
 # guidelines
