@@ -557,34 +557,38 @@ Implement features for maximizing throughput for concurrent requests, starting f
   win must come from fewer syncs, not a faster submit),
   device-side SSM/attention (host O(pos) attention dominates long ctx).
 - Prefix-cache TTFT verdict (2026-09-26, ec86808, 27B TP=2 serve,
-  bench_chat.sh --turns 3 --max-tokens 30, outputs in
-  /var/home/fra/build_tmp/chat_{on,off}_run.txt): single-entry
-  last-completed-request snapshot (grid K=16, lowest-4+highest-12,
-  INTFER_NO_PREFIX_CACHE=1 kill switch). REPRODUCED 3 consecutive
-  sessions. Latest ON (load ~3.7): t0 TTFT 3.7s, t1 4.0s pchit=16
-  (prompt=54), t2 4.9s pchit=48 (prompt=100). OFF (load ~4.7, zero
-  pchit, all 3 turns parity OK bit-exact): t0 3.7s, t1 4.9s, t2
-  8.0s. Delta t1 -0.9s (-18%), t2 -3.1s (-39%); prior sessions
-  -1.0s/-3.3s and -1.0s/-3.2s (stable direction, ~0.1-0.2s
-  variance). use=16/48 are K=16 grid multiples, use=48 on
-  prompt=100 proves mid-stream snaps survive retention
-  (full-stream-only would decline). Sr_old-4 chat divergence
-  absorbed by largest-grid-pos<=hit. q.fill=use ->
+  bench_chat.sh --turns 3 --max-tokens 30, parity in
+  /var/home/fra/build_tmp/chat_quiet_on.txt; logs serve_27b_18411
+  (ON) + serve_27b_18412 (OFF)): single-entry last-completed-request
+  snapshot (grid K=16, lowest-4+highest-12, INTFER_NO_PREFIX_CACHE=1
+  kill switch, INTFER_LOAD_ORACLE override for non-0.8B serve-load
+  oracle). REPRODUCED 5 consecutive sessions. Latest ON (box load
+  ~9.2, warmed): t0 TTFT 3.7s/E2E 8.1s, t1 3.9s/23.4s pchit=16
+  (prompt=54), t2 4.8s/28.0s pchit=48 (prompt=100). OFF (load 1.1,
+  zero pchit, all 3 turns parity OK bit-exact, rc=0): t0 3.7s/8.1s,
+  t1 4.8s/28.5s, t2 8.0s/42.9s. Delta t1 -0.9s (-19%), t2 -3.2s
+  (-40%); prior sessions -1.0s/-3.3s, -1.0s/-3.2s, -0.9s/-3.1s,
+  -1.0s/-3.1s (stable direction, ~0.1-0.2s variance). use=16/48 are
+  K=16 grid multiples, use=48 on prompt=100 proves mid-stream snaps
+  survive retention (full-stream-only would decline). Sr_old-4 chat
+  divergence absorbed by largest-grid-pos<=hit. q.fill=use ->
   P=min(chunk_M,Sr-fill) structurally skips `use` prefill rows.
-  Memory: ~159MB/snap x 16 grid-max ~= 2.5GB host max (+KV mirrors),
-  CONSTANT single-entry bound (code-bound: harvest caps grid at 16
-  incl. completion-top; cap unstressed at <=100tok prompts; no
-  multi-entry LRU). Serve-load cache-ON (27B, load ~8, MT=8 sweep +
-  MT=64 probe): c1/c4/c8 completion + c8 parity + floor + bigmt all
-  PASS (c1 1.84 -> c8 1.59 tok/s MT=8 prefill-dominated as expected;
-  MT=64 probe 2.45 tok/s over 346 ctoks); solo.oracle FAIL is a
-  pre-existing harness artifact (oracle hardcodes 0.8B text, server
-  runs 27B — c8.parity byte-identical is the real determinism gate).
+  Divergence-hunt CLOSED same session: claimed HIT/MISS divergence
+  does NOT reproduce on clean tree (install() copies bit-exact,
+  10/10 + 12/12 identical outputs; earlier "alternation" was a probe
+  history bug). Memory: ~159MB/snap x 16 grid-max ~= 2.5GB host max
+  (+KV mirrors), CONSTANT single-entry bound (code-bound: harvest
+  caps grid at 16 incl. completion-top; cap unstressed at <=100tok
+  prompts; no multi-entry LRU). Serve-load cache-ON (27B, load ~8,
+  MT=8 sweep + MT=64 probe): c1/c4/c8 completion + c8 parity + floor
+  + bigmt all PASS (c1 1.84 -> c8 1.59 tok/s MT=8 prefill-dominated
+  as expected; MT=64 probe 2.45 tok/s over 346 ctoks); solo.oracle
+  gate now has INTFER_LOAD_ORACLE override (249d3f8) for non-0.8B
+  models — c8.parity byte-identical stays the real determinism gate.
   Cache fires under concurrency (pchit=16 at admit with pq=8).
-  CAVEAT: box load 3.6-4.7
-  all runs — absolute TTFTs load-inflated; quiet-box (load1<2)
-  re-run still owed for clean numbers, but 3-session reproduction
-  bounds the claim.
+  CAVEAT: ON side ran at load ~9.2 (quiet window closed mid-run);
+  OFF at 1.1 is the cleanest baseline yet. Direction is structural
+  (5 sessions agree); clean quiet-ON absolute numbers still owed.
 
 
 # guidelines
