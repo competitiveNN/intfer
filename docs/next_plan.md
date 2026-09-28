@@ -1,7 +1,9 @@
-# Next plan: from ~27 tok/s TP1 toward 40 tok/s (0.8B decode)
+# Next plan: 27B decode on 2x B580 TP=2 (was: 0.8B TP1)
 
 Date: 2026-09-26. HEAD `34d3c54` (argmax 27B no-op check; prefix-cache
 quiet-box complete; argmax scalar wall-time = measured loss).
+UPDATE 2026-09-28: focus is 27B TP=2 decode (ceiling ~2.8 tok/s, TAB
+promoted e0e6e84). 0.8B TP1 ~27 tok/s numbers below are legacy reference.
 Box contended (load ~19) — wall-time A/B gated on quiet box (load1<2).
 Load-insensitive work (stream-identity + code) can proceed now.
 
@@ -54,15 +56,34 @@ fused MLP (gate/up -> down) and L4 (norm -> la_out) both use it.
 ## 4. Ranked next steps
 
 ### Step 1 — Extend the device-act seam to remaining GEMM round-trips
-Highest value, load-insensitive (stream-gated). For each GEMM whose output
-feeds only the next GEMM's input with no host math between, keep it
-device-resident via the existing `run_linear_tp_devact` seam (no new
-launches added — unlike L5). Candidates to audit: qkv/z/b/a GEMM outputs
-on the LA path, gate/up outputs on the non-fused (TP2/DPAS48) paths,
-lm_head input (final-norm out -> head GEMM).
-Deliverable: ranked seam-extension list with per-seam launch-count deltas
-(nk/nw/nr), then implement top seam behind a default-off env flag,
-stream-gated base==flag on TP1/TP2.
+AUDIT DONE 2026-09-28 (this box, 27B TP=2 decode, TAB-on ceiling 2.82
+tok/s = 354ms/token: kernel 253 / submit 93 / waitblock 128 /
+transfers ~92ms; nk/nw/nr 63488/63488/16384 per 65 toks = 977/977/252
+per token). Per-token GEMM inventory: 16 full layers x (qkv-wave-3 as
+1 wave + k/v + q seq + o) + 48 LA layers x (qkv/z/b/a wave-4 + la_out)
++ 64 MLP x (gate/up wave + down) + 1 batched lm_head. TP split is
+N-sharded (engine.cpp:420 `split(t.N)`), so gate/up/down outputs are
+N/2 per device and all existing fusion (run_mlp_fused, L4, L5) is
+TP=1-only — every one DECLINES on 27B (TP=2-only viable).
+Ranked TP=2-viable candidates:
+1. TP=2 fused MLP (WINNER — implement next): replicate gate/up FULL-N
+on both devices (measured 27B shard kernel: gate 1109 + up 1518us;
+full-N ~2.2/3.0ms x2 devices), silu-mul via certified silumul_to_half,
+down takes full-inter K input per device (row-split N/2: NO cross-talk,
+no all-gather). Saves per MLP layer x64: 2 D2H (gate/up halves) + host
+silu-mul + convert + H2D + 1 wait; costs 2x gate/up kernel compute.
+Kernel budget check: +2.6ms x64 = +169ms compute vs removed
+waitblock+transfers (MLP-weighted share of 220ms). Wall-time decides
+(quiet box); stream-gate first. Design: Engine::run_mlp_fused_tp2,
+flag INTFER_TP2_FUSE=1 default-off, decline -> wave+host path.
+2. lm_head input seam: 1 convert+H2D saved of 977 launches — negligible
+alone; bundle only if #1 needs a second seam for its wait collapse.
+3. LA wave-4 -> conv FIR: conv stays host scalar (10240x4 taps); a device
+prep kernel saves 1 D2H of 48 (qkv only; z/b/a stay host) — weak, skip.
+4. Cross-layer wait collapsing: blocked behind #1 (needs device-resident
+chains first).
+Deliverable: #1 behind default-off env flag, stream-gated base==flag
+on TP1/TP2 (+ cpu parity + gpu-optin + http batch), then quiet-box A/B.
 
 ### Step 2 — Reduce sync count (not submit cost)
 Wave grouping (convert+submit back-to-back, one wait per wave) is done.
