@@ -66,24 +66,35 @@ N-sharded (engine.cpp:420 `split(t.N)`), so gate/up/down outputs are
 N/2 per device and all existing fusion (run_mlp_fused, L4, L5) is
 TP=1-only — every one DECLINES on 27B (TP=2-only viable).
 Ranked TP=2-viable candidates:
-1. TP=2 fused MLP (WINNER — implement next): replicate gate/up FULL-N
-on both devices (measured 27B shard kernel: gate 1109 + up 1518us;
-full-N ~2.2/3.0ms x2 devices), silu-mul via certified silumul_to_half,
-down takes full-inter K input per device (row-split N/2: NO cross-talk,
-no all-gather). Saves per MLP layer x64: 2 D2H (gate/up halves) + host
-silu-mul + convert + H2D + 1 wait; costs 2x gate/up kernel compute.
-Kernel budget check: +2.6ms x64 = +169ms compute vs removed
-waitblock+transfers (MLP-weighted share of 220ms). Wall-time decides
-(quiet box); stream-gate first. Design: Engine::run_mlp_fused_tp2,
-flag INTFER_TP2_FUSE=1 default-off, decline -> wave+host path.
+1. TP=2 fused MLP (OVERTURNED 2026-09-28 — DECLINE, measured VRAM
+arithmetic, load-insensitive): full-N gate/up replication needs the peer
+N/2 halves resident per device: gate half 14.45MB (INT2, code 22.28MB
+full) + up half 16.9MB (INT4, code 44.56MB full) = ~31MB/layer x64 =
+~2.0GB extra per device (parsed from Qwen3.8-27B-int2.intifer JSON
+metadata: gate N=17408 K=5120 INT2 g16, up N=17408 K=5120 INT4 g64,
+down N=5120 K=17408 INT2 g16; total weights 19.504GB = 9.75GB/dev
+N-split). Steady-state occupancy is ALREADY 11.27/10.94GB of 12GB
+(AGENTS.md first-touch note) — 9.75+2.0 = 11.75GB = 98% before
+workspaces/KV/transients. Variants also dead: on-demand peer staging =
+~31MB H2D x64 = 2GB/token transfers vs ~92ms budget; down K-split
+needs P2P partial-sum machinery (new invention, not a seam extension).
+The down row-split N/2 needs no cross-talk, but the gate/up weights to
+feed it do not fit. Do NOT implement as scoped.
 2. lm_head input seam: 1 convert+H2D saved of 977 launches — negligible
 alone; bundle only if #1 needs a second seam for its wait collapse.
 3. LA wave-4 -> conv FIR: conv stays host scalar (10240x4 taps); a device
 prep kernel saves 1 D2H of 48 (qkv only; z/b/a stay host) — weak, skip.
 4. Cross-layer wait collapsing: blocked behind #1 (needs device-resident
 chains first).
-Deliverable: #1 behind default-off env flag, stream-gated base==flag
-on TP1/TP2 (+ cpu parity + gpu-optin + http batch), then quiet-box A/B.
+Deliverable: Step 1 has NO implementable seam on 27B TP=2 (all four
+candidates declined by measurement: #1 VRAM above, #2 negligible, #3
+weak, #4 blocked behind #1). The device-act seam family is EXHAUSTED on
+this hardware for the 27B — remaining paths are session-scale new
+machinery (XMX DPAS kernel rewrite + device act-quant; P2P reduction)
+or serve batching (Step 3, the documented 40 tok/s path, quiet box).
+Per-role 27B VRAM table (parsed 2026-09-28, keep for future budgeting):
+QKV 5.03 / Z 3.02 / OUT 3.02 / DOWN 2.10 / UP 2.16 / GATE 1.85 /
+ATTN_Q 0.50 / O 0.25 / K 0.17 / V 0.08 / EMBED+LM_HEAD 0.64 each GB.
 
 ### Step 2 — Reduce sync count (not submit cost)
 Wave grouping (convert+submit back-to-back, one wait per wave) is done.
