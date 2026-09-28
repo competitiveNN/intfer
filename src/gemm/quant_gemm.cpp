@@ -16,6 +16,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <sycl/sycl.hpp>
 
 #include <vector>
@@ -391,6 +392,10 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       const int num_groups = (static_cast<int>(K) + Gw - 1) / Gw;
       const bool is_int8 = (bits >= 8);
       const int pack = is_int8 ? 1 : 8 / bits;
+      // Host-side flag read (captured by value into the kernel below;
+      // getenv/static are illegal inside device code).
+      const bool use_int2_tab =
+          (std::getenv("INTFER_INT2_TAB") != nullptr);
       return q.submit([&](sycl::handler& h) {
         h.depends_on(copy_dep);
         h.parallel_for<class gemm_usm_decode1_vec>(
@@ -443,6 +448,48 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                   const std::size_t row_base =
                       static_cast<std::size_t>(ng) * K;
                   const int shr = (bits == 4) ? 1 : 2;  // j -> byte index
+                  // INT2 table-hoist fast path (INTFER_INT2_TAB=1): fold the
+                  // per-group scale into a 4-entry register weight table so
+                  // the inner element costs one table lookup + one FMA
+                  // instead of canon_value (branch + static-table load) plus
+                  // two scale multiplies. Op order changes from
+                  // (av*scale)*c2 to av*(scale*c2): ~1ulp on rare elements,
+                  // oracle-gated (same standing as the silu-exp precedent).
+                  // INT4 keeps the generic path (linear formula vectorizes).
+                  // (use_int2_tab is a host-read flag captured by value.)
+                  if (use_int2_tab && bits == 2) {
+                    const float wtab[4] = {
+                        scale * -1.0f, scale * (-1.0f / 3.0f),
+                        scale * (1.0f / 3.0f), scale * 1.0f};
+                    int kg = kg0;
+                    std::size_t b0 =
+                        (row_base + (std::size_t)kg) / (std::size_t)pack;
+                    for (; kg + codes_per_chunk <= kg1;
+                         kg += codes_per_chunk) {
+                      sycl::vec<std::uint16_t, 8> a16;
+                      a16.load(0, act_mp + kg);
+                      const std::uint8_t b0v = code_u8[b0];
+                      const std::uint8_t b1v = code_u8[b0 + 1];
+                      b0 += 2;
+                      for (int j = 0; j < codes_per_chunk; ++j) {
+                        const float av = static_cast<float>(
+                            sycl::bit_cast<sycl::half>(a16[j]));
+                        const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                        const int code =
+                            (bv >> ((j & 3) * 2)) & 3;
+                        acc += av * wtab[code];
+                      }
+                    }
+                    for (; kg < kg1; ++kg) {
+                      const float av = from_half_bits(act_usm[kg]);
+                      const std::size_t idx = row_base + kg;
+                      const std::uint8_t byte = code_u8[idx / pack];
+                      const int within = (int)(idx % pack);
+                      const int code =
+                          (byte >> (within * bits)) & ((1 << bits) - 1);
+                      acc += av * scale * canon_value(bits, code);
+                    }
+                  } else {
                   int kg = kg0;
                   std::size_t b0 =
                       (row_base + (std::size_t)kg) / (std::size_t)pack;
@@ -472,6 +519,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                         (byte >> (within * bits)) & ((1 << bits) - 1);
                     acc += av * scale * canon_value(bits, code);
                   }
+                  }  // end generic packed path (non-INT2-tab)
                 }
               }
               out_usm[ng] = to_half_bits(acc);
