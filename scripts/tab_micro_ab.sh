@@ -13,8 +13,9 @@ for r in $(seq 1 "$ROUNDS"); do
   if [ $((r % 2)) -eq 1 ]; then order="BASE TAB"; else order="TAB BASE"; fi
   for mode in $order; do
     echo "===== round $r mode=$mode ====="
-    if [ "$mode" = TAB ]; then export INTFER_INT2_TAB=1; else unset INTFER_INT2_TAB; fi
+    # TAB is default-ON (promoted 2026-09-28); BASE leg opts out.
+    if [ "$mode" = BASE ]; then export INTFER_NO_INT2_TAB=1; else unset INTFER_NO_INT2_TAB; fi
     "$BIN" "$MODEL" "$TENSOR" "$REPS" 2>&1 | grep -aE 'tensor|steady/call|steady2/call|y\[0'
   done
 done
-unset INTFER_INT2_TAB
+unset INTFER_NO_INT2_TAB

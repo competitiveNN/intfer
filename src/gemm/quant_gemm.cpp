@@ -392,10 +392,10 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       const int num_groups = (static_cast<int>(K) + Gw - 1) / Gw;
       const bool is_int8 = (bits >= 8);
       const int pack = is_int8 ? 1 : 8 / bits;
-      // Host-side flag read (captured by value into the kernel below;
-      // getenv/static are illegal inside device code).
+      // Kill switch INTFER_NO_INT2_TAB=1 restores the generic path
+      // (bisection). Host-side read; getenv/static are illegal in device.
       const bool use_int2_tab =
-          (std::getenv("INTFER_INT2_TAB") != nullptr);
+          (std::getenv("INTFER_NO_INT2_TAB") == nullptr);
       return q.submit([&](sycl::handler& h) {
         h.depends_on(copy_dep);
         h.parallel_for<class gemm_usm_decode1_vec>(
@@ -448,7 +448,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                   const std::size_t row_base =
                       static_cast<std::size_t>(ng) * K;
                   const int shr = (bits == 4) ? 1 : 2;  // j -> byte index
-                  // INT2 table-hoist fast path (INTFER_INT2_TAB=1): fold the
+                  // INT2 table-hoist path (default ON; kill switch
+                  // INTFER_NO_INT2_TAB=1): fold the
                   // per-group scale into a 4-entry register weight table so
                   // the inner element costs one table lookup + one FMA
                   // instead of canon_value (branch + static-table load) plus
@@ -457,6 +458,11 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                   // oracle-gated (same standing as the silu-exp precedent).
                   // INT4 keeps the generic path (linear formula vectorizes).
                   // (use_int2_tab is a host-read flag captured by value.)
+                  // PROMOTED 2026-09-28 (was INTFER_INT2_TAB opt-in, 4917d8f):
+                  // quiet-box 27B TP=2 decode 3 rounds +5.7/+6.0/+5.2%
+                  // (2.63->2.78, 2.67->2.83, 2.68->2.82 tok/s), kernel bucket
+                  // (load-immune) -12.8%, streams identical TP1/TP2,
+                  // cpu parity + http batch + gpu-optin 10/10 PASS.
                   if (use_int2_tab && bits == 2) {
                     const float wtab[4] = {
                         scale * -1.0f, scale * (-1.0f / 3.0f),
