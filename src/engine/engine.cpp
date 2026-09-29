@@ -54,6 +54,13 @@ Engine::~Engine() {
     if (ws_[d].out) sycl::free(ws_[d].out, devices_[d].queue);
     ws_[d].act = nullptr; ws_[d].out = nullptr;
   }
+  // Free the DPAS act workspaces (3 live allocs per device max).
+  for (size_t d = 0; d < ws48_.size() && d < devices_.size(); ++d) {
+    if (ws48_[d].act) sycl::free(ws48_[d].act, devices_[d].queue);
+    if (ws48_[d].as) sycl::free(ws48_[d].as, devices_[d].queue);
+    if (ws48_[d].f32) sycl::free(ws48_[d].f32, devices_[d].queue);
+    ws48_[d].act = nullptr; ws48_[d].as = nullptr; ws48_[d].f32 = nullptr;
+  }
   // Free the wave workspaces (2*W live allocs per device max).
   for (size_t i = 0; i < wv_.size(); ++i) {
     const size_t dd = wv_W_ > 0 ? i / wv_W_ : 0;
@@ -165,6 +172,16 @@ bool dpas48_eligible(QuantScheme scheme, uint32_t group_size,
 // getenv/static are illegal in device code, so the flag is read once.
 bool dpas_row_enabled() {
   const char* env = std::getenv("INTFER_DPAS_ROW");
+  static const bool enabled = (env && env[0] == '1' && env[1] == '\0');
+  return enabled;
+}
+
+// Device act-quant pre-pass opt-in (default OFF). Host-side read, same
+// getenv/static rule as dpas_row_enabled(). The pre-pass is bit-exact (same
+// GA64 HalfAway contract as dashq::act_quant_ga64_batch) — it moves the
+// quant from host to device, it does not change the arithmetic.
+bool dpas_preq_enabled() {
+  const char* env = std::getenv("INTFER_DPAS_PREQ");
   static const bool enabled = (env && env[0] == '1' && env[1] == '\0');
   return enabled;
 }
@@ -623,19 +640,22 @@ void Engine::ensure_workspace48(uint32_t M, uint32_t K) {
   const uint32_t nGA = (K + GA - 1) / GA;
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto& w = ws48_[d];
-    if (w.act && w.as && M <= w.M && K <= w.K && nGA <= w.nGA) continue;
+    if (w.act && w.as && w.f32 && M <= w.M && K <= w.K && nGA <= w.nGA) continue;
     devices_[d].queue.wait();
     uint32_t nM = std::max(M, w.M);
     uint32_t nK = std::max(K, w.K);
     uint32_t nnGA = std::max(nGA, w.nGA);
     if (w.act) { sycl::free(w.act, devices_[d].queue); w.act = nullptr; }
     if (w.as) { sycl::free(w.as, devices_[d].queue); w.as = nullptr; }
+    if (w.f32) { sycl::free(w.f32, devices_[d].queue); w.f32 = nullptr; }
     auto& dev = devices_[d];
     w.act = static_cast<std::int8_t*>(sycl::malloc_shared(
         (size_t)nM * nK, dev.sycl_device, dev.sycl_context));
     w.as = static_cast<float*>(sycl::malloc_shared(
         (size_t)nM * nnGA * sizeof(float), dev.sycl_device, dev.sycl_context));
-    if (!w.act || !w.as) {
+    w.f32 = static_cast<float*>(sycl::malloc_shared(
+        (size_t)nM * nK * sizeof(float), dev.sycl_device, dev.sycl_context));
+    if (!w.act || !w.as || !w.f32) {
       std::fprintf(stderr,
                    "[intfer] FATAL: workspace48 alloc failed on device %zu "
                    "(M=%u K=%u nGA=%u)\n", d, nM, nK, nnGA);
@@ -870,10 +890,46 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
   const int bits = (sc.scheme == gemm::WeightScheme::INT2)    ? 2
                    : (sc.scheme == gemm::WeightScheme::INT4)  ? 4
                                                               : 8;
-  // 1) Fused act quant on the host: per (row, GA-slice) max-abs scale.
+  const uint32_t Gw = (sc.group_size == 0) ? K : sc.group_size;
+  // EXPERIMENTAL row-cooperative geometry (default-off INTFER_DPAS_ROW=1;
+  // measured ~460x slower — experiment base only). Eligible: INT4/G64.
+  const bool use_row = dpas_row_enabled() && bits == 4 && Gw == 64;
+  // Device act-quant pre-pass (INTFER_DPAS_PREQ=1, default OFF): per device
+  // one FP32 H2D + one GA64 quant kernel, dep-chained into that rank's DPAS
+  // launch. Kills the host quant loop and adds no host wait. Per device
+  // (NOT one launch for both): each rank owns its sycl::context, so a kernel
+  // cannot legally write the other rank's malloc_shared buffer.
+  bool preq_ok = dpas_preq_enabled() && !use_row;
+  for (size_t d = 0; d < devices_.size() && preq_ok; ++d)
+    preq_ok = ws48_[d].f32 && ws48_[d].act && ws48_[d].as;
+
+  // 1) Activation quant into ws48_ (per row, per GA-slice max-abs scale).
+  //    Device pre-pass first; on ANY decline fall through to the host loop,
+  //    which rewrites every device's rows — never partial work.
+  std::vector<sycl::event> preq_events;
 #ifdef INTFER_PROFILE_GPU
   auto t_copy0 = std::chrono::high_resolution_clock::now();
 #endif
+  if (preq_ok) {
+    preq_events.resize(devices_.size());
+    for (size_t d = 0; d < devices_.size(); ++d) {
+      sycl::queue& q = devices_[d].queue;
+      float* xd = ws48_[d].f32;
+      if (xd != x.data())
+        q.memcpy(xd, x.data(), (size_t)M * K * sizeof(float));
+      gemm::ActQuantDevParams ap;
+      ap.x_f32 = xd;
+      ap.q_out = ws48_[d].act;
+      ap.s_out = ws48_[d].as;
+      ap.M = M;
+      ap.K = K;
+      ap.Kstride = ws48_[d].K;
+      ap.nGAstride = ws48_[d].nGA;
+      preq_events[d] = gemm::act_quant_ga64_dev(q, ap);
+      if (preq_events[d] == sycl::event{}) preq_ok = false;
+    }
+  }
+  if (!preq_ok) {
   for (uint32_t m = 0; m < M; ++m) {
     const float* xr = x.data() + (size_t)m * K;
     // Vectorized GA=64 quant into HOST staging (bit-exact vs the old scalar
@@ -897,6 +953,7 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
                   (size_t)nGA * sizeof(float));
     }
   }
+  }
 #ifdef INTFER_PROFILE_GPU
   {
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -907,10 +964,6 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
 
   // 2) Launch per device.
   float alpha = sc.has_global_divisor ? sc.global_host : 1.0f;
-  // EXPERIMENTAL row-cooperative geometry (default-off INTFER_DPAS_ROW=1;
-  // measured ~460x slower — experiment base only). Eligible: INT4/G64.
-  const uint32_t Gw = (sc.group_size == 0) ? K : sc.group_size;
-  const bool use_row = dpas_row_enabled() && bits == 4 && Gw == 64;
   std::vector<sycl::event> kernel_events;
   kernel_events.reserve(devices_.size());
   for (size_t d = 0; d < devices_.size(); ++d) {
@@ -933,12 +986,14 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
     p.bits = bits;
     p.act_stride = ws48_[d].K;
     p.as_stride = ws48_[d].nGA;
+    sycl::event dep = preq_ok ? preq_events[d] : sycl::event{};
 #ifdef INTFER_PROFILE_GPU
     auto t_s0 = std::chrono::high_resolution_clock::now();
 #endif
-    sycl::event kernel_evt = use_row ? gemm::quant_gemm_dpas4_row(q, p)
-                                     : gemm::quant_gemm_dpas48(q, p);
-    if (kernel_evt == sycl::event{}) kernel_evt = gemm::quant_gemm_dpas48(q, p);
+    sycl::event kernel_evt = use_row ? gemm::quant_gemm_dpas4_row(q, p, dep)
+                                     : gemm::quant_gemm_dpas48(q, p, dep);
+    if (kernel_evt == sycl::event{})
+      kernel_evt = gemm::quant_gemm_dpas48(q, p, dep);
     kernel_events.push_back(kernel_evt);
 #ifdef INTFER_PROFILE_GPU
     {

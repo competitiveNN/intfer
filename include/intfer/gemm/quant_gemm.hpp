@@ -224,9 +224,13 @@ struct Dpas48Params {
   // are grow-only, so a call's K/nGA can be SMALLER than the workspace
   // dims: rows must be addressed by workspace stride, not call shape
   // (M=1 never noticed; M>1 read garbage scales/acts for rows >= 1).
-  uint32_t act_stride = 0;          // 0 => K (tight); else workspace K
-  uint32_t as_stride = 0;           // 0 => nGA; else workspace nGA
+  uint32_t act_stride = 0;  // 0 => K (tight); else workspace K
+  uint32_t as_stride = 0;   // 0 => nGA; else workspace nGA
 };
+// NOTE: the device act-quant pre-pass dependency is NOT a Dpas48Params
+// member — the struct is captured BY VALUE into the kernel lambda, and
+// sycl::event is not device-copyable. It is a separate trailing parameter
+// instead (default {} = no dependency).
 
 // Host-side repack: row-major packed codes (n*K+k indices) -> DPAS vertical
 // B tiles. out size = (N/16) * (K/opK) * (opK*16*b/8) bytes; opK=32.
@@ -234,8 +238,34 @@ struct Dpas48Params {
 bool repack_dpas412(const std::uint8_t* row_codes, uint32_t N, uint32_t K,
                     int bits, std::vector<std::uint8_t>& out);
 
-// M=1 W4A8/W2A8 decode kernel. Returns the kernel event.
-sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p);
+// M=1 W4A8/W2A8 decode kernel. Returns the kernel event. `dep` is an
+// optional prerequisite (INTFER_DPAS_PREQ=1 passes the act-quant pre-pass
+// event); default {} means the act buffers are already host-staged.
+sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
+                              sycl::event dep = sycl::event{});
+
+// Device-side GA64 activation quant pre-pass (INTFER_DPAS_PREQ=1).
+// Mirrors dashq::act_quant_ga64_batch(HalfAway) bit-exactly: per-64-slice
+// max-abs (floor 1e-6), s=mx/127, inv=1/s, clamp(x*inv, +-127),
+// half-away-from-zero. One WI per (row, slice): each element is quanted and
+// stored ONCE — the fused-quant failure mode replicated the O(K) quant work
+// nT x, once per 16-N tile. Plain SYCL (no ESIMD: scalar FP32 + select
+// only), so the arithmetic is plain IEEE-754 FP32 exactly like the host
+// scalar loop. The caller dep-chains the DPAS launch on the returned event
+// (Dpas48Params::dep), so the pre-pass costs no extra host wait.
+//
+// ONE LAUNCH PER DEVICE, never one for both ranks: every rank has its own
+// sycl::context (device_manager.cpp), so a kernel on rank 0's queue cannot
+// legally write rank 1's malloc_shared buffer.
+struct ActQuantDevParams {
+  const float* x_f32 = nullptr;      // M*K FP32 rows (device USM, H2D'd)
+  std::int8_t* q_out = nullptr;      // M*Ks INT8 out (row stride Ks)
+  float* s_out = nullptr;            // M*Ss FP32 act scales (row stride Ss)
+  uint32_t M = 0, K = 0;
+  uint32_t Kstride = 0;              // workspace K (row stride, elements)
+  uint32_t nGAstride = 0;            // workspace nGA (row stride)
+};
+sycl::event act_quant_ga64_dev(sycl::queue& q, const ActQuantDevParams& p);
 
 // Row-cooperative INT4/G64 DPAS (EXPERIMENTAL, SLOWER — see .cpp note).
 // Same Dpas48Params contract as quant_gemm_dpas48; one WI per row loops
@@ -243,7 +273,8 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p);
 // (occupancy collapse). Default-off INTFER_DPAS_ROW=1 opts in; declines
 // (null event) unless bits==4 and weight group==64. Experiment base for
 // subgroup-cooperative sharing only — do NOT promote without a quiet A/B.
-sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p);
+sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
+                                sycl::event dep = sycl::event{});
 
 // ---------------------------------------------------------------------------
 // FP16-act-equivalent s8-weight DPAS GEMM for the VRAM-resident lm_head.

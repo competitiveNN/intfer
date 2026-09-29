@@ -919,7 +919,66 @@ bool repack_dpas412(const std::uint8_t* row_codes, uint32_t N, uint32_t K,
   return true;
 }
 
-sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p) {
+// Device-side GA64 act-quant pre-pass (see header for bit-contract).
+sycl::event act_quant_ga64_dev(sycl::queue& q, const ActQuantDevParams& p) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
+  constexpr uint32_t GA = 64;
+  const uint32_t M = p.M, K = p.K;
+  if (M == 0 || K == 0 || !p.x_f32 || !p.q_out || !p.s_out)
+    return sycl::event{};
+  const uint32_t nGA = (K + GA - 1) / GA;
+  const uint32_t Ks = (p.Kstride == 0) ? K : p.Kstride;
+  const uint32_t Ss = (p.nGAstride == 0) ? nGA : p.nGAstride;
+  const uint32_t nWG = 32;
+  const uint32_t n_blocks = M * nGA;
+  const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
+  const float* X = p.x_f32;
+  std::int8_t* Q0 = p.q_out;
+  float* S0 = p.s_out;
+  return q.submit([&](sycl::handler& h) {
+    h.parallel_for<class act_quant_ga64_dev_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) {
+          const uint32_t b = it.get_global_id(0);
+          if (b >= n_blocks) return;
+          const uint32_t m = b / nGA;
+          const uint32_t g = b % nGA;
+          const uint32_t k0 = g * GA;
+          uint32_t k1 = k0 + GA;
+          if (k1 > K) k1 = K;
+          const float* xr = X + (size_t)m * K;
+          float mx = 1e-6f;
+          for (uint32_t k = k0; k < k1; ++k) {
+            float v = xr[k] >= 0 ? xr[k] : -xr[k];
+            if (v > mx) mx = v;
+          }
+          const float s = mx / 127.0f;
+          const float inv = 1.0f / s;
+          // Row-strided workspace write; each element is quanted ONCE and
+          // stored ONCE (the fused-quant failure mode replicated the O(K)
+          // quant work nT x, once per 16-N tile).
+          std::int8_t* qo = Q0 + (size_t)m * Ks + k0;
+          for (uint32_t k = k0; k < k1; ++k) {
+            float v = xr[k] * inv;
+            if (v > 127.0f) v = 127.0f;
+            else if (v < -127.0f) v = -127.0f;
+            // Truncation of (v +- 0.5) IS half-away-from-zero: same result
+            // as the host std::lround and as the AVX2 path's
+            // (v + (sign|0.5)) followed by cvttps, for every |v| <= 127.
+            qo[k - k0] = (std::int8_t)(v >= 0 ? v + 0.5f : v - 0.5f);
+          }
+          S0[(size_t)m * Ss + g] = s;
+        });
+  });
+}
+
+sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
+                              sycl::event dep) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
   using namespace sycl::ext::intel::esimd;
   using namespace sycl::ext::intel::esimd::xmx;
   constexpr uint32_t TN = 16, OP = 32;
@@ -951,6 +1010,7 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p) {
   const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
 
   return q.submit([&](sycl::handler& h) {
+    if (dep != sycl::event{}) h.depends_on(dep);
     h.parallel_for<class gemm_dpas48_m1_kernel>(
         sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
         [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
@@ -1086,7 +1146,8 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p) {
 // Do NOT promote without a quiet-box A/B win. Declines (null event)
 // unless bits==4 and weight group==64.
 // ---------------------------------------------------------------------------
-sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p) {
+sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
+                                sycl::event dep) {
 #ifdef INTFER_PROFILE_GPU
   profile_note_launch();
 #endif
@@ -1111,7 +1172,8 @@ sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p) {
   const uint32_t global = ((M + nWG - 1) / nWG) * nWG;
 
   return q.submit([&](sycl::handler& h) {
-    h.parallel_for<class gemm_dpas4_row_kernel>(
+    if (dep != sycl::event{}) h.depends_on(dep);
+      h.parallel_for<class gemm_dpas4_row_kernel>(
         sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
         [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
           const uint32_t m = it.get_global_id(0);

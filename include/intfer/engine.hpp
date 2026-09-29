@@ -313,6 +313,12 @@ class Engine {
   struct Workspace48 {
     std::int8_t* act = nullptr;  // M * K INT8
     float* as = nullptr;         // M * nGA FP32 act scales (nGA = max over K)
+    // FP32 act landing zone for the device act-quant pre-pass
+    // (INTFER_DPAS_PREQ): per-device because every rank has its own
+    // sycl::context. The H2D is skipped when the caller's buffer already
+    // aliases this one (devact callers); with the current const-vector
+    // signature the copy is unconditional.
+    float* f32 = nullptr;        // M * K FP32
     uint32_t M = 0, K = 0, nGA = 0;
   };
   std::vector<Workspace48> ws48_;
