@@ -48,6 +48,20 @@ fused MLP (gate/up -> down) and L4 (norm -> la_out) both use it.
   la_conv_prep kernels retained for future fused kernels).
 - DPAS48 default-ON at any shape; device-side act-quant alone;
   standalone INTFER_SSM_GPU=1 (still -9%, default-off).
+- FP16 joint_matrix DPAS without weight repack (2026-09-29, compile+JIT
+  gated, tree reverted clean — do not retry as-is): probe-verified legal
+  combo m=1 n=64 k=32 fp16->fp32 exists on B580, and B=W^T as col_major
+  stride-K is offset-identical to the row-major shard (zero-copy in
+  theory). But the compiler lowers col_major fp16 B loads to the PACKED-VNNI
+  builtin (__builtin_spriv_OpJointMatrixLoadINTEL_PackedB_ColumnMajor_*),
+  which the BE does not implement (JIT link error, TK=32 AND TK=16).
+  Plain col_major fp16 has no legal load builtin — B MUST be VNNI-packed,
+  i.e. the same shard-build repack the 2026-09-08 ESIMD FP16-DPAS needed
+  (measured 1.1x, reverted: bandwidth-bound). joint_matrix without repack
+  is impossible on this BE, and with repack it re-proves the same ~1%
+  ceiling with more machinery. Second independent confirmation of the
+  FP16-leave-alone verdict. XMX work belongs on ALU-bound INT2/INT4
+  (2D-tiled DPAS rewrite + device act-quant, AGENTS.md recipe).
 - OpenVINO evaluated, NOT adopted (2026-09-18 spike): OV 2026.3 sees both
   B580s, but FP16 matmul M=361 2.6ms (~our EU kernel, no XMX unlock) and
   M=1 1.2ms vs our ~50us (20x worse, framework overhead). Native SYCL stays;
