@@ -108,6 +108,35 @@ Implement features for maximizing throughput for concurrent requests, starting f
   361tok capture = 180M INT8 slots; decode-only M=1 = 5.5M INT8 slots
   (~0.8M/token, consistent with vocab/16 tiles x K/32 ops). Layer GEMMs
   (99% of launches) remain EU/ALU, XMX idle there — that half stands.
+  DEVICE ACT-QUANT PRE-PASS (2026-09-29, 49b21d3, INTFER_DPAS_PREQ=1,
+  default-OFF): kills the host GA64 act-quant loop that made DPAS a net
+  +6% wall loss on 27B despite a -15% device-side kernel win (copy bucket
+  269us/GEMM + submit 127us). Quant moves to a standalone pre-pass kernel,
+  dep-chained into the DPAS launch (Dpas48Params::dep -> trailing
+  `sycl::event` PARAMETER, NOT a struct member) so it adds NO host wait.
+  Bit-exact vs dashq::act_quant_ga64_batch(HalfAway); plain SYCL (no
+  ESIMD) so FP32 arithmetic is IEEE-identical to the host scalar loop.
+  TWO STRUCTURAL CORRECTIONS vs the initial draft: (1) one launch PER
+  DEVICE, never one for both ranks — each rank owns its own
+  sycl::context (device_manager.cpp), so a kernel on rank 0's queue
+  cannot legally write rank 1's malloc_shared buffer (the ndev/q1/s1
+  cross-device write was UB); (2) the dep must be a function parameter
+  because Dpas48Params is captured BY VALUE into the kernel lambda and
+  sycl::event is not device-copyable. Also fixed a pre-existing leak:
+  ws48_ was never freed in ~Engine. Gates: streams bit-identical base vs
+  PREQ at TP=1 AND TP=2; path fires (decode nk 1116->1488 = +372 = 4tok x
+  93, nw unchanged 744 => dep-chain adds no wait); cpu parity + http batch
+  + gpu-optin 10/10 PASS. NO wall-time claim yet (box load 2.2 > quiet
+  threshold) — needs a quiet-box 27B INT4/G64 A/B before any perf claim.
+  Orthogonally: device-act-quant INTO the fused DPAS kernel stays a dead
+  end (replication), but the standalone pre-pass is a different shape and
+  is now open. SYCL-ENVS GOTCHA: a plain non-sourced shell cannot
+  enumerate ANY GPU ("No devices matching filter 'Arc'") because
+  libumf.so.1 (at /opt/intel/oneapi/umf/1.1/lib) is off LD_LIBRARY_PATH,
+  so every UR adapter fails to load. Export
+  LD_LIBRARY_PATH=/opt/intel/oneapi/umf/1.1/lib:... before any --gpu run;
+  verify with sycl-ls. xpu-smi still shows the GPUs fine — do not debug
+  device_manager.cpp for this warning. (memory: sycl_env_libumf.md)
   DPAS48 re-exam at M=361 (interleaved A/B, contended box, 2/2 rounds):
   OFF wins prefill 147.8/146.3 vs 132.7/131.0 (~11%) AND decode
   6.70/6.87 vs 5.13/5.06 (~30%); kernel 318->496ms (one-WI-per-16N-tile
