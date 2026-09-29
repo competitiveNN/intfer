@@ -1069,6 +1069,99 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p) {
 }
 
 // ---------------------------------------------------------------------------
+// Row-cooperative INT4/G64 DPAS (EXPERIMENTAL, default-off INTFER_DPAS_ROW).
+// Same Dpas48Params contract + same u4 fold math as quant_gemm_dpas48, but
+// one WI per ROW loops over the 16-N tiles (strips of RSTRIP resident)
+// instead of one WI per (row, tile). Per-(row,op) A work (va load, S sum,
+// as load) runs once instead of nT x.
+//
+// MEASURED 2026-09-29 (build_tmp probe, since removed): BIT-EXACT vs
+// legacy (0 diffs) but ~460x SLOWER device-side (260us -> 119ms on the
+// 27B up shape N=8704/K=5120 M=1). Cause: serializing all tiles x ops
+// through one WI collapses occupancy AND the acc[strip][16] private
+// array + runtime-bound inner tile loop defeats ESIMD DPAS pipelining.
+// The legacy WI-per-(m,t) geometry is already right for DPAS issue.
+// Kept ONLY as the experiment base for subgroup-cooperative sharing
+// (shuffle/SLM broadcast of va/S/as, WI-per-tile parallelism kept).
+// Do NOT promote without a quiet-box A/B win. Declines (null event)
+// unless bits==4 and weight group==64.
+// ---------------------------------------------------------------------------
+sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
+  using namespace sycl::ext::intel::esimd;
+  using namespace sycl::ext::intel::esimd::xmx;
+  constexpr uint32_t TN = 16, OP = 32;
+  constexpr uint32_t RSTRIP = 4;
+  const uint32_t M = p.M, N = p.N, K = p.K;
+  const uint32_t G = (p.group_size == 0) ? K : p.group_size;
+  if (p.bits != 4 || G != 64) return sycl::event{};
+  const uint32_t GA = (p.act_group == 0) ? K : p.act_group;
+  const uint32_t nT = N / TN, nOp = K / OP;
+  const uint32_t nGA = (K + GA - 1) / GA;
+  const uint32_t nG = (K + G - 1) / G;
+  const uint32_t act_stride = (p.act_stride == 0) ? K : p.act_stride;
+  const uint32_t as_stride = (p.as_stride == 0) ? nGA : p.as_stride;
+  const uint32_t op_bytes = OP * TN * 4 / 8;  // u4
+  const uint8_t* B = static_cast<const uint8_t*>(p.code_dpas);
+  const float alpha = p.alpha;
+
+  const uint32_t nWG = 16;
+  const uint32_t global = ((M + nWG - 1) / nWG) * nWG;
+
+  return q.submit([&](sycl::handler& h) {
+    h.parallel_for<class gemm_dpas4_row_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+          const uint32_t m = it.get_global_id(0);
+          if (m >= M) return;
+          const std::int8_t* Aqr = p.act_int8 + (size_t)m * act_stride;
+          const float* Asr = p.act_scale + (size_t)m * as_stride;
+          for (uint32_t ts = 0; ts < nT; ts += RSTRIP) {
+            const uint32_t tlim = (ts + RSTRIP < nT) ? ts + RSTRIP : nT;
+            float acc[RSTRIP][TN];
+            for (uint32_t tt = ts; tt < tlim; ++tt)
+              for (uint32_t nl = 0; nl < TN; ++nl) acc[tt - ts][nl] = 0.0f;
+            for (uint32_t o = 0; o < nOp; ++o) {
+              const uint32_t k0 = o * OP;
+              simd<std::int8_t, OP> va;
+              va.copy_from(Aqr + k0);
+              const float as = Asr[k0 / GA];
+              int S = 0;
+              for (uint32_t k = 0; k < OP; ++k) S += va[k];
+              const uint32_t g = k0 / G;
+              for (uint32_t tt = ts; tt < tlim; ++tt) {
+                simd<uint8_t, 256> vb;  // op_bytes(u4) = 32*16*4/8
+                vb.copy_from(B + ((size_t)tt * nOp + o) * op_bytes);
+                simd<int, TN> c;
+                c = dpas<8, 1, int, uint8_t, std::int8_t,
+                         dpas_argument_type::u4, dpas_argument_type::s8>(vb, va);
+                for (uint32_t nl = 0; nl < TN; ++nl) {
+                  const uint32_t n = tt * TN + nl;
+                  const float ws = static_cast<float>(
+                      sycl::bit_cast<sycl::half>(
+                          p.scale_usm[(size_t)n * nG + g]));
+                  acc[tt - ts][nl] += as * ws * alpha *
+                                      (2.0f * (float)c[nl] - 15.0f * (float)S) /
+                                      15.0f;
+                }
+              }
+            }
+            for (uint32_t tt = ts; tt < tlim; ++tt) {
+              std::uint16_t oh[TN];
+              for (uint32_t nl = 0; nl < TN; ++nl)
+                oh[nl] = to_half_bits(acc[tt - ts][nl]);
+              simd<std::uint16_t, TN> oc;
+              oc.copy_from(oh);
+              oc.copy_to(p.out_usm + (size_t)m * N + (size_t)tt * TN);
+            }
+          }
+        });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // FP16-act-equivalent s8-weight DPAS GEMM (lm_head decode).
 // ---------------------------------------------------------------------------
 sycl::event quant_gemm_dpas_s8w(sycl::queue& q, const Dpas48Params& p) {

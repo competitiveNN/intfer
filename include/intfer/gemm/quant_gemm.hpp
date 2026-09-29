@@ -237,6 +237,14 @@ bool repack_dpas412(const std::uint8_t* row_codes, uint32_t N, uint32_t K,
 // M=1 W4A8/W2A8 decode kernel. Returns the kernel event.
 sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p);
 
+// Row-cooperative INT4/G64 DPAS (EXPERIMENTAL, SLOWER — see .cpp note).
+// Same Dpas48Params contract as quant_gemm_dpas48; one WI per row loops
+// over 16-N tiles. Bit-exact vs the u4 path; ~460x slower device-side
+// (occupancy collapse). Default-off INTFER_DPAS_ROW=1 opts in; declines
+// (null event) unless bits==4 and weight group==64. Experiment base for
+// subgroup-cooperative sharing only — do NOT promote without a quiet A/B.
+sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p);
+
 // ---------------------------------------------------------------------------
 // FP16-act-equivalent s8-weight DPAS GEMM for the VRAM-resident lm_head.
 //

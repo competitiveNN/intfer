@@ -161,6 +161,14 @@ bool dpas48_eligible(QuantScheme scheme, uint32_t group_size,
   return (N_local % 16 == 0) && (K % 32 == 0);
 }
 
+// Row-cooperative DPAS experiment opt-in (default OFF). Host-side read;
+// getenv/static are illegal in device code, so the flag is read once.
+bool dpas_row_enabled() {
+  const char* env = std::getenv("INTFER_DPAS_ROW");
+  static const bool enabled = (env && env[0] == '1' && env[1] == '\0');
+  return enabled;
+}
+
 // Build a per-device GemmWeightBuffers view over rows [start,end) of a tensor's
 // packed payload (column tensor-parallel sharding of the output dim N).
 //
@@ -899,6 +907,10 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
 
   // 2) Launch per device.
   float alpha = sc.has_global_divisor ? sc.global_host : 1.0f;
+  // EXPERIMENTAL row-cooperative geometry (default-off INTFER_DPAS_ROW=1;
+  // measured ~460x slower — experiment base only). Eligible: INT4/G64.
+  const uint32_t Gw = (sc.group_size == 0) ? K : sc.group_size;
+  const bool use_row = dpas_row_enabled() && bits == 4 && Gw == 64;
   std::vector<sycl::event> kernel_events;
   kernel_events.reserve(devices_.size());
   for (size_t d = 0; d < devices_.size(); ++d) {
@@ -924,7 +936,10 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
 #ifdef INTFER_PROFILE_GPU
     auto t_s0 = std::chrono::high_resolution_clock::now();
 #endif
-    kernel_events.push_back(gemm::quant_gemm_dpas48(q, p));
+    sycl::event kernel_evt = use_row ? gemm::quant_gemm_dpas4_row(q, p)
+                                     : gemm::quant_gemm_dpas48(q, p);
+    if (kernel_evt == sycl::event{}) kernel_evt = gemm::quant_gemm_dpas48(q, p);
+    kernel_events.push_back(kernel_evt);
 #ifdef INTFER_PROFILE_GPU
     {
       auto t1 = std::chrono::high_resolution_clock::now();
