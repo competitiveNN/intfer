@@ -92,17 +92,44 @@ echo "run_all_checks: tree clean, HEAD=$HEAD_SHORT"
 RC_SUMMARY=""
 FAILED=0
 UNPROVEN=0
-step() { # $1 = label, rest = command
-  local label="$1"; shift
-  local log rc
+UNPROVEN_LABELS=""
+
+# One place that knows what each step's command is, so the post-matrix re-run
+# dispatches through the SAME definition instead of a second hand-maintained list.
+# A duplicated table is exactly how a step silently stops being re-run.
+dispatch() { # $1 = label -> runs it
+  case "$1" in
+    gate_inventory.sh)
+      timeout 1800 bash "$SCRIPT_DIR/gate_inventory.sh" ;;
+    fold_report_counts.sh)
+      timeout 1800 bash "$SCRIPT_DIR/fold_report_counts.sh" ;;
+    check_device_precond.sh)
+      if [ "${INTFER_SKIP_HEALTHY:-0}" = "1" ]; then
+        INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1 timeout 1800 bash "$SCRIPT_DIR/check_device_precond.sh"
+      else
+        timeout 3600 bash "$SCRIPT_DIR/check_device_precond.sh"
+      fi ;;
+    mutate_fold_matrix.sh)
+      timeout 7200 bash "$SCRIPT_DIR/mutate_fold_matrix.sh" ;;
+    mutate_gate_inventory.sh)
+      timeout 7200 bash "$SCRIPT_DIR/mutate_gate_inventory.sh" ;;
+    mutate_device_precond.sh)
+      timeout 7200 bash "$SCRIPT_DIR/mutate_device_precond.sh" ;;
+    *) echo "internal: unknown step '$1'" >&2; return 97 ;;
+  esac
+}
+
+step() { # $1 = label
+  local label="$1" log rc
   log="$BUILD_DIR/run_all_$(printf '%s' "$label" | tr -c 'a-zA-Z0-9' '_').log"
   printf '  %-34s ' "$label"
-  "$@" >"$log" 2>&1
+  dispatch "$label" >"$log" 2>&1
   rc=$?
   case "$rc" in
     0) printf 'ok\n' ;;
     2) printf 'UNPROVEN rc=2 (stale evidence, not a regression -- %s)\n' "$log"
-       UNPROVEN=$((UNPROVEN + 1)) ;;
+       UNPROVEN=$((UNPROVEN + 1))
+       UNPROVEN_LABELS="$UNPROVEN_LABELS $label" ;;
     *) printf 'FAIL rc=%s (see %s)\n' "$rc" "$log"
        FAILED=$((FAILED + 1)) ;;
   esac
@@ -111,20 +138,42 @@ step() { # $1 = label, rest = command
 }
 
 echo "== 1/2 checkers =="
-step "gate_inventory.sh"      timeout 1800 bash "$SCRIPT_DIR/gate_inventory.sh"
-step "fold_report_counts.sh"  timeout 1800 bash "$SCRIPT_DIR/fold_report_counts.sh"
-if [ "${INTFER_SKIP_HEALTHY:-0}" = "1" ]; then
-  step "check_device_precond.sh (no healthy)" env INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1 \
-    timeout 1800 bash "$SCRIPT_DIR/check_device_precond.sh"
-else
-  step "check_device_precond.sh" timeout 3600 bash "$SCRIPT_DIR/check_device_precond.sh"
-fi
+step "gate_inventory.sh"
+step "fold_report_counts.sh"
+step "check_device_precond.sh"
 
 if [ "${INTFER_QUICK:-0}" != "1" ]; then
   echo "== 2/2 mutation matrices (slow; each edits and restores tracked source) =="
-  step "mutate_fold_matrix.sh"      timeout 7200 bash "$SCRIPT_DIR/mutate_fold_matrix.sh"
-  step "mutate_gate_inventory.sh"   timeout 7200 bash "$SCRIPT_DIR/mutate_gate_inventory.sh"
-  step "mutate_device_precond.sh"   timeout 7200 bash "$SCRIPT_DIR/mutate_device_precond.sh"
+  step "mutate_fold_matrix.sh"
+  step "mutate_gate_inventory.sh"
+  step "mutate_device_precond.sh"
+
+  # --- re-validate anything that was unproven -------------------------------
+  # ORDERING, and the first run got this wrong. fold_report_counts.sh reads the
+  # fold matrix's stamp, and the checkers run BEFORE the matrices -- so on a tree
+  # whose stamps were stale it correctly reported rc=2, the matrices then
+  # re-stamped everything, and the run still exited 2 claiming evidence was
+  # missing when it was present. A verdict computed from a snapshot the rest of
+  # the run invalidated.
+  #
+  # The fix RE-RUNS the steps that came back rc=2, rather than hard-coding which
+  # checkers depend on which stamp. That keeps it derived: a future checker that
+  # reads a matrix stamp is re-validated automatically, and a hand-written
+  # dependency table would quietly omit it. Reported, never silent.
+  if [ -n "$UNPROVEN_LABELS" ]; then
+    echo "== 2b re-validating unproven step(s) after the matrices =="
+    for label in $UNPROVEN_LABELS; do
+      printf '  %-34s ' "$label (re-run)"
+      log="$BUILD_DIR/run_all_$(printf '%s' "$label" | tr -c 'a-zA-Z0-9' '_')_rerun.log"
+      if dispatch "$label" >"$log" 2>&1; then
+        printf 'ok (evidence now current)\n'
+        UNPROVEN=$((UNPROVEN - 1))
+      else
+        rc=$?
+        printf 'still rc=%s (%s)\n' "$rc" "$log"
+      fi
+    done
+  fi
 fi
 
 # --- 3. the stamp assertion, over an ENUMERATED set -------------------------
