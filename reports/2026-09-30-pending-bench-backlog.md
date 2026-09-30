@@ -247,7 +247,46 @@ Implemented and gated; awaiting quiet-box numbers. Full report (with the
 measured device-side counters, the mutation proof, and the row-stride bug the
 probe caught during development) is in
 **`reports/2026-09-30-dpas48-fold.md`** — read that file for the command.
-Run its `dpas_fold_probe` pre-flight before spending a quiet window on it.
+Run its pre-flight before spending a quiet window on it:
+`./scripts/test_dpas_fold.sh` (builds its own target first, so it cannot
+report PASS for a stale binary).
+
+## E4 — PROPOSED (not implemented): cooperative 2D-tiled DPAS block
+
+**Status: design only. There is no flag and no code yet — do not go looking for
+`INTFER_DPAS48_TILED` or similar; it does not exist.** Pre-registered here so
+the pending list stays honest about what the project still owes a
+measurement.
+
+**What is left.** E3 removed the *arithmetic* replication: the per-(row,op)
+activation fold no longer runs once per 16-N tile. It did not touch the *load*
+replication. In `quant_gemm_dpas48` every WI still does its own
+`vb.copy_from(B + ((size_t)t * nOp + o) * op_bytes)` — one B operand load per
+WI per op, so the same B op-tile is fetched `nT` times per row-group from L1/L2
+rather than once per block.
+
+**The shape being proposed.** One WI per 16-N tile is the problem; the fix is a
+genuinely 2D work-item block (a strip of tiles per WI, or a cooperative
+subgroup that loads a B op-tile once into registers and reuses it across
+several tiles), so B traffic per output element drops from `nT` to ~1. This is
+the same class of change as `quant_gemm_dpas4_row` (`INTFER_DPAS_ROW`, already
+built and measured ~460x SLOWER — so a naive "one WI per row" is already known
+to be wrong; the geometry has to actually cooperate, not just re-partition).
+
+**Why it is on the prefill-4000 list.** Prefill 4000 tok/s needs XMX doing real
+work, and the EU pipes are the whole prefill story today. DPAS is the only
+XMX path available, and it is gated on exactly this kernel being competitive at
+wide N and M>1.
+
+**Honest blocker, stated up front.** A 2D/cooperative DPAS kernel changes the
+accumulation ORDER of the FP32 `acc_tile`, so unlike E3 it is **not** a
+bit-exact hoist. It will need a real numerics contract and a tolerance-based
+comparison against the legacy path (not `==`), and that contract has to be
+agreed before the code is written. That is why it is registered rather than
+started. See the "Also not yet implemented" list below, which this section
+replaces for the DPAS row.
+
+RESULT (27B TP=2 prefill chunk361, vs DPAS48 and DPAS48+FOLD baselines):
 
 ---
 
@@ -275,8 +314,11 @@ Do not use a loaded or 1-GPU window and do not report a number from one.
 
 ## Also not yet implemented (no flag to test — do not go looking)
 
-- rewritten **2D-tiled** DPAS kernel (proper subgroup DPAS, no one-WI-per-16N-tile
-  K-fold replication) — this, not device act-quant, is what prefill 4000 tok/s needs
+- rewritten **2D-tiled / cooperative** DPAS kernel (B operands loaded once per
+  block, not once per WI). Registered as **E4** above with its design and its
+  numerics blocker; it is no longer lumped in here because it now has a written
+  shape. The K-fold arithmetic half of that work SHIPPED as E3
+  (`INTFER_DPAS48_FOLD`, gated).
 - batched multi-launch L0 command lists amortizing one sync over many kernels
   (single immediate append+sync was measured at the same floor as UR submit)
 

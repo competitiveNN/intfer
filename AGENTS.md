@@ -117,7 +117,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
   NO host wait. One launch PER DEVICE, never one for both — each rank owns
   its own sycl::context (device_manager.cpp), so a kernel on rank 0's queue
   cannot legally write rank 1's malloc_shared buffer.
-  === 2026-09-30 AUDIT: THE ORIGINAL GATE EVIDENCE WAS VACUOUS ===
+
+   === 2026-09-30 AUDIT: THE ORIGINAL GATE EVIDENCE WAS VACUOUS ===
   PREQ is NESTED INSIDE the DPAS48 path, and DPAS48 is default-OFF. The
   gates cited in 49b21d3 (cpu parity, http batch, gpu-optin 10/10) all ran
   WITHOUT INTFER_DPAS48=1, so run_linear_tp_dpas48 was never entered and
@@ -126,7 +127,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
   impossible: DPAS48's own INT8/GA64 act-quant legitimately differs from
   the FP16-act base. The correct invariant is PREQ == DPAS48 (the pre-pass
   reproduces the host GA64 quant).
-  === 2026-09-30 AUDIT #2: THE NEWTON "FIX" WAS BACKWARDS. DO NOT RE-ADD IT ===
+
+   === 2026-09-30 AUDIT #2: THE NEWTON "FIX" WAS BACKWARDS. DO NOT RE-ADD IT ===
   An earlier revision of this audit concluded "device 1.0f/s is not IEEE,
   add an fma Newton step". WRONG IN DIRECTION, and reverted. Truth, from a
   direct device probe (9,689,600 realistic GA64 elements incl. adversarial
@@ -147,7 +149,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
   => "Correcting" the device moved it AWAY from the reference and CREATED
   the decode-step-14 divergence this same commit then documented as an
   unfixable "KNOWN, UNRESOLVED tie rule". The Newton step is GONE.
-  === THE FIX: ship the host's (scale, inverse) to the device ===
+
+   === THE FIX: ship the host's (scale, inverse) to the device ===
   dashq::act_quant_ga64_scale_inv_batch() computes per 64-slice
   (s, inv) = (max(1e-6,max|x|)/127, 1.0f/s) ON THE HOST; the pre-pass
   consumes both verbatim via ActQuantDevParams::scale_inv_in (2*M*nGA FP32
@@ -158,7 +161,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
   back (the pre-pass was built to delete the full host quant); it is a
   reduction plus M*K/64 divides instead of a full host quant, and stays off
   the GEMM critical path (dep-chained, no added wait).
-  === AUDIT #3: ONE reciprocal site, and a numeric gate for it ===
+
+   === AUDIT #3: ONE reciprocal site, and a numeric gate for it ===
   The fix above shipped the host's bits but still computed them at a SECOND
   host call site (`1.0f/s` inside the helper vs inside the AVX2 oracle).
   That is the same hazard one layer down: correct only by luck of codegen,
@@ -189,7 +193,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (nextafterf) into the helper makes it FAIL — tie dataset 64000/64000
   slices caught, random dataset 21 — so the gate is not vacuous (the earlier
   vacuous-gate bug was the nested PREQ flag).
-  === 2026-09-30 AUDIT #4: THE GATE CHECKED 1 OF M ROWS, AND READ A
+
+   === 2026-09-30 AUDIT #4: THE GATE CHECKED 1 OF M ROWS, AND READ A
   STALE BINARY. BOTH FIXED. ===
   (a) COVERAGE HOLE, PROVEN. check_batch() called the helper with M=3 but
   only ever validated ROW 0 against the oracle, while the helper writes
@@ -239,6 +244,7 @@ Implement features for maximizing throughput for concurrent requests, starting f
   557 264 5054'). A temporary INTFER_PREQ_TRACE probe (not committed)
   confirmed the pre-pass really is fed M=97 (x93 GEMM calls) and M=1 (x744) on
   that run, so the arm is not accidentally running an M=1 prefill.
+
    === 2026-09-30 AUDIT #5: async-lifetime (checked, no bug) + dispatch hoist ===
    SUSPECTED use-after-free, DISPROVED by reading the code: if the DPAS
    kernel declined after a successful pre-pass, nothing would ever wait on
@@ -272,7 +278,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
    device correctness to the host's divss codegen, so any future compiler
    change to ga64_recip breaks it invisibly. Not worth it for a default-OFF
    path; recorded, not built.
-  === 2026-09-30 AUDIT #7: gate hygiene, family 3 tree-wide + shared helper ===
+
+   === 2026-09-30 AUDIT #7: gate hygiene, family 3 tree-wide + shared helper ===
    Audit #6's fix (74e80a0) closed the stale-artifact hole in the FOUR gates it
    had audited and the memory note then declared family 3 "FIXED EVERYWHERE".
    That was wrong, and it broke the note's own scope corollary: grepping every
@@ -347,6 +354,7 @@ Implement features for maximizing throughput for concurrent requests, starting f
    has no binary; override unset -> resolves to the real default binary).
    All 17 artifact consumers now honor the override; `bash -n` clean on each.
    Benchmarks re-verified CORRECTNESS-only; no wall-time claim is made here.
+
    === AUDIT #9: test_tp2_27b FAILING = BOX STATE, NOT A REGRESSION ===
    *** SUPERSEDED IN PART BY AUDIT #11 (further below). Keep this section's
    CONCLUSION ("box state, not a code regression") and DISREGARD its
@@ -389,6 +397,7 @@ Implement features for maximizing throughput for concurrent requests, starting f
    the clamp was SILENT, and that is now fixed (a loud, deliberately
    NON-fatal warning when dm.size() < tp_devices, so a real TP shortfall can
    never be mistaken for a driver fault).
+
    === AUDIT #11: AUDIT #9's ROOT CAUSE WAS WRONG (supersedes it) ===
    #9 attributed the tp2_27b rc=139 to TP sharding walking a missing device
    ("ranges[d] -> wild pointer"). TESTED AND DISPROVED: the clamp is real and
@@ -433,63 +442,81 @@ Implement features for maximizing throughput for concurrent requests, starting f
    mechanism is not a verified one — read the code that would have to be wrong,
    or reproduce it. Reproducing was cheap (the 0.8B run is seconds) and would
    have caught this immediately.
+
    === EXPERIMENT SHIPPED: INTFER_DPAS48_FOLD=1 (default OFF) ===
-  The "rewritten 2D-tiled DPAS kernel" was blocked on one specific thing, and
-  that thing is now removed. quant_gemm_dpas48 runs one WI per (row, 16-N
-  tile) and, INSIDE its K loop, recomputed the activation column sums
-  `S = sum_{k<32} va[k]` (and S0/Sf for the INT2/G16 split). Those depend only
-  on (row, op), never on the tile — so all nT = N/16 tiles per row redid the
-  same O(K) integer fold. That replication is the documented reason the wide-N
-  DPAS kernel loses to the legacy tiled path despite the multiply being on XMX.
-  New plain-SYCL kernel `quant_gemm_dpas48_rowfold` computes them once per
-  (row, op) into a grow-only per-device workspace (2*M*nOp INT32); the DPAS
-  kernel reads them. Dep-chains on the pre-pass, adds no host wait.
-  WHY IT IS SAFE, precisely: the hoisted values are EXACT int32 sums of int8
-  codes (|sum| <= 4096). Integer addition is exact and associative, so hoisting
-  cannot change a bit — no rounding-order exposure, unlike the FP32 folds
-  elsewhere in that file. DPAS math, scales and accumulation order untouched.
-  A WORK hoist, not a numerics change. Do not "simplify" it into a device sum
-  in another order or a wider type; the exactness IS the safety argument.
-  ROW-STRIDE TRAP (cost a real bug, caught only by the new probe): each row
-  owns 2*nOp ints, `[S0][Sfull]`, so the stride must be >= 2*nOp, NOT >= nOp.
-  With a shorter stride, row m's Sfull block OVERWRITES row m+1's S0 block.
-  This is SILENT AT M=1 (only row 0 exists) and only fires when the grow-only
-  workspace stride is below the call's 2*nOp — i.e. a smaller-K GEMM after a
-  larger one. Guarded in the kernel (`fold_stride < 2*nOp` -> decline) and again
-  in the engine. The probe failed on `M=8 big-K` with S0 always right and Sfull
-  garbage, which is exactly this signature.
-  New gate: `examples/dpas_fold_probe` (device, no model) compares every
-  (row,op) S0/Sfull against a host reference over M=1/3/4/8, tight and
-  row-strided workspaces and big-K, plus 4 negative cases that must DECLINE and
-  write nothing (decline detected via a sentinel prerequisite event, because
-  comparing against a bare `sycl::event{}` is not reliable). PASS: 3907 pairs,
-  0 violations. MUTATION-PROVEN non-vacuous twice: (1) weakening the stride
-  guard back to `< nOp` -> rc=1; (2) corrupting `dst[nOp+o] = sf` to
-  `dst[o] = sf` -> rc=1 with the value comparison firing on M=1. Both reverted.
-  It is NOT yet wrapped in a scripts/test_*.sh gate — treat it as a mandatory
-  manual pre-flight until someone adds the wrapper (which must then use
-  gate_require_build + INTFER_BUILD_DIR like the other nine).
-  `scripts/test_gpu_optin.sh` gained 4 arms, PASS at TP=1 AND TP=2:
-  DPAS48+FOLD == DPAS48 (n=24), DPAS48+PREQ+FOLD == DPAS48 (n=24), WIDE
-  DPAS48+FOLD == DPAS48 (~97-token prompt => one ~97-row batch, the arm that
-  actually exercises the M>1 row stride), and FOLD-alone == base (inert
-  without DPAS48, same nested-flag shape as PREQ).
-  Measured, load-insensitive (0.8B TP=1, device-side total_kernel_us, NOT wall
-  time): decode n=8 88028.5 -> 86590.3us (-1.6%) with launches 2232 -> 2736
-  (+504); prefill chunk128 43533.5 -> 42795.0us (-1.7%), launches 1116 -> 1368
-  (+252). Read honestly: it costs ONE EXTRA LAUNCH PER DPAS GEMM and 0.8B is
-  the weak case (small N => few tiles to amortize against). 27B wide-N is where
-  it should pay and CANNOT be measured here (1 GPU; 27B needs --tp 2). No
-  tok/s claim. Handover report with blank RESULT lines:
-  `reports/2026-09-30-dpas48-fold.md` (E3), cross-referenced from
-  `reports/2026-09-30-pending-bench-backlog.md`, which now also states plainly
-  that the queue is blocked on 2-GPU box state, not on missing experiments.
-  STILL NOT DONE, deliberately: the remaining 2D-tiled geometry work proper
-  (subgroup DPAS with a genuinely cooperative 2D block, so B operands are
-  loaded once per block instead of per WI). This change removes the ARITHMETIC
-  replication, which was the blocker removable without a new numerics contract;
-  the load-replication half is untouched.
-    === AUDIT #10: AUDIT #8's OWN ENUMERATION WAS THE SAME NARROW PATTERN ===
+   The "rewritten 2D-tiled DPAS kernel" was blocked on one specific thing, and
+   that thing is now removed. quant_gemm_dpas48 runs one WI per (row, 16-N
+   tile) and, INSIDE its K loop, recomputed the activation column sums
+   `S = sum_{k<32} va[k]` (and S0/Sf for the INT2/G16 split). Those depend only
+   on (row, op), never on the tile — so all nT = N/16 tiles per row redid the
+   same O(K) integer fold. That replication is the documented reason the wide-N
+   DPAS kernel loses to the legacy tiled path despite the multiply being on XMX.
+   New plain-SYCL kernel `quant_gemm_dpas48_rowfold` computes them once per
+   (row, op) into a grow-only per-device workspace (2*M*nOp INT32); the DPAS
+   kernel reads them. Dep-chains on the pre-pass, adds no host wait.
+   WHY IT IS SAFE, precisely: the hoisted values are EXACT int32 sums of int8
+   codes (|sum| <= 4096). Integer addition is exact and associative, so hoisting
+   cannot change a bit — no rounding-order exposure, unlike the FP32 folds
+   elsewhere in that file. DPAS math, scales and accumulation order untouched.
+   A WORK hoist, not a numerics change. Do not "simplify" it into a device sum
+   in another order or a wider type; the exactness IS the safety argument.
+   ROW-STRIDE TRAP (cost a real bug, caught only by the new probe): each row
+   owns 2*nOp ints, `[S0][Sfull]`, so the stride must be >= 2*nOp, NOT >= nOp.
+   With a shorter stride, row m's Sfull block OVERWRITES row m+1's S0 block.
+   This is SILENT AT M=1 (only row 0 exists) and only fires when the grow-only
+   workspace stride is below the call's 2*nOp — i.e. a smaller-K GEMM after a
+   larger one. Guarded in the kernel (`fold_stride < 2*nOp` -> decline) and again
+   in the engine. The probe failed on `M=8 big-K` with S0 always right and Sfull
+   garbage, which is exactly this signature.
+   New gate: `examples/dpas_fold_probe` (device, no model) compares every
+   (row,op) S0/Sfull against a host reference over M=1/3/4/8, tight and
+   row-strided workspaces and big-K, plus 4 negative cases that must DECLINE and
+   write nothing (decline detected via a sentinel prerequisite event, because
+   comparing against a bare `sycl::event{}` is not reliable). PASS: 3907 pairs,
+   0 violations. MUTATION-PROVEN non-vacuous twice: (1) weakening the stride
+   guard back to `< nOp` -> rc=1; (2) corrupting `dst[nOp+o] = sf` to
+   `dst[o] = sf` -> rc=1 with the value comparison firing on M=1. Both reverted.
+   It is wrapped as `scripts/test_dpas_fold.sh` — the TENTH correctness gate,
+   and the last build-artifact consumer that had no build guard. It calls
+   `gate_require_build dpas_fold_probe` (own log
+   `gate_test_dpas_fold_build.log`, derived automatically by the shared helper
+   from BASH_SOURCE[1], so a new gate needs no extra wiring) and honors
+   INTFER_BUILD_DIR. WRAPPER MUTATION-PROVEN: with static_assert(false) in
+   src/gemm/quant_gemm.cpp the stale probe binary was confirmed STILL PRINTING
+   PASS (rc=0) — the trap genuinely armed — and the gate returned rc=1. Reverted,
+   green. This mattered concretely: a failed build twice left a stale probe
+   reporting a misleading result earlier in this same session. FAMILY 3 IS NOW
+   FULLY CLOSED: 10 guarded correctness gates, 8 measurement harnesses
+   deliberately unguarded by decision, 10 model-prep/microbench scripts
+   honoring their tree's override. Nothing is both unguarded and unintentional.
+   `scripts/test_gpu_optin.sh` gained 4 arms, PASS at TP=1 AND TP=2:
+   DPAS48+FOLD == DPAS48 (n=24), DPAS48+PREQ+FOLD == DPAS48 (n=24), WIDE
+   DPAS48+FOLD == DPAS48 (~97-token prompt => one ~97-row batch, the arm that
+   actually exercises the M>1 row stride), and FOLD-alone == base (inert
+   without DPAS48, same nested-flag shape as PREQ).
+   Measured, load-insensitive (0.8B TP=1, device-side total_kernel_us, NOT wall
+   time): decode n=8 88028.5 -> 86590.3us (-1.6%) with launches 2232 -> 2736
+   (+504); prefill chunk128 43533.5 -> 42795.0us (-1.7%), launches 1116 -> 1368
+   (+252). Read honestly: it costs ONE EXTRA LAUNCH PER DPAS GEMM and 0.8B is
+   the weak case (small N => few tiles to amortize against). 27B wide-N is where
+   it should pay and CANNOT be measured here (1 GPU; 27B needs --tp 2). No
+   tok/s claim. Handover report with blank RESULT lines:
+   `reports/2026-09-30-dpas48-fold.md` (E3), cross-referenced from
+   `reports/2026-09-30-pending-bench-backlog.md`, which now also states plainly
+   that the queue is blocked on 2-GPU box state, not on missing experiments.
+   STILL NOT DONE, deliberately: the remaining 2D-tiled geometry work proper
+   (subgroup DPAS with a genuinely cooperative 2D block, so B operands are
+   loaded once per block instead of per WI). This change removes the ARITHMETIC
+   replication, which was the blocker removable without a new numerics contract;
+   the load-replication half is untouched. Registered as **E4** in
+   reports/2026-09-30-pending-bench-backlog.md with its design and its real
+   blocker: a cooperative block changes the FP32 accumulation ORDER, so unlike
+   E3 it is NOT a bit-exact hoist and needs a tolerance-based numerics contract
+   agreed BEFORE any code is written. Do not start it on the assumption it will
+   be exact. Also note INTFER_DPAS_ROW is the cautionary precedent: re-partitioning
+   one-WI-per-row without real cooperation measured ~460x SLOWER.
+
+   === AUDIT #10: AUDIT #8's OWN ENUMERATION WAS THE SAME NARROW PATTERN ===
    7efed06 fixed 5 harnesses and then claimed "All 17 artifact consumers now
    honor the override". That claim was FALSE, and the failure is precisely the
    one the process lesson above warns about: the enumeration was done by
@@ -546,6 +573,7 @@ Implement features for maximizing throughput for concurrent requests, starting f
    ga64-recip PASS (480645 slices / 30,753,153 elements bit-identical, discrim
    103/192000/11/0 — IDENTICAL to the recorded baseline, confirming no source
    drift) and cpu-parity PASS. No gate or engine source was touched.
+
    === AUDIT #3b: the DPAS48 x SSM_GPU gate was asserting TIE-LUCK ===
   Forcing the single reciprocal site changed the host oracle's own codes
   (5 differing bytes over 4.1M codes on a fixed dataset) and the GPU gate
@@ -580,7 +608,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
   slightly (ties only), so DPAS48-family streams differ from those recorded
   at 7f005fe. Base/FP16 streams are unaffected (gate: base n=24 unchanged).
   Do not treat pre-audit DPAS48 token lists as golden.
-  === AUDIT #3c: a build break the gates could NOT see (987c554 -> 1fbf9a6) ===
+
+   === AUDIT #3c: a build break the gates could NOT see (987c554 -> 1fbf9a6) ===
   ssm_gpu_allowed() was defined INSIDE #ifdef INTFER_HAS_GPU_BACKEND while
   its step() call site (main.cpp:4985) sits OUTSIDE it, so the CLI failed to
   compile without -DINTFER_HAS_GPU_BACKEND=1. All four gates still passed,
@@ -594,7 +623,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
   errors — GpuBackend / SsmRow used outside guards). Helpers added near the
   GPU backend must be hoisted OUT of the guard unless every caller is inside
   it; check with the macro stripped, do not assume the gates cover it.
-  === OTHER FIXES ===
+
+   === OTHER FIXES ===
   (a) PARTIAL-DECLINE RACE (nondeterminism): if device d's pre-pass
   launched but device d+1 declined, the already-queued d kernel still
   writes ws48_[d].act while the host fallback memcpy's the same buffer.
@@ -605,7 +635,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (c) profile_note_launch() ran BEFORE the decline check, so a declined
   call inflated nk. Moved after.
   (d) Indentation regression in quant_gemm_dpas4_row fixed.
-  === FIXED (was "KNOWN, UNRESOLVED"): PREQ x SSM_GPU tie divergence ===
+
+   === FIXED (was "KNOWN, UNRESOLVED"): PREQ x SSM_GPU tie divergence ===
   Real and deterministic (step 14, TP=1 and TP=2, ~2 mismatched elements per
   ~1950 GEMM calls), but NOT a tie-rule bug: it was the reciprocal (AUDIT #2
   above) — the device was the correctly rounded one and the HOST differed
