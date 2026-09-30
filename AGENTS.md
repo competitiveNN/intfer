@@ -704,6 +704,12 @@ e.g. S3's contract column is 40 not 42).
    gates. The GATE exits 2, so that is 7, not 8. An aggregate that does not
    reconcile against per-gate exit codes is the same defect class as a report
    that claims coverage it does not have. ***
+   *** THE WRONG NUMBER ALSO LIVES IN COMMIT 793b880's SUBJECT LINE, and it is
+   left there on purpose. Do not "fix" it by amending: 530cc81 is the commit
+   that records the error and its correction, so the history explains itself,
+   and rewriting a published message to hide a mistake that the next commit
+   already documents destroys the only record that the mistake happened. The
+   same rule as the era-marked TP=2 lines above, applied to commits. ***
    Two things this run actually PROVED about the fix, not just exercised:
      - device_argmax's section 4 reported `gpu-optin: PARTIAL/SKIP (rc=2, box
        state -- not counted as a failure)`. Without sub_gate()'s rc map, the
