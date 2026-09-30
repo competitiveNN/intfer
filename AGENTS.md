@@ -369,20 +369,26 @@ Implement features for maximizing throughput for concurrent requests, starting f
    enumeration dropped PCI 86:00.0. Shell env is clean (no SYCL_DEVICE_FILTER
    /ZE_AFFINITY_MASK/ONEAPI_DEVICE_SELECTOR), so this is NOT the libumf
    LD_LIBRARY_PATH gotcha (that one yields ZERO devices, not one).
-   TP=2 then slices every tensor into 2 shard ranges while only rank 0 has a
-   device, and the wave path walks ranges[d] -> wild pointer -> SIGSEGV.
+   ~~TP=2 then slices every tensor into 2 shard ranges while only rank 0
+   has a device, and the wave path walks ranges[d] -> wild pointer ->
+   SIGSEGV.~~  STRUCK BY AUDIT #11: FALSE. engine.cpp:361 already clamps
+   `n = min(tp_devices, dm.size())` and shards come from devices_.size(), so
+   --tp 2 on a 1-GPU box is simply TP=1. Verified: 0.8B with `--gpu --tp 2`
+   exits rc=0 with the expected ids. Real cause is 27B VRAM exhaustion
+   (~19GB vs ~12GB), aborting inside Level Zero's page-fault manager.
    Timeline fits the loss: gpu_optin (TP=1+TP=2 arms) PASSED earlier in the
    same run, then the second GPU vanished before the last gate.
    ACTION: re-run scripts/test_tp2_27b.sh once BOTH GPUs enumerate again
    (`sycl-ls` must print 2 [level_zero:gpu] lines). Until then treat the
    9-gate result as 8/9 with TP=2 coverage unverified, not as a code failure.
-   SCOPED, NOT ATTEMPTED: the engine should reject `--tp N` when
+   ~~SCOPED, NOT ATTEMPTED: the engine should reject `--tp N` when
    devices_.size() < N with a clear error instead of segfaulting deeper in
-   the wave path. That is a real robustness gap worth fixing, but it is
-   engine code and CANNOT be gate-validated while only 1 GPU is visible
-   (every TP=2 gate arm would fail for the same reason) — so it is recorded,
-   not blind-patched. This is family "gate cannot exercise the configuration"
-   (see AUDIT #3c): do not ship an unverifiable engine change.
+   the wave path.~~  WITHDRAWN BY AUDIT #11: this task is aimed at a bug
+   that DOES NOT EXIST — there is no missing-rank walk, because the clamp is
+   correct. Do NOT implement it. What was actually missing is the opposite:
+   the clamp was SILENT, and that is now fixed (a loud, deliberately
+   NON-fatal warning when dm.size() < tp_devices, so a real TP shortfall can
+   never be mistaken for a driver fault).
    === AUDIT #11: AUDIT #9's ROOT CAUSE WAS WRONG (supersedes it) ===
    #9 attributed the tp2_27b rc=139 to TP sharding walking a missing device
    ("ranges[d] -> wild pointer"). TESTED AND DISPROVED: the clamp is real and
@@ -466,11 +472,15 @@ Implement features for maximizing throughput for concurrent requests, starting f
    were the cause, not a pre-existing break. Corollary: `bash -n` on every
    edited script is not optional, and a script that was clean at HEAD and
    dirty after an edit means the edit, not the repo.
-   Box state re-checked independently while here: AUDIT #9's mechanism HOLDS.
-   Both GPUs are xe-bound in PCI (04:00.0, 86:00.0, class 030000) and ALL FOUR
-   DRM nodes exist as char devices (major 226: card0/card1, renderD128/129);
-   xpu-smi and sycl-ls still enumerate ONE adapter, so the discriminator is
-   Level Zero adapter enumeration, exactly as #9 recorded. Also worth knowing
+   Box state re-checked independently while here: the box really is in a
+   1-GPU state (both GPUs xe-bound in PCI at 04:00.0 / 86:00.0, class 030000;
+   ALL FOUR DRM nodes present as char devices, major 226 — card0/card1,
+   renderD128/129; xpu-smi and sycl-ls enumerate ONE adapter). So #9's
+   CONCLUSION (box state, not a code regression) stands. Its MECHANISM does
+   NOT — see AUDIT #11: the min(tp,devices) clamp is correct, so this is not
+   sharding into a missing device. Do not read the two statements below as
+   confirming #9's wild-pointer story; they only describe how to measure the
+   box. Also worth knowing
    on this box: `lspci` is NOT INSTALLED (a `lspci | grep -c` returning 0 is a
    missing tool, not evidence about hardware) and `ls -la /dev/dri` is WRONG
    here — an `ls` wrapper (`rtk ls`) hides entries and reported only
