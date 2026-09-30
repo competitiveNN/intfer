@@ -1188,7 +1188,7 @@ sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
 
   return q.submit([&](sycl::handler& h) {
     if (dep != sycl::event{}) h.depends_on(dep);
-    h.parallel_for<class gemm_dpas4_row_kernel>(
+      h.parallel_for<class gemm_dpas4_row_kernel>(
         sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
         [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
           const uint32_t m = it.get_global_id(0);

@@ -19,12 +19,34 @@
 # codes disagree, over random / tie-adversarial / edge / non-multiple-of-64
 # datasets and multi-row batches. Runs in well under a second.
 #
+# BUILD-FIRST (added after this gate was caught validating a STALE binary):
+# the script used to run whatever $BIN happened to be on disk, so a source
+# edit that failed to compile left the previous binary in place and the gate
+# happily printed PASS for code that no longer existed. That is the same
+# failure class as audit #3c ("gates cannot protect a configuration they
+# cannot exercise"), and it is how the row-coverage hole below survived three
+# commits. This target is 2 translation units and builds in seconds.
+# Opt out with INTFER_GATE_NO_BUILD=1 only when the build is known current.
+#
 # Usage: scripts/test_ga64_recip.sh
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/ga64_recip_test/ga64_recip_test"
+BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
+BIN="$BUILD_DIR/examples/ga64_recip_test/ga64_recip_test"
+
+if [ "${INTFER_GATE_NO_BUILD:-0}" != "1" ]; then
+  if [ ! -f "$BUILD_DIR/build.ninja" ] && [ ! -f "$BUILD_DIR/Makefile" ]; then
+    echo "FAIL: no build system in $BUILD_DIR (configure it, or set INTFER_BUILD_DIR)" >&2
+    exit 1
+  fi
+  if ! cmake --build "$BUILD_DIR" --target ga64_recip_test >"$BUILD_DIR/ga64_recip_build.log" 2>&1; then
+    echo "FAIL: ga64_recip_test did not build (refusing to run a stale binary)" >&2
+    tail -20 "$BUILD_DIR/ga64_recip_build.log" >&2
+    exit 1
+  fi
+fi
 
 [ -x "$BIN" ] || { echo "FAIL: ga64_recip_test binary missing: $BIN" >&2; exit 1; }
 "$BIN"

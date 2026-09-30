@@ -967,31 +967,35 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
         if (e != sycl::event{}) e.wait_and_throw();
       preq_events.clear();
     }
-  }  // end if (preq_ok)
-  if (!preq_ok) {
-  for (uint32_t m = 0; m < M; ++m) {
-    const float* xr = x.data() + (size_t)m * K;
-    // Vectorized GA=64 quant into HOST staging (bit-exact vs the old scalar
-    // loop, incl. the trunk's original lround half-away-from-zero); then one memcpy per device
-    // row into the shared workspace. Scalar stores straight into
-    // malloc_shared are ~100x slower (copy bucket 96ms/7tok); memcpy emits
-    // wide vectorized stores. Staging is grow-only (zero steady-state
-    // allocs); rows are tight here, workspace rows strided — copy per row.
-    if (act48_staging_.size() != (size_t)M * K)
-      act48_staging_.resize((size_t)M * K);
-    if (as48_staging_.size() != (size_t)M * nGA)
-      as48_staging_.resize((size_t)M * nGA);
-    std::int8_t* qrow = act48_staging_.data() + (size_t)m * K;
-    float* srow = as48_staging_.data() + (size_t)m * nGA;
-    // Trunk's original loop used std::lround (half away from zero).
-    dashq::act_quant_ga64_batch(xr, qrow, srow, K,
-                                dashq::ActQuantRound::HalfAway);
-    for (size_t d = 0; d < devices_.size(); ++d) {
-      std::memcpy(ws48_[d].act + (size_t)m * ws48_[d].K, qrow, K);
-      std::memcpy(ws48_[d].as + (size_t)m * ws48_[d].nGA, srow,
-                  (size_t)nGA * sizeof(float));
+  } else {
+    // Host fallback: vectorized GA=64 quant into HOST staging (bit-exact vs
+    // the old scalar loop, incl. the trunk's original lround half-away-from-
+    // zero); then one memcpy per device row into the shared workspace. Scalar
+    // stores straight into malloc_shared are ~100x slower (copy bucket
+    // 96ms/7tok); memcpy emits wide vectorized stores. Staging is grow-only
+    // (zero steady-state allocs); rows are tight here, workspace rows strided
+    // — copy per row.
+    //
+    // This branch ALSO owns the (scale, inverse) pairs the pre-pass path
+    // shipped from the host: both derive s and inv from the same shared
+    // ga64_slice_max/ga64_recip sites, so a decline costs time, not codes.
+    for (uint32_t m = 0; m < M; ++m) {
+      const float* xr = x.data() + (size_t)m * K;
+      if (act48_staging_.size() != (size_t)M * K)
+        act48_staging_.resize((size_t)M * K);
+      if (as48_staging_.size() != (size_t)M * nGA)
+        as48_staging_.resize((size_t)M * nGA);
+      std::int8_t* qrow = act48_staging_.data() + (size_t)m * K;
+      float* srow = as48_staging_.data() + (size_t)m * nGA;
+      // Trunk's original loop used std::lround (half away from zero).
+      dashq::act_quant_ga64_batch(xr, qrow, srow, K,
+                                  dashq::ActQuantRound::HalfAway);
+      for (size_t d = 0; d < devices_.size(); ++d) {
+        std::memcpy(ws48_[d].act + (size_t)m * ws48_[d].K, qrow, K);
+        std::memcpy(ws48_[d].as + (size_t)m * ws48_[d].nGA, srow,
+                    (size_t)nGA * sizeof(float));
+      }
     }
-  }
   }
 #ifdef INTFER_PROFILE_GPU
   {

@@ -109,10 +109,10 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (~0.8M/token, consistent with vocab/16 tiles x K/32 ops). Layer GEMMs
   (99% of launches) remain EU/ALU, XMX idle there — that half stands.
   DEVICE ACT-QUANT PRE-PASS (2026-09-29 49b21d3; AUDITED + CORRECTED
-  2026-09-30, INTFER_DPAS_PREQ=1, default-OFF): kills the host GA64
-  act-quant loop that made DPAS a net +6% wall loss on 27B despite a -15%
-  device-side kernel win (copy bucket 269us/GEMM + submit 127us). Quant
-  moves to a standalone pre-pass kernel, dep-chained into the DPAS launch
+  2026-09-30, INTFER_DPAS_PREQ=1, default-OFF): moves the GA64 act-quant
+  STORE half off the host (it made DPAS a net +6% wall loss on 27B despite
+  a -15% device-side kernel win — copy bucket 269us/GEMM + submit 127us).
+  Quant store moves to a standalone pre-pass kernel, dep-chained into the DPAS launch
   (trailing `sycl::event` PARAMETER, NOT a Dpas48Params member) so it adds
   NO host wait. One launch PER DEVICE, never one for both — each rank owns
   its own sycl::context (device_manager.cpp), so a kernel on rank 0's queue
@@ -189,6 +189,43 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (nextafterf) into the helper makes it FAIL — tie dataset 64000/64000
   slices caught, random dataset 21 — so the gate is not vacuous (the earlier
   vacuous-gate bug was the nested PREQ flag).
+  === 2026-09-30 AUDIT #4: THE GATE CHECKED 1 OF M ROWS, AND READ A
+  STALE BINARY. BOTH FIXED. ===
+  (a) COVERAGE HOLE, PROVEN. check_batch() called the helper with M=3 but
+  only ever validated ROW 0 against the oracle, while the helper writes
+  2*M*nGA (s, inv) pairs at a row stride and the engine feeds it M rows
+  (decode M=1, prefill M=8..128, serve M>1). A row-index bug therefore left
+  every prefill/serve row with row 0's bits and the gate still reported
+  PASS. Demonstrated with a mutation that keeps row 0 bit-exact
+  (`o = out + 2*m*nGA + (m ? 2 : 0)`, in bounds): OLD row-0-only gate
+  PASSED (64000/64000 ok on all four datasets), FIXED gate FAILED with
+  467289 diagnostics. Now every row is checked against its OWN oracle call
+  (192000 slices instead of 64000).
+  (b) VACUITY NOW ASSERTED, NOT ASSUMED. Each slice also records whether a
+  1-ulp reciprocal drift WOULD have changed the answer, and the gate FAILS
+  if the tie-adversarial dataset contains no such slice. It contains
+  192000/192000 — the tie construction is genuinely adversarial. (A gate
+  that cannot fail proves nothing; the nested-PREQ bug was a vacuous gate,
+  this is the second one in the same family.)
+  (c) THE GATE READ A STALE BINARY. test_ga64_recip.sh ran whatever
+  $BIN/ga64_recip_test was on disk with no build step, so a source edit
+  that failed to compile left the old binary in place and the script printed
+  PASS for code that no longer existed — observed live during this audit
+  (a compile error scrolled past, then "GA64 RECIPROCAL TEST: PASS"). The
+  script now BUILDS its target first and refuses to run on build failure
+  (opt out with INTFER_GATE_NO_BUILD=1). Verified: an injected
+  `static_assert(false)` now yields rc=1 instead of a stale PASS. Same class
+  as audit #3c; the sibling GPU/parity/http scripts have the same gap and
+  are NOT yet fixed.
+  (d) Housekeeping: engine.cpp's host fallback had been left as a second
+  unindented `if (!preq_ok) {` after the pre-pass block's closing brace —
+  merged into a single `else`; a stray 2-space reindent inside
+  quant_gemm_dpas4_row (unrelated to the audit) reverted.
+  UNCHANGED: the perf story. The O(M*K) max-abs reduction is still on the
+  HOST (see the "Cost:" note under AUDIT #3) — only the quantize+store half
+  moved to the device, so expect roughly half the host act-quant saving the
+  49b21d3 design promised, and read the `copy` bucket as including that
+  reduction.
   === AUDIT #3b: the DPAS48 x SSM_GPU gate was asserting TIE-LUCK ===
   Forcing the single reciprocal site changed the host oracle's own codes
   (5 differing bytes over 4.1M codes on a fixed dataset) and the GPU gate
@@ -773,3 +810,4 @@ Implement features for maximizing throughput for concurrent requests, starting f
 
 - remember to commit any meaningful change made such that in case of regressions everything can be bisected.
 - remember to not litter /tmp with large tmp files, RAM is precious
+- try to parallelize work as much as possible, spawn tasks (subagents) in different worktrees that implement a specific optimization experiment, then merge all the experiments in one single batch. Every optimization experiment is gated behind a flag in the cli. The user the runs the benchmarks and reports back the results.

@@ -17,13 +17,19 @@
 //
 // This gate fails if anyone reintroduces a second reciprocal site, inlines
 // ga64_recip(), derives a scale in the helper without the shared max-abs
-// reduction, or makes the helper quantize with a different rounding rule.
+// reduction, mis-strides the helper's per-row output, or makes the helper
+// quantize with a different rounding rule.
 //
 // Method: the reference path exposes its scale but not its reciprocal, so we
 // RECOVER the reciprocal the oracle effectively used -- for each slice we
 // re-quantize with inv-1ulp, inv and inv+1ulp and see which one reproduces
 // the reference codes exactly. A regression then reports exactly how far the
 // helper drifted (1 ulp / scale mismatch) instead of just "streams differ".
+//
+// NON-VACUITY is asserted, not assumed. Each slice also records whether a
+// 1-ulp reciprocal drift WOULD have changed the answer, and the gate fails if
+// the tie-adversarial dataset contains no such slice -- otherwise "PASS"
+// could just mean the dataset never exercises the failure it claims to.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -74,37 +80,49 @@ struct Tally {
   long scale_off = 0;      // shipped scale != oracle scale
   long code_off = 0;       // shipped codes != oracle codes
   long elements = 0;
+  long ulp_discrim = 0;  // a 1-ulp drift WOULD have changed the codes
 };
 
-// One multi-row batch: row 0 is the reference row, every row is checked.
+// One multi-row batch. EVERY row is checked, and each row against its OWN
+// oracle call: the helper writes 2*M*nGA pairs at row stride 2*nGA, so a
+// mis-strided helper leaves rows 1..M-1 holding row 0's bits (or garbage)
+// while row 0 still matches. A row-0-only check cannot see that, which is
+// exactly the class of bug this gate exists to rule out.
 void check_batch(const std::vector<float>& x, size_t M, size_t K, Tally& t) {
   const size_t nGA = (K + kGA - 1) / kGA;
   std::vector<std::int8_t> q_ref(K), q_h(K), q_dn(K), q_up(K);
   std::vector<float> s_ref(nGA), si(2 * M * nGA);
-  intfer::dashq::act_quant_ga64_batch(x.data(), q_ref.data(), s_ref.data(), K,
-                                       ActQuantRound::HalfAway);
   intfer::dashq::act_quant_ga64_scale_inv_batch(x.data(), M, K, si.data());
-  for (size_t g = 0; g < nGA; ++g) {
-    const size_t k0 = g * kGA;
-    const size_t k1 = std::min(k0 + kGA, K);
-    const float sh = si[2 * g], ih = si[2 * g + 1];
-    if (std::memcmp(&sh, &s_ref[g], 4) != 0) t.scale_off++;
-    quant_with(x.data() + k0, k1 - k0, ih, q_h.data());
-    quant_with(x.data() + k0, k1 - k0, ulp_dn(ih), q_dn.data());
-    quant_with(x.data() + k0, k1 - k0, ulp_up(ih), q_up.data());
-    const std::int8_t* qr = q_ref.data() + k0;
-    const bool mh = std::memcmp(q_h.data(), qr, k1 - k0) == 0;
-    const bool md = std::memcmp(q_dn.data(), qr, k1 - k0) == 0;
-    const bool mu = std::memcmp(q_up.data(), qr, k1 - k0) == 0;
-    if (!mh) t.code_off++;
-    t.slices++;
-    t.elements += static_cast<long>(k1 - k0);
-    if (mh) {
-      t.ok++;
-    } else if (md || mu) {
-      t.inv_off++;
-    } else {
-      t.inv_off++;  // further than 1 ulp: still a reciprocal-class failure
+  for (size_t m = 0; m < M; ++m) {
+    const float* xm = x.data() + m * K;
+    intfer::dashq::act_quant_ga64_batch(xm, q_ref.data(), s_ref.data(), K,
+                                        ActQuantRound::HalfAway);
+    for (size_t g = 0; g < nGA; ++g) {
+      const size_t k0 = g * kGA;
+      const size_t k1 = std::min(k0 + kGA, K);
+      const float sh = si[2 * (m * nGA + g)], ih = si[2 * (m * nGA + g) + 1];
+      if (std::memcmp(&sh, &s_ref[g], 4) != 0) t.scale_off++;
+      quant_with(xm + k0, k1 - k0, ih, q_h.data());
+      quant_with(xm + k0, k1 - k0, ulp_dn(ih), q_dn.data());
+      quant_with(xm + k0, k1 - k0, ulp_up(ih), q_up.data());
+      const std::int8_t* qr = q_ref.data() + k0;
+      const bool mh = std::memcmp(q_h.data(), qr, k1 - k0) == 0;
+      const bool md = std::memcmp(q_dn.data(), qr, k1 - k0) == 0;
+      const bool mu = std::memcmp(q_up.data(), qr, k1 - k0) == 0;
+      if (!mh) t.code_off++;
+      // Discriminating power: a 1-ulp drift in `inv` changes the answer here.
+      if (!md || !mu) t.ulp_discrim++;
+      t.slices++;
+      t.elements += static_cast<long>(k1 - k0);
+      if (mh) {
+        t.ok++;
+      } else {
+        // Either a neighbouring reciprocal (1 ulp) reproduces the oracle, or
+        // nothing this close does -- both are reciprocal-class failures, but
+        // the second also implicates the scale.
+        if (!(md || mu)) t.scale_off++;
+        t.inv_off++;
+      }
     }
   }
 }
@@ -121,8 +139,9 @@ void check_tail(Tally& t) {
 void report(const char* name, const Tally& t) {
   std::printf(
       "  %-10s slices=%-7ld ok=%-7ld inv_off=%-4ld scale_off=%-4ld "
-      "code_off=%-4ld elems=%ld\n",
-      name, t.slices, t.ok, t.inv_off, t.scale_off, t.code_off, t.elements);
+      "code_off=%-4ld discrim=%-7ld elems=%ld\n",
+      name, t.slices, t.ok, t.inv_off, t.scale_off, t.code_off, t.ulp_discrim,
+      t.elements);
 }
 
 }  // namespace
@@ -204,13 +223,24 @@ int main() {
   if (bad != 0) {
     std::printf(
         "GA64 RECIPROCAL TEST: FAIL (%ld failures: the helper no longer ships "
-        "the oracle's (scale, reciprocal) bits)\n",
+        "the oracle's (scale, reciprocal) bits for every row)\n",
         bad);
     return 1;
   }
+  // A gate that cannot fail proves nothing. The tie dataset exists precisely
+  // because a 1-ulp reciprocal drift flips a code only at exact .5 boundaries;
+  // if no slice there is sensitive to a 1-ulp drift, the dataset is silently
+  // no longer adversarial and the whole gate is vacuous.
+  if (b.ulp_discrim == 0) {
+    std::printf(
+        "GA64 RECIPROCAL TEST: FAIL (tie dataset has NO 1-ulp-discriminating "
+        "slice -> the gate is vacuous; rebuild the adversarial construction)\n");
+    return 1;
+  }
   std::printf(
-      "GA64 RECIPROCAL TEST: PASS (%ld slices, %ld elements bit-identical)\n",
+      "GA64 RECIPROCAL TEST: PASS (%ld slices, %ld elements bit-identical; "
+      "%ld tie slices are 1-ulp-discriminating, so the gate has teeth)\n",
       a.slices + b.slices + c.slices + d.slices,
-      a.elements + b.elements + c.elements + d.elements);
+      a.elements + b.elements + c.elements + d.elements, b.ulp_discrim);
   return 0;
 }
