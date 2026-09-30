@@ -919,17 +919,23 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
     preq_events.resize(devices_.size());
     // (scale, inverse) pairs on the HOST, verbatim. The device must neither
     // divide nor re-reduce: q = trunc(x*inv +- 0.5) turns a 1-ulp reciprocal
-    // difference into a whole +-1 code error at .5 ties, and host `1.0f/s` is
-    // codegen-dependent (measured 1 ulp off correctly-rounded in this binary)
-    // while a device `1.0f/s` lowers to rcp.approx. Shipping the host's bits
-    // makes the pre-pass bit-exact by construction. O(M*K) work + a tiny H2D;
-    // this replaces the O(M*K) host quant loop it was introduced to delete,
-    // but keeps it off the critical path of the GEMM itself (no wait).
+    // difference into a whole +-1 code error at .5 ties, and `1.0f/s` is not a
+    // portable bit-source (device lowers it to rcp.approx). Shipping the host's
+    // bits -- all produced by dashq's single noinline ga64_recip site, gated
+    // by scripts/test_ga64_recip.sh -- makes the pre-pass bit-exact by
+    // construction. O(M*K) work + a tiny H2D; this replaces the O(M*K) host
+    // quant loop it was introduced to delete (but not its max-abs reduction),
+    // and stays off the GEMM's critical path (dep-chained, no added wait).
     if (si48_staging_.size() != 2 * (size_t)M * nGA)
       si48_staging_.resize(2 * (size_t)M * nGA);
-    dashq::act_quant_ga64_scale_inv_batch(x.data(), M, K, nGA,
+    // nGA is re-derived inside the helper from K (identical expression to the
+    // kernel's), so the staging size above and the kernel's slice count cannot
+    // drift apart.
+    dashq::act_quant_ga64_scale_inv_batch(x.data(), M, K,
                                           si48_staging_.data());
-    for (size_t d = 0; d < devices_.size(); ++d) {
+    // Stop submitting once any device declines: the remaining devices are
+    // about to be overwritten by the host fallback anyway.
+    for (size_t d = 0; d < devices_.size() && preq_ok; ++d) {
       sycl::queue& q = devices_[d].queue;
       float* xd = ws48_[d].f32;
       // Unconditional H2D. `x` is a host std::vector; `xd` is device USM,

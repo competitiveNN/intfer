@@ -140,10 +140,10 @@ Implement features for maximizing throughput for concurrent requests, starting f
       rounded.
     * A DEVICE `1.0f/s` lowers to rcp.approx: 15,868/151,400 mismatches vs
       host divss over legal s.
-    * The HOST `1.0f/s` in dashq.cpp is ALSO 1 ulp off the correctly
-      rounded value IN THIS BINARY (exact integer rational comparison of the
-      two candidate bit patterns). Same expression, same -O3 flags, no
-      fast-math anywhere: codegen-context dependent, never assume IEEE.
+    * HOST `1.0f/s` is not a portable bit-source either: same expression,
+      same -O3 flags, no fast-math, yet host call sites in different
+      codegen contexts were observed to disagree (that is the whole reason
+      one site now exists). Never assume a second site agrees.
   => "Correcting" the device moved it AWAY from the reference and CREATED
   the decode-step-14 divergence this same commit then documented as an
   unfixable "KNOWN, UNRESOLVED tie rule". The Newton step is GONE.
@@ -158,6 +158,71 @@ Implement features for maximizing throughput for concurrent requests, starting f
   back (the pre-pass was built to delete the full host quant); it is a
   reduction plus M*K/64 divides instead of a full host quant, and stays off
   the GEMM critical path (dep-chained, no added wait).
+  === AUDIT #3: ONE reciprocal site, and a numeric gate for it ===
+  The fix above shipped the host's bits but still computed them at a SECOND
+  host call site (`1.0f/s` inside the helper vs inside the AVX2 oracle).
+  That is the same hazard one layer down: correct only by luck of codegen,
+  while the commit message claimed "by construction". Measured with a probe
+  that RECOVERS the oracle's effective reciprocal (re-quantizing with
+  inv-1ulp/inv/inv+1ulp): 288k slices / 18.4M elements agreed in the
+  7f005fe binary — luck, not a guarantee.
+  FIX: dashq now has exactly ONE max-abs site (ga64_slice_max{,_avx2,_scalar})
+  and ONE reciprocal site, `ga64_recip()`, deliberately NOINLINE so it
+  compiles to a single body/instruction sequence that every GA64 producer
+  executes (AVX2 oracle, scalar fallback, scale_inv helper). Side benefits:
+  the helper stopped duplicating a SCALAR max-abs loop (it now vectorizes via
+  the shared site, so the restored host reduction is cheaper than 7f005fe's),
+  the helper's NaN handling now matches the oracle's, and the helper derives
+  nGA from K itself (a caller-supplied nGA could silently leave tail slices'
+  (s,inv) uninitialized). Also: the pre-pass loop now stops submitting once
+  any device declines instead of launching on the remaining ranks.
+  The shared site currently happens to be correctly rounded (64000/64000
+  legal scales) — that is a property to PRESERVE, not to re-derive; a
+  Newton-style "fix" at a second site would move it away from the oracle.
+  NEW GATE: scripts/test_ga64_recip.sh -> examples/ga64_recip_test (CPU-only,
+  <1s, no model/GPU). It asserts the helper's (s, inv) reproduce the oracle's
+  scales bit-exactly AND that the device quant rule applied to the shipped inv
+  reproduces the oracle's CODES, over random / tie-adversarial / edge
+  (zeros, denormals, saturation, outliers) / K-not-multiple-of-64 datasets and
+  M=3 multi-row batches; on failure it reports the ulp distance, not just
+  "streams differ". NEGATIVE TEST: injecting a 1-ulp drift
+  (nextafterf) into the helper makes it FAIL — tie dataset 64000/64000
+  slices caught, random dataset 21 — so the gate is not vacuous (the earlier
+  vacuous-gate bug was the nested PREQ flag).
+  === AUDIT #3b: the DPAS48 x SSM_GPU gate was asserting TIE-LUCK ===
+  Forcing the single reciprocal site changed the host oracle's own codes
+  (5 differing bytes over 4.1M codes on a fixed dataset) and the GPU gate
+  then FAILED on `DPAS48+SSM_GPU == DPAS48`, diverging at decode step 15
+  (TP=1 and TP=2). Note what did NOT fail: `DPAS48+PREQ == DPAS48` and
+  `DPAS48+PREQ+SSM_GPU == DPAS48+SSM_GPU` still held exactly — the pre-pass
+  contract survived, so the only differing component between those two arms
+  is WHERE THE SSM RECURRENCE RUNS.
+  Root cause (measured, not inferred): gemm::ssm_forward is NOT bit-exact with
+  the host loop, and never was — the "bit-identical math, same element order"
+  comment at the INTFER_SSM_GPU gate site was wrong. (a) sycl::exp differs from
+  std::expf on 694714/1048576 = 66.25% of FP32 inputs over [-8,0], so
+  g_t=exp(g) and beta=sigmoid(b) differ and the state S diverges from step 1;
+  (b) the kv/readout dot products accumulate in a register on device (FMA
+  contraction) vs into memory on the host. The resulting ~1ulp drift is
+  invisible on the FP16 GEMM path (FP16 resolves ~1e-3), which is why
+  base-stream identity held and SSM_GPU was certified. INT8/GA64 act quant
+  resolves ~1/127 per slice, so the same drift flips a code at a tie and the
+  greedy stream diverges. The pre-single-site build "passed" that assertion
+  only because its accidental reciprocal bits happened to put every tie on
+  the same side — the assertion was luck, not a property.
+  FIX: SSM_GPU now DECLINES when INTFER_DPAS48=1 (single gate helper
+  ssm_gpu_allowed() at main.cpp; all 5 env read sites route through it, with a
+  one-time stderr notice). Same idiom as L4/L5: a fast path that cannot hold
+  the bit-contract falls back to the host. Every existing gate assertion is
+  therefore unchanged and still meaningful, and no flag combination silently
+  yields a different token stream. Both flags are default-off experiments, so
+  nothing production changes. The REAL fix (port the host exp polynomial to
+  the device, or kill contraction there, then re-certify SSM_GPU x DPAS48) is
+  NOT attempted — scoped as future work.
+  CONSEQUENCE FOR RECORDED STREAMS: the host GA64 act-quant codes changed
+  slightly (ties only), so DPAS48-family streams differ from those recorded
+  at 7f005fe. Base/FP16 streams are unaffected (gate: base n=24 unchanged).
+  Do not treat pre-audit DPAS48 token lists as golden.
   === OTHER FIXES ===
   (a) PARTIAL-DECLINE RACE (nondeterminism): if device d's pre-pass
   launched but device d+1 declined, the already-queued d kernel still
@@ -172,8 +237,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
   === FIXED (was "KNOWN, UNRESOLVED"): PREQ x SSM_GPU tie divergence ===
   Real and deterministic (step 14, TP=1 and TP=2, ~2 mismatched elements per
   ~1950 GEMM calls), but NOT a tie-rule bug: it was the reciprocal (AUDIT #2
-  above) — the device was correctly rounded and the HOST was the 1-ulp-off
-  one. The earlier "host gives 48 where trunc(v+0.5) gives 47" evidence was
+  above) — the device was the correctly rounded one and the HOST differed
+  from it. The earlier "host gives 48 where trunc(v+0.5) gives 47" evidence was
   an artifact of a reference using `_mm_cvtss_si32` (CVTSS2SI = round to
   NEAREST) instead of `_mm_cvttss_si32` (CVTTSS2SI = truncate); dashq
   correctly uses `_mm256_cvttps_epi32`. Writing a host reference for this
@@ -181,7 +246,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
   wrong on ~53% of elements. PREQ now composes with SSM_GPU and the gate
   ASSERTS it. Correctness-gated: gpu-optin PASS (base arms + PREQ==DPAS48 +
   ROW+PREQ + PREQ+SSM_GPU + SSM_GPU + PREQ-alone inert, n=24, TP1/TP2), cpu
-  parity PASS, http batch PASS. Path fires: decode nk 1116->1488
+  parity PASS, http batch PASS, plus the new ga64-recip numeric gate (AUDIT #3
+  above). Path fires: decode nk 1116->1488
   (+372 = 4tok x 93), nw unchanged 744.
   NO wall-time claim (never benchmarked here) — needs a quiet-box 27B
   INT4/G64 A/B before any perf claim.
@@ -306,7 +372,11 @@ Implement features for maximizing throughput for concurrent requests, starting f
   INTFER_SSM_GPU) exist as opt-in paths, certified stream-identical on
   GPU by scripts/test_gpu_optin.sh (10/10: base/KV/Q8/Q8+HAD/SSM_GPU x
   TP1/TP2, .intifer stream 279/6511/314/279) — wall-time comparison
-  still needs quiet box (load<2).
+  still needs quiet box (load<2). SCOPE CAVEAT (audit #3b above): the
+  SSM_GPU identity holds only on the FP16 GEMM path; its ~1ulp device/host
+  recurrence drift is invisible in FP16 but visible under INT8/GA64 act
+  quant, so SSM_GPU now declines under INTFER_DPAS48=1. "Certified
+  stream-identical" never meant "bit-exact SSM recurrence".
 - First-touch migration (2026-09-21, measured on 27B TP=2 serve):
   preload_all builds 496 shards in ~49s and pins them (zero rebuilds on
   first request), but shard USM is malloc_shared so pages stay host-resident

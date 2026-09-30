@@ -1,0 +1,2 @@
+add_executable(ga64_recip_test main.cpp)
+target_link_libraries(ga64_recip_test PRIVATE intfer_quant_core intfer_common)

@@ -92,13 +92,16 @@ for tp in 1 2; do
   # step 14 and is now GATED, because the cause was fixed, not tolerated:
   # the GA64 rule q = trunc(x*inv +- 0.5) amplifies a 1-ulp difference in the
   # reciprocal `inv` into a whole +-1 code error whenever the product lands on
-  # a .5 tie. The host's `1.0f/s` is codegen-dependent (measured 1 ulp off the
-  # correctly rounded value in this binary, checked against exact rational
-  # arithmetic) while a device `1.0f/s` lowers to rcp.approx, so the two sides
+  # a .5 tie. `1.0f/s` is not a portable bit-source (a device division lowers
+  # to rcp.approx, 1 ulp off on ~10% of legal scales; host call sites in
+  # different contexts have been observed to disagree), so the two sides
   # disagreed by one code on ~2 elements per ~1950 GEMM calls. The pre-pass now
-  # consumes the HOST's reciprocal verbatim (ActQuantDevParams::inv_in via
-  # dashq::act_quant_ga64_inv_batch) instead of dividing, which is bit-exact by
-  # construction. Do not "simplify" that back into a device division.
+  # consumes the HOST's reciprocal verbatim (ActQuantDevParams::scale_inv_in
+  # fed by dashq::act_quant_ga64_scale_inv_batch, which routes through the
+  # single noinline ga64_recip site) instead of dividing. Do not "simplify"
+  # that back into a device or kernel-local division. The numeric invariant
+  # itself is gated independently and much faster by scripts/test_ga64_recip.sh
+  # -- this stream gate only proves it survives the real model numerics.
   GOT="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS_PREQ=1 INTFER_SSM_GPU=1)"
   echo "TP=$tp [DPAS48+PREQ+SSM_GPU n=24]: '$GOT'"
   [ "$GOT" = "$D48" ] || fail "TP=$tp [DPAS48+PREQ+SSM_GPU] '$GOT' != DPAS48 '$D48'"

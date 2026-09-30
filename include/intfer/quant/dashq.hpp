@@ -82,19 +82,25 @@ void act_quant_ga64_batch(const float* x, int8_t* q, float* scales, size_t K,
 
 // Per-slice activation (scale, inverse scale) pairs for the GA64 rule, laid
 // out as 2*M*nGA tight floats: out[2*(m*nGA+g)] = s, out[2*(m*nGA+g)+1] = inv.
-// Both are exactly what act_quant_ga64_batch() derives internally
-// (s = max(1e-6, max|x|)/127, inv = 1.0f/s), so a device kernel consuming
-// these bits reproduces the host act-quant codes exactly -- and cannot emit a
-// scale that disagrees with the inverse it multiplied by.
+// nGA is derived from K as ceil(K/64) -- the same expression the device
+// pre-pass kernel uses -- so the two cannot disagree on slice count.
+//
+// Both values come from the SAME max-abs and reciprocal code sites that
+// act_quant_ga64_batch() uses internally (ga64_slice_max / ga64_recip in
+// dashq.cpp), so a device kernel consuming these bits reproduces the host
+// act-quant codes exactly -- and cannot emit a scale that disagrees with the
+// inverse it multiplied by.
 //
 // This exists because q = trunc(x*inv +- 0.5) amplifies a 1-ulp reciprocal
 // difference into a full +-1 code error whenever the product lands on a .5
-// tie, and `1.0f/s` is codegen-dependent: inside this binary it measures 1 ulp
-// off the correctly rounded value (checked against exact rational
-// arithmetic), whereas a device `1.0f/s` lowers to rcp.approx. Compute the
-// reciprocal ONCE, on the side whose codes are the reference.
+// tie, and `1.0f/s` is not a portable bit-source: the device lowers it to
+// rcp.approx (1 ulp off on ~10% of legal scales) and host call sites in
+// different contexts have been observed to disagree. The reciprocal is
+// therefore computed ONCE, through the single shared ga64_recip() site in
+// dashq.cpp, on the side whose codes are the reference -- never re-derived
+// per call site. Gated by scripts/test_ga64_recip.sh.
 void act_quant_ga64_scale_inv_batch(const float* x, size_t M, size_t K,
-                                    uint32_t nGA, float* out);
+                                    float* out);
 
 // ---------------------------------------------------------------------------
 // Diagonal Hessian

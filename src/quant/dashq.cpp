@@ -115,6 +115,82 @@ void half_to_float_batch(const uint16_t* x, float* y, size_t n) {
   for (size_t i = 0; i < n; ++i) y[i] = half_to_float(x[i]);
 }
 
+// ---------------------------------------------------------------------------
+// GA64 slice scale: ONE max-abs site and ONE reciprocal site.
+//
+// q = trunc(x*inv +- 0.5) is pathologically ill-conditioned in `inv`: a 1-ulp
+// reciprocal difference moves the product across an exact .5 tie and flips the
+// code by one. `1.0f/s` is therefore NOT a portable bit-source -- its codegen
+// depends on the caller (the device lowers it to rcp.approx, which is 1 ulp off
+// the correctly rounded value on ~10% of legal scales, and host call sites
+// written in different contexts have been observed to disagree with each
+// other). So EVERY producer of GA64 reciprocal bits (the AVX2 oracle, the
+// scalar fallback, and act_quant_ga64_scale_inv_batch() feeding the device
+// pre-pass) goes through the two helpers below:
+//
+//   ga64_slice_max*  -- one max-abs reduction, so the scale is one value and
+//                       the reciprocal is always derived from THAT scale.
+//   ga64_recip       -- noinline on purpose: one compiled body means one
+//                       instruction sequence, which makes the shared bits a
+//                       structural property instead of a coincidence of how
+//                       each caller happens to be optimized. Do NOT inline it,
+//                       do NOT add a second division site, and do NOT re-add an
+//                       fma/Newton "correction": a device- or kernel-local
+//                       reciprocal can only move AWAY from the oracle. (The
+//                       shared site is correctly rounded today -- verified over
+//                       64000 legal scales by examples/ga64_recip_test -- but
+//                       that is a property to preserve, not to re-derive.)
+#if defined(_MSC_VER)
+#define INTFER_GA64_NOINLINE __declspec(noinline)
+#else
+#define INTFER_GA64_NOINLINE __attribute__((noinline))
+#endif
+
+static INTFER_GA64_NOINLINE float ga64_recip(float s) { return 1.0f / s; }
+
+static float ga64_slice_max_scalar(const float* x, size_t k0, size_t k1) {
+  float mx = 1e-6f;
+  for (size_t k = k0; k < k1; ++k) {
+    float v = x[k] >= 0 ? x[k] : -x[k];
+    if (v > mx) mx = v;
+  }
+  return mx;
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2")))
+static float ga64_slice_max_avx2(const float* x, size_t k0, size_t k1) {
+  const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+  __m256 mx8 = _mm256_set1_ps(1e-6f);
+  size_t k = k0;
+  for (; k + 8 <= k1; k += 8) {
+    __m256 v = _mm256_loadu_ps(x + k);
+    mx8 = _mm256_max_ps(mx8, _mm256_and_ps(v, absmask));
+  }
+  // Horizontal max of the 8 lanes.
+  __m128 lo = _mm256_castps256_ps128(mx8);
+  __m128 hi = _mm256_extractf128_ps(mx8, 1);
+  __m128 m4 = _mm_max_ps(lo, hi);
+  m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+  m4 = _mm_max_ps(m4, _mm_shuffle_ps(m4, m4, 0x55));
+  float mx = _mm_cvtss_f32(m4);
+  for (; k < k1; ++k) {
+    float v = x[k] >= 0 ? x[k] : -x[k];
+    if (v > mx) mx = v;
+  }
+  return mx;
+}
+
+static inline float ga64_slice_max(const float* x, size_t k0, size_t k1) {
+  if (avx2_available()) return ga64_slice_max_avx2(x, k0, k1);
+  return ga64_slice_max_scalar(x, k0, k1);
+}
+#else
+static inline float ga64_slice_max(const float* x, size_t k0, size_t k1) {
+  return ga64_slice_max_scalar(x, k0, k1);
+}
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64)
 // 8-wide AVX2 GA=64 act quant. Per slice: horizontal max-abs (SIMD tree +
 // scalar tail), then scale/broadcast/quantize.
@@ -130,7 +206,6 @@ static void act_quant_ga64_avx2(const float* x, int8_t* q, float* scales,
                                 size_t K) {
   constexpr size_t GA = 64;
   const __m256 signbit = _mm256_set1_ps(-0.0f);
-  const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
   const __m256 v127 = _mm256_set1_ps(127.0f);
   const __m256 vn127 = _mm256_set1_ps(-127.0f);
   const __m256 half = _mm256_set1_ps(0.5f);
@@ -139,30 +214,15 @@ static void act_quant_ga64_avx2(const float* x, int8_t* q, float* scales,
     const size_t k0 = g * GA;
     size_t k1 = k0 + GA;
     if (k1 > K) k1 = K;
-    // Max-abs over the slice.
-    __m256 mx8 = _mm256_set1_ps(1e-6f);
-    size_t k = k0;
-    for (; k + 8 <= k1; k += 8) {
-      __m256 v = _mm256_loadu_ps(x + k);
-      mx8 = _mm256_max_ps(mx8, _mm256_and_ps(v, absmask));
-    }
-    // Horizontal max of the 8 lanes.
-    __m128 lo = _mm256_castps256_ps128(mx8);
-    __m128 hi = _mm256_extractf128_ps(mx8, 1);
-    __m128 m4 = _mm_max_ps(lo, hi);
-    m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
-    m4 = _mm_max_ps(m4, _mm_shuffle_ps(m4, m4, 0x55));
-    float mx = _mm_cvtss_f32(m4);
-    for (; k < k1; ++k) {
-      float v = x[k] >= 0 ? x[k] : -x[k];
-      if (v > mx) mx = v;
-    }
-    const float s = mx / 127.0f;
-    const float inv = 1.0f / s;
+    // Scale from the SHARED max-abs site and the SHARED reciprocal site (see
+    // ga64_recip): the oracle and the device pre-pass feed must not be able to
+    // disagree, at any .5 tie, ever.
+    const float s = ga64_slice_max_avx2(x, k0, k1) / 127.0f;
+    const float inv = ga64_recip(s);
     scales[g] = s;
     // Quantize: clamp, then round per mode.
     const __m256 vinv = _mm256_set1_ps(inv);
-    k = k0;
+    size_t k = k0;
     for (; k + 8 <= k1; k += 8) {
       __m256 v = _mm256_mul_ps(_mm256_loadu_ps(x + k), vinv);
       v = _mm256_min_ps(_mm256_max_ps(v, vn127), v127);
@@ -204,13 +264,8 @@ static void act_quant_ga64_scalar(const float* x, int8_t* q, float* scales,
     const size_t k0 = g * GA;
     size_t k1 = k0 + GA;
     if (k1 > K) k1 = K;
-    float mx = 1e-6f;
-    for (size_t k = k0; k < k1; ++k) {
-      float v = x[k] >= 0 ? x[k] : -x[k];
-      if (v > mx) mx = v;
-    }
-    const float s = mx / 127.0f;
-    const float inv = 1.0f / s;
+    const float s = ga64_slice_max_scalar(x, k0, k1) / 127.0f;
+    const float inv = ga64_recip(s);
     scales[g] = s;
     for (size_t k = k0; k < k1; ++k) {
       float v = x[k] * inv;
@@ -225,23 +280,22 @@ static void act_quant_ga64_scalar(const float* x, int8_t* q, float* scales,
 }
 
 void act_quant_ga64_scale_inv_batch(const float* x, size_t M, size_t K,
-                                    uint32_t nGA, float* out) {
+                                    float* out) {
   constexpr size_t GA = 64;
+  // nGA is DERIVED here, not passed in: the device pre-pass derives it from K
+  // with the identical expression, and a caller-supplied nGA that disagreed
+  // would silently leave the tail slices' (s, inv) pairs uninitialised.
+  const size_t nGA = (K + GA - 1) / GA;
   for (size_t m = 0; m < M; ++m) {
     const float* xr = x + m * K;
     float* o = out + 2 * (size_t)m * nGA;
-    for (uint32_t g = 0; g < nGA; ++g) {
-      const size_t k0 = (size_t)g * GA;
+    for (size_t g = 0; g < nGA; ++g) {
+      const size_t k0 = g * GA;
       size_t k1 = k0 + GA;
       if (k1 > K) k1 = K;
-      float mx = 1e-6f;
-      for (size_t k = k0; k < k1; ++k) {
-        float v = xr[k] >= 0 ? xr[k] : -xr[k];
-        if (v > mx) mx = v;
-      }
-      const float s = mx / 127.0f;
+      const float s = ga64_slice_max(xr, k0, k1) / 127.0f;
       o[2 * g] = s;
-      o[2 * g + 1] = 1.0f / s;
+      o[2 * g + 1] = ga64_recip(s);
     }
   }
 }

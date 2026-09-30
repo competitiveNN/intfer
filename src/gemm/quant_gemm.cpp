@@ -960,12 +960,14 @@ sycl::event act_quant_ga64_dev(sycl::queue& q, const ActQuantDevParams& p) {
           //
           // Do NOT recompute `1.0f / s` here: q = trunc(x*inv +- 0.5) turns a
           // 1-ulp reciprocal difference into a whole +-1 code error at .5
-          // ties, and the two sides legitimately disagree (host `1.0f/s` is
-          // codegen-dependent and measures 1 ulp off correctly-rounded here;
-          // a device `1.0f/s` lowers to rcp.approx, off the other way). An
-          // earlier revision "fixed" this with an fma Newton step, which made
-          // the device correctly rounded and therefore moved it AWAY from the
-          // host — that is what perturbed the greedy stream at decode step 14.
+          // ties, and `1.0f/s` is not a portable bit-source (a device
+          // division lowers to rcp.approx, 1 ulp off on ~10% of legal
+          // scales). An earlier revision "fixed" this with an fma Newton
+          // step on the device, which made the device correctly rounded and
+          // therefore moved it AWAY from the host — that is what perturbed the
+          // greedy stream at decode step 14. The host side now routes every
+          // GA64 reciprocal through one noinline site (dashq::ga64_recip);
+          // this kernel consumes those exact bits.
           const float* si = SI + 2 * ((size_t)m * nGA + g);
           const float s = si[0];
           const float inv = si[1];

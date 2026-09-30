@@ -2547,6 +2547,47 @@ struct GpuBackend : public LinearBackend {
 #endif
 
 #ifdef INTFER_HAS_GPU_BACKEND
+// ---------------------------------------------------------------------------
+// SSM_GPU gate (all call sites go through this; never read the env directly).
+//
+// INTFER_SSM_GPU=1 moves the LA SSM recurrence from the host loop to the
+// device kernel gemm::ssm_forward. The kernel runs the SAME loop order, but it
+// is NOT bit-exact with the host loop, and never was -- the "bit-identical
+// math" claim in the old comment here was wrong:
+//   * sycl::exp differs from expf on ~66% of FP32 inputs (measured, 1M
+//     samples over [-8,0]); g_t = exp(g) and beta = sigmoid(b) therefore
+//     differ, so the state S diverges from step 1 onwards;
+//   * the kv/readout dot products accumulate in a register on device (FMA
+//     contraction) but into memory on the host.
+// The resulting ~1ulp difference is invisible on the FP16 GEMM path (FP16
+// resolves ~1e-3), which is why base-stream identity held and the path was
+// certified. It is NOT invisible on the DPAS48 path: INT8/GA64 act quant
+// resolves ~1/127 per slice, so an activation sitting on a quant tie flips a
+// code and the greedy stream diverges (observed at decode step 15, TP=1 and
+// TP=2, n=24).
+//
+// So SSM_GPU DECLINES under INTFER_DPAS48=1 -- the same "fast path cannot hold
+// the bit-contract => fall back to host" idiom L4/L5 use. Both flags are
+// default-off experiments, so nothing production is affected; the point is that
+// no flag combination silently produces a different token stream. Making the
+// two bit-exact instead (port the host's exp polynomial to the device, or
+// disable contraction there) is the real fix and is NOT attempted here.
+static bool ssm_gpu_allowed() {
+  static const bool env_on = (std::getenv("INTFER_SSM_GPU") != nullptr);
+  static const char* d48 = std::getenv("INTFER_DPAS48");
+  static const bool dpas48 = (d48 && d48[0] == '1' && d48[1] == '\0');
+  static std::atomic<bool> warned{false};
+  if(env_on && dpas48 && !warned.exchange(true)) {
+    std::fprintf(stderr,
+        "[intfer] INTFER_SSM_GPU declined: INTFER_DPAS48=1 is also set. The "
+        "device SSM recurrence is not bit-exact with the host loop (sycl::exp "
+        "vs expf, FMA-contracted reductions) and INT8/GA64 act quant resolves "
+        "that ~1ulp drift as a different greedy stream. Use one flag or the "
+        "other.\n");
+  }
+  return env_on && !dpas48;
+}
+
 // Shared SsmDev resolver for gpu_ssm_rows and the L4 fused path below:
 // resolve (alloc/upload on first use) the resident state entry for
 // (req, L), growing staging to `need` rows. Pure move of the logic that
@@ -4941,7 +4982,7 @@ static StepOut step(Request& req, int token, int pos,
       // the oracle token stream is the arbiter. Env-off (default) keeps
       // the exact host path. No snapshots in step() => no mirror sync.
       static const bool ssm_gpu_env =
-          (std::getenv("INTFER_SSM_GPU") != nullptr);
+          ssm_gpu_allowed();
       bool ssm_done = false;
 #ifdef INTFER_HAS_GPU_BACKEND
       if(ssm_gpu_env) {
@@ -5448,7 +5489,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
 #ifdef INTFER_HAS_GPU_BACKEND
       {
         static const bool ssm_gpu_env =
-            (std::getenv("INTFER_SSM_GPU") != nullptr);
+            ssm_gpu_allowed();
         if(ssm_gpu_env) {
           if(auto* gpu_be = dynamic_cast<GpuBackend*>(backend)) {
             if(gpu_be->eng) {
@@ -5861,7 +5902,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
 #ifdef INTFER_HAS_GPU_BACKEND
       {
         static const bool ssm_gpu_env =
-            (std::getenv("INTFER_SSM_GPU") != nullptr);
+            ssm_gpu_allowed();
         if(ssm_gpu_env) {
           if(auto* gpu_be0 = dynamic_cast<GpuBackend*>(backend))
             c_ssm_on = (gpu_be0->eng != nullptr);
@@ -6555,7 +6596,7 @@ static std::vector<StepOut> step_batch(
 #ifdef INTFER_HAS_GPU_BACKEND
       {
         static const bool ssm_gpu_env =
-            (std::getenv("INTFER_SSM_GPU") != nullptr);
+            ssm_gpu_allowed();
         if(ssm_gpu_env) {
           if(auto* gpu_be0 = dynamic_cast<GpuBackend*>(backend))
             b_ssm_on = (gpu_be0->eng != nullptr);
@@ -10095,7 +10136,7 @@ int main(int argc, char** argv){
         // host ssm_state vectors under the resident device states — push
         // the mirrors back to the device so the next step() sees the
         // rolled-back state. No-op when the device path was never used.
-        if(std::getenv("INTFER_SSM_GPU") != nullptr) {
+        if(ssm_gpu_allowed()) {
           if(auto* gpu_rb = dynamic_cast<GpuBackend*>(backend.get()))
             gpu_rb->ssm_resync_all();
         }

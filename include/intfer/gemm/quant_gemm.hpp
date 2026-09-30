@@ -264,12 +264,14 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
 // max-abs reduction is therefore NOT redone on device. Rationale — the GA64
 // rule q = trunc(x*inv +- 0.5) is pathologically ill-conditioned in `inv`: a
 // 1-ulp difference in the reciprocal moves the product across a .5 tie and
-// flips the code by one. The host's `1.0f/s` is *codegen-dependent* and
-// measured 1 ulp off the correctly rounded value inside this binary (verified
-// against exact rational arithmetic), while a device `1.0f/s` lowers to
-// rcp.approx. Handing the host's bits across is the only way to be bit-exact
-// by construction instead of by luck, and it also removes the only way the
-// written scale could disagree with the inverse actually used.
+// flips the code by one. `1.0f/s` is not a portable bit-source: the device
+// lowers it to rcp.approx (1 ulp off on ~10% of legal scales) and host call
+// sites in different contexts have been observed to disagree, so every GA64
+// producer routes through ONE noinline reciprocal site in dashq.cpp
+// (ga64_recip) and this kernel consumes those bits verbatim. Handing the bits
+// across is the only way to be bit-exact by construction instead of by luck,
+// and it also removes the only way the written scale could disagree with the
+// inverse actually used. Gated by scripts/test_ga64_recip.sh.
 struct ActQuantDevParams {
   const float* x_f32 = nullptr;      // M*K FP32 rows (device USM, H2D'd)
   const float* scale_inv_in = nullptr;  // 2*M*nGA FP32 (s, inv) pairs (tight)
