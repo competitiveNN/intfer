@@ -115,9 +115,16 @@ and is not a bug. If DPAS48+PREQ and DPAS48 print different token ids, stop —
 that is a real regression in the pre-pass.
 
 ### Gates already passed (my side, load-insensitive)
+*(Re-verified at audit #13 on the current 1-GPU box: **7 PASS, 2 PARTIAL,
+1 SKIPPED**, tallied by gate exit code. Anything below marked “era: 2-GPU box”
+records a run from when the box still had two devices — true then, and NOT a
+claim about the current tree.)*
 - `scripts/test_ga64_recip.sh` — 480,645 slices / 30.7M elements bit-identical; 192,000 tie slices verified to be 1-ulp-discriminating
 - `scripts/test_cpu_parity.sh`, `scripts/test_http_batch.sh`
-- `scripts/test_gpu_optin.sh` — TP=1 and TP=2, plus a wide ~97-token prefill arm (M=97) that covers the 2*M*nGA row stride
+- `scripts/test_gpu_optin.sh` — **tp=1 arms all green on the current box**,
+  including the wide ~97-token prefill arm (M=97) that covers the 2*M*nGA row
+  stride. Its **tp=2 pass is UNVERIFIED** (era: 2-GPU box, and re-runnable only
+  once `sycl-ls` prints two `[level_zero:gpu]` lines)
 
 ### Commands (27B, TP=2, decode)
 ```bash
@@ -186,7 +193,7 @@ and for concurrency on a ~12 GB/card TP=2 split.
 - VRAM: strictly lower for the cache
 
 ### Gates already passed (my side, load-insensitive)
-- `scripts/test_gpu_optin.sh` 10/10 — base / KV / Q8 / Q8+HAD / SSM_GPU, x TP=1 and TP=2, streams identical
+- `scripts/test_gpu_optin.sh` 10/10 — base / KV / Q8 / Q8+HAD / SSM_GPU, x TP=1 and TP=2, streams identical *(era: 2-GPU box — see the "Gates already passed" note above; on the current 1-GPU box the tp=2 pass is UNVERIFIED)*
 - `scripts/test_cpu_parity.sh`, `scripts/test_http_batch.sh`, `scripts/test_serve_load.sh`
 
 ### Stream-identity invariant
@@ -252,13 +259,27 @@ Run its pre-flight before spending a quiet window on it:
 report PASS for a stale binary).
 
 **Its non-vacuity proof is itself a runnable script, not prose.**
-`./scripts/mutate_fold_matrix.sh` re-derives the S0-S4 matrix (each state applied
-alone from a clean header, per-state logs, tree restored and re-verified), and
-asserts the *character* of every state rather than dumping output. Run it if you
-touch the fold layout. It refuses to start on a dirty tree, because it edits
-tracked files. Current result: 5/5 as characterized, where
-S1 (wrong default) is invisible to the device readback and S4 (wrong reader
-index) is invisible to the stride contract — so neither gate alone suffices.
+`./scripts/mutate_fold_matrix.sh` re-derives the **S0-S6** matrix (each state
+applied alone from a clean header, per-state logs, tree restored and
+re-verified), and asserts the *character* of every state rather than dumping
+output. Run it if you touch the fold layout. It refuses to start on a dirty
+tree, because it edits tracked files. `--anchors-only` is a <1s no-build
+pre-flight if you only need to know the harness still matches the tree.
+
+**Current result: 7/7 as characterized.** S5 and S6 were added in audit #13, and
+each is invisible to every check the others can see:
+
+- S1 (wrong default) is invisible to the device readback; only the contract
+  check sees it.
+- S4 (wrong reader index) is invisible to the stride contract; the index check
+  and the readback see it.
+- S5 (writer's accept/reject gate removed) is invisible to the contract, index
+  **and** readback checks; only the writer's `NEG` probe rows see it.
+- S6 (`fold_index_s0` row offset) is invisible to everything except the index
+  check — and to the device readback, because no device path in the tree
+  reaches `fold_index_s0` at all.
+
+So no single check covers the class, and **all four checks are load-bearing**.
 
 ## E4 — PROPOSED (not implemented): cooperative 2D-tiled DPAS block
 
@@ -350,7 +371,7 @@ skip only their `--tp 2` arms, and exit **2 = PARTIAL**; `test_tp2_27b.sh` has
 no 1-GPU arm at all and exits **2 = SKIPPED**. None exit 0 (which would claim
 coverage nobody got) and none exit 1 (indistinguishable from a real regression,
 and it trains everyone to ignore red gates). So a full run on this box reads
-**8 PASS, 2 PARTIAL, 1 SKIPPED**.
+**7 PASS, 2 PARTIAL, 1 SKIPPED**.
 
 Two things audit #13 corrected, both worth knowing before you touch these
 scripts:
@@ -378,7 +399,7 @@ described as covered by them until they have actually run.
 | E4 | unimplemented by design; no flag exists | pre-registered only, see above |
 
 If a future session cannot get a second GPU, the correct statement is
-"8 PASS, 2 PARTIAL, 1 SKIPPED, E1-E4 unmeasured" — **not** a full pass, and
+"7 PASS, 2 PARTIAL, 1 SKIPPED, E1-E4 unmeasured" — **not** a full pass, and
 never a tok/s figure from a 1-GPU or loaded window.
 
 ### Self-check for the fold matrix (run it after any refactor of that code)

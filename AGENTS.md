@@ -1,5 +1,35 @@
 Port ninfer (https://github.com/Neroued/ninfer) to our local setup made of intel arc pro b580 (2x gpus)
 
+## READ FIRST — current gate state, and how to read the history below
+
+**The box currently enumerates ONE Arc B580** (`sycl-ls` prints a single
+`[level_zero:gpu]` line). The design target is still 2 GPUs, but the second one
+is not currently visible — see AUDIT #11, where it vanished mid-session. That
+single fact governs how every gate result in this file must be read:
+
+- **Current full-suite result: 7 PASS, 2 PARTIAL, 1 SKIPPED** (rc = 0/2/2).
+  The 10 gates, by exit code: rc=0 → `cpu_parity`, `dpas_fold`, `ga64_recip`,
+  `gguf_roundtrip`, `http_batch`, `oracle_equiv`, `serve_load` (7). rc=2
+  PARTIAL → `device_argmax`, `gpu_optin` (2). rc=2 SKIPPED → `tp2_27b` (1).
+  Do not "improve" this to 8 by counting device_argmax's passing TP=1 sections
+  as a gate-level PASS — the gate itself exits 2. That double-count is what an
+  earlier draft of this line did.
+- **There is currently NO TP=2 coverage at all.** `test_gpu_optin` and
+  `test_device_argmax` run and assert every arm that works on one GPU and skip
+  only their `--tp 2` arms; `test_tp2_27b` skips outright.
+- Throughout this file there are older lines reading "PASS (20/20 arms, TP=1 and
+  TP=2)", "x TP=1/TP=2", "10/10". Those are **records of the 2-GPU era**, when
+  the second device was present and the claim was literally true. They are NOT
+  statements about the current tree. Do not quote one as present-day coverage,
+  and do not "correct" one either — rewriting a true historical record to match
+  today's box is the same laundering failure in the other direction.
+- The correct present-tense sentence is: *"7 PASS, 2 PARTIAL, 1 SKIPPED; TP=2
+  unverified pending a second GPU."* Anything shorter is an overclaim.
+- `scripts/gate_inventory.sh` prints the guard/precondition state of every
+  correctness gate from source, and flags a whole-gate skip on a gate that has
+  1-GPU arms (the audit #13 over-skip bug, made mechanically detectable).
+
+
 Stage 1.
 - choose specific model quantization analyze what makes the quantization format chosen by ninfer really fast
 - Construct our own int2 quantization based on this schema:
@@ -491,7 +521,9 @@ Implement features for maximizing throughput for concurrent requests, starting f
    checkout, full output captured per state (an earlier draft asserted the
    M2-alone row by inference; it was WRONG, corrected below, and S4 added
    because the real question is whether the readback earns its place).
-   RE-RUNNABLE: ./scripts/mutate_fold_matrix.sh (5/5 as characterized):
+   RE-RUNNABLE: ./scripts/mutate_fold_matrix.sh (7/7 as characterized;
+   S5+S6 added in AUDIT #13 — see the 7-state table there, this one is the
+   original 5):
      S0 clean                contract pass    index pass  readback pass          rc=0
      S1 M1 default 2*nOp->nOp contract FAIL(20) index pass  readback PASS (masked) rc=1
      S2 M2 no-validation     contract FAIL(30) index pass  readback FAIL 30/64    rc=1
@@ -512,11 +544,15 @@ Implement features for maximizing throughput for concurrent requests, starting f
    exit code; the verdict now prints last. And `bad` did not accumulate the
    reader-contract failures, so a failing run printed the self-contradictory
    "[dpas-fold-probe] FAIL (... 0 violations)" — the line now carries the real
-   count (S1=20, S2=31, S3=42, S4=2 as measured above).
+   count (the probe's aggregate, which sums contract + index + readback:
+S1=20, S2=31, S3=42, S4=722, S5=4, S6=810 — note this file previously said
+"S4=2", a pre-index-check figure; per-COLUMN counts are in the report and differ,
+e.g. S3's contract column is 40 not 42).
    THE MATRIX IS NOW A SCRIPT, NOT PROSE: scripts/mutate_fold_matrix.sh
-   re-derives S0-S4 (each state alone from a clean header, per-state logs,
-   restore + residue re-verified) and ASSERTS each state's character. 5/5 as
-   characterized, stamped with the HEAD sha it was proven against
+   re-derives S0-S6 (each state alone from a clean header, per-state logs,
+   restore + residue re-verified) and ASSERTS each state's character. 7/7 as
+   characterized (S5/S6 added in AUDIT #13), stamped with the HEAD sha it was
+   proven against
    (build/fold_matrix/last_pass.stamp). It REFUSES to start on a dirty tree
    because it edits tracked files and restores with `git checkout --` — which
    is a real hazard, not a hypothetical one: during this work an ad-hoc
@@ -555,10 +591,14 @@ Implement features for maximizing throughput for concurrent requests, starting f
    INDEX expressions, and a stride contract cannot see indexing.
    GATES (correctness only, load-insensitive, NO wall-time claim): quant_gemm.hpp
    is a SHARED header pulled in by intfer_gemm, so the audit enumerated the
-   consumers instead of stopping at the 4 that are obviously GPU-path:
-   dpas_fold PASS, gpu_optin PASS (20/20 arms TP=1+TP=2), cpu_parity PASS,
-   http_batch PASS, ga64_recip PASS, gguf_roundtrip PASS, oracle_equiv PASS,
-   serve_load PASS. (device_argmax/tp2_27b still unrunnable: 1-GPU box.)
+   consumers instead of stopping at the 4 that are obviously GPU-path.
+   On the CURRENT 1-GPU box, re-verified at AUDIT #13: dpas_fold, cpu_parity,
+   http_batch, ga64_recip, gguf_roundtrip, oracle_equiv, serve_load all PASS;
+   gpu_optin and device_argmax are PARTIAL (their TP=1 arms all pass, their
+   TP=2 arms do not run — **TP=2 is UNVERIFIED**); tp2_27b is SKIPPED.
+   *** The line this replaces read "gpu_optin PASS (20/20 arms TP=1+TP=2)". It
+   was true of the 2-GPU era (AUDIT #11: the second GPU later vanished) and is
+   NOT a claim about the tree you are reading. ***
    LESSON: when a fix lands at ONE call site of a layout rule, grep for the
    OTHER sites that re-derive it — and check whether any of them document the
    wrong value as the contract, because a header that says "0 => nOp" is worse
@@ -627,7 +667,7 @@ Implement features for maximizing throughput for concurrent requests, starting f
      added in AUDIT #12 is its sole gate. Matrix is now 7/7 (S0..S6) and the
      claim is "all FOUR checks are load-bearing", each invisible to the others.
 
-   === FULL 10-GATE SUITE ON THIS TREE — 8 PASS, 2 PARTIAL (BOX STATE) ===
+   === FULL 10-GATE SUITE ON THIS TREE — 7 PASS, 2 PARTIAL, 1 SKIPPED ===
    Re-run after test_dpas_fold.sh was added. PASS: cpu_parity, dpas_fold,
    ga64_recip, gguf_roundtrip, http_batch, oracle_equiv, serve_load.
    PARTIAL (exit 2, not FAIL): device_argmax and gpu_optin — every arm that
@@ -648,16 +688,22 @@ Implement features for maximizing throughput for concurrent requests, starting f
    *** OUTSTANDING, NOT DONE: the TP=2 arms of device_argmax and gpu_optin,
    and all of tp2_27b, are UNVERIFIED ***
    RE-RUN AFTER AUDIT #13 (this box, 1 GPU, correctness only, no timing claim).
-   All ten gates executed; nothing skipped silently.
-     PASS (rc=0), 8: cpu_parity, dpas_fold, ga64_recip, gguf_roundtrip,
-       http_batch, oracle_equiv, serve_load, + device_argmax's TP=1 sections.
-     PARTIAL (rc=2), 2: gpu_optin (every tp=1 arm green: KV/Q8/HAD/SSM_GPU,
-       the DPAS48 family, PREQ x ROW/PREW/SSM_GPU, wide M=97, n=24 FOLD arms,
-       FOLD-alone inert; tp=2 pass dropped) and device_argmax (sections 1, 1b,
-       2, 3, 3b and the serve fence lock ALL ran and passed -- PARTS 32/40/40
-       exactly as locked, fence server alive through greedy+sampling+mixed;
-       only its 5 TP=2 arms dropped).
-     SKIPPED (rc=2), 1: tp2_27b.
+   All ten gates executed; nothing skipped silently. Tally by EXIT CODE, which
+   is the only non-double-countable measure:
+     rc=0 (PASS), 7: cpu_parity, dpas_fold, ga64_recip, gguf_roundtrip,
+       http_batch, oracle_equiv, serve_load.
+     rc=2 (PARTIAL), 2: gpu_optin and device_argmax. Every tp=1 / TP=1 arm
+       inside them ran and passed -- gpu_optin's KV/Q8/HAD/SSM_GPU, the whole
+       DPAS48 family, PREQ x ROW/PREW/SSM_GPU, the wide M=97 arm, the n=24 FOLD
+       arms and FOLD-alone inert; device_argmax's sections 1, 1b, 2, 3, 3b with
+       PARTS 32/40/40 exactly as locked, plus the serve fence lock (server alive
+       through greedy+sampling+mixed). Their TP=2 arms did not run.
+     rc=2 (SKIPPED), 1: tp2_27b.
+   *** COUNTING TRAP, hit while writing this very block: it first read "8 PASS"
+   by listing device_argmax's green TP=1 sections alongside the seven rc=0
+   gates. The GATE exits 2, so that is 7, not 8. An aggregate that does not
+   reconcile against per-gate exit codes is the same defect class as a report
+   that claims coverage it does not have. ***
    Two things this run actually PROVED about the fix, not just exercised:
      - device_argmax's section 4 reported `gpu-optin: PARTIAL/SKIP (rc=2, box
        state -- not counted as a failure)`. Without sub_gate()'s rc map, the
@@ -673,7 +719,8 @@ Implement features for maximizing throughput for concurrent requests, starting f
    from the CMake `add_executable` list, not from a remembered name list).
    They are blocked on a second GPU, not on missing work. Do not let any
    future summary fold "skipped" into "covered" — the correct phrasing is
-   "8 PASS, 2 SKIPPED, E1-E4 unmeasured". Itemized table of exactly what is
+   "7 PASS, 2 PARTIAL, 1 SKIPPED, E1-E4 unmeasured". Itemized table of exactly
+   what is
    unverified and how to close it: reports/2026-09-30-pending-bench-backlog.md,
    "OUTSTANDING — blocked on the second GPU".
    THE FAILURE IS BOX STATE, NOT A REGRESSION — established, not assumed:
