@@ -175,23 +175,31 @@ step() { # $1 = label
 # missing evidence (rc 2). Each writes a sentinel, so "the step never ran" is
 # distinguishable from "the step ran and was classified".
 selfcheck() {
-  local d bad=0 g rc verdict want sent
+  local d bad=0 g rc verdict want sent label code
   d="$(mktemp -d "$BUILD_DIR/.selfcheck.XXXXXX")" || return 1
+  # Fields are split ONCE into three named variables. The first version used
+  # "${spec#*:}" on "sc_ok:0:ok", which yields "0:ok" and wrote `exit 0:ok` --
+  # an invalid exit argument, so ALL THREE steps returned bash's exit-error
+  # status 2 and the self-check reported every case wrong. The self-check caught
+  # a bug in itself, which is the only reason to trust it.
   for spec in "sc_ok:0:ok" "sc_unproven:2:unproven" "sc_fail:1:fail"; do
-    g="$d/${spec%%:*}"; want="${spec##*:}"; want="${want#*:}"
-    sent="$d/${spec%%:*}.ran"
-    printf '#!/usr/bin/env bash\n: > %q\nexit %s\n' "$sent" "${spec#*:}" >"$g"
+    label="${spec%%:*}"
+    code="${spec#*:}"; code="${code%%:*}"
+    want="${spec##*:}"
+    g="$d/$label"
+    sent="$d/$label.ran"
+    printf '#!/usr/bin/env bash\n: > %q\nexit %s\n' "$sent" "$code" >"$g"
     chmod +x "$g"
     rm -f "$sent"
-    INTFER_RUN_ALL_EXTRA_STEPS_DIR="$d" "$g" >/dev/null 2>&1
+    "$g" >/dev/null 2>&1
     rc=$?
     verdict="$(classify_rc "$rc")"
     if [ ! -f "$sent" ]; then
-      echo "  SELFCHECK: ${spec%%:*} never ran (no sentinel) -- the check is vacuous" >&2
+      echo "  SELFCHECK: $label never ran (no sentinel) -- the check is vacuous" >&2
       bad=1; continue
     fi
     if [ "$verdict" != "$want" ]; then
-      echo "  SELFCHECK: ${spec%%:*} exited $rc and classified '$verdict', want '$want'" >&2
+      echo "  SELFCHECK: $label exited $rc and classified '$verdict', want '$want'" >&2
       bad=1
     fi
   done
