@@ -263,6 +263,27 @@ inline const std::int32_t* fold_readable(const std::int32_t* usm,
   return fold_row_stride(fold_stride, nOp) >= 2u * nOp ? usm : nullptr;
 }
 
+// Fold INDEX rule -- likewise one definition, consumed by every read site in
+// both readers. Kept separate from the stride rule on purpose: the stride check
+// reasons about arithmetic agreement and is structurally BLIND to the kernel's
+// indexing. Mutation S4 in scripts/mutate_fold_matrix.sh drops the `+ nOp`
+// that selects the Sfull half from the reader's index expression and the stride
+// check still reports 80/80 agreement -- only the device readback catches it,
+// at 60/64 outputs. Routing every read through these two functions means the
+// expression has exactly ONE home, so it can be unit-gated cheaply instead of
+// only by a device launch.
+//
+// Sfull half: selected by `+ nOp` (the second nOp ints of the row block).
+inline std::size_t fold_index_sfull(std::size_t m, uint32_t fold_stride,
+                                   uint32_t nOp, uint32_t o) {
+  return m * (std::size_t)fold_stride + (std::size_t)nOp + (std::size_t)o;
+}
+// S0 half: the first nOp ints of the row block (INT2/G16 linearity split).
+inline std::size_t fold_index_s0(std::size_t m, uint32_t fold_stride,
+                                 uint32_t o) {
+  return m * (std::size_t)fold_stride + (std::size_t)o;
+}
+
 // DPAS48 row-fold pre-pass (EXPERIMENTAL, default-off INTFER_DPAS48_FOLD).
 //
 // quant_gemm_dpas48 runs one WI per (row m, 16-N tile t) and, inside its K

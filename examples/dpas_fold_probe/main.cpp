@@ -275,6 +275,55 @@ bool check_reader_contract(sycl::queue& q, std::uint64_t& pairs,
               (unsigned long long)pairs, cbad ? " -- NO" : "");
   ok = ok && (cbad == 0);
 
+  // ---- (1b) INDEX rule, the cheap half of the S4 coverage -------------
+  // The stride contract above is structurally blind to the kernel's index
+  // arithmetic: mutation S4 (scripts/mutate_fold_matrix.sh) drops the `+ nOp`
+  // that selects the Sfull half and the stride check still reports 80/80
+  // agreement, because the index is a separate expression. Now that every read
+  // goes through fold_index_sfull/fold_index_s0, that expression has ONE home
+  // and can be gated without a device launch. Three properties, all of which S4
+  // breaks: the two halves are exactly nOp apart; S0 lands at the row's base;
+  // neither half ever escapes into the next row's block.
+  std::uint64_t ibad = 0, ipairs = 0;
+  for (std::uint32_t nOp : nOps) {
+    const std::uint32_t need = 2u * nOp;
+    for (std::uint32_t st : {need, need + 7u, 2u * need}) {
+      for (std::size_t m : {std::size_t(0), std::size_t(1), std::size_t(7),
+                            std::size_t(4095)}) {
+        for (std::uint32_t o : {0u, nOp / 2u, nOp - 1u}) {
+          const std::size_t s0 = intfer::gemm::fold_index_s0(m, st, o);
+          const std::size_t sf = intfer::gemm::fold_index_sfull(m, st, nOp, o);
+          const std::size_t base = m * (std::size_t)st;
+          ++ipairs;
+          if (sf - s0 != (std::size_t)nOp) {
+            std::printf("  FAIL index nOp=%-4u stride=%-5u m=%-5zu o=%-4u "
+                        "Sfull-S0=%zu, expected %u\n",
+                        nOp, st, m, o, sf - s0, nOp);
+            ++ibad;
+          }
+          if (s0 != base + (std::size_t)o || sf != base + nOp + (std::size_t)o) {
+            std::printf("  FAIL index nOp=%-4u stride=%-5u m=%-5zu o=%-4u "
+                        "S0=%zu Sfull=%zu expected base=%zu\n",
+                        nOp, st, m, o, s0, sf, base);
+            ++ibad;
+          }
+          // Must stay inside this row's 2*nOp block, never spill into the next.
+          if (s0 - base >= (std::size_t)nOp || sf - base >= (std::size_t)need) {
+            std::printf("  FAIL index nOp=%-4u stride=%-5u m=%-5zu o=%-4u "
+                        "escapes its row block\n",
+                        nOp, st, m, o);
+            ++ibad;
+          }
+        }
+      }
+    }
+  }
+  std::printf("  index:    %llu (m,stride,nOp,o) tuples, halves %s%s\n",
+              (unsigned long long)ipairs, ibad ? "WRONG -- NO" : "correct",
+              ibad ? "" : " (Sfull-S0 == nOp, neither escapes its row)");
+  ok = ok && (ibad == 0);
+  bad += ibad;
+
   // ---- (2) device-level readback identity --------------------------
   // M=4, N=16, K=32, INT4/G64 -> nOp=1, so each row owns exactly one S0/Sfull
   // pair and the default-stride case is the regression under test.

@@ -466,9 +466,15 @@ Implement features for maximizing throughput for concurrent requests, starting f
        nothing can break.
    (b) MUTUAL MASKING, the interesting half. Wrong default is harmless while
        the reader VALIDATES; missing validation is harmless while the default
-       is RIGHT. Corruption needs BOTH wrong at once, so each single-half bug
-       looked fine. Same species as the GA64 reciprocal (#3) and "1 of M rows"
-       (#4): a rule fixed at one site and merely assumed at another.
+       is RIGHT. Under the ENGINE's call pattern that means neither bug
+       produces wrong numbers: the engine always passes a stride that clears
+       2*nOp, and validation absorbs the bad default — so the four
+       end-to-end arms could not have shown either one. PRECISION, measured
+       (see the matrix below): M2 alone is NOT harmless to a gate, because a
+       probe can feed the too-small stride the engine never sends — S2 fails
+       the readback at 30/64. The masking is real in the ENGINE, not in the
+       probe. Same species as the GA64 reciprocal (#3) and "1 of M rows" (#4):
+       a rule fixed at one site and merely assumed at another.
    FIX: ONE shared rule in quant_gemm.hpp — `fold_row_stride()` (0 => 2*nOp)
    and `fold_readable()` (refuses any stride < 2*nOp, returns nullptr so the
    kernel falls back to the INLINE fold = bit-identical to pre-FOLD, just no

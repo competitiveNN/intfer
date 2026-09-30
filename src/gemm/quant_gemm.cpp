@@ -1108,7 +1108,7 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
               c = dpas<8, 1, int, uint8_t, std::int8_t,
                        dpas_argument_type::u4, dpas_argument_type::s8>(vb, va);
               int S;
-              if (Fold) S = Fold[(size_t)m * fold_stride + nOp + o];
+              if (Fold) S = Fold[fold_index_sfull(m, fold_stride, nOp, o)];
               else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }
               const uint32_t g = k0 / G;
               for (uint32_t nl = 0; nl < TN; ++nl) {
@@ -1127,7 +1127,7 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
               c = dpas<8, 1, int, uint8_t, std::int8_t,
                        dpas_argument_type::u8, dpas_argument_type::s8>(vb, va);
               int S;
-              if (Fold) S = Fold[(size_t)m * fold_stride + nOp + o];
+              if (Fold) S = Fold[fold_index_sfull(m, fold_stride, nOp, o)];
               else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }
               const uint32_t g = k0 / G;
               for (uint32_t nl = 0; nl < TN; ++nl) {
@@ -1167,8 +1167,8 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
                 simd<std::int8_t, OP> va0(0);
                 int S0, Sf;
                 if (Fold) {
-                  S0 = Fold[(size_t)m * fold_stride + o];
-                  Sf = Fold[(size_t)m * fold_stride + nOp + o];
+                  S0 = Fold[fold_index_s0(m, fold_stride, o)];
+                  Sf = Fold[fold_index_sfull(m, fold_stride, nOp, o)];
                   for (uint32_t k = 0; k < 16; ++k) va0[k] = va[k];
                 } else {
                   S0 = 0;
@@ -1283,7 +1283,7 @@ sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
               va.copy_from(Aqr + k0);
               const float as = Asr[k0 / GA];
               int S;
-              if (Fold) S = Fold[(size_t)m * fold_stride + nOp + o];
+              if (Fold) S = Fold[fold_index_sfull(m, fold_stride, nOp, o)];
               else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }
               const uint32_t g = k0 / G;
               for (uint32_t tt = ts; tt < tlim; ++tt) {
