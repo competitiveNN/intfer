@@ -364,7 +364,7 @@ fi
 if has_residue "$HDR" "$SRC"; then
   echo "FAIL: mutation residue left in tracked sources" >&2; FAILED=$((FAILED + 1))
 else
-  echo "residue: none (no M1/M2/M4 markers in tracked sources)"
+  echo "residue: none (no M1/M2/M4/M5/M6 markers in tracked sources)"
 fi
 
 echo
