@@ -10,6 +10,9 @@
 #      split-vs-joint comparison is the regression test for the lifted
 #      joint P>1 cap (pre-fix, wide joint chunks diverged: 271 vs 561).
 #
+# BUILD-FIRST (audit #6): see test_gpu_optin.sh. Opt out with
+# INTFER_GATE_NO_BUILD=1 only when the build is known current.
+#
 # Usage: scripts/test_cpu_parity.sh
 set -o pipefail
 
@@ -21,6 +24,19 @@ BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/intfer_cli/intfer_cli"
 PROMPT="The capital of France is"
 PROMPT2="The quick brown fox jumps over the lazy dog."
 PROMPT3="Hi"
+
+BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
+if [ "${INTFER_GATE_NO_BUILD:-0}" != "1" ]; then
+  if [ ! -f "$BUILD_DIR/build.ninja" ] && [ ! -f "$BUILD_DIR/Makefile" ]; then
+    echo "FAIL: no build system in $BUILD_DIR (configure it, or set INTFER_BUILD_DIR)" >&2
+    exit 1
+  fi
+  if ! cmake --build "$BUILD_DIR" --target intfer_cli >"$BUILD_DIR/intfer_cli_build.log" 2>&1; then
+    echo "FAIL: intfer_cli did not build (refusing to run a stale binary)" >&2
+    tail -20 "$BUILD_DIR/intfer_cli_build.log" >&2
+    exit 1
+  fi
+fi
 
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }
