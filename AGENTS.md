@@ -223,6 +223,20 @@ Implement features for maximizing throughput for concurrent requests, starting f
   slightly (ties only), so DPAS48-family streams differ from those recorded
   at 7f005fe. Base/FP16 streams are unaffected (gate: base n=24 unchanged).
   Do not treat pre-audit DPAS48 token lists as golden.
+  === AUDIT #3c: a build break the gates could NOT see (987c554 -> 1fbf9a6) ===
+  ssm_gpu_allowed() was defined INSIDE #ifdef INTFER_HAS_GPU_BACKEND while
+  its step() call site (main.cpp:4985) sits OUTSIDE it, so the CLI failed to
+  compile without -DINTFER_HAS_GPU_BACKEND=1. All four gates still passed,
+  because the define is unconditional in examples/intfer_cli/CMakeLists.txt.
+  Lesson (same species as the two vacuous-gate bugs already recorded here):
+  a gate that cannot exercise a configuration cannot protect it. The check
+  that caught it was a targeted `-fsyntax-only` recompile of the single TU
+  with the macro stripped — cheap, and the only thing that saw the defect.
+  Note for whoever tries to enable a real CPU-only build: it was ALREADY
+  unsupported before this work (the same check on 7f005fe fails with 20
+  errors — GpuBackend / SsmRow used outside guards). Helpers added near the
+  GPU backend must be hoisted OUT of the guard unless every caller is inside
+  it; check with the macro stripped, do not assume the gates cover it.
   === OTHER FIXES ===
   (a) PARTIAL-DECLINE RACE (nondeterminism): if device d's pre-pass
   launched but device d+1 declined, the already-queued d kernel still
