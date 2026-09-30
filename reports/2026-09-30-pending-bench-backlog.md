@@ -251,6 +251,15 @@ Run its pre-flight before spending a quiet window on it:
 `./scripts/test_dpas_fold.sh` (builds its own target first, so it cannot
 report PASS for a stale binary).
 
+**Its non-vacuity proof is itself a runnable script, not prose.**
+`./scripts/mutate_fold_matrix.sh` re-derives the S0-S4 matrix (each state applied
+alone from a clean header, per-state logs, tree restored and re-verified), and
+asserts the *character* of every state rather than dumping output. Run it if you
+touch the fold layout. It refuses to start on a dirty tree, because it edits
+tracked files. Current result: 5/5 as characterized, where
+S1 (wrong default) is invisible to the device readback and S4 (wrong reader
+index) is invisible to the stride contract — so neither gate alone suffices.
+
 ## E4 — PROPOSED (not implemented): cooperative 2D-tiled DPAS block
 
 **Status: design only. There is no flag and no code yet — do not go looking for
@@ -268,7 +277,19 @@ rather than once per block.
 **The shape being proposed.** One WI per 16-N tile is the problem; the fix is a
 genuinely 2D work-item block (a strip of tiles per WI, or a cooperative
 subgroup that loads a B op-tile once into registers and reuses it across
-several tiles), so B traffic per output element drops from `nT` to ~1. This is
+several tiles), so B traffic per output element drops from `nT` to ~1.
+
+**Carry one lesson from AUDIT #12 into this kernel specifically.** Reordering
+the work means rewriting the *index* expressions, and a stride/contract check
+is structurally blind to indexing: mutation S4 drops the `+ nOp` that selects
+the Sfull half of the fold row, and the stride contract still reports 80/80
+agreement — only a device readback catches it (60/64 outputs). E3 now keeps
+every read behind `fold_index_sfull`/`fold_index_s0` in
+`include/intfer/gemm/quant_gemm.hpp` so the expression has one home, unit-gated
+over 360 (m,stride,nOp,o) tuples. Do the same for any new E4 indexing: one
+named helper, one gate, and do not rely on the stride contract to notice.
+
+This is
 the same class of change as `quant_gemm_dpas4_row` (`INTFER_DPAS_ROW`, already
 built and measured ~460x SLOWER — so a naive "one WI per row" is already known
 to be wrong; the geometry has to actually cooperate, not just re-partition).
@@ -320,6 +341,16 @@ the compute runtime, so **none of them can run** — see the PRECONDITION at the
 top. That is a known box state (AGENTS.md AUDIT #9/#11), not an engine bug, and
 not something to re-investigate: when both GPUs enumerate, the queue is ready.
 Do not use a loaded or 1-GPU window and do not report a number from one.
+
+**The two 2-GPU gates now SKIP instead of FAILing** (`scripts/_gate_precond.sh`,
+`gate_require_gpus 2`, wired into `test_device_argmax.sh` and
+`test_tp2_27b.sh`). This matters for reading a gate run: on a 1-GPU box those
+two exit **2 = SKIPPED**, loudly, and verify nothing. They do not exit 0 (which
+would claim coverage nobody got) and they do not exit 1 (which is
+indistinguishable from a real regression and trains everyone to ignore red).
+So a full run on this box reads **8 PASS, 2 SKIPPED** — and the two skips are
+waiting on the second GPU, not on missing work.
+
 
 ## Also not yet implemented (no flag to test — do not go looking)
 

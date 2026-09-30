@@ -513,6 +513,23 @@ Implement features for maximizing throughput for concurrent requests, starting f
    reader-contract failures, so a failing run printed the self-contradictory
    "[dpas-fold-probe] FAIL (... 0 violations)" — the line now carries the real
    count (S1=20, S2=31, S3=42, S4=2 as measured above).
+   THE MATRIX IS NOW A SCRIPT, NOT PROSE: scripts/mutate_fold_matrix.sh
+   re-derives S0-S4 (each state alone from a clean header, per-state logs,
+   restore + residue re-verified) and ASSERTS each state's character. 5/5 as
+   characterized. It REFUSES to start on a dirty tree because it edits tracked
+   files and restores with `git checkout --` — which is a real hazard, not a
+   hypothetical one: during this work an ad-hoc `git checkout --` on the header
+   destroyed uncommitted helpers and broke the build, exactly as the guard
+   predicts. Negative-tested twice (asserting S1's readback fails, and S4's
+   contract is violated) — both report UNEXPECTED, rc=1.
+   S4's GAP CLOSED AT SOURCE (not just by a slower device check): every fold
+   read now goes through fold_index_sfull/fold_index_s0 in quant_gemm.hpp, so
+   the index expression has ONE home, unit-gated over 360 (m,stride,nOp,o)
+   tuples (Sfull-S0 == nOp; S0 at the row base; neither escapes its row). Drop
+   `+ nOp` from fold_index_sfull and the index check reports "halves WRONG"
+   while the stride contract still says 80/80 — the blindness, caught for free.
+   This is the lesson to carry into E4: reordering the work means rewriting
+   INDEX expressions, and a stride contract cannot see indexing.
    GATES (correctness only, load-insensitive, NO wall-time claim): quant_gemm.hpp
    is a SHARED header pulled in by intfer_gemm, so the audit enumerated the
    consumers instead of stopping at the 4 that are obviously GPU-path:
@@ -528,11 +545,20 @@ Implement features for maximizing throughput for concurrent requests, starting f
    it alone inverted the conclusion, and the S4 control then showed why BOTH
    checks are needed instead of a hand-wave.
 
-   === FULL 10-GATE SUITE ON THIS TREE — 9 PASS, 1 BLOCKED BY BOX STATE ===
+   === FULL 10-GATE SUITE ON THIS TREE — 8 PASS, 2 SKIPPED (BOX STATE) ===
    Re-run after test_dpas_fold.sh was added. PASS: cpu_parity, dpas_fold,
    ga64_recip, gguf_roundtrip, gpu_optin (TP=1 AND TP=2, 4 FOLD arms),
-   http_batch, oracle_equiv, serve_load. FAIL: device_argmax. NOT RUNNABLE:
-   tp2_27b (27B needs --tp 2; the box exposes one GPU).
+   http_batch, oracle_equiv, serve_load. SKIPPED (exit 2, not FAIL):
+   device_argmax and tp2_27b — both need 2 GPUs, the box exposes one.
+   Those two used to report a BARE FAIL, which was the whole problem: a
+   clamped TP=1 run (Engine::load min()s tp_devices to dm.size()) fails an
+   assertion about a path it never took, and a red gate that means "the box"
+   teaches everyone to ignore red gates. They now SKIP loudly via
+   scripts/_gate_precond.sh `gate_require_gpus 2`. Never exit 0 (that would
+   claim coverage nobody got) and never exit 1 (indistinguishable from a real
+   regression). Re-run both on a 2-GPU box; the queue in
+   reports/2026-09-30-pending-bench-backlog.md is blocked on that, not on
+   missing experiments.
    THE FAILURE IS BOX STATE, NOT A REGRESSION — established, not assumed:
      GATE FAIL: hook fired on TP2 (40 lines)   [PARTS TP2 spec flag: 40, expect 0]
    The gate's TP2 arm asserts the argmax hook stays OFF under --tp 2, because

@@ -45,6 +45,13 @@ gate_require_build intfer_cli || exit 1
 
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }
+# 2-GPU precondition (AUDIT #12 follow-up). This gate is named for --tp 2, and
+# 27B needs ~19GB against a ~12GB B580, so on a 1-GPU box the run clamps to
+# TP=1 and aborts inside the Level Zero page-fault manager (AUDIT #11). That is
+# a VRAM/box outcome, not a code failure, and reporting it as FAIL is what made
+# AGENTS.md carry a standing red item that was never a regression. Exit 2 = SKIP.
+. "$SCRIPT_DIR/_gate_precond.sh"
+gate_require_gpus 2 || exit 2
 
 LOG="$(mktemp --tmpdir="$TMPDIR" tp2_27b.XXXX.log)"
 # Keep the per-run CLI logs next to the wrapper log (not mktemp orphans):

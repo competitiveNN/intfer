@@ -84,36 +84,20 @@ apply_m2() {
   sed -i 's|return fold_row_stride(fold_stride, nOp) >= 2u \* nOp ? usm : nullptr;|return usm;  /*M2*/|' "$HDR"
   grep -q '/\*M2\*/' "$HDR"
 }
-# M4: the u4 reader's index expression drops the Sfull half. Helpers untouched,
-# so the contract check stays green -- that is precisely what S4 demonstrates.
+# M4: the reader's index expression drops the Sfull half. After the index
+# refactor this expression has exactly ONE home -- fold_index_sfull in the
+# header -- so the mutation goes there and the kernel bodies stay untouched. The
+# STRIDE contract stays green (it reasons about stride arithmetic and is
+# structurally blind to indexing); the cheap INDEX check turns red, as does the
+# device readback. That combination is precisely what S4 demonstrates, and it
+# is why the index is now gated without needing a device launch.
 apply_m4() {
-  python3 - "$SRC" <<'PY' || return 1
-import sys
-p = sys.argv[1]
-s = open(p).read()
-anchor = ("              if (Fold) S = Fold[(size_t)m * fold_stride + nOp + o];\n"
-          "              else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }\n"
-          "              const uint32_t g = k0 / G;\n"
-          "              for (uint32_t nl = 0; nl < TN; ++nl) {\n"
-          "                const uint32_t n = t * TN + nl;\n"
-          "                const float ws = static_cast<float>(\n"
-          "                    sycl::bit_cast<sycl::half>(\n"
-          "                        p.scale_usm[(size_t)n * nG + g]));\n"
-          "                acc_tile[nl] += as * ws * alpha *\n"
-          "                                (2.0f * (float)c[nl] - 15.0f * (float)S) *")
-if s.count(anchor) != 1:
-    sys.stderr.write("S4 anchor matched %d times; expected 1\n" % s.count(anchor))
-    sys.exit(1)
-new = anchor.replace("fold_stride + nOp + o]", "fold_stride + o]")
-open(p, "w").write(s.replace(anchor, new, 1))
-PY
-  # Verify the mutation LANDED: the Sfull half must now be missing at the u4
-  # reader, while at least one correctly-indexed reader must remain elsewhere.
-  grep -q 'if (Fold) S = Fold\[(size_t)m \* fold_stride + o\];' "$SRC" || {
-    echo "  M4: mutated index not found in $SRC" >&2; return 1; }
-  grep -q 'if (Fold) S = Fold\[(size_t)m \* fold_stride + nOp + o\];' "$SRC" || {
-    echo "  M4: no correctly-indexed reader left -- anchor matched too broadly" >&2
-    return 1; }
+  sed -i 's|  return m \* (std::size_t)fold_stride + (std::size_t)nOp + (std::size_t)o;|  return m * (std::size_t)fold_stride + (std::size_t)o;  /*M4*/|' "$HDR"
+  grep -q '/\*M4\*/' "$HDR" || { echo "  M4: fold_index_sfull not mutated" >&2; return 1; }
+  # The S0 helper must be untouched, so an over-broad sed is caught here.
+  if grep -A3 'fold_index_s0(std::size_t m' "$HDR" | grep -q 'M4'; then
+    echo "  M4: fold_index_s0 was also hit -- anchor too broad" >&2; return 1
+  fi
   return 0
 }
 
@@ -121,18 +105,19 @@ PY
 # $1 = state label, $2 = expected rc, $3 = expected readback FAIL count class
 #       ("none" | "some"), $4 = expected contract status ("clean" | "violated")
 run_state() {
-  local label="$1" want_rc="$2" want_rb="$3" want_ct="$4"
+  local label="$1" want_rc="$2" want_rb="$3" want_ct="$4" want_ix="${5:-clean}"
   local log="$LOG_DIR/$label.log"
   bash scripts/test_dpas_fold.sh >"$log" 2>&1
   local rc=$?
 
-  local rb ct verdict=""
+  local rb ct ix verdict=""
   rb=$(grep -cE '^  readback .*FAIL' "$log")
   if grep -qE '^  contract: [0-9]+ \(nOp,stride\) pairs.* -- NO' "$log"; then
     ct=violated
   else
     ct=clean
   fi
+  if grep -qE '^  index: +[0-9]+ .*WRONG' "$log"; then ix=wrong; else ix=clean; fi
 
   [ "$rc" = "$want_rc" ] || verdict="$verdict rc(want=$want_rc got=$rc)"
   case "$want_rb" in
@@ -140,16 +125,18 @@ run_state() {
     some) [ "$rb" -ge 1 ] || verdict="$verdict readback_expected_failure_got_none" ;;
   esac
   [ "$ct" = "$want_ct" ] || verdict="$verdict contract(want=$want_ct got=$ct)"
+  [ "$ix" = "$want_ix" ] || verdict="$verdict index(want=$want_ix got=$ix)"
 
   if [ -z "$verdict" ]; then
-    printf '  %-26s rc=%s  readback_failures=%-2s contract=%-8s  AS EXPECTED\n' \
-      "$label" "$rc" "$rb" "$ct" | tee -a "$SUMMARY"
+    printf '  %-26s rc=%s  readback_fail=%-2s contract=%-8s index=%-6s  AS EXPECTED\n' \
+      "$label" "$rc" "$rb" "$ct" "$ix" | tee -a "$SUMMARY"
   else
-    printf '  %-26s rc=%s  readback_failures=%-2s contract=%-8s  UNEXPECTED:%s\n' \
-      "$label" "$rc" "$rb" "$ct" "$verdict" | tee -a "$SUMMARY"
+    printf '  %-26s rc=%s  readback_fail=%-2s contract=%-8s index=%-6s  UNEXPECTED:%s\n' \
+      "$label" "$rc" "$rb" "$ct" "$ix" "$verdict" | tee -a "$SUMMARY"
     FAILED=$((FAILED + 1))
   fi
-  grep -E '^  contract: [0-9]+ \(nOp,stride\)|^  readback ' "$log" | sed 's/^/       /' >>"$SUMMARY"
+  grep -E '^  contract: [0-9]+ \(nOp,stride\)|^  index: |^  readback ' "$log" \
+    | sed 's/^/       /' >>"$SUMMARY"
 }
 
 echo "=== DPAS fold mutation matrix (non-vacuity proof) ==="
@@ -169,7 +156,7 @@ restore; apply_m1 && apply_m2 || { echo "FAIL: M1+M2 did not apply" >&2; exit 1;
 run_state S3_M1_and_M2        1 some violated
 
 restore; apply_m4 || { echo "FAIL: M4 did not apply" >&2; exit 1; }
-run_state S4_reader_index     1 some clean
+run_state S4_reader_index     1 some clean wrong
 
 # --- restore and prove the tree survived -------------------------------
 restore

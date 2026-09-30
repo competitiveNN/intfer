@@ -54,6 +54,17 @@ if ! python3 -c "open('/dev/dri/renderD128','rb').close()" 2>/dev/null; then
   echo "SKIP: no render-node access from this shell."
   exit 2
 fi
+# 2-GPU precondition (AUDIT #12 follow-up). This gate asserts on --tp 2 arms.
+# Engine::load clamps to min(tp_devices, dm.size()), so on a 1-GPU box every
+# TP=2 arm silently runs as TP=1 and the assertion fails against a path that was
+# never exercised -- a false FAIL that is really box state. Exit 2 = SKIP (the
+# convention already documented above), never a bare FAIL and never exit 0,
+# which would claim coverage we do not have.
+set +u
+source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+set -u
+. "$SCRIPT_DIR/_gate_precond.sh"
+gate_require_gpus 2 || exit 2
 set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 set -u
