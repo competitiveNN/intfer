@@ -490,23 +490,23 @@ Implement features for maximizing throughput for concurrent requests, starting f
    MUTATION TABLE — each state applied and run IN ISOLATION from a clean
    checkout, full output captured per state (an earlier draft asserted the
    M2-alone row by inference; it was WRONG, corrected below, and S4 added
-   because the real question is whether the readback earns its place):
-     S0 clean            contract pass              readback pass          rc=0
-     S1 M1 default 2*nOp->nOp   contract FAIL(20)   readback PASS (masked) rc=1
-     S2 M2 no-validation       contract FAIL(30)   readback FAIL 30/64    rc=1
-     S3 M1+M2 (historical)     contract FAIL(42)   readback FAIL 30/64    rc=1
-     S4 reader index +nOp+o->+o contract PASS(BLIND) readback FAIL 60/64   rc=1
-   (S1)  = (fold_stride==0) ? nOp : fold_stride;  S2 = return usm;
-   (S3)  = both;  (S4) = corrupt the u4 reader index in quant_gemm_dpas48.
+   because the real question is whether the readback earns its place).
+   RE-RUNNABLE: ./scripts/mutate_fold_matrix.sh (5/5 as characterized):
+     S0 clean                contract pass    index pass  readback pass          rc=0
+     S1 M1 default 2*nOp->nOp contract FAIL(20) index pass  readback PASS (masked) rc=1
+     S2 M2 no-validation     contract FAIL(30) index pass  readback FAIL 30/64    rc=1
+     S3 M1+M2 (historical)   contract FAIL(42) index pass  readback FAIL 30/64    rc=1
+     S4 fold_index_sfull drops +nOp
+                              contract PASS(BLIND) index FAIL readback FAIL 60/64  rc=1
+   (S1) = (fold_stride==0) ? nOp : fold_stride;  (S2) = return usm;  (S3) = both;
+   (S4) = fold_index_sfull loses the `+ nOp` (its single home, post-refactor).
    CORRECTION to the first writeup: M2 is NOT masked. With the default correct
    but validation gone, the deliberately-too-small stride=1 regime is accepted
    and mis-reads; that fail-closed regime is what catches it. Only M1 is masked
-   from the readback. S4 is the load-bearing one: corrupting the reader's index
-   EXPRESSION with the helpers untouched (contract 80/80 satisfied) changes
-   60/64 outputs. The contract check reasons about stride arithmetic and is
-   structurally BLIND to the kernel's indexing. => the two checks are NOT
-   redundant for OPPOSITE reasons: only the contract sees M1, only the readback
-   sees S4.
+   from the readback. S4 is the load-bearing one: the contract check reasons
+   about stride arithmetic and is structurally BLIND to the kernel's indexing, so
+   it reports 80/80 while 60/64 outputs change. => no single check covers the
+   class: only the contract sees S1; only index+readback see S4.
    ALSO FIXED: the probe printed its one-line PASS/FAIL verdict BEFORE the E4
    section ran, so a reader could see PASS and then a failure that flipped the
    exit code; the verdict now prints last. And `bad` did not accumulate the
