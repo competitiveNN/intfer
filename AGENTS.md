@@ -348,6 +348,11 @@ Implement features for maximizing throughput for concurrent requests, starting f
    All 17 artifact consumers now honor the override; `bash -n` clean on each.
    Benchmarks re-verified CORRECTNESS-only; no wall-time claim is made here.
    === AUDIT #9: test_tp2_27b FAILING = BOX STATE, NOT A REGRESSION ===
+   *** SUPERSEDED IN PART BY AUDIT #11 (further below). Keep this section's
+   CONCLUSION ("box state, not a code regression") and DISREGARD its
+   MECHANISM — the "ranges[d] wild pointer" story below was TESTED AND
+   DISPROVED, and the follow-up action item it spawned was aimed at a bug
+   that does not exist. Do not "fix" the TP clamp; it is correct. ***
    The audit-#8 9-gate re-run came back 8 PASS / 1 FAIL, the failure being
    test_tp2_27b: intfer_cli exits rc=139 (SIGSEGV) after preload, with the
    backtrace resolving to intfer::Engine::run_linear_wave <- GpuBackend::
