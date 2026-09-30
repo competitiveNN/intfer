@@ -24,9 +24,19 @@
 #   S4 reader index +nOp+o -> +o    rc=1, contract MUST stay green (it is
 #                                   structurally blind to kernel-side indexing)
 #                                   while readback MUST fail at 60/64.
+#   S5 writer gate removed          rc=1, contract/index/readback MUST ALL stay
+#                                   green. Only the probe's two NEG stride rows
+#                                   can see this (AUDIT #13).
+#   S6 fold_index_s0 row offset     rc=1, ONLY the index check sees it -- no
+#     dropped                        device path in the tree reaches
+#                                   fold_index_s0 (u2/G16 only; the readback
+#                                   runs bits=4).
 #
 # S1 and S4 are the load-bearing pair: S1 is invisible to the readback and S4 is
-# invisible to the contract check, so neither gate alone is sufficient.
+# invisible to the contract check, so neither gate alone is sufficient. S5 and
+# S6 are load-bearing for a second reason: each is invisible to every check the
+# others can see, so removing any ONE of the four checks leaves a real defect
+# undetected.
 #
 # SAFETY. This script EDITS TRACKED FILES (the fold header and quant_gemm.cpp)
 # and restores them with `git checkout --`. That is destructive to uncommitted
@@ -72,9 +82,17 @@ preflight_anchors() {
   desc="M1 target: fold_row_stride default '2u * nOp'"
   n=$(anchor_count "$HDR" 'return (fold_stride == 0) ? 2u * nOp : fold_stride;')
   [ "$n" = "1" ] || { echo "ANCHOR STALE: $desc found $n time(s), want 1" >&2; bad=1; }
-  #  M2 -> fold_readable validation
-  desc="M2 target: fold_readable validation '>= 2u * nOp'"
-  n=$(anchor_count "$HDR" 'return fold_row_stride(fold_stride, nOp) >= 2u * nOp ? usm : nullptr;')
+  #  M2 -> fold_readable validation (delegates to the shared decision)
+  desc="M2 target: fold_readable 'return fold_stride_ok(fold_stride, nOp) ? usm : nullptr;'"
+  n=$(anchor_count "$HDR" 'return fold_stride_ok(fold_stride, nOp) ? usm : nullptr;')
+  [ "$n" = "1" ] || { echo "ANCHOR STALE: $desc found $n time(s), want 1" >&2; bad=1; }
+  #  M5 -> the WRITER's gate in quant_gemm_dpas48_rowfold
+  desc="M5 target: writer gate '!fold_usm || !fold_stride_ok(fold_stride, nOp)'"
+  n=$(anchor_count "$SRC" 'if (!fold_usm || !fold_stride_ok(fold_stride, nOp)) return dep;')
+  [ "$n" = "1" ] || { echo "ANCHOR STALE: $desc found $n time(s), want 1" >&2; bad=1; }
+  #  M6 -> fold_index_s0 row offset
+  desc="M6 target: fold_index_s0 'm * (std::size_t)fold_stride + (std::size_t)o'"
+  n=$(anchor_count "$HDR" 'return m * (std::size_t)fold_stride + (std::size_t)o;')
   [ "$n" = "1" ] || { echo "ANCHOR STALE: $desc found $n time(s), want 1" >&2; bad=1; }
   #  M4 -> fold_index_sfull Sfull offset
   desc="M4 target: fold_index_sfull '+(std::size_t)nOp'"
@@ -91,6 +109,15 @@ preflight_anchors() {
   [ "$n" = "0" ] || {
     echo "ANCHOR STALE: $desc (got $n). Re-route them through" >&2
     echo "  fold_index_sfull/fold_index_s0 or M4 becomes partial." >&2; bad=1; }
+  #  The writer must route its accept/reject through the shared predicate too
+  #  (AUDIT #13). A re-open-coded `fold_stride < 2*nOp` in the writer is the
+  #  second copy of the rule, and M5 would then have no target at all.
+  desc="no open-coded 'fold_stride < 2 * nOp' gate left in the writer (want 0)"
+  n=$(grep -c 'fold_stride < 2 \* nOp' "$SRC" 2>/dev/null || true)
+  [ "$n" = "0" ] || {
+    echo "ANCHOR STALE: $desc (got $n). The writer must call fold_stride_ok();" >&2
+    echo "  a second copy of the rule is what AUDIT #12/#13 exist to prevent." >&2
+    bad=1; }
 
   if [ "$bad" != "0" ]; then
     cat >&2 <<EOF
@@ -122,11 +149,15 @@ EOF
 emit_summary() {
   echo "  S1: readback stays GREEN (masked)  -> only the contract check sees it"
   echo "  S4: contract stays GREEN (blind)   -> index + readback see it"
-  echo "  => no single check covers the class; all three are load-bearing."
+  echo "  S5: ONLY the writer's NEG cases see it (contract/index/readback all blind)"
+  echo "  S6: ONLY the index check sees it (no device path reaches fold_index_s0)"
+  echo "  => no single check covers the class; all four are load-bearing."
 }
 EXPECTED_SUMMARY="  S1: readback stays GREEN (masked)  -> only the contract check sees it
   S4: contract stays GREEN (blind)   -> index + readback see it
-  => no single check covers the class; all three are load-bearing."
+  S5: ONLY the writer's NEG cases see it (contract/index/readback all blind)
+  S6: ONLY the index check sees it (no device path reaches fold_index_s0)
+  => no single check covers the class; all four are load-bearing."
 
 # Returns 0 if any mutation marker is present in the files given.
 has_residue() {
@@ -136,7 +167,7 @@ has_residue() {
   # regex form did) is correct only for a regex; under -F the backslash is a
   # literal character and the pattern can never match anything. The selfcheck
   # caught that within one run of being introduced.
-  for pat in '/*M1*/' '/*M2*/' '/*M4*/'; do
+  for pat in '/*M1*/' '/*M2*/' '/*M4*/' '/*M5*/' '/*M6*/'; do
     for f in "$@"; do
       grep -qF -- "$pat" "$f" 2>/dev/null && return 0
     done
@@ -151,7 +182,7 @@ selfcheck() {
     bad=1
   fi
   tmp="$(mktemp "${TMPDIR:-/tmp}/fold_matrix_selfcheck.XXXXXX")"
-  for m in M1 M2 M4; do
+  for m in M1 M2 M4 M5 M6; do
     printf 'int x; /*%s*/\n' "$m" >"$tmp"
     has_residue "$tmp" || { echo "SELFCHECK: residue scan misses a /*$m*/ marker" >&2; bad=1; }
   done
@@ -207,7 +238,7 @@ apply_m1() {
 }
 # M2: fold_readable stops validating the stride.
 apply_m2() {
-  sed -i 's|return fold_row_stride(fold_stride, nOp) >= 2u \* nOp ? usm : nullptr;|return usm;  /*M2*/|' "$HDR"
+  sed -i 's|return fold_stride_ok(fold_stride, nOp) ? usm : nullptr;|return usm;  /*M2*/|' "$HDR"
   grep -q '/\*M2\*/' "$HDR"
 }
 # M4: the reader's index expression drops the Sfull half. After the index
@@ -223,6 +254,36 @@ apply_m4() {
   # The S0 helper must be untouched, so an over-broad sed is caught here.
   if grep -A3 'fold_index_s0(std::size_t m' "$HDR" | grep -q 'M4'; then
     echo "  M4: fold_index_s0 was also hit -- anchor too broad" >&2; return 1
+  fi
+  return 0
+}
+# M5: the WRITER stops rejecting a too-small stride. Added in AUDIT #13.
+#
+# This is the state that proves the writer was a real coverage hole rather than a
+# cosmetic duplication. Nothing else sees it: the contract check only calls
+# fold_readable (untouched here), the index check does not reason about strides,
+# and the readback drives the READER, which still declines correctly. Only the
+# probe's two NEG stride cases (stride 100 and 127 against 2*nOp=128) notice --
+# so before this state existed, the writer's copy of the rule was verified by
+# exactly two hand-picked probe rows and by nothing else.
+apply_m5() {
+  sed -i 's|if (!fold_usm \|\| !fold_stride_ok(fold_stride, nOp)) return dep;|if (!fold_usm \|\| false) return dep;  /*M5*/|' "$SRC"
+  grep -q '/\*M5\*/' "$SRC" || { echo "  M5: writer gate not mutated" >&2; return 1; }
+  return 0
+}
+# M6: fold_index_s0 loses its row offset, so every row reads row 0's S0 half.
+#
+# Note what this state does NOT do: it leaves the device readback GREEN. The
+# only reader path that calls fold_index_s0 is the u2/G16 split branch, and the
+# probe's readback runs bits=4, i.e. the u4 path, which reads only
+# fold_index_sfull. So fold_index_s0 has NO device coverage anywhere in the
+# tree and the host-side index check is its ONLY gate -- which is the strongest
+# argument for having added that check.
+apply_m6() {
+  sed -i 's|  return m \* (std::size_t)fold_stride + (std::size_t)o;|  return (std::size_t)o;  /*M6*/|' "$HDR"
+  grep -q '/\*M6\*/' "$HDR" || { echo "  M6: fold_index_s0 not mutated" >&2; return 1; }
+  if grep -A3 'fold_index_sfull(std::size_t m' "$HDR" | grep -q 'M6'; then
+    echo "  M6: fold_index_sfull was also hit -- anchor too broad" >&2; return 1
   fi
   return 0
 }
@@ -284,6 +345,12 @@ run_state S3_M1_and_M2        1 some violated
 restore; apply_m4 || { echo "FAIL: M4 did not apply" >&2; exit 1; }
 run_state S4_reader_index     1 some clean wrong
 
+restore; apply_m5 || { echo "FAIL: M5 did not apply" >&2; exit 1; }
+run_state S5_writer_gate     1 none clean  clean
+
+restore; apply_m6 || { echo "FAIL: M6 did not apply" >&2; exit 1; }
+run_state S6_index_s0        1 none clean  wrong
+
 # --- restore and prove the tree survived -------------------------------
 restore
 trap - EXIT INT TERM
@@ -309,9 +376,9 @@ if [ "$FAILED" = "0" ]; then
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "states=S0,S1,S2,S3,S4"
+    echo "states=S0,S1,S2,S3,S4,S5,S6"
   } >"$STAMP" 2>/dev/null
-  echo "FOLD MUTATION MATRIX: PASS (5/5 states behaved as characterized)"
+  echo "FOLD MUTATION MATRIX: PASS (7/7 states behaved as characterized)"
   emit_summary
   echo "  stamped $(git rev-parse --short HEAD 2>/dev/null) -> $STAMP"
   exit 0

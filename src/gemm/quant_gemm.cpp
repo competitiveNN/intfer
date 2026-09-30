@@ -1007,11 +1007,17 @@ sycl::event quant_gemm_dpas48_rowfold(sycl::queue& q,
   if (M == 0 || K < OP || (K % OP) != 0) return dep;
   const uint32_t nOp = K / OP;
   const uint32_t blocks = M * nOp;
+  // Accept/reject through the SAME predicate the readers use. The rule is
+  // "stride must be >= 2*nOp" (each row owns 2*nOp ints, [S0][Sfull], so a
+  // shorter stride lets row m's Sfull overwrite row m+1's S0 -- silent at
+  // M=1). Declining is always safe: the caller keeps the inline fold.
+  // AUDIT #13: this used to be an open-coded `fold_stride < 2*nOp` here, a
+  // second copy of a rule the header says never to hand-roll. The null check
+  // is the writer-side mirror of fold_readable()'s: the writer dereferences
+  // fold_usm unguarded at dst = fold_usm + m*fold_stride, so a null buffer
+  // would be a device-side null write rather than a decline.
+  if (!fold_usm || !fold_stride_ok(fold_stride, nOp)) return dep;
   fold_stride = fold_row_stride(fold_stride, nOp);
-  // MUST be >= 2*nOp: each row owns 2*nOp ints ([S0][Sfull]), so a shorter
-  // stride lets row m's Sfull block overwrite row m+1's S0 block. Silent at
-  // M=1. Declining is always safe — the caller keeps the inline fold.
-  if (fold_stride < 2 * nOp) return dep;
   const uint32_t global = ((blocks + TN - 1) / TN) * TN;
   return q.submit([&](sycl::handler& h) {
     if (dep != sycl::event{}) h.depends_on(dep);

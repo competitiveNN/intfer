@@ -253,6 +253,20 @@ inline uint32_t fold_row_stride(uint32_t fold_stride, uint32_t nOp) {
   return (fold_stride == 0) ? 2u * nOp : fold_stride;
 }
 
+// The ONE accept/reject DECISION for a fold row stride, consumed by the writer
+// (quant_gemm_dpas48_rowfold) AND by fold_readable() below.
+//
+// AUDIT #13: the writer used to open-code this as a bare
+// `if (fold_stride < 2*nOp) return dep;` -- a SECOND copy of a rule whose header
+// comment explicitly says "do NOT resolve or validate this by hand at a call
+// site". Two copies is the exact condition AUDIT #12 exists to eliminate, and
+// it was invisible to the contract check (which only calls fold_readable) and to
+// the whole mutation matrix (which never touched the writer's line). It was
+// caught only by the probe's two NEG stride cases. Same semantics, one home.
+inline bool fold_stride_ok(uint32_t fold_stride, uint32_t nOp) {
+  return fold_row_stride(fold_stride, nOp) >= 2u * nOp;
+}
+
 // Fail CLOSED. A reader handed a fold buffer whose stride it cannot validate
 // returns nullptr and recomputes the column sums inline: bit-identical to the
 // pre-FOLD path, just without the hoist. Never returns a mis-strided row.
@@ -260,7 +274,7 @@ inline const std::int32_t* fold_readable(const std::int32_t* usm,
                                          uint32_t fold_stride,
                                          uint32_t nOp) {
   if (!usm) return nullptr;
-  return fold_row_stride(fold_stride, nOp) >= 2u * nOp ? usm : nullptr;
+  return fold_stride_ok(fold_stride, nOp) ? usm : nullptr;
 }
 
 // Fold INDEX rule -- likewise one definition, consumed by every read site in
