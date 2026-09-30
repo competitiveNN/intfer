@@ -351,6 +351,31 @@ indistinguishable from a real regression and trains everyone to ignore red).
 So a full run on this box reads **8 PASS, 2 SKIPPED** — and the two skips are
 waiting on the second GPU, not on missing work.
 
+### OUTSTANDING — blocked on the second GPU (do NOT report as done)
+
+These are **unverified here**, not "good enough". Nothing in this repo may be
+described as covered by them until they have actually run.
+
+| item | what is unverified | how to close it |
+|---|---|---|
+| `test_device_argmax.sh` | the whole gate: device-argmax correctness, spec-rollback, parts path — every `--tp 2` arm | `sycl-ls` must print 2 `[level_zero:gpu]` lines, then `bash scripts/test_device_argmax.sh` (expects rc=0) |
+| `test_tp2_27b.sh` | 27B TP=2 greedy decode vs oracle, and the ~19GB-vs-~12GB VRAM headroom claim | same condition, then `bash scripts/test_tp2_27b.sh` |
+| E1 / E2 / E3 A/Bs | every tok/s number in those sections | needs both GPUs *and* a quiet window (load1 < 2) |
+| E4 | unimplemented by design; no flag exists | pre-registered only, see above |
+
+If a future session cannot get a second GPU, the correct statement is
+"8 PASS, 2 SKIPPED, E1-E4 unmeasured" — **not** a partial pass and never a tok/s
+figure from a 1-GPU or loaded window.
+
+### Self-check for the fold matrix (run it after any refactor of that code)
+
+`bash scripts/mutate_fold_matrix.sh --anchors-only` is a <1s, no-build,
+no-mutation pre-flight that fails if any M1/M2/M4 mutation target has moved,
+duplicated or vanished, or if a read site has stopped routing through
+`fold_index_sfull`/`fold_index_s0`. The full run stamps
+`build/fold_matrix/last_pass.stamp` with the HEAD sha it was proven against, so
+"the matrix passed" and "the matrix passed on THIS code" stay distinguishable.
+
 
 ## Also not yet implemented (no flag to test — do not go looking)
 

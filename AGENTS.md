@@ -516,12 +516,35 @@ Implement features for maximizing throughput for concurrent requests, starting f
    THE MATRIX IS NOW A SCRIPT, NOT PROSE: scripts/mutate_fold_matrix.sh
    re-derives S0-S4 (each state alone from a clean header, per-state logs,
    restore + residue re-verified) and ASSERTS each state's character. 5/5 as
-   characterized. It REFUSES to start on a dirty tree because it edits tracked
-   files and restores with `git checkout --` — which is a real hazard, not a
-   hypothetical one: during this work an ad-hoc `git checkout --` on the header
-   destroyed uncommitted helpers and broke the build, exactly as the guard
-   predicts. Negative-tested twice (asserting S1's readback fails, and S4's
-   contract is violated) — both report UNEXPECTED, rc=1.
+   characterized, stamped with the HEAD sha it was proven against
+   (build/fold_matrix/last_pass.stamp). It REFUSES to start on a dirty tree
+   because it edits tracked files and restores with `git checkout --` — which
+   is a real hazard, not a hypothetical one: during this work an ad-hoc
+   `git checkout --` on the header destroyed uncommitted helpers and broke the
+   build, exactly as the guard predicts. Negative-tested on all three columns
+   (contract, readback, index) — each reports UNEXPECTED, rc=1.
+   THE STALE-ANCHOR HOLE, CLOSED: a mutation harness has artifact assumptions a
+   refactor silently invalidates — the index refactor DELETED the text apply_m4
+   corrupted, and the matrix only failed closed by luck of ordering. An
+   ambiguous (not absent) anchor would have mis-targeted a state and still said
+   "pass". preflight_anchors() now asserts every M1/M2/M4 target occurs
+   EXACTLY ONCE plus two structural invariants, before any state runs; all
+   three drift classes verified (rc=1 each). `--anchors-only` runs it in <1s
+   with no build and no mutation. Re-point the apply_* if it fires; NEVER loosen
+   the check — a loosened anchor is how a mutation silently stops mutating.
+   AND THE SELF-CHECK WAS VACUOUS AT FIRST: it grepped its own source for the
+   summary strings, so the pattern sat INSIDE the check and it could never fail
+   — it reported OK with the S1 line deleted. Same failure class, one level
+   down; found by mutation-testing the check instead of reading it. It is now
+   BEHAVIOURAL: compares what the script RENDERS against a literal, and proves
+   the residue scan detects each marker by seeding a temp file. Rewriting it
+   that way immediately exposed a real bug it had introduced — the scan had
+   become `grep -F '/\*M1\*/'`, where the backslash is a LITERAL under -F, so
+   it could never match the actual '/*M1*/' marker (the old `git grep -e` form
+   was a regex, where `\*` is correct). Moral: -F and regex spell the same
+   pattern differently, and a "cleanup" between them is a silent no-op gate.
+   Both the PASS summary and the residue scan now route through emit_summary()
+   and has_residue(), so the strings the conclusions depend on have one home.
    S4's GAP CLOSED AT SOURCE (not just by a slower device check): every fold
    read now goes through fold_index_sfull/fold_index_s0 in quant_gemm.hpp, so
    the index expression has ONE home, unit-gated over 360 (m,stride,nOp,o)
@@ -548,7 +571,7 @@ Implement features for maximizing throughput for concurrent requests, starting f
    === FULL 10-GATE SUITE ON THIS TREE — 8 PASS, 2 SKIPPED (BOX STATE) ===
    Re-run after test_dpas_fold.sh was added. PASS: cpu_parity, dpas_fold,
    ga64_recip, gguf_roundtrip, gpu_optin (TP=1 AND TP=2, 4 FOLD arms),
-   http_batch, oracle_equiv, serve_load. SKIPPED (exit 2, not FAIL):
+   http_batch, oracle_equiv, serve_load.    SKIPPED (exit 2, not FAIL):
    device_argmax and tp2_27b — both need 2 GPUs, the box exposes one.
    Those two used to report a BARE FAIL, which was the whole problem: a
    clamped TP=1 run (Engine::load min()s tp_devices to dm.size()) fails an
@@ -556,9 +579,14 @@ Implement features for maximizing throughput for concurrent requests, starting f
    teaches everyone to ignore red gates. They now SKIP loudly via
    scripts/_gate_precond.sh `gate_require_gpus 2`. Never exit 0 (that would
    claim coverage nobody got) and never exit 1 (indistinguishable from a real
-   regression). Re-run both on a 2-GPU box; the queue in
-   reports/2026-09-30-pending-bench-backlog.md is blocked on that, not on
-   missing experiments.
+   regression). ALL FOUR helper paths unit-checked: require-met -> 0,
+   require-unmet -> 2, empty arg -> 1, sycl-ls absent -> 2.
+   *** OUTSTANDING, NOT DONE: device_argmax and tp2_27b are UNVERIFIED ***
+   They are blocked on a second GPU, not on missing work. Do not let any
+   future summary fold "skipped" into "covered" — the correct phrasing is
+   "8 PASS, 2 SKIPPED, E1-E4 unmeasured". Itemized table of exactly what is
+   unverified and how to close it: reports/2026-09-30-pending-bench-backlog.md,
+   "OUTSTANDING — blocked on the second GPU".
    THE FAILURE IS BOX STATE, NOT A REGRESSION — established, not assumed:
      GATE FAIL: hook fired on TP2 (40 lines)   [PARTS TP2 spec flag: 40, expect 0]
    The gate's TP2 arm asserts the argmax hook stays OFF under --tp 2, because
