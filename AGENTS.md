@@ -851,7 +851,8 @@ e.g. S3's contract column is 40 not 42).
   without re-deriving what the checker checks. Re-deriving — from the gates
   themselves, not from the 10 names the docs remembered — found three gates that
   `gate_inventory.sh` had been reporting as precondition "none", counted in the
-  7 PASS, and which are 100% device-dependent:
+  among the seven gates counted as exits-0, and which are 100%
+  device-dependent:
    test_dpas_fold.sh   runs dpas_fold_probe, whose 3 device readback regimes are
      the whole point of the gate. It said "needs a GPU" in its HEADER COMMENT
      (line 2) and carried no guard whatsoever — the comment was the entire

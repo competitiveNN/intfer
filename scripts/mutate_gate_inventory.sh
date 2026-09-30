@@ -52,6 +52,13 @@
 #      `--gpu --tp 1`). All three PASS on a 1-GPU box, which is exactly why the
 #      gap survived. They now carry a render-node guard, and this state is what
 #      stops the class reopening.
+#   M8 make the doc-tally parser comma-only again
+#      The parser only understood ", N PARTIAL". Live prose also uses the slash
+#      form ("7 PASS / 2 PARTIAL / 1 SKIPPED"), which the site-finder DETECTED
+#      and the parser then mis-read as 7/0/0 -- so a CORRECT line was reported
+#      STALE. A site the checker finds but cannot parse is worse than not finding
+#      it: it cries wolf on the line it was written to protect. Observed live
+#      against this file's own new audit-#15 paragraph.
 #   M6 let a 0-GPU box exit 0 again
 #      The defect audit #14 actually shipped: gate_inventory did not source
 #      setvars, so sycl-ls was absent, the doc-tally skipped, and the script
@@ -114,6 +121,7 @@ grep -qE 'SKIPPED_(TP2|SUB)|PARTIAL' |||M5 target: NO-SKIP-REPORT check
 unplaceable require classified|M6a target: BROKEN self-check case (makes M1 observable)
 doc-tally: SKIPPED|M6b target: the 0-GPU loud-skip branch
   if grep -qE 'renderD|gate_require_render_node' "$1"; then echo "render-node"; else echo "MISSING"; fi|M7 target: the NEEDS-GPU-without-a-guard verdict
+      sk="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) SKIPPED.*/\1/p')"|M8 target: the slash-tolerant tally parser
 EOF
   if [ "$bad" != "0" ]; then
     cat >&2 <<'EOF'
@@ -124,7 +132,7 @@ EOF
 EOF
     return 1
   fi
-  echo "anchors: all 7 mutation targets found exactly once"
+  echo "anchors: all 8 mutation targets found exactly once"
   return 0
 }
 
@@ -142,7 +150,8 @@ emit_summary() {
   echo "  M5: a per-arm guard that never reports its skip is rejected"
   echo "  M6: a 0-GPU box is refused (exit 2), never a silent exit 0"
   echo "  M7: a GPU gate with NO guard is reported, not filed as 'needs no device'"
-  echo "  => all seven mechanisms can fail the checker; none is untested."
+  echo "  M8: a slash-form doc tally is PARSED, not mis-read as 7/0/0"
+  echo "  => all eight mechanisms can fail the checker; none is untested."
 }
 EXPECTED_SUMMARY="  M1: the line-start anchoring is OBSERVABLE (un-anchoring flips the BROKEN case)
   M2: classification reads CODE, not the gates' own prose comments
@@ -151,7 +160,8 @@ EXPECTED_SUMMARY="  M1: the line-start anchoring is OBSERVABLE (un-anchoring fli
   M5: a per-arm guard that never reports its skip is rejected
   M6: a 0-GPU box is refused (exit 2), never a silent exit 0
   M7: a GPU gate with NO guard is reported, not filed as 'needs no device'
-  => all seven mechanisms can fail the checker; none is untested."
+  M8: a slash-form doc tally is PARSED, not mis-read as 7/0/0
+  => all eight mechanisms can fail the checker; none is untested."
 
 # rc class -> 0 = MISSED (checker still passed), 1 = CAUGHT by the self-check,
 # 2 = CAUGHT by the loud-skip path, anything else = CAUGHT with an odd rc.
@@ -376,6 +386,12 @@ run_state M7 "disable the NEEDS-GPU-without-a-guard verdict" "CAUGHT-selfcheck" 
   if grep -qE 'renderD|gate_require_render_node' "$1"; then echo "render-node"; else echo "not-gpu"; fi
 PATCH
 
+run_state M8 "make the tally parser comma-only again" "CAUGHT-selfcheck" <<'PATCH'
+      sk="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) SKIPPED.*/\1/p')"
+|||
+      sk="$(printf '%s' "$txt" | sed -nE 's/.*, ([0-9]+) SKIPPED.*/\1/p')"
+PATCH
+
 # M6 is scored differently: it needs a STUB sycl-ls reporting no device, because
 # the defect is that a box the checker cannot see still exited 0. There is no
 # source to edit, which is why it gets its own runner.
@@ -421,7 +437,7 @@ if [ "$FAILED" = "0" ]; then
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "states=S0,M1,M2,M3,M4,M5,M7,M6"
+    echo "states=S0,M1,M2,M3,M4,M5,M7,M8,M6"
     echo "caught=$NC/$NC"
   } >"$STAMP" 2>/dev/null
   echo "GATE-INVENTORY MUTATION MATRIX: PASS ($NC/$NC mutations refused the checker)"

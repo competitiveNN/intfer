@@ -377,9 +377,13 @@ else
     while IFS= read -r hit; do
       [ -n "$hit" ] || continue
       ln="${hit%%:*}"; txt="${hit#*:}"
+      # Separator is EITHER ", " or " / ": the slash form appears in live prose
+      # ("7 PASS / 2 PARTIAL / 1 SKIPPED") and was detected as a site but parsed
+      # with a comma-only pattern, so a CORRECT line was reported STALE. A site
+      # the checker finds but cannot parse is worse than not finding it.
       p="$(printf '%s' "$txt"  | sed -nE 's/.*[^0-9]([0-9]+) PASS.*/\1/p')"
-      pa="$(printf '%s' "$txt" | sed -nE 's/.*, ([0-9]+) PARTIAL.*/\1/p')"
-      sk="$(printf '%s' "$txt" | sed -nE 's/.*, ([0-9]+) SKIPPED.*/\1/p')"
+      pa="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) PARTIAL.*/\1/p')"
+      sk="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) SKIPPED.*/\1/p')"
       [ -n "$p" ] || continue
       # (2) wrapped tally: pull SKIPPED off the FOLLOWING FILE LINE if absent.
       if [ -n "$pa" ] && [ -z "$sk" ] && [ "$ln" -lt "${#ALL[@]}" ]; then
