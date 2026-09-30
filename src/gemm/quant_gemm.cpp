@@ -989,6 +989,56 @@ sycl::event act_quant_ga64_dev(sycl::queue& q, const ActQuantDevParams& p) {
   });
 }
 
+sycl::event quant_gemm_dpas48_rowfold(sycl::queue& q,
+                                      const std::int8_t* act_int8,
+                                      std::int32_t* fold_usm,
+                                      uint32_t M, uint32_t K,
+                                      uint32_t act_stride,
+                                      uint32_t fold_stride,
+                                      sycl::event dep) {
+#ifdef INTFER_PROFILE_GPU
+  profile_note_launch();
+#endif
+  constexpr uint32_t OP = 32, TN = 16;
+  // Self-guarding: any geometry the DPAS kernel cannot consume exactly, this
+  // declines and the caller keeps the inline fold. K%32!=0 is included because
+  // quant_gemm_dpas48 assumes whole K-ops; folding a truncated op count would
+  // silently agree with a wrong GEMM instead of refusing.
+  if (M == 0 || K < OP || (K % OP) != 0) return dep;
+  const uint32_t nOp = K / OP;
+  const uint32_t blocks = M * nOp;
+  if (fold_stride == 0) fold_stride = 2 * nOp;
+  // MUST be >= 2*nOp: each row owns 2*nOp ints ([S0][Sfull]), so a shorter
+  // stride lets row m's Sfull block overwrite row m+1's S0 block. Silent at
+  // M=1. Declining is always safe — the caller keeps the inline fold.
+  if (fold_stride < 2 * nOp) return dep;
+  const uint32_t global = ((blocks + TN - 1) / TN) * TN;
+  return q.submit([&](sycl::handler& h) {
+    if (dep != sycl::event{}) h.depends_on(dep);
+    h.parallel_for<class gemm_dpas48_rowfold_kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(TN)),
+        [=](sycl::nd_item<1> it) {
+          const uint32_t b = it.get_global_id(0);
+          if (b >= blocks) return;
+          const uint32_t m = b / nOp;
+          const uint32_t o = b - m * nOp;
+          const std::int8_t* Aq =
+              act_int8 + (size_t)m * act_stride + (size_t)o * OP;
+          // Same element order as the inline fold in quant_gemm_dpas48; the
+          // result is an exact int32 sum so the order cannot change it.
+          int s0 = 0, sf = 0;
+          for (uint32_t k = 0; k < OP; ++k) {
+            const int v = (int)Aq[k];
+            sf += v;
+            if (k < 16) s0 += v;
+          }
+          std::int32_t* dst = fold_usm + (size_t)m * fold_stride;
+          dst[o] = (std::int32_t)s0;
+          dst[nOp + o] = (std::int32_t)sf;
+        });
+  });
+}
+
 sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
                               sycl::event dep) {
 #ifdef INTFER_PROFILE_GPU
@@ -1016,6 +1066,12 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
   const float C = (p.bits == 4) ? 15.0f : (p.bits == 2) ? 3.0f : 255.0f;
   const float Cinv = 1.0f / C;
   const float alpha = p.alpha;
+  // INTFER_DPAS48_FOLD: when the caller ran quant_gemm_dpas48_rowfold, the
+  // per-(row,op) sums are precomputed and every tile WI just reads them,
+  // instead of redoing the identical O(K) integer fold once per 16-N tile.
+  // Exact int32 values, so this is a pure work hoist — not a numeric change.
+  const std::int32_t* Fold = p.fold_usm;
+  const uint32_t fold_stride = (p.fold_stride == 0) ? nOp : p.fold_stride;
 
   // One WI per (row m, 16-N tile t). B op-tiles reload per WI (L1-resident
   // across the M rows of a tile); A is per-row. Same fold math as the M=1
@@ -1048,8 +1104,9 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
               simd<int, TN> c;
               c = dpas<8, 1, int, uint8_t, std::int8_t,
                        dpas_argument_type::u4, dpas_argument_type::s8>(vb, va);
-              int S = 0;
-              for (uint32_t k = 0; k < OP; ++k) S += va[k];
+              int S;
+              if (Fold) S = Fold[(size_t)m * fold_stride + nOp + o];
+              else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }
               const uint32_t g = k0 / G;
               for (uint32_t nl = 0; nl < TN; ++nl) {
                 const uint32_t n = t * TN + nl;
@@ -1066,8 +1123,9 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
               simd<int, TN> c;
               c = dpas<8, 1, int, uint8_t, std::int8_t,
                        dpas_argument_type::u8, dpas_argument_type::s8>(vb, va);
-              int S = 0;
-              for (uint32_t k = 0; k < OP; ++k) S += va[k];
+              int S;
+              if (Fold) S = Fold[(size_t)m * fold_stride + nOp + o];
+              else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }
               const uint32_t g = k0 / G;
               for (uint32_t nl = 0; nl < TN; ++nl) {
                 const uint32_t n = t * TN + nl;
@@ -1104,15 +1162,22 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
                 cf = dpas<8, 1, int, uint8_t, std::int8_t,
                           dpas_argument_type::u2, dpas_argument_type::s8>(vb, va);
                 simd<std::int8_t, OP> va0(0);
-                int S0 = 0;
-                for (uint32_t k = 0; k < 16; ++k) {
-                  va0[k] = va[k];
-                  S0 += va[k];
+                int S0, Sf;
+                if (Fold) {
+                  S0 = Fold[(size_t)m * fold_stride + o];
+                  Sf = Fold[(size_t)m * fold_stride + nOp + o];
+                  for (uint32_t k = 0; k < 16; ++k) va0[k] = va[k];
+                } else {
+                  S0 = 0;
+                  for (uint32_t k = 0; k < 16; ++k) {
+                    va0[k] = va[k];
+                    S0 += va[k];
+                  }
+                  Sf = S0;
+                  for (uint32_t k = 16; k < OP; ++k) Sf += va[k];
                 }
                 c0 = dpas<8, 1, int, uint8_t, std::int8_t,
                           dpas_argument_type::u2, dpas_argument_type::s8>(vb, va0);
-                int Sf = S0;
-                for (uint32_t k = 16; k < OP; ++k) Sf += va[k];
                 const uint32_t g0 = k0 / G, g1 = g0 + 1;
                 for (uint32_t nl = 0; nl < TN; ++nl) {
                   const uint32_t n = t * TN + nl;
@@ -1182,6 +1247,12 @@ sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
   const uint32_t op_bytes = OP * TN * 4 / 8;  // u4
   const uint8_t* B = static_cast<const uint8_t*>(p.code_dpas);
   const float alpha = p.alpha;
+  // Same INTFER_DPAS48_FOLD contract as quant_gemm_dpas48. This kernel already
+  // evaluates the fold once per (row, op) (it sits outside the tile strip
+  // loop), so it does not NEED the hoist — but reading the precomputed values
+  // is still exact and keeps the flag uniform across both DPAS geometries.
+  const std::int32_t* Fold = p.fold_usm;
+  const uint32_t fold_stride = (p.fold_stride == 0) ? nOp : p.fold_stride;
 
   const uint32_t nWG = 16;
   const uint32_t global = ((M + nWG - 1) / nWG) * nWG;
@@ -1205,8 +1276,9 @@ sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
               simd<std::int8_t, OP> va;
               va.copy_from(Aqr + k0);
               const float as = Asr[k0 / GA];
-              int S = 0;
-              for (uint32_t k = 0; k < OP; ++k) S += va[k];
+              int S;
+              if (Fold) S = Fold[(size_t)m * fold_stride + nOp + o];
+              else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }
               const uint32_t g = k0 / G;
               for (uint32_t tt = ts; tt < tlim; ++tt) {
                 simd<uint8_t, 256> vb;  // op_bytes(u4) = 32*16*4/8

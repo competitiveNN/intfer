@@ -226,7 +226,55 @@ struct Dpas48Params {
   // (M=1 never noticed; M>1 read garbage scales/acts for rows >= 1).
   uint32_t act_stride = 0;  // 0 => K (tight); else workspace K
   uint32_t as_stride = 0;   // 0 => nGA; else workspace nGA
+  // INTFER_DPAS48_FOLD=1: precomputed per-(row,op) activation column sums
+  // from quant_gemm_dpas48_rowfold. nullptr (default) => the kernel recomputes
+  // them inline, which is what makes it redo the same O(K) integer fold once
+  // per 16-N tile. Bit-identical either way (exact int32 sums).
+  const std::int32_t* fold_usm = nullptr;
+  uint32_t fold_stride = 0;  // 0 => nOp; else workspace nOp stride
 };
+
+// DPAS48 row-fold pre-pass (EXPERIMENTAL, default-off INTFER_DPAS48_FOLD).
+//
+// quant_gemm_dpas48 runs one WI per (row m, 16-N tile t) and, inside its K
+// loop, recomputes the activation column sums
+//     S  = sum_{k<32} va[k]                (u4/u8/u2 non-split)
+//     S0 = sum_{k<16} va[k], Sf = S - S0   (INT2/G16 linearity split)
+// Those depend ONLY on (row, op), never on the tile, so each of the
+// nT = N/16 tiles per row recomputes an identical O(K) integer fold. That
+// replication is the documented reason the wide-N DPAS kernel loses to the
+// legacy tiled path even though the multiply itself is on XMX.
+//
+// This computes the sums once per (row, op). BIT-EXACT BY CONSTRUCTION: they
+// are exact int32 sums of int8 codes (|sum| <= 32*128 = 4096, nowhere near
+// overflow), and integer addition is exact and associative, so hoisting the
+// sum out of the tile loop cannot change a single bit — unlike the FP32 folds
+// elsewhere in this file, there is no rounding-order exposure. The DPAS math,
+// the scales, and the accumulation order are all untouched.
+//
+// Layout (row stride fold_stride ints; MUST be >= 2*nOp, i.e. >= 2*K/32):
+//     fold_usm[(m*fold_stride) + o]           = S0    (first 16 of the op)
+//     fold_usm[(m*fold_stride) + nOp + o]     = Sfull (all 32; = Sf in split)
+// The >= 2*nOp requirement is NOT cosmetic: each row occupies 2*nOp ints
+// ([S0 block][Sfull block]), so a shorter stride makes row m's Sfull block
+// overwrite row m+1's S0 block. That is silent at M=1 (only row 0 exists) and
+// only bites once the workspace stride is smaller than the call's 2*nOp, which
+// is exactly what a grow-only workspace hits when a smaller-K GEMM follows a
+// larger one. Found by examples/dpas_fold_probe, which gates this exact value.
+// `dep` is the optional prerequisite (the act-quant pre-pass event under
+// INTFER_DPAS_PREQ=1), because this reads the same activation buffer it
+// writes. Default {} means the activations are already on device.
+sycl::event quant_gemm_dpas48_rowfold(sycl::queue& q,
+                                      const std::int8_t* act_int8,
+                                      std::int32_t* fold_usm,
+                                      uint32_t M, uint32_t K,
+                                      uint32_t act_stride,
+                                      uint32_t fold_stride,
+                                      sycl::event dep = sycl::event{});
+// Declines (returns `dep` unchanged and writes NOTHING) when the geometry is
+// unusable: M==0, K < 32, K % 32 != 0, or fold_stride < 2*(K/32). The caller
+// must treat a decline as "fold_usm is not usable" and keep the inline fold —
+// which is why the engine re-checks before setting Dpas48Params::fold_usm.
 // NOTE: the device act-quant pre-pass dependency is NOT a Dpas48Params
 // member — the struct is captured BY VALUE into the kernel lambda, and
 // sycl::event is not device-copyable. It is a separate trailing parameter

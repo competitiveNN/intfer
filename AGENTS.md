@@ -433,7 +433,63 @@ Implement features for maximizing throughput for concurrent requests, starting f
    mechanism is not a verified one — read the code that would have to be wrong,
    or reproduce it. Reproducing was cheap (the 0.8B run is seconds) and would
    have caught this immediately.
-   === AUDIT #10: AUDIT #8's OWN ENUMERATION WAS THE SAME NARROW PATTERN ===
+   === EXPERIMENT SHIPPED: INTFER_DPAS48_FOLD=1 (default OFF) ===
+  The "rewritten 2D-tiled DPAS kernel" was blocked on one specific thing, and
+  that thing is now removed. quant_gemm_dpas48 runs one WI per (row, 16-N
+  tile) and, INSIDE its K loop, recomputed the activation column sums
+  `S = sum_{k<32} va[k]` (and S0/Sf for the INT2/G16 split). Those depend only
+  on (row, op), never on the tile — so all nT = N/16 tiles per row redid the
+  same O(K) integer fold. That replication is the documented reason the wide-N
+  DPAS kernel loses to the legacy tiled path despite the multiply being on XMX.
+  New plain-SYCL kernel `quant_gemm_dpas48_rowfold` computes them once per
+  (row, op) into a grow-only per-device workspace (2*M*nOp INT32); the DPAS
+  kernel reads them. Dep-chains on the pre-pass, adds no host wait.
+  WHY IT IS SAFE, precisely: the hoisted values are EXACT int32 sums of int8
+  codes (|sum| <= 4096). Integer addition is exact and associative, so hoisting
+  cannot change a bit — no rounding-order exposure, unlike the FP32 folds
+  elsewhere in that file. DPAS math, scales and accumulation order untouched.
+  A WORK hoist, not a numerics change. Do not "simplify" it into a device sum
+  in another order or a wider type; the exactness IS the safety argument.
+  ROW-STRIDE TRAP (cost a real bug, caught only by the new probe): each row
+  owns 2*nOp ints, `[S0][Sfull]`, so the stride must be >= 2*nOp, NOT >= nOp.
+  With a shorter stride, row m's Sfull block OVERWRITES row m+1's S0 block.
+  This is SILENT AT M=1 (only row 0 exists) and only fires when the grow-only
+  workspace stride is below the call's 2*nOp — i.e. a smaller-K GEMM after a
+  larger one. Guarded in the kernel (`fold_stride < 2*nOp` -> decline) and again
+  in the engine. The probe failed on `M=8 big-K` with S0 always right and Sfull
+  garbage, which is exactly this signature.
+  New gate: `examples/dpas_fold_probe` (device, no model) compares every
+  (row,op) S0/Sfull against a host reference over M=1/3/4/8, tight and
+  row-strided workspaces and big-K, plus 4 negative cases that must DECLINE and
+  write nothing (decline detected via a sentinel prerequisite event, because
+  comparing against a bare `sycl::event{}` is not reliable). PASS: 3907 pairs,
+  0 violations. MUTATION-PROVEN non-vacuous twice: (1) weakening the stride
+  guard back to `< nOp` -> rc=1; (2) corrupting `dst[nOp+o] = sf` to
+  `dst[o] = sf` -> rc=1 with the value comparison firing on M=1. Both reverted.
+  It is NOT yet wrapped in a scripts/test_*.sh gate — treat it as a mandatory
+  manual pre-flight until someone adds the wrapper (which must then use
+  gate_require_build + INTFER_BUILD_DIR like the other nine).
+  `scripts/test_gpu_optin.sh` gained 4 arms, PASS at TP=1 AND TP=2:
+  DPAS48+FOLD == DPAS48 (n=24), DPAS48+PREQ+FOLD == DPAS48 (n=24), WIDE
+  DPAS48+FOLD == DPAS48 (~97-token prompt => one ~97-row batch, the arm that
+  actually exercises the M>1 row stride), and FOLD-alone == base (inert
+  without DPAS48, same nested-flag shape as PREQ).
+  Measured, load-insensitive (0.8B TP=1, device-side total_kernel_us, NOT wall
+  time): decode n=8 88028.5 -> 86590.3us (-1.6%) with launches 2232 -> 2736
+  (+504); prefill chunk128 43533.5 -> 42795.0us (-1.7%), launches 1116 -> 1368
+  (+252). Read honestly: it costs ONE EXTRA LAUNCH PER DPAS GEMM and 0.8B is
+  the weak case (small N => few tiles to amortize against). 27B wide-N is where
+  it should pay and CANNOT be measured here (1 GPU; 27B needs --tp 2). No
+  tok/s claim. Handover report with blank RESULT lines:
+  `reports/2026-09-30-dpas48-fold.md` (E3), cross-referenced from
+  `reports/2026-09-30-pending-bench-backlog.md`, which now also states plainly
+  that the queue is blocked on 2-GPU box state, not on missing experiments.
+  STILL NOT DONE, deliberately: the remaining 2D-tiled geometry work proper
+  (subgroup DPAS with a genuinely cooperative 2D block, so B operands are
+  loaded once per block instead of per WI). This change removes the ARITHMETIC
+  replication, which was the blocker removable without a new numerics contract;
+  the load-replication half is untouched.
+    === AUDIT #10: AUDIT #8's OWN ENUMERATION WAS THE SAME NARROW PATTERN ===
    7efed06 fixed 5 harnesses and then claimed "All 17 artifact consumers now
    honor the override". That claim was FALSE, and the failure is precisely the
    one the process lesson above warns about: the enumeration was done by

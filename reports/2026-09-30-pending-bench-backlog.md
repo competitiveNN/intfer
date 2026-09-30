@@ -241,6 +241,16 @@ RESULT (27B TP=2 long-ctx decode, 3 rounds, load1 at each round):
 
 ---
 
+## E3 — `INTFER_DPAS48_FOLD=1`
+
+Implemented and gated; awaiting quiet-box numbers. Full report (with the
+measured device-side counters, the mutation proof, and the row-stride bug the
+probe caught during development) is in
+**`reports/2026-09-30-dpas48-fold.md`** — read that file for the command.
+Run its `dpas_fold_probe` pre-flight before spending a quiet window on it.
+
+---
+
 ## Do NOT spend a quiet window on these (already measured, verdict final)
 
 Listed so nobody re-runs them; details and numbers in AGENTS.md.
@@ -255,6 +265,13 @@ Listed so nobody re-runs them; details and numbers in AGENTS.md.
 | SYCL command graphs / L0 immediate submit | same floor as plain UR submit |
 | prefix cache (`INTFER_NO_PREFIX_CACHE=1` kill switch) | quiet-box A/B already done 2026-09-26, verdict in |
 | OpenVINO | evaluated, not adopted |
+
+### The queue is blocked on box state, not on missing experiments
+E1/E2/E3 are all `--tp 2`. As of this writing the box enumerates **one** GPU to
+the compute runtime, so **none of them can run** — see the PRECONDITION at the
+top. That is a known box state (AGENTS.md AUDIT #9/#11), not an engine bug, and
+not something to re-investigate: when both GPUs enumerate, the queue is ready.
+Do not use a loaded or 1-GPU window and do not report a number from one.
 
 ## Also not yet implemented (no flag to test — do not go looking)
 

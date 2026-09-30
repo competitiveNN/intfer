@@ -330,7 +330,14 @@ class Engine {
     // ActQuantDevParams::scale_inv_in for why the reciprocal must come from
     // the host.
     float* si = nullptr;
+    // INTFER_DPAS48_FOLD: per-device landing zone for the DPAS row-fold
+    // pre-pass — 2 * M * nOp INT32 (S0 and Sfull per (row, op), op = 32).
+    // Tiny (K/32 entries), grow-only, same contract as the buffers above.
+    // Per-device for the same reason as the rest: each rank owns its own
+    // sycl::context, so rank 0's queue cannot legally write rank 1's USM.
+    std::int32_t* fold = nullptr;
     uint32_t M = 0, K = 0, nGA = 0;
+    uint32_t nOp = 0;  // max K/32 seen (DPAS row-fold stride)
   };
   std::vector<Workspace48> ws48_;
   void ensure_workspace48(uint32_t M, uint32_t K);

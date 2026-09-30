@@ -146,12 +146,44 @@ for tp in 1 2; do
   [ -n "$WD48" ] || fail "TP=$tp wide DPAS48 stream empty (broken run)"
   [ "$WGOT" = "$WD48" ] || fail "TP=$tp [wide DPAS48+PREQ] '$WGOT' != wide DPAS48 '$WD48'"
 
-  # PREQ without DPAS48 must be inert (nested-flag guard).
-  PQ="$(N=24 ids_of "$tp" INTFER_DPAS_PREQ=1)"
+  # base and the PREQ-alone inertness check. Defined HERE (not at the end of
+  # this block) because the FOLD arms below reuse BOTH: PREQ-alone must be
+  # inert without DPAS48, and FOLD-alone likewise, and both compare to base.
   B24="$(N=24 ids_of "$tp")"
+  PQ="$(N=24 ids_of "$tp" INTFER_DPAS_PREQ=1)"
   echo "TP=$tp [base n=24]: '$B24'"
   echo "TP=$tp [INTFER_DPAS_PREQ=1 alone]: '$PQ'"
   [ "$PQ" = "$B24" ] || fail "TP=$tp PREQ-alone '$PQ' != base '$B24' (PREQ must be inert without DPAS48)"
+
+  # --- INTFER_DPAS48_FOLD arms (default-off row-fold hoist) -------------
+  # The fold pre-pass hoists the per-(row,op) activation column sums out of
+  # quant_gemm_dpas48's 16-N tile loop. It is a pure WORK hoist: the values are
+  # exact int32 sums of int8 codes, so the contract is bit-identity with plain
+  # DPAS48 — NOT identity with the FP16-act base (same as DPAS48 itself).
+  # Do not "simplify" this into a device-side sum of a different order or a
+  # wider type; the exactness argument is what makes it safe.
+  FOLD="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1)"
+  echo "TP=$tp [DPAS48+FOLD n=24]: '$FOLD'"
+  [ -n "$FOLD" ] || fail "TP=$tp DPAS48+FOLD stream empty (broken run)"
+  [ "$FOLD" = "$D48" ] || fail "TP=$tp [DPAS48+FOLD] '$FOLD' != DPAS48 '$D48'"
+
+  # Composes with the pre-pass (the fold dep-chains on it).
+  FOLDP="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS_PREQ=1 INTFER_DPAS48_FOLD=1)"
+  echo "TP=$tp [DPAS48+PREQ+FOLD n=24]: '$FOLDP'"
+  [ "$FOLDP" = "$D48" ] || fail "TP=$tp [DPAS48+PREQ+FOLD] '$FOLDP' != DPAS48 '$D48'"
+
+  # WIDE arm, and the one that actually matters for the fold: the row-stride
+  # contract needs >= 2*nOp, which is invisible at M=1 (single row, nothing can
+  # be overwritten) and only bites at M>1 with a workspace stride smaller than
+  # the call's 2*nOp. The ~97-token prompt is forwarded as one ~97-row batch.
+  WFOLD="$(wide_ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1)"
+  echo "TP=$tp [wide DPAS48+FOLD]: '$WFOLD'"
+  [ "$WFOLD" = "$WD48" ] || fail "TP=$tp [wide DPAS48+FOLD] '$WFOLD' != wide DPAS48 '$WD48'"
+
+  # FOLD without DPAS48 must be inert (nested-flag guard, same shape as PREQ).
+  FOLDA="$(N=24 ids_of "$tp" INTFER_DPAS48_FOLD=1)"
+  echo "TP=$tp [INTFER_DPAS48_FOLD=1 alone]: '$FOLDA'"
+  [ "$FOLDA" = "$B24" ] || fail "TP=$tp [INTFER_DPAS48_FOLD=1 alone] '$FOLDA' != base '$B24'"
 done
 
 if [ "$PASS" = 1 ]; then echo "GPU-OPTIN TEST: PASS"; else echo "GPU-OPTIN TEST: FAIL" >&2; exit 1; fi

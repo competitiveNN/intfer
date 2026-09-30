@@ -60,8 +60,9 @@ Engine::~Engine() {
     if (ws48_[d].as) sycl::free(ws48_[d].as, devices_[d].queue);
     if (ws48_[d].f32) sycl::free(ws48_[d].f32, devices_[d].queue);
     if (ws48_[d].si) sycl::free(ws48_[d].si, devices_[d].queue);
+    if (ws48_[d].fold) sycl::free(ws48_[d].fold, devices_[d].queue);
     ws48_[d].act = nullptr; ws48_[d].as = nullptr; ws48_[d].f32 = nullptr;
-    ws48_[d].si = nullptr;
+    ws48_[d].si = nullptr; ws48_[d].fold = nullptr;
   }
   // Free the wave workspaces (2*W live allocs per device max).
   for (size_t i = 0; i < wv_.size(); ++i) {
@@ -184,6 +185,16 @@ bool dpas_row_enabled() {
 // quant from host to device, it does not change the arithmetic.
 bool dpas_preq_enabled() {
   const char* env = std::getenv("INTFER_DPAS_PREQ");
+  static const bool enabled = (env && env[0] == '1' && env[1] == '\0');
+  return enabled;
+}
+
+// DPAS row-fold hoist opt-in (default OFF). Same getenv/static rule as the
+// flags above. Pure work hoist: the values moved out of the tile loop are
+// exact int32 sums of the int8 activation codes, so this cannot change a
+// result — it only stops every 16-N tile WI from recomputing them.
+bool dpas_fold_enabled() {
+  const char* env = std::getenv("INTFER_DPAS48_FOLD");
   static const bool enabled = (env && env[0] == '1' && env[1] == '\0');
   return enabled;
 }
@@ -654,17 +665,22 @@ void Engine::ensure_workspace48(uint32_t M, uint32_t K) {
   if (M == 0) M = 1;
   if (ws48_.size() != devices_.size()) ws48_.resize(devices_.size());
   const uint32_t nGA = (K + GA - 1) / GA;
+  const uint32_t nOp = K / 32;  // DPAS K-op = 32
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto& w = ws48_[d];
-    if (w.act && w.as && w.f32 && w.si && M <= w.M && K <= w.K && nGA <= w.nGA) continue;
+    if (w.act && w.as && w.f32 && w.si && w.fold && M <= w.M && K <= w.K &&
+        nGA <= w.nGA && nOp <= w.nOp)
+      continue;
     devices_[d].queue.wait();
     uint32_t nM = std::max(M, w.M);
     uint32_t nK = std::max(K, w.K);
     uint32_t nnGA = std::max(nGA, w.nGA);
+    uint32_t nnOp = std::max(nOp, w.nOp);
     if (w.act) { sycl::free(w.act, devices_[d].queue); w.act = nullptr; }
     if (w.as) { sycl::free(w.as, devices_[d].queue); w.as = nullptr; }
     if (w.f32) { sycl::free(w.f32, devices_[d].queue); w.f32 = nullptr; }
     if (w.si) { sycl::free(w.si, devices_[d].queue); w.si = nullptr; }
+    if (w.fold) { sycl::free(w.fold, devices_[d].queue); w.fold = nullptr; }
     auto& dev = devices_[d];
     w.act = static_cast<std::int8_t*>(sycl::malloc_shared(
         (size_t)nM * nK, dev.sycl_device, dev.sycl_context));
@@ -674,14 +690,19 @@ void Engine::ensure_workspace48(uint32_t M, uint32_t K) {
         (size_t)nM * nK * sizeof(float), dev.sycl_device, dev.sycl_context));
     w.si = static_cast<float*>(sycl::malloc_shared(
         2 * (size_t)nM * nnGA * sizeof(float), dev.sycl_device, dev.sycl_context));
-    if (!w.act || !w.as || !w.f32 || !w.si) {
+    // 2 * M * nOp INT32 (S0 + Sfull per op). Guard the multiply: nnOp is
+    // derived from nK, and the count is allocated 64-bit.
+    w.fold = static_cast<std::int32_t*>(sycl::malloc_shared(
+        (size_t)2 * nM * nnOp * sizeof(std::int32_t), dev.sycl_device,
+        dev.sycl_context));
+    if (!w.act || !w.as || !w.f32 || !w.si || !w.fold) {
       std::fprintf(stderr,
                    "[intfer] FATAL: workspace48 alloc failed on device %zu "
-                   "(M=%u K=%u nGA=%u)\n", d, nM, nK, nnGA);
+                   "(M=%u K=%u nGA=%u nOp=%u)\n", d, nM, nK, nnGA, nnOp);
       std::fflush(stderr);
       std::abort();
     }
-    w.M = nM; w.K = nK; w.nGA = nnGA;
+    w.M = nM; w.K = nK; w.nGA = nnGA; w.nOp = nnOp;
   }
 }
 
@@ -921,6 +942,10 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
   bool preq_ok = dpas_preq_enabled() && !use_row;
   for (size_t d = 0; d < devices_.size() && preq_ok; ++d)
     preq_ok = ws48_[d].f32 && ws48_[d].act && ws48_[d].as && ws48_[d].si;
+  // EXPERIMENTAL DPAS row-fold hoist (default-off INTFER_DPAS48_FOLD=1).
+  // Composes with the pre-pass above (the fold dep-chains on it) and with the
+  // row-cooperative geometry (which has its own fold handling).
+  const bool use_fold = dpas_fold_enabled();
 
   // 1) Activation quant into ws48_ (per row, per GA-slice max-abs scale).
   //    Device pre-pass first; on ANY decline fall through to the host loop,
@@ -1044,6 +1069,26 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
     p.act_stride = ws48_[d].K;
     p.as_stride = ws48_[d].nGA;
     sycl::event dep = preq_ok ? preq_events[d] : sycl::event{};
+    // INTFER_DPAS48_FOLD (default OFF): hoist the per-(row,op) activation
+    // column sums out of the 16-N tile loop. quant_gemm_dpas48 runs one WI per
+    // (row, tile) and otherwise recomputes the identical O(K) integer fold in
+    // every tile WI — the documented reason the wide-N DPAS kernel loses to the
+    // legacy tiled path. Bit-identical: the values are exact int32 sums, and
+    // the DPAS math, scales and accumulation order are untouched.
+    // Declines (leaves p.fold_usm null => inline fold) whenever the workspace
+    // or the op geometry is not usable, so the fallback is the old path.
+    if (use_fold && ws48_[d].fold && K >= 32 && (K % 32) == 0 &&
+        // 2*nOp per row, and the workspace must be wide enough for the
+        // call's ops (not just its own max): a shorter stride would make
+        // row m's Sfull block overwrite row m+1's S0 block.
+        ws48_[d].nOp >= 2 * (K / 32)) {
+      const uint32_t fold_stride = 2 * ws48_[d].nOp;
+      sycl::event fold_evt = gemm::quant_gemm_dpas48_rowfold(
+          q, ws48_[d].act, ws48_[d].fold, M, K, ws48_[d].K, fold_stride, dep);
+      p.fold_usm = ws48_[d].fold;
+      p.fold_stride = fold_stride;
+      dep = fold_evt;
+    }
 #ifdef INTFER_PROFILE_GPU
     auto t_s0 = std::chrono::high_resolution_clock::now();
 #endif
