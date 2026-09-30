@@ -168,10 +168,10 @@ if git diff --quiet -- "$HDR" "$SRC"; then
 else
   echo "FAIL: restore left the tree dirty" >&2; FAILED=$((FAILED + 1))
 fi
-if git grep -qI -e '/\*M1\*/' -e '/\*M2\*/' -- "$HDR" "$SRC" 2>/dev/null; then
+if git grep -qI -e '/\*M1\*/' -e '/\*M2\*/' -e '/\*M4\*/' -- "$HDR" "$SRC" 2>/dev/null; then
   echo "FAIL: mutation residue left in tracked sources" >&2; FAILED=$((FAILED + 1))
 else
-  echo "residue: none (no M1/M2 markers in tracked sources)"
+  echo "residue: none (no M1/M2/M4 markers in tracked sources)"
 fi
 
 echo
