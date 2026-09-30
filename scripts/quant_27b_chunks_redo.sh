@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd /var/home/fra/dev/intfer
-BIN=./build_quant_real/quant_model_real
+BIN="${INTFER_QUANT_REAL_BIN:-$ROOT/build_quant_real/quant_model_real}"
 SRC=/var/home/fra/data/models/safetensors/Qwen3.8-27B/model.safetensors.index.json
 OUT=test/quant_27b
 export OMP_NUM_THREADS=4

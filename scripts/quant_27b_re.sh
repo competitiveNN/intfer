@@ -3,12 +3,14 @@
 # Peak RSS ~23GB per chunk; run serially. Skips chunks whose output exists
 # and exceeds 1GB.
 set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd /var/home/fra/dev/intfer
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 # OMP=2: peak RSS ~16GB per 2-layer chunk (fits alongside desktop usage).
 # OMP=4 peaked at ~23GB and OOMs when available RAM < ~24GB.
 export OMP_NUM_THREADS=2
-BIN=./build_quant_real/quant_model_real
+BIN="${INTFER_QUANT_REAL_BIN:-$ROOT/build_quant_real/quant_model_real}"
 SRC=/var/home/fra/data/models/safetensors/Qwen3.8-27B/model.safetensors.index.json
 OUT=test/quant_27b
 mkdir -p "$OUT"

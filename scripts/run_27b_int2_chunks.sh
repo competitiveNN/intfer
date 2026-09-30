@@ -11,8 +11,10 @@
 # Chunks go to /data scratch (home disk is full); serial (-P1, ~2.5min/chunk).
 set -o pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd /var/home/fra/dev/intfer
-BIN=./build_quant_real/quant_model_real
+BIN="${INTFER_QUANT_REAL_BIN:-$ROOT/build_quant_real/quant_model_real}"
 SRC=/var/home/fra/data/models/safetensors/Qwen3.8-27B/model.safetensors.index.json
 OUT=/var/home/fra/data/models/intfer/chunks_int2
 LAYER_PER_CHUNK=2

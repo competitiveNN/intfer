@@ -378,6 +378,59 @@ Implement features for maximizing throughput for concurrent requests, starting f
    (every TP=2 gate arm would fail for the same reason) — so it is recorded,
    not blind-patched. This is family "gate cannot exercise the configuration"
    (see AUDIT #3c): do not ship an unverifiable engine change.
+   === AUDIT #10: AUDIT #8's OWN ENUMERATION WAS THE SAME NARROW PATTERN ===
+   7efed06 fixed 5 harnesses and then claimed "All 17 artifact consumers now
+   honor the override". That claim was FALSE, and the failure is precisely the
+   one the process lesson above warns about: the enumeration was done by
+   grepping for three ARTIFACT NAMES the previous fix already knew about
+   (intfer_cli / intfer_gguf / ga64_recip_test), so it could only ever
+   rediscover the instances already on the list. A family is closed by
+   enumerating from the SOURCE OF TRUTH, not from remembered names.
+   Redone from the CMake target list (all 19 `add_executable` targets across
+   examples/*, plus the separate build_quant_real tree), 10 more instances
+   existed in 3 build trees, all silently ignoring their documented override:
+     * MAIN tree, MEASUREMENT harness — tab_micro_ab.sh (gemm_bench): the
+       INT2 down-proj interleaved A/B, hardcoded "$ROOT/build/...". Same bug,
+       same class, same consequence ("measured the wrong binary") as the 5
+       fixed in 7efed06; it was simply not in the artifact-name grep.
+     * MAIN tree, model prep — merge_27b.sh, merge_27b_all.sh,
+       merge_27b_batched.sh, merge_27b_final.sh, merge_batched.sh
+       (quant_merge): hardcoded "./build/..." RELATIVE, so they only ever
+       honored an override of zero. Root-relative now.
+     * build_quant_real tree — quant_27b_chunks_redo.sh, quant_27b_re.sh,
+       run_27b_chunks.sh, run_27b_int2_chunks.sh (quant_model_real):
+       hardcoded "./build_quant_real/...", ignoring the INTFER_QUANT_REAL_BIN
+       override that scripts/build_quant_real.sh documents and defines.
+   All 10 now use the SCRIPT_DIR/ROOT idiom and their tree's override.
+   Verified WITHOUT running them (they launch 27B quantization jobs): a probe
+   evals only the prefix up to the assignment line, run from a real file in
+   scripts/ so ${BASH_SOURCE[0]} is populated — default resolves byte-identical
+   to the old hardcoded path (no behavior change), override resolves into the
+   override tree. 10/10 both directions. `bash -n` clean on all 10.
+   GOTCHA WORTH KEEPING: an eval-from-stdin harness SILENTLY misreports this
+   class of fix — with bash reading from stdin ${BASH_SOURCE[0]} is empty, so
+   ROOT degrades to `/var/home/fra/dev` (or empty) and a correct script looks
+   broken. Probe with a real file in place, or you will "fix" a non-bug.
+   Second gotcha, same session: the bulk `edit` tool DROPPED a trailing `"`
+   from new_string in 5 files at once (`MERGE="${...quant_merge`), which
+   `bash -n` caught as a syntax error — git showed HEAD clean, so the edits
+   were the cause, not a pre-existing break. Corollary: `bash -n` on every
+   edited script is not optional, and a script that was clean at HEAD and
+   dirty after an edit means the edit, not the repo.
+   Box state re-checked independently while here: AUDIT #9's mechanism HOLDS.
+   Both GPUs are xe-bound in PCI (04:00.0, 86:00.0, class 030000) and ALL FOUR
+   DRM nodes exist as char devices (major 226: card0/card1, renderD128/129);
+   xpu-smi and sycl-ls still enumerate ONE adapter, so the discriminator is
+   Level Zero adapter enumeration, exactly as #9 recorded. Also worth knowing
+   on this box: `lspci` is NOT INSTALLED (a `lspci | grep -c` returning 0 is a
+   missing tool, not evidence about hardware) and `ls -la /dev/dri` is WRONG
+   here — an `ls` wrapper (`rtk ls`) hides entries and reported only
+   `by-path/` while all four nodes existed; use `find /dev/dri -maxdepth 1`
+   or `stat` when the hardware state matters.
+   Re-verified after the edits (correctness only, no wall-time claim):
+   ga64-recip PASS (480645 slices / 30,753,153 elements bit-identical, discrim
+   103/192000/11/0 — IDENTICAL to the recorded baseline, confirming no source
+   drift) and cpu-parity PASS. No gate or engine source was touched.
    === AUDIT #3b: the DPAS48 x SSM_GPU gate was asserting TIE-LUCK ===
   Forcing the single reciprocal site changed the host oracle's own codes
   (5 differing bytes over 4.1M codes on a fixed dataset) and the GPU gate

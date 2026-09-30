@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd /var/home/fra/dev/intfer
 
-MERGE=./build/examples/quant_merge/quant_merge
+MERGE="${INTFER_BUILD_DIR:-$ROOT/build}/examples/quant_merge/quant_merge"
 CHUNKS=test/quant_27b
 EXISTING=/var/home/fra/data/models/intfer/Qwen3.8-27B.intifer
 OUT=/var/home/fra/data/models/intfer/Qwen3.8-27B.intifer.new

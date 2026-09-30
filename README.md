@@ -93,7 +93,14 @@ CMake options:
 | `INTFER_BUILD_EXAMPLES` | `ON` | Build the example programs |
 | `INTFER_SYCL_TARGET` | `spir64` | SYCL offload target triple |
 
-Build outputs land in `build/` (or `$INTFER_BUILD_DIR`).
+Build outputs land in `build/` (or `$INTFER_BUILD_DIR`). Every script that
+runs a built binary resolves it through that variable, so pointing
+`INTFER_BUILD_DIR` at another tree benchmarks/builds *that* tree rather than
+silently falling back to the default one.
+
+The separate host-only Stage-1 quantizer (`scripts/build_quant_real.sh`) has its
+own tree, `build_quant_real/`, and its own override `$INTFER_QUANT_REAL_BIN`;
+the `quant_27b_*` / `run_27b_*` chunk scripts resolve their binary through it.
 
 ---
 

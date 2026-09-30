@@ -3,7 +3,7 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN="$ROOT/build/examples/gemm_bench/gemm_bench"
+BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/gemm_bench/gemm_bench"
 MODEL="/var/home/fra/data/models/intfer/Qwen3.8-27B-int2.intifer"
 TENSOR="layers.0.mlp.down_proj"
 REPS="${1:-6}"

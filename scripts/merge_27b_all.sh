@@ -2,9 +2,11 @@
 # Streaming merge of all 32 2-layer chunks into the final 27B .intifer.
 # Uses quant_merge's dedup + streaming design (3.5 GB peak vs 57 GB naive).
 set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd /var/home/fra/dev/intfer
 
-MERGE=./build/examples/quant_merge/quant_merge
+MERGE="${INTFER_BUILD_DIR:-$ROOT/build}/examples/quant_merge/quant_merge"
 CHUNKS=test/quant_27b
 OUT=/var/home/fra/data/models/intfer/Qwen3.8-27B.intifer
 
