@@ -232,15 +232,24 @@ mkdir -p "$LOG_DIR" || exit 1
 : >"$SUMMARY"
 
 # --- mutation appliers -----------------------------------------------------
-# M1: the reader/writer shared rule resolves the 0 default to nOp, not 2*nOp.
+# EVERY applier verifies its own patch landed, by re-grepping for the marker it
+# injects. That is the audit-#17b discipline (a patch that silently does nothing
+# is reported as "the mechanism is not load-bearing", a confident false verdict
+# about code that was never exercised) -- and here it is marker-based rather than
+# the cmp-based verify_patched() of the newer matrices. Both mechanisms are sound;
+# this one is older. M1/M2 previously signalled failure only as a bare trailing
+# `grep` exit code with no diagnostic, unlike M4/M5/M6, so a stale anchor
+# produced an unexplained "M1 did not apply" from the call site.
 apply_m1() {
   sed -i 's|return (fold_stride == 0) ? 2u \* nOp : fold_stride;|return (fold_stride == 0) ? nOp : fold_stride;  /*M1*/|' "$HDR"
-  grep -q '/\*M1\*/' "$HDR"
+  grep -q '/\*M1\*/' "$HDR" || { echo "  M1: shared stride default not mutated (anchor stale?)" >&2; return 1; }
+  return 0
 }
 # M2: fold_readable stops validating the stride.
 apply_m2() {
   sed -i 's|return fold_stride_ok(fold_stride, nOp) ? usm : nullptr;|return usm;  /*M2*/|' "$HDR"
-  grep -q '/\*M2\*/' "$HDR"
+  grep -q '/\*M2\*/' "$HDR" || { echo "  M2: fold_readable stride validation not removed" >&2; return 1; }
+  return 0
 }
 # M4: the reader's index expression drops the Sfull half. After the index
 # refactor this expression has exactly ONE home -- fold_index_sfull in the
