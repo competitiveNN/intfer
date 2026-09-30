@@ -568,20 +568,109 @@ Implement features for maximizing throughput for concurrent requests, starting f
    it alone inverted the conclusion, and the S4 control then showed why BOTH
    checks are needed instead of a hand-wave.
 
-   === FULL 10-GATE SUITE ON THIS TREE — 8 PASS, 2 SKIPPED (BOX STATE) ===
+   === AUDIT #13: THE 2-GPU PRECONDITION WAS BOTH OVER- AND UNDER-APPLIED ===
+   AUDIT #12's follow-up wired `gate_require_gpus 2` into test_device_argmax.sh
+   and test_tp2_27b.sh. Enumerating the family (not the files the fix happened
+   to touch -- the audit #7 lesson) and re-reading what each gate actually
+   contains found BOTH errors at once.
+   (a) OVER-APPLIED in test_device_argmax.sh. That gate is MOSTLY 1-GPU:
+   sections 1, 1b, 2, 3, 4 and 5 are TP=1 (5 runs in section 4 are
+   cpu_parity/http_batch/gpu_optin, all 1-GPU), and only FIVE arms need a
+   second device. A top-level `gate_require_gpus 2 || exit 2` therefore skipped
+   the WHOLE gate on a 1-GPU box -- silently dropping section 5, the serve
+   fence-lock test, which exists precisely because that crash "only manifests on
+   a LATER sampling request" and is invisible to every stream gate. A gate that
+   always skips is indistinguishable from a gate nobody runs, and it took the
+   coverage of a known-dangerous path with it. FIXED: the guard is now PER ARM
+   (HAVE_TP2), the five TP=2 arms are skipped, and the verdict reports
+   PARTIAL PASS with exit 2 -- still never 0, still never a bare FAIL.
+   Knock-on: section 4 ran its sub-gates with a bare `if ...; then`, so
+   gpu-optin's new exit 2 would have been counted as a failure. sub_gate() now
+   maps 0 -> PASS, 2 -> PARTIAL (counted, not failed), else -> FAIL.
+   (b) UNDER-APPLIED: test_gpu_optin.sh was MISSED. It runs
+   `for tp in 1 2` with ~14 assertions each, and had no precondition at all.
+   This is the worst of the three outcomes the helper exists to prevent, and
+   worse than the false FAIL it was introduced to fix: because its assertions
+   are stream-IDENTITY comparisons, the tp=2 pass on a 1-GPU box re-ran tp=1
+   and every assertion HELD, so the gate printed PASS while certifying nothing
+   about tensor parallelism. A false PASS is strictly more dangerous than a false
+   FAIL. FIXED: TPS is "1" or "1 2" by device count, verdict exits 2 when the
+   tp=2 pass was skipped.
+   (c) test_tp2_27b.sh's top-level skip is CORRECT and unchanged: its one arm
+   is `--tp 2` on 27B and it asserts TP=sharded, so there is no 1-GPU coverage
+   to preserve.
+   FAMILY, EXHAUSTIVELY ENUMERATED (grep every script for a TP>1 arm): 8 scripts
+   match -- bench_gpu_ab.sh, bench_quiet_l4_ab.sh, bench_serve.sh, serve_27b.sh
+   (measurement/serve harnesses, deliberately unguarded per the audit #8 scope
+   note), and test_device_argmax.sh, test_gpu_optin.sh, test_tp2_27b.sh
+   (correctness gates, all three now guarded -- per-arm where 1-GPU coverage
+   exists, whole-gate only where none does).
+   THIRD FOLD COVERAGE HOLE, FOUND WHILE DOING (a)/(b): the matrix never
+   mutated the WRITER, and the writer open-coded the stride rule as a bare
+   `if (fold_stride < 2*nOp) return dep;` -- a SECOND copy of a rule whose own
+   header says "Do NOT resolve or validate this by hand at a call site", i.e.
+   the exact condition AUDIT #12 exists to eliminate, recreated 800 lines away.
+   Invisible to the contract check (which only calls fold_readable) and to the
+   whole matrix. FIXED: one shared decision, fold_stride_ok(), consumed by the
+   writer and by fold_readable; the writer also gained the null check that
+   mirrors fold_readable's (it dereferences fold_usm unguarded, so null was a
+   device-side null WRITE rather than a decline). Two new states prove it:
+     S5 writer gate removed       -> rc=1, and contract/index/readback ALL stay
+                                      green. Only the probe's two NEG stride
+                                      rows see it, so that copy was verified by
+                                      exactly two hand-picked rows and nothing else.
+     S6 fold_index_s0 row offset  -> rc=1, and ONLY the index check sees it.
+     S6 is the sharpest result in the matrix: fold_index_s0 is called from the
+     u2/G16 split branch ONLY, and every device readback in the tree runs
+     bits=4 (the u4 path, which reads just fold_index_sfull). So
+     fold_index_s0 has NO device coverage anywhere -- the host-side index check
+     added in AUDIT #12 is its sole gate. Matrix is now 7/7 (S0..S6) and the
+     claim is "all FOUR checks are load-bearing", each invisible to the others.
+
+   === FULL 10-GATE SUITE ON THIS TREE — 8 PASS, 2 PARTIAL (BOX STATE) ===
    Re-run after test_dpas_fold.sh was added. PASS: cpu_parity, dpas_fold,
-   ga64_recip, gguf_roundtrip, gpu_optin (TP=1 AND TP=2, 4 FOLD arms),
-   http_batch, oracle_equiv, serve_load.    SKIPPED (exit 2, not FAIL):
-   device_argmax and tp2_27b — both need 2 GPUs, the box exposes one.
-   Those two used to report a BARE FAIL, which was the whole problem: a
+   ga64_recip, gguf_roundtrip, http_batch, oracle_equiv, serve_load.
+   PARTIAL (exit 2, not FAIL): device_argmax and gpu_optin — every arm that
+   runs on 1 GPU is green, and only their TP=2 arms are skipped, because the
+   box exposes one GPU. tp2_27b is SKIPPED outright (exit 2): its single arm is
+   `--tp 2` on 27B, so there is nothing it can still check here.
+   Those gates used to report a BARE FAIL, which was the whole problem: a
    clamped TP=1 run (Engine::load min()s tp_devices to dm.size()) fails an
    assertion about a path it never took, and a red gate that means "the box"
-   teaches everyone to ignore red gates. They now SKIP loudly via
-   scripts/_gate_precond.sh `gate_require_gpus 2`. Never exit 0 (that would
-   claim coverage nobody got) and never exit 1 (indistinguishable from a real
-   regression). ALL FOUR helper paths unit-checked: require-met -> 0,
-   require-unmet -> 2, empty arg -> 1, sycl-ls absent -> 2.
-   *** OUTSTANDING, NOT DONE: device_argmax and tp2_27b are UNVERIFIED ***
+   teaches everyone to ignore red gates. And gpu_optin was worse still — it
+   reported PASS, because identity assertions on a re-run tp=1 trivially hold.
+   All three now go through scripts/_gate_precond.sh, PER ARM where 1-GPU
+   coverage exists. Never exit 0 (that would claim coverage nobody got) and
+   never exit 1 (indistinguishable from a real regression). Helper paths
+   unit-checked: require-met -> 0, require-unmet -> 2, empty arg -> 1,
+   sycl-ls absent -> 2. See AUDIT #13 for why whole-gate skipping was itself a
+   defect.
+   *** OUTSTANDING, NOT DONE: the TP=2 arms of device_argmax and gpu_optin,
+   and all of tp2_27b, are UNVERIFIED ***
+   RE-RUN AFTER AUDIT #13 (this box, 1 GPU, correctness only, no timing claim).
+   All ten gates executed; nothing skipped silently.
+     PASS (rc=0), 8: cpu_parity, dpas_fold, ga64_recip, gguf_roundtrip,
+       http_batch, oracle_equiv, serve_load, + device_argmax's TP=1 sections.
+     PARTIAL (rc=2), 2: gpu_optin (every tp=1 arm green: KV/Q8/HAD/SSM_GPU,
+       the DPAS48 family, PREQ x ROW/PREW/SSM_GPU, wide M=97, n=24 FOLD arms,
+       FOLD-alone inert; tp=2 pass dropped) and device_argmax (sections 1, 1b,
+       2, 3, 3b and the serve fence lock ALL ran and passed -- PARTS 32/40/40
+       exactly as locked, fence server alive through greedy+sampling+mixed;
+       only its 5 TP=2 arms dropped).
+     SKIPPED (rc=2), 1: tp2_27b.
+   Two things this run actually PROVED about the fix, not just exercised:
+     - device_argmax's section 4 reported `gpu-optin: PARTIAL/SKIP (rc=2, box
+       state -- not counted as a failure)`. Without sub_gate()'s rc map, the
+       gpu_optin fix would have turned a legitimate skip into a red line here —
+       the same false-FAIL class one level up. Caught in the same commit that
+       caused it.
+     - The serve fence lock ran and passed. Under the previous top-level skip it
+       never ran at all, so that crash-only-on-a-later-sampling-request path had
+       been silently uncovered on every 1-GPU box.
+   Fold matrix 7/7 (S0..S6) on the single-sourced rule; anchors-only rc=0;
+   residue 0/0; 36/36 scripts `bash -n` clean; all 10 gates carry a build
+   guard; all 29 artifact consumers still honor INTFER_BUILD_DIR (re-enumerated
+   from the CMake `add_executable` list, not from a remembered name list).
    They are blocked on a second GPU, not on missing work. Do not let any
    future summary fold "skipped" into "covered" — the correct phrasing is
    "8 PASS, 2 SKIPPED, E1-E4 unmeasured". Itemized table of exactly what is
