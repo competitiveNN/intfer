@@ -1114,6 +1114,111 @@ e.g. S3's contract column is 40 not 42).
   Rule: for permissions use `stat`, for device existence use the same syscall
   the gate uses. Never report a defect read off an `ls` rendering.
 
+- **AUDIT #17b: THREE BLIND SPOTS IN THE DEVICE-PRECOND PROOF, AND A DRIVER FOR
+  THE WHOLE STACK** (scripts/check_device_precond.sh healthy column,
+  scripts/mutate_device_precond.sh now 6 states, NEW scripts/run_all_checks.sh;
+  still no engine/quant/schedule code touched). Audit #17 closed the "fixtures
+  with no driver" gap. This pass asked the question #17 should have asked first:
+  **which claimed mechanism is actually exercised by a state that exists?**
+    (1) **M-A NEVER EXERCISED THE DRIFT COMPARISON.** Stripping a gate's device
+  guard tripped the per-file "carries NO guard at all" message, so the
+  `own_devices != inv_devices` branch was never the assertion that fired — a
+  claimed load-bearing check that was STRUCTURALLY BLIND, which is the audit-#12
+  S4 shape. New state **M-D** narrows ONLY this checker's GPU-token regex, so its
+  derived list shrinks (dropping test_dpas_fold.sh, which names dpas_fold_probe
+  and carries no `--gpu`) while gate_inventory.sh still lists that gate, and
+  neither gate is broken. "classification drift" must fire.
+    (2) **4 CLAIMED MECHANISMS, 3 STATES.** Added:
+      * **M-E** rots the `INTFER_SYCL_LS` seam: `gate_gpu_count` reports "0
+        devices, counted fine" when sycl-ls is absent instead of "unmeasurable",
+        so both paths exit 2 with the SAME diagnostic and the zero-device
+        direction degrades into "sycl-ls is missing" while still reporting green.
+        Only the seam-discrimination assertion can see this. Patched as a
+        two-line block with python3, because a sloppy `sed` would hit the wrong
+        branch.
+      * **M-F** rewords ONLY self-check case (c)'s synthetic gate, so the
+        always-red case genuinely rejects the correct cause. Without it, a harness
+        that rejected EVERYTHING would still read as a passing non-vacuity proof.
+    (3) **EACH STATE NOW DECLARES THE REASON IT MUST FAIL FOR.** A non-zero exit
+  is not enough: a checker can exit non-zero for an unrelated reason, which is
+  exactly how the contaminated hand-run of M-C scored a false catch. A state
+  caught for the wrong reason is now MISSED, and the log distinguishes the three
+  kinds (not load-bearing / wrong reason / unattributed).
+  **THREE BUGS FOUND BY RUNNING IT — TWO OF THEM SCORED MY OWN MATRIX WRONG**
+    * **M-D's `sed` never applied.** `sed -i "s|$A_TOKENS|(--gpu)|"` used `|` as
+  the delimiter on an anchor that CONTAINS `|` (ERE alternation), so sed died
+  with "unknown option to `s'". This is the audit-#16 collision recurring in a new
+  form: a `pat|desc` table and an `IFS='|'` parser truncating at a `|` inside a
+  pattern — here a sed DELIMITER. All text patches now go through
+  `patch_literal()`, a quoted python exact-literal replacement with no delimiter
+  to collide with.
+    * **M-E's rot was too weak, and the matrix blamed the checker.** The patch
+  kept `gate_gpu_count`'s `echo "SKIP: ... not available"` line, and `probe_diag`
+  takes the FIRST `SKIPPED|SKIP:` line, which that surviving echo precedes — so
+  the two diagnostics stayed distinguishable and the seam assertion correctly did
+  NOT fire. The state then reported "the mechanism is NOT load-bearing", a
+  confident false conclusion about code that was never exercised. A seam that
+  still announces itself is not rotted; both lines go.
+    * **Consequence, now structural: `verify_patched()`.** If a patch does not
+  change its file, the run ABORTS naming the STATE, not the checker. An
+  unverified patch is worse than no state: it converts a fault in the harness into
+  a verdict about the harness. A mutation that fails to REPRODUCE its defect is
+  worse than none, because it launders red green.
+  **THE THIRD DIRECTION, WHICH THE HARNESS ITSELF DISCLAIMED.** It printed "NOT
+  asserted here: that the gates PASS on a healthy box (AGENTS.md records those
+  runs)" — a proof in a transcript, the defect audit #17 closed one level up. A
+  **healthy column** now runs all 6 device gates and records the observed rc in
+  the stamp: committed state, not prose. It asserts rc is 0 or 2, that an rc=2 is
+  EXPLAINED by a skip diagnostic, and that nothing crashes, times out, or goes
+  red. It deliberately does NOT demand rc=0 — measured, 3 gates return 0 and 3
+  return 2 (tp2_27b needs 2 devices; gpu_optin/device_argmax report PARTIAL when
+  their TP=2 arms skip). Over-asserting here is how a correctness gate becomes a
+  flaky gate, and a timeout (rc=124) is explicitly not scored as a pass. Measured
+  on this box (loadavg 7-8, ~6.5 min): dpas_fold 0, http_batch 0, serve_load 0,
+  gpu_optin 2, device_argmax 2, tp2_27b 2.
+    Two defects in this addition, caught by running it:
+    * The PASS line claimed "on this healthy box no gate went red or silently
+  skipped" even when the column was SKIPPED — the same defect as `ddea91d` ("the
+  OK line must not claim the tally check ran when it skipped"), committed into
+  this harness by this very change. The healthy claim now follows the healthy RUN,
+  and the stamp's `healthy=` line is labelled STALE when the column did not run.
+    * The per-gate rc display used `${HEALTHY_RCS##* =}` with a space before the
+  `=`, which can never match `name=rc`, so it printed the whole accumulator.
+  The mutation matrix sets `INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1` for a STATED
+  reason (M-A/M-C break the guards, so on a healthy box the gate would run to
+  completion and its rc would change for reasons unrelated to the mutation). A
+  stated purpose, not a silent default-off; the checker runs the column by default.
+  **`scripts/run_all_checks.sh` — MECHANISED THE STAMP STANDARD.** "All stamps
+  equal HEAD" was a SESSION RITUAL: a human re-ran three checkers and three
+  matrices serially and read four stamp files, i.e. the "enumerate, never
+  remember" rule performed BY MEMORY. It now does the enumeration, the ordering,
+  the locking, and the staleness assertion. The stamp list comes from
+  `find -name '*last_pass.stamp'`, never a table — a hand-written list quietly
+  stops covering a matrix when one is added, which is how audits #7 and #8
+  overclaimed "closed". Fails closed on a dirty tracked tree, because the matrices
+  restore with `git checkout --`. `INTFER_QUICK=1` runs checkers only.
+  TWO MORE DEFECTS FOUND IN IT, both by running it:
+    * It called `fold_report_counts.sh` rc=2 a "real regression". That script
+  exits 2 when its stamp PREDATES HEAD — "Nothing is wrong with the code; the
+  EVIDENCE is about an older tree." Conflating the two makes a red meaning
+  "re-run the matrix" indistinguishable from a red meaning "fix the code", which
+  is the doctrine violation this repo keeps auditing for. rc=2 is now UNPROVEN,
+  counted separately, and only a real failure exits 1; a stale stamp exits 2.
+    * The full run left all four stamps CURRENT and still exited 2. The verdict
+  was computed from a snapshot the run itself invalidated: checkers run BEFORE the
+  matrices, so `fold_report_counts` correctly reported rc=2 on a tree whose stamps
+  were stale, the matrices then re-stamped everything, and nothing re-checked.
+  Unproven steps are now RE-RUN after the matrices, and the set is DERIVED
+  (whichever steps returned rc=2) rather than hard-coded as "this checker reads
+  that stamp" — a future checker that reads a matrix stamp is then re-validated
+  automatically, where a hand-written dependency table would quietly omit it.
+  Step dispatch moved into one `dispatch()` so the first pass and the re-run
+  cannot drift apart, and the re-run is reported, never silent.
+  Verified end-to-end at ea955bb: 6/6 device-precond states caught for their own
+  reasons, fold 7/7, gate-inventory 9/9, 4/4 stamps current, `run_all_checks`
+  rc=0 with the 2b re-run visibly reporting "ok (evidence now current)".
+
+
 
 
 
