@@ -94,6 +94,18 @@ FAILED=0
 UNPROVEN=0
 UNPROVEN_LABELS=""
 
+# The 0 / 2 / other decision lives in ONE place, used by step() and by the
+# self-check below. A classification that exists twice is one that can disagree
+# with itself, and the self-check would then be testing a copy rather than the
+# code that actually runs.
+classify_rc() { # $1 = rc -> prints ok | unproven | fail
+  case "$1" in
+    0) printf 'ok\n' ;;
+    2) printf 'unproven\n' ;;
+    *) printf 'fail\n' ;;
+  esac
+}
+
 # One place that knows what each step's command is, so the post-matrix re-run
 # dispatches through the SAME definition instead of a second hand-maintained list.
 # A duplicated table is exactly how a step silently stops being re-run.
@@ -115,38 +127,100 @@ dispatch() { # $1 = label -> runs it
       timeout 7200 bash "$SCRIPT_DIR/mutate_gate_inventory.sh" ;;
     mutate_device_precond.sh)
       timeout 7200 bash "$SCRIPT_DIR/mutate_device_precond.sh" ;;
-    *) echo "internal: unknown step '$1'" >&2; return 97 ;;
+    mutate_run_all_checks.sh)
+      timeout 3600 bash "$SCRIPT_DIR/mutate_run_all_checks.sh" ;;
   esac
+  # Seam: an external step directory. It exists because this script is the ENTRY
+  # POINT for a ~45 minute stack, so a mutation matrix that invoked it directly
+  # would need three hours -- and an assumption the harness cannot redirect is an
+  # assumption the harness cannot test (same rationale as INTFER_SYCL_LS and
+  # INTFER_BUILD_DIR). The self-check and its matrix both run here.
+  if [ -n "${INTFER_RUN_ALL_EXTRA_STEPS_DIR:-}" ] && [ -x "$INTFER_RUN_ALL_EXTRA_STEPS_DIR/$1" ]; then
+    "$INTFER_RUN_ALL_EXTRA_STEPS_DIR/$1"
+    return $?
+  fi
+  echo "internal: unknown step '$1'" >&2
+  return 97
 }
 
 step() { # $1 = label
-  local label="$1" log rc
+  local label="$1" log rc verdict
   log="$BUILD_DIR/run_all_$(printf '%s' "$label" | tr -c 'a-zA-Z0-9' '_').log"
   printf '  %-34s ' "$label"
   dispatch "$label" >"$log" 2>&1
   rc=$?
-  case "$rc" in
-    0) printf 'ok\n' ;;
-    2) printf 'UNPROVEN rc=2 (stale evidence, not a regression -- %s)\n' "$log"
-       UNPROVEN=$((UNPROVEN + 1))
-       UNPROVEN_LABELS="$UNPROVEN_LABELS $label" ;;
-    *) printf 'FAIL rc=%s (see %s)\n' "$rc" "$log"
-       FAILED=$((FAILED + 1)) ;;
+  verdict="$(classify_rc "$rc")"
+  case "$verdict" in
+    ok) printf 'ok\n' ;;
+    unproven)
+      printf 'UNPROVEN rc=%s (stale evidence, not a regression -- %s)\n' "$rc" "$log"
+      UNPROVEN=$((UNPROVEN + 1))
+      UNPROVEN_LABELS="$UNPROVEN_LABELS $label" ;;
+    fail)
+      printf 'FAIL rc=%s (see %s)\n' "$rc" "$log"
+      FAILED=$((FAILED + 1)) ;;
   esac
   RC_SUMMARY="$RC_SUMMARY$(printf '%-34s %s\n' "$label" "rc=$rc")\n"
   return 0
 }
 
+# --- CLASSIFIER SELF-CHECK (behavioural, gating) ---------------------------
+# Every other checker in this stack opens with a self-check that its own
+# classification can fail, because a harness that would reject everything still
+# reads as a passing proof (the audit-#17 always-red lesson). run_all_checks.sh
+# had none, so a state that made it always-red would have looked healthy.
+#
+# Three synthetic steps, because the three verdicts are the three things this
+# script exists to keep apart: a regression (rc 1) must NOT be reported as
+# missing evidence (rc 2). Each writes a sentinel, so "the step never ran" is
+# distinguishable from "the step ran and was classified".
+selfcheck() {
+  local d bad=0 g rc verdict want sent
+  d="$(mktemp -d "$BUILD_DIR/.selfcheck.XXXXXX")" || return 1
+  for spec in "sc_ok:0:ok" "sc_unproven:2:unproven" "sc_fail:1:fail"; do
+    g="$d/${spec%%:*}"; want="${spec##*:}"; want="${want#*:}"
+    sent="$d/${spec%%:*}.ran"
+    printf '#!/usr/bin/env bash\n: > %q\nexit %s\n' "$sent" "${spec#*:}" >"$g"
+    chmod +x "$g"
+    rm -f "$sent"
+    INTFER_RUN_ALL_EXTRA_STEPS_DIR="$d" "$g" >/dev/null 2>&1
+    rc=$?
+    verdict="$(classify_rc "$rc")"
+    if [ ! -f "$sent" ]; then
+      echo "  SELFCHECK: ${spec%%:*} never ran (no sentinel) -- the check is vacuous" >&2
+      bad=1; continue
+    fi
+    if [ "$verdict" != "$want" ]; then
+      echo "  SELFCHECK: ${spec%%:*} exited $rc and classified '$verdict', want '$want'" >&2
+      bad=1
+    fi
+  done
+  rm -rf "$d"
+  return $bad
+}
+echo "== 0/3 classifier self-check (must be able to fail) =="
+if ! selfcheck; then
+  echo >&2
+  echo "RUN ALL CHECKS: FAIL -- the classifier self-check did not hold, so every" >&2
+  echo "  verdict below is meaningless. A checker that cannot fail proves nothing." >&2
+  exit 1
+fi
+echo "  ok    sc_ok->ok, sc_unproven->unproven, sc_fail->fail"
+
+# The step list, overridable so the self-check and its mutation matrix can run
+# this script in seconds instead of 45 minutes.
+if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
+  STEPS="$INTFER_RUN_ALL_STEPS"
+else
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh"
+  [ "${INTFER_QUICK:-0}" = "1" ] || \
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh"
+fi
 echo "== 1/2 checkers =="
-step "gate_inventory.sh"
-step "fold_report_counts.sh"
-step "check_device_precond.sh"
+for label in $STEPS; do step "$label"; done
 
 if [ "${INTFER_QUICK:-0}" != "1" ]; then
   echo "== 2/2 mutation matrices (slow; each edits and restores tracked source) =="
-  step "mutate_fold_matrix.sh"
-  step "mutate_gate_inventory.sh"
-  step "mutate_device_precond.sh"
 
   # --- re-validate anything that was unproven -------------------------------
   # ORDERING, and the first run got this wrong. fold_report_counts.sh reads the
@@ -178,8 +252,10 @@ fi
 
 # --- 3. the stamp assertion, over an ENUMERATED set -------------------------
 # find, not a table. A hand-written list is a table that quietly stops covering a
-# matrix when one is added.
-echo "== 3/3 stamp assertion (enumerated) =="
+# matrix when one is added. STAMP_DIR is overridable so the mutation matrix can
+# point this at a synthetic stamp population and observe the enumeration.
+STAMP_DIR="${INTFER_RUN_ALL_STAMP_DIR:-$BUILD_DIR}"
+echo "== 3/3 stamp assertion (enumerated from $STAMP_DIR) =="
 STALE=0
 STAMP_COUNT=0
 while IFS= read -r stamp; do
@@ -187,7 +263,7 @@ while IFS= read -r stamp; do
   STAMP_COUNT=$((STAMP_COUNT + 1))
   sha="$(sed -n 's/^sha=//p' "$stamp" | head -1)"
   extra="$(sed -n 's/^\(caught\|states\)=//p' "$stamp" | head -1)"
-  rel="${stamp#$BUILD_DIR/}"
+  rel="${stamp#$STAMP_DIR/}"
   if [ "$sha" = "$HEAD_SHA" ]; then
     printf '  ok    %-46s %s %s\n' "$rel" "${sha:0:7}" "$extra"
   else
@@ -195,10 +271,10 @@ while IFS= read -r stamp; do
     STALE=$((STALE + 1))
   fi
 done <<EOF
-$(find "$BUILD_DIR" -name '*last_pass.stamp' -type f 2>/dev/null | sort)
+$(find "$STAMP_DIR" -name '*last_pass.stamp' -type f 2>/dev/null | sort)
 EOF
 if [ "$STAMP_COUNT" -eq 0 ]; then
-  echo "  FAIL  no stamps found under $BUILD_DIR -- nothing was proven." >&2
+  echo "  FAIL  no stamps found under $STAMP_DIR -- nothing was proven." >&2
   STALE=$((STALE + 1))
 fi
 
