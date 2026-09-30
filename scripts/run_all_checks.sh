@@ -112,35 +112,43 @@ classify_rc() { # $1 = rc -> prints ok | unproven | fail
 dispatch() { # $1 = label -> runs it
   case "$1" in
     gate_inventory.sh)
-      timeout 1800 bash "$SCRIPT_DIR/gate_inventory.sh" ;;
+      timeout 1800 bash "$SCRIPT_DIR/gate_inventory.sh"; return $? ;;
     fold_report_counts.sh)
-      timeout 1800 bash "$SCRIPT_DIR/fold_report_counts.sh" ;;
+      timeout 1800 bash "$SCRIPT_DIR/fold_report_counts.sh"; return $? ;;
     check_device_precond.sh)
       if [ "${INTFER_SKIP_HEALTHY:-0}" = "1" ]; then
         INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1 timeout 1800 bash "$SCRIPT_DIR/check_device_precond.sh"
       else
         timeout 3600 bash "$SCRIPT_DIR/check_device_precond.sh"
-      fi ;;
+      fi
+      return $? ;;
     mutate_fold_matrix.sh)
-      timeout 7200 bash "$SCRIPT_DIR/mutate_fold_matrix.sh" ;;
+      timeout 7200 bash "$SCRIPT_DIR/mutate_fold_matrix.sh"; return $? ;;
     mutate_gate_inventory.sh)
-      timeout 7200 bash "$SCRIPT_DIR/mutate_gate_inventory.sh" ;;
+      timeout 7200 bash "$SCRIPT_DIR/mutate_gate_inventory.sh"; return $? ;;
     mutate_device_precond.sh)
-      timeout 7200 bash "$SCRIPT_DIR/mutate_device_precond.sh" ;;
+      timeout 7200 bash "$SCRIPT_DIR/mutate_device_precond.sh"; return $? ;;
     mutate_run_all_checks.sh)
-      timeout 3600 bash "$SCRIPT_DIR/mutate_run_all_checks.sh" ;;
+      timeout 3600 bash "$SCRIPT_DIR/mutate_run_all_checks.sh"; return $? ;;
+    *)
+      # Seam: an external step directory. It exists because this script is the
+      # ENTRY POINT for a ~45 minute stack, so a mutation matrix that invoked it
+      # directly would need three hours -- and an assumption the harness cannot
+      # redirect is an assumption the harness cannot test (same rationale as
+      # INTFER_SYCL_LS and INTFER_BUILD_DIR). The self-check and its matrix run
+      # here. Deliberately the `*)` arm: the first version placed this AFTER the
+      # `esac` with no `*)`, so a MATCHING arm ran its command and then fell
+      # straight through to "unknown step" and returned 97 -- every real step was
+      # broken, and it went unnoticed because the only tests in that commit drove
+      # synthetic steps, which take the fallback path and work.
+      if [ -n "${INTFER_RUN_ALL_EXTRA_STEPS_DIR:-}" ] && [ -x "$INTFER_RUN_ALL_EXTRA_STEPS_DIR/$1" ]; then
+        "$INTFER_RUN_ALL_EXTRA_STEPS_DIR/$1"
+        return $?
+      fi
+      echo "internal: unknown step '$1'" >&2
+      return 97
+      ;;
   esac
-  # Seam: an external step directory. It exists because this script is the ENTRY
-  # POINT for a ~45 minute stack, so a mutation matrix that invoked it directly
-  # would need three hours -- and an assumption the harness cannot redirect is an
-  # assumption the harness cannot test (same rationale as INTFER_SYCL_LS and
-  # INTFER_BUILD_DIR). The self-check and its matrix both run here.
-  if [ -n "${INTFER_RUN_ALL_EXTRA_STEPS_DIR:-}" ] && [ -x "$INTFER_RUN_ALL_EXTRA_STEPS_DIR/$1" ]; then
-    "$INTFER_RUN_ALL_EXTRA_STEPS_DIR/$1"
-    return $?
-  fi
-  echo "internal: unknown step '$1'" >&2
-  return 97
 }
 
 step() { # $1 = label

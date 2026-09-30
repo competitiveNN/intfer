@@ -72,6 +72,19 @@ WORK="$BUILD_DIR/run_all_mutate"
 STAMP="$WORK/last_pass.stamp"
 LOCK="$WORK/.lock"
 PROBE="scripts/_rac_dirty_probe.md"
+# The SYNTHETIC world deliberately lives OUTSIDE the build tree. Two reasons, both
+# learned the hard way:
+#   * run_all_checks.sh enumerates stamps with `find "$BUILD_DIR" -name
+#     '*last_pass.stamp'`. Synthetic stamp files inside the build tree were picked
+#     up by the REAL enumeration, so the stack's stamp population grew by seven
+#     fixture files -- the enumerator silently measuring its own test data.
+#     Adding this matrix is exactly the population change that exposed it.
+#   * The inner runs get their own INTFER_BUILD_DIR (see run_rac), so the mutant's
+#     lock is not the one the OUTER run_all_checks.sh already holds. Sharing it
+#     made every inner run exit 1 with "another run_all_checks.sh is running", and
+#     the matrix correctly reported that as a broken CASE.
+SYNTH="$(mktemp -d "${TMPDIR:-/tmp}/rac_mut.XXXXXX")" || exit 1
+mkdir -p "$SYNTH/inner"
 rm -rf "$WORK"; mkdir -p "$WORK" || exit 1
 
 if ! mkdir "$LOCK" 2>/dev/null; then
@@ -80,7 +93,12 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 # Always clean up the mutant, even on an abort: it lives in scripts/, and leaving
 # a mutated copy there would poison every later check that globs that directory.
-cleanup() { rm -f "$MUTANT" "$PROBE"; git reset -- "$PROBE" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true; }
+cleanup() {
+  rm -f "$MUTANT" "$PROBE"
+  git reset -- "$PROBE" 2>/dev/null
+  rmdir "$LOCK" 2>/dev/null || true
+  rm -rf "$SYNTH"
+}
 trap cleanup EXIT
 
 [ -e "$MUTANT" ] && { echo "FAIL: $MUTANT already exists; refusing to overwrite" >&2; exit 1; }
@@ -93,10 +111,10 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 # --- the synthetic world ---------------------------------------------------
-STEPS="$WORK/steps"; mkdir -p "$STEPS"
+STEPS="$SYNTH/steps"; mkdir -p "$STEPS"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$STEPS/step_ok"
-printf '#!/usr/bin/env bash\nC="%s/step_flaky2.count"\nn=$(cat "$C" 2>/dev/null || echo 0)\necho $((n+1)) >"$C"\n[ "$n" -eq 0 ] && exit 2\nexit 0\n' "$WORK" >"$STEPS/step_flaky2"
-printf '#!/usr/bin/env bash\n: >"%s/step_sentinel.ran"\nexit 0\n' "$WORK" >"$STEPS/step_sentinel"
+printf '#!/usr/bin/env bash\nC="%s/step_flaky2.count"\nn=$(cat "$C" 2>/dev/null || echo 0)\necho $((n+1)) >"$C"\n[ "$n" -eq 0 ] && exit 2\nexit 0\n' "$SYNTH" >"$STEPS/step_flaky2"
+printf '#!/usr/bin/env bash\n: >"%s/step_sentinel.ran"\nexit 0\n' "$SYNTH" >"$STEPS/step_sentinel"
 chmod +x "$STEPS"/*
 
 mk_stamps() { # $1 = dir, $2 = "stale" to make c/ stale
@@ -107,13 +125,15 @@ mk_stamps() { # $1 = dir, $2 = "stale" to make c/ stale
   [ "$2" = "stale" ] && printf 'sha=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' >"$1/c/last_pass.stamp"
   return 0
 }
-ALL_CURRENT="$WORK/stamps_all_current"; mk_stamps "$ALL_CURRENT" current
-HAS_STALE="$WORK/stamps_with_stale";    mk_stamps "$HAS_STALE" stale
+ALL_CURRENT="$SYNTH/stamps_all_current"; mk_stamps "$ALL_CURRENT" current
+HAS_STALE="$SYNTH/stamps_with_stale";    mk_stamps "$HAS_STALE" stale
 
 reset_mutant() { rm -f "$MUTANT"; cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"; }
 run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir
   local id="$1" steps="$2" sdir="$3"
-  rm -f "$WORK/step_sentinel.ran" "$WORK/step_flaky2.count"
+  rm -f "$SYNTH/step_sentinel.ran" "$SYNTH/step_flaky2.count"
+  # INTFER_BUILD_DIR is redirected so the mutant's lock is not the outer run's.
+  INTFER_BUILD_DIR="$SYNTH/inner" \
   INTFER_RUN_ALL_STEPS="$steps" INTFER_RUN_ALL_EXTRA_STEPS_DIR="$STEPS" \
     INTFER_RUN_ALL_STAMP_DIR="$sdir" \
     timeout 600 bash "$MUTANT" >"$WORK/$id.log" 2>&1
@@ -143,7 +163,7 @@ baseline() {
 def_n_a() { grep -q 'SELFCHECK: sc_unproven' "$WORK/N-A.log"; }
 def_n_b() { grep -q '1 step(s) unproven' "$WORK/N-B.log" && ! grep -q '(re-run)' "$WORK/N-B.log"; }
 def_n_c() { ! grep -q 'c/last_pass.stamp' "$WORK/N-C.log"; }   # 3rd stamp not enumerated
-def_n_d() { [ -f "$WORK/step_sentinel.ran" ]; }                  # a step ran on a dirty tree
+def_n_d() { [ -f "$SYNTH/step_sentinel.ran" ]; }                  # a step ran on a dirty tree
 
 echo "== BASELINES (unmutated run_all_checks must be CORRECT in each setup) =="
 baseline "N-A" "step_ok"     "$ALL_CURRENT" 0 ""
@@ -236,6 +256,14 @@ run_state "N-D" "dirty-tree guard deleted; a step ran over uncommitted work" def
   "step_sentinel" "$ALL_CURRENT" "dirty"
 
 rm -f "$MUTANT"
+# The synthetic population must never have leaked into the real one, or the real
+# enumeration counts fixture stamps as matrix evidence.
+if find "$BUILD_DIR" \( -path '*stamps_all_current*' -o -path '*stamps_with_stale*' \) 2>/dev/null | grep -q .; then
+  echo "FAIL: synthetic stamp files leaked into the build tree." >&2
+  echo "  run_all_checks.sh enumerates '*last_pass.stamp' under BUILD_DIR, so" >&2
+  echo "  fixtures living there are counted as matrix evidence." >&2
+  exit 1
+fi
 echo
 if [ "$CAUGHT" -eq "$TOTAL" ]; then
   {
