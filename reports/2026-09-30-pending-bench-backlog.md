@@ -27,6 +27,39 @@ produced several retracted claims in this project.
 until awk '{exit !($1 < 2)}' /proc/loadavg; do sleep 30; done; echo "load1=$(awk '{print $1}' /proc/loadavg)"
 ```
 
+## PRECONDITION — both B580s must enumerate, or none of this can run
+
+Every command below is `--tp 2`, so **do not start a round until both GPUs are
+visible to the compute runtime**. Check this first, every session:
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+export LD_LIBRARY_PATH=/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}
+sycl-ls | grep -c '\[level_zero:gpu\]'     # must print 2
+xpu-smi --list-gpus | grep -c 'Arc'        # must print 2
+```
+
+If that prints **1**, stop: this is the box state recorded in AGENTS.md
+AUDIT #9/#11, not an engine regression. With one GPU the engine correctly
+clamps `--tp 2` down to TP=1, 27B does not fit (~19 GB vs ~12 GB), and the run
+dies during prefill. You will now also see a new, deliberate diagnostic that
+did not exist before commit `bc851e5`:
+
+```
+Engine: WARNING: TP=2 requested but only 1 Arc GPU(s) discovered — continuing with TP=1. ...
+```
+
+That warning plus a later `rc=139` / `FATAL: signal 6` with
+`cpu_page_fault_memory_manager.cpp` in the abort is the **known 1-GPU
+signature**, not a new bug. Do not debug it and do not report it as a result —
+wait for both GPUs. (The clamp itself is correct; only its silence was a defect,
+and that is what the warning fixes.)
+
+Do not verify GPU presence with `lspci` — it is not installed on this box, so
+it answers "0" regardless of the hardware. Do not trust `ls -la /dev/dri`
+either; use `find /dev/dri -maxdepth 1`. Both traps produced false readings
+during AUDIT #10/#11.
+
 ---
 
 ## E1 — `INTFER_DPAS_PREQ=1` (device GA64 activation-quant pre-pass)
@@ -88,7 +121,7 @@ that is a real regression in the pre-pass.
 
 ### Commands (27B, TP=2, decode)
 ```bash
-BIN=build/examples/intfer_cli/intfer_cli
+BIN="${INTFER_BUILD_DIR:-build}/examples/intfer_cli/intfer_cli"
 M=/var/home/fra/data/models/intfer/Qwen3.8-27B-int2.intifer
 TOK="--tokenizer-py scripts/bpe_tokenize.py --detok-py scripts/bpe_detokenize.py"
 export LD_LIBRARY_PATH=/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}
@@ -159,6 +192,15 @@ and for concurrency on a ~12 GB/card TP=2 split.
 ### Stream-identity invariant
 **base == KV == Q8 == Q8+HAD**, byte-identical. Unlike E1, all four arms are
 meant to be identical. Verify the ids first; only then believe a timing.
+
+The E2 snippets reuse `$BIN`, `$M` and `$TOK` from E1's block — define them
+first if you run E2 on its own:
+
+```bash
+BIN="${INTFER_BUILD_DIR:-build}/examples/intfer_cli/intfer_cli"
+M=/var/home/fra/data/models/intfer/Qwen3.8-27B-int2.intifer
+TOK="--tokenizer-py scripts/bpe_tokenize.py --detok-py scripts/bpe_detokenize.py"
+```
 
 ```bash
 for mode in "INTFER_INT8_KV=1" "INTFER_INT8_KV=1 INTFER_KV_Q8=1" \
