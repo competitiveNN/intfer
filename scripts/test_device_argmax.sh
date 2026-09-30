@@ -50,10 +50,6 @@ gate_require_build intfer_cli || exit 1
 
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }
-if ! python3 -c "open('/dev/dri/renderD128','rb').close()" 2>/dev/null; then
-  echo "SKIP: no render-node access from this shell."
-  exit 2
-fi
 # 2-GPU precondition, PER ARM (AUDIT #13). Engine::load clamps
 # min(tp_devices, dm.size()), so on a 1-GPU box every `--tp 2` arm silently runs
 # as TP=1 and asserts against a path it never exercised.
@@ -73,7 +69,13 @@ fi
 set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 set -u
+# gate_require_device counts devices, so it must run AFTER setvars puts sycl-ls
+# on PATH -- called earlier it sees an empty count and, per the helper's own
+# rc/emptiness contract, refuses to certify rather than silently passing. It is
+# the whole-gate precondition ("can this shell reach a device at all"); the TP=2
+# arm count below is the per-arm one.
 . "$SCRIPT_DIR/_gate_precond.sh"
+gate_require_device || exit 2
 # `|| N_GPUS=0`, not `|| echo 0`: the count is a bare integer and a FAILED COUNT
 # must be a substitution failure, not text appended to a value (audit #14 --
 # `|| echo 0` produced a two-line "0\n0" whenever sycl-ls saw no device, and the

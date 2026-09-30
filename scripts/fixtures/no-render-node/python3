@@ -1,0 +1,13 @@
+#!/bin/sh
+# Fails ONLY the render-node probe; everything else passes through to the real
+# python3. A blanket "exit 1" would misreport the condition under test: the
+# gates that matter also use python3 for real work (the BPE tokenizer, the HTTP
+# client), so failing every invocation would make a gate look red for the wrong
+# reason -- the same mis-scoring the fold matrix refuses when a mutation breaks
+# syntax instead of behaviour.
+for a in "$@"; do
+  case "$a" in
+    *renderD128*) exit 1 ;;
+  esac
+done
+exec /usr/bin/python3 "$@"

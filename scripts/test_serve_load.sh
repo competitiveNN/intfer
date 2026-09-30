@@ -59,7 +59,7 @@ source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 # this and serve_load passed on a 1-GPU box while carrying no guard, so they
 # were the gates that would have gone red on a 0-GPU box.
 . "$SCRIPT_DIR/_gate_precond.sh"
-gate_require_render_node || exit 2
+gate_require_device || exit 2
 export TMPDIR=/var/home/fra/build_tmp
 mkdir -p "$TMPDIR"
 

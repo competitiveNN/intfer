@@ -52,6 +52,14 @@
 #      `--gpu --tp 1`). All three PASS on a 1-GPU box, which is exactly why the
 #      gap survived. They now carry a render-node guard, and this state is what
 #      stops the class reopening.
+#   M9 strip the render-node guard from a GPU gate (target = a GATE, not the
+#      checker)
+#      Audit #15 added gate_require_device to test_dpas_fold /
+#      test_http_batch / test_serve_load. Their end-to-end proof was run once,
+#      by hand, and the result lived in a transcript -- which is the defect this
+#      whole matrix exists to stop. Here it is a state: remove the guard, and the
+#      RENDER-NODE column MUST report MISSING and the checker MUST exit 1. Proves
+#      both that the guard is load-bearing and that the column is live.
 #   M8 make the doc-tally parser comma-only again
 #      The parser only understood ", N PARTIAL". Live prose also uses the slash
 #      form ("7 PASS / 2 PARTIAL / 1 SKIPPED"), which the site-finder DETECTED
@@ -83,13 +91,18 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT" || exit 1
 
 TGT=scripts/gate_inventory.sh
+# Second class of target: a GATE rather than the checker. Audit #15's end-to-end
+# proof (seed an unguarded GPU gate, watch the RENDER-NODE column catch it) lived
+# only in a transcript -- the exact defect #13/#14 exist to prevent, one level up
+# from the prose-table problem. M9 below makes it a re-runnable state.
+TGT2=scripts/test_dpas_fold.sh
 LOG_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/gate_inventory_matrix"
 SUMMARY="$LOG_DIR/summary.txt"
 STAMP="$LOG_DIR/last_pass.stamp"
 
 # --- fail closed on a dirty tree: we are about to `git checkout --` it --------
-if ! git diff --quiet -- "$TGT" || ! git diff --cached --quiet -- "$TGT"; then
-  echo "FAIL: $TGT has uncommitted changes." >&2
+if ! git diff --quiet -- "$TGT" "$TGT2" || ! git diff --cached --quiet -- "$TGT" "$TGT2"; then
+  echo "FAIL: $TGT or $TGT2 has uncommitted changes." >&2
   echo "  This script edits it and restores with 'git checkout --', which would" >&2
   echo "  DESTROY that work. Commit or stash first, then re-run." >&2
   exit 1
@@ -103,26 +116,60 @@ fi
 # moved/duplicated/vanished anchor is a hard stop before any state runs. (Same
 # rationale as mutate_fold_matrix.sh's preflight, which exists because the index
 # refactor deleted a mutation's target text outright.)
-anchors_ok() {
-  local bad=0 n
-  while IFS='|' read -r pat desc; do
-    [ -n "$pat" ] || continue
-    n="$(grep -cF -- "$pat" "$TGT" 2>/dev/null || true)"
+# Patterns live in a QUOTED ARRAY, not a `pat|desc` table parsed with IFS='|'.
+#
+# AUDIT #16. The table used `|` as the field separator while the patterns
+# themselves contain `|` -- ERE alternation ('renderD|gate_require_render_node',
+# 'SKIPPED_(TP2|SUB)|PARTIAL') and `||`. Every such row was silently TRUNCATED at
+# the first `|`, and because a truncated prefix is still a substring, the
+# pre-flight went on reporting "found exactly once" while checking strictly LESS
+# than it claimed. Four of nine anchors were affected. That is precisely the
+# failure the pre-flight exists to prevent -- a loosened anchor -- arriving
+# through the pre-flight's own parser.
+#
+# A quoted array element can contain any character, so there is nothing left to
+# collide with. $1 = file to check (a parameter so the self-check can run it
+# against a seeded temp file and prove it CAN fail).
+ANCHOR_PATTERNS=(
+  '  if grep -qE '"'"'^[[:space:]]*gate_require_gpus[[:space:]]+[0-9]'"'"' "$1"; then'
+  'strip_comments() { sed -e '"'"'s/[[:space:]]#.*$//'"'"''
+  'elif grep -q '"'"'gate_gpu_count'"'"' "$1"; then'
+  '  [ "$p" = "per-arm" ] ||'
+  'grep -qE '"'"'SKIPPED_(TP2|SUB)|PARTIAL'"'"' ||'
+  'unplaceable require classified'
+  '      sk="$(printf '"'"'%s'"'"' "$txt" | sed -nE '"'"'s/.*[,/] ?([0-9]+) SKIPPED.*/\1/p'"'"')"'
+  'doc-tally: SKIPPED'
+  'if grep -qE '"'"'renderD|gate_require_render_node|gate_require_device'"'"' "$1"; then echo "render-node"'
+  'gate_require_device || exit 2'
+)
+# Which file each anchor lives in. M9 mutates a GATE, not the checker, so its
+# anchor is in $TGT2 -- a single-file pre-flight silently checked 0 of it.
+ANCHOR_FILE=(TGT TGT TGT TGT TGT TGT TGT TGT TGT TGT2)
+ANCHOR_DESC=(
+  "M1/M7 target: line-start gate_require_gpus test"
+  "M2 target: comment stripper"
+  "M3 target: the elif that M3 starves"
+  "M4 target: the per-arm self-check expectation"
+  "M5 target: NO-SKIP-REPORT check"
+  "M7b target: BROKEN self-check case (makes M1 observable)"
+  "M8 target: the slash-tolerant tally parser"
+  "M6b target: the 0-GPU loud-skip branch"
+  "M7 target: the NEEDS-GPU verdict line"
+  "M9 target: the device guard in a GPU gate (lives in $TGT2)"
+)
+anchors_ok() { # $1 = file to check
+  local f="${1:-$TGT}" bad=0 n i tgt
+  for i in "${!ANCHOR_PATTERNS[@]}"; do
+    # The optional $1 overrides the FILE for every anchor, so the self-check can
+    # point the whole table at a seeded copy. Without it, an anchor belonging to
+    # $TGT2 would be checked against $TGT and found zero times.
+    if [ -n "${f}" ] && [ "$f" != "$TGT" ]; then tgt="$f"; else tgt="${ANCHOR_FILE[$i]}"; tgt="${!tgt}"; fi
+    n="$(grep -cF -- "${ANCHOR_PATTERNS[$i]}" "$tgt" 2>/dev/null || true)"
     if [ "$n" != "1" ]; then
-      echo "ANCHOR STALE: $desc -- found $n occurrence(s), want 1" >&2
+      echo "ANCHOR STALE: ${ANCHOR_DESC[$i]} -- found $n occurrence(s), want 1" >&2
       bad=1
     fi
-  done <<'EOF'
-  if grep -qE '^[[:space:]]*gate_require_gpus[[:space:]]+[0-9]' "$1"; then|M1 target: line-start gate_require_gpus test
-strip_comments() { sed -e 's/[[:space:]]#.*$//'|M2 target: comment stripper
-elif grep -q 'gate_gpu_count' "$1"; then|M3 target: the elif that M3 starves
-[ "$p" = "per-arm" ] |||M4 target: the per-arm self-check expectation
-grep -qE 'SKIPPED_(TP2|SUB)|PARTIAL' |||M5 target: NO-SKIP-REPORT check
-unplaceable require classified|M6a target: BROKEN self-check case (makes M1 observable)
-doc-tally: SKIPPED|M6b target: the 0-GPU loud-skip branch
-  if grep -qE 'renderD|gate_require_render_node' "$1"; then echo "render-node"; else echo "MISSING"; fi|M7 target: the NEEDS-GPU-without-a-guard verdict
-      sk="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) SKIPPED.*/\1/p')"|M8 target: the slash-tolerant tally parser
-EOF
+  done
   if [ "$bad" != "0" ]; then
     cat >&2 <<'EOF'
 
@@ -132,7 +179,7 @@ EOF
 EOF
     return 1
   fi
-  echo "anchors: all 8 mutation targets found exactly once"
+  echo "anchors: all ${#ANCHOR_PATTERNS[@]} mutation targets found exactly once (across $TGT and $TGT2)"
   return 0
 }
 
@@ -151,7 +198,8 @@ emit_summary() {
   echo "  M6: a 0-GPU box is refused (exit 2), never a silent exit 0"
   echo "  M7: a GPU gate with NO guard is reported, not filed as 'needs no device'"
   echo "  M8: a slash-form doc tally is PARSED, not mis-read as 7/0/0"
-  echo "  => all eight mechanisms can fail the checker; none is untested."
+  echo "  M9: a GPU gate with its device guard REMOVED is caught (target = a gate)"
+  echo "  => all nine mechanisms can fail the checker; none is untested."
 }
 EXPECTED_SUMMARY="  M1: the line-start anchoring is OBSERVABLE (un-anchoring flips the BROKEN case)
   M2: classification reads CODE, not the gates' own prose comments
@@ -161,7 +209,8 @@ EXPECTED_SUMMARY="  M1: the line-start anchoring is OBSERVABLE (un-anchoring fli
   M6: a 0-GPU box is refused (exit 2), never a silent exit 0
   M7: a GPU gate with NO guard is reported, not filed as 'needs no device'
   M8: a slash-form doc tally is PARSED, not mis-read as 7/0/0
-  => all eight mechanisms can fail the checker; none is untested."
+  M9: a GPU gate with its device guard REMOVED is caught (target = a gate)
+  => all nine mechanisms can fail the checker; none is untested."
 
 # rc class -> 0 = MISSED (checker still passed), 1 = CAUGHT by the self-check,
 # 2 = CAUGHT by the loud-skip path, anything else = CAUGHT with an odd rc.
@@ -189,6 +238,22 @@ selfcheck() {
   # ...and must not be a constant function.
   [ "$(rc_class 0)" != "$(rc_class 2)" ] || {
     echo "SELFCHECK: rc_class cannot tell a pass from a skip" >&2; bad=1; }
+  # THE ANCHOR PRE-FLIGHT MUST BE ABLE TO FAIL. It shipped with a `|` field
+  # separator that truncated four of its own nine patterns, and reported "found
+  # exactly once" anyway -- a pre-flight that cannot fail is worse than none,
+  # because it manufactures confidence. Seed a duplicated anchor into a copy of
+  # the target and require the pre-flight to reject it.
+  local tf
+  tf="$(mktemp "${TMPDIR:-/tmp}/gi_anchor_selfcheck.XXXXXX")"
+  cp "$TGT" "$tf"
+  printf '%s\n' "${ANCHOR_PATTERNS[0]}" >>"$tf"
+  if anchors_ok "$tf" >/dev/null 2>&1; then
+    echo "SELFCHECK: the anchor pre-flight accepted a DUPLICATED anchor" >&2; bad=1
+  fi
+  rm -f "$tf"
+  # ...and must still accept the real file.
+  anchors_ok "$TGT" >/dev/null 2>&1 || {
+    echo "SELFCHECK: the anchor pre-flight rejects the unmutated target" >&2; bad=1; }
   return $bad
 }
 
@@ -200,10 +265,10 @@ mkdir -p "$LOG_DIR" || exit 1
 : >"$SUMMARY"
 
 restore() {
-  git checkout -- "$TGT" 2>/dev/null
-  if ! git diff --quiet -- "$TGT"; then
-    echo "RESTORING: $TGT was not clean; discarding mutation residue" >&2
-    git checkout -- "$TGT"
+  git checkout -- "$TGT" "$TGT2" 2>/dev/null
+  if ! git diff --quiet -- "$TGT" "$TGT2"; then
+    echo "RESTORING: $TGT/$TGT2 were not clean; discarding mutation residue" >&2
+    git checkout -- "$TGT" "$TGT2"
   fi
 }
 trap restore EXIT INT TERM
@@ -328,6 +393,46 @@ run_state() {
   rm -f "$pf"
 }
 
+# Same discipline as run_state, but the target is a GATE and the thing that must
+# notice is the CHECKER. Proves the render-node guard is LOAD-BEARING: remove it
+# from a GPU gate and the RENDER-NODE column must report MISSING and the checker
+# must exit 1. This is audit #15's end-to-end proof, as a committed state.
+run_gate_state() {
+  local label="$1" desc="$2" expect="$3"
+  local log="$LOG_DIR/$label.log" rc class verdict="" pf
+  pf="$(mktemp "${TMPDIR:-/tmp}/gi_patch2.XXXXXX")" || return 1
+  cat >"$pf"
+  restore
+  if ! patch_once "$TGT2" "$pf"; then
+    echo "  $label: PATCH ERROR (target not found exactly once; see above)" | tee -a "$SUMMARY"
+    FAILED=$((FAILED + 1)); rm -f "$pf"; return
+  fi
+  if ! bash -n "$TGT2" 2>"$log"; then
+    echo "  $label: $desc -- MUTATION BROKE SYNTAX (scored MISSED)" | tee -a "$SUMMARY"
+    FAILED=$((FAILED + 1)); rm -f "$pf"; restore; return
+  fi
+  if git diff --quiet -- "$TGT2"; then
+    echo "  $label: $desc -- MUTATION DID NOT CHANGE THE FILE" | tee -a "$SUMMARY"
+    FAILED=$((FAILED + 1)); rm -f "$pf"; restore; return
+  fi
+  bash "$TGT" >"$log" 2>&1
+  rc=$?
+  class="$(rc_class "$rc")"
+  case "$class" in
+    MISSED) verdict="checker STILL EXITED 0 on an unguarded GPU gate" ;;
+    *) [ "$class" = "$expect" ] || verdict="caught as $class, expected $expect" ;;
+  esac
+  NC=$((NC + 1))
+  if [ -z "$verdict" ]; then
+    printf '  %-4s rc=%-3s %-16s %-50s AS EXPECTED\n' "$label" "$rc" "$class" "$desc" | tee -a "$SUMMARY"
+  else
+    printf '  %-4s rc=%-3s %-16s %-50s UNEXPECTED: %s\n' "$label" "$rc" "$class" "$desc" "$verdict" | tee -a "$SUMMARY"
+    FAILED=$((FAILED + 1))
+  fi
+  grep -m1 -E 'NEEDS A GPU BUT HAS NO GUARD|MISSING' "$log" | sed 's/^/       > /' | tee -a "$SUMMARY" || true
+  rm -f "$pf"
+}
+
 echo "=== gate_inventory checker mutation matrix (non-vacuity proof) ==="
 echo "tree must be clean; logs -> $LOG_DIR"
 
@@ -380,16 +485,27 @@ run_state M5 "disable the per-arm NO-SKIP-REPORT check" "CAUGHT-selfcheck" <<'PA
     printf '%s\n' "$code" | grep -qE 'ZZZ_NEVER_MATCHES' || {
 PATCH
 
+# NOTE the old side names gate_require_device too. When audit #16 taught
+# gpu_guard_state() to recognise the combined helper, this patch went stale --
+# and the pre-flight is what said so, because its anchor is now the full line
+# rather than a prefix truncated at the first `|`. Re-pointing a mutation at moved
+# code is the sanctioned response; loosening its anchor is not.
 run_state M7 "disable the NEEDS-GPU-without-a-guard verdict" "CAUGHT-selfcheck" <<'PATCH'
-  if grep -qE 'renderD|gate_require_render_node' "$1"; then echo "render-node"; else echo "MISSING"; fi
+  if grep -qE 'renderD|gate_require_render_node|gate_require_device' "$1"; then echo "render-node"; else echo "MISSING"; fi
 |||
-  if grep -qE 'renderD|gate_require_render_node' "$1"; then echo "render-node"; else echo "not-gpu"; fi
+  if grep -qE 'renderD|gate_require_render_node|gate_require_device' "$1"; then echo "render-node"; else echo "not-gpu"; fi
 PATCH
 
 run_state M8 "make the tally parser comma-only again" "CAUGHT-selfcheck" <<'PATCH'
       sk="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) SKIPPED.*/\1/p')"
 |||
       sk="$(printf '%s' "$txt" | sed -nE 's/.*, ([0-9]+) SKIPPED.*/\1/p')"
+PATCH
+
+run_gate_state M9 "strip the render-node guard from a GPU gate" "CAUGHT-selfcheck" <<'PATCH'
+gate_require_device || exit 2
+|||
+: guard removed on purpose
 PATCH
 
 # M6 is scored differently: it needs a STUB sycl-ls reporting no device, because
@@ -421,15 +537,15 @@ restore
 trap - EXIT INT TERM
 
 echo
-if git diff --quiet -- "$TGT"; then
-  echo "restore: $TGT is byte-identical to HEAD"
+if git diff --quiet -- "$TGT" "$TGT2"; then
+  echo "restore: $TGT and $TGT2 are byte-identical to HEAD"
 else
   echo "FAIL: restore left the tree dirty" >&2; FAILED=$((FAILED + 1))
 fi
-if grep -qE 'ZZZ_NEVER_MATCHES' "$TGT"; then
-  echo "FAIL: mutation residue left in $TGT" >&2; FAILED=$((FAILED + 1))
+if grep -qE 'ZZZ_NEVER_MATCHES' "$TGT" "$TGT2"; then
+  echo "FAIL: mutation residue left in $TGT/$TGT2" >&2; FAILED=$((FAILED + 1))
 else
-  echo "residue: none (no ZZZ_NEVER_MATCHES marker in $TGT)"
+  echo "residue: none (no ZZZ_NEVER_MATCHES marker in $TGT/$TGT2)"
 fi
 
 echo
@@ -437,7 +553,7 @@ if [ "$FAILED" = "0" ]; then
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "states=S0,M1,M2,M3,M4,M5,M7,M8,M6"
+    echo "states=S0,M1,M2,M3,M4,M5,M7,M8,M9,M6"
     echo "caught=$NC/$NC"
   } >"$STAMP" 2>/dev/null
   echo "GATE-INVENTORY MUTATION MATRIX: PASS ($NC/$NC mutations refused the checker)"

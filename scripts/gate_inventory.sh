@@ -131,7 +131,10 @@ gpu_guard_state() { # $1 = comment-stripped code file
   # render-node check is the strict, adapter-independent one: a missing libumf
   # makes sycl-ls report zero devices on a perfectly healthy box, so a count
   # would refuse coverage that would actually run.
-  if grep -qE 'renderD|gate_require_render_node' "$1"; then echo "render-node"; else echo "MISSING"; fi
+  # Matches the shared helper by name as well as the raw probe, so a gate that
+  # adopts gate_require_device (which covers BOTH failure modes) is not reported
+  # as unguarded.
+  if grep -qE 'renderD|gate_require_render_node|gate_require_device' "$1"; then echo "render-node"; else echo "MISSING"; fi
 }
 
 # --- CLASSIFIER SELF-CHECK (behavioural, on a seeded temp gate) --------------
@@ -282,13 +285,21 @@ for f in $GATES; do
   # no guard), test_http_batch.sh and test_serve_load.sh (both launch the server
   # `--gpu --tp 1`). All three passed here, which is exactly why the gap was
   # invisible until the list was rebuilt from the gates themselves.
-  rnode="-"
+  # RENDER-NODE column, one of four tokens and never a bare "-":
+  #   via-count    a COUNT precondition (gate_gpu_count/gate_require_gpus) already
+  #                covers the device check, so the render-node probe is redundant.
+  #                Naming it beats "-", which a reader cannot tell from "unchecked".
+  #   render-node  no count precondition, but a render-node probe is present.
+  #   not-gpu      the gate needs no device.
+  #   MISSING      the gate needs a device and has NO guard -> VIOLATION.
   if [ "$gran_raw" = "none" ]; then
     rnode="$(gpu_guard_state "$codefile")"
     if [ "$rnode" = "MISSING" ]; then
       mark="$mark <-- NEEDS A GPU BUT HAS NO GUARD (goes red on a 0-GPU box)"
       VIOLATIONS=$((VIOLATIONS + 1))
     fi
+  else
+    rnode="via-count"
   fi
 
   rm -f "$codefile"

@@ -928,6 +928,68 @@ e.g. S3's contract column is 40 not 42).
   GENERALISATION for the next matrix: a mutation harness that edits tracked
   source must treat the build tree as part of the state it mutates. A
   byte-identical restore of the sources is not a restore.
+  === 2026-09-30 AUDIT #16: THE DEVICE GUARD COVERED HALF THE FAILURE MODES,
+  AND THE ANCHOR PRE-FLIGHT WAS CHECKING LESS THAN IT CLAIMED ===
+  (1) `gate_require_render_node` protected only ONE of the two ways a gate can
+  fail to get a device. It exits 2 when /dev/dri/renderD128 will not open, but a
+  box where the node opens fine and Level Zero enumerates ZERO devices — the
+  libumf LD_LIBRARY_PATH failure documented in this repo's own notes, and the
+  common one on THIS box — still produced a RED line from test_dpas_fold /
+  test_http_batch / test_serve_load. The helper's own comment already said
+  callers needing a count "use both", and no gate did.
+    FIX: `gate_require_device()` in scripts/_gate_precond.sh checks BOTH, node
+  first (a direct syscall, free) then the count, exit 2 on either. All three
+  gates now route through it, and test_gpu_optin / test_device_argmax had their
+  INLINE render-node probes replaced with the shared helper — two fewer
+  hand-rolled copies of the same probe, which is how this family reopened the
+  first time. Zero hand-rolled `renderD128` probes remain in scripts/test_*.sh.
+    Verified in ALL THREE directions with in-tree fixtures
+  (scripts/fixtures/{no-device,no-render-node}): node open + 1 GPU -> rc=0;
+  node unreachable -> all five gates rc=2; node open + 0 devices -> all five
+  rc=2. The fixtures exist because a proof that lives in a transcript cannot be
+  re-run (audit #13/#14), and because `source setvars.sh` PREPENDS the oneAPI bin
+  dir, so a PATH stub for sycl-ls is shadowed inside every gate. Hence the
+  `INTFER_SYCL_LS` override — an assumption baked into a probe that the harness
+  cannot redirect is an assumption the harness cannot test. Same rationale as
+  INTFER_BUILD_DIR.
+    TWO BUGS FOUND BY RUNNING THE DIRECTIONS RATHER THAN READING THE CODE, both
+  introduced by this very fix:
+    * `gate_require_device` was a SILENT NO-OP when sycl-ls was absent. It took
+      `n="$(gate_gpu_count)"` with no rc check; that returns EMPTY stdout for
+      "unmeasurable", and `[ "" -lt 1 ]` is a bash integer error whose result is
+      FALSE — so the helper returned 0, i.e. certified a device it could not
+      see. That is audit #14's "two failure modes in one value" class recurring
+      one function down. Now gated on rc AND emptiness, and "cannot count" exits
+      2 loudly.
+    * The two per-arm gates called the whole-gate guard BEFORE sourcing setvars,
+      so the count was always empty and (by the bug above) always passed. The
+      guard now runs after setvars, which is the only point at which sycl-ls
+      exists to be counted.
+  (2) The anchor pre-flight in scripts/mutate_gate_inventory.sh parsed its table
+  with `IFS='|'` while the anchor PATTERNS themselves contain `|` — ERE
+  alternation and `||`. Every such row was silently TRUNCATED at the first `|`,
+  and because a truncated prefix is still a substring, the pre-flight went on
+  printing "found exactly once" while checking strictly LESS than it claimed.
+  Four of nine anchors were affected. That is the failure the pre-flight exists
+  to prevent — a loosened anchor — arriving through the pre-flight's OWN parser.
+  Surfaced only because the M7 patch went stale after gpu_guard_state() learned
+  about gate_require_device and the two disagreed; `patch_once` reported 0
+  matches while the pre-flight said 1.
+    FIX: the patterns now live in a QUOTED ARRAY, where a pattern may contain
+  any character, and a parallel ANCHOR_FILE array says which file each lives in
+  (M9's target is in a GATE, not the checker, and a single-file pre-flight
+  silently checked zero of it). A behavioural self-check now seeds a DUPLICATED
+  anchor into a copy of the target and requires the pre-flight to REJECT it —
+  a pre-flight that cannot fail manufactures confidence rather than checking.
+  (3) The RENDER-NODE column emitted "-" both for "not applicable" and for "not
+  checked", which a reader cannot tell apart. It now emits one of four tokens:
+  `via-count` / `render-node` / `not-gpu` / `MISSING`.
+  (4) Audit #15's end-to-end proof — seed an unguarded GPU gate, watch the
+  column catch it — lived only in a transcript, the exact defect this matrix
+  exists to stop. It is now state M9, whose target is a GATE rather than the
+  checker: strip the device guard from test_dpas_fold and the column MUST report
+  MISSING and the checker MUST exit 1. Proves both that the guard is
+  load-bearing and that the column is live. Matrix 9/9.
   === TOOLING NOTE: THE BULK-EDIT TOOL LOST AN EDIT A THIRD TIME ===
   The `gpu_guard_state()` function definition was inserted with the bulk edit
   tool, which reported success; the four CALL SITES (written by a later

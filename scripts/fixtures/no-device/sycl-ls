@@ -1,0 +1,12 @@
+#!/bin/sh
+# Reports NO Level Zero devices, the way the real sycl-ls does when libumf is
+# missing from LD_LIBRARY_PATH (memory: sycl_env_libumf.md). Exits 0 and prints
+# nothing: sycl-ls SUCCEEDS, it just enumerates an empty device list. That
+# distinction is the whole point -- a stub that exited non-zero would test
+# "sycl-ls is missing", a different (also real) failure mode.
+#
+# Kept in the tree, not /tmp, so the 0-GPU direction is re-runnable by the next
+# session instead of living in a transcript -- the defect audits #13/#14/#15
+# exist to prevent. Use by PREPENDING THIS DIRECTORY to PATH: the stub only
+# shadows the tool if it carries the tool's exact name.
+exit 0

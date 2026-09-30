@@ -45,13 +45,20 @@
 # signalled ONLY by rc, never by text mixed into the value. Callers should use
 # `N="$(gate_gpu_count)" || N=0` -- NOT `|| echo 0`, which cannot distinguish a
 # failed substitution from a failed count.
+# Env: INTFER_SYCL_LS  override the sycl-ls binary (default: sycl-ls on PATH).
+#   Needed because `source setvars.sh` PREPENDS the oneAPI bin dir, so a PATH stub
+#   for sycl-ls is shadowed by the real one inside every gate -- the 0-device
+#   direction was untestable end-to-end until this seam existed. Same rationale as
+#   the INTFER_BUILD_DIR override: an assumption baked into a probe that the
+#   harness cannot redirect is an assumption the harness cannot test.
 gate_gpu_count() {
-  if ! command -v sycl-ls >/dev/null 2>&1; then
-    echo "SKIP: sycl-ls not on PATH; cannot count GPUs" >&2
+  local sycl_ls="${INTFER_SYCL_LS:-sycl-ls}"
+  if [ ! -x "$sycl_ls" ] && ! command -v "$sycl_ls" >/dev/null 2>&1; then
+    echo "SKIP: $sycl_ls not available; cannot count GPUs" >&2
     return 1
   fi
   local n
-  n="$(sycl-ls 2>/dev/null | grep -c "\[level_zero:gpu\]")" || true
+  n="$("$sycl_ls" 2>/dev/null | grep -c "\[level_zero:gpu\]")" || true
   printf '%s\n' "${n:-0}"
   return 0
 }
@@ -74,6 +81,62 @@ gate_require_render_node() {
   echo "  regressed. A GPU gate reaching this point NEEDS a device, so it must" >&2
   echo "  skip rather than fail red -- see gate_inventory.sh's NEEDS-GPU column." >&2
   exit 2
+}
+
+# A gate that needs a DEVICE has two independent ways to be unable to get one,
+# and audit #15 closed only the first:
+#
+#   (a) the render node cannot be opened from this shell   -> covered below
+#   (b) the node opens fine but Level Zero enumerates ZERO devices, because
+#       libumf is missing from LD_LIBRARY_PATH (memory: sycl_env_libumf.md)
+#
+# (b) is the common one on this exact box and it is a RED line, not a skip:
+# test_dpas_fold.sh / test_http_batch.sh / test_serve_load.sh all carried only
+# the render-node check, so on a box with (b) and not (a) they would have gone
+# red and the red would be indistinguishable from a regression. So a gate that
+# needs a device wants BOTH, and this is the helper that means both.
+#
+# Order matters and is deliberate: probe the node FIRST. The node probe is a
+# direct syscall and costs nothing; the sycl-ls count spawns a process. And if
+# the node is unreachable the count is meaningless anyway.
+#
+# rc 0 = a device is reachable, 1 = not. Exits 2 (SKIP) when not, with the same
+# "this is BOX STATE" framing as the other two.
+gate_require_device() {
+  if ! python3 -c "open('/dev/dri/renderD128','rb').close()" 2>/dev/null; then
+    echo "SKIPPED: cannot open /dev/dri/renderD128 from this shell." >&2
+    echo "  BOX STATE, not a code failure. Nothing was verified and nothing" >&2
+    echo "  regressed." >&2
+    exit 2
+  fi
+  # "CANNOT COUNT" is not a pass, and the distinction is load-bearing.
+  # gate_gpu_count returns rc=1 with EMPTY stdout when sycl-ls is not on PATH
+  # (that is how it signals "unmeasurable", vs rc=0 with an integer). An empty
+  # n makes `[ "" -lt 1 ]` a bash INTEGER ERROR whose result is FALSE -- so the
+  # helper would return 0, i.e. a SILENT NO-OP, on exactly the box it exists to
+  # catch. Caught by running the fixture directions rather than reading the
+  # function: the audit-#14 "two failure modes in one value" class, recurring one
+  # function down. Hence the explicit rc and emptiness tests, not a bare -lt.
+  local n rc=0
+  n="$(gate_gpu_count)" || rc=$?
+  if [ "$rc" != "0" ] || [ -z "$n" ]; then
+    echo "SKIPPED: render node opens but sycl-ls cannot count devices." >&2
+    echo "  Not a pass and not a device: the precondition is UNMEASURABLE, so" >&2
+    echo "  nothing was verified. Source /opt/intel/oneapi/setvars.sh, which puts" >&2
+    echo "  sycl-ls on PATH, then re-run." >&2
+    exit 2
+  fi
+  if [ "$n" -lt 1 ]; then
+    # Distinguish "sycl-ls works and found none" from "sycl-ls is unusable" --
+    # both mean no device here, but only one is the libumf LD_LIBRARY_PATH
+    # failure, and that is the one worth naming.
+    echo "SKIPPED: render node opens but Level Zero enumerates 0 device(s)." >&2
+    echo "  BOX STATE, not a code failure. This is the libumf LD_LIBRARY_PATH" >&2
+    echo "  failure mode (memory: sycl_env_libumf.md): source" >&2
+    echo "  /opt/intel/oneapi/setvars.sh, which puts umf on the path." >&2
+    exit 2
+  fi
+  return 0
 }
 
 # $1 = required device count. Exits 2 (SKIP) unless that many are visible.
