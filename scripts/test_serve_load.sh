@@ -18,6 +18,14 @@
 #      the batching ceiling (2026-09-17: C=8/MT=8 18 tok/s vs C=8/MT=64
 #      36.3 tok/s). Informational only — completion-gated, no floor.
 #
+#
+# BUILD-FIRST (audit #7): gate_require_build in scripts/_gate_build.sh. Audit
+# #6 fixed four gates against the stale-artifact class; this one consumed the
+# intfer_cli binary without ever building it, so a source edit that failed to
+# compile left the previous binary in place and the gate judged code that no
+# longer existed. Opt out with INTFER_GATE_NO_BUILD=1 only when the build is
+# known current.
+#
 # Usage: scripts/test_serve_load.sh [--port P]
 #   INTFER_HTTP_URL: reuse an already-running server (script won't kill it).
 #   INTFER_LOAD_LEVELS: space-separated concurrency levels (default "1 4 8").
@@ -36,6 +44,9 @@ PORT="${INTFER_HTTP_PORT:-18312}"
 LEVELS="${INTFER_LOAD_LEVELS:-1 4 8}"
 MAXTOK="${INTFER_LOAD_MAXTOK:-8}"
 BIGMT="${INTFER_LOAD_BIGMT:-}"
+
+. "$SCRIPT_DIR/_gate_build.sh"
+gate_require_build intfer_cli || exit 1
 
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }

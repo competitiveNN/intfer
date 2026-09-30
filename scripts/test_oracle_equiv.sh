@@ -7,6 +7,14 @@
 # MODEL: the canonical .intfer file (NOT .intifer — see
 # memories/model_files_intfer_vs_intifer.md; one-letter name difference,
 # different greedy streams).
+#
+# BUILD-FIRST (audit #7): gate_require_build in scripts/_gate_build.sh. Audit
+# #6 fixed four gates against the stale-artifact class; this one consumed the
+# intfer_cli binary without ever building it, so a source edit that failed to
+# compile left the previous binary in place and the gate judged code that no
+# longer existed. Opt out with INTFER_GATE_NO_BUILD=1 only when the build is
+# known current.
+#
 # Usage: VAR_ENV="K=V ..." scripts/test_oracle_equiv.sh
 #   e.g. VAR_ENV="INTFER_CPU_FMA_DOT=1" scripts/test_oracle_equiv.sh
 set -o pipefail
@@ -16,6 +24,9 @@ MODEL="${INTFER_08B:-$ROOT/test/models/Qwen3.5-0.8B.intfer}"
 BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/intfer_cli/intfer_cli"
 PROMPT="The capital of France is"
 PLONG="$(python3 -c "print('The history of artificial intelligence and machine learning. '*40)")"
+. "$SCRIPT_DIR/_gate_build.sh"
+gate_require_build intfer_cli || exit 1
+
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }
 export TMPDIR="${TMPDIR:-/tmp}"

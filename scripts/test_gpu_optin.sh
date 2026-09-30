@@ -14,12 +14,13 @@
 # oracle lives in the legacy .intfer file (see memories/
 # model_files_intfer_vs_intifer.md). This gate asserts cross-knob identity
 # on the .intifer stream, not oracle equivalence.
-# BUILD-FIRST (audit #6): like test_ga64_recip.sh, build intfer_cli before
-# running it. Without this step a source edit that fails to compile leaves the
-# previous binary in place and the gate prints PASS for code that no longer
-# exists -- the stale-artifact class observed live during audit #4c on the
-# sibling gate. Opt out with INTFER_GATE_NO_BUILD=1 only when the build is
-# known current.
+# BUILD-FIRST (audit #6, shared since #7): gate_require_build in
+# scripts/_gate_build.sh builds intfer_cli before running it. Without this step
+# a source edit that fails to compile leaves the previous binary in place and
+# the gate prints PASS for code that no longer exists -- the stale-artifact
+# class observed live during audit #4c on the sibling gate, and then found in
+# EVERY gate that consumes a build artifact (audit #7). Opt out with
+# INTFER_GATE_NO_BUILD=1 only when the build is known current.
 #
 # Usage: scripts/test_gpu_optin.sh
 set -o pipefail
@@ -33,18 +34,8 @@ PROMPT="The capital of France is"
 WIDE_PROMPT="In a distant galaxy a cartographer of nebulae catalogued every drifting island, noting their altitude, their colour, and the names the locals gave them; she travelled for eleven years before the atlas was complete, and when she finally returned home she found the coastline had itself moved, so she added a final chapter explaining that maps are only ever arguments with time, and that the honest cartographer admits in the margin where the ink has faded what she no longer dares to assert."
 TOK="--tokenizer-py $SCRIPT_DIR/bpe_tokenize.py --detok-py $SCRIPT_DIR/bpe_detokenize.py"
 
-BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
-if [ "${INTFER_GATE_NO_BUILD:-0}" != "1" ]; then
-  if [ ! -f "$BUILD_DIR/build.ninja" ] && [ ! -f "$BUILD_DIR/Makefile" ]; then
-    echo "FAIL: no build system in $BUILD_DIR (configure it, or set INTFER_BUILD_DIR)" >&2
-    exit 1
-  fi
-  if ! cmake --build "$BUILD_DIR" --target intfer_cli >"$BUILD_DIR/intfer_cli_build.log" 2>&1; then
-    echo "FAIL: intfer_cli did not build (refusing to run a stale binary)" >&2
-    tail -20 "$BUILD_DIR/intfer_cli_build.log" >&2
-    exit 1
-  fi
-fi
+. "$SCRIPT_DIR/_gate_build.sh"
+gate_require_build intfer_cli || exit 1
 
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }

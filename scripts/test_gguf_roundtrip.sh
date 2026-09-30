@@ -6,6 +6,11 @@
 # .intfer, reads the .gguf back, and requires bit-identical dequantization
 # (same payload, different container).
 #
+#
+# BUILD-FIRST (audit #7): gate_require_build in scripts/_gate_build.sh, for the
+# intfer_gguf target (not intfer_cli) -- see test_gpu_optin.sh for the class of
+# bug. Opt out with INTFER_GATE_NO_BUILD=1 only when the build is known current.
+#
 # Usage: scripts/test_gguf_roundtrip.sh
 set -o pipefail
 
@@ -14,6 +19,9 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 MODEL="${INTFER_08B:-$ROOT/test/models/Qwen3.5-0.8B.intfer}"
 BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/intfer_gguf/intfer_gguf"
+
+. "$SCRIPT_DIR/_gate_build.sh"
+gate_require_build intfer_gguf || exit 1
 
 [ -x "$BIN" ] || { echo "FAIL: intfer_gguf binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }

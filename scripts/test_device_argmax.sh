@@ -26,6 +26,14 @@
 #      device path) is unperturbed — it is NOT a verify-row gate.
 #   4. Standard gates: cpu parity + http batch + gpu-optin 10/10.
 #
+#
+# BUILD-FIRST (audit #7): gate_require_build in scripts/_gate_build.sh. Audit
+# #6 fixed four gates against the stale-artifact class; this one consumed the
+# intfer_cli binary without ever building it, so a source edit that failed to
+# compile left the previous binary in place and the gate judged code that no
+# longer existed. Opt out with INTFER_GATE_NO_BUILD=1 only when the build is
+# known current.
+#
 # Usage: scripts/test_device_argmax.sh
 # Env: INTFER_08B (model), INTFER_BUILD_DIR (build dir).
 # Exit 0 PASS, 1 FAIL, 2 SKIP (no render node).
@@ -36,6 +44,9 @@ MODEL="${INTFER_08B:-$ROOT/test/models/Qwen3.5-0.8B.intifer}"
 BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/intfer_cli/intfer_cli"
 PROMPT="The capital of France is"
 TOK="--tokenizer-py $SCRIPT_DIR/bpe_tokenize.py --detok-py $SCRIPT_DIR/bpe_detokenize.py"
+
+. "$SCRIPT_DIR/_gate_build.sh"
+gate_require_build intfer_cli || exit 1
 
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }

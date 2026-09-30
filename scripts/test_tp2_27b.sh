@@ -6,6 +6,14 @@
 #   prefill -> 11751, decode -> 13 198 760
 # Also reports prefill tok/s and decode tok/s vs the 4000 / 40t/s targets.
 #
+#
+# BUILD-FIRST (audit #7): gate_require_build in scripts/_gate_build.sh. Audit
+# #6 fixed four gates against the stale-artifact class; this one consumed the
+# intfer_cli binary without ever building it, so a source edit that failed to
+# compile left the previous binary in place and the gate judged code that no
+# longer existed. Opt out with INTFER_GATE_NO_BUILD=1 only when the build is
+# known current.
+#
 # Usage: scripts/test_tp2_27b.sh [-n MAX_NEW] [-p PROMPT]
 set -o pipefail
 
@@ -31,6 +39,9 @@ done
 
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 export TMPDIR=/var/home/fra/build_tmp
+
+. "$SCRIPT_DIR/_gate_build.sh"
+gate_require_build intfer_cli || exit 1
 
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }

@@ -215,8 +215,9 @@ Implement features for maximizing throughput for concurrent requests, starting f
   script now BUILDS its target first and refuses to run on build failure
   (opt out with INTFER_GATE_NO_BUILD=1). Verified: an injected
   `static_assert(false)` now yields rc=1 instead of a stale PASS. Same class
-  as audit #3c; the sibling GPU/parity/http scripts have the same gap and
-  are NOT yet fixed.
+  as audit #3c; the sibling GPU/parity/http scripts had the same gap and were
+  closed in audit #6, then re-audited tree-wide in audit #7 — see
+  `scripts/_gate_build.sh`.
   (d) Housekeeping: engine.cpp's host fallback had been left as a second
   unindented `if (!preq_ok) {` after the pre-pass block's closing brace —
   merged into a single `else`; a stray 2-space reindent inside
@@ -271,7 +272,48 @@ Implement features for maximizing throughput for concurrent requests, starting f
    device correctness to the host's divss codegen, so any future compiler
    change to ga64_recip breaks it invisibly. Not worth it for a default-OFF
    path; recorded, not built.
-  === AUDIT #3b: the DPAS48 x SSM_GPU gate was asserting TIE-LUCK ===
+  === 2026-09-30 AUDIT #7: gate hygiene, family 3 tree-wide + shared helper ===
+   Audit #6's fix (74e80a0) closed the stale-artifact hole in the FOUR gates it
+   had audited and the memory note then declared family 3 "FIXED EVERYWHERE".
+   That was wrong, and it broke the note's own scope corollary: grepping every
+   script for a build-artifact consumer found FIVE more with no build step —
+   test_serve_load.sh (the Stage-3 continuous-batching load gate),
+   test_device_argmax.sh, test_oracle_equiv.sh, test_tp2_27b.sh (all
+   intfer_cli) and test_gguf_roundtrip.sh (intfer_gguf). Nine gates total;
+   audit #6 touched four. Same damage as http_batch: a failed build leaves the
+   previous binary runnable, so the gate judges code that no longer exists.
+   Fix: ONE shared, sourced helper `scripts/_gate_build.sh` with
+   `gate_require_build <cmake-target>`, called by all nine gates
+   (`. "$SCRIPT_DIR/_gate_build.sh"; gate_require_build <target> || exit 1`).
+   Rationale: nine hand-rolled copies of the block is precisely how the family
+   reopened — a per-gate copy is a per-gate chance to forget it. The helper
+   fails closed on an empty target name, keeps INTFER_GATE_NO_BUILD=1, and
+   writes a PER-GATE log ($BUILD_DIR/gate_<gate>_build.log): audit #6's version
+   had all four gates sharing intfer_cli_build.log, so a concurrent pair
+   overwrote each other's compiler error and `tail -20` could print the wrong
+   failure. No engine/quant/schedule code touched.
+   Anti-vacuity, measured (not asserted): `static_assert(false)` appended to
+   src/common/logger.cpp — a 707-byte TU that both intfer_cli (via
+   intfer_common) and intfer_gguf compile — while the on-disk binary was
+   confirmed still present and still runnable (`--help` rc=0). Result: all NINE
+   gates rc=1 with "did not build (refusing to run a stale binary)", and
+   nothing downstream of the guard executed. Helper unit checks: bogus target
+   -> rc=1 with ninja's "unknown target" (so the target name is really passed
+   through, not a blanket build), empty target -> rc=1, real target -> rc=0,
+   INTFER_GATE_NO_BUILD=1 -> bypasses. Mutation reverted, logger.cpp
+   byte-identical to db6e98c, binary relinked.
+   Clean-tree re-run of all nine (box load 8-14, CORRECTNESS ONLY — no wall-time
+   or throughput claim): ga64-recip PASS (480645 slices / 30,753,153 elements
+   bit-identical, 192000 tie slices discriminating), gguf-roundtrip PASS,
+   cpu-parity PASS, oracle-equiv PASS, gpu-optin PASS (TP=1+TP=2, wide M=97
+   prefill arm, PREQ-alone inert), http-batch PASS, device-argmax PASS (its
+   nested cpu-parity/http-batch/gpu-optin all PASS through the helper too),
+   serve-load PASS, tp2-27b PASS.
+   Process lesson, now in memories/gate-hygiene-three-families.md: a family is
+   closed by an exhaustive ENUMERATION of its instances (grep every script for
+   the artifact it consumes), never by the count of files the current fix
+   happened to touch.
+   === AUDIT #3b: the DPAS48 x SSM_GPU gate was asserting TIE-LUCK ===
   Forcing the single reciprocal site changed the host oracle's own codes
   (5 differing bytes over 4.1M codes on a fixed dataset) and the GPU gate
   then FAILED on `DPAS48+SSM_GPU == DPAS48`, diverging at decode step 15
