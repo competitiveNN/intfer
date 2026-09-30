@@ -21,6 +21,9 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MODEL="${INTFER_08B:-$ROOT/test/models/Qwen3.5-0.8B.intifer}"
 BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/intfer_cli/intfer_cli"
 PROMPT="The capital of France is"
+# Wide prefill: ~97 prompt tokens, so the chunked prefill runs ONE ~97-row
+# batch instead of the ~5-row batch the short PROMPT produces.
+WIDE_PROMPT="In a distant galaxy a cartographer of nebulae catalogued every drifting island, noting their altitude, their colour, and the names the locals gave them; she travelled for eleven years before the atlas was complete, and when she finally returned home she found the coastline had itself moved, so she added a final chapter explaining that maps are only ever arguments with time, and that the honest cartographer admits in the margin where the ink has faded what she no longer dares to assert."
 TOK="--tokenizer-py $SCRIPT_DIR/bpe_tokenize.py --detok-py $SCRIPT_DIR/bpe_detokenize.py"
 
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
@@ -38,6 +41,14 @@ fail() { echo "GATE FAIL: $1" >&2; PASS=0; }
 ids_of() { # $1=tp $2=env... -- prints decode ids
   local tp="$1"; shift
   env "$@" "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" -n "${N:-4}" \
+    --no-stream --ids $TOK 2>&1 >/dev/null \
+    | grep -a -oE "decode step [0-9]+: token=[0-9]+" | sed -E 's/.*token=//' \
+    | tr '\n' ' ' | sed 's/ *$//'
+}
+
+wide_ids_of() { # $1=tp $2=env... -- prints decode ids for the ~97-token prefill
+  local tp="$1"; shift
+  env "$@" "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$WIDE_PROMPT" -n 8 \
     --no-stream --ids $TOK 2>&1 >/dev/null \
     | grep -a -oE "decode step [0-9]+: token=[0-9]+" | sed -E 's/.*token=//' \
     | tr '\n' ' ' | sed 's/ *$//'
@@ -110,6 +121,19 @@ for tp in 1 2; do
   GOT="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_SSM_GPU=1)"
   echo "TP=$tp [DPAS48+SSM_GPU n=24]: '$GOT'"
   [ "$GOT" = "$D48" ] || fail "TP=$tp [DPAS48+SSM_GPU] '$GOT' != DPAS48 '$D48'"
+
+  # WIDE-PREFILL (M>1) ARM. Every assertion above uses the 5-token PROMPT, so
+  # the pre-pass only ever runs with M=5 during prefill there; the short-prompt
+  # arms prove nothing about the helper's 2*M*nGA row stride (act #4's hole).
+  # This prompt tokenizes to ~97 tokens, which the default chunk_M=128 forwards
+  # as ONE ~97-row batch, so DPAS48+PREQ is checked against DPAS48 with the
+  # pre-pass consuming M=97 rows of shipped (scale, inverse) pairs per device.
+  WD48="$(wide_ids_of "$tp" INTFER_DPAS48=1)"
+  WGOT="$(wide_ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS_PREQ=1)"
+  echo "TP=$tp [wide DPAS48]: '$WD48'"
+  echo "TP=$tp [wide DPAS48+PREQ]: '$WGOT'"
+  [ -n "$WD48" ] || fail "TP=$tp wide DPAS48 stream empty (broken run)"
+  [ "$WGOT" = "$WD48" ] || fail "TP=$tp [wide DPAS48+PREQ] '$WGOT' != wide DPAS48 '$WD48'"
 
   # PREQ without DPAS48 must be inert (nested-flag guard).
   PQ="$(N=24 ids_of "$tp" INTFER_DPAS_PREQ=1)"

@@ -226,6 +226,18 @@ Implement features for maximizing throughput for concurrent requests, starting f
   moved to the device, so expect roughly half the host act-quant saving the
   49b21d3 design promised, and read the `copy` bucket as including that
   reduction.
+  (e) M>1 DEVICE COVERAGE ADDED. Every PREQ stream assertion in
+  test_gpu_optin.sh used the 5-token PROMPT, whose prefill is a single ~5-row
+  batch — so nothing in the suite exercised the helper's 2*M*nGA row stride on
+  a device-sized batch (decode is M=1 by definition, which is why (a) shipped
+  unnoticed for three commits). New WIDE-PREFILL arm uses a ~97-token prompt
+  that the default chunk_M=128 forwards as ONE ~97-row batch, asserting
+  DPAS48+PREQ == DPAS48 at TP=1 and TP=2 ('198 760 7171 40132 369 264 5054
+  852'). Non-vacuity proven by mutation: re-injecting the row bug from (a)
+  makes the wide arm diverge on the FIRST decode token ('1292 557 264 5054 852
+  557 264 5054'). A temporary INTFER_PREQ_TRACE probe (not committed)
+  confirmed the pre-pass really is fed M=97 (x93 GEMM calls) and M=1 (x744) on
+  that run, so the arm is not accidentally running an M=1 prefill.
   === AUDIT #3b: the DPAS48 x SSM_GPU gate was asserting TIE-LUCK ===
   Forcing the single reciprocal site changed the host oracle's own codes
   (5 differing bytes over 4.1M codes on a fixed dataset) and the GPU gate
