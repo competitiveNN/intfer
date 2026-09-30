@@ -901,6 +901,33 @@ e.g. S3's contract column is 40 not 42).
    the same overclaim in a new place.
    Matrix now 7/7 (M1–M5, M7 via the checker's self-check; M6 via its exit-2
    path). No engine, quant or schedule code touched.
+  === AUDIT #15 (b): THE FOLD MUTATION HARNESS LEFT A MUTATED BINARY ON DISK ===
+  Found by the final verification pass, and it is the same class as everything
+  else above — family 3, stale artifact — except that the harness that CAUSES it
+  is the one written to prove the checks work.
+  `scripts/mutate_fold_matrix.sh` restores the SOURCE with `git checkout --` and
+  nothing else. Its last state is S6, so the `dpas_fold_probe` binary left in the
+  build tree is the MUTATED one. Any later gate that reuses the build without
+  rebuilding (`INTFER_GATE_NO_BUILD=1`) then judges mutated code. Observed live:
+  the parallel 7-gate re-run reported `test_dpas_fold rc=1` with the S6
+  signature — 360 index tuples WRONG, m=4095 reading S0=224 — while `git status`
+  was clean, and a one-line rebuild turned it PASS. The gate was RIGHT and the
+  harness was wrong, which is the only acceptable way for this to surface.
+  Note what the old post-run check could not see: it asserted the SOURCE was
+  byte-identical to HEAD, which was true, and said nothing about the 4 MB binary
+  next to it. Restoring text and restoring a build are different acts.
+  FIX. The matrix's last act is now restore -> REBUILD `dpas_fold_probe` through
+  the shared `gate_require_build` helper -> run `test_dpas_fold.sh` with the
+  build DISABLED and require rc=0. A green result is the real proof that the tree
+  was left in the state the matrix claims, and it also catches an artifact
+  poisoned by an EARLIER run, which no source-diff check can see.
+  Proven non-vacuous both ways: poison the binary, then run the matrix with the
+  rebuild opted out -> FAIL, 7 states UNEXPECTED plus the explicit "the build
+  tree is poisoned" message; run it normally -> the rebuild self-heals and it
+  reports 7/7 with "post-restore rc=0 on the LEFT-BEHIND artifact".
+  GENERALISATION for the next matrix: a mutation harness that edits tracked
+  source must treat the build tree as part of the state it mutates. A
+  byte-identical restore of the sources is not a restore.
   === TOOLING NOTE: THE BULK-EDIT TOOL LOST AN EDIT A THIRD TIME ===
   The `gpu_guard_state()` function definition was inserted with the bulk edit
   tool, which reported success; the four CALL SITES (written by a later

@@ -54,7 +54,8 @@ cd "$ROOT" || exit 1
 
 HDR=include/intfer/gemm/quant_gemm.hpp
 SRC=src/gemm/quant_gemm.cpp
-LOG_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/fold_matrix"
+BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
+LOG_DIR="$BUILD_DIR/fold_matrix"
 SUMMARY="$LOG_DIR/summary.txt"
 STAMP="$LOG_DIR/last_pass.stamp"
 ANCHORS_ONLY=0
@@ -351,7 +352,21 @@ run_state S5_writer_gate     1 none clean  clean
 restore; apply_m6 || { echo "FAIL: M6 did not apply" >&2; exit 1; }
 run_state S6_index_s0        1 none clean  wrong
 
-# --- restore and prove the tree survived -------------------------------
+# --- restore the ARTIFACT too, and prove the tree is GREEN, not just clean ----
+# AUDIT #15. `git checkout --` restores the SOURCE and nothing else. The last
+# state run is S6, so the dpas_fold_probe binary left in the build tree is the
+# MUTATED one -- and any later gate that reuses the build without rebuilding
+# (INTFER_GATE_NO_BUILD=1) judges mutated code. Observed live and caught by the
+# gate rather than by the harness: test_dpas_fold.sh reported rc=1 with the S6
+# signature (360 index tuples WRONG, m=4095 reading S0=224) while
+# `git status` was clean and a one-line rebuild made it PASS. This is family 3
+# (stale artifact) committed BY the harness that exists to prove the checks work.
+#
+# So the matrix's last act is now: restore the source, REBUILD the probe through
+# the shared build helper, and run the gate with the build disabled. A green
+# result is the real proof that the tree was left in the state the matrix claims
+# -- and it also catches an artifact poisoned by an EARLIER run, which a
+# byte-identical-restore check cannot see at all.
 restore
 trap - EXIT INT TERM
 
@@ -360,6 +375,21 @@ if git diff --quiet -- "$HDR" "$SRC"; then
   echo "restore: $HDR and $SRC are byte-identical to HEAD"
 else
   echo "FAIL: restore left the tree dirty" >&2; FAILED=$((FAILED + 1))
+fi
+
+echo "rebuild: dpas_fold_probe from the restored source (not the mutated one)"
+. "$SCRIPT_DIR/_gate_build.sh"
+if gate_require_build dpas_fold_probe; then
+  if INTFER_GATE_NO_BUILD=1 bash scripts/test_dpas_fold.sh >"$LOG_DIR/post_restore_green.log" 2>&1; then
+    echo "post-restore: test_dpas_fold.sh rc=0 on the LEFT-BEHIND artifact (tree is green)"
+  else
+    echo "FAIL: the tree is clean but the gate is RED on the left-behind artifact --" >&2
+    echo "  the build tree is poisoned (by this run or an earlier one). Any gate" >&2
+    echo "  reusing it without rebuilding would judge the wrong code." >&2
+    FAILED=$((FAILED + 1))
+  fi
+else
+  echo "FAIL: could not rebuild dpas_fold_probe after restore" >&2; FAILED=$((FAILED + 1))
 fi
 if has_residue "$HDR" "$SRC"; then
   echo "FAIL: mutation residue left in tracked sources" >&2; FAILED=$((FAILED + 1))
