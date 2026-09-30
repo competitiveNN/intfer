@@ -80,7 +80,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 # Always clean up the mutant, even on an abort: it lives in scripts/, and leaving
 # a mutated copy there would poison every later check that globs that directory.
-cleanup() { rm -f "$MUTANT" "$PROBE"; git reset -q -- "$PROBE" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true; }
+cleanup() { rm -f "$MUTANT" "$PROBE"; git reset -- "$PROBE" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true; }
 trap cleanup EXIT
 
 [ -e "$MUTANT" ] && { echo "FAIL: $MUTANT already exists; refusing to overwrite" >&2; exit 1; }
@@ -149,9 +149,9 @@ echo "== BASELINES (unmutated run_all_checks must be CORRECT in each setup) =="
 baseline "N-A" "step_ok"     "$ALL_CURRENT" 0 ""
 baseline "N-B" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"   # 2b re-run visible
 baseline "N-C" "step_ok"     "$HAS_STALE"   2 "STALE c/last_pass.stamp"      # 3rd stamp enumerated
-printf 'probe\n' >"$PROBE"; git add -q "$PROBE"   # a genuinely TRACKED, dirty file
+printf 'probe\n' >"$PROBE"; git add -- "$PROBE"   # a genuinely TRACKED, dirty file
 baseline "N-D" "step_sentinel" "$ALL_CURRENT" 1 "uncommitted changes"
-git reset -q -- "$PROBE"; rm -f "$PROBE"
+git reset -- "$PROBE"; rm -f "$PROBE"
 
 # --- anchor pre-flight (checked against the PRISTINE target) ---------------
 check_anchor() { # $1 = literal, $2 = description
@@ -201,9 +201,9 @@ CAUGHT=0; TOTAL=0
 run_state() { # $1 id, $2 desc, $3 predicate, $4 steps, $5 stampdir, $6 dirty?
   local id="$1" desc="$2" pred="$3" steps="$4" sdir="$5" dirty="${6:-}"
   TOTAL=$((TOTAL + 1))
-  [ "$dirty" = "dirty" ] && { printf 'probe\n' >"$PROBE"; git add -q "$PROBE"; }
+  [ "$dirty" = "dirty" ] && { printf 'probe\n' >"$PROBE"; git add -- "$PROBE"; }
   run_rac "$id" "$steps" "$sdir"
-  [ "$dirty" = "dirty" ] && { git reset -q -- "$PROBE"; rm -f "$PROBE"; }
+  [ "$dirty" = "dirty" ] && { git reset -- "$PROBE"; rm -f "$PROBE"; }
   if $pred; then
     CAUGHT=$((CAUGHT + 1))
     printf '  ok    %-4s defect reproduced: %s\n' "$id" "$desc"
