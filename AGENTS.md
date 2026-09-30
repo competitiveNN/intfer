@@ -945,13 +945,17 @@ e.g. S3's contract column is 40 not 42).
   first time. Zero hand-rolled `renderD128` probes remain in scripts/test_*.sh.
     Verified in ALL THREE directions with in-tree fixtures
   (scripts/fixtures/{no-device,no-render-node}): node open + 1 GPU -> rc=0;
-  node unreachable -> all five gates rc=2; node open + 0 devices -> all five
-  rc=2. The fixtures exist because a proof that lives in a transcript cannot be
-  re-run (audit #13/#14), and because `source setvars.sh` PREPENDS the oneAPI bin
-  dir, so a PATH stub for sycl-ls is shadowed inside every gate. Hence the
-  `INTFER_SYCL_LS` override — an assumption baked into a probe that the harness
-  cannot redirect is an assumption the harness cannot test. Same rationale as
-  INTFER_BUILD_DIR.
+  node unreachable -> every device gate rc=2; node open + 0 devices -> every
+  device gate rc=2. (Measured by hand first; since AUDIT #17 this is a COMMITTED
+  HARNESS, not a transcript claim — run `scripts/check_device_precond.sh` for the
+  12-cell matrix and `scripts/mutate_device_precond.sh` for its 3/3
+  non-vacuity proof. Note there are SIX GPU gates, not five: test_tp2_27b.sh is
+  count-guarded and was outside the original five.) The fixtures exist because a
+  proof that lives in a transcript cannot be re-run (audit #13/#14), and because
+  `source setvars.sh` PREPENDS the oneAPI bin dir, so a PATH stub for sycl-ls is
+  shadowed inside every gate. Hence the `INTFER_SYCL_LS` override — an assumption
+  baked into a probe that the harness cannot redirect is an assumption the
+  harness cannot test. Same rationale as INTFER_BUILD_DIR.
     TWO BUGS FOUND BY RUNNING THE DIRECTIONS RATHER THAN READING THE CODE, both
   introduced by this very fix:
     * `gate_require_device` was a SILENT NO-OP when sycl-ls was absent. It took
@@ -1000,6 +1004,116 @@ e.g. S3's contract column is 40 not 42).
   is not evidence the bytes are on disk, and a self-check that CALLS the new code
   is what converts a silent loss into a loud one. Verify with grep for the
   DEFINITION, not for its uses.
+
+- **AUDIT #17: THE FIXTURES WERE COMMITTED, THE DRIVER THAT RUNS THEM WAS NOT**
+  (scripts/check_device_precond.sh + scripts/mutate_device_precond.sh; no
+  engine/quant/schedule code touched). Audit #16 added two stubs —
+  `scripts/fixtures/{no-device,no-render-node}` — and recorded the measured
+  result at AGENTS.md:946-948. Enumerating the tree, not the transcript:
+  `$ grep -rn 'fixtures' scripts/*.sh` -> **no matches**. The stubs were
+  committed; the wiring that drives them (prepend the dir to PATH, set
+  `INTFER_SYCL_LS`) existed only in the stub's own header comments. So the
+  device-direction proof still lived in a transcript, with a decorative fixture
+  attached to it — the exact defect the fixture was added to fix, one level up.
+  A stub with no driver is a comment with a shebang. Meanwhile
+  `mutate_gate_inventory.sh` (audit #16) was exactly the pattern that was
+  already right in this repo, so the omission was not a judgement call.
+    FIX: `scripts/check_device_precond.sh` runs 6 GPU gates x 2 failure
+  directions (12 cells) and asserts rc=2 AND the correct DIAGNOSTIC per cell;
+  `scripts/mutate_device_precond.sh` proves it can fail (3/3). Both stamp the
+  sha. Four load-bearing pieces, each added because a weaker version was
+  measurably vacuous:
+    * SEAM DISCRIMINATION. `gate_require_device` turns BOTH "0 devices" and
+      "sycl-ls unmeasurable" into exit 2, so if the `INTFER_SYCL_LS` seam rots
+      the whole zero-device direction silently degrades into "sycl-ls is
+      missing" while still reporting green. The harness requires the two causes
+      to produce DIFFERENT diagnostics and fails if they stop being
+      distinguishable — otherwise direction 2 is a tautology that cannot go red.
+    * PER-GATE DIAGNOSTIC, not just rc. rc=2 for the WRONG reason is still a
+      defect: it reports box state that is not the box state, and it is how a
+      guard quietly degrades to a weaker mechanism. M-C below is exactly this.
+    * CLASSIFICATION CROSS-CHECK. The device-gate list is derived in the harness
+      AND cross-checked against the RENDER-NODE column `gate_inventory.sh`
+      reports; disagreement is a hard fail. Two derivations that must agree,
+      deliberately not a third hand-maintained table (the copy-drift family).
+    * BEHAVIOURAL SELF-CHECK, run FIRST, gating the matrix. Three synthetic
+      gates: one that exits 0 under a failure direction (must be REJECTED), one
+      that skips for the wrong cause (must be REJECTED), one with the correct
+      cause (must be ACCEPTED, so the first two cannot pass by an always-red
+      harness). Executable scripts, never a grep of the harness's own source.
+  MEASURED, all 12 cells rc=2: 5 gates report `node` + `count0`;
+  **test_tp2_27b.sh reports the COUNT cause in BOTH directions** — correct, and
+  not a gap: for a >=2 GPU requirement both failure modes collapse to
+  `count < need`, so a node probe would be redundant, and demanding a node
+  message would have been force-fitting. This closes the audit-#16 claim's
+  coverage hole too: it said "all FIVE device gates"; there are SIX GPU gates
+  and test_tp2_27b was never exercised in either direction.
+  NAMING IS LOAD-BEARING. The checker must NOT be named `test_*.sh`.
+  `ls scripts/test_*.sh` IS the definition of the gate population
+  `gate_inventory.sh` classifies, and this checker's own CODE names the stub
+  path (`NODEV_STUB=".../fixtures/no-device/sycl-ls"`), so as a `test_*` it
+  would be classified a GPU gate carrying no device guard — a false MISSING row,
+  against a checker that by design needs no device. Caught before it happened by
+  asking what the glob would classify, not after.
+  MUTATION MATRIX 3/3, 0 unattributed (scripts/mutate_device_precond.sh):
+    * M-A strip a real gate's device guard -> classification cross-check
+      catches "needs a device but carries NO guard at all".
+    * M-B clear a fixture's EXECUTE BIT. The nastiest shape: PATH lookup skips
+      a non-executable file, so a 644 stub hands every probe back to the real
+      tool and BOTH directions become no-ops that still report green. It does
+      not fail, it stops testing. Caught by a fixture pre-flight that stats the
+      mode. (Verified by measurement that `git checkout --` restores the
+      recorded mode, 644 -> 755, so M-B restores cleanly.)
+    * M-C weaken `gate_require_device` -> `gate_require_render_node`, a HALF
+      guard: still correct for node-unreachable, blind to the 0-device libumf
+      failure this box actually hits. The gate then runs and exits 0. This is
+      the audit-#16 defect in its purest form and the reason the matrix needs
+      BOTH directions: a single-direction matrix scores M-C as a PASS.
+  === BUGS FOUND BY RUNNING IT, INCLUDING SEVERAL I INTRODUCED ===
+    * A `fi` closing a `for` loop. It was MASKED because I chained
+      `bash -n f && echo OK; echo RUN; run` with `;` instead of `&&`, so the
+      script ran anyway and produced plausible partial output. Gate your own
+      verification commands; a syntax check that is not load-bearing is a
+      comment.
+    * THE BULK-EDIT TOOL MERGED THREE SELF-CHECK CASES INTO ONE WRONG BLOCK
+      (cases a/b/c collapsed; a later edit overwrote the real case c). The
+      FOURTH occurrence of the silent-loss family already recorded three times
+      above — reproduced inside the fix for that very family, by a different
+      tool. Detected by counting gate DEFINITIONS with grep, then by a
+      self-check that actually CALLS the code.
+    * The self-check's INTENDED rejections each incremented the global failure
+      counter through `expect_skip`'s own `bad()`, so the run ended FAIL(2) with
+      every real assertion green — the always-red twin of the vacuous check.
+      Only the self-check's explicit verdicts may count (`SUPPRESS`).
+    * CROSS-CONTAMINATION, the one that nearly produced a fake result: M-B and
+      M-C were first run in a PARALLEL tool batch sharing one working tree, so
+      M-C inherited M-B's `chmod` and "passed" by aborting on M-B's pre-flight.
+      That result was DISCARDED and M-C re-run serially, where it was caught
+      for the right reason. Two of these states touch the same files, so the
+      matrix now takes a `mkdir` lock and re-asserts a clean pre-state before
+      EVERY state (asserting inside `run_state` was itself wrong: M-B's mutation
+      IS the chmod, so it would always abort).
+    * The `via:` attribution pattern `^ *FAIL` dropped M-C's reason, because the
+      matrix prints a per-cell prefix BEFORE the FAIL — a real catch was
+      reporting as unattributed. Now matches FAIL anywhere, and an
+      UNATTRIBUTED catch FAILS the run: a checker that exits non-zero without
+      naming an assertion may be failing for an unrelated reason.
+    * The M-B anchor `python3` matched 3x in the fixture (two comments + the
+      exec) and the pre-flight refused to score. Correct refusal: an anchor
+      matching several sites proves nothing about which is mutated. Re-pointed
+      to `exec /usr/bin/python3`.
+  === TOOLING CAUTION: TWO OF MY "FINDINGS" WERE OUTPUT ARTIFACTS ===
+  Before the real work I nearly filed two bogus defects, both from trusting a
+  tool's rendering rather than the system:
+    * `ls -l` in this shell DROPS the permission columns, so both fixtures
+      appeared to be mode 644. `stat -c %a` says 755 and git records 100755.
+    * `ls /dev/dri` showed only `by-path/`, suggesting no render node — yet
+      `python3 -c "open('/dev/dri/renderD128','rb').close()` returned 0, which
+      is exactly what the gate probes, and all three render-node-guarded gates
+      passed. `/dev/dri` listing is not a device-existence test.
+  Rule: for permissions use `stat`, for device existence use the same syscall
+  the gate uses. Never report a defect read off an `ls` rendering.
+
 
 
 
