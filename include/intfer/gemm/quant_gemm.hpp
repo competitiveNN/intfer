@@ -231,8 +231,37 @@ struct Dpas48Params {
   // them inline, which is what makes it redo the same O(K) integer fold once
   // per 16-N tile. Bit-identical either way (exact int32 sums).
   const std::int32_t* fold_usm = nullptr;
-  uint32_t fold_stride = 0;  // 0 => nOp; else workspace nOp stride
+  // Fold workspace row stride in INT32 elements. MUST be >= 2*nOp, because a
+  // row owns [S0][Sfull]. 0 means "tight", which fold_row_stride resolves to
+  // exactly 2*nOp. Do NOT resolve or validate this by hand at a call site --
+  // go through fold_readable(), which is the same rule the writer uses.
+  uint32_t fold_stride = 0;
 };
+
+// INTFER_DPAS48_FOLD layout rule -- ONE definition, consumed by the writer
+// (quant_gemm_dpas48_rowfold) and by BOTH readers (quant_gemm_dpas48 and
+// quant_gemm_dpas4_row).
+//
+// Each row owns 2*nOp ints, [S0][Sfull]. A stride below 2*nOp lets row m's
+// Sfull block overwrite row m+1's S0 block, which is SILENT at M=1 -- the
+// defect this hoist already shipped and then caught. The writer refuses such
+// a stride, so a reader that resolved the stride any other way would index a
+// layout the writer can never produce and read Sfull out of the *wrong row's*
+// S0. Same lesson as the GA64 reciprocal site: a rule enforced at one site and
+// merely assumed at another is not enforced.
+inline uint32_t fold_row_stride(uint32_t fold_stride, uint32_t nOp) {
+  return (fold_stride == 0) ? 2u * nOp : fold_stride;
+}
+
+// Fail CLOSED. A reader handed a fold buffer whose stride it cannot validate
+// returns nullptr and recomputes the column sums inline: bit-identical to the
+// pre-FOLD path, just without the hoist. Never returns a mis-strided row.
+inline const std::int32_t* fold_readable(const std::int32_t* usm,
+                                         uint32_t fold_stride,
+                                         uint32_t nOp) {
+  if (!usm) return nullptr;
+  return fold_row_stride(fold_stride, nOp) >= 2u * nOp ? usm : nullptr;
+}
 
 // DPAS48 row-fold pre-pass (EXPERIMENTAL, default-off INTFER_DPAS48_FOLD).
 //

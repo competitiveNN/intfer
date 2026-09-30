@@ -1007,7 +1007,7 @@ sycl::event quant_gemm_dpas48_rowfold(sycl::queue& q,
   if (M == 0 || K < OP || (K % OP) != 0) return dep;
   const uint32_t nOp = K / OP;
   const uint32_t blocks = M * nOp;
-  if (fold_stride == 0) fold_stride = 2 * nOp;
+  fold_stride = fold_row_stride(fold_stride, nOp);
   // MUST be >= 2*nOp: each row owns 2*nOp ints ([S0][Sfull]), so a shorter
   // stride lets row m's Sfull block overwrite row m+1's S0 block. Silent at
   // M=1. Declining is always safe — the caller keeps the inline fold.
@@ -1070,8 +1070,11 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
   // per-(row,op) sums are precomputed and every tile WI just reads them,
   // instead of redoing the identical O(K) integer fold once per 16-N tile.
   // Exact int32 values, so this is a pure work hoist — not a numeric change.
-  const std::int32_t* Fold = p.fold_usm;
-  const uint32_t fold_stride = (p.fold_stride == 0) ? nOp : p.fold_stride;
+  // One shared layout rule with the writer (fold_readable): a fold buffer
+  // whose stride does not clear 2*nOp is IGNORED and the kernel falls back to
+  // the inline fold, rather than reading Sfull out of the wrong row's S0.
+  const uint32_t fold_stride = fold_row_stride(p.fold_stride, nOp);
+  const std::int32_t* Fold = fold_readable(p.fold_usm, p.fold_stride, nOp);
 
   // One WI per (row m, 16-N tile t). B op-tiles reload per WI (L1-resident
   // across the M rows of a tile); A is per-row. Same fold math as the M=1
@@ -1251,8 +1254,11 @@ sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
   // evaluates the fold once per (row, op) (it sits outside the tile strip
   // loop), so it does not NEED the hoist — but reading the precomputed values
   // is still exact and keeps the flag uniform across both DPAS geometries.
-  const std::int32_t* Fold = p.fold_usm;
-  const uint32_t fold_stride = (p.fold_stride == 0) ? nOp : p.fold_stride;
+  // One shared layout rule with the writer (fold_readable): a fold buffer
+  // whose stride does not clear 2*nOp is IGNORED and the kernel falls back to
+  // the inline fold, rather than reading Sfull out of the wrong row's S0.
+  const uint32_t fold_stride = fold_row_stride(p.fold_stride, nOp);
+  const std::int32_t* Fold = fold_readable(p.fold_usm, p.fold_stride, nOp);
 
   const uint32_t nWG = 16;
   const uint32_t global = ((M + nWG - 1) / nWG) * nWG;

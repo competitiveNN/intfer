@@ -446,6 +446,56 @@ Implement features for maximizing throughput for concurrent requests, starting f
    or reproduce it. Reproducing was cheap (the 0.8B run is seconds) and would
    have caught this immediately.
 
+   === AUDIT #12: THE FOLD ROW-STRIDE RULE WAS NOT APPLIED AT THE READER ===
+   E3 (INTFER_DPAS48_FOLD=1, aeb65b5) hoists the per-(row,op) activation
+   column sums out of quant_gemm_dpas48's 16-N tile loop. Its commit message
+   insists the row stride must be >= 2*nOp (each row owns [S0][Sfull]; a
+   shorter stride lets row m's Sfull overwrite row m+1's S0 — silent at M=1).
+   That rule was enforced ONLY in the WRITER (quant_gemm_dpas48_rowfold). BOTH
+   READERS resolved it independently and got it wrong — `? nOp : p.fold_stride`
+   in quant_gemm_dpas48 AND verbatim again in quant_gemm_dpas4_row — and the
+   header DOCUMENTED the bug as the contract (`fold_stride = 0; // 0 => nOp`),
+   so the public API invited any caller to set fold_usm and leave the stride
+   defaulted. Not reachable today (engine.cpp sets both fields), but latent and
+   wrong, and the header invited it.
+   TWO REASONS IT SURVIVED ITS OWN FEATURE'S MUTATIONS:
+   (a) VACUOUS COVERAGE. The probe gated the writer's VALUES; the engine always
+       sets fold_usm AND fold_stride together, so all four test_gpu_optin FOLD
+       arms — which DO exercise M>1 and the row stride — are structurally
+       incapable of reaching the 0 default. A path nothing reaches is a path
+       nothing can break.
+   (b) MUTUAL MASKING, the interesting half. Wrong default is harmless while
+       the reader VALIDATES; missing validation is harmless while the default
+       is RIGHT. Corruption needs BOTH wrong at once, so each single-half bug
+       looked fine. Same species as the GA64 reciprocal (#3) and "1 of M rows"
+       (#4): a rule fixed at one site and merely assumed at another.
+   FIX: ONE shared rule in quant_gemm.hpp — `fold_row_stride()` (0 => 2*nOp)
+   and `fold_readable()` (refuses any stride < 2*nOp, returns nullptr so the
+   kernel falls back to the INLINE fold = bit-identical to pre-FOLD, just no
+   hoist). Writer and both readers now consume the same two functions, so the
+   reader can never index a layout the writer refuses to produce.
+   COVERAGE (same probe, so still one gate): contract check over 80
+   (nOp,stride) pairs with expectations restated INDEPENDENTLY of the rule it
+   checks (so it cannot pass by sharing code with it), plus a DEVICE READBACK
+   that runs the real quant_gemm_dpas48 against the inline fold in three stride
+   regimes and demands bit-identical FP16 outputs. Activations are built so S0
+   and Sfull are deterministically distinct, making a mis-stride catchable BY
+   CONSTRUCTION rather than by luck.
+   MUTATION TABLE (each reverted, tree re-verified): default->nOp alone =>
+   contract FAIL(80) / readback pass (MASKED); no-validation alone => contract
+   FAIL / readback pass (MASKED); BOTH (the historical state) => contract FAIL
+   AND readback FAIL at 30/64 outputs. The readback alone would have missed
+   every single-half bug — which is why both checks stay.
+   ALSO FIXED: the probe printed its one-line PASS/FAIL verdict BEFORE the E4
+   section ran, so a reader could see PASS and then a failure that flipped the
+   exit code; the verdict now prints last.
+   GATES (correctness only, load-insensitive, NO wall-time claim):
+   dpas_fold PASS, gpu_optin PASS (20/20 arms TP=1+TP=2), cpu_parity PASS,
+   http_batch PASS. LESSON: when a fix lands at ONE call site of a layout rule,
+   grep for the OTHER sites that re-derive it — and check whether any of them
+   document the wrong value as the contract, because a header that says
+   "0 => nOp" is worse than no header: it launders the bug into the API.
+
    === FULL 10-GATE SUITE ON THIS TREE — 9 PASS, 1 BLOCKED BY BOX STATE ===
    Re-run after test_dpas_fold.sh was added. PASS: cpu_parity, dpas_fold,
    ga64_recip, gguf_roundtrip, gpu_optin (TP=1 AND TP=2, 4 FOLD arms),

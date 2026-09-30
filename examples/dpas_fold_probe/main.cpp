@@ -203,6 +203,171 @@ struct Case {
   std::uint32_t force_stride;  // 0 => model the engine (2*wsOp + pad)
 };
 
+// --- Reader/writer layout contract + device-level readback identity ----
+//
+// The value cases in main() gate the WRITER (quant_gemm_dpas48_rowfold). They
+// cannot reach the READERS' stride plumbing, and neither can the end-to-end
+// arms in test_gpu_optin.sh: the engine always sets fold_usm AND fold_stride
+// together, so "fold_stride left at its 0 default" had NO coverage anywhere in
+// the tree. That is the vacuous-gate shape -- a path nothing reaches is a path
+// nothing can break.
+//
+// Two checks close it:
+//
+//  (1) CONTRACT. For every (nOp, stride), the reader must accept EXACTLY the
+//      strides the writer accepts, resolving them to the same value. The
+//      expected values here restate the writer's own rule independently
+//      (0 => 2*nOp, then refuse anything below 2*nOp), so regressing the
+//      reader's default to nOp fails immediately.
+//
+//  (2) DEVICE READBACK. Run the real quant_gemm_dpas48 twice on identical
+//      inputs -- once with a hoisted fold buffer, once with the inline fold --
+//      and require the stored FP16 outputs to be BIT-IDENTICAL. Covers three
+//      stride regimes: the correct one, the 0 default, and a deliberately
+//      too-small one (must fail CLOSED to the inline fold, not read garbage).
+//
+// The activation codes are built so S0 and Sfull are deterministically
+// DISTINCT (lanes 0..15 = +(m+1), lanes 16..31 = -(m+1)), so a mis-strided read
+// is caught by construction rather than by luck: with nOp=1 a reader wrongly
+// resolving stride=nOp reads fold_d[m+1], which alternates Sfull/S0 between
+// rows and so flips S for rows 1 and 3 by large, known amounts.
+bool check_reader_contract(sycl::queue& q, std::uint64_t& pairs,
+                           std::uint64_t& devs) {
+  bool ok = true;
+
+  // ---- (1) writer/reader stride agreement ---------------------------
+  const std::uint32_t nOps[] = {1, 2, 3, 4, 8, 16, 32, 64, 128, 448};
+  const std::uint32_t kDummy = 1;
+  const std::int32_t* dummy = reinterpret_cast<const std::int32_t*>(&kDummy);
+  std::uint64_t cbad = 0;
+  for (std::uint32_t nOp : nOps) {
+    const std::uint32_t need = 2u * nOp;
+    const std::uint32_t strides[] = {0u,      1u,      nOp,  need - 1u,
+                                     need,    need + 1u, need + 7u, 2u * need};
+    for (std::uint32_t s : strides) {
+      // Independent restatement of the WRITER's rule (quant_gemm.cpp).
+      const std::uint32_t exp_str = (s == 0u) ? need : s;
+      const bool exp_ok = (exp_str >= need);
+      ++pairs;
+      const bool r_ok =
+          (intfer::gemm::fold_readable(dummy, s, nOp) != nullptr);
+      if (r_ok != exp_ok) {
+        std::printf("  FAIL contract nOp=%-4u stride=%-6u reader accepts=%d but "
+                    "the writer would accept=%d\n",
+                    nOp, s, (int)r_ok, (int)exp_ok);
+        ++cbad;
+      }
+      if (intfer::gemm::fold_row_stride(s, nOp) != exp_str) {
+        std::printf("  FAIL contract nOp=%-4u stride=%-6u resolved %u, writer "
+                    "resolves %u\n",
+                    nOp, s, intfer::gemm::fold_row_stride(s, nOp), exp_str);
+        ++cbad;
+      }
+      if (intfer::gemm::fold_readable(nullptr, s, nOp) != nullptr) {
+        std::printf("  FAIL contract nOp=%-4u stride=%-6u null usm accepted\n",
+                    nOp, s);
+        ++cbad;
+      }
+    }
+  }
+  std::printf("  contract: %llu (nOp,stride) pairs, writer and reader agree on "
+              "every one%s\n",
+              (unsigned long long)pairs, cbad ? " -- NO" : "");
+  ok = ok && (cbad == 0);
+
+  // ---- (2) device-level readback identity --------------------------
+  // M=4, N=16, K=32, INT4/G64 -> nOp=1, so each row owns exactly one S0/Sfull
+  // pair and the default-stride case is the regression under test.
+  constexpr std::uint32_t M = 4, N = 16, K = 32, G = 64, GA = 64;
+  const std::uint32_t nOp = K / OP, nGA = (K + GA - 1) / GA;
+  const std::uint32_t nG = (K + G - 1) / G;
+
+  // repack_dpas412 reads u4 codes PACKED (two per byte, low nibble first).
+  std::vector<std::uint8_t> row_codes((size_t)N * K / 2);
+  std::uint32_t seed = 24680u;
+  for (auto& b : row_codes) {
+    seed = seed * 1664525u + 1013904223u;
+    b = (std::uint8_t)((seed >> 16) & 0xFF);
+  }
+  std::vector<std::uint8_t> code;
+  if (!intfer::gemm::repack_dpas412(row_codes.data(), N, K, 4, code)) {
+    std::printf("  FAIL readback: repack_dpas412 refused N=%u K=%u\n", N, K);
+    return false;
+  }
+
+  auto* code_d = sycl::malloc_shared<std::uint8_t>(code.size(), q);
+  auto* scale_d = sycl::malloc_shared<std::uint16_t>((size_t)N * nG, q);
+  auto* act_d = sycl::malloc_shared<std::int8_t>((size_t)M * K, q);
+  auto* as_d = sycl::malloc_shared<float>((size_t)M * nGA, q);
+  auto* fold_d = sycl::malloc_shared<std::int32_t>((size_t)M * 2 * nOp, q);
+  auto* out_base = sycl::malloc_shared<std::uint16_t>((size_t)M * N, q);
+  auto* out_fold = sycl::malloc_shared<std::uint16_t>((size_t)M * N, q);
+  if (!code_d || !scale_d || !act_d || !as_d || !fold_d || !out_base ||
+      !out_fold) {
+    std::printf("  FAIL readback: alloc failed\n");
+    return false;
+  }
+  std::memcpy(code_d, code.data(), code.size());
+  for (std::uint32_t i = 0; i < N * nG; ++i) {
+    seed = seed * 1664525u + 1013904223u;
+    scale_d[i] = (std::uint16_t)((seed >> 16) & 0xFFFF);  // raw FP16 bits
+  }
+  for (std::uint32_t m = 0; m < M; ++m)
+    for (std::uint32_t k = 0; k < OP; ++k)
+      act_d[(size_t)m * K + k] =
+          (std::int8_t)(k < 16 ? (int)(m + 1) : -(int)(m + 1));
+  for (std::uint32_t m = 0; m < M * nGA; ++m)
+    as_d[m] = 0.01f + 0.002f * (float)m;
+  for (std::uint32_t m = 0; m < M; ++m) {
+    fold_d[2 * m + 0] = (std::int32_t)(16 * (m + 1));  // S0 = 16*(m+1)
+    fold_d[2 * m + 1] = 0;                            // Sfull = 0
+  }
+
+  auto run = [&](std::uint16_t* out, const std::int32_t* fold,
+                 std::uint32_t fstride) {
+    intfer::gemm::Dpas48Params p;
+    p.code_dpas = code_d;
+    p.scale_usm = scale_d;
+    p.act_int8 = act_d;
+    p.act_scale = as_d;
+    p.alpha = 1.0f / 100.0f;
+    p.out_usm = out;
+    p.M = M; p.N = N; p.K = K;
+    p.group_size = G;
+    p.act_group = GA;
+    p.bits = 4;
+    p.act_stride = K;
+    p.as_stride = nGA;
+    p.fold_usm = fold;
+    p.fold_stride = fstride;
+    intfer::gemm::quant_gemm_dpas48(q, p).wait_and_throw();
+  };
+
+  run(out_base, nullptr, 0);  // reference: the inline fold
+  std::uint64_t rbad = 0;
+  struct Regime { const char* name; std::uint32_t stride; };
+  const Regime regimes[] = {
+      {"correct stride 2*nOp", 2 * nOp},
+      {"fold_stride left at 0", 0},
+      {"too-small stride 1 (fail closed)", 1},
+  };
+  for (const Regime& r : regimes) {
+    run(out_fold, fold_d, r.stride);
+    std::uint32_t diff = 0;
+    for (std::uint32_t i = 0; i < M * N; ++i)
+      if (out_base[i] != out_fold[i]) ++diff;
+    ++devs;
+    std::printf("  readback %-34s stride=%-4u %s (%u/%u outputs differ)\n",
+                r.name, r.stride, diff ? "FAIL" : "ok", diff, M * N);
+    if (diff) ++rbad;
+  }
+
+  sycl::free(code_d, q); sycl::free(scale_d, q); sycl::free(act_d, q);
+  sycl::free(as_d, q); sycl::free(fold_d, q);
+  sycl::free(out_base, q); sycl::free(out_fold, q);
+  return ok && (rbad == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -225,7 +390,7 @@ int main() {
       {"NEG stride=2nOp-1", 4, 2048, 4096, 0, true, 127},
   };
 
-  std::uint64_t checked = 0, bad = 0;
+  std::uint64_t checked = 0, bad = 0, devs = 0;
   bool ok = true;
 
   for (const Case& c : cases) {
@@ -316,9 +481,17 @@ int main() {
     sycl::free(fold, q);
   }
 
-  std::printf("[dpas-fold-probe] %s (%llu (row,op) pairs compared, %llu violations)\n",
-              ok ? "PASS" : "FAIL", (unsigned long long)checked,
-              (unsigned long long)bad);
+  // The writer cases above cannot reach the readers' stride plumbing, and no
+  // end-to-end arm can (the engine always sets both fields). Gate it here.
+  std::printf("\n[dpas-fold-probe] reader/writer layout contract:\n");
+  std::uint64_t rc_pairs = 0, rc_devs = 0;
+  if (!check_reader_contract(q, rc_pairs, rc_devs)) ok = false;
+  checked += rc_pairs;
+  devs += rc_devs;
+
+  // NOTE: the one-line verdict is printed at the END, after E4. Printing it
+  // here would announce PASS and then let a later section flip it to FAIL, so
+  // the line a human reads would disagree with the exit code.
 
   // --- E4 numerics contract: accumulation-order sensitivity --------------
   // Not a property of the fold; a property of ANY geometry change that
@@ -362,6 +535,11 @@ int main() {
     std::printf("  E4 contract: VIOLATED -- the bound is wrong for this shape\n");
   ok = ok && (e4bad == 0);
   bad += (std::uint64_t)e4bad;
+
+  std::printf("\n[dpas-fold-probe] %s (%llu (row,op)+contract pairs compared, "
+              "%llu device readback regimes, %llu violations)\n",
+              ok ? "PASS" : "FAIL", (unsigned long long)checked,
+              (unsigned long long)devs, (unsigned long long)bad);
 
   if (!ok) {
     std::printf(
