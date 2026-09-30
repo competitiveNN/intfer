@@ -54,20 +54,36 @@ if ! python3 -c "open('/dev/dri/renderD128','rb').close()" 2>/dev/null; then
   echo "SKIP: no render-node access from this shell."
   exit 2
 fi
-# 2-GPU precondition (AUDIT #12 follow-up). This gate asserts on --tp 2 arms.
-# Engine::load clamps to min(tp_devices, dm.size()), so on a 1-GPU box every
-# TP=2 arm silently runs as TP=1 and the assertion fails against a path that was
-# never exercised -- a false FAIL that is really box state. Exit 2 = SKIP (the
-# convention already documented above), never a bare FAIL and never exit 0,
-# which would claim coverage we do not have.
+# 2-GPU precondition, PER ARM (AUDIT #13). Engine::load clamps
+# min(tp_devices, dm.size()), so on a 1-GPU box every `--tp 2` arm silently runs
+# as TP=1 and asserts against a path it never exercised.
+#
+# This gate is MOSTLY 1-GPU, though: sections 1, 1b, 2, 3, 4 and 5 are TP=1 (and
+# 4's sub-gates are 1-GPU). Only five arms need a second device. So the guard is
+# applied to those five arms, NOT to the script.
+#
+# That distinction is the whole point. An earlier revision put a top-level
+# `gate_require_gpus 2 || exit 2` here, which on a 1-GPU box skipped the ENTIRE
+# gate -- silently dropping the serve-fence regression test (section 5), which
+# exists precisely to catch a crash that "only manifests on a LATER sampling
+# request" and so is invisible to every stream gate. A gate that always skips is
+# indistinguishable from a gate that is not run, and the path it protects is a
+# known-dangerous one. Restoring per-arm granularity is the fix; exit 2 still
+# reports the lost coverage at the end (see the verdict block).
 set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 set -u
 . "$SCRIPT_DIR/_gate_precond.sh"
-gate_require_gpus 2 || exit 2
-set +u
-source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
-set -u
+N_GPUS="$(gate_gpu_count || echo 0)"
+HAVE_TP2=0; [ "${N_GPUS:-0}" -ge 2 ] && HAVE_TP2=1
+SKIPPED_TP2=0
+if [ "$HAVE_TP2" = 1 ]; then
+  echo "precondition: $N_GPUS GPU(s) visible (need 2 for the TP=2 arms)" >&2
+else
+  echo "SKIPPING the 5 TP=2 arms: need 2 GPUs, ${N_GPUS:-0} visible." >&2
+  echo "  BOX STATE, not a code failure. The TP=1 arms below still run and still assert." >&2
+  SKIPPED_TP2=1
+fi
 
 PASS=1
 fail() { echo "GATE FAIL: $1" >&2; PASS=0; }
@@ -102,12 +118,14 @@ for mode in "INTFER_L5_HOSTPREP=1" "INTFER_SSM_GPU=1" \
   echo "TP1 [$mode]: '$GOT'"
   [ "$GOT" = "$TP1_BASE" ] || fail "TP1 [$mode] '$GOT' != base '$TP1_BASE'"
 done
-TP2_BASE="$(ids_of 2)"
-echo "TP2 base: '$TP2_BASE'"
-[ -n "$TP2_BASE" ] || fail "TP2 base empty (broken GPU run)"
-TP2_FLAG="$(ids_of 2 INTFER_DEVICE_ARGMAX=1)"
-echo "TP2 flag: '$TP2_FLAG'"
-[ "$TP2_FLAG" = "$TP2_BASE" ] || fail "TP2 flag '$TP2_FLAG' != base '$TP2_BASE'"
+if [ "$HAVE_TP2" = 1 ]; then
+  TP2_BASE="$(ids_of 2)"
+  echo "TP2 base: '$TP2_BASE'"
+  [ -n "$TP2_BASE" ] || fail "TP2 base empty (broken GPU run)"
+  TP2_FLAG="$(ids_of 2 INTFER_DEVICE_ARGMAX=1)"
+  echo "TP2 flag: '$TP2_FLAG'"
+  [ "$TP2_FLAG" = "$TP2_BASE" ] || fail "TP2 flag '$TP2_FLAG' != base '$TP2_BASE'"
+fi
 
 echo "--- 1b. non-triviality: [argmax] counter fires on GPU flag runs ---"
 DBG_N="$(INTFER_DEVICE_ARGMAX=1 INTFER_ARGMAX_DBG=1 "$BIN" --gpu --tp 1 \
@@ -183,21 +201,41 @@ echo "PARTS no-spec=$P_NOSPEC spec=$P_SPEC spec-rerun=$P_SPEC2"
   fail "verify rows did not ride the hook (spec PARTS $P_SPEC <= no-spec $P_NOSPEC)"
 [ "$P_SPEC2" = "$P_SPEC" ] || \
   fail "verify PARTS not deterministic ($P_SPEC vs rerun $P_SPEC2)"
-P_TP2FLAG="$(env INTFER_DEVICE_ARGMAX=1 INTFER_ARGMAX_PARTS=1 INTFER_SPEC_K=4 "$BIN" \
-  --gpu --tp 2 -m "$MODEL" -p "$SPEC_PROMPT" -n 8 --no-stream --ids $TOK 2>&1 >/dev/null \
-  | grep -ac "argmax-part")"
-echo "PARTS TP2 spec flag: $P_TP2FLAG (expect 0: TP1-only guard)"
-[ "$P_TP2FLAG" = 0 ] || fail "hook fired on TP2 ($P_TP2FLAG lines)"
-SP2_BASE="$(env INTFER_SPEC_K=4 "$BIN" --gpu --tp 2 -m "$MODEL" -p "$SPEC_PROMPT" \
-  -n 8 --no-stream --ids $TOK 2>&1 | grep -a -E "decode step [0-9]+: token=[0-9]+" | tr '\n' '|')"
-SP2_FLAG="$(env INTFER_DEVICE_ARGMAX=1 INTFER_SPEC_K=4 "$BIN" --gpu --tp 2 -m "$MODEL" \
-  -p "$SPEC_PROMPT" -n 8 --no-stream --ids $TOK 2>&1 | grep -a -E "decode step [0-9]+: token=[0-9]+" | tr '\n' '|')"
-[ "$SP2_FLAG" = "$SP2_BASE" ] || fail "TP2 spec repetitive flag != base"
+if [ "$HAVE_TP2" = 1 ]; then
+  P_TP2FLAG="$(env INTFER_DEVICE_ARGMAX=1 INTFER_ARGMAX_PARTS=1 INTFER_SPEC_K=4 "$BIN" \
+    --gpu --tp 2 -m "$MODEL" -p "$SPEC_PROMPT" -n 8 --no-stream --ids $TOK 2>&1 >/dev/null \
+    | grep -ac "argmax-part")"
+  echo "PARTS TP2 spec flag: $P_TP2FLAG (expect 0: TP1-only guard)"
+  [ "$P_TP2FLAG" = 0 ] || fail "hook fired on TP2 ($P_TP2FLAG lines)"
+  SP2_BASE="$(env INTFER_SPEC_K=4 "$BIN" --gpu --tp 2 -m "$MODEL" -p "$SPEC_PROMPT" \
+    -n 8 --no-stream --ids $TOK 2>&1 | grep -a -E "decode step [0-9]+: token=[0-9]+" | tr '\n' '|')"
+  SP2_FLAG="$(env INTFER_DEVICE_ARGMAX=1 INTFER_SPEC_K=4 "$BIN" --gpu --tp 2 -m "$MODEL" \
+    -p "$SPEC_PROMPT" -n 8 --no-stream --ids $TOK 2>&1 | grep -a -E "decode step [0-9]+: token=[0-9]+" | tr '\n' '|')"
+  [ "$SP2_FLAG" = "$SP2_BASE" ] || fail "TP2 spec repetitive flag != base"
+else
+  echo "  (skipped 3 TP=2 spec/PARTS arms -- need 2 GPUs)"
+fi
 
 echo "--- 4. standard gates ---"
-if "$SCRIPT_DIR/test_cpu_parity.sh" >/dev/null 2>&1; then echo "cpu parity: PASS"; else fail "cpu parity"; fi
-if "$SCRIPT_DIR/test_http_batch.sh" >/dev/null 2>&1; then echo "http batch: PASS"; else fail "http batch"; fi
-if "$SCRIPT_DIR/test_gpu_optin.sh" >/dev/null 2>&1; then echo "gpu-optin: PASS"; else fail "gpu-optin"; fi
+# Sub-gate rc map: 0 = PASS, 2 = PARTIAL/SKIP (box state, NOT a failure),
+# anything else = FAIL. Collapsing 2 into "not 0" would turn an honest skip
+# report from gpu-optin (which now returns 2 on a 1-GPU box) into a red line
+# here -- the same false-FAIL class AUDIT #13 removed one level up.
+sub_gate() { # $1 = label, rest = script
+  local label="$1"; shift
+  "$@" >/dev/null 2>&1
+  local rc=$?
+  case "$rc" in
+    0) echo "$label: PASS" ;;
+    2) echo "$label: PARTIAL/SKIP (rc=2, box state -- not counted as a failure)"
+       SKIPPED_SUB=$((SKIPPED_SUB + 1)) ;;
+    *) fail "$label (rc=$rc)"; echo "$label: FAIL (rc=$rc)" >&2 ;;
+  esac
+}
+SKIPPED_SUB=0
+sub_gate "cpu parity" "$SCRIPT_DIR/test_cpu_parity.sh"
+sub_gate "http batch" "$SCRIPT_DIR/test_http_batch.sh"
+sub_gate "gpu-optin" "$SCRIPT_DIR/test_gpu_optin.sh"
 
 echo "--- 5. serve fence lock (flag ON server: no prefill-chunk hook firing) ---"
 # The decode_only fence (batch hook declines prefill chunks — serve-poison
@@ -268,4 +306,15 @@ fi
 serve_cleanup
 trap - EXIT
 
-if [ "$PASS" = 1 ]; then echo "DEVICE-ARGMAX TEST: PASS"; else echo "DEVICE-ARGMAX TEST: FAIL" >&2; exit 1; fi
+if [ "$PASS" != 1 ]; then
+  echo "DEVICE-ARGMAX TEST: FAIL" >&2
+  exit 1
+fi
+if [ "$SKIPPED_TP2" = 1 ] || [ "${SKIPPED_SUB:-0}" -gt 0 ]; then
+  # Everything runnable here passed, but some coverage never executed (TP=2
+  # arms and/or a sub-gate that returned 2). Exit 2, never 0: a silent skip
+  # reads as coverage we do not have.
+  echo "DEVICE-ARGMAX TEST: PARTIAL PASS (TP=1 arms all green; skipped: TP2 arms=$SKIPPED_TP2, sub-gates=$SKIPPED_SUB -- need 2 GPUs)" >&2
+  exit 2
+fi
+echo "DEVICE-ARGMAX TEST: PASS"
