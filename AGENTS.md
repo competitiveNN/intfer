@@ -289,6 +289,9 @@ Implement features for maximizing throughput for concurrent requests, starting f
    intfer_cli) and test_gguf_roundtrip.sh (intfer_gguf). Nine gates total;
    audit #6 touched four. Same damage as http_batch: a failed build leaves the
    previous binary runnable, so the gate judges code that no longer exists.
+   (HISTORICAL COUNT: nine was correct for audits #7/#8. There are TEN gates now
+   — scripts/test_dpas_fold.sh was added later; see the EXPERIMENT SHIPPED
+   block. Do not read "nine" below as the current count.)
    Fix: ONE shared, sourced helper `scripts/_gate_build.sh` with
    `gate_require_build <cmake-target>`, called by all nine gates
    (`. "$SCRIPT_DIR/_gate_build.sh"; gate_require_build <target> || exit 1`).
@@ -442,6 +445,30 @@ Implement features for maximizing throughput for concurrent requests, starting f
    mechanism is not a verified one — read the code that would have to be wrong,
    or reproduce it. Reproducing was cheap (the 0.8B run is seconds) and would
    have caught this immediately.
+
+   === FULL 10-GATE SUITE ON THIS TREE — 9 PASS, 1 BLOCKED BY BOX STATE ===
+   Re-run after test_dpas_fold.sh was added. PASS: cpu_parity, dpas_fold,
+   ga64_recip, gguf_roundtrip, gpu_optin (TP=1 AND TP=2, 4 FOLD arms),
+   http_batch, oracle_equiv, serve_load. FAIL: device_argmax. NOT RUNNABLE:
+   tp2_27b (27B needs --tp 2; the box exposes one GPU).
+   THE FAILURE IS BOX STATE, NOT A REGRESSION — established, not assumed:
+     GATE FAIL: hook fired on TP2 (40 lines)   [PARTS TP2 spec flag: 40, expect 0]
+   The gate's TP2 arm asserts the argmax hook stays OFF under --tp 2, because
+   the hook is TP1-only. The hook's guard is `is_distributed()` =
+   `num_devices_ > 1` (main.cpp:989). With ONE GPU the engine correctly clamps
+   --tp 2 down to a single device, so it is correctly NOT distributed, so the
+   hook correctly fires, so the gate's expectation of 0 lines is wrong for a
+   1-GPU box. Verified NOT MINE: `git log 7efed06..HEAD -- scripts/
+   test_device_argmax.sh examples/intfer_cli/main.cpp` is EMPTY, and
+   `is_distributed()` last changed in 22431d5, long before this session.
+   DO NOT "fix" this by relaxing the gate to expect 40 lines — that would break
+   it the moment a second GPU enumerates. It is the same class as AUDIT #9/#11
+   (a gate whose expectation encodes a 2-GPU box configuration). Re-run once
+   both GPUs enumerate. Recorded here so the next session does not read 9/10 as
+   a code defect or "fix" the gate into a permanent no-op.
+   serve_load numbers in that run (c1=8.04 -> c8=5.07 tok/s aggregate, x0.63)
+   are CONTENDED-BOX throughput, not a measurement: the box was not quiet and
+   no round was interleaved. Recorded only to show the gate ran; no perf claim.
 
    === EXPERIMENT SHIPPED: INTFER_DPAS48_FOLD=1 (default OFF) ===
    The "rewritten 2D-tiled DPAS kernel" was blocked on one specific thing, and

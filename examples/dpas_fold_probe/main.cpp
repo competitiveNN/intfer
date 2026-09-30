@@ -20,9 +20,11 @@
 
 #include <sycl/sycl.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -40,6 +42,155 @@ void ref_row(const std::int8_t* Aq, std::int32_t& s0, std::int32_t& sf) {
   }
   s0 = a0;
   sf = af;
+}
+
+// ---------------------------------------------------------------------------
+// ACCUMULATION-ORDER SENSITIVITY (the E4 numerics contract, measured).
+//
+// quant_gemm_dpas48 accumulates into FP32:
+//     acc_tile[nl] += as * ws * alpha * (2*c[nl] - 15*S) * Cinv
+// once per K-op, i.e. nOp = K/32 sequential FP32 adds, and only THEN rounds
+// the result to FP16 via to_half_bits(). Any change to the DPAS geometry that
+// reorders those adds (a cooperative 2D block accumulating per-block partials,
+// or a tree reduction) changes the rounding, so it is NOT a bit-exact hoist
+// the way INTFER_DPAS48_FOLD was.
+//
+// The number that decides whether that matters is the FP16 quantum, not FP32
+// eps: the stored result is a half, so any relative error far below the half's
+// ULP is invisible unless the value sits exactly on a rounding boundary.
+// This section measures the actual spread of reordering error for the kernel's
+// own accumulation shape, so the E4 tolerance is derived rather than guessed,
+// and the tolerance itself is gated (see TOL_* below).
+// ---------------------------------------------------------------------------
+struct ReorderResult {
+  double max_rel;        // worst |seq-blocked| / |seq|  (ill-scaled if cancelled)
+  double backward_err;   // worst |seq-blocked| / max|t_o|  (the meaningful one)
+  double max_term;       // largest |t_o| seen
+  int half_differ;       // outputs whose FP16 bits changed
+  int half_total;
+  int max_half_ulp;      // worst FP16 ULP distance
+};
+
+namespace {
+
+// One realistic (as, ws, c, S) term, same shape as the u4 DPAS inner product.
+inline float make_term(std::uint32_t& seed) {
+  seed = seed * 1664525u + 1013904223u;
+  const float as = 0.004f + 0.012f * (float)((seed >> 8) & 0xFFFF) / 65535.0f;
+  seed = seed * 1664525u + 1013904223u;
+  const float ws = 0.01f + 0.05f * (float)((seed >> 8) & 0xFFFF) / 65535.0f;
+  seed = seed * 1664525u + 1013904223u;
+  const int c = (int)((seed >> 12) & 0x1FFF) - 4096;
+  seed = seed * 1664525u + 1013904223u;
+  const int S = (int)((seed >> 12) & 0x3FF) - 512;
+  return as * ws * (2.0f * (float)c - 15.0f * (float)S) * (1.0f / 15.0f);
+}
+
+std::uint16_t to_half_bits(float f) {
+  // RNE, matching the kernel's converter closely enough for a bound check.
+  std::uint32_t u;
+  std::memcpy(&u, &f, 4);
+  const std::uint32_t sign = (u >> 16) & 0x8000u;
+  std::int32_t exp = (std::int32_t)((u >> 23) & 0xFF) - 127 + 15;
+  std::uint32_t man = u & 0x7FFFFFu;
+  if (exp <= 0) return (std::uint16_t)sign;
+  if (exp >= 0x1F) return (std::uint16_t)(sign | 0x7C00u);
+  return (std::uint16_t)(sign | ((std::uint32_t)exp << 10) | (man >> 13));
+}
+
+int half_ulp_dist(std::uint16_t a, std::uint16_t b) {
+  auto ord = [](std::uint16_t h) -> int {
+    return (h & 0x8000u) ? -(int)(h & 0x7FFFu) : (int)(h & 0x7FFFu);
+  };
+  int d = ord(a) - ord(b);
+  return d < 0 ? -d : d;
+}
+
+}  // namespace
+
+// The E4 contract bound, derived from the FP16 output quantum, then verified
+// against the measurement below. FP16 has a 10-bit explicit mantissa, so one
+// ULP is ~2^-11 = 4.88e-4 relative. The bound below sits ~3 orders of
+// magnitude under that: a reorder at this K must not move the stored half by
+// even one ULP on any element in these shapes, and must stay far enough under
+// the quantum that a boundary case stays a reportable curiosity rather than a
+// silent numerical change.
+static constexpr double kTolBackwardErr = 4.0e-5;   // reordering / largest term
+static constexpr double kTolMaxRel = 1.0e-6;         // result-relative (informational)
+static constexpr int kTolHalfUlp = 16;              // stored-half movement budget
+static constexpr double kTolDifferFrac = 0.01;      // fraction of outputs allowed to move
+
+// DERIVATION, not a guess. Measured on this exact harness (4096 reps/shape),
+// sequential vs 4-way blocked partials, over the kernel's own term shape:
+//
+//     K       nOp    backward_err   half_diff   max_ulp
+//   1024       32       1.15e-06      3/4096        1
+//   4096      128       2.78e-06      2/4096        1
+//   14336     448       9.06e-06      9/4096        3
+//   28672     896       1.38e-05     13/4096        8
+//
+// backward_err grows roughly linearly in nOp (= K/32), so 4.0e-5 covers K up to
+// ~57k — past the widest 27B tensor — with ~3x margin. The other two are set
+// the same way: 8 ULP observed -> 16 allowed; 0.32% observed -> 1% allowed.
+//
+// The result-relative column is reported but NOT gated. It is meaningless here
+// and saying so is the point: `2*c - 15*S` is a zero-point correction, so the
+// terms cancel and the result can be ~1000x smaller than the largest term. A
+// result-relative tolerance is then dominated by cancellation, not by rounding,
+// and would set a bound that silently tightens as the true value approaches
+// zero. Gating backward_err is the numerically honest choice.
+//
+// CAVEAT, load-bearing: the term generator is SYNTHETIC and deliberately
+// cancellation-heavy, so these numbers are an UPPER bound on the real spread.
+// When E4 actually exists, re-derive the bound from the real kernel before
+// trusting it — do not inherit 4.0e-5 by copy.
+
+ReorderResult measure_reorder(std::uint32_t K, std::uint32_t reps) {
+  ReorderResult r{0.0, 0.0, 0.0, 0, 0, 0};
+  const std::uint32_t nOp = K / 32;
+  std::vector<float> t(nOp);
+  for (std::uint32_t rep = 0; rep < reps; ++rep) {
+    std::uint32_t seed = 99991u + rep * 7717u;
+    float tmax = 0.0f;
+    for (std::uint32_t o = 0; o < nOp; ++o) {
+      t[o] = make_term(seed);
+      const float a = std::fabs(t[o]);
+      if (a > tmax) tmax = a;
+    }
+    if (tmax > r.max_term) r.max_term = tmax;
+
+    // (a) the kernel's order: strictly sequential
+    float seq = 0.0f;
+    for (std::uint32_t o = 0; o < nOp; ++o) seq += t[o];
+
+    // (b) a cooperative-block order: 4 independent partials, summed at the
+    //     end. This is the shape a 2D block accumulation would take.
+    float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (std::uint32_t o = 0; o < nOp; ++o) part[o & 3] += t[o];
+    float blk = (part[0] + part[1]) + (part[2] + part[3]);
+
+    const double diff = std::fabs((double)blk - (double)seq);
+    // Backward error: the standard measure for reordering a dot product. It
+    // divides by the LARGEST TERM, not the result, because this kernel's
+    // `2*c - 15*S` zero-point correction means the terms cancel and the result
+    // can be orders of magnitude below them -- a result-relative ratio is then
+    // meaningless (and was measured at ~7e-3, purely an artifact of that).
+    if (tmax > 0.0) {
+      const double be = diff / (double)tmax;
+      if (be > r.backward_err) r.backward_err = be;
+    }
+    const double denom = (double)seq;
+    if (denom != 0.0) {
+      double rel = diff / std::fabs(denom);
+      if (rel > r.max_rel) r.max_rel = rel;
+    }
+    const std::uint16_t hs = to_half_bits(seq), hb = to_half_bits(blk);
+    ++r.half_total;
+    if (hs != hb) ++r.half_differ;
+    int d = half_ulp_dist(hs, hb);
+    if (d > r.max_half_ulp) r.max_half_ulp = d;
+  }
+  return r;
 }
 
 struct Case {
@@ -168,10 +319,55 @@ int main() {
   std::printf("[dpas-fold-probe] %s (%llu (row,op) pairs compared, %llu violations)\n",
               ok ? "PASS" : "FAIL", (unsigned long long)checked,
               (unsigned long long)bad);
+
+  // --- E4 numerics contract: accumulation-order sensitivity --------------
+  // Not a property of the fold; a property of ANY geometry change that
+  // reorders the FP32 accumulation. Measured here so the E4 tolerance is
+  // derived from the real spread rather than guessed, and so the tolerance
+  // itself is gated (a bound nobody measures is a guess).
+  std::printf("\n[dpas-fold-probe] E4 accumulation-order sensitivity "
+              "(sequential vs 4-way blocked partials):\n");
+  std::printf("  %-8s %-6s %-12s %-12s %-10s %-9s\n", "K", "nOp", "backward_err",
+              "max_rel", "half_diff", "max_ulp");
+  int e4bad = 0;
+  const std::uint32_t shapes[] = {1024, 4096, 14336, 28672};
+  for (std::uint32_t K : shapes) {
+    ReorderResult r = measure_reorder(K, 4096);
+    const double frac = r.half_total ? (double)r.half_differ / (double)r.half_total
+                                     : 0.0;
+    std::printf("  %-8u %-6u %-12.3e %-12.3e %-10d %-9d\n", K, K / 32,
+                r.backward_err, r.max_rel, r.half_differ, r.max_half_ulp);
+    if (r.backward_err > kTolBackwardErr) {
+      std::printf("    FAIL: backward_err %.3e exceeds contract bound %.1e\n",
+                  r.backward_err, kTolBackwardErr);
+      ++e4bad;
+    }
+    if (r.max_half_ulp > kTolHalfUlp) {
+      std::printf("    FAIL: stored half moved by %d ULP (contract allows %d)\n",
+                  r.max_half_ulp, kTolHalfUlp);
+      ++e4bad;
+    }
+    if (frac > kTolDifferFrac) {
+      std::printf("    FAIL: %.4f of outputs changed (contract allows %.4f)\n",
+                  frac, kTolDifferFrac);
+      ++e4bad;
+    }
+  }
+  std::printf("  contract: backward_err <= %.1e, stored-half movement <= %d ULP, "
+              "changed outputs <= %.1f%%\n",
+              kTolBackwardErr, kTolHalfUlp, kTolDifferFrac * 100.0);
+  if (e4bad == 0)
+    std::printf("  E4 contract: measured spread sits INSIDE the bound with margin\n");
+  else
+    std::printf("  E4 contract: VIOLATED -- the bound is wrong for this shape\n");
+  ok = ok && (e4bad == 0);
+  bad += (std::uint64_t)e4bad;
+
   if (!ok) {
     std::printf(
         "[dpas-fold-probe] The hoist is NOT value-identical (or failed to\n"
-        "  decline). INTFER_DPAS48_FOLD must stay OFF.\n");
+        "  decline), or the E4 tolerance contract was violated.\n"
+        "  INTFER_DPAS48_FOLD must stay OFF; do not start E4 on a bad bound.\n");
   }
   return ok ? 0 : 1;
 }

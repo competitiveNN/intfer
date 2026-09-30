@@ -280,11 +280,20 @@ wide N and M>1.
 
 **Honest blocker, stated up front.** A 2D/cooperative DPAS kernel changes the
 accumulation ORDER of the FP32 `acc_tile`, so unlike E3 it is **not** a
-bit-exact hoist. It will need a real numerics contract and a tolerance-based
-comparison against the legacy path (not `==`), and that contract has to be
-agreed before the code is written. That is why it is registered rather than
-started. See the "Also not yet implemented" list below, which this section
-replaces for the DPAS row.
+bit-exact hoist. It needs a tolerance-based gate, not `==`.
+
+**That contract is now WRITTEN DOWN: `reports/2026-09-30-e4-dpas-2d-contract.md`.**
+Key decision: gate **backward error** (`max |seq-blocked| / max |t_o|`), not
+result-relative error, because the kernel's `2*c - 15*S` zero-point correction
+makes the terms cancel and the result ~1000x smaller than the largest term — a
+result-relative bound would be dominated by cancellation. Tolerances are
+measured, not guessed, and enforced today by a section of
+`examples/dpas_fold_probe` (gated via `scripts/test_dpas_fold.sh`):
+`backward_err <= 4.0e-5` (measured worst 1.38e-5 at K=28672), stored-FP16
+movement `<= 16` ULP (measured 8), changed outputs `<= 1%` (measured 0.32%).
+Stream identity is **reported, not asserted** — asserting it would be tie-luck
+(AUDIT #3b). Read the contract file before writing any E4 code; it also lists
+the five conditions that would invalidate the tolerances.
 
 RESULT (27B TP=2 prefill chunk361, vs DPAS48 and DPAS48+FOLD baselines):
 
