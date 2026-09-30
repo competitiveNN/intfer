@@ -46,6 +46,28 @@ fi
 set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 set -u
+# 2-GPU precondition, PER ARM (AUDIT #13). The `for tp in 1 2` loop below runs
+# ~14 assertions per tp. Engine::load clamps min(tp_devices, dm.size()), so on a
+# 1-GPU box the tp=2 pass silently re-runs tp=1 and every assertion still HOLDS
+# -- the gate reports PASS while certifying nothing about tensor parallelism.
+# That is the worst of the three outcomes the precond helper exists to prevent:
+# not a false FAIL, not a visible skip, but a false PASS. The tp=1 loop is fully
+# runnable here, so the guard drops tp=2 only, and the verdict reports the lost
+# coverage with exit 2.
+. "$SCRIPT_DIR/_gate_precond.sh"
+N_GPUS="$(gate_gpu_count || echo 0)"
+HAVE_TP2=0; [ "${N_GPUS:-0}" -ge 2 ] && HAVE_TP2=1
+SKIPPED_TP2=0
+TPS="1"
+if [ "$HAVE_TP2" = 1 ]; then
+  TPS="1 2"
+  echo "precondition: $N_GPUS GPU(s) visible (need 2 for the tp=2 pass)" >&2
+else
+  echo "SKIPPING the tp=2 pass: need 2 GPUs, ${N_GPUS:-0} visible." >&2
+  echo "  BOX STATE, not a code failure. The tp=1 pass still runs and still asserts." >&2
+  echo "  Without this the tp=2 arms would re-run tp=1 and PASS vacuously." >&2
+  SKIPPED_TP2=1
+fi
 
 PASS=1
 fail() { echo "GATE FAIL: $1" >&2; PASS=0; }
@@ -65,7 +87,7 @@ wide_ids_of() { # $1=tp $2=env... -- prints decode ids for the ~97-token prefill
     | tr '\n' ' ' | sed 's/ *$//'
 }
 
-for tp in 1 2; do
+for tp in $TPS; do
   BASE="$(ids_of "$tp")"
   echo "TP=$tp base: '$BASE'"
   [ -n "$BASE" ] || fail "TP=$tp base empty (broken GPU run)"
@@ -186,4 +208,14 @@ for tp in 1 2; do
   [ "$FOLDA" = "$B24" ] || fail "TP=$tp [INTFER_DPAS48_FOLD=1 alone] '$FOLDA' != base '$B24'"
 done
 
-if [ "$PASS" = 1 ]; then echo "GPU-OPTIN TEST: PASS"; else echo "GPU-OPTIN TEST: FAIL" >&2; exit 1; fi
+if [ "$PASS" != 1 ]; then
+  echo "GPU-OPTIN TEST: FAIL" >&2
+  exit 1
+fi
+if [ "$SKIPPED_TP2" = 1 ]; then
+  # tp=1 fully green; tp=2 never ran. Exit 2 so this is never mistaken for the
+  # full matrix being certified on this box.
+  echo "GPU-OPTIN TEST: PARTIAL PASS (tp=1 arms all green; tp=2 pass SKIPPED -- need 2 GPUs)" >&2
+  exit 2
+fi
+echo "GPU-OPTIN TEST: PASS"
