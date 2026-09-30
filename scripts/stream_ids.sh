@@ -3,7 +3,7 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN="$ROOT/build/examples/intfer_cli/intfer_cli"
+BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/intfer_cli/intfer_cli"
 MODEL="${INTFER_08B:-$ROOT/test/models/Qwen3.5-0.8B.intifer}"
 TP="${1:-1}"; shift
 N="${1:-8}"; shift

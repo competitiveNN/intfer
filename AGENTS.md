@@ -313,6 +313,71 @@ Implement features for maximizing throughput for concurrent requests, starting f
    closed by an exhaustive ENUMERATION of its instances (grep every script for
    the artifact it consumes), never by the count of files the current fix
    happened to touch.
+   AUDIT #8 (re-verification of #7 + scope correction). #7's guard is sound;
+   re-derived independently rather than trusted: guard ordering re-checked in
+   all 9 (every guard precedes the first EXECUTION of the binary — the earlier
+   "hole" reading was an assignment line, not a call), helper edge cases
+   re-tested (empty/no target -> rc=1, bogus target -> rc=1 with ninja's
+   "unknown target" so the name really reaches cmake, missing build tree ->
+   rc=1, real target -> rc=0, INTFER_GATE_NO_BUILD=1 -> bypass, `sh` -> still
+   rc=0), and the mutation RE-RUN: static_assert(false) into
+   src/common/logger.cpp with the stale binary confirmed still runnable
+   (--help rc=0) => 9/9 gates rc=1, nothing past the guard. Reverted; logger.cpp
+   byte-identical; all 9 green again on the rebuilt tree.
+   SCOPE CORRECTION — "closed tree-wide" was still an overclaim, the same error
+   in a new place. Grepping for build-artifact consumers finds SEVENTEEN scripts,
+   not nine: the 9 correctness gates (guarded) plus 8 measurement/serve
+   harnesses — bench_gpu_ab.sh, bench_quiet_ab.sh, bench_quiet_l4_ab.sh,
+   bench_serve.sh, bench_chat.sh, serve_27b.sh, stream_ids.sh, xmx_profile.sh
+   — which consume intfer_cli with NO build step. Family 3 is therefore closed
+   for CORRECTNESS ORACLES ONLY; those 8 are measurement scripts whose whole
+   purpose is timing a specific binary on a quiet box, so an implicit rebuild
+   would (a) perturb the very quiet-loadavg window they gate on and (b) silently
+   substitute code for the A/B under test. They are deliberately NOT guarded —
+   but that is now stated instead of being papered over by "tree-wide".
+   REAL BUG FOUND AND FIXED in that sweep: 5 of those harnesses hardcoded
+   BIN="$ROOT/build/...", silently IGNORING the documented INTFER_BUILD_DIR
+   override (README.md:96) that 12 other scripts honor. Consequence: pointing
+   INTFER_BUILD_DIR at another tree — the natural way to benchmark an
+   experimental build — left all five benchmarking the DEFAULT tree instead,
+   i.e. exactly the "measured the wrong binary" failure family 3 exists to
+   prevent, arrived at from the other direction. Now
+   BIN="${INTFER_BUILD_DIR:-$ROOT/build}/..." in all five; verified both
+   directions (override set -> resolves into that tree and fails closed when it
+   has no binary; override unset -> resolves to the real default binary).
+   All 17 artifact consumers now honor the override; `bash -n` clean on each.
+   Benchmarks re-verified CORRECTNESS-only; no wall-time claim is made here.
+   === AUDIT #9: test_tp2_27b FAILING = BOX STATE, NOT A REGRESSION ===
+   The audit-#8 9-gate re-run came back 8 PASS / 1 FAIL, the failure being
+   test_tp2_27b: intfer_cli exits rc=139 (SIGSEGV) after preload, with the
+   backtrace resolving to intfer::Engine::run_linear_wave <- GpuBackend::
+   run_linear_wave <- step <- main (addr2line on the shipped binary; no -g,
+   hence no line numbers). NOT a code regression — this audit touched no
+   engine/quant/schedule source (diff is 5 harness scripts + docs), and the
+   same binary passed tp2_27b earlier in the session.
+   ROOT CAUSE, measured not inferred: the box now exposes ONE GPU to the
+   compute runtime. The CLI's own banner says `Engine: 1 Arc device(s)`, and
+   independently: `xpu-smi --list-gpus` -> GPU 0 only; `sycl-ls` (compiler
+   2026.0, umf on LD_LIBRARY_PATH) -> exactly one [level_zero:gpu] entry.
+   Meanwhile /dev/dri still has card0/renderD128 AND card1/renderD129 and all
+   four open OK, i.e. the kernel still has both nodes and only the runtime's
+   enumeration dropped PCI 86:00.0. Shell env is clean (no SYCL_DEVICE_FILTER
+   /ZE_AFFINITY_MASK/ONEAPI_DEVICE_SELECTOR), so this is NOT the libumf
+   LD_LIBRARY_PATH gotcha (that one yields ZERO devices, not one).
+   TP=2 then slices every tensor into 2 shard ranges while only rank 0 has a
+   device, and the wave path walks ranges[d] -> wild pointer -> SIGSEGV.
+   Timeline fits the loss: gpu_optin (TP=1+TP=2 arms) PASSED earlier in the
+   same run, then the second GPU vanished before the last gate.
+   ACTION: re-run scripts/test_tp2_27b.sh once BOTH GPUs enumerate again
+   (`sycl-ls` must print 2 [level_zero:gpu] lines). Until then treat the
+   9-gate result as 8/9 with TP=2 coverage unverified, not as a code failure.
+   SCOPED, NOT ATTEMPTED: the engine should reject `--tp N` when
+   devices_.size() < N with a clear error instead of segfaulting deeper in
+   the wave path. That is a real robustness gap worth fixing, but it is
+   engine code and CANNOT be gate-validated while only 1 GPU is visible
+   (every TP=2 gate arm would fail for the same reason) — so it is recorded,
+   not blind-patched. This is family "gate cannot exercise the configuration"
+   (see AUDIT #3c): do not ship an unverifiable engine change.
    === AUDIT #3b: the DPAS48 x SSM_GPU gate was asserting TIE-LUCK ===
   Forcing the single reciprocal site changed the host oracle's own codes
   (5 differing bytes over 4.1M codes on a fixed dataset) and the GPU gate
@@ -898,3 +963,4 @@ Implement features for maximizing throughput for concurrent requests, starting f
 - remember to commit any meaningful change made such that in case of regressions everything can be bisected.
 - remember to not litter /tmp with large tmp files, RAM is precious
 - try to parallelize work as much as possible, spawn tasks (subagents) in different worktrees that implement a specific optimization experiment, then merge all the experiments in one single batch. Every optimization experiment is gated behind a flag in the cli. The user the runs the benchmarks and reports back the results.
+- MANDATORY: every batch of optimization experiments handed to the user for testing MUST be written up as a report file in `reports/` (create the directory if missing; filename `reports/<YYYY-MM-DD>-<batch-slug>.md`, e.g. `reports/2026-09-30-batch-dpas-preq.md`). The user benchmarks from these reports, so a batch delivered without one is an unfinished batch. Each report MUST contain, per experiment: (1) the flag + kill switch and default state, (2) what it changes and why it should help, (3) the exact benchmark command to run (and the quiet-box rule load1 < 2), (4) the load-INSENSITIVE buckets I measured myself (kernel/submit/waitblock/copy/usm_write/readback, nk/nw/nr counters) with the caveat that they are counters, not wall time, (5) the expected direction and what counts as a win/neutral/loss, (6) which correctness gates already passed. NEVER put a tok/s or wall-time number I did not measure in a report — leave a blank `RESULT:` line for the user to fill from a quiet-box run. Update the report (not just AGENTS.md) when a follow-up session re-scopes or kills one of the experiments, so the user's list of pending tests stays accurate.

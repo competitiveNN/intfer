@@ -27,7 +27,7 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN="$ROOT/build/examples/intfer_cli/intfer_cli"
+BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/intfer_cli/intfer_cli"
 
 TP=1; DEVICE=0; PERIOD=100
 XMXMON="${XMXMON:-}"
