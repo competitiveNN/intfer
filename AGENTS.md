@@ -238,6 +238,39 @@ Implement features for maximizing throughput for concurrent requests, starting f
   557 264 5054'). A temporary INTFER_PREQ_TRACE probe (not committed)
   confirmed the pre-pass really is fed M=97 (x93 GEMM calls) and M=1 (x744) on
   that run, so the arm is not accidentally running an M=1 prefill.
+   === 2026-09-30 AUDIT #5: async-lifetime (checked, no bug) + dispatch hoist ===
+   SUSPECTED use-after-free, DISPROVED by reading the code: if the DPAS
+   kernel declined after a successful pre-pass, nothing would ever wait on
+   preq_events, and the in-flight pre-pass would race the next call's
+   std::memcpy into ws48_[d].act — and `si48_staging_`/`x` (host memory the
+   async q.memcpy reads) could be freed under the copy. NOT reachable:
+   quant_gemm_dpas48() has exactly ONE return statement (the q.submit) and
+   never declines, and use_row (which CAN decline) is mutually exclusive with
+   preq_ok, so whenever preq_ok is true a real DPAS event dep-chains on
+   preq_events[d] and the kernel_events wait at the end of the call covers the
+   memcpys transitively. No code change; recorded so the next reader does not
+   re-open it or "fix" it with a redundant drain.
+   REAL FIX (host cost): act_quant_ga64_scale_inv_batch called
+   avx2_available() — a function-local static, so a guard-variable load —
+   once PER SLICE, i.e. M*nGA times per GEMM on the host pass that audit #3
+   had to bring back. Hoisted to once per call (ga64_slice_max_sel). Provably
+   bit-neutral (the probe result is a process constant): test_ga64_recip.sh
+   is unchanged at 480645 slices / 30.7M elements with IDENTICAL per-dataset
+   discriminating-slice counts (random 103, tie 192000, edge 11, tail 0)
+   before and after.
+   SCOPED, NOT ATTEMPTED: deleting the host O(M*K) reduction outright. The
+   max-abs IS order-independent and therefore exactly reproducible on device
+   (IEEE max is exact and associative; only NaN differs, and NaN activations
+   mean a broken model anyway), so the device could own the reduction. The
+   blocker is still the reciprocal: shipping host `inv` requires the host to
+   already have `s`, so the reduction cannot leave the host without a per-GEMM
+   D2H/H2D round trip that costs far more than the pass it removes. The only
+   way out is a correctly-rounded reciprocal computed on device with integer
+   arithmetic, which WOULD match the host site today (ga64_recip is verified
+   correctly rounded, 64000/64000 legal scales) — but that silently couples
+   device correctness to the host's divss codegen, so any future compiler
+   change to ga64_recip breaks it invisibly. Not worth it for a default-OFF
+   path; recorded, not built.
   === AUDIT #3b: the DPAS48 x SSM_GPU gate was asserting TIE-LUCK ===
   Forcing the single reciprocal site changed the host oracle's own codes
   (5 differing bytes over 4.1M codes on a fixed dataset) and the GPU gate

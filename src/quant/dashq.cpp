@@ -185,8 +185,24 @@ static inline float ga64_slice_max(const float* x, size_t k0, size_t k1) {
   if (avx2_available()) return ga64_slice_max_avx2(x, k0, k1);
   return ga64_slice_max_scalar(x, k0, k1);
 }
+
+// Same dispatch with the AVX2 probe hoisted by the caller. avx2_available()
+// is a function-local static, so every call re-reads its guard variable; the
+// scale_inv helper runs M*nGA slices per GEMM, and hoisting keeps the restored
+// host reduction as cheap as it can be. The probe result is a process
+// constant, so this cannot change a single bit -- test_ga64_recip.sh is the
+// regression test for exactly that claim.
+static inline float ga64_slice_max_sel(const float* x, size_t k0, size_t k1,
+                                       bool avx2) {
+  if (avx2) return ga64_slice_max_avx2(x, k0, k1);
+  return ga64_slice_max_scalar(x, k0, k1);
+}
 #else
 static inline float ga64_slice_max(const float* x, size_t k0, size_t k1) {
+  return ga64_slice_max_scalar(x, k0, k1);
+}
+static inline float ga64_slice_max_sel(const float* x, size_t k0, size_t k1,
+                                       bool) {
   return ga64_slice_max_scalar(x, k0, k1);
 }
 #endif
@@ -286,6 +302,7 @@ void act_quant_ga64_scale_inv_batch(const float* x, size_t M, size_t K,
   // with the identical expression, and a caller-supplied nGA that disagreed
   // would silently leave the tail slices' (s, inv) pairs uninitialised.
   const size_t nGA = (K + GA - 1) / GA;
+  const bool avx2 = avx2_available();
   for (size_t m = 0; m < M; ++m) {
     const float* xr = x + m * K;
     float* o = out + 2 * (size_t)m * nGA;
@@ -293,7 +310,7 @@ void act_quant_ga64_scale_inv_batch(const float* x, size_t M, size_t K,
       const size_t k0 = g * GA;
       size_t k1 = k0 + GA;
       if (k1 > K) k1 = K;
-      const float s = ga64_slice_max(xr, k0, k1) / 127.0f;
+      const float s = ga64_slice_max_sel(xr, k0, k1, avx2) / 127.0f;
       o[2 * g] = s;
       o[2 * g + 1] = ga64_recip(s);
     }
