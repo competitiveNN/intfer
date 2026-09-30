@@ -70,13 +70,15 @@
 #      is vacuous by construction.
 #
 # SCOPE / HONEST LIMITS (do not read the pass as more than it is):
-#   * This harness asserts the two FAILURE directions only. It does NOT assert
-#     that the gates pass on a healthy box; gate_inventory.sh's doc-tally does
-#     not re-run gates either, and the per-gate PASS results are recorded in
-#     AGENTS.md from a real run. Nothing here substitutes for running a gate.
-#   * test_tp2_27b.sh needs 2 GPUs, so on a 1-GPU box its healthy direction is
-#     unmeasurable here. Its two failure directions ARE covered, but only via
-#     the count guard (see 3).
+#   * THREE directions are measured: the two failure directions (skip paths,
+#     asserted strictly) and a HEALTHY column (liveness only -- see the block
+#     above). The healthy column asserts rc is 0 or 2, that an rc=2 is
+#     EXPLAINED, and that nothing crashes, times out, or goes red. It does NOT
+#     assert that a gate's correctness assertions hold; that is what running the
+#     gate is for, and its per-gate results remain AGENTS.md's job.
+#   * test_tp2_27b.sh needs 2 GPUs, so on a 1-GPU box its healthy rc=2 is
+#     legitimate. Its two failure directions ARE covered, but only via the count
+#     guard (see 3).
 #   * A gate may legitimately be absent from this matrix if gate_inventory says
 #     it does not need a device. That is the cross-check's job, not a table's.
 #
@@ -356,27 +358,112 @@ for name in $own_devices; do
   fi
 done
 
+# --- the HEALTHY direction (the third column) -------------------------------
+# Why this exists. The two failure directions prove a gate SKIPS when it cannot
+# get a device. They say NOTHING about what a gate does on a working box, and
+# that result lived in AGENTS.md prose -- which is a proof in a transcript, the
+# exact defect the fixtures were committed to end (audit #17), one level up. So
+# the healthy column is measured here and recorded in the stamp below.
+#
+# What it does and does NOT assert, because over-asserting here is how a
+# correctness gate becomes a flaky gate:
+#   * rc 0 -> the gate ran and passed.
+#   * rc 2 -> LEGITIMATE on a 1-GPU box: test_tp2_27b needs 2 devices, and the
+#     per-arm gates (gpu_optin, device_argmax) report PARTIAL when their TP=2
+#     arms skip. So this harness must NOT demand rc=0 -- measured on this box:
+#     3 gates return 0 and 3 return 2, all healthy.
+#   * rc 2 must be EXPLAINED. An rc=2 whose log carries no skip diagnostic is a
+#     silent skip and is scored as a failure, not a pass.
+#   * rc 1, or death by signal (>=128: 134 SIGABRT, 139 SIGSEGV), or a timeout
+#     (124) -> FAIL. A gate that goes RED on a healthy box is the one thing this
+#     column exists to catch, and a timeout is explicitly NOT scored as a pass.
+# This column therefore cannot tell you a gate's CORRECTNESS -- only that it is
+# neither red nor silently skipping on a box that is working.
+#
+# Env: INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1  skip this column. Default OFF, and
+#   the mutation matrix sets it: states M-A/M-C break the GUARDS, so under a
+#   healthy box the gate would run to completion (minutes) and its rc would
+#   change for reasons unrelated to the mutation. A stated purpose, not a
+#   silent default-off.
+HEALTHY_RCS=""
+expect_healthy() { # $1 = gate path
+  local gate="$1" out rc
+  out="$LOG_DIR/$(basename "$gate" .sh).healthy.log"
+  timeout 900 bash "$gate" >"$out" 2>&1
+  rc=$?
+  HEALTHY_RCS="$HEALTHY_RCS $(basename "$gate" .sh)=$rc"
+  case "$rc" in
+    0) return 0 ;;
+    2)
+      if grep -qE 'SKIPPED|SKIP:|PARTIAL' "$out"; then return 0; fi
+      bad "$(basename "$gate") [healthy] exited 2 with NO skip diagnostic -- a silent skip"
+      return 1
+      ;;
+    124)
+      bad "$(basename "$gate") [healthy] TIMED OUT (900s) -- not a pass; likely box load"
+      return 1
+      ;;
+    *)
+      bad "$(basename "$gate") [healthy] exited rc=$rc; a gate must not go red on a healthy box"
+      [ "$rc" -ge 128 ] 2>/dev/null && bad "  (death by signal $(($rc - 128)))"
+      sed -n '1,4p' "$out" | sed 's/^/          | /'
+      return 1
+      ;;
+  esac
+}
+
+if [ "${INTFER_DEVICE_PRECOND_SKIP_HEALTHY:-0}" = "1" ]; then
+  note ""
+  note "== HEALTHY COLUMN: SKIPPED (INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1) =="
+  note "   The healthy results in the stamp are therefore STALE, not re-measured."
+else
+  note ""
+  note "== HEALTHY COLUMN: $NDEV_OWN device gate(s) on this box (rc 0 or 2; a 2 must be explained) =="
+  for name in $own_devices; do
+    printf '  %-24s healthy            ' "$name"
+    if expect_healthy "scripts/$name"; then
+      # Strip up to the LAST '=' in the accumulator to get THIS gate's rc.
+      # (The first version used '##* =' with a space before the '=', which can
+      # never match "name=rc", so it printed the whole accumulator.)
+      printf 'rc=%s (ok)\n' "${HEALTHY_RCS##*=}"
+    fi
+  done
+fi
+
 # --- verdict ----------------------------------------------------------------
 echo
 if [ "$FAILURES" -ne 0 ]; then
   echo "DEVICE PRECOND: FAIL ($FAILURES failed assertion(s))" >&2
-  echo "  At least one GPU gate does not SKIP LOUDLY when it cannot get a device." >&2
-  echo "  Per-run logs in $LOG_DIR" >&2
+  echo "  Either a GPU gate does not SKIP LOUDLY when it cannot get a device, or" >&2
+  echo "  one went red / silently skipped on a healthy box. Per-run logs:" >&2
+  echo "  $LOG_DIR" >&2
   exit 1
 fi
 echo "DEVICE PRECOND: PASS"
 echo "  every device gate exits 2 (SKIP) in both failure directions, naming the"
 echo "  real cause; and the 0-device direction is distinguishable from a rotted"
 echo "  INTFER_SYCL_LS seam, so it can still go red."
-echo "  NOT asserted here: that the gates PASS on a healthy box (AGENTS.md records"
-echo "  those runs). This harness proves only the skip paths."
+# The healthy claim must follow the healthy RUN. An OK line that says "no gate
+# went red" when the column was skipped is the same defect as ddea91d ("the OK
+# line must not claim the tally check ran when it skipped"), committed into this
+# harness by this very change.
+if [ "${INTFER_DEVICE_PRECOND_SKIP_HEALTHY:-0}" = "1" ]; then
+  echo "  NOT CHECKED: the healthy column (INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1), so"
+  echo "  this pass says NOTHING about gate liveness on a working box, and the"
+  echo "  'healthy=' line in the stamp below is STALE, not re-measured."
+else
+  echo "  on this healthy box no gate went red, timed out, or silently skipped."
+fi
+echo "  This harness says NOTHING about whether a gate's CORRECTNESS assertions"
+echo "  hold -- it checks the skip paths, plus liveness when the healthy column ran."
 
 {
   echo "sha=$(git rev-parse HEAD)"
   echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "gates=$(printf '%s' "$own_devices" | tr ' ' ',')"
-  echo "directions=node-unreachable,zero-device"
-  echo "assertions=selfcheck,seam-discrimination,classification-crosscheck,per-gate-rc,per-gate-cause"
+  echo "directions=node-unreachable,zero-device,healthy"
+  echo "healthy=$(printf '%s' "$HEALTHY_RCS" | tr -s ' ' | sed 's/^ //;s/ /,/g')"
+  echo "assertions=selfcheck,seam-discrimination,classification-crosscheck,per-gate-rc,per-gate-cause,healthy-liveness"
 } >"$STAMP"
 echo "  stamp: $STAMP"
 exit 0
