@@ -142,6 +142,42 @@ TOTAL=0
 STATES_LOG="$LOG_DIR/mutate_states.txt"
 : >"$STATES_LOG"
 
+# Patch with an EXACT literal replacement, never sed. The first version used
+# `sed -i "s|$A_TOKENS|(--gpu)|"` and the anchor itself CONTAINS '|'
+# (ERE alternation), so sed died with "unknown option to `s'" and changed
+# nothing -- which then scored as "the mechanism is NOT load-bearing", the exact
+# false conclusion audit #16 warns about (a `pat|desc` table and an IFS='|'
+# parser silently truncating at a '|' inside a pattern; here the delimiter).
+# A quoted python literal has no delimiter to collide with.
+patch_literal() { # $1 = file, $2 = exact old text, $3 = exact new text
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(path).read()
+n = src.count(old)
+if n != 1:
+    sys.exit("patch_literal: anchor found %d times in %s, want 1" % (n, path))
+open(path, "w").write(src.replace(old, new))
+PY
+}
+
+# AND prove the patch landed. An unverified patch is worse than no state: if it
+# silently does nothing, the checker passes, and the log reports "the mechanism is
+# NOT load-bearing" -- a false conclusion about the CHECKER, when the real fault
+# is in the state. BOTH M-D and M-E failed this way on the first run (a sed
+# delimiter collision, and a rot that was too weak to reproduce the defect).
+# So every patch is followed by a changed-file assertion.
+verify_patched() { # $1 = file, $2 = state id
+  if git diff --quiet -- "$1"; then
+    echo "  ABORT $2  the patch did NOT change $1." >&2
+    echo "         The state would score as 'not load-bearing' -- a conclusion" >&2
+    echo "         about the CHECKER that is actually a fault in the state." >&2
+    echo "         Fix the patch, not the checker. (A common cause: a sed" >&2
+    echo "         delimiter that occurs inside the pattern.)" >&2
+    exit 1
+  fi
+}
+
 assert_clean() { # $1 = file, $2 = state id -- must run BEFORE the mutation
   if ! git diff --quiet -- "$1"; then
     echo "  ABORT $2  pre-state DIRTY: $1 already modified (leftover from a killed" >&2
@@ -214,11 +250,13 @@ assert_clean "$TGT_B" M-B || exit 1
 # M-A
 assert_clean "$TGT_A" M-A || exit 1
 sed -i '/^gate_require_device || exit 2$/d' "$TGT_A"
+verify_patched "$TGT_A" M-A
 run_state "M-A" "device guard stripped from a real gate" "$TGT_A" "carries NO guard at all"
 
 # M-C
 assert_clean "$TGT_C" M-C || exit 1
 sed -i 's/^gate_require_device || exit 2$/gate_require_render_node || exit 2/' "$TGT_C"
+verify_patched "$TGT_C" M-C
 run_state "M-C" "guard weakened to render_node-only (half a guard)" "$TGT_C" "exited rc=0, want 2"
 
 # M-D: narrow ONLY this checker's token regex, so its list shrinks and the two
@@ -226,29 +264,31 @@ run_state "M-C" "guard weakened to render_node-only (half a guard)" "$TGT_C" "ex
 # with just --gpu, which drops test_dpas_fold.sh (it names dpas_fold_probe and
 # carries no --gpu) while gate_inventory.sh still lists it.
 assert_clean "$TGT_H" M-D || exit 1
-sed -i "s|$A_TOKENS|(--gpu)|" "$TGT_H"
+patch_literal "$TGT_H" "$A_TOKENS" '(--gpu)'
+verify_patched "$TGT_H" M-D
 run_state "M-D" "checker's own GPU-token regex narrowed (list drifts)" "$TGT_H" "classification drift"
 
-# M-E: rot the seam. Two-line block, so patched with python3 for an exact literal
-# replacement; sed cannot express it, and a sloppy sed here would silently patch
-# the wrong branch.
+# M-E: rot the seam the way a real simplification would -- gate_gpu_count stops
+# ANNOUNCING that it could not count and just reports 0 devices, so the
+# "unmeasurable" and "0 devices" paths become indistinguishable.
+#
+# The first version kept the `echo "SKIP: ... not available"` line, and the state
+# then read as NOT load-bearing -- but the fault was the state, not the checker:
+# probe_diag takes the FIRST 'SKIPPED|SKIP:' line, and that surviving echo
+# precedes gate_require_device's message, so the two diagnostics still differed.
+# A rotted seam that stays self-describing is not rotted. Both lines go.
 assert_clean "$TGT_P" M-E || exit 1
-python3 - "$TGT_P" "$A_NOTAVAIL" <<'PY'
-import sys
-path, anchor = sys.argv[1], sys.argv[2]
-src = open(path).read()
-old = anchor + "\n    return 1\n"
-new = anchor + "\n    printf '0\\n'   # MUTATION: report a rotted seam as a genuine 0-device box\n    return 0\n"
-if src.count(old) != 1:
-    sys.exit("M-E: anchor block found %d times, want 1" % src.count(old))
-open(path, "w").write(src.replace(old, new))
-PY
+patch_literal "$TGT_P" "$A_NOTAVAIL
+    return 1" "printf '0\\n'
+    return 0"
+verify_patched "$TGT_P" M-E
 run_state "M-E" "INTFER_SYCL_LS seam rotted (unmeasurable looks like 0 devices)" "$TGT_P" "indistinguishable"
 
 # M-F: reword ONLY self-check case (c)'s synthetic gate, so the always-red case
 # actually rejects the correct cause.
 assert_clean "$TGT_H" M-F || exit 1
-sed -i 's|echo "SKIPPED: render node opens but Level Zero enumerates 0 device(s)."|echo "SKIPPED: render node opens but Level Zero enumerates 7 device(s)."|' "$TGT_H"
+patch_literal "$TGT_H" "$A_CASEC" 'echo "SKIPPED: render node opens but Level Zero enumerates 7 device(s)."'
+verify_patched "$TGT_H" M-F
 run_state "M-F" "self-check case (c) made always-red" "$TGT_H" "CORRECT cause was REJECTED"
 
 echo
