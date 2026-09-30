@@ -285,6 +285,11 @@ class Engine {
   // ~100x (each store its own transaction: copy bucket 96ms -> ~25ms).
   std::vector<std::int8_t> act48_staging_;
   std::vector<float> as48_staging_;
+  // Host-side GA64 (scale, inverse) pairs (2*M*nGA) for the device act-quant
+  // pre-pass. Computed here, on the reference side, and shipped to the device
+  // so the pre-pass never divides or re-reduces (see
+  // ActQuantDevParams::scale_inv_in).
+  std::vector<float> si48_staging_;
   // Shared per-device act/out workspaces (replaces per-shard act/out USM).
   // One buffer pair per device serves all shards: a shard's act/out are
   // written+consumed within a single run_linear_tp call and never live
@@ -319,6 +324,12 @@ class Engine {
     // aliases this one (devact callers); with the current const-vector
     // signature the copy is unconditional.
     float* f32 = nullptr;        // M * K FP32
+    // Host-computed GA64 (scale, inverse) pairs for the device act-quant
+    // pre-pass (2 * M * nGA FP32, tight rows). Sent from the host so the
+    // device neither divides nor re-reduces max-abs: see
+    // ActQuantDevParams::scale_inv_in for why the reciprocal must come from
+    // the host.
+    float* si = nullptr;
     uint32_t M = 0, K = 0, nGA = 0;
   };
   std::vector<Workspace48> ws48_;

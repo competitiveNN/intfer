@@ -224,6 +224,28 @@ static void act_quant_ga64_scalar(const float* x, int8_t* q, float* scales,
   }
 }
 
+void act_quant_ga64_scale_inv_batch(const float* x, size_t M, size_t K,
+                                    uint32_t nGA, float* out) {
+  constexpr size_t GA = 64;
+  for (size_t m = 0; m < M; ++m) {
+    const float* xr = x + m * K;
+    float* o = out + 2 * (size_t)m * nGA;
+    for (uint32_t g = 0; g < nGA; ++g) {
+      const size_t k0 = (size_t)g * GA;
+      size_t k1 = k0 + GA;
+      if (k1 > K) k1 = K;
+      float mx = 1e-6f;
+      for (size_t k = k0; k < k1; ++k) {
+        float v = xr[k] >= 0 ? xr[k] : -xr[k];
+        if (v > mx) mx = v;
+      }
+      const float s = mx / 127.0f;
+      o[2 * g] = s;
+      o[2 * g + 1] = 1.0f / s;
+    }
+  }
+}
+
 void act_quant_ga64_batch(const float* x, int8_t* q, float* scales,
                           size_t K, ActQuantRound round) {
 #if defined(__x86_64__) || defined(_M_X64)

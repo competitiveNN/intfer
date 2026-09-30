@@ -126,16 +126,38 @@ Implement features for maximizing throughput for concurrent requests, starting f
   impossible: DPAS48's own INT8/GA64 act-quant legitimately differs from
   the FP16-act base. The correct invariant is PREQ == DPAS48 (the pre-pass
   reproduces the host GA64 quant).
-  === REAL BUG FOUND AND FIXED: device 1.0f/s was NOT IEEE ===
-  The kernel computed `inv = 1.0f / s`. DPC++ lowers that to rcp.approx
-  (+ Newton), which lands 1 ulp off the host's fl(1/s) for ~9% of inputs
-  (MEASURED 715/8192). One extra fma-based Newton step
-  (`e = fma(-s,inv,1); inv = fma(inv,e,inv)`) recovers the correctly-rounded
-  result (0/8192 mismatches). This only surfaced at exact .5
-  half-away-from-zero TIES, where a 1-ulp inv shift flips the code by one —
-  enough to change the greedy stream. DO NOT "simplify" the two-step form
-  back to a bare 1.0f/s. Note the host uses divss (IEEE) in dashq.cpp, so
-  host and device genuinely disagreed.
+  === 2026-09-30 AUDIT #2: THE NEWTON "FIX" WAS BACKWARDS. DO NOT RE-ADD IT ===
+  An earlier revision of this audit concluded "device 1.0f/s is not IEEE,
+  add an fma Newton step". WRONG IN DIRECTION, and reverted. Truth, from a
+  direct device probe (9,689,600 realistic GA64 elements incl. adversarial
+  exact-.5 tie zones: 0 mismatches for the bare kernel expression vs the
+  host AVX2 lane path) plus exact rational arithmetic on the bit patterns:
+    * `q = trunc(x*inv +- 0.5)` is PATHOLOGICALLY ILL-CONDITIONED in `inv`:
+      a 1-ulp reciprocal difference moves the product across a .5 tie and
+      flips the code by a full +-1. Two implementations that do not share
+      the SAME reciprocal bits disagree on ~2 elements per ~1950 GEMM
+      calls. Correctness here means sharing `inv`, NOT being correctly
+      rounded.
+    * A DEVICE `1.0f/s` lowers to rcp.approx: 15,868/151,400 mismatches vs
+      host divss over legal s.
+    * The HOST `1.0f/s` in dashq.cpp is ALSO 1 ulp off the correctly
+      rounded value IN THIS BINARY (exact integer rational comparison of the
+      two candidate bit patterns). Same expression, same -O3 flags, no
+      fast-math anywhere: codegen-context dependent, never assume IEEE.
+  => "Correcting" the device moved it AWAY from the reference and CREATED
+  the decode-step-14 divergence this same commit then documented as an
+  unfixable "KNOWN, UNRESOLVED tie rule". The Newton step is GONE.
+  === THE FIX: ship the host's (scale, inverse) to the device ===
+  dashq::act_quant_ga64_scale_inv_batch() computes per 64-slice
+  (s, inv) = (max(1e-6,max|x|)/127, 1.0f/s) ON THE HOST; the pre-pass
+  consumes both verbatim via ActQuantDevParams::scale_inv_in (2*M*nGA FP32
+  interleaved, per-device `ws48_[d].si` landing zone, tiny H2D).
+  Bit-exact BY CONSTRUCTION. Bonus: the device no longer redoes the O(64)
+  max-abs reduction, removing the only way the scale it WRITES could
+  disagree with the inverse it used. Cost: the O(M*K) max-abs reduction is
+  back (the pre-pass was built to delete the full host quant); it is a
+  reduction plus M*K/64 divides instead of a full host quant, and stays off
+  the GEMM critical path (dep-chained, no added wait).
   === OTHER FIXES ===
   (a) PARTIAL-DECLINE RACE (nondeterminism): if device d's pre-pass
   launched but device d+1 declined, the already-queued d kernel still
@@ -147,21 +169,20 @@ Implement features for maximizing throughput for concurrent requests, starting f
   (c) profile_note_launch() ran BEFORE the decline check, so a declined
   call inflated nk. Moved after.
   (d) Indentation regression in quant_gemm_dpas4_row fixed.
-  === KNOWN, UNRESOLVED: PREQ x SSM_GPU tie divergence ===
-  DPAS48+PREQ+SSM_GPU diverges from DPAS48 at decode step 14 (TP=1 and
-  TP=2, deterministic across repeats). NOT introduced by the pre-pass:
-  the same tie-boundary class appears for DPAS48+PREQ alone at longer
-  horizons, tracking whichever SSM path (host vs device) perturbs the
-  activation into the tie. Isolated to the GA64 half-away-from-zero rule:
-  at v = 47.499996185 the device yields 47 and the host AVX2 lane path
-  yields 48, though trunc(v+0.5) and lround(v) both give 47 — i.e. the
-  two code paths disagree on a value where the documented formula is
-  unambiguous. 2 residual mismatches per ~1950 GEMM calls. Until the tie
-  rule is unified, DO NOT combine PREQ with SSM_GPU; the gate reports it
-  as a NOTE rather than asserting it. Correctness-gated: gpu-optin PASS
-  (base arms + PREQ==DPAS48 + ROW+PREQ + PREQ-alone inert), cpu parity
-  PASS, http batch PASS (also re-run with DPAS48+PREQ exported). Path
-  fires: decode nk 1116->1488 (+372 = 4tok x 93), nw unchanged 744.
+  === FIXED (was "KNOWN, UNRESOLVED"): PREQ x SSM_GPU tie divergence ===
+  Real and deterministic (step 14, TP=1 and TP=2, ~2 mismatched elements per
+  ~1950 GEMM calls), but NOT a tie-rule bug: it was the reciprocal (AUDIT #2
+  above) — the device was correctly rounded and the HOST was the 1-ulp-off
+  one. The earlier "host gives 48 where trunc(v+0.5) gives 47" evidence was
+  an artifact of a reference using `_mm_cvtss_si32` (CVTSS2SI = round to
+  NEAREST) instead of `_mm_cvttss_si32` (CVTTSS2SI = truncate); dashq
+  correctly uses `_mm256_cvttps_epi32`. Writing a host reference for this
+  rule with the rounding intrinsic makes the real, correct device path look
+  wrong on ~53% of elements. PREQ now composes with SSM_GPU and the gate
+  ASSERTS it. Correctness-gated: gpu-optin PASS (base arms + PREQ==DPAS48 +
+  ROW+PREQ + PREQ+SSM_GPU + SSM_GPU + PREQ-alone inert, n=24, TP1/TP2), cpu
+  parity PASS, http batch PASS. Path fires: decode nk 1116->1488
+  (+372 = 4tok x 93), nw unchanged 744.
   NO wall-time claim (never benchmarked here) — needs a quiet-box 27B
   INT4/G64 A/B before any perf claim.
   Orthogonally: device-act-quant INTO the fused DPAS kernel stays a dead

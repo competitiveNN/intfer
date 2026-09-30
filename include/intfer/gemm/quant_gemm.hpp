@@ -246,19 +246,33 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
 
 // Device-side GA64 activation quant pre-pass (INTFER_DPAS_PREQ=1).
 // Mirrors dashq::act_quant_ga64_batch(HalfAway) bit-exactly: per-64-slice
-// max-abs (floor 1e-6), s=mx/127, inv=1/s, clamp(x*inv, +-127),
-// half-away-from-zero. One WI per (row, slice): each element is quanted and
-// stored ONCE — the fused-quant failure mode replicated the O(K) quant work
-// nT x, once per 16-N tile. Plain SYCL (no ESIMD: scalar FP32 + select
-// only), so the arithmetic is plain IEEE-754 FP32 exactly like the host
-// scalar loop. The caller dep-chains the DPAS launch on the returned event
+// max-abs (floor 1e-6), s=mx/127, clamp(x*inv, +-127), half-away-from-zero.
+// One WI per (row, slice): each element is quanted and stored ONCE — the
+// fused-quant failure mode replicated the O(K) quant work nT x, once per
+// 16-N tile. Plain SYCL (no ESIMD: scalar FP32 + select only), so the
+// arithmetic is plain IEEE-754 FP32 exactly like the host scalar loop. The
+// caller dep-chains the DPAS launch on the returned event
 // (Dpas48Params::dep), so the pre-pass costs no extra host wait.
 //
 // ONE LAUNCH PER DEVICE, never one for both ranks: every rank has its own
 // sycl::context (device_manager.cpp), so a kernel on rank 0's queue cannot
 // legally write rank 1's malloc_shared buffer.
+//
+// scale_inv_in IS REQUIRED (2*M*nGA FP32, row stride nGA, device USM, H2D'd),
+// interleaved (s, inv) per slice from dashq::act_quant_ga64_scale_inv_batch.
+// Both the scale AND its reciprocal are consumed verbatim and the per-slice
+// max-abs reduction is therefore NOT redone on device. Rationale — the GA64
+// rule q = trunc(x*inv +- 0.5) is pathologically ill-conditioned in `inv`: a
+// 1-ulp difference in the reciprocal moves the product across a .5 tie and
+// flips the code by one. The host's `1.0f/s` is *codegen-dependent* and
+// measured 1 ulp off the correctly rounded value inside this binary (verified
+// against exact rational arithmetic), while a device `1.0f/s` lowers to
+// rcp.approx. Handing the host's bits across is the only way to be bit-exact
+// by construction instead of by luck, and it also removes the only way the
+// written scale could disagree with the inverse actually used.
 struct ActQuantDevParams {
   const float* x_f32 = nullptr;      // M*K FP32 rows (device USM, H2D'd)
+  const float* scale_inv_in = nullptr;  // 2*M*nGA FP32 (s, inv) pairs (tight)
   std::int8_t* q_out = nullptr;      // M*Ks INT8 out (row stride Ks)
   float* s_out = nullptr;            // M*Ss FP32 act scales (row stride Ss)
   uint32_t M = 0, K = 0;

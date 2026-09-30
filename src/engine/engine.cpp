@@ -59,7 +59,9 @@ Engine::~Engine() {
     if (ws48_[d].act) sycl::free(ws48_[d].act, devices_[d].queue);
     if (ws48_[d].as) sycl::free(ws48_[d].as, devices_[d].queue);
     if (ws48_[d].f32) sycl::free(ws48_[d].f32, devices_[d].queue);
+    if (ws48_[d].si) sycl::free(ws48_[d].si, devices_[d].queue);
     ws48_[d].act = nullptr; ws48_[d].as = nullptr; ws48_[d].f32 = nullptr;
+    ws48_[d].si = nullptr;
   }
   // Free the wave workspaces (2*W live allocs per device max).
   for (size_t i = 0; i < wv_.size(); ++i) {
@@ -640,7 +642,7 @@ void Engine::ensure_workspace48(uint32_t M, uint32_t K) {
   const uint32_t nGA = (K + GA - 1) / GA;
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto& w = ws48_[d];
-    if (w.act && w.as && w.f32 && M <= w.M && K <= w.K && nGA <= w.nGA) continue;
+    if (w.act && w.as && w.f32 && w.si && M <= w.M && K <= w.K && nGA <= w.nGA) continue;
     devices_[d].queue.wait();
     uint32_t nM = std::max(M, w.M);
     uint32_t nK = std::max(K, w.K);
@@ -648,6 +650,7 @@ void Engine::ensure_workspace48(uint32_t M, uint32_t K) {
     if (w.act) { sycl::free(w.act, devices_[d].queue); w.act = nullptr; }
     if (w.as) { sycl::free(w.as, devices_[d].queue); w.as = nullptr; }
     if (w.f32) { sycl::free(w.f32, devices_[d].queue); w.f32 = nullptr; }
+    if (w.si) { sycl::free(w.si, devices_[d].queue); w.si = nullptr; }
     auto& dev = devices_[d];
     w.act = static_cast<std::int8_t*>(sycl::malloc_shared(
         (size_t)nM * nK, dev.sycl_device, dev.sycl_context));
@@ -655,7 +658,9 @@ void Engine::ensure_workspace48(uint32_t M, uint32_t K) {
         (size_t)nM * nnGA * sizeof(float), dev.sycl_device, dev.sycl_context));
     w.f32 = static_cast<float*>(sycl::malloc_shared(
         (size_t)nM * nK * sizeof(float), dev.sycl_device, dev.sycl_context));
-    if (!w.act || !w.as || !w.f32) {
+    w.si = static_cast<float*>(sycl::malloc_shared(
+        2 * (size_t)nM * nnGA * sizeof(float), dev.sycl_device, dev.sycl_context));
+    if (!w.act || !w.as || !w.f32 || !w.si) {
       std::fprintf(stderr,
                    "[intfer] FATAL: workspace48 alloc failed on device %zu "
                    "(M=%u K=%u nGA=%u)\n", d, nM, nK, nnGA);
@@ -901,7 +906,7 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
   // cannot legally write the other rank's malloc_shared buffer.
   bool preq_ok = dpas_preq_enabled() && !use_row;
   for (size_t d = 0; d < devices_.size() && preq_ok; ++d)
-    preq_ok = ws48_[d].f32 && ws48_[d].act && ws48_[d].as;
+    preq_ok = ws48_[d].f32 && ws48_[d].act && ws48_[d].as && ws48_[d].si;
 
   // 1) Activation quant into ws48_ (per row, per GA-slice max-abs scale).
   //    Device pre-pass first; on ANY decline fall through to the host loop,
@@ -912,6 +917,18 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
 #endif
   if (preq_ok) {
     preq_events.resize(devices_.size());
+    // (scale, inverse) pairs on the HOST, verbatim. The device must neither
+    // divide nor re-reduce: q = trunc(x*inv +- 0.5) turns a 1-ulp reciprocal
+    // difference into a whole +-1 code error at .5 ties, and host `1.0f/s` is
+    // codegen-dependent (measured 1 ulp off correctly-rounded in this binary)
+    // while a device `1.0f/s` lowers to rcp.approx. Shipping the host's bits
+    // makes the pre-pass bit-exact by construction. O(M*K) work + a tiny H2D;
+    // this replaces the O(M*K) host quant loop it was introduced to delete,
+    // but keeps it off the critical path of the GEMM itself (no wait).
+    if (si48_staging_.size() != 2 * (size_t)M * nGA)
+      si48_staging_.resize(2 * (size_t)M * nGA);
+    dashq::act_quant_ga64_scale_inv_batch(x.data(), M, K, nGA,
+                                          si48_staging_.data());
     for (size_t d = 0; d < devices_.size(); ++d) {
       sycl::queue& q = devices_[d].queue;
       float* xd = ws48_[d].f32;
@@ -920,7 +937,10 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
       // be used to skip the copy — the source is host memory either way).
       q.memcpy(xd, x.data(), (size_t)M * K * sizeof(float));
       gemm::ActQuantDevParams ap;
+      q.memcpy(ws48_[d].si, si48_staging_.data(),
+               2 * (size_t)M * nGA * sizeof(float));
       ap.x_f32 = xd;
+      ap.scale_inv_in = ws48_[d].si;
       ap.q_out = ws48_[d].act;
       ap.s_out = ws48_[d].as;
       ap.M = M;

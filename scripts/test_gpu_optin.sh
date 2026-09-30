@@ -88,19 +88,25 @@ for tp in 1 2; do
   echo "TP=$tp [DPAS48+ROW+PREQ n=24]: '$GOT'"
   [ "$GOT" = "$D48" ] || fail "TP=$tp [DPAS48+ROW+PREQ] '$GOT' != DPAS48 '$D48'"
 
-  # KNOWN DIVERGENCE (2026-09-30 audit, NOT a gate): DPAS48+PREQ+SSM_GPU
-  # diverges from DPAS48 at decode step 14. Root cause is an exact-.5 tie in
-  # the GA64 half-away-from-zero rounding where the device and the host AVX2
-  # lane path disagree by one code. It is NOT introduced by the pre-pass: the
-  # same class of divergence appears for DPAS48+PREQ alone at longer horizons,
-  # i.e. it tracks whichever code path (host SSM vs device SSM) perturbs the
-  # activation into/out of the tie. Until the tie rule is unified, PREQ must
-  # not be combined with SSM_GPU. Reported, not asserted.
+  # SSM_GPU composes with the pre-pass. This WAS a known divergence at decode
+  # step 14 and is now GATED, because the cause was fixed, not tolerated:
+  # the GA64 rule q = trunc(x*inv +- 0.5) amplifies a 1-ulp difference in the
+  # reciprocal `inv` into a whole +-1 code error whenever the product lands on
+  # a .5 tie. The host's `1.0f/s` is codegen-dependent (measured 1 ulp off the
+  # correctly rounded value in this binary, checked against exact rational
+  # arithmetic) while a device `1.0f/s` lowers to rcp.approx, so the two sides
+  # disagreed by one code on ~2 elements per ~1950 GEMM calls. The pre-pass now
+  # consumes the HOST's reciprocal verbatim (ActQuantDevParams::inv_in via
+  # dashq::act_quant_ga64_inv_batch) instead of dividing, which is bit-exact by
+  # construction. Do not "simplify" that back into a device division.
   GOT="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS_PREQ=1 INTFER_SSM_GPU=1)"
   echo "TP=$tp [DPAS48+PREQ+SSM_GPU n=24]: '$GOT'"
-  if [ "$GOT" != "$D48" ]; then
-    echo "  NOTE: known PREQ x SSM_GPU tie-boundary divergence (see comment); not gated."
-  fi
+  [ "$GOT" = "$D48" ] || fail "TP=$tp [DPAS48+PREQ+SSM_GPU] '$GOT' != DPAS48 '$D48'"
+
+  # SSM_GPU alone against the DPAS48 host-act-quant baseline.
+  GOT="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_SSM_GPU=1)"
+  echo "TP=$tp [DPAS48+SSM_GPU n=24]: '$GOT'"
+  [ "$GOT" = "$D48" ] || fail "TP=$tp [DPAS48+SSM_GPU] '$GOT' != DPAS48 '$D48'"
 
   # PREQ without DPAS48 must be inert (nested-flag guard).
   PQ="$(N=24 ids_of "$tp" INTFER_DPAS_PREQ=1)"

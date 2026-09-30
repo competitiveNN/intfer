@@ -80,6 +80,22 @@ bool avx2_available();
 void act_quant_ga64_batch(const float* x, int8_t* q, float* scales, size_t K,
                           ActQuantRound round);
 
+// Per-slice activation (scale, inverse scale) pairs for the GA64 rule, laid
+// out as 2*M*nGA tight floats: out[2*(m*nGA+g)] = s, out[2*(m*nGA+g)+1] = inv.
+// Both are exactly what act_quant_ga64_batch() derives internally
+// (s = max(1e-6, max|x|)/127, inv = 1.0f/s), so a device kernel consuming
+// these bits reproduces the host act-quant codes exactly -- and cannot emit a
+// scale that disagrees with the inverse it multiplied by.
+//
+// This exists because q = trunc(x*inv +- 0.5) amplifies a 1-ulp reciprocal
+// difference into a full +-1 code error whenever the product lands on a .5
+// tie, and `1.0f/s` is codegen-dependent: inside this binary it measures 1 ulp
+// off the correctly rounded value (checked against exact rational
+// arithmetic), whereas a device `1.0f/s` lowers to rcp.approx. Compute the
+// reciprocal ONCE, on the side whose codes are the reference.
+void act_quant_ga64_scale_inv_batch(const float* x, size_t M, size_t K,
+                                    uint32_t nGA, float* out);
+
 // ---------------------------------------------------------------------------
 // Diagonal Hessian
 // ---------------------------------------------------------------------------

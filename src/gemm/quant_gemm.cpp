@@ -923,7 +923,7 @@ bool repack_dpas412(const std::uint8_t* row_codes, uint32_t N, uint32_t K,
 sycl::event act_quant_ga64_dev(sycl::queue& q, const ActQuantDevParams& p) {
   constexpr uint32_t GA = 64;
   const uint32_t M = p.M, K = p.K;
-  if (M == 0 || K == 0 || !p.x_f32 || !p.q_out || !p.s_out)
+  if (M == 0 || K == 0 || !p.x_f32 || !p.scale_inv_in || !p.q_out || !p.s_out)
     return sycl::event{};
 #ifdef INTFER_PROFILE_GPU
   // AFTER the decline check: a declined call submits no kernel, so counting
@@ -937,6 +937,7 @@ sycl::event act_quant_ga64_dev(sycl::queue& q, const ActQuantDevParams& p) {
   const uint32_t n_blocks = M * nGA;
   const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
   const float* X = p.x_f32;
+  const float* SI = p.scale_inv_in;
   std::int8_t* Q0 = p.q_out;
   float* S0 = p.s_out;
   return q.submit([&](sycl::handler& h) {
@@ -951,25 +952,23 @@ sycl::event act_quant_ga64_dev(sycl::queue& q, const ActQuantDevParams& p) {
           uint32_t k1 = k0 + GA;
           if (k1 > K) k1 = K;
           const float* xr = X + (size_t)m * K;
-          float mx = 1e-6f;
-          for (uint32_t k = k0; k < k1; ++k) {
-            float v = xr[k] >= 0 ? xr[k] : -xr[k];
-            if (v > mx) mx = v;
-          }
-          const float s = mx / 127.0f;
-          // IEEE-CORRECT 1/s. A bare `1.0f / s` is NOT bit-exact vs the host:
-          // DPC++ lowers it to rcp.approx (+ Newton), which lands 1 ulp off
-          // fl(1/s) for ~9% of inputs (measured 715/8192). One extra
-          // fma-based Newton step recovers the correctly-rounded result
-          // (0/8192 mismatches, examples/rdiv_probe.cpp). This matters only
-          // at exact .5 rounding ties, where a 1-ulp inv shift flips the
-          // half-away-from-zero result by one code — enough to change the
-          // greedy stream. Keep the two-step form; do not "simplify" it back.
-          float inv = 1.0f / s;
-          {
-            const float e = sycl::fma(-s, inv, 1.0f);
-            inv = sycl::fma(inv, e, inv);
-          }
+          // Scale AND reciprocal come from the HOST (see
+          // ActQuantDevParams::scale_inv_in), which is why there is no
+          // per-slice max-abs reduction here: the host already did it, and
+          // doing it twice only created a way for the scale we WRITE to
+          // disagree with the inverse we multiply by.
+          //
+          // Do NOT recompute `1.0f / s` here: q = trunc(x*inv +- 0.5) turns a
+          // 1-ulp reciprocal difference into a whole +-1 code error at .5
+          // ties, and the two sides legitimately disagree (host `1.0f/s` is
+          // codegen-dependent and measures 1 ulp off correctly-rounded here;
+          // a device `1.0f/s` lowers to rcp.approx, off the other way). An
+          // earlier revision "fixed" this with an fma Newton step, which made
+          // the device correctly rounded and therefore moved it AWAY from the
+          // host — that is what perturbed the greedy stream at decode step 14.
+          const float* si = SI + 2 * ((size_t)m * nGA + g);
+          const float s = si[0];
+          const float inv = si[1];
           // Row-strided workspace write; each element is quanted ONCE and
           // stored ONCE (the fused-quant failure mode replicated the O(K)
           // quant work nT x, once per 16-N tile).
