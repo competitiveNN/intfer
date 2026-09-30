@@ -795,28 +795,57 @@ e.g. S3's contract column is 40 not 42).
    The honest reading of that state: the cells are still VALID (4b31d25 was
    comment-only, and `--anchors-only` re-proves the anchors still resolve) but
    they are evidence for a806ef3, not for HEAD — a citation, not a guess.
-   MUTATION-TESTED, because the previous checker was not: 5/5 CAUGHT — (M1)
-   un-anchoring the line-start require test, (M2) dropping comment stripping,
-   (M3) reintroducing the stdin-consuming grep chain (the bug the classifier's
-   own first draft had, caught live on its first run), (M4) inverting a
-   self-check expectation, (M5) disabling the NO-SKIP-REPORT check. M1 is worth
-   naming: with comment-stripping in place it changes no verdict on the real
-   gates, i.e. an EQUIVALENT mutation — so a self-check case was added for an
-   unplaceable `gate_require_gpus` (wrapped in a helper) that the classifier
-   now reports as BROKEN rather than silently calling per-arm, which is what
-   makes the anchoring observable instead of decoration.
+   MUTATION-TESTED, because the previous checker was not. The evidence is
+   COMMITTED as a re-runnable script, scripts/mutate_gate_inventory.sh, NOT
+   left in a transcript: a mutation that exists only in a commit message cannot
+   be re-run, so the next session re-derives (or re-asserts) it. It mirrors
+   scripts/mutate_fold_matrix.sh — dirty-tree guard, EXIT trap + `git checkout
+   --` restore, an anchor pre-flight asserting each of the 6 targets occurs
+   EXACTLY ONCE, per-state logs + summary.txt, a byte-identical restore check,
+   a residue scan, and a sha/date stamp. 6/6 mutations refused the checker
+   (M1–M5 via the checker's own self-check, M6 via its exit-2 loud-skip path):
+     M1 un-anchor the line-start require test — the LOAD-BEARING row. With
+        comment-stripping in place this is an EQUIVALENT mutation on the real
+        gates, so it is observable only through the BROKEN self-check case
+        (an unplaceable `gate_require_gpus` wrapped in a helper). Proves the
+        anchoring is tested rather than merely present.
+     M2 drop comment stripping, M3 reintroduce the stdin-consuming grep chain,
+        M4 invert a self-check expectation, M5 disable the NO-SKIP-REPORT check.
+     M6 let a 0-GPU box exit 0 again — the defect (4) above, replayed with a
+        stub `sycl-ls` so it needs no special hardware.
+   TWO SCORING RULES THE HARNESS ENFORCED ON ITSELF, both from it refusing to
+   launder a red state green: a mutation that BREAKS SYNTAX is scored MISSED,
+   not caught (a syntax error is not evidence a mechanism is load-bearing) —
+   which caught three of the first draft's six mutations, written as shell
+   strings with a `|||` delimiter that left trailing garbage and unbalanced
+   quotes; and the first M3 attempt, which patched only the elif with
+   `- <"$1"`, reopened the file for that one grep and starved nothing, so it
+   changed no verdict and was scored MISSED. Reproducing the real bug needs
+   both greps on a shared fd, hence the multi-hunk patch support. Harness
+   guards proven non-vacuous: dirty tree -> rc=1 without mutating; duplicated
+   anchor -> "ANCHOR STALE ... found 2 occurrence(s), want 1", rc=1.
    RE-RUN ON THIS TREE AFTER THE FIX (1 GPU, correctness only, no timing
-   claim): gate_inventory rc=0 with the tally actually RUNNING
+   claim). All ten gates have MEASURED exit codes on the final bytes — the
+   device gates were re-run with a generous timeout specifically so their rc is
+   observed rather than a timeout artefact:
+     rc=0 (PASS), 7: ga64_recip, dpas_fold (3 real device readback regimes),
+       gguf_roundtrip, cpu_parity, oracle_equiv, http_batch, serve_load.
+     rc=2 (PARTIAL), 2: gpu_optin "tp=1 arms all green; tp=2 pass SKIPPED",
+       and device_argmax "TP=1 arms all green; skipped: TP2 arms=1,
+       sub-gates=1" — measured, NOT killed on a timeout this time. Every TP=1
+       arm inside it ran and passed: the 6-way TP=1 stream matrix, the
+       [argmax] counter non-triviality lock (1 on flag, 0 on base), the
+       sampling count parity, both spec-verify sections, PARTS 32/40/40 exactly
+       as locked, cpu parity + http batch PASS, and the serve fence lock with
+       the server alive through greedy+sampling+mixed.
+     rc=2 (SKIPPED), 1: tp2_27b.
+   Also on the final bytes: gate_inventory rc=0 with the tally actually RUNNING
    (sites_found=8, 0 stale) and the corrected PRECONDITION column;
-   fold_report_counts rc=2 (stale stamp, as it should be); anchors-only rc=0;
-   the audit-#13 mutation re-added -> rc=1 with the OVER-SKIP marker; 0-GPU
-   box -> rc=2 loud; all 7 rc=0 gates PASS (ga64_recip, dpas_fold with 3 real
-   device readback regimes, gguf_roundtrip, cpu_parity, oracle_equiv,
-   http_batch, serve_load); gpu_optin rc=2 and tp2_27b rc=2 with the correct
-   skip messages; device_argmax ran its 1-GPU arms (killed on the timeout
-   here, which is the point — under the old whole-gate skip it would have
-   exited 2 in under a second and covered nothing). No engine, quant or
-   schedule code touched.
+   mutate_gate_inventory 6/6; the audit-#13 mutation re-added -> rc=1 with the
+   OVER-SKIP marker; 0-GPU box -> rc=2 loud; fold_report_counts rc=2 (stale
+   stamp, as it should be); fold-matrix anchors-only rc=0; 39/39 scripts
+   `bash -n` clean. No engine, quant or schedule code touched.
+
 
    THE FAILURE IS BOX STATE, NOT A REGRESSION — established, not assumed:
      GATE FAIL: hook fired on TP2 (40 lines)   [PARTS TP2 spec flag: 40, expect 0]

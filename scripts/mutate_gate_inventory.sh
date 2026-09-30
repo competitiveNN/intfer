@@ -185,10 +185,24 @@ restore() {
 }
 trap restore EXIT INT TERM
 
-# Replace `old` with `new` in $1, from the patch file $2. Hard-fails unless `old`
-# occurs exactly once -- a zero-match or multi-match is a stale anchor, not a
-# mutation. Kept as its own file so the replacement is a pure, testable function
-# of (file, patch) with no shell quoting anywhere near it.
+# Replace `old` with `new` in $1, from the patch file $2. Hard-fails unless every
+# `old` occurs exactly once AT THE TIME IT IS APPLIED -- a zero-match or
+# multi-match is a stale anchor, not a mutation.
+#
+# MULTIPLE HUNKS. Hunks are separated by a line containing only "@@@" and applied
+# in order, each requiring its own target to be unique at the time it is applied.
+#
+# M3 is the reason this exists, twice over. The stdin-starvation bug needs BOTH
+# greps to read a SHARED stream, so it takes two coordinated edits. The first
+# M3 attempt instead patched only the elif to `- <"$1"`, which reopens the file
+# for that one grep, starves nothing, and changed no verdict -- the matrix scored
+# it MISSED, correctly. A mutation that does not reproduce the defect is worse
+# than no mutation, because it launders a red state green. The faithful version
+# opens the file once on a shared fd 3 and points both greps at it, so the first
+# grep's early exit leaves the elif reading from the offset onward: the
+# per-arm sample, which has no `gate_require_gpus` at all, is consumed whole by
+# the first grep and the elif then sees an empty stream. Call sites are left
+# untouched, so the only thing under test is the classifier.
 patch_once() {
   python3 - "$1" "$2" <<'PY'
 import sys
@@ -196,21 +210,42 @@ tgt, pf = sys.argv[1], sys.argv[2]
 s = open(tgt).read()
 lines = open(pf).read().split("\n")
 # The heredoc body arrives with a trailing newline; drop exactly one so a
-# single-line patch round-trips byte-identically.
+# single-hunk patch round-trips byte-identically.
 if lines and lines[-1] == "":
     lines.pop()
-try:
-    i = lines.index("|||")
-except ValueError:
+
+# Split into hunks on lines that are exactly "@@@".
+hunks, cur = [], []
+for ln in lines:
+    if ln == "@@@":
+        hunks.append(cur); cur = []
+    else:
+        cur.append(ln)
+hunks.append(cur)
+if not any("|||" in h for h in hunks):
     sys.stderr.write("patch has no '|||' separator line\n")
     sys.exit(1)
-old = "\n".join(lines[:i])
-new = "\n".join(lines[i + 1:])
-n = s.count(old)
-if n != 1:
-    sys.stderr.write("target found %d times, want 1: %r\n" % (n, old[:70]))
+
+applied = 0
+for h in hunks:
+    if "|||" not in h:
+        if [x for x in h if x.strip()]:
+            sys.stderr.write("hunk %d has no '|||' separator\n" % applied)
+            sys.exit(1)
+        continue
+    i = h.index("|||")
+    old, new = "\n".join(h[:i]), "\n".join(h[i + 1:])
+    n = s.count(old)
+    if n != 1:
+        sys.stderr.write("hunk %d: target found %d times, want 1: %r\n" % (applied, n, old[:70]))
+        sys.exit(1)
+    s = s.replace(old, new, 1)
+    applied += 1
+if applied == 0:
+    sys.stderr.write("patch contained no hunks\n")
     sys.exit(1)
-open(tgt, "w").write(s.replace(old, new, 1))
+open(tgt, "w").write(s)
+print("applied %d hunk(s)" % applied, file=sys.stderr)
 PY
 }
 
@@ -298,9 +333,16 @@ strip_comments() { cat "$1"; }
 PATCH
 
 run_state M3 "reintroduce the stdin-consuming grep chain" "CAUGHT-selfcheck" <<'PATCH'
+granularity_of() { # $1 = comment-stripped code file
+  if grep -qE '^[[:space:]]*gate_require_gpus[[:space:]]+[0-9]' "$1"; then
+|||
+granularity_of() { # $1 = comment-stripped code file
+  exec 3<"$1"
+  if grep -qE '^[[:space:]]*gate_require_gpus[[:space:]]+[0-9]' <&3; then
+@@@
   elif grep -q 'gate_gpu_count' "$1"; then
 |||
-  elif grep -q 'gate_gpu_count' - <"$1"; then
+  elif grep -q 'gate_gpu_count' <&3; then
 PATCH
 
 run_state M4 "invert the per-arm self-check expectation" "CAUGHT-selfcheck" <<'PATCH'
