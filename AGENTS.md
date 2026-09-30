@@ -378,6 +378,50 @@ Implement features for maximizing throughput for concurrent requests, starting f
    (every TP=2 gate arm would fail for the same reason) — so it is recorded,
    not blind-patched. This is family "gate cannot exercise the configuration"
    (see AUDIT #3c): do not ship an unverifiable engine change.
+   === AUDIT #11: AUDIT #9's ROOT CAUSE WAS WRONG (supersedes it) ===
+   #9 attributed the tp2_27b rc=139 to TP sharding walking a missing device
+   ("ranges[d] -> wild pointer"). TESTED AND DISPROVED: the clamp is real and
+   correct — engine.cpp:361 `n = (tp_devices==0) ? dm.size() :
+   std::min(tp_devices, dm.size())` and shards are built from devices_.size(),
+   so --tp 2 on a 1-GPU box is simply TP=1. Verified: 0.8B with `--gpu --tp 2`
+   on this 1-GPU box exits rc=0 with the expected ids and the banner
+   "Engine: 1 Arc device(s)" / "GPU backend: 1 device(s) (TP=single)". There
+   is no missing-rank wild pointer. #9's conclusion (box state, not a code
+   regression) still holds; its MECHANISM did not, and the mechanism is what
+   the follow-up action item was built on — so #9's "reject --tp N when
+   devices < N" task was aimed at a bug that does not exist.
+   ACTUAL ROOT CAUSE, reproduced and read out of the log: 27B simply does not
+   fit one B580. Order of events in the failing run: "preloading all shards
+   into VRAM..." -> "starting prefill..." -> prompt ids computed fine ->
+   "FATAL: signal 6" with the abort raised INSIDE the Intel Level Zero runtime
+   (`level_zero/core/source/memory/cpu_page_fault_memory_manager.cpp`), rc=139.
+   So it is a device-OOM at page-fault time: pool_acquire's FATAL guard
+   (engine.cpp:91-101) only fires when malloc_shared returns null, and shared
+   USM under pressure RESERVES successfully and fails later when the GPU
+   faults the pages in — which is why the guard never saw it and the death
+   looked like a driver fault. Consistent with the standing 27B note that TP=1
+   needs ~19GB for the lm_head INT8 tile against a ~12GB B580.
+   FIX SHIPPED (diagnosability only, the OOM itself untouched): the min() clamp
+   was SILENT — nothing ever said "you asked for 2, you got 1". Engine::load
+   now prints a loud WARNING when dm.size() < tp_devices, naming the shortfall
+   and the ~19GB-vs-~12GB consequence. Deliberately NON-fatal: a legitimate
+   deliberate TP=1 run must not be blocked, so warn and continue. Verified on
+   the exact trigger box: --tp 1 -> 0 warnings (no false positive), --tp 2 and
+   --tp 4 -> exactly 1 warning each, and all three produce IDENTICAL ids
+   ("...capital of the country"), i.e. zero behavior change. On 27B the warning
+   lands at log line 11 vs the abort at line 50, so the cause now reaches the
+   operator before the failure instead of after. cpu-parity PASS after the
+   change. The 27B rc=139 is unchanged and expected on a 1-GPU box — a real
+   preflight VRAM check (footprint vs device_free_bytes) is the only way to
+   turn it into a clean refusal, and that is NOT attempted: it is heuristic,
+   a false positive would block runs that work today, and it cannot be
+   validated on the TP=2 configuration it exists to protect (family "gate
+   cannot exercise the configuration", AUDIT #3c).
+   LESSON (same family as #10, one level up): #9 recorded a mechanism from
+   a backtrace symbol without reading the clamping code. A plausible-sounding
+   mechanism is not a verified one — read the code that would have to be wrong,
+   or reproduce it. Reproducing was cheap (the 0.8B run is seconds) and would
+   have caught this immediately.
    === AUDIT #10: AUDIT #8's OWN ENUMERATION WAS THE SAME NARROW PATTERN ===
    7efed06 fixed 5 harnesses and then claimed "All 17 artifact consumers now
    honor the override". That claim was FALSE, and the failure is precisely the

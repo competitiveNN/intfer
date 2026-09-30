@@ -360,6 +360,20 @@ std::unique_ptr<Engine> Engine::load(const std::string& intfer_path,
   auto dm = device::DeviceManager::discover("Arc");
   size_t n = (tp_devices == 0) ? dm.size() : std::min(tp_devices, dm.size());
   if (n == 0) { std::cerr << "Engine: no Arc GPU discovered\n"; return nullptr; }
+  // AUDIT #9/#11: the min() clamp above is correct but SILENT. When the caller
+  // asked for more ranks than the box actually has, the run continues at the
+  // smaller TP and, if the model does not fit that many devices, dies later in
+  // an opaque place — for 27B on one B580 the failure surfaces as a Level Zero
+  // CPU-page-fault-memory-manager abort (signal 6) during prefill, which reads
+  // like a driver bug and buries the real cause. Loud, NON-fatal: a legitimate
+  // deliberate TP=1 run must not be blocked by this, so warn and continue.
+  if (tp_devices != 0 && dm.size() < tp_devices) {
+    std::cerr << "Engine: WARNING: TP=" << tp_devices << " requested but only "
+              << dm.size() << " Arc GPU(s) discovered — continuing with TP=" << n
+              << ". A model that needs more VRAM than one device holds (27B "
+                 "needs ~19GB; a B580 has ~12GB) will fail below.\n"
+              << std::flush;
+  }
   for (size_t i = 0; i < n; ++i) e->devices_.push_back(dm.at(i));
   std::cerr << "Engine: " << n << " Arc device(s): ";
   for (auto& d : e->devices_) std::cerr << d.name << " ";
