@@ -127,6 +127,7 @@ if [ "${NDEV:-0}" -eq 0 ]; then
   echo "  Loud, not silent: a precondition that cannot see the box verifies nothing."
   echo "  (This is the libumf LD_LIBRARY_PATH gotcha, not a code problem.)"
 else
+  TALLY_RAN=1
   if [ "$NDEV" -ge 2 ]; then EXP_PASS="$((N_PASS + N_PARTIAL + N_SKIP))"; EXP_PARTIAL=0; EXP_SKIP=0
   else EXP_PASS="$N_PASS"; EXP_PARTIAL="$N_PARTIAL"; EXP_SKIP="$N_SKIP"; fi
   echo "doc-tally: expected from source + $NDEV GPU(s) visible = ${EXP_PASS} PASS, ${EXP_PARTIAL} PARTIAL, ${EXP_SKIP} SKIPPED"
@@ -189,7 +190,14 @@ fi
 
 echo
 if [ "$VIOLATIONS" = "0" ]; then
-  echo "GATE INVENTORY: OK (every gate builds its own target; no whole-gate skip strands 1-GPU arms; doc tallies reconcile)"
+  # Do NOT claim the doc tallies reconciled when that check declined to run. An
+  # OK line reading "reconcile" after a SKIP is the same overclaim this script
+  # exists to catch, in the script's own voice.
+  if [ "${TALLY_RAN:-0}" = "1" ]; then
+    echo "GATE INVENTORY: OK (every gate builds its own target; no whole-gate skip strands 1-GPU arms; doc tallies reconcile)"
+  else
+    echo "GATE INVENTORY: OK on guards/granularity; DOC TALLY CHECK DID NOT RUN (see the SKIPPED note above)"
+  fi
   exit 0
 fi
 echo "GATE INVENTORY: $VIOLATIONS PROBLEM(S) -- see the <-- markers and STALE lines above" >&2
