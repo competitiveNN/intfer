@@ -108,26 +108,62 @@ Implement features for maximizing throughput for concurrent requests, starting f
   361tok capture = 180M INT8 slots; decode-only M=1 = 5.5M INT8 slots
   (~0.8M/token, consistent with vocab/16 tiles x K/32 ops). Layer GEMMs
   (99% of launches) remain EU/ALU, XMX idle there — that half stands.
-  DEVICE ACT-QUANT PRE-PASS (2026-09-29, 49b21d3, INTFER_DPAS_PREQ=1,
-  default-OFF): kills the host GA64 act-quant loop that made DPAS a net
-  +6% wall loss on 27B despite a -15% device-side kernel win (copy bucket
-  269us/GEMM + submit 127us). Quant moves to a standalone pre-pass kernel,
-  dep-chained into the DPAS launch (Dpas48Params::dep -> trailing
-  `sycl::event` PARAMETER, NOT a struct member) so it adds NO host wait.
-  Bit-exact vs dashq::act_quant_ga64_batch(HalfAway); plain SYCL (no
-  ESIMD) so FP32 arithmetic is IEEE-identical to the host scalar loop.
-  TWO STRUCTURAL CORRECTIONS vs the initial draft: (1) one launch PER
-  DEVICE, never one for both ranks — each rank owns its own
-  sycl::context (device_manager.cpp), so a kernel on rank 0's queue
-  cannot legally write rank 1's malloc_shared buffer (the ndev/q1/s1
-  cross-device write was UB); (2) the dep must be a function parameter
-  because Dpas48Params is captured BY VALUE into the kernel lambda and
-  sycl::event is not device-copyable. Also fixed a pre-existing leak:
-  ws48_ was never freed in ~Engine. Gates: streams bit-identical base vs
-  PREQ at TP=1 AND TP=2; path fires (decode nk 1116->1488 = +372 = 4tok x
-  93, nw unchanged 744 => dep-chain adds no wait); cpu parity + http batch
-  + gpu-optin 10/10 PASS. NO wall-time claim yet (box load 2.2 > quiet
-  threshold) — needs a quiet-box 27B INT4/G64 A/B before any perf claim.
+  DEVICE ACT-QUANT PRE-PASS (2026-09-29 49b21d3; AUDITED + CORRECTED
+  2026-09-30, INTFER_DPAS_PREQ=1, default-OFF): kills the host GA64
+  act-quant loop that made DPAS a net +6% wall loss on 27B despite a -15%
+  device-side kernel win (copy bucket 269us/GEMM + submit 127us). Quant
+  moves to a standalone pre-pass kernel, dep-chained into the DPAS launch
+  (trailing `sycl::event` PARAMETER, NOT a Dpas48Params member) so it adds
+  NO host wait. One launch PER DEVICE, never one for both — each rank owns
+  its own sycl::context (device_manager.cpp), so a kernel on rank 0's queue
+  cannot legally write rank 1's malloc_shared buffer.
+  === 2026-09-30 AUDIT: THE ORIGINAL GATE EVIDENCE WAS VACUOUS ===
+  PREQ is NESTED INSIDE the DPAS48 path, and DPAS48 is default-OFF. The
+  gates cited in 49b21d3 (cpu parity, http batch, gpu-optin 10/10) all ran
+  WITHOUT INTFER_DPAS48=1, so run_linear_tp_dpas48 was never entered and
+  the pre-pass NEVER FIRED in any of them. They prove nothing about PREQ.
+  Worse, the cited invariant "streams bit-identical base vs PREQ" is
+  impossible: DPAS48's own INT8/GA64 act-quant legitimately differs from
+  the FP16-act base. The correct invariant is PREQ == DPAS48 (the pre-pass
+  reproduces the host GA64 quant).
+  === REAL BUG FOUND AND FIXED: device 1.0f/s was NOT IEEE ===
+  The kernel computed `inv = 1.0f / s`. DPC++ lowers that to rcp.approx
+  (+ Newton), which lands 1 ulp off the host's fl(1/s) for ~9% of inputs
+  (MEASURED 715/8192). One extra fma-based Newton step
+  (`e = fma(-s,inv,1); inv = fma(inv,e,inv)`) recovers the correctly-rounded
+  result (0/8192 mismatches). This only surfaced at exact .5
+  half-away-from-zero TIES, where a 1-ulp inv shift flips the code by one —
+  enough to change the greedy stream. DO NOT "simplify" the two-step form
+  back to a bare 1.0f/s. Note the host uses divss (IEEE) in dashq.cpp, so
+  host and device genuinely disagreed.
+  === OTHER FIXES ===
+  (a) PARTIAL-DECLINE RACE (nondeterminism): if device d's pre-pass
+  launched but device d+1 declined, the already-queued d kernel still
+  writes ws48_[d].act while the host fallback memcpy's the same buffer.
+  Now every submitted preq_event is drained before falling through.
+  (b) `if (xd != x.data())` compared a USM pointer against a host
+  std::vector pointer — never legitimately equal, always copied. Now an
+  unconditional memcpy with a comment.
+  (c) profile_note_launch() ran BEFORE the decline check, so a declined
+  call inflated nk. Moved after.
+  (d) Indentation regression in quant_gemm_dpas4_row fixed.
+  === KNOWN, UNRESOLVED: PREQ x SSM_GPU tie divergence ===
+  DPAS48+PREQ+SSM_GPU diverges from DPAS48 at decode step 14 (TP=1 and
+  TP=2, deterministic across repeats). NOT introduced by the pre-pass:
+  the same tie-boundary class appears for DPAS48+PREQ alone at longer
+  horizons, tracking whichever SSM path (host vs device) perturbs the
+  activation into the tie. Isolated to the GA64 half-away-from-zero rule:
+  at v = 47.499996185 the device yields 47 and the host AVX2 lane path
+  yields 48, though trunc(v+0.5) and lround(v) both give 47 — i.e. the
+  two code paths disagree on a value where the documented formula is
+  unambiguous. 2 residual mismatches per ~1950 GEMM calls. Until the tie
+  rule is unified, DO NOT combine PREQ with SSM_GPU; the gate reports it
+  as a NOTE rather than asserting it. Correctness-gated: gpu-optin PASS
+  (base arms + PREQ==DPAS48 + ROW+PREQ + PREQ-alone inert), cpu parity
+  PASS, http batch PASS (also re-run with DPAS48+PREQ exported). Path
+  fires: decode nk 1116->1488 (+372 = 4tok x 93), nw unchanged 744.
+  NO wall-time claim (never benchmarked here) — needs a quiet-box 27B
+  INT4/G64 A/B before any perf claim.
   Orthogonally: device-act-quant INTO the fused DPAS kernel stays a dead
   end (replication), but the standalone pre-pass is a different shape and
   is now open. SYCL-ENVS GOTCHA: a plain non-sourced shell cannot

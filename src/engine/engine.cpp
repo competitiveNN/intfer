@@ -915,8 +915,10 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
     for (size_t d = 0; d < devices_.size(); ++d) {
       sycl::queue& q = devices_[d].queue;
       float* xd = ws48_[d].f32;
-      if (xd != x.data())
-        q.memcpy(xd, x.data(), (size_t)M * K * sizeof(float));
+      // Unconditional H2D. `x` is a host std::vector; `xd` is device USM,
+      // so an address comparison can never legitimately match (and must not
+      // be used to skip the copy — the source is host memory either way).
+      q.memcpy(xd, x.data(), (size_t)M * K * sizeof(float));
       gemm::ActQuantDevParams ap;
       ap.x_f32 = xd;
       ap.q_out = ws48_[d].act;
@@ -928,7 +930,18 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
       preq_events[d] = gemm::act_quant_ga64_dev(q, ap);
       if (preq_events[d] == sycl::event{}) preq_ok = false;
     }
-  }
+    // PARTIAL-DECLINE GUARD: a pre-pass kernel already submitted for device
+    // d' < d is still queued and WILL write ws48_[d'].act asynchronously. If
+    // we now fall through to the host fallback, its std::memcpy into the same
+    // buffer races that in-flight kernel -> nondeterministic act codes. Drain
+    // every already-submitted pre-pass event first (the host path then owns
+    // the buffer exclusively and overwrites all of it).
+    if (!preq_ok) {
+      for (auto& e : preq_events)
+        if (e != sycl::event{}) e.wait_and_throw();
+      preq_events.clear();
+    }
+  }  // end if (preq_ok)
   if (!preq_ok) {
   for (uint32_t m = 0; m < M; ++m) {
     const float* xr = x.data() + (size_t)m * K;

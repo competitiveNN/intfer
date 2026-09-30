@@ -921,13 +921,15 @@ bool repack_dpas412(const std::uint8_t* row_codes, uint32_t N, uint32_t K,
 
 // Device-side GA64 act-quant pre-pass (see header for bit-contract).
 sycl::event act_quant_ga64_dev(sycl::queue& q, const ActQuantDevParams& p) {
-#ifdef INTFER_PROFILE_GPU
-  profile_note_launch();
-#endif
   constexpr uint32_t GA = 64;
   const uint32_t M = p.M, K = p.K;
   if (M == 0 || K == 0 || !p.x_f32 || !p.q_out || !p.s_out)
     return sycl::event{};
+#ifdef INTFER_PROFILE_GPU
+  // AFTER the decline check: a declined call submits no kernel, so counting
+  // it here would inflate nk relative to actual device work.
+  profile_note_launch();
+#endif
   const uint32_t nGA = (K + GA - 1) / GA;
   const uint32_t Ks = (p.Kstride == 0) ? K : p.Kstride;
   const uint32_t Ss = (p.nGAstride == 0) ? nGA : p.nGAstride;
@@ -955,7 +957,19 @@ sycl::event act_quant_ga64_dev(sycl::queue& q, const ActQuantDevParams& p) {
             if (v > mx) mx = v;
           }
           const float s = mx / 127.0f;
-          const float inv = 1.0f / s;
+          // IEEE-CORRECT 1/s. A bare `1.0f / s` is NOT bit-exact vs the host:
+          // DPC++ lowers it to rcp.approx (+ Newton), which lands 1 ulp off
+          // fl(1/s) for ~9% of inputs (measured 715/8192). One extra
+          // fma-based Newton step recovers the correctly-rounded result
+          // (0/8192 mismatches, examples/rdiv_probe.cpp). This matters only
+          // at exact .5 rounding ties, where a 1-ulp inv shift flips the
+          // half-away-from-zero result by one code — enough to change the
+          // greedy stream. Keep the two-step form; do not "simplify" it back.
+          float inv = 1.0f / s;
+          {
+            const float e = sycl::fma(-s, inv, 1.0f);
+            inv = sycl::fma(inv, e, inv);
+          }
           // Row-strided workspace write; each element is quanted ONCE and
           // stored ONCE (the fused-quant failure mode replicated the O(K)
           // quant work nT x, once per 16-N tile).
@@ -1173,7 +1187,7 @@ sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
 
   return q.submit([&](sycl::handler& h) {
     if (dep != sycl::event{}) h.depends_on(dep);
-      h.parallel_for<class gemm_dpas4_row_kernel>(
+    h.parallel_for<class gemm_dpas4_row_kernel>(
         sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
         [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
           const uint32_t m = it.get_global_id(0);

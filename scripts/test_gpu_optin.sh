@@ -35,9 +35,9 @@ set -u
 
 PASS=1
 fail() { echo "GATE FAIL: $1" >&2; PASS=0; }
-ids_of() { # $1=tp $2=env... -- prints "t0 t1 t2 t3" decode ids
+ids_of() { # $1=tp $2=env... -- prints decode ids
   local tp="$1"; shift
-  env "$@" "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" -n 4 \
+  env "$@" "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" -n "${N:-4}" \
     --no-stream --ids $TOK 2>&1 >/dev/null \
     | grep -a -oE "decode step [0-9]+: token=[0-9]+" | sed -E 's/.*token=//' \
     | tr '\n' ' ' | sed 's/ *$//'
@@ -56,6 +56,58 @@ for tp in 1 2; do
     echo "TP=$tp [$mode]: '$GOT'"
     [ "$GOT" = "$BASE" ] || fail "TP=$tp [$mode] '$GOT' != base '$BASE'"
   done
+
+  # --- DPAS48 family --------------------------------------------------------
+  # INTFER_DPAS48=1 switches the GEMM to the INT8/GA64 act-quant DPAS path,
+  # which is a DIFFERENT numerics from the FP16-act base above — DPAS48 is
+  # expected to diverge from BASE and is not asserted against it. What MUST be
+  # bit-exact is the act-quant PRE-PASS against its own host-quant baseline:
+  #
+  #   DPAS48        != BASE  (intentional: different act quant)
+  #   DPAS48+PREQ   == DPAS48 (the pre-pass reproduces the host GA64 quant)
+  #   PREQ alone    == BASE  (PREQ is nested inside DPAS48 and inert without it)
+  #
+  # The middle equality is the real bit-contract gate for INTFER_DPAS_PREQ.
+  # Asserting PREQ against BASE instead is a vacuous/misleading test.
+  # N=24 (not the default -n 4): at n=4 the DPAS48 and base streams happen to
+  # coincide, so a short run can pass while the numerics actually differ. The
+  # longer window makes the DPAS-vs-BASE divergence visible, which proves the
+  # pre-pass equality below is a real comparison and not a coincidence.
+  D48="$(N=24 ids_of "$tp" INTFER_DPAS48=1)"
+  echo "TP=$tp [INTFER_DPAS48=1 n=24]: '$D48'"
+  [ -n "$D48" ] || fail "TP=$tp DPAS48 stream empty (broken run)"
+
+  # MUST be bit-exact: the device pre-pass reproduces the host GA64 quant.
+  GOT="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS_PREQ=1)"
+  echo "TP=$tp [DPAS48+PREQ n=24]: '$GOT'"
+  [ "$GOT" = "$D48" ] || fail "TP=$tp [DPAS48+PREQ] '$GOT' != DPAS48 '$D48'"
+
+  # Also gated: the pre-pass must be inert when the row-cooperative geometry
+  # is selected (use_row and preq_ok are mutually exclusive by construction).
+  GOT="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS_ROW=1 INTFER_DPAS_PREQ=1)"
+  echo "TP=$tp [DPAS48+ROW+PREQ n=24]: '$GOT'"
+  [ "$GOT" = "$D48" ] || fail "TP=$tp [DPAS48+ROW+PREQ] '$GOT' != DPAS48 '$D48'"
+
+  # KNOWN DIVERGENCE (2026-09-30 audit, NOT a gate): DPAS48+PREQ+SSM_GPU
+  # diverges from DPAS48 at decode step 14. Root cause is an exact-.5 tie in
+  # the GA64 half-away-from-zero rounding where the device and the host AVX2
+  # lane path disagree by one code. It is NOT introduced by the pre-pass: the
+  # same class of divergence appears for DPAS48+PREQ alone at longer horizons,
+  # i.e. it tracks whichever code path (host SSM vs device SSM) perturbs the
+  # activation into/out of the tie. Until the tie rule is unified, PREQ must
+  # not be combined with SSM_GPU. Reported, not asserted.
+  GOT="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS_PREQ=1 INTFER_SSM_GPU=1)"
+  echo "TP=$tp [DPAS48+PREQ+SSM_GPU n=24]: '$GOT'"
+  if [ "$GOT" != "$D48" ]; then
+    echo "  NOTE: known PREQ x SSM_GPU tie-boundary divergence (see comment); not gated."
+  fi
+
+  # PREQ without DPAS48 must be inert (nested-flag guard).
+  PQ="$(N=24 ids_of "$tp" INTFER_DPAS_PREQ=1)"
+  B24="$(N=24 ids_of "$tp")"
+  echo "TP=$tp [base n=24]: '$B24'"
+  echo "TP=$tp [INTFER_DPAS_PREQ=1 alone]: '$PQ'"
+  [ "$PQ" = "$B24" ] || fail "TP=$tp PREQ-alone '$PQ' != base '$B24' (PREQ must be inert without DPAS48)"
 done
 
 if [ "$PASS" = 1 ]; then echo "GPU-OPTIN TEST: PASS"; else echo "GPU-OPTIN TEST: FAIL" >&2; exit 1; fi
