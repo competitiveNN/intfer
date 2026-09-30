@@ -795,6 +795,11 @@ e.g. S3's contract column is 40 not 42).
    The honest reading of that state: the cells are still VALID (4b31d25 was
    comment-only, and `--anchors-only` re-proves the anchors still resolve) but
    they are evidence for a806ef3, not for HEAD — a citation, not a guess.
+   RESOLVED, not argued away: after audit #15 the full matrix was re-run on the
+   final tree (7/7, with real device readback regimes), so the stamp is current
+   and `fold_report_counts.sh` certifies rc=0 with "logs match HEAD". The
+   STALE-qualifying path is RETAINED, not deleted to make a report green: it is
+   the behaviour that makes the rc=0 mean something.
    MUTATION-TESTED, because the previous checker was not. The evidence is
    COMMITTED as a re-runnable script, scripts/mutate_gate_inventory.sh, NOT
    left in a transcript: a mutation that exists only in a commit message cannot
