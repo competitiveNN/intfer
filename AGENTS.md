@@ -1217,6 +1217,84 @@ e.g. S3's contract column is 40 not 42).
   Verified end-to-end at ea955bb: 6/6 device-precond states caught for their own
   reasons, fold 7/7, gate-inventory 9/9, 4/4 stamps current, `run_all_checks`
   rc=0 with the 2b re-run visibly reporting "ok (evidence now current)".
+- **AUDIT #17c: THE ENTRY POINT HAD NO MATRIX, NO SELF-CHECK, AND THE SEAM THAT
+  MADE IT TESTABLE BROKE IT** (NEW scripts/mutate_run_all_checks.sh, 4/4;
+  run_all_checks.sh gains a gating self-check + three seams; no engine/quant/
+  schedule code touched). `run_all_checks.sh` is the ENTRY POINT for the whole
+  verification stack and was the one script in it with neither a mutation matrix
+  nor a self-check, so a state that made it always-red, or that broke its
+  verdict, would have looked healthy.
+    **It could not be matrixed naively** — it runs the full ~45 minute stack, so
+  four states would cost three hours. Hence three seams
+  (`INTFER_RUN_ALL_STEPS` / `INTFER_RUN_ALL_EXTRA_STEPS_DIR` /
+  `INTFER_RUN_ALL_STAMP_DIR`), for the same reason `INTFER_SYCL_LS` exists: an
+  assumption the harness cannot redirect is one it cannot test. Every case runs in
+  seconds against synthetic steps and stamps; none runs another matrix, so there
+  is no recursion.
+  **TWO DESIGN POINTS WORTH KEEPING**
+    * A state is judged by a **DEFECT PREDICATE**, not by the exit code, because
+  three of the four breaks produce rc=0 or rc=2 — exactly what a HEALTHY run
+  produces. A matrix watching only the exit code scores those as passes forever.
+      * Every predicate is a **POSITIVE** assertion ("this specific evidence is
+    ABSENT/BAD"), never the mere absence of a good signal. The first N-C
+    predicate was `NOT grep STALE`, which a top-of-run abort trivially satisfies.
+    * Every case is **BASELINED** first, and the baseline must show the correct
+    marker PRESENT as well as the right rc. A baseline that checks only the rc is
+    exactly what let that false catch through.
+    States: **N-A** rc=2 no longer UNPROVEN (only the self-check sees it);
+  **N-B** the 2b re-run deleted; **N-C** `find` replaced by a hand-written
+  2-item list so a third, stale stamp goes unreported (the audits #7/#8 shape);
+  **N-D** the dirty-tree guard deleted, detected behaviourally via a sentinel.
+  **THE FIRST VERSION OF THIS MATRIX WAS MASKING ITS OWN DEFECTS.** It mutated
+  `run_all_checks.sh` IN PLACE and then ran it — but that script fails closed on
+  any dirty tracked tree, so the MUTATION ITSELF tripped its own target's guard
+  and every case aborted at the top before the defect could express itself. Both
+  outcomes were bad and one was worse than a miss: N-A/N-B scored MISSED when the
+  states never ran, and **N-C scored CAUGHT and that was a FALSE CATCH** — its
+  loose predicate was satisfied by the abort, so the stamp-enumeration defect it
+  claims to test was never exercised. A mask that hides the defect under test is
+  worse than no state, and a predicate loose enough to be satisfied by an early
+  abort is a check that cannot fail. FIX: the mutation applies to an **UNTRACKED
+  copy** at `scripts/_rac_mutant.sh` (`git diff` ignores untracked files, so the
+  tree stays clean and the target's guard stays armed); the trap always removes
+  the mutant, since a mutated copy left in `scripts/` would poison every later
+  check that globs that directory.
+  **THREE MORE DEFECTS FOUND BY RUNNING THE MATRIX AS A STEP** (not in isolation)
+    * **The seam broke EVERY real step.** `dispatch()` had a `case` with no `*)`
+  arm and the external-dir fallback placed AFTER the `esac`, so a MATCHING arm
+  ran its command and then fell through to "unknown step" and returned 97. Every
+  real step was broken by that edit — and it went unnoticed because the only
+  tests in the same commit drove SYNTHETIC steps, which take the fallback path and
+  work. A seam that changes control flow needs a REAL-PATH test, not only a seam
+  test. Now the seam is the `*)` arm and every arm returns.
+    * **The matrix polluted the stamp population it was measuring.** Its synthetic
+  stamp files lived under the build tree, and the real enumeration is
+  `find $BUILD_DIR -name '*last_pass.stamp'` — so the stack's real stamp set grew
+  by SEVEN fixture files. The enumerator was silently measuring its own test data.
+  Adding a fourth matrix is exactly the population change that exposed it. The
+  synthetic world now lives outside the build tree, and a leak check FAILS the
+  matrix if any fixture stamp is found under `BUILD_DIR`. This is the audit #7/#8
+  lesson one level down: an enumerator needs its own population audited, because
+  "enumerate, never remember" does not mean "enumerate only what you meant to".
+    * **The inner runs inherited the outer run's lock.** The mutant tried to take
+  the lock `run_all_checks.sh` already held, so every inner run exited 1 with
+  "another run_all_checks.sh is running" and the matrix reported that as a broken
+  CASE. Inner runs now get their own `INTFER_BUILD_DIR`.
+  **ITEM #2 RE-DERIVED, NOT ASSUMED.** `verify_patched()` was added to
+  `mutate_device_precond.sh` in #17b, so the question became whether the other two
+  matrices had the same hole. They did NOT, by a different mechanism:
+  `mutate_fold_matrix.sh` re-greps for the marker each `apply_mN` injects and
+  every call site is `|| { echo "FAIL: MN did not apply"; exit 1; }`;
+  `mutate_gate_inventory.sh`'s `patch_once` requires every hunk to match EXACTLY
+  ONCE, errors on `applied == 0`, and `run_state` reports PATCH ERROR. Both were
+  already sound, so the only real gap was diagnostic: the fold M1/M2 appliers
+  signalled failure as a bare trailing `grep` exit code with no message, unlike
+  M4/M5/M6. They now name what was not mutated. Reported rather than "fixed",
+  because the improvement is cosmetic and the substance was already correct.
+  Verified at d7a5ab6: `mutate_run_all_checks` 4/4 with 4/4 baselines; run AS A
+  STEP of run_all_checks it reports `ok` and `gate_inventory.sh` also reports
+  `ok` (proving the rc=97 fall-through is gone), the stamp population is exactly
+  5 with the new `run_all_mutate/last_pass.stamp` enumerated and no fixtures.
 
 
 
