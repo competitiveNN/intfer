@@ -51,6 +51,15 @@ gate_require_build dpas_fold_probe || exit 1
 # devices. Do not "fix" device_manager.cpp if you see that warning.
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 
+# The probe's 3 device readback regimes are the whole point of this gate, so a
+# box it cannot reach must SKIP (exit 2) rather than fail red -- a red line here
+# would be indistinguishable from a real regression. Found by RE-DERIVING the
+# gate list instead of remembering it: this gate said "needs a GPU" in a COMMENT
+# and carried no guard at all, so it was the one GPU gate that would have gone
+# red on a 0-GPU box. See gate_inventory.sh's NEEDS-GPU column.
+. "$SCRIPT_DIR/_gate_precond.sh"
+gate_require_render_node || exit 2
+
 "$BIN"
 RC=$?
 if [ "$RC" = "0" ]; then

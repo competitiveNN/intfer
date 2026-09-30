@@ -35,6 +35,14 @@ gate_require_build intfer_cli || exit 1
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }
 
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+
+# This gate launches the server with `--gpu --tp 1`, so it is 100% device-
+# dependent with no CPU-only section to fall back on. A box it cannot reach
+# must SKIP (exit 2), not fail red. Found by RE-DERIVING the gate list: both
+# this and serve_load passed on a 1-GPU box while carrying no guard, so they
+# were the gates that would have gone red on a 0-GPU box.
+. "$SCRIPT_DIR/_gate_precond.sh"
+gate_require_render_node || exit 2
 export TMPDIR=/var/home/fra/build_tmp
 mkdir -p "$TMPDIR"
 

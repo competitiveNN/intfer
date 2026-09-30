@@ -109,6 +109,31 @@ has_1gpu_arm() { # $1 = comment-stripped stream file
   echo no
 }
 
+# Does this gate NEED a GPU, and does it carry a guard that will SKIP rather
+# than fail red if the box has none? Echoes: not-gpu | render-node | MISSING.
+#
+# Split out as a function of a file so the classifier self-check can exercise it
+# on a seeded temp gate. Inlined in the loop it was UNREACHABLE in practice: on
+# the real tree every GPU gate is guarded, so the MISSING branch never fires and a
+# mutation disabling it is an EQUIVALENT mutation -- untestable, i.e. decoration.
+# That is the M1 lesson applied to M7, and it is the whole reason this is a
+# function and not four lines in the loop.
+#
+# The NEEDS-GPU test is RE-DERIVED from the code, not read from a remembered
+# list, so a newly added GPU gate is classified without anyone editing a table.
+# That re-derivation is what found the gap: test_dpas_fold.sh (which said "needs a
+# GPU" in a COMMENT and carried no guard), test_http_batch.sh and
+# test_serve_load.sh (both launch the server `--gpu --tp 1`). All three PASS on a
+# 1-GPU box, which is exactly why the gap survived AUDIT #14.
+gpu_guard_state() { # $1 = comment-stripped code file
+  grep -qE -- '(--gpu|sycl-ls|level_zero|xpu-smi|dpas_fold_probe)' "$1" || { echo "not-gpu"; return 0; }
+  # A GPU gate with no COUNT-based precondition still needs SOME guard. The
+  # render-node check is the strict, adapter-independent one: a missing libumf
+  # makes sycl-ls report zero devices on a perfectly healthy box, so a count
+  # would refuse coverage that would actually run.
+  if grep -qE 'renderD|gate_require_render_node' "$1"; then echo "render-node"; else echo "MISSING"; fi
+}
+
 # --- CLASSIFIER SELF-CHECK (behavioural, on a seeded temp gate) --------------
 # The invariant above had a proven false negative, so the classifier is now
 # itself gated: a synthetic gate reproducing the audit-#13 shape (top-level
@@ -167,6 +192,29 @@ GATE
   strip_comments "$tmp" >"$tmp.c"
   r="$(granularity_of "$tmp.c")"
   [ "$r" = "BROKEN" ] || { echo "SELFCHECK: unplaceable require classified '$r', want BROKEN" >&2; bad=1; }
+  # A GPU gate with NO guard must be reported MISSING. This case is what makes
+  # the NEEDS-GPU check observable: on the real tree every GPU gate is guarded,
+  # so without it a mutation disabling the MISSING branch is EQUIVALENT and
+  # would silently pass.
+  cat >"$tmp" <<'GATE'
+. "$SCRIPT_DIR/_gate_build.sh"
+gate_require_build intfer_cli || exit 1
+setsid nohup "$BIN" -m "$MODEL" --gpu --tp 1 --serve-http &
+GATE
+  strip_comments "$tmp" >"$tmp.c"
+  r="$(gpu_guard_state "$tmp.c")"
+  [ "$r" = "MISSING" ] || { echo "SELFCHECK: unguarded GPU gate read '$r', want MISSING" >&2; bad=1; }
+  # ...and the same gate WITH the guard must read render-node, so the case is not
+  # satisfied by a function that always says MISSING.
+  printf '. "$SCRIPT_DIR/_gate_precond.sh"\ngate_require_render_node || exit 2\n' >>"$tmp"
+  strip_comments "$tmp" >"$tmp.c"
+  r="$(gpu_guard_state "$tmp.c")"
+  [ "$r" = "render-node" ] || { echo "SELFCHECK: guarded GPU gate read '$r', want render-node" >&2; bad=1; }
+  # ...and a CPU gate must not be dragged into the device column at all.
+  printf 'echo hello\n' >"$tmp"
+  strip_comments "$tmp" >"$tmp.c"
+  r="$(gpu_guard_state "$tmp.c")"
+  [ "$r" = "not-gpu" ] || { echo "SELFCHECK: CPU gate read '$r', want not-gpu" >&2; bad=1; }
   rm -f "$tmp" "$tmp.c"
   return $bad
 }
@@ -178,8 +226,8 @@ selfcheck_classifier || {
 
 N_PASS=0; N_PARTIAL=0; N_SKIP=0
 
-printf '%-26s %-9s %-22s %-11s %s\n' GATE BUILD-GUARD PRECONDITION GRANULARITY 1-GPU-ARM
-printf '%s\n' "----------------------------------------------------------------------------------------"
+printf '%-26s %-9s %-22s %-11s %-12s %s\n' GATE BUILD-GUARD PRECONDITION GRANULARITY 1-GPU-ARM RENDER-NODE
+printf '%s\n' "-----------------------------------------------------------------------------------------------------"
 
 VIOLATIONS=0
 for f in $GATES; do
@@ -194,6 +242,8 @@ for f in $GATES; do
 
   # Precondition mechanism, from CODE.
   gran="$(granularity_of "$codefile")"
+  gran_raw="$gran"   # kept: the loop rewrites "none" to "-" for display, and the
+                    # NEEDS-GPU test below must see the CLASS, not the display form
   if [ "$gran" = "WHOLE-gate" ]; then
     precond="gate_require_gpus"
   elif [ "$gran" = "BROKEN" ]; then
@@ -213,12 +263,35 @@ for f in $GATES; do
   else
     arm="$(has_1gpu_arm "$codefile")"
   fi
-  rm -f "$codefile"
 
   if [ "$build" = "NONE" ]; then
     mark=" <-- NO BUILD GUARD"
     VIOLATIONS=$((VIOLATIONS + 1))
   else mark=""; fi
+
+  # --- NEEDS-GPU vs HAS-A-GUARD (the class AUDIT #15 closed) ------------------
+  # GRANULARITY conflates two different things: "this gate needs no device" and
+  # "this gate needs a device and forgot to say so". Both classify as "none",
+  # and on a healthy 1-GPU box both exit 0 -- so the distinction is invisible
+  # until the second GPU goes away, at which point the second kind goes RED and
+  # is indistinguishable from a regression.
+  #
+  # Re-derived here, not from a remembered list, so a newly added GPU gate is
+  # classified without anyone editing a table. That re-derivation is what found
+  # them: test_dpas_fold.sh (which said "needs a GPU" in a COMMENT and carried
+  # no guard), test_http_batch.sh and test_serve_load.sh (both launch the server
+  # `--gpu --tp 1`). All three passed here, which is exactly why the gap was
+  # invisible until the list was rebuilt from the gates themselves.
+  rnode="-"
+  if [ "$gran_raw" = "none" ]; then
+    rnode="$(gpu_guard_state "$codefile")"
+    if [ "$rnode" = "MISSING" ]; then
+      mark="$mark <-- NEEDS A GPU BUT HAS NO GUARD (goes red on a 0-GPU box)"
+      VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+  fi
+
+  rm -f "$codefile"
 
   # Accumulate the EXPECTED exit class for this gate, from source. This is what
   # makes the doc-tally reconciliation below possible without running anything.
@@ -241,8 +314,8 @@ for f in $GATES; do
     VIOLATIONS=$((VIOLATIONS + 1))
   fi
 
-  printf '%-26s %-9s %-22s %-11s %s%s\n' "$name" \
-    "$([ "$build" = NONE ] && echo "-" || echo yes)" "$precond" "$gran" "$arm" "$mark"
+  printf '%-26s %-9s %-22s %-11s %-12s %s%s\n' "$name" \
+    "$([ "$build" = NONE ] && echo "-" || echo yes)" "$precond" "$gran" "$arm" "$rnode" "$mark"
 done
 
 # --- DOC TALLY RECONCILIATION -----------------------------------------------

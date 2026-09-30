@@ -56,6 +56,26 @@ gate_gpu_count() {
   return 0
 }
 
+# The cheaper, stricter precondition: can this shell OPEN THE RENDER NODE at all?
+# Stricter than the sycl-ls count, because a missing libumf makes sycl-ls report
+# zero devices on a box whose GPUs are perfectly healthy -- the count would then
+# refuse coverage that would actually run. Opening the node is a direct syscall,
+# so it cannot be fooled by an adapter that failed to load.
+#
+# rc 0 = the node opened, 1 = cannot open. Exits 2 (SKIP) when it cannot, with
+# the same "this is BOX STATE" framing as gate_require_gpus. Callers that need a
+# device COUNT as well (the TP=2 arms) use both, never this alone.
+gate_require_render_node() {
+  if python3 -c "open('/dev/dri/renderD128','rb').close()" 2>/dev/null; then
+    return 0
+  fi
+  echo "SKIPPED: cannot open /dev/dri/renderD128 from this shell." >&2
+  echo "  BOX STATE, not a code failure. Nothing was verified and nothing" >&2
+  echo "  regressed. A GPU gate reaching this point NEEDS a device, so it must" >&2
+  echo "  skip rather than fail red -- see gate_inventory.sh's NEEDS-GPU column." >&2
+  exit 2
+}
+
 # $1 = required device count. Exits 2 (SKIP) unless that many are visible.
 gate_require_gpus() {
   local need="${1:-}" n

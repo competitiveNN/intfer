@@ -42,6 +42,16 @@
 #   M5 disable the per-arm NO-SKIP-REPORT check
 #      A per-arm guard that never records what it skipped is a silent skip
 #      wearing a per-arm hat. Must be caught.
+#   M7 disable the NEEDS-GPU-without-a-guard check
+#      GRANULARITY conflates "needs no device" with "needs a device and forgot to
+#      say so". Both classify as "none" and both exit 0 on a healthy box, so the
+#      gap is invisible until the GPUs go away -- and then the second kind goes
+#      RED. Found by RE-DERIVING the gate list instead of remembering it:
+#      test_dpas_fold.sh (which said "needs a GPU" in a COMMENT and carried no
+#      guard), test_http_batch.sh and test_serve_load.sh (both launch the server
+#      `--gpu --tp 1`). All three PASS on a 1-GPU box, which is exactly why the
+#      gap survived. They now carry a render-node guard, and this state is what
+#      stops the class reopening.
 #   M6 let a 0-GPU box exit 0 again
 #      The defect audit #14 actually shipped: gate_inventory did not source
 #      setvars, so sycl-ls was absent, the doc-tally skipped, and the script
@@ -103,6 +113,7 @@ elif grep -q 'gate_gpu_count' "$1"; then|M3 target: the elif that M3 starves
 grep -qE 'SKIPPED_(TP2|SUB)|PARTIAL' |||M5 target: NO-SKIP-REPORT check
 unplaceable require classified|M6a target: BROKEN self-check case (makes M1 observable)
 doc-tally: SKIPPED|M6b target: the 0-GPU loud-skip branch
+  if grep -qE 'renderD|gate_require_render_node' "$1"; then echo "render-node"; else echo "MISSING"; fi|M7 target: the NEEDS-GPU-without-a-guard verdict
 EOF
   if [ "$bad" != "0" ]; then
     cat >&2 <<'EOF'
@@ -113,7 +124,7 @@ EOF
 EOF
     return 1
   fi
-  echo "anchors: all 6 mutation targets found exactly once"
+  echo "anchors: all 7 mutation targets found exactly once"
   return 0
 }
 
@@ -130,7 +141,8 @@ emit_summary() {
   echo "  M4: the self-check expectations are load-bearing, not decorative"
   echo "  M5: a per-arm guard that never reports its skip is rejected"
   echo "  M6: a 0-GPU box is refused (exit 2), never a silent exit 0"
-  echo "  => all six mechanisms can fail the checker; none is untested."
+  echo "  M7: a GPU gate with NO guard is reported, not filed as 'needs no device'"
+  echo "  => all seven mechanisms can fail the checker; none is untested."
 }
 EXPECTED_SUMMARY="  M1: the line-start anchoring is OBSERVABLE (un-anchoring flips the BROKEN case)
   M2: classification reads CODE, not the gates' own prose comments
@@ -138,7 +150,8 @@ EXPECTED_SUMMARY="  M1: the line-start anchoring is OBSERVABLE (un-anchoring fli
   M4: the self-check expectations are load-bearing, not decorative
   M5: a per-arm guard that never reports its skip is rejected
   M6: a 0-GPU box is refused (exit 2), never a silent exit 0
-  => all six mechanisms can fail the checker; none is untested."
+  M7: a GPU gate with NO guard is reported, not filed as 'needs no device'
+  => all seven mechanisms can fail the checker; none is untested."
 
 # rc class -> 0 = MISSED (checker still passed), 1 = CAUGHT by the self-check,
 # 2 = CAUGHT by the loud-skip path, anything else = CAUGHT with an odd rc.
@@ -357,6 +370,12 @@ run_state M5 "disable the per-arm NO-SKIP-REPORT check" "CAUGHT-selfcheck" <<'PA
     printf '%s\n' "$code" | grep -qE 'ZZZ_NEVER_MATCHES' || {
 PATCH
 
+run_state M7 "disable the NEEDS-GPU-without-a-guard verdict" "CAUGHT-selfcheck" <<'PATCH'
+  if grep -qE 'renderD|gate_require_render_node' "$1"; then echo "render-node"; else echo "MISSING"; fi
+|||
+  if grep -qE 'renderD|gate_require_render_node' "$1"; then echo "render-node"; else echo "not-gpu"; fi
+PATCH
+
 # M6 is scored differently: it needs a STUB sycl-ls reporting no device, because
 # the defect is that a box the checker cannot see still exited 0. There is no
 # source to edit, which is why it gets its own runner.
@@ -402,7 +421,7 @@ if [ "$FAILED" = "0" ]; then
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "states=S0,M1,M2,M3,M4,M5,M6"
+    echo "states=S0,M1,M2,M3,M4,M5,M7,M6"
     echo "caught=$NC/$NC"
   } >"$STAMP" 2>/dev/null
   echo "GATE-INVENTORY MUTATION MATRIX: PASS ($NC/$NC mutations refused the checker)"
