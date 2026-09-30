@@ -177,7 +177,9 @@ fi
 echo
 if [ "$FAILED" = "0" ]; then
   echo "FOLD MUTATION MATRIX: PASS (5/5 states behaved as characterized)"
-  echo "  S1 invisible to readback / S4 invisible to contract => both checks required."
+  echo "  S1: readback stays GREEN (masked)  -> only the contract check sees it"
+  echo "  S4: contract stays GREEN (blind)   -> index + readback see it"
+  echo "  => no single check covers the class; all three are load-bearing."
   exit 0
 fi
 echo "FOLD MUTATION MATRIX: FAIL ($FAILED state(s) not as characterized)" >&2
