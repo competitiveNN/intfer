@@ -293,6 +293,13 @@ inline std::size_t fold_index_sfull(std::size_t m, uint32_t fold_stride,
   return m * (std::size_t)fold_stride + (std::size_t)nOp + (std::size_t)o;
 }
 // S0 half: the first nOp ints of the row block (INT2/G16 linearity split).
+//
+// THIS ONE HAS NO DEVICE COVERAGE ANYWHERE (mutation S6, audit #13). It is
+// called from exactly one place -- the u2/G16 split branch of quant_gemm_dpas48
+// -- and every device readback in the tree runs bits=4, i.e. the u4 path, which
+// reads only fold_index_sfull. Drop the row offset here and the device readback
+// stays GREEN; the probe's host-side index check is the only thing that fails.
+// Do not assume a device arm is covering this when you add one.
 inline std::size_t fold_index_s0(std::size_t m, uint32_t fold_stride,
                                  uint32_t o) {
   return m * (std::size_t)fold_stride + (std::size_t)o;
