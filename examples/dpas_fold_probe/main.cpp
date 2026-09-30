@@ -232,7 +232,7 @@ struct Case {
 // resolving stride=nOp reads fold_d[m+1], which alternates Sfull/S0 between
 // rows and so flips S for rows 1 and 3 by large, known amounts.
 bool check_reader_contract(sycl::queue& q, std::uint64_t& pairs,
-                           std::uint64_t& devs) {
+                           std::uint64_t& devs, std::uint64_t& bad) {
   bool ok = true;
 
   // ---- (1) writer/reader stride agreement ---------------------------
@@ -292,6 +292,7 @@ bool check_reader_contract(sycl::queue& q, std::uint64_t& pairs,
   std::vector<std::uint8_t> code;
   if (!intfer::gemm::repack_dpas412(row_codes.data(), N, K, 4, code)) {
     std::printf("  FAIL readback: repack_dpas412 refused N=%u K=%u\n", N, K);
+    ++bad;
     return false;
   }
 
@@ -305,6 +306,7 @@ bool check_reader_contract(sycl::queue& q, std::uint64_t& pairs,
   if (!code_d || !scale_d || !act_d || !as_d || !fold_d || !out_base ||
       !out_fold) {
     std::printf("  FAIL readback: alloc failed\n");
+    ++bad;
     return false;
   }
   std::memcpy(code_d, code.data(), code.size());
@@ -365,6 +367,10 @@ bool check_reader_contract(sycl::queue& q, std::uint64_t& pairs,
   sycl::free(code_d, q); sycl::free(scale_d, q); sycl::free(act_d, q);
   sycl::free(as_d, q); sycl::free(fold_d, q);
   sycl::free(out_base, q); sycl::free(out_fold, q);
+  // Fold these into the caller's violation count. Without this the one-line
+  // verdict could read "FAIL (... 0 violations)" — a self-contradictory line
+  // that makes a real failure look like a counting bug.
+  bad += cbad + rbad;
   return ok && (rbad == 0);
 }
 
@@ -485,7 +491,7 @@ int main() {
   // end-to-end arm can (the engine always sets both fields). Gate it here.
   std::printf("\n[dpas-fold-probe] reader/writer layout contract:\n");
   std::uint64_t rc_pairs = 0, rc_devs = 0;
-  if (!check_reader_contract(q, rc_pairs, rc_devs)) ok = false;
+  if (!check_reader_contract(q, rc_pairs, rc_devs, bad)) ok = false;
   checked += rc_pairs;
   devs += rc_devs;
 

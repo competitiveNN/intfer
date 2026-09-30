@@ -481,20 +481,46 @@ Implement features for maximizing throughput for concurrent requests, starting f
    regimes and demands bit-identical FP16 outputs. Activations are built so S0
    and Sfull are deterministically distinct, making a mis-stride catchable BY
    CONSTRUCTION rather than by luck.
-   MUTATION TABLE (each reverted, tree re-verified): default->nOp alone =>
-   contract FAIL(80) / readback pass (MASKED); no-validation alone => contract
-   FAIL / readback pass (MASKED); BOTH (the historical state) => contract FAIL
-   AND readback FAIL at 30/64 outputs. The readback alone would have missed
-   every single-half bug — which is why both checks stay.
+   MUTATION TABLE — each state applied and run IN ISOLATION from a clean
+   checkout, full output captured per state (an earlier draft asserted the
+   M2-alone row by inference; it was WRONG, corrected below, and S4 added
+   because the real question is whether the readback earns its place):
+     S0 clean            contract pass              readback pass          rc=0
+     S1 M1 default 2*nOp->nOp   contract FAIL(20)   readback PASS (masked) rc=1
+     S2 M2 no-validation       contract FAIL(30)   readback FAIL 30/64    rc=1
+     S3 M1+M2 (historical)     contract FAIL(42)   readback FAIL 30/64    rc=1
+     S4 reader index +nOp+o->+o contract PASS(BLIND) readback FAIL 60/64   rc=1
+   (S1)  = (fold_stride==0) ? nOp : fold_stride;  S2 = return usm;
+   (S3)  = both;  (S4) = corrupt the u4 reader index in quant_gemm_dpas48.
+   CORRECTION to the first writeup: M2 is NOT masked. With the default correct
+   but validation gone, the deliberately-too-small stride=1 regime is accepted
+   and mis-reads; that fail-closed regime is what catches it. Only M1 is masked
+   from the readback. S4 is the load-bearing one: corrupting the reader's index
+   EXPRESSION with the helpers untouched (contract 80/80 satisfied) changes
+   60/64 outputs. The contract check reasons about stride arithmetic and is
+   structurally BLIND to the kernel's indexing. => the two checks are NOT
+   redundant for OPPOSITE reasons: only the contract sees M1, only the readback
+   sees S4.
    ALSO FIXED: the probe printed its one-line PASS/FAIL verdict BEFORE the E4
    section ran, so a reader could see PASS and then a failure that flipped the
-   exit code; the verdict now prints last.
-   GATES (correctness only, load-insensitive, NO wall-time claim):
+   exit code; the verdict now prints last. And `bad` did not accumulate the
+   reader-contract failures, so a failing run printed the self-contradictory
+   "[dpas-fold-probe] FAIL (... 0 violations)" — the line now carries the real
+   count (S1=20, S2=31, S3=42, S4=2 as measured above).
+   GATES (correctness only, load-insensitive, NO wall-time claim): quant_gemm.hpp
+   is a SHARED header pulled in by intfer_gemm, so the audit enumerated the
+   consumers instead of stopping at the 4 that are obviously GPU-path:
    dpas_fold PASS, gpu_optin PASS (20/20 arms TP=1+TP=2), cpu_parity PASS,
-   http_batch PASS. LESSON: when a fix lands at ONE call site of a layout rule,
-   grep for the OTHER sites that re-derive it — and check whether any of them
-   document the wrong value as the contract, because a header that says
-   "0 => nOp" is worse than no header: it launders the bug into the API.
+   http_batch PASS, ga64_recip PASS, gguf_roundtrip PASS, oracle_equiv PASS,
+   serve_load PASS. (device_argmax/tp2_27b still unrunnable: 1-GPU box.)
+   LESSON: when a fix lands at ONE call site of a layout rule, grep for the
+   OTHER sites that re-derive it — and check whether any of them document the
+   wrong value as the contract, because a header that says "0 => nOp" is worse
+   than no header: it launders the bug into the API. SECOND LESSON, from the
+   bad first mutation table: do not generalize a row you did not run in
+   isolation. S2 was asserted from a run where M1 was still applied; measuring
+   it alone inverted the conclusion, and the S4 control then showed why BOTH
+   checks are needed instead of a hand-wave.
 
    === FULL 10-GATE SUITE ON THIS TREE — 9 PASS, 1 BLOCKED BY BOX STATE ===
    Re-run after test_dpas_fold.sh was added. PASS: cpu_parity, dpas_fold,
