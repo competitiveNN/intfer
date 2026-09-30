@@ -845,6 +845,67 @@ e.g. S3's contract column is 40 not 42).
    OVER-SKIP marker; 0-GPU box -> rc=2 loud; fold_report_counts rc=2 (stale
    stamp, as it should be); fold-matrix anchors-only rc=0; 39/39 scripts
    `bash -n` clean. No engine, quant or schedule code touched.
+  === 2026-09-30 AUDIT #15: THREE GPU GATES HAD NO DEVICE GUARD AT ALL ===
+  The follow-up audit to #14 asked one question AUDIT #8 had already answered
+  the hard way: is the instance list still right? #14 hardened the checker
+  without re-deriving what the checker checks. Re-deriving — from the gates
+  themselves, not from the 10 names the docs remembered — found three gates that
+  `gate_inventory.sh` had been reporting as precondition "none", counted in the
+  7 PASS, and which are 100% device-dependent:
+   test_dpas_fold.sh   runs dpas_fold_probe, whose 3 device readback regimes are
+     the whole point of the gate. It said "needs a GPU" in its HEADER COMMENT
+     (line 2) and carried no guard whatsoever — the comment was the entire
+     precondition. This is the sharpest instance of the class #14 found: a
+     comment read as a mechanism.
+   test_http_batch.sh  launches the server `--gpu --tp 1` (line 45).
+   test_serve_load.sh  launches the server `--gpu --tp 1` (line 62).
+  All three PASS on a 1-GPU box, which is exactly why the gap survived a day of
+  gate work: the failure is not visible until the second GPU goes away, at which
+  point they go RED and a red line is indistinguishable from a regression. The
+  old `sycl-ls | grep -c` render check in test_device_argmax.sh/test_gpu_optin.sh
+  is the same idiom these three lack.
+  ROOT CAUSE, precisely: gate_inventory's GRANULARITY column classified
+  "needs no device" and "needs a device and forgot to say so" IDENTICALLY, both
+  as "none". Two different things, one label, and on a healthy box both exit 0.
+   FIX. gate_require_render_node() in scripts/_gate_precond.sh, sibling of
+   gate_require_gpus, exits 2 (SKIP) with the same "BOX STATE, not a code
+   failure" framing. It is the STRICTER and more correct of the two
+   preconditions: a missing libumf makes sycl-ls report zero devices on a
+   perfectly healthy box, so a device COUNT would refuse coverage that would in
+   fact run, whereas opening /dev/dri/renderD128 is a direct syscall that no
+   failed adapter can fake. All three gates already sourced setvars.sh, so the
+   guard sits beside it. Verified BOTH directions with a stubbed python3: node
+   open -> rc=0 and the gates still pass; node unopenable -> each of the three
+   exits 2 with the loud message.
+   CLOSE THE CLASS, not the instance. gate_inventory gains a RENDER-NODE column
+   that re-derives GPU dependence from each gate's own code (--gpu / sycl-ls /
+   level_zero / xpu-smi / dpas_fold_probe) and fails a GPU gate carrying no
+   guard, so a newly added GPU gate cannot reopen this. M7 in
+   scripts/mutate_gate_inventory.sh proves it can fail, and M7's own history is
+   the argument: the FIRST M7 neutered the loop's `rnode="MISSING"` branch and
+   was scored MISSED, correctly, because every GPU gate on the real tree is
+   guarded so that branch is UNREACHABLE. Fixed by hoisting the verdict into
+   gpu_guard_state() and adding a self-check case that seeds an unguarded GPU
+   gate. That is the audit-#14 equivalent-mutation lesson recurring one level
+   down, and it was caught by the harness rather than argued about.
+   The doc tally is deliberately UNCHANGED at 7 PASS / 2 PARTIAL / 1 SKIPPED.
+   The render-node guard exits 2 only on a box with no device, so on a 1-GPU box
+   these three are the same rc=0 they always were: the guard is protective, not a
+   behaviour change. A tally that moved because a no-op guard was added would be
+   the same overclaim in a new place.
+   Matrix now 7/7 (M1–M5, M7 via the checker's self-check; M6 via its exit-2
+   path). No engine, quant or schedule code touched.
+  === TOOLING NOTE: THE BULK-EDIT TOOL LOST AN EDIT A THIRD TIME ===
+  The `gpu_guard_state()` function definition was inserted with the bulk edit
+  tool, which reported success; the four CALL SITES (written by a later
+  python3 patch) persisted while the DEFINITION did not, and the failure only
+  surfaced because the self-check I had just added exercised the function and
+  printed `gpu_guard_state: command not found`. AGENTS.md already records two
+  silent losses of the same kind. The generalisation: a tool reporting success
+  is not evidence the bytes are on disk, and a self-check that CALLS the new code
+  is what converts a silent loss into a loud one. Verify with grep for the
+  DEFINITION, not for its uses.
+
 
 
    THE FAILURE IS BOX STATE, NOT A REGRESSION — established, not assumed:
