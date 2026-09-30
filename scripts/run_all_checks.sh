@@ -83,8 +83,15 @@ echo "run_all_checks: tree clean, HEAD=$HEAD_SHORT"
 [ "${INTFER_QUICK:-0}" = "1" ] && echo "run_all_checks: INTFER_QUICK=1 -- checkers only, NO mutation matrices"
 
 # --- run a step, record its rc ---------------------------------------------
+# rc 2 from a step means UNPROVEN, not broken. fold_report_counts.sh exits 2 when
+# its stamp predates HEAD: "Nothing is wrong with the code; the EVIDENCE is about
+# an older tree." Reporting that as FAIL would be the exact doctrine violation this
+# repo audits for -- conflating missing evidence with a regression, so a red that
+# means "re-run the matrix" is indistinguishable from a red that means "fix the
+# code", and people learn to ignore both.
 RC_SUMMARY=""
 FAILED=0
+UNPROVEN=0
 step() { # $1 = label, rest = command
   local label="$1"; shift
   local log rc
@@ -92,12 +99,13 @@ step() { # $1 = label, rest = command
   printf '  %-34s ' "$label"
   "$@" >"$log" 2>&1
   rc=$?
-  if [ "$rc" -eq 0 ]; then
-    printf 'ok\n'
-  else
-    printf 'FAIL rc=%s (see %s)\n' "$rc" "$log"
-    FAILED=$((FAILED + 1))
-  fi
+  case "$rc" in
+    0) printf 'ok\n' ;;
+    2) printf 'UNPROVEN rc=2 (stale evidence, not a regression -- %s)\n' "$log"
+       UNPROVEN=$((UNPROVEN + 1)) ;;
+    *) printf 'FAIL rc=%s (see %s)\n' "$rc" "$log"
+       FAILED=$((FAILED + 1)) ;;
+  esac
   RC_SUMMARY="$RC_SUMMARY$(printf '%-34s %s\n' "$label" "rc=$rc")\n"
   return 0
 }
@@ -148,18 +156,21 @@ fi
 # --- verdict ----------------------------------------------------------------
 echo
 if [ "$FAILED" -ne 0 ]; then
-  echo "RUN ALL CHECKS: FAIL ($FAILED step(s) failed) -- a real regression." >&2
+  echo "RUN ALL CHECKS: FAIL ($FAILED step(s) FAILED) -- a real regression." >&2
+  [ "$UNPROVEN" -ne 0 ] && echo "  plus $UNPROVEN step(s) unproven (stale evidence)." >&2
   exit 1
 fi
-if [ "$STALE" -ne 0 ]; then
-  echo "RUN ALL CHECKS: $STAMP_COUNT stamp(s) checked, $STALE STALE for $HEAD_SHORT." >&2
-  echo "  Not a regression: the evidence simply does not cover this commit." >&2
+if [ "$STALE" -ne 0 ] || [ "$UNPROVEN" -ne 0 ]; then
+  echo "RUN ALL CHECKS: $STAMP_COUNT stamp(s) checked, $STALE STALE, $UNPROVEN step(s) unproven, for $HEAD_SHORT." >&2
+  echo "  NOT a regression: the evidence does not cover this commit. Nothing is" >&2
+  echo "  wrong with the code; the proof is just older than the tree." >&2
   echo "  Re-run the named matrix (or all of them) so its stamp names $HEAD_SHORT." >&2
   exit 2
 fi
 echo "RUN ALL CHECKS: PASS ($STAMP_COUNT stamp(s), all at $HEAD_SHORT)"
 echo "  every checker and matrix passed, and every enumerated stamp names HEAD."
-[ "${INTFER_QUICK:-0}" = "1" ] && \
-  echo "  NOTE: INTFER_QUICK=1 -- no matrix was re-run, so only pre-existing" && \
-  echo "  stamps were asserted. That is weaker than a full run: re-run without it."
+if [ "${INTFER_QUICK:-0}" = "1" ]; then
+  echo "  NOTE: INTFER_QUICK=1 -- no matrix was RE-RUN, so only pre-existing stamps"
+  echo "  were asserted. That is weaker than a full run: re-run without the flag."
+fi
 exit 0
