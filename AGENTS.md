@@ -25,9 +25,26 @@ single fact governs how every gate result in this file must be read:
   today's box is the same laundering failure in the other direction.
 - The correct present-tense sentence is: *"7 PASS, 2 PARTIAL, 1 SKIPPED; TP=2
   unverified pending a second GPU."* Anything shorter is an overclaim.
-- `scripts/gate_inventory.sh` prints the guard/precondition state of every
+- All 7 rc=0 gates were re-run after the audit #13 tooling/doc commits, to
+  confirm that pass was cosmetic-only (no engine source touched since ce2eb05):
+  ga64_recip, gguf_roundtrip, dpas_fold, cpu_parity, oracle_equiv, http_batch,
+  serve_load — all rc=0. The two TP=2-dependent gates and tp2_27b were not
+  re-run; their class is unchanged (still blocked on the second GPU).
   correctness gate from source, and flags a whole-gate skip on a gate that has
-  1-GPU arms (the audit #13 over-skip bug, made mechanically detectable).
+  1-GPU arms (the audit #13 over-skip bug, made mechanically detectable). It also
+  **reconciles the doc tallies**: it derives the expected
+  `N PASS / N PARTIAL / N SKIPPED` from each gate's own precondition plus the
+  visible device count, and fails if any tally in `AGENTS.md` or `reports/*.md`
+  disagrees — so "the docs said 8 instead of 7" is a build refusal now, not
+  something a reviewer has to notice. Mutation-tested both ways: reverting one
+  site to 8 gives rc=1, and making the tally regex match nothing gives rc=1 via
+  its own `sites_found=0` vacuity guard (which is not theoretical — the first
+  version of that regex was `^`-anchored, matched 0 sites, and cheerfully
+  reported "0 stale" while verifying nothing).
+  `scripts/fold_report_counts.sh` does the same job for the fold matrix table,
+  printing every cell from `build/fold_matrix/*.log` and naming the counting
+  basis, so the report's numbers cannot be silently transcribed onto the wrong
+  basis again. Both are read-only: no mutation, no GPU, no build.
 
 
 Stage 1.

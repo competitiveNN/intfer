@@ -266,6 +266,12 @@ output. Run it if you touch the fold layout. It refuses to start on a dirty
 tree, because it edits tracked files. `--anchors-only` is a <1s no-build
 pre-flight if you only need to know the harness still matches the tree.
 
+**And the report's table cells are readable, not transcribed:**
+`./scripts/fold_report_counts.sh` prints every cell of the S0-S6 table straight
+out of `build/fold_matrix/*.log`, with the counting basis stated (the two check
+columns vs the probe's separate aggregate — three different numbers under similar
+labels, which is how the table drifted before). Read-only, no GPU, no mutation.
+
 **Current result: 7/7 as characterized.** S5 and S6 were added in audit #13, and
 each is invisible to every check the others can see:
 

@@ -48,6 +48,8 @@ has_1gpu_arm() {
   return 1
 }
 
+N_PASS=0; N_PARTIAL=0; N_SKIP=0
+
 printf '%-26s %-9s %-22s %-11s %s\n' GATE BUILD-GUARD PRECONDITION GRANULARITY 1-GPU-ARM
 printf '%s\n' "----------------------------------------------------------------------------------------"
 
@@ -84,6 +86,14 @@ for f in $GATES; do
     VIOLATIONS=$((VIOLATIONS + 1))
   else mark=""; fi
 
+  # Accumulate the EXPECTED exit class for this gate, from source. This is what
+  # makes the doc-tally reconciliation below possible without running anything.
+  case "$gran" in
+    "-")         N_PASS=$((N_PASS + 1)) ;;
+    per-arm)     N_PARTIAL=$((N_PARTIAL + 1)) ;;
+    WHOLE-gate)  N_SKIP=$((N_SKIP + 1)) ;;
+  esac
+
   # THE INVARIANT: a whole-gate skip must not strand arms that would still run.
   if [ "$gran" = "WHOLE-gate" ] && [ "$arm" = "yes" ]; then
     mark="$mark <-- OVER-SKIP: 1-GPU arms stranded (audit #13)"
@@ -94,10 +104,93 @@ for f in $GATES; do
     "$([ "$build" = NONE ] && echo "-" || echo yes)" "$precond" "$gran" "$arm" "$mark"
 done
 
+# --- DOC TALLY RECONCILIATION -----------------------------------------------
+# Close the class, not the instance. During audit #13 this file's own docs
+# claimed "8 PASS, 2 PARTIAL, 1 SKIPPED" for a 10-gate suite -- a sum of 11,
+# produced by listing a PARTIAL gate's green inner sections alongside the gates
+# that really exited 0. A reviewer caught it. Nothing mechanical would have.
+#
+# The expected tally is DERIVED from the source classification above, so this
+# needs no gate run:
+#   no precondition          -> exits 0            -> PASS
+#   per-arm precondition     -> exits 2 on 1 GPU   -> PARTIAL (its 1-GPU arms run)
+#   whole-gate precondition  -> exits 2 on 1 GPU   -> SKIPPED (no 1-GPU arm)
+# With 2+ GPUs visible every gate would exit 0, so a doc still claiming
+# PARTIAL/SKIPPED is then stale in the other direction and this catches that too.
+echo
+. "$SCRIPT_DIR/_gate_precond.sh" 2>/dev/null
+NDEV="$(gate_gpu_count 2>/dev/null || echo 0)"
+DOCS="AGENTS.md $(ls reports/*.md 2>/dev/null)"
+
+if [ "${NDEV:-0}" -eq 0 ]; then
+  echo "doc-tally: SKIPPED (0 level_zero GPUs visible -- cannot derive the expected rc classes)."
+  echo "  Loud, not silent: a precondition that cannot see the box verifies nothing."
+  echo "  (This is the libumf LD_LIBRARY_PATH gotcha, not a code problem.)"
+else
+  if [ "$NDEV" -ge 2 ]; then EXP_PASS="$((N_PASS + N_PARTIAL + N_SKIP))"; EXP_PARTIAL=0; EXP_SKIP=0
+  else EXP_PASS="$N_PASS"; EXP_PARTIAL="$N_PARTIAL"; EXP_SKIP="$N_SKIP"; fi
+  echo "doc-tally: expected from source + $NDEV GPU(s) visible = ${EXP_PASS} PASS, ${EXP_PARTIAL} PARTIAL, ${EXP_SKIP} SKIPPED"
+  echo "           (PASS=$N_PASS no-precond, PARTIAL=$N_PARTIAL per-arm, SKIPPED=$N_SKIP whole-gate)"
+  # NOT ^-anchored. The tally appears mid-sentence in prose ("The correct
+  # present-tense sentence is: *7 PASS, ..."), so an anchored pattern matches
+  # NOTHING and this check reports "0 stale" while verifying zero sites -- the
+  # vacuous-gate trap, hit here for real. sites_found is asserted non-zero
+  # below so that can never pass again.
+  #
+  # Two false-positive classes had to be handled, both found by running it:
+  #   (1) HISTORICAL/QUOTED text that legitimately carries an old tally. Excluded
+  #       by two explicit markers ("audit-#", "COUNTING TRAP"). Excluded lines
+  #       are PRINTED and counted, so the exclusion cannot silently swallow the
+  #       corpus -- and the count is asserted below.
+  #   (2) A tally WRAPPED across two markdown lines ("7 PASS, 2 PARTIAL," then
+  #       "1 SKIPPED**"), which parses as SKIPPED=0. The next line is consulted
+  #       when PARTIAL is present but SKIPPED is not.
+  bad_tally=0; sites_found=0; excluded=0
+  for d in $DOCS; do
+    [ -f "$d" ] || continue
+    # ALL lines, so the wrap look-up below can reach a continuation line that
+    # does not itself match the tally regex (the "1 SKIPPED**" half never does).
+    mapfile -t ALL < "$d"
+    while IFS= read -r hit; do
+      [ -n "$hit" ] || continue
+      ln="${hit%%:*}"; txt="${hit#*:}"
+      p="$(printf '%s' "$txt"  | sed -nE 's/.*[^0-9]([0-9]+) PASS.*/\1/p')"
+      pa="$(printf '%s' "$txt" | sed -nE 's/.*, ([0-9]+) PARTIAL.*/\1/p')"
+      sk="$(printf '%s' "$txt" | sed -nE 's/.*, ([0-9]+) SKIPPED.*/\1/p')"
+      [ -n "$p" ] || continue
+      # (2) wrapped tally: pull SKIPPED off the FOLLOWING FILE LINE if absent.
+      if [ -n "$pa" ] && [ -z "$sk" ] && [ "$ln" -lt "${#ALL[@]}" ]; then
+        sk="$(printf '%s' "${ALL[$ln]}" | sed -nE 's/^[^0-9]*([0-9]+) SKIPPED.*/\1/p')"
+      fi
+      pa="${pa:-0}"; sk="${sk:-0}"
+      # (1) explicit, narrow exclusion for quoted/history text.
+      if printf '%s' "$txt" | grep -qE 'audit-#|COUNTING TRAP'; then
+        excluded=$((excluded + 1))
+        printf '           excl  %s:%s  %s\n' "$d" "$ln" "$(printf '%s' "$txt" | cut -c1-66)"
+        continue
+      fi
+      sites_found=$((sites_found + 1))
+      if [ "$p" = "$EXP_PASS" ] && [ "$pa" = "$EXP_PARTIAL" ] && [ "$sk" = "$EXP_SKIP" ]; then
+        printf '           ok    %s:%s  %s\n' "$d" "$ln" "$(printf '%s' "$txt" | cut -c1-66)"
+      else
+        printf '           STALE %s:%s  says %s/%s/%s, source implies %s/%s/%s\n' \
+          "$d" "$ln" "$p" "$pa" "$sk" "$EXP_PASS" "$EXP_PARTIAL" "$EXP_SKIP"
+        bad_tally=$((bad_tally + 1))
+      fi
+    done < <(grep -nE '[0-9]+ PASS, [0-9]+ PARTIAL|[0-9]+ PASS[^*]*$' "$d")
+  done
+  echo "           sites_found=$sites_found excluded_history=$excluded stale_tally_sites=$bad_tally"
+  VIOLATIONS=$((VIOLATIONS + bad_tally))
+  if [ "$sites_found" -eq 0 ]; then
+    echo "           <-- VACUOUS: matched 0 tally sites, so nothing was verified." >&2
+    VIOLATIONS=$((VIOLATIONS + 1))
+  fi
+fi
+
 echo
 if [ "$VIOLATIONS" = "0" ]; then
-  echo "GATE INVENTORY: OK (every gate builds its own target; no whole-gate skip strands 1-GPU arms)"
+  echo "GATE INVENTORY: OK (every gate builds its own target; no whole-gate skip strands 1-GPU arms; doc tallies reconcile)"
   exit 0
 fi
-echo "GATE INVENTORY: $VIOLATIONS PROBLEM(S) -- see the <-- markers above" >&2
+echo "GATE INVENTORY: $VIOLATIONS PROBLEM(S) -- see the <-- markers and STALE lines above" >&2
 exit 1
