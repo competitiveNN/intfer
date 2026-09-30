@@ -342,14 +342,27 @@ top. That is a known box state (AGENTS.md AUDIT #9/#11), not an engine bug, and
 not something to re-investigate: when both GPUs enumerate, the queue is ready.
 Do not use a loaded or 1-GPU window and do not report a number from one.
 
-**The two 2-GPU gates now SKIP instead of FAILing** (`scripts/_gate_precond.sh`,
-`gate_require_gpus 2`, wired into `test_device_argmax.sh` and
-`test_tp2_27b.sh`). This matters for reading a gate run: on a 1-GPU box those
-two exit **2 = SKIPPED**, loudly, and verify nothing. They do not exit 0 (which
-would claim coverage nobody got) and they do not exit 1 (which is
-indistinguishable from a real regression and trains everyone to ignore red).
-So a full run on this box reads **8 PASS, 2 SKIPPED** — and the two skips are
-waiting on the second GPU, not on missing work.
+**The 2-GPU-dependent gate arms now SKIP instead of FAILing** — and, since audit
+#13, they skip **per arm** rather than per gate (`scripts/_gate_precond.sh`).
+This matters for reading a gate run. On a 1-GPU box `test_device_argmax.sh` and
+`test_gpu_optin.sh` still run and still assert every arm that works on one GPU,
+skip only their `--tp 2` arms, and exit **2 = PARTIAL**; `test_tp2_27b.sh` has
+no 1-GPU arm at all and exits **2 = SKIPPED**. None exit 0 (which would claim
+coverage nobody got) and none exit 1 (indistinguishable from a real regression,
+and it trains everyone to ignore red gates). So a full run on this box reads
+**8 PASS, 2 PARTIAL, 1 SKIPPED**.
+
+Two things audit #13 corrected, both worth knowing before you touch these
+scripts:
+
+- A whole-gate `gate_require_gpus 2` was tried on `test_device_argmax.sh` and
+  was **wrong**. That gate is mostly 1-GPU; skipping all of it also dropped the
+  serve fence-lock test, which guards a crash that no stream gate can see. Skip
+  the arms, not the gate.
+- `test_gpu_optin.sh` was **never guarded at all** and was reporting a **false
+  PASS**: its assertions are stream-identity, so re-running "tp 2" as tp 1 on a
+  1-GPU box satisfied every one of them. A false pass is worse than the false
+  fail the precondition was introduced to remove.
 
 ### OUTSTANDING — blocked on the second GPU (do NOT report as done)
 
@@ -358,20 +371,21 @@ described as covered by them until they have actually run.
 
 | item | what is unverified | how to close it |
 |---|---|---|
-| `test_device_argmax.sh` | the whole gate: device-argmax correctness, spec-rollback, parts path — every `--tp 2` arm | `sycl-ls` must print 2 `[level_zero:gpu]` lines, then `bash scripts/test_device_argmax.sh` (expects rc=0) |
-| `test_tp2_27b.sh` | 27B TP=2 greedy decode vs oracle, and the ~19GB-vs-~12GB VRAM headroom claim | same condition, then `bash scripts/test_tp2_27b.sh` |
+| `test_device_argmax.sh` | only its 5 `--tp 2` arms (TP=2 base/flag identity, TP2 spec PARTS=0, TP2 spec streams). The TP=1 arms — including the serve fence lock — **do** run here | `sycl-ls` must print 2 `[level_zero:gpu]` lines, then `bash scripts/test_device_argmax.sh` (expects rc=0 instead of rc=2) |
+| `test_gpu_optin.sh` | only its whole `tp 2` pass (~14 arms). The `tp 1` pass **does** run here | same condition, then `bash scripts/test_gpu_optin.sh` (expects rc=0 instead of rc=2) |
+| `test_tp2_27b.sh` | everything: 27B TP=2 greedy decode vs oracle, and the ~19GB-vs-~12GB VRAM headroom claim | same condition, then `bash scripts/test_tp2_27b.sh` |
 | E1 / E2 / E3 A/Bs | every tok/s number in those sections | needs both GPUs *and* a quiet window (load1 < 2) |
 | E4 | unimplemented by design; no flag exists | pre-registered only, see above |
 
 If a future session cannot get a second GPU, the correct statement is
-"8 PASS, 2 SKIPPED, E1-E4 unmeasured" — **not** a partial pass and never a tok/s
-figure from a 1-GPU or loaded window.
+"8 PASS, 2 PARTIAL, 1 SKIPPED, E1-E4 unmeasured" — **not** a full pass, and
+never a tok/s figure from a 1-GPU or loaded window.
 
 ### Self-check for the fold matrix (run it after any refactor of that code)
 
 `bash scripts/mutate_fold_matrix.sh --anchors-only` is a <1s, no-build,
-no-mutation pre-flight that fails if any M1/M2/M4 mutation target has moved,
-duplicated or vanished, or if a read site has stopped routing through
+no-mutation pre-flight that fails if any M1/M2/M4/M5/M6 mutation target has
+moved, duplicated or vanished, or if a read site has stopped routing through
 `fold_index_sfull`/`fold_index_s0`. The full run stamps
 `build/fold_matrix/last_pass.stamp` with the HEAD sha it was proven against, so
 "the matrix passed" and "the matrix passed on THIS code" stay distinguishable.
