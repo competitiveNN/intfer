@@ -2546,9 +2546,13 @@ struct GpuBackend : public LinearBackend {
 // Closes the #ifdef INTFER_HAS_GPU_BACKEND opened at struct GpuBackend.
 #endif
 
-#ifdef INTFER_HAS_GPU_BACKEND
 // ---------------------------------------------------------------------------
 // SSM_GPU gate (all call sites go through this; never read the env directly).
+//
+// Deliberately OUTSIDE any #ifdef: this is pure getenv logic with no SYCL or
+// GPU dependency, and one call site (the step() arm at ~4985) sits outside
+// #ifdef INTFER_HAS_GPU_BACKEND, so a guarded definition would fail to
+// compile in a CPU-only build.
 //
 // INTFER_SSM_GPU=1 moves the LA SSM recurrence from the host loop to the
 // device kernel gemm::ssm_forward. The kernel runs the SAME loop order, but it
@@ -2588,6 +2592,7 @@ static bool ssm_gpu_allowed() {
   return env_on && !dpas48;
 }
 
+#ifdef INTFER_HAS_GPU_BACKEND
 // Shared SsmDev resolver for gpu_ssm_rows and the L4 fused path below:
 // resolve (alloc/upload on first use) the resident state entry for
 // (req, L), growing staging to `need` rows. Pure move of the logic that
@@ -4978,9 +4983,11 @@ static StepOut step(Request& req, int token, int pos,
       // ---- Device-side SSM (INTFER_SSM_GPU=1, GPU backend only) ----
       // Replaces the host scalar recurrence below with one FP32 SYCL
       // kernel over (n_v_heads x vd) work-items against the request's
-      // resident device state. Bit-identical math, same element order;
-      // the oracle token stream is the arbiter. Env-off (default) keeps
-      // the exact host path. No snapshots in step() => no mirror sync.
+      // resident device state. SAME loop order, but NOT bit-exact with the
+      // host loop (sycl::exp vs expf, FMA-contracted reductions -- see
+      // ssm_gpu_allowed() above for the measurement and for why this is
+      // refused under INTFER_DPAS48=1). Env-off (default) keeps the exact
+      // host path. No snapshots in step() => no mirror sync.
       static const bool ssm_gpu_env =
           ssm_gpu_allowed();
       bool ssm_done = false;
