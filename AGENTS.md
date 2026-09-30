@@ -746,6 +746,78 @@ e.g. S3's contract column is 40 not 42).
    what is
    unverified and how to close it: reports/2026-09-30-pending-bench-backlog.md,
    "OUTSTANDING — blocked on the second GPU".
+  === 2026-09-30 AUDIT #14: THE AUDIT-#13 CHECKER HAD A PROVEN FALSE
+  NEGATIVE, AND THE COUNTING HELPER CORRUPTED ITS OWN VALUE AT 0 GPUs ===
+  AUDIT #13 shipped scripts/gate_inventory.sh as the machine check that the
+  doc tallies and the skip shapes reconcile, plus the fold-matrix report cells
+  and the 7/7 stamp. Auditing that machinery found four defects, all in the
+  checkers — none in the engine, and the fold matrix itself still holds 7/7.
+   (1) THE HEADLINE INVARIANT HAD A FALSE NEGATIVE (proved by mutation, not
+   argued). Granularity was classified by grepping for the PRESENCE of
+   per-arm marker text (`HAVE_TP2|SKIPPED_TP2`), so a gate carrying a
+   top-level `gate_require_gpus 2` *while keeping* the per-arm machinery was
+   still read as "per-arm" — the exact audit-#13 defect, re-added, and
+   gate_inventory exited 0. Measured: RC=0 with the defect present, RC=1
+   after the fix. Root cause: a whole-gate skip was detected by the ABSENCE of
+   something, which is not a detection. Now derived from an actual
+   line-start `gate_require_gpus` statement.
+   (2) BOTH CLASSIFICATION COLUMNS READ PROSE, NOT CODE. test_device_argmax.sh's
+   ONLY `gate_require_gpus` occurrence is inside the comment explaining the
+   audit-#13 defect it must never re-introduce. So the PRECONDITION column
+   labelled it `gate_require_gpus` while it actually uses `gate_gpu_count`,
+   and reported test_gpu_optin.sh — the identical mechanism — under a
+   different name. Two gates, same shape, two labels, in the one column a
+   reader would act on. Every classification now runs on a comment-stripped
+   copy of the source.
+   (3) THE COUNTING HELPER CORRUPTED ITS OWN VALUE ON THE CASE IT EXISTS FOR.
+   `gate_gpu_count` was a bare `sycl-ls | grep -c`, and `grep -c` prints "0"
+   *and exits 1* when nothing matches. So every `n="$(gate_gpu_count || echo
+   0)"` captured the TWO-LINE string "0\n0" precisely when Level Zero reports no
+   device — the libumf LD_LIBRARY_PATH case the helper is written about. The
+   following `[ "$n" -ge 2 ]` printed `[: 0
+   0: integer expected`. The verdict survived by luck (a failed test is
+   non-zero) but gate_inventory's `NDEV -eq 0` loud-skip branch could never be
+   taken, so on the one box state it exists for it fell into the "GPUs are
+   visible, run the tally" path instead. Fixed at the source: the helper now
+   prints exactly one integer line and signals "could not count" by RETURN CODE
+   ONLY, never by text mixed into the value. Callers use `|| N_GPUS=0` (a
+   substitution failure), not `|| echo 0`.
+   (4) THE CHECKER EXEMPTED ITSELF FROM THE RULE IT ENFORCES, AND THE NEW
+   REPORT HAD NO PROVENANCE. gate_inventory.sh did not `source setvars.sh`
+   (every sibling gate does), so on a bare shell `sycl-ls` was absent, the count
+   was 0, the doc-tally check SKIPPED — and the script still exited 0. It now
+   sources setvars itself and, if it still cannot see a GPU, exits 2 (never 0).
+   Separately, scripts/fold_report_counts.sh printed "7/7 as characterized"
+   from logs stamped at a806ef3 while HEAD was ddea91d and 4b31d25 had touched
+   the very header five of the six mutations target: family 3 (stale artifact)
+   in a brand-new script. It now prints the stamp-vs-HEAD delta, names any
+   mutated file changed since, refuses the unqualified verdict, and exits 2.
+   The honest reading of that state: the cells are still VALID (4b31d25 was
+   comment-only, and `--anchors-only` re-proves the anchors still resolve) but
+   they are evidence for a806ef3, not for HEAD — a citation, not a guess.
+   MUTATION-TESTED, because the previous checker was not: 5/5 CAUGHT — (M1)
+   un-anchoring the line-start require test, (M2) dropping comment stripping,
+   (M3) reintroducing the stdin-consuming grep chain (the bug the classifier's
+   own first draft had, caught live on its first run), (M4) inverting a
+   self-check expectation, (M5) disabling the NO-SKIP-REPORT check. M1 is worth
+   naming: with comment-stripping in place it changes no verdict on the real
+   gates, i.e. an EQUIVALENT mutation — so a self-check case was added for an
+   unplaceable `gate_require_gpus` (wrapped in a helper) that the classifier
+   now reports as BROKEN rather than silently calling per-arm, which is what
+   makes the anchoring observable instead of decoration.
+   RE-RUN ON THIS TREE AFTER THE FIX (1 GPU, correctness only, no timing
+   claim): gate_inventory rc=0 with the tally actually RUNNING
+   (sites_found=8, 0 stale) and the corrected PRECONDITION column;
+   fold_report_counts rc=2 (stale stamp, as it should be); anchors-only rc=0;
+   the audit-#13 mutation re-added -> rc=1 with the OVER-SKIP marker; 0-GPU
+   box -> rc=2 loud; all 7 rc=0 gates PASS (ga64_recip, dpas_fold with 3 real
+   device readback regimes, gguf_roundtrip, cpu_parity, oracle_equiv,
+   http_batch, serve_load); gpu_optin rc=2 and tp2_27b rc=2 with the correct
+   skip messages; device_argmax ran its 1-GPU arms (killed on the timeout
+   here, which is the point — under the old whole-gate skip it would have
+   exited 2 in under a second and covered nothing). No engine, quant or
+   schedule code touched.
+
    THE FAILURE IS BOX STATE, NOT A REGRESSION — established, not assumed:
      GATE FAIL: hook fired on TP2 (40 lines)   [PARTS TP2 spec flag: 40, expect 0]
    The gate's TP2 arm asserts the argmax hook stays OFF under --tp 2, because

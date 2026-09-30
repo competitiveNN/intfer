@@ -30,22 +30,150 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT" || exit 1
 
+# Best-effort oneAPI env, so this checker can actually SEE the box. Its sibling
+# gates all `source setvars.sh` before counting; this script did not, and
+# without it sycl-ls is absent from PATH, the count is 0, and the doc-tally
+# check below skips -- silently, while the script still exited 0 (audit #14).
+# A checker that cannot see the box must not report success.
+if ! command -v sycl-ls >/dev/null 2>&1; then
+  if [ -r /opt/intel/oneapi/setvars.sh ]; then
+    set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u
+  fi
+fi
+
 GATES=$(ls scripts/test_*.sh 2>/dev/null | sort)
 [ -n "$GATES" ] || { echo "FAIL: no scripts/test_*.sh found" >&2; exit 1; }
 
-# Is there an arm that runs on a single GPU? Two shapes count:
-#   * a literal `--tp 1` / `--tp "$tp"` with tp pinned to 1
-#   * a loop or helper whose tp argument is only ever 1
-# We look for the explicit form plus a loop var, and report UNKNOWN rather than
-# guessing when neither is present.
-has_1gpu_arm() {
+# --- CODE vs COMMENT (audit #14) ---------------------------------------------
+# Both classification columns used to grep the RAW file. A gate's own explanatory
+# comments quote the very tokens being searched for, so the greps were reading
+# prose. Two live consequences, both measured:
+#   * test_device_argmax.sh's ONLY `gate_require_gpus` occurrence is inside the
+#     comment explaining the audit-#13 defect it must never re-introduce -- so
+#     the PRECONDITION column called it `gate_require_gpus` while it actually
+#     uses gate_gpu_count, and reported test_gpu_optin.sh (identical mechanism)
+#     under a DIFFERENT label.
+#   * a whole-gate skip was detected by the ABSENCE of per-arm marker text, so
+#     re-adding `gate_require_gpus 2 || exit 2` at top level WHILE KEEPING the
+#     per-arm machinery still classified as "per-arm" and this script exited 0.
+#     Verified: the checker's headline invariant had a proven false negative.
+#
+# So every classification now runs against a comment-stripped copy. `#` inside
+# strings/expansions is vanishingly rare in these gates, and an over-strip can
+# only ever REMOVE matches, which for these two columns fails toward "no
+# precondition detected" (a report) or toward flagging, never toward silence.
+strip_comments() { sed -e 's/[[:space:]]#.*$//' -e 's/^[[:space:]]*#.*$//' "$1"; }
+
+# WHOLE-GATE skip = a `gate_require_gpus` STATEMENT at the start of a line.
+# A per-arm guard calls gate_gpu_count and branches; it does not call
+# gate_require_gpus at all.
+#
+# Takes a FILE, not stdin. The first version piped the stream into `grep -q` and
+# then a second `grep -q` in the elif -- but `grep -q` exits as soon as it has
+# its verdict, consuming the whole stream, so the elif always saw an empty input
+# and every gate read as "none". The classifier self-check below caught that on
+# its first run, which is the argument for having it.
+#
+# BROKEN is a third answer, not a fallback: a `gate_require_gpus` that is NOT a
+# line-start statement (wrapped in a helper function, or a command substitution)
+# is a whole-gate skip this classifier cannot reason about. Calling that
+# "per-arm" would be exactly the false negative that let audit #13's defect
+# through, so it refuses to classify -- fail toward flagging.
+#
+# The anchoring and the comment-stripping are MUTUALLY COVERING, which is why the
+# anchoring needed its own case below to stop being untested decoration: measured,
+# un-anchoring the line-start test changes no verdict on the real gates once
+# comments are stripped, so a mutation that removes the anchor is EQUIVALENT and
+# would otherwise be unobservable.
+granularity_of() { # $1 = comment-stripped code file
+  if grep -qE '^[[:space:]]*gate_require_gpus[[:space:]]+[0-9]' "$1"; then
+    echo "WHOLE-gate"
+  elif grep -q 'gate_require_gpus' "$1"; then
+    echo "BROKEN"
+  elif grep -q 'gate_gpu_count' "$1"; then
+    echo "per-arm"
+  else
+    echo "none"
+  fi
+}
+
+# Is there an arm that runs on a single GPU? Looked for on the stripped stream.
+# Reports `yes` / `no` / `UNKNOWN` -- never guesses, and `UNKNOWN` on a
+# per-arm gate is itself a violation (an unclassified 1-GPU arm is exactly the
+# audit-#13 shape).
+has_1gpu_arm() { # $1 = comment-stripped stream file
   local f="$1"
-  grep -qE -- '--tp 1([^0-9]|$)' "$f" && return 0
-  # `ids_of 1`, `count_of 1`, `spec_steps`-style direct 1-arg calls
-  grep -qE '\b(ids_of|count_of|ids_of_tp) 1([^0-9]|$)' "$f" && return 0
-  # `for tp in $TPS` where TPS defaults to "1" -> the tp=1 pass is real
-  grep -qE '^TPS="1"$' "$f" && return 0
-  return 1
+  grep -qE -- '--tp 1([^0-9]|$)' "$f" && { echo yes; return 0; }
+  grep -qE '(ids_of|count_of|spec_steps|ids_of_tp) 1([^0-9]|$)' "$f" && { echo yes; return 0; }
+  grep -qE '^[[:space:]]*TPS="1"$' "$f" && { echo yes; return 0; }
+  echo no
+}
+
+# --- CLASSIFIER SELF-CHECK (behavioural, on a seeded temp gate) --------------
+# The invariant above had a proven false negative, so the classifier is now
+# itself gated: a synthetic gate reproducing the audit-#13 shape (top-level
+# require PLUS per-arm machinery -- the combination that fooled the old check)
+# must classify WHOLE-gate, and a per-arm gate must not. If this ever cannot
+# fail, it is the vacuous-check trap again and it will say so.
+selfcheck_classifier() {
+  local bad=0 tmp w p r
+  tmp="$(mktemp "${TMPDIR:-/tmp}/gate_inv_selfcheck.XXXXXX")"
+  # audit-#13 defect shape, verbatim in structure: whole-gate require retained
+  # while the per-arm machinery is still present.
+  cat >"$tmp" <<'GATE'
+. "$SCRIPT_DIR/_gate_precond.sh"
+gate_require_gpus 2 || exit 2
+N_GPUS="$(gate_gpu_count)" || N_GPUS=0
+HAVE_TP2=0; [ "$N_GPUS" -ge 2 ] && HAVE_TP2=1
+GATE
+  strip_comments "$tmp" >"$tmp.c"
+  w="$(granularity_of "$tmp.c")"
+  [ "$w" = "WHOLE-gate" ] || { echo "SELFCHECK: audit-#13 shape misread as '$w'" >&2; bad=1; }
+  # a real per-arm gate must NOT be read as whole-gate
+  cat >"$tmp" <<'GATE'
+. "$SCRIPT_DIR/_gate_precond.sh"
+N_GPUS="$(gate_gpu_count)" || N_GPUS=0
+HAVE_TP2=0; [ "$N_GPUS" -ge 2 ] && HAVE_TP2=1
+GATE
+  strip_comments "$tmp" >"$tmp.c"
+  p="$(granularity_of "$tmp.c")"
+  [ "$p" = "per-arm" ] || { echo "SELFCHECK: per-arm gate misread as '$p'" >&2; bad=1; }
+  # the real whole-gate gate must be seen as whole-gate
+  cat >"$tmp" <<'GATE'
+. "$SCRIPT_DIR/_gate_precond.sh"
+gate_require_gpus 2 || exit 2
+GATE
+  strip_comments "$tmp" >"$tmp.c"
+  r="$(granularity_of "$tmp.c")"
+  [ "$r" = "WHOLE-gate" ] || { echo "SELFCHECK: real whole-gate gate misread as '$r'" >&2; bad=1; }
+  # a PROSE mention of the token must not create a precondition (the bug)
+  cat >"$tmp" <<'GATE'
+# an earlier revision put a `gate_require_gpus 2 || exit 2` here, which was wrong
+. "$SCRIPT_DIR/_gate_precond.sh"
+N_GPUS="$(gate_gpu_count)" || N_GPUS=0
+GATE
+  strip_comments "$tmp" >"$tmp.c"
+  r="$(granularity_of "$tmp.c")"
+  [ "$r" = "per-arm" ] || { echo "SELFCHECK: comment text read as code ('$r')" >&2; bad=1; }
+  # A gate_require_gpus this classifier cannot place MUST NOT be silently called
+  # per-arm. This case is what makes the line-start anchoring observable: drop
+  # the anchor and it flips to WHOLE-gate, i.e. an equivalent mutation on the
+  # real gates becomes a caught one here.
+  cat >"$tmp" <<'GATE'
+. "$SCRIPT_DIR/_gate_precond.sh"
+need_tp2() { gate_require_gpus 2 || exit 2; }
+N_GPUS="$(gate_gpu_count)" || N_GPUS=0
+GATE
+  strip_comments "$tmp" >"$tmp.c"
+  r="$(granularity_of "$tmp.c")"
+  [ "$r" = "BROKEN" ] || { echo "SELFCHECK: unplaceable require classified '$r', want BROKEN" >&2; bad=1; }
+  rm -f "$tmp" "$tmp.c"
+  return $bad
+}
+selfcheck_classifier || {
+  echo "GATE INVENTORY: FAIL -- the classifier self-check failed, so the table below" >&2
+  echo "  proves nothing. Fix the classifier before trusting any row of it." >&2
+  exit 1
 }
 
 N_PASS=0; N_PARTIAL=0; N_SKIP=0
@@ -56,30 +184,36 @@ printf '%s\n' "-----------------------------------------------------------------
 VIOLATIONS=0
 for f in $GATES; do
   name="$(basename "$f")"
+  code="$(strip_comments "$f")"
+  codefile="$(mktemp "${TMPDIR:-/tmp}/gate_inv_code.XXXXXX")"
+  printf '%s\n' "$code" >"$codefile"
 
   # Build guard: report the ACTUAL cmake target, not just "yes".
-  target="$(sed -nE 's/^[[:space:]]*gate_require_build[[:space:]]+([A-Za-z0-9_]+).*/\1/p' "$f" | head -1)"
-  if [ -n "$target" ]; then build="-> $target"; else build="NONE"; fi
+  target="$(printf '%s\n' "$code" | sed -nE 's/^[[:space:]]*gate_require_build[[:space:]]+([A-Za-z0-9_]+).*/\1/p' | head -1)"
+  if [ -n "$target" ]; then build="yes"; else build="NONE"; fi
 
-  # Precondition mechanism, read from source.
-  if grep -q 'gate_require_gpus' "$f"; then
+  # Precondition mechanism, from CODE.
+  gran="$(granularity_of "$codefile")"
+  if [ "$gran" = "WHOLE-gate" ]; then
     precond="gate_require_gpus"
-  elif grep -q 'gate_gpu_count' "$f"; then
+  elif [ "$gran" = "BROKEN" ]; then
+    precond="gate_require_gpus(?)"
+  elif [ "$gran" = "per-arm" ]; then
     precond="gate_gpu_count"
+    # A per-arm gate that never records what it skipped is a silent skip wearing
+    # a per-arm hat: it would exit 0 on a 1-GPU box while claiming the shape.
+    printf '%s\n' "$code" | grep -qE 'SKIPPED_(TP2|SUB)|PARTIAL' || {
+      precond="$precond(NO-SKIP-REPORT)"; gran="BROKEN"; }
   else
     precond="none"
   fi
 
-  # Granularity: WHOLE-gate skip vs PER-ARM skip. This is the column that was
-  # wrong before, so it is derived, not pattern-matched.
-  if [ "$precond" = "none" ]; then
+  if [ "$gran" = "none" ]; then
     gran="-"; arm="-"
-  elif grep -qE 'HAVE_TP2|SKIPPED_TP2' "$f"; then
-    gran="per-arm"; arm="$(has_1gpu_arm "$f" && echo yes || echo "no?!")"
   else
-    # gate_require_gpus with no per-arm machinery => skips the whole script.
-    gran="WHOLE-gate"; arm="$(has_1gpu_arm "$f" && echo yes || echo no)"
+    arm="$(has_1gpu_arm "$codefile")"
   fi
+  rm -f "$codefile"
 
   if [ "$build" = "NONE" ]; then
     mark=" <-- NO BUILD GUARD"
@@ -92,6 +226,13 @@ for f in $GATES; do
     "-")         N_PASS=$((N_PASS + 1)) ;;
     per-arm)     N_PARTIAL=$((N_PARTIAL + 1)) ;;
     WHOLE-gate)  N_SKIP=$((N_SKIP + 1)) ;;
+    BROKEN)      # Two distinct unclassifiable shapes; both are violations and
+                 # both are counted as a violation, never quietly as a pass.
+                 N_PASS=$((N_PASS + 1)); VIOLATIONS=$((VIOLATIONS + 1))
+                 case "$precond" in
+                   *"(?)"*) mark="$mark <-- gate_require_gpus not a line-start statement: cannot classify" ;;
+                   *)       mark="$mark <-- per-arm guard that never reports the skip" ;;
+                 esac;;
   esac
 
   # THE INVARIANT: a whole-gate skip must not strand arms that would still run.
@@ -118,14 +259,22 @@ done
 # With 2+ GPUs visible every gate would exit 0, so a doc still claiming
 # PARTIAL/SKIPPED is then stale in the other direction and this catches that too.
 echo
-. "$SCRIPT_DIR/_gate_precond.sh" 2>/dev/null
-NDEV="$(gate_gpu_count 2>/dev/null || echo 0)"
+. "$SCRIPT_DIR/_gate_precond.sh"
+# `|| NDEV=0`, and stderr is NOT redirected: the helper's "cannot count" note is
+# the only thing distinguishing "box has no GPU" from "we cannot see the box"
+# (audit #14). A 0 here must not be silently indistinguishable from a failure to
+# measure.
+NDEV="$(gate_gpu_count)" || NDEV=0
 DOCS="AGENTS.md $(ls reports/*.md 2>/dev/null)"
 
-if [ "${NDEV:-0}" -eq 0 ]; then
-  echo "doc-tally: SKIPPED (0 level_zero GPUs visible -- cannot derive the expected rc classes)."
+if [ "${NDEV:-0}" -lt 1 ]; then
+  echo "doc-tally: SKIPPED (${NDEV} level_zero GPU(s) visible -- cannot derive the expected rc classes)."
   echo "  Loud, not silent: a precondition that cannot see the box verifies nothing."
-  echo "  (This is the libumf LD_LIBRARY_PATH gotcha, not a code problem.)"
+  echo "  (This is the libumf LD_LIBRARY_PATH gotcha, or setvars not sourced --"
+  echo "   not a code problem. Source /opt/intel/oneapi/setvars.sh and re-run.)"
+  echo "  EXIT 2 (SKIP), never 0: an OK line here would claim a reconciliation"
+  echo "  that was never performed."
+  exit 2
 else
   TALLY_RAN=1
   if [ "$NDEV" -ge 2 ]; then EXP_PASS="$((N_PASS + N_PARTIAL + N_SKIP))"; EXP_PARTIAL=0; EXP_SKIP=0
@@ -190,14 +339,19 @@ fi
 
 echo
 if [ "$VIOLATIONS" = "0" ]; then
-  # Do NOT claim the doc tallies reconciled when that check declined to run. An
-  # OK line reading "reconcile" after a SKIP is the same overclaim this script
-  # exists to catch, in the script's own voice.
-  if [ "${TALLY_RAN:-0}" = "1" ]; then
-    echo "GATE INVENTORY: OK (every gate builds its own target; no whole-gate skip strands 1-GPU arms; doc tallies reconcile)"
-  else
-    echo "GATE INVENTORY: OK on guards/granularity; DOC TALLY CHECK DID NOT RUN (see the SKIPPED note above)"
+  # The OK line may claim a reconciliation ONLY because reaching this line
+  # requires the tally to have run: the 0-GPU path exits 2 above, so there is no
+  # longer a branch in which a skip can print "doc tallies reconcile". Kept as
+  # an explicit assertion anyway, so a future edit that reintroduces a soft
+  # skip cannot also reintroduce the overclaim.
+  if [ "${TALLY_RAN:-0}" != "1" ]; then
+    echo "GATE INVENTORY: BUG -- reached the OK line with the tally unrun" >&2
+    exit 1
   fi
+  echo "GATE INVENTORY: OK (every gate builds its own target; no whole-gate skip strands 1-GPU arms; doc tallies reconcile)"
+  echo "  NOTE what 'reconcile' means: the doc NUMBERS agree with what the source"
+  echo "  classification predicts for this box's GPU count. It is not a re-run of"
+  echo "  the gates, so it cannot detect a gate that is green-numbered but red."
   exit 0
 fi
 echo "GATE INVENTORY: $VIOLATIONS PROBLEM(S) -- see the <-- markers and STALE lines above" >&2

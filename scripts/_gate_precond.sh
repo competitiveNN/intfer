@@ -25,12 +25,35 @@
 # makes sycl-ls report ZERO devices (memory: sycl_env_libumf.md), so a 0 here
 # means "cannot verify" and skips rather than passing.
 
+# Prints EXACTLY ONE integer line, and the return code carries the distinction:
+#   0 = counted successfully (the integer may legitimately be 0)
+#   1 = could NOT count (sycl-ls unavailable); stdout is EMPTY
+#
+# WHY THE SHAPE MATTERS (audit #14). The previous body was a bare
+# `sycl-ls | grep -c`. `grep -c` prints "0" AND exits 1 when nothing matches, so
+# every caller's `n="$(gate_gpu_count || echo 0)"` captured the TWO-LINE string
+# "0\n0" on exactly the case this helper exists to handle: sycl-ls present,
+# Level Zero reporting no device (the libumf LD_LIBRARY_PATH failure, memory
+# sycl_env_libumf.md). The following `[ "$n" -ge 2 ]` then printed
+# `[: 0
+# 0: integer expected` to stderr. The verdict came out right by accident -- a
+# failed test is non-zero -- but gate_inventory's `NDEV -eq 0` loud-skip branch
+# could never be taken, so on the one box state it exists for it silently fell
+# into the "GPUs are visible, run the tally" path instead.
+#
+# So: the number goes to stdout as one clean line, and "could not count" is
+# signalled ONLY by rc, never by text mixed into the value. Callers should use
+# `N="$(gate_gpu_count)" || N=0` -- NOT `|| echo 0`, which cannot distinguish a
+# failed substitution from a failed count.
 gate_gpu_count() {
   if ! command -v sycl-ls >/dev/null 2>&1; then
     echo "SKIP: sycl-ls not on PATH; cannot count GPUs" >&2
     return 1
   fi
-  sycl-ls 2>/dev/null | grep -c "\[level_zero:gpu\]"
+  local n
+  n="$(sycl-ls 2>/dev/null | grep -c "\[level_zero:gpu\]")" || true
+  printf '%s\n' "${n:-0}"
+  return 0
 }
 
 # $1 = required device count. Exits 2 (SKIP) unless that many are visible.

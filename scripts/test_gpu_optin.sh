@@ -55,7 +55,11 @@ set -u
 # runnable here, so the guard drops tp=2 only, and the verdict reports the lost
 # coverage with exit 2.
 . "$SCRIPT_DIR/_gate_precond.sh"
-N_GPUS="$(gate_gpu_count || echo 0)"
+# `|| N_GPUS=0`, not `|| echo 0`: see the identical note in
+# test_device_argmax.sh (audit #14 -- `|| echo 0` produced a two-line "0\n0"
+# whenever sycl-ls saw no device, and stderr stays visible so a failed COUNT is
+# distinguishable from a counted zero).
+N_GPUS="$(gate_gpu_count)" || N_GPUS=0
 HAVE_TP2=0; [ "${N_GPUS:-0}" -ge 2 ] && HAVE_TP2=1
 SKIPPED_TP2=0
 TPS="1"

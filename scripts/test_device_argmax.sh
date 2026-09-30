@@ -74,7 +74,11 @@ set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 set -u
 . "$SCRIPT_DIR/_gate_precond.sh"
-N_GPUS="$(gate_gpu_count || echo 0)"
+# `|| N_GPUS=0`, not `|| echo 0`: the count is a bare integer and a FAILED COUNT
+# must be a substitution failure, not text appended to a value (audit #14 --
+# `|| echo 0` produced a two-line "0\n0" whenever sycl-ls saw no device, and the
+# following `-ge 2` printed an "integer expected" error to stderr).
+N_GPUS="$(gate_gpu_count)" || N_GPUS=0
 HAVE_TP2=0; [ "${N_GPUS:-0}" -ge 2 ] && HAVE_TP2=1
 SKIPPED_TP2=0
 if [ "$HAVE_TP2" = 1 ]; then
