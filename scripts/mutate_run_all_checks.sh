@@ -187,6 +187,13 @@ STEPS="$SYNTH/steps"; mkdir -p "$STEPS"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$STEPS/step_ok"
 printf '#!/usr/bin/env bash\nC="%s/step_flaky2.count"\nn=$(cat "$C" 2>/dev/null || echo 0)\necho $((n+1)) >"$C"\n[ "$n" -eq 0 ] && exit 2\nexit 0\n' "$SYNTH" >"$STEPS/step_flaky2"
 printf '#!/usr/bin/env bash\n: >"%s/step_sentinel.ran"\nexit 0\n' "$SYNTH" >"$STEPS/step_sentinel"
+# N-G/N-I: a step that leaves residue DURING the run. It has to be the STEP that
+# litters, not the harness: the end-of-run check is a diff against a snapshot
+# taken before step 1, so a file the harness created beforehand is present in
+# both snapshots and correctly reads as "not left behind". That first version
+# of the N-G baseline scored rc=0 for exactly that reason -- the case was broken,
+# and the baseline caught it.
+printf '#!/usr/bin/env bash\nprintf "litter\\n" >"\${INTFER_RAC_LITTER:?no litter path}"\nexit 0\n' >"$STEPS/step_litter"
 # N-H: unproven on the FIRST pass, a REAL failure on the re-run. The only
 # shape that distinguishes "missing evidence" from "a regression appeared while
 # we were re-measuring", and therefore the only shape that exercises the
@@ -233,11 +240,10 @@ run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
   # and `git add -N` makes the file intent-to-add, which counts as staged dirt --
   # so the START guard rejected it first and the residue assertion was never
   # reached. Untracked means untracked.
-  [ -n "$residue" ] && printf 'residue\n' >"$litter"
   # INTFER_BUILD_DIR is redirected so the mutant's lock is not the outer run's.
   INTFER_BUILD_DIR="$SYNTH/inner" \
   INTFER_RUN_ALL_STEPS="$steps" INTFER_RUN_ALL_EXTRA_STEPS_DIR="$STEPS" \
-    INTFER_RUN_ALL_STAMP_DIR="$sdir" \
+    INTFER_RUN_ALL_STAMP_DIR="$sdir" INTFER_RAC_LITTER="$litter" \
     timeout 600 bash "$MUTANT" >"$WORK/$id.log" 2>&1
   local rc=$?
   rm -f "$RESIDUE_PROBE" "$ROOT_PROBE"
@@ -305,12 +311,12 @@ baseline "N-D" "step_sentinel" "$ALL_CURRENT" 1 "uncommitted changes"
 git -C "$SB" reset -q -- "$PROBE"; rm -f "$PROBE"
 baseline "N-E" "step_ok"     "$ALL_CURRENT" 0 ""                              # self-check passes
 baseline "N-F" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"       # re-run works
-baseline "N-G" "step_ok"     "$ALL_CURRENT" 1 "untracked residue left behind" yes
+baseline "N-G" "step_litter" "$ALL_CURRENT" 1 "untracked residue left behind" yes
 baseline "N-H" "step_escalate" "$ALL_CURRENT" 1 "REGRESSED rc=1"
 # The litter goes to the sandbox ROOT, and the baseline must prove the check
 # still sees it there -- otherwise N-I's predicate would be satisfied by a run
 # that never littered anything.
-baseline "N-I" "step_ok"     "$ALL_CURRENT" 1 "untracked residue left behind" yes root
+baseline "N-I" "step_litter" "$ALL_CURRENT" 1 "untracked residue left behind" yes root
 # N-J: an undispatched matrix dropped into scripts/. COMMITTED, so the run's own
 # residue diff cannot be what fails -- only the coverage check can.
 printf '#!/usr/bin/env bash\nexit 0\n' >"$DUMMY"; chmod +x "$DUMMY"
@@ -451,7 +457,7 @@ run_state "N-F" "re-run block present but its set derivation is broken" def_n_f 
 reset_mutant
 patch_literal "$MUTANT" "$A_RESIDUE" 'RESIDUE=""'
 verify_patched N-G
-run_state "N-G" "end-of-run tree-hygiene assertion deleted" def_n_g "step_ok" "$ALL_CURRENT" "" "yes"
+run_state "N-G" "end-of-run tree-hygiene assertion deleted" def_n_g "step_litter" "$ALL_CURRENT" "" "yes"
 
 # N-H: the exact pre-fix 2b fail arm -- success/failure only, FAILED left at 0.
 reset_mutant
@@ -464,7 +470,7 @@ reset_mutant
 patch_literal "$MUTANT" "$A_RESIDUE" \
   "RESIDUE=\"\$(git status --porcelain --untracked-files=all -- scripts/ | grep -v '^ M' || true)\""
 verify_patched N-I
-run_state "N-I" "residue diff narrowed back to scripts/" def_n_i "step_ok" "$ALL_CURRENT" "" "yes" "root"
+run_state "N-I" "residue diff narrowed back to scripts/" def_n_i "step_litter" "$ALL_CURRENT" "" "yes" "root"
 
 # N-J: the coverage enumeration neutered; the undispatched dummy must be missed.
 reset_mutant
