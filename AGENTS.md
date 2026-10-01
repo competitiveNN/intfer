@@ -194,6 +194,13 @@ matrix, and the shared patch helper — all dispatched steps of
     `mutate_run_all_checks.sh` have no same-named checker because they check
     OTHER files, and flagging them produced three false alarms on a healthy
     tree. A check that cries wolf is the mirror defect.
+    *** NO TOTAL IS QUOTED HERE, ON PURPOSE. *** Per "every hand-counted total
+    is a citation", the checker/matrix counts are DERIVED at run time and
+    deliberately not transcribed into prose -- a number written here goes stale
+    the moment a script is added. Re-derive on demand:
+        scripts/check_checker_matrix_coverage.sh
+    It enumerates `check_*.sh` and `mutate_*.sh` (the same population
+    run_all_checks.sh section 0b uses) and exits 1 on any drift.
   - `scripts/mutate_checker_matrix_coverage.sh` — its matrix, 3/3. Each state
     does BOTH things: it plants a checker with no matrix in the sandbox tree AND
     removes the requirement that would catch it. Weakening alone is
