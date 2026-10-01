@@ -239,8 +239,20 @@ matrix, and the shared patch helper — all dispatched steps of
   that card1 was dropped because its VRAM BAR is smaller than its VRAM
   (`IoctlHelperXe::isSmallBarConfigAllowed()` returns false; upstream #905). A
   plain rebind fixed it, so that was NOT the cause — it was driver state. The
-  `min/max_freq` ECANCELED refutation (non-gating path) still stands. Treat a
-  recurrence as driver-state first, BARs only if a rebind stops working.
+  `min/max_freq` ECANCELED refutation (non-gating path) still stands.
+  ==> **RUNBOOK IF IT DROPS AGAIN — DRIVER STATE FIRST.** A plain rebind of the
+  missing card fixed it; nothing about the hardware, driver-library version,
+  cgroup, NUMA, power or BAR sizes had to change.
+    1. `scripts/gpu_recover.sh diag` — read-only. Confirms BOTH cards are still
+       xe-bound and that only the ENUMERATION dropped. A card that is unbound
+       needs a rebind and nothing else.
+    2. `sudo scripts/gpu_recover.sh rebind` — unbind + rebind, recording the PCI
+       `resource` layout before and after, then `verify`. **This is what worked.**
+    3. `verify`: 0 = 2 devices, 1 = MEASURED 1 device, 2 = UNMEASURABLE. A box
+       that cannot count its devices is not a box with one device.
+  *** DO NOT LEAD WITH THE BAR THEORY. *** Small BAR is a real drop path in
+  compute-runtime and worth knowing, but it was NOT this failure — a rebind
+  fixed it with no BAR change. Investigate BARs only if a rebind stops working.
 - **Current full-suite result: 10 PASS, 0 PARTIAL, 0 SKIPPED** (rc = 0 for all
   ten). The ten gates: `cpu_parity`, `device_argmax`, `dpas_fold`, `ga64_recip`,
   `gguf_roundtrip`, `gpu_optin`, `http_batch`, `oracle_equiv`, `serve_load`,

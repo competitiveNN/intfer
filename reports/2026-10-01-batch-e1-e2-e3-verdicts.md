@@ -671,3 +671,62 @@ the command that produces it rather than in prose.
 | `10b17a3` | `bench_reports_batch.sh`'s LOG path honored the override — found by the new consumer checker, not by reading |
 | `6b1bf32` | closed AUDIT #8 from the CMake source of truth; added `check_doc_counts.sh` and a behavioural self-check to `check_e2_ctx.sh`; wired all three into the suite |
 | `2442361` | derived the leak assertion's `known_dirs` from each matrix's own path assignment instead of hand-listing it; `check_doc_counts.sh` gained a STALE-vs-wrong distinction |
+
+---
+
+## 2026-10-01 (later, after the rebind): 27B at --tp 2, load-insensitive counters
+
+The rebind restored the second GPU, so the arms below ran on the actual target for
+the first time. **27B shards: 9375 MiB per device, `GPU backend: 2 device(s)
+(TP=sharded)`.** Counters only -- the box was contended (load1 5.05 / 8.13 /
+10.05), so **no tok/s is claimed**; `RESULT:` stays blank for wall-time.
+
+Decode, 64 tokens, 27B `--tp 2`. `kernel` is device-side event time; `copy`,
+`usm_write` and `readback` are host-side and are NOT load-insensitive.
+
+| arm | nk | nw | nr | kernel (device) | copy | usm_write | readback |
+|---|---|---|---|---|---|---|---|
+| **E1** BASE | 63488 | 63488 | 16384 | 16387.2 ms | 11.7 ms | 3108.5 | 3018.7 |
+| E1 DPAS48 | 94208 | 63488 | 22528 | 18214.5 ms | 2559.2 ms | 1618.6 | 3073.3 |
+| E1 +PREQ | 124928 | 63488 | 22528 | 18197.7 ms | 2506.5 ms | 1683.8 | 3503.3 |
+| **E2** BASE | 63488 | 63488 | 16384 | 16398.1 ms | 11.8 ms | 3024.8 | 3031.4 |
+| E2 +KV | 63488 | 63488 | 16384 | 16390.4 ms | 11.8 ms | 3071.5 | 2957.3 |
+| E2 +KVQ8+HAD | 63488 | 63488 | 16384 | 16380.2 ms | 12.1 ms | 3035.2 | 2928.2 |
+| **E3** BASE | 63488 | 63488 | 16384 | 16392.5 ms | 11.5 ms | 3025.0 | 3032.6 |
+| E3 DPAS48 | 94208 | 63488 | 22528 | 18215.9 ms | 2522.8 ms | 1661.8 | 3282.8 |
+| E3 +FOLD | 116736 | 63488 | 22528 | **17884.1 ms** | 2835.1 ms | 1652.8 | 3055.6 |
+| E3 +FOLD+PREQ | 147456 | 63488 | 22528 | **17868.1 ms** | 2521.8 ms | 1725.5 | 3542.8 |
+
+### Stream identity at 27B (the gate before any timing)
+
+    E1  BASE == DPAS48 == PREQ   11751 13 198 760 6511 314 9338 369
+    E2  BASE == KV == KVQ8      11751 13 198 760 6511 314 9338 369
+    E3  FOLD == DPAS48, FOLDPREQ == DPAS48
+
+**E1's invariant holds at 27B** (`PREQ == DPAS48`), which is the point of the
+experiment. Note E1 `BASE == DPAS48` here, where at 0.8B BASE differed -- the
+INT8/GA64 act-quant does not change this prompt's argmax at 27B. That is a
+property of the prompt, not evidence that DPAS48 is a no-op.
+
+### What the counters say, per experiment
+
+* **E3 `FOLD` is the only positive device-side delta, and it REPLICATES at 27B.**
+  18215.9 -> 17884.1 ms = **-1.8%** kernel for **+22528 launches** (352/token),
+  with `nw`/`nr` **unchanged** -- the dep-chain design scales. The 0.8B figure was
+  -1.5% and the report's own claim -1.6%; three independent scales now agree.
+  **KEEP, default-OFF** -- still the only candidate with positive evidence.
+* **E1 `PREQ` does not pay at 27B either.** It recovers only ~53 ms of `copy`
+  against DPAS48 while adding **+30720 launches** (480/token) and 16.8 ms of
+  kernel. The theory it was built for (host act-quant dominating) does not
+  dominate at this scale: DPAS48's `copy` is 2559 ms out of a ~29 s decode, and
+  PREQ removes almost none of it because AUDIT #3/#5 deliberately KEPT the host
+  O(M*K) max-abs reduction. **DO NOT PROMOTE.**
+* **E2 `KV`/`KVQ8` remain launch-neutral** (`nk`/`nw`/`nr` byte-identical), kernel
+  flat within ~18 ms, `usm_write` marginally UP and `readback` marginally DOWN.
+  No traffic is actually reduced. **DO NOT PROMOTE.**
+
+### Still outstanding
+
+Wall-time (`RESULT:` lines) needs a quiet box, load1 < 2, 3+ interleaved rounds.
+What is now ANSWERED at 27B TP=2 is identity + counters + launch accounting; what
+is NOT answered is whether any of it converts to tok/s.

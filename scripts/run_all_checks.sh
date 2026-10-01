@@ -196,6 +196,13 @@ dispatch() { # $1 = label -> runs it
       # asserts the enumerated stamp-DIRECTORY set is unchanged, so its own
       # artefacts cannot join the population step 3/3 compares.
       timeout 1800 bash "$SCRIPT_DIR/mutate_gpu_recover.sh"; return $? ;;
+    mutate_fold_report_class.sh)
+      # Removes one EXPECTED DIRECTION from the classifier check. Per AUDIT #21
+      # the states cannot weaken the CHECKER here -- every artifact it drives is
+      # correct by construction, so that would score MISSED for free. They break
+      # the expectation instead, so a direction the checker quietly stopped
+      # testing must show up as a missing ok line.
+      timeout 1800 bash "$SCRIPT_DIR/mutate_fold_report_class.sh"; return $? ;;
     mutate_gate_enum.sh)
       # Patches SANDBOX COPIES under the build tree, never scripts/, so a
       # mutated helper cannot leak into a later glob of that directory.
@@ -358,7 +365,7 @@ else
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh"
 fi
 echo "== 1/2 checkers =="
 for label in $STEPS; do step "$label"; done
