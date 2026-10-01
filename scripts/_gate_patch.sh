@@ -24,7 +24,22 @@
 #         patch_literal <file> <exact-old> <exact-new>
 #         verify_patched <file> <marker>        # marker absent -> syntax error
 #         residue_scan <root> <marker>...       # fail if any marker survives
-patch_literal() { # $1 = file, $2 = exact old text, $3 = exact new text
+patch_literal() {
+  # *** EXACTLY THREE ARGUMENTS: file, exact-old, exact-new. *** Asserted, not
+  # assumed. This helper was called with FIVE by a matrix author who passed one
+  # single-quoted string per LINE of a two-line case, expecting them to
+  # concatenate. They do not: each quoted string is a separate ARGUMENT, so the
+  # helper replaced the first line with the second, wrote no mutation marker,
+  # and returned SUCCESS -- five states reporting "PATCH VERIFY FAIL" with no
+  # error anywhere. Found only with `bash -x`.
+  # A single-quoted bash string MAY span lines: put the newline INSIDE one
+  # argument rather than adding arguments.
+  if [ "$#" -ne 3 ]; then
+    echo "patch_literal: expected 3 args (file, exact-old, exact-new), got $#" >&2
+    echo "  Patching a MULTI-LINE block? Put the newline INSIDE ONE single-quoted" >&2
+    echo "  argument -- do NOT pass one quoted string per line." >&2
+    return 2
+  fi
   python3 - "$1" "$2" "$3" <<'PY'
 import sys
 path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]

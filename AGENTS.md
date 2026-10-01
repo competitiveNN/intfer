@@ -1951,6 +1951,25 @@ e.g. S3's contract column is 40 not 42).
     `mutate_gate_inventory.sh` uses its own `patch_once`, which is a DIFFERENT
     function (per-hunk, not whole-block) and is not a candidate for this helper.
     Do NOT convert it "for consistency".
+    *** `patch_literal` TAKES EXACTLY THREE ARGS — and now ASSERTS IT. ***
+    `file`, `exact-old`, `exact-new`. This was violated and cost a long hunt:
+    a matrix author passed FIVE arguments — one single-quoted string per LINE of
+    a two-line case — expecting them to concatenate. **They do not: each quoted
+    string is a separate ARGUMENT.** The helper therefore replaced line 1 with
+    line 2, wrote no mutation marker, and **returned success**, so five states
+    reported "PATCH VERIFY FAIL: NOT present" with no error anywhere. Found only
+    with `bash -x`, comparing the argv the function actually built against a
+    hand-verified invocation.
+    **To patch a MULTI-LINE block, put the newline INSIDE ONE single-quoted
+    argument** — a single-quoted bash string may span lines:
+        patch_literal F 'line1
+      line2' ': # MARKER'
+        patch_literal F 'line1
+      line2' 'repl1
+      repl2'           && verify_patched F 'MARKER'
+    `patch_literal` now returns 2 with that message on a wrong argument count, so
+    the silent mis-patch cannot recur. **When a matrix state reports "PATCH
+    VERIFY FAIL", run `bash -x` and read the argv — do not re-hypothesise.**
     *** THE TRIGGERS ARE CHECKED, NOT ASSUMED. *** As of 2026-10-01 none has
     fired: the three are untouched by recent work (`mutate_fold_matrix.sh` last
     changed at `b49e164`, `mutate_device_precond.sh` at `8d6ac55`,
