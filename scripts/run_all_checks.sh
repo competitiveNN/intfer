@@ -152,6 +152,12 @@ dispatch() { # $1 = label -> runs it
       # exits 2 if the pin cannot be resolved, which reads as UNPROVEN rather
       # than as a pass.
       timeout 1800 bash "$SCRIPT_DIR/check_l0_cite.sh"; return $? ;;
+    check_gate_enum.sh)
+      # Behavioural self-check for the SHARED vacuity guard. Four cases plus a
+      # converse: must reject 0/empty/non-numeric/below-minimum, and must
+      # ACCEPT well-formed input SILENTLY -- without that, a helper that
+      # rejects everything would score 3/3 and prove nothing.
+      timeout 300 bash "$SCRIPT_DIR/check_gate_enum.sh"; return $? ;;
     check_build_dir_consumers.sh)
       # Static: derives the artifact-consumer population from the CMake
       # add_executable list plus every script touching a build tree, then fails
@@ -315,7 +321,7 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_build_dir_consumers.sh check_doc_counts.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_build_dir_consumers.sh check_doc_counts.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \

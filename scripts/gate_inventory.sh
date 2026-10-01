@@ -41,6 +41,16 @@ if ! command -v sycl-ls >/dev/null 2>&1; then
   fi
 fi
 
+# The shared vacuity guard: a checker that cannot harvest its subject cannot
+# certify it. Sourced, not executed (sibling of scripts/_gate_precond.sh).
+# Placed AFTER the oneAPI-env block -- a first version landed INSIDE it, so it
+# was sourced only when sycl-ls happened to be missing from PATH, and the call
+# site 400 lines later failed with "command not found" on the normal path.
+# A guard sourced conditionally is a guard that is usually absent.
+# shellcheck source=scripts/_gate_enum.sh
+. "$SCRIPT_DIR/_gate_enum.sh"
+enum_reset
+
 GATES=$(ls scripts/test_*.sh 2>/dev/null | sort)
 [ -n "$GATES" ] || { echo "FAIL: no scripts/test_*.sh found" >&2; exit 1; }
 
@@ -419,8 +429,14 @@ else
   done
   echo "           sites_found=$sites_found excluded_history=$excluded stale_tally_sites=$bad_tally"
   VIOLATIONS=$((VIOLATIONS + bad_tally))
-  if [ "$sites_found" -eq 0 ]; then
-    echo "           <-- VACUOUS: matched 0 tally sites, so nothing was verified." >&2
+  # Routed through the SHARED vacuity guard (scripts/_gate_enum.sh) rather than
+  # a second hand-rolled copy of the same rule -- the audit #7/#8 "rule fixed at
+  # one site, re-derived at another" shape. Verified to behave identically here:
+  # rc=1 with sites_found=0, and silent on the normal path.
+  enum_reset
+  if enum_require_nonempty "tally-sites" "$sites_found" "doc tally sites"; then
+    :
+  else
     VIOLATIONS=$((VIOLATIONS + 1))
   fi
 

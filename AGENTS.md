@@ -1746,6 +1746,63 @@ e.g. S3's contract column is 40 not 42).
     case the harness did not set up. Related: AUDIT #17b's `verify_patched()`
     (a mutation that does not reproduce its defect is worse than none).
 
+  - **AUDIT #20 (2026-10-01): THE VACUOUS-GREEN CLASS RECURRED THREE TIMES, AND
+    ONCE INSIDE THE CHECKER WRITTEN TO CATCH IT.** AUDIT #14 recorded the shape —
+    a harvest that matches nothing reports "nothing to fix" while verifying
+    nothing. It is not retired, and the proof is that it arrived again:
+    * (a) `check_doc_counts.sh` printed **`WARN no 'agree at **N**' sentence
+      found to check (skip, not silently pass)`** and exited **0** when its
+      subject sentence was absent. MEASURED by rewording the sentence. The
+      wording of the warning *was* the defect restated: it WAS silently passing.
+      A missing subject is now rc=1 citing this audit.
+    * (b) `check_build_dir_consumers.sh` printed
+      **`PASS (0 consumer(s), all honor INTFER_BUILD_DIR)`** at exit 0 when its
+      self-exclusion was widened until it skipped every script — a green verdict
+      over an empty census. Found by its OWN matrix state M-E, i.e. inside the
+      checker written to prevent exactly this. Now closed by a guard asserting
+      the classifier inspected something.
+    * (c) `check_build_dir_consumers.sh` had already shipped once with `awk
+      '{print $2}'` on `add_executable(name ...` — awk does not split on `(` —
+      so the CMake harvest was **0** and the checker exited 2 looking like a
+      working check that simply found no consumers.
+    FIX, structural rather than three separate patches: **one shared guard**,
+    `scripts/_gate_enum.sh` (`enum_require_nonempty` / `enum_require_min`),
+    now used by `check_doc_counts.sh`, `check_build_dir_consumers.sh` AND
+    `gate_inventory.sh` — the last of which previously carried its own hand-rolled
+    copy of the `sites_found == 0` rule, i.e. the AUDIT #7/#8 "rule fixed at one
+    site, re-derived at another" shape. **RULES FOR THE NEXT ONE:**
+      * A checker must assert it harvested something BEFORE reporting a verdict
+        on it. "0 findings" and "found nothing to look at" are different claims.
+      * **A `WARN ... skip` path in a correctness checker is a defect.** If the
+        subject is missing the checker is broken, not the input optional.
+      * Never write a numeric test that a non-numeric value can satisfy.
+        `scripts/check_gate_enum.sh` asserts `""` and `"abc"` FAIL CLOSED, because
+        `[ "" -gt 0 ]` is FALSE and a naive implementation would pass them.
+    *** AND THE MUTATION-TESTING RESULT, which is the argument for the rest. ***
+    Every checker added this session failed on its first run, and every failure
+    was in the CHECKER, never in the engine — and case (b) was AUDIT #14's exact
+    shape reproduced *inside* the checker written to catch it, found only because
+    that checker had a mutation state designed to make it fail. A checker with no
+    matrix would have shipped all three.
+
+  - **A GUARD SOURCED INSIDE A CONDITIONAL IS A GUARD THAT IS USUALLY ABSENT.**
+    While routing `gate_inventory.sh` through `_gate_enum.sh`, the `.` landed
+    inside its `if ! command -v sycl-ls` block, so the helper existed **only when
+    sycl-ls was missing from PATH** — and the call site 400 lines below failed
+    with `enum_require_nonempty: command not found` on the NORMAL path, turning
+    a passing suite red. Sourced helpers go at top level, after any env
+    bootstrap, and never inside a conditional. (The repo already records a
+    related one: AUDIT #3c, a helper hoisted outside `#ifdef` because its caller
+    was not.)
+
+  - **A HELPER THAT RECORDS ITS VERDICT IN A GLOBAL SILENTLY LOSES IT IN
+    `$(...)`.** `_gate_enum.sh` sets `_enum_bad`; the self-check that drives it
+    originally called it inside command substitution, so the assignment died in
+    the subshell and the parent read `0` — the helper's own stdout said FAIL
+    while the harness recorded it as accepted. Four cases scored FAIL for a
+    reason that had nothing to do with the helper. Capture to a file so the call
+    runs in the current shell.
+
   - **SINGLE WRITER: do not commit to this clone while `run_all_checks.sh` is
     running.** MEASURED, not hypothetical — a second agent session committed
     three times during one ~45 min stack here. HEAD then moved between the
