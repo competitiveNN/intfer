@@ -220,7 +220,7 @@ dispatch() { # $1 = label -> runs it
       # exact-new -- and old/new each span a literal newline. Passing one quoted
       # string per LINE was the original bug: five states, all "PATCH VERIFY
       # FAIL", found with bash -x rather than by guessing.
-      timeout 1800 bash "$SCRIPT_DIR/mutate_gate_pop.sh mutate_checker_matrix_coverage.sh"; return $? ;;
+      timeout 1800 bash "$SCRIPT_DIR/mutate_gate_pop.sh"; return $? ;;
     mutate_gate_enum.sh)
       # Patches SANDBOX COPIES under the build tree, never scripts/, so a
       # mutated helper cannot leak into a later glob of that directory.
