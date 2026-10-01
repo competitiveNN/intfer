@@ -287,9 +287,19 @@ run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
 
 # --- baselines: correct behaviour must be observable BEFORE any mutation ----
 # $1 id, $2 steps, $3 stampdir, $4 want rc, $5 marker that MUST be present
+#                                       $6 litter  $7 litter site  $8 FORBIDDEN marker
+# The forbidden marker is the CONVERSE half of the proof. Every other baseline
+# asserts a marker is present, which cannot distinguish a check that fires on the
+# right condition from one that ALWAYS fires -- the always-red twin of the vacuous
+# check (audit #17). For N-K that mattered: the detector's whole job is to stay
+# SILENT when HEAD holds still, and every other baseline in this file runs on a
+# tree that never moves, so "the detector is quiet on a healthy run" was asserted
+# nowhere. A detector that always reported HEAD MOVED would have passed N-K and
+# turned every future stack run red.
 baseline() {
   local id="$1" steps="$2" sdir="$3" want="$4" marker="$5" residue="${6:-}" rc
   local where="${7:-}"   # litter site: "" = scripts/, "root" = sandbox repo root
+  local forbidden="${8:-}"
   NBASE=$((NBASE + 1))
   reset_mutant
   run_rac "$id" "$steps" "$sdir" "$residue" "$where" ".baseline"; rc=$?
@@ -308,9 +318,16 @@ baseline() {
   # accepting a litter-site argument and never forwarding it) is visibly
   # indistinguishable from N-G. The marker cannot express that, so the litter
   # site is echoed rather than left in the reader's imagination.
+  # Converse assertion: this marker must be ABSENT on a correct run.
+  if [ -n "$forbidden" ] && grep -qF -- "$forbidden" "$WORK/$id.baseline.log"; then
+    echo "FAIL: baseline $id emitted '$forbidden', which must be ABSENT." >&2
+    echo "  A check that fires on every run is an always-red gate, not a" >&2
+    echo "  detector. ($WORK/$id.baseline.log)" >&2; exit 1
+  fi
   local lit="(none)"
   [ -n "$residue" ] && lit="$([ "$where" = root ] && echo "sandbox ROOT" || echo "scripts/")"
-  printf '  ok    baseline %-4s rc=%s, correct marker present, litter=%s\n' "$id" "$rc" "$lit"
+  printf '  ok    baseline %-4s rc=%s, correct marker present, litter=%s%s\n' \
+    "$id" "$rc" "$lit" "$([ -n "$forbidden" ] && echo ', converse marker absent' || true)"
 }
 
 # --- defect predicates: return 0 ONLY when the defect is really present -----
@@ -349,53 +366,6 @@ def_n_k() { ! grep -q 'HEAD MOVED under this run' "$WORK/N-K.log"; }
 # run_rac does; N-H also needs its own counter file reset because a leftover
 # count would make the first pass answer rc=1 (a plain failure) and never reach
 # the re-run. run_rac removes it, which is asserted by the N-H baseline marker.
-
-NBASE=0
-echo "== BASELINES (unmutated run_all_checks must be CORRECT in each setup) =="
-baseline "N-A" "step_ok"     "$ALL_CURRENT" 0 ""
-baseline "N-B" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"   # 2b re-run visible
-baseline "N-C" "step_ok"     "$HAS_STALE"   2 "STALE c/last_pass.stamp"      # 3rd stamp enumerated
-printf 'probe\n' >"$PROBE"; git -C "$SB" add -- "$PROBE"   # a genuinely TRACKED, dirty file
-baseline "N-D" "step_sentinel" "$ALL_CURRENT" 1 "uncommitted changes"
-git -C "$SB" reset -q -- "$PROBE"; rm -f "$PROBE"
-baseline "N-E" "step_ok"     "$ALL_CURRENT" 0 ""                              # self-check passes
-baseline "N-F" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"       # re-run works
-baseline "N-G" "step_litter" "$ALL_CURRENT" 1 "untracked residue left behind" yes
-baseline "N-H" "step_escalate" "$ALL_CURRENT" 1 "REGRESSED rc=1"
-# The litter goes to the sandbox ROOT, and the baseline must prove the check
-# still sees it there -- otherwise N-I's predicate would be satisfied by a run
-# that never littered anything.
-baseline "N-I" "step_litter" "$ALL_CURRENT" 1 "untracked residue left behind" yes root
-# N-J: an undispatched matrix dropped into scripts/. COMMITTED, so the run's own
-# residue diff cannot be what fails -- only the coverage check can.
-printf '#!/usr/bin/env bash\nexit 0\n' >"$DUMMY"; chmod +x "$DUMMY"
-git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$DUMMY" >/dev/null 2>&1
-git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m dummy -- "$DUMMY" >/dev/null 2>&1
-baseline "N-J" "step_ok"     "$ALL_CURRENT" 1 "no dispatch() arm for: mutate_dummy.sh"
-# N-K baseline: a step commits mid-run, so the DETECTOR must fire. rc=1, and the
-# marker must be the move notice -- without it, N-K's predicate is satisfied by
-# any run that happens to not print that line, including one that aborted early.
-baseline "N-K" "step_ok step_commit" "$ALL_CURRENT" 1 "HEAD MOVED under this run"
-# `rm -f` alone leaves a DELETION in the sandbox's working tree, so every
-# subsequent state aborted at the top on the mutant's own dirty-tree guard and
-# scored MISSED -- four states (N-A, N-B, N-E, N-F) disarmed by one stray `rm`.
-# The removal is committed, and the sandbox-clean assertion below catches that
-# class independently of this comment.
-rm -f "$DUMMY"
-git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "drop dummy" -- "$DUMMY" >/dev/null 2>&1
-
-# The baselines are where the sandbox is set up, so this is the last point at
-# which a stray staged change can be seen before the states start aborting on
-# it. Derived (git status), not a list of files to remember to clean.
-if [ -n "$(git -C "$SB" status --porcelain)" ]; then
-  echo "FAIL: the sandbox git repo is dirty after the baselines." >&2
-  echo "  Every state below would abort at the top on the mutant's own" >&2
-  echo "  dirty-tree guard and score MISSED -- a broken HARNESS that reads as" >&2
-  echo "  ten working states." >&2
-  git -C "$SB" status --porcelain >&2
-  exit 1
-fi
-echo "sandbox hygiene: ok (clean after $NBASE baselines)"
 
 # --- anchor pre-flight (checked against the PRISTINE target) ---------------
 # Counted with the SAME mechanism patch_literal uses, deliberately. Two earlier
@@ -477,6 +447,60 @@ check_anchor "$A_ESCALATE" "N-H: the 2b re-run's REGRESSED announcement"
 check_anchor "$A_COVER"   "N-J: the dispatch-coverage enumeration"
 check_anchor "$A_HEADMOVE" "N-K: the mid-run HEAD-moved detector"
 echo "anchor pre-flight: ok (10/10 targets located exactly once)"
+NBASE=0
+echo "== BASELINES (unmutated run_all_checks must be CORRECT in each setup) =="
+baseline "N-A" "step_ok"     "$ALL_CURRENT" 0 ""
+baseline "N-B" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"   # 2b re-run visible
+baseline "N-C" "step_ok"     "$HAS_STALE"   2 "STALE c/last_pass.stamp"      # 3rd stamp enumerated
+printf 'probe\n' >"$PROBE"; git -C "$SB" add -- "$PROBE"   # a genuinely TRACKED, dirty file
+baseline "N-D" "step_sentinel" "$ALL_CURRENT" 1 "uncommitted changes"
+git -C "$SB" reset -q -- "$PROBE"; rm -f "$PROBE"
+baseline "N-E" "step_ok"     "$ALL_CURRENT" 0 ""                              # self-check passes
+baseline "N-F" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"       # re-run works
+baseline "N-G" "step_litter" "$ALL_CURRENT" 1 "untracked residue left behind" yes
+baseline "N-H" "step_escalate" "$ALL_CURRENT" 1 "REGRESSED rc=1"
+# The litter goes to the sandbox ROOT, and the baseline must prove the check
+# still sees it there -- otherwise N-I's predicate would be satisfied by a run
+# that never littered anything.
+baseline "N-I" "step_litter" "$ALL_CURRENT" 1 "untracked residue left behind" yes root
+# N-J: an undispatched matrix dropped into scripts/. COMMITTED, so the run's own
+# residue diff cannot be what fails -- only the coverage check can.
+printf '#!/usr/bin/env bash\nexit 0\n' >"$DUMMY"; chmod +x "$DUMMY"
+git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$DUMMY" >/dev/null 2>&1
+git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m dummy -- "$DUMMY" >/dev/null 2>&1
+baseline "N-J" "step_ok"     "$ALL_CURRENT" 1 "no dispatch() arm for: mutate_dummy.sh"
+# N-K baseline: a step commits mid-run, so the DETECTOR must fire. rc=1, and the
+# marker must be the move notice -- without it, N-K's predicate is satisfied by
+# any run that happens to not print that line, including one that aborted early.
+baseline "N-K" "step_ok step_commit" "$ALL_CURRENT" 1 "HEAD MOVED under this run"
+# N-K converse: with NO committing step, HEAD holds still, so the detector must
+# stay SILENT and the run must reach PASS. This is the half that makes N-K a
+# detector rather than an always-red gate, and every other baseline in this file
+# runs on a tree that never moves -- so without this line "the detector is quiet
+# on a healthy run" was asserted nowhere. A detector hard-wired to always report a
+# move would pass N-K and turn every future stack run red.
+baseline "N-Kq" "step_ok" "$ALL_CURRENT" 0 "" "" "HEAD MOVED under this run"
+# `rm -f` alone leaves a DELETION in the sandbox's working tree, so every
+# subsequent state aborted at the top on the mutant's own dirty-tree guard and
+# scored MISSED -- four states (N-A, N-B, N-E, N-F) disarmed by one stray `rm`.
+# The removal is committed, and the sandbox-clean assertion below catches that
+# class independently of this comment.
+rm -f "$DUMMY"
+git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "drop dummy" -- "$DUMMY" >/dev/null 2>&1
+
+# The baselines are where the sandbox is set up, so this is the last point at
+# which a stray staged change can be seen before the states start aborting on
+# it. Derived (git status), not a list of files to remember to clean.
+if [ -n "$(git -C "$SB" status --porcelain)" ]; then
+  echo "FAIL: the sandbox git repo is dirty after the baselines." >&2
+  echo "  Every state below would abort at the top on the mutant's own" >&2
+  echo "  dirty-tree guard and score MISSED -- a broken HARNESS that reads as" >&2
+  echo "  ten working states." >&2
+  git -C "$SB" status --porcelain >&2
+  exit 1
+fi
+echo "sandbox hygiene: ok (clean after $NBASE baselines)"
+
 
 # Exact literal replacement -- no delimiter that can occur inside the pattern
 # (audit #17b: a sed delimiter inside an ERE alternation killed a state, and a
@@ -621,6 +645,31 @@ reset_mutant
 patch_literal "$MUTANT" "$A_HEADMOVE" 'HEAD_MOVED=0  # detector removed; move now silent'
 verify_patched N-K
 run_state "N-K" "mid-run HEAD-moved detector deleted" def_n_k "step_ok step_commit" "$ALL_CURRENT"
+
+# N-L: the detector hard-wired to ALWAYS fire. This state exists so the N-Kq
+# converse baseline is not another vacuous check -- without it, "the detector
+# stays silent on a healthy run" is a line nobody has ever seen fail. Under this
+# mutation the N-Kq baseline (no committing step, HEAD still) MUST report the
+# forbidden marker and abort; N-K itself is unaffected, since an always-firing
+# detector still catches the real move. That asymmetry is the point: N-K alone
+# cannot tell a detector from an alarm, only N-L can.
+#
+# Patched by forcing the GUARD to true rather than deleting the block, because
+# deleting it is N-K. Same always-red twin, opposite direction.
+reset_mutant
+patch_literal "$MUTANT" 'if [ "$HEAD_NOW" != "$HEAD_SHA" ]; then' \
+  'if [ "$HEAD_NOW" != "$HEAD_SHA" ] || true; then  # N-L: always fire'
+verify_patched N-L
+if ! run_rac "N-L" "step_ok" "$ALL_CURRENT" 0 "" "" ".baseline"; then
+  echo "FAIL: the N-L converse baseline did not REJECT an always-firing detector." >&2
+  echo "  A baseline whose converse can never fire proves nothing; N-K alone" >&2
+  echo "  would have scored this mutation as a pass. ($WORK/N-L.baseline.log)" >&2
+  exit 1
+fi
+grep -q 'HEAD MOVED under this run' "$WORK/N-L.baseline.log" || {
+  echo "FAIL: N-L baseline did not show the always-firing detector's notice." >&2
+  echo "  ($WORK/N-L.baseline.log)" >&2; exit 1; }
+echo "  ok    baseline N-L   converse REJECTED an always-firing detector (as it must)"
 
 rm -f "$MUTANT"
 # The synthetic population must never have leaked into the real one, or the real

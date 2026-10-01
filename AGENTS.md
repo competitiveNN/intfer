@@ -769,6 +769,16 @@ e.g. S3's contract column is 40 not 42).
    Fold matrix 7/7 (S0..S6) on the single-sourced rule; anchors-only rc=0;
    residue 0/0; 36/36 scripts `bash -n` clean; all 10 gates carry a build
    guard; all 29 artifact consumers still honor INTFER_BUILD_DIR (re-enumerated
+   *** EVERY HAND-COUNTED TOTAL IN THIS FILE IS A CITATION, NOT A COUNT ***
+   "36/36 scripts", "39/39 scripts", "29 artifact consumers" etc. above were
+   true when written and are NOT re-derived by anything. Scripts have been added
+   since (they are added, not replaced), so today's figure is higher. Do NOT
+   "correct" one of these to match a present-day `ls` -- rewriting a true
+   historical record to fit today's box is the same laundering failure in the
+   other direction, and it destroys the only record of what the tree looked like.
+   Conversely do not quote one as present-day coverage. Derive the live numbers
+   from source when they are needed: `ls scripts/*.sh | wc -l` for the syntax
+   sweep, and `scripts/gate_inventory.sh` for gate/consumer classification.
    from the CMake `add_executable` list, not from a remembered name list).
    They are blocked on a second GPU, not on missing work. Do not let any
    future summary fold "skipped" into "covered" — the correct phrasing is
@@ -879,6 +889,7 @@ e.g. S3's contract column is 40 not 42).
    mutate_gate_inventory 6/6; the audit-#13 mutation re-added -> rc=1 with the
    OVER-SKIP marker; 0-GPU box -> rc=2 loud; fold_report_counts rc=2 (stale
    stamp, as it should be); fold-matrix anchors-only rc=0; 39/39 scripts
+   (historical citation -- see the "EVERY HAND-COUNTED TOTAL" note)
    `bash -n` clean. No engine, quant or schedule code touched.
   === 2026-09-30 AUDIT #15: THREE GPU GATES HAD NO DEVICE GUARD AT ALL ===
   The follow-up audit to #14 asked one question AUDIT #8 had already answered
@@ -1143,6 +1154,32 @@ e.g. S3's contract column is 40 not 42).
       passed. `/dev/dri` listing is not a device-existence test.
   Rule: for permissions use `stat`, for device existence use the same syscall
   the gate uses. Never report a defect read off an `ls` rendering.
+
+- **MUTATION-ANCHOR WRITING RULE (2026-10-01, learned twice in one session while
+  adding state N-K).** An `A_*` anchor is a literal that must occur EXACTLY ONCE
+  in the target so `patch_literal` can swap it. Three rules, each bought with a
+  failed state:
+  1. **Span the whole syntactic unit being removed.** The first N-K anchor stopped
+     at `HEAD_MOVED=1` and orphaned the closing `fi`; `verify_patched` aborted on a
+     syntax error. Correct behaviour — a syntax error is not evidence a mechanism
+     is load-bearing — but the state scored nothing. If the replacement is a
+     one-liner, the anchor must cover every line the one-liner absorbs.
+  2. **Build it with a quoted heredoc, never hand-escaped inside single quotes.**
+     `read -r -d '' A_X <<'EOF' ... EOF`. That block contains `'STALE'`, and
+     escaping those quotes into a single-quoted shell literal produced a syntax
+     error in the MATRIX SCRIPT ITSELF — the same anchor-covers-the-wrong-bytes
+     failure, one level out, and it broke the file before any state ran.
+  3. **Assert uniqueness before committing, and before the baselines.** The
+     pre-flight (`check_anchor`) now runs BEFORE the baselines, not after: an
+     anchor that has drifted should fail in the first second, not after eleven
+     baselines have each executed a full mutant run.
+  The unifying lesson: an anchor that covers the wrong bytes does not fail
+  quietly, but it fails in a way that reads as a *harness* problem rather than a
+  *state* problem — so it is always worth confirming the anchor form mechanically
+  (`occurs exactly 1x`, first line, last line) instead of by eye. And note the
+  family: this is the same shape as audits #3 (rule fixed at one site, re-derived
+  at another), #4 (checked on 1 of M rows) and #12 (stride rule enforced only in
+  the writer), recurring in the tooling that verifies those very fixes.
 
 - **AUDIT #17b: THREE BLIND SPOTS IN THE DEVICE-PRECOND PROOF, AND A DRIVER FOR
   THE WHOLE STACK** (scripts/check_device_precond.sh healthy column,

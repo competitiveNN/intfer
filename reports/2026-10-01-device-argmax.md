@@ -159,6 +159,24 @@ and therefore needs its own gate. That work is **scoped, not started** — see
 §8. Until it exists, E5's verdict genuinely does require the quiet-box run, and
 the honest statement stays "unmeasured", not "counters looked neutral".
 
+**Status of E5 is therefore PERMANENTLY UNMEASURED, not "owed".** E1-E4 are owed a
+*measurement* — their mechanisms are visible in existing counters and only the
+wall-clock verdict is missing. E5 is different: it needs new **instrumentation**
+before any measurement, on any box, at any load. So this is the wording to use,
+and the wording not to use:
+
+| do NOT write | write instead |
+|---|---|
+| "E5 is owed a benchmark" (implies running one suffices) | "E5 needs a bytes-transferred counter (E6) before it can be measured at all" |
+| "E5 counters looked neutral" | "E5 has no load-insensitive observable yet" |
+| "E5 pending quiet box" | "E5 pending E6; the quiet box is necessary but NOT sufficient" |
+
+If E6 is never built, E5 stays unmeasured **forever** and that is the correct
+end state — a default-off lever with a proven bit-contract and no throughput
+evidence is a fine resting place. It must not silently revert to reading as
+"just needs the box to go quiet", which is the failure mode that would let it sit
+in the backlog indefinitely with nobody knowing it is unreachable.
+
 ### 6. Gates already passed
 
 - `scripts/test_device_argmax.sh` — TP1/TP2 8-way matrix, `[argmax]` non-triviality
