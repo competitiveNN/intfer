@@ -338,7 +338,26 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$DUMMY"; chmod +x "$DUMMY"
 git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$DUMMY" >/dev/null 2>&1
 git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m dummy -- "$DUMMY" >/dev/null 2>&1
 baseline "N-J" "step_ok"     "$ALL_CURRENT" 1 "no dispatch() arm for: mutate_dummy.sh"
+# `rm -f` alone leaves a DELETION in the sandbox's working tree, so every
+# subsequent state aborted at the top on the mutant's own dirty-tree guard and
+# scored MISSED -- four states (N-A, N-B, N-E, N-F) disarmed by one stray `rm`.
+# The removal is committed, and the sandbox-clean assertion below catches that
+# class independently of this comment.
 rm -f "$DUMMY"
+git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "drop dummy" -- "$DUMMY" >/dev/null 2>&1
+
+# The baselines are where the sandbox is set up, so this is the last point at
+# which a stray staged change can be seen before the states start aborting on
+# it. Derived (git status), not a list of files to remember to clean.
+if [ -n "$(git -C "$SB" status --porcelain)" ]; then
+  echo "FAIL: the sandbox git repo is dirty after the baselines." >&2
+  echo "  Every state below would abort at the top on the mutant's own" >&2
+  echo "  dirty-tree guard and score MISSED -- a broken HARNESS that reads as" >&2
+  echo "  ten working states." >&2
+  git -C "$SB" status --porcelain >&2
+  exit 1
+fi
+echo "sandbox hygiene: ok (clean after $NBASE baselines)"
 
 # --- anchor pre-flight (checked against the PRISTINE target) ---------------
 check_anchor() { # $1 = literal, $2 = description
@@ -358,7 +377,14 @@ A_FIND="find \"\$STAMP_DIR\" -name '*last_pass.stamp' -type f 2>/dev/null | sort
 A_GUARD='if ! git diff --quiet || ! git diff --cached --quiet; then'
 A_SELFCHK='return $bad'
 A_DERIVE='UNPROVEN_LABELS="$UNPROVEN_LABELS $label"'
-A_RESIDUE='RESIDUE="$(LC_ALL=C comm -13 \'
+# The WHOLE four-line block, not just its first line: the first attempt anchored
+# on line 1 alone, the patch replaced it with a one-liner, and the three
+# continuation lines were left dangling -- verify_patched aborted with a syntax
+# error, correctly, before the state could score.
+A_RESIDUE='RESIDUE="$(LC_ALL=C comm -13 \
+             <(LC_ALL=C sort "$UNTRACKED_BEFORE") \
+             <(git status --porcelain --untracked-files=all | LC_ALL=C sort) \
+           | grep -v '"'"'^ M'"'"' || true)"'
 A_ESCALATE="printf 'REGRESSED rc=%s (%s) -- was unproven, is now a real failure\\n' \"\$rc\" \"\$log\""
 A_COVER='grep -qxF "$b" || UNDISPATCHED="$UNDISPATCHED $b"'
 check_anchor "$A_CLASSIFY" "N-A: the rc=2 UNPROVEN classification"
@@ -434,6 +460,16 @@ run_state "N-A" "rc=2 no longer classified UNPROVEN" def_n_a "step_ok" "$ALL_CUR
 # The converse def_n_e depends on: with the self-check ARMED, a misclassification
 # must stop the run BEFORE the steps. Without this assertion, def_n_e ("reached the
 # steps") would be satisfied by a healthy run and prove nothing.
+# The converse, asserted in BOTH directions on purpose. The first version only
+# checked that '1/2 checkers' was ABSENT -- which a top-of-run abort (a dirty
+# sandbox, a bad anchor) satisfies trivially. It printed 'ok' while four states
+# were scoring MISSED for exactly that reason. Requiring the self-check to have
+# actually RUN first pins the absence to the gating decision and nothing else.
+if ! grep -q 'SELFCHECK' "$WORK/N-A.log"; then
+  echo "  ABORT N-A  the mutant never reached the self-check, so the converse" >&2
+  echo "           assertion below would be satisfied by an early abort." >&2
+  exit 1
+fi
 if grep -q '1/2 checkers' "$WORK/N-A.log"; then
   echo "  MISSED N-A  the misclassification did NOT gate the run -- the run reached" >&2
   echo "             the steps anyway, so the self-check is not load-bearing and" >&2
@@ -496,6 +532,7 @@ git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$DUMMY" >/dev/null 2>
 git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m dummy -- "$DUMMY" >/dev/null 2>&1
 run_state "N-J" "dispatch-coverage enumeration neutered" def_n_j "step_ok" "$ALL_CURRENT"
 rm -f "$DUMMY"
+git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "drop dummy" -- "$DUMMY" >/dev/null 2>&1
 
 rm -f "$MUTANT"
 # The synthetic population must never have leaked into the real one, or the real
