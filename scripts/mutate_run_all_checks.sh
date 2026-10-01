@@ -366,9 +366,9 @@ echo "sandbox hygiene: ok (clean after $NBASE baselines)"
 #     every miss reported "found 0\n0 times".
 #   * `grep -cF` itself counts LINES, and one anchor (A_RESIDUE) is a four-line
 #     continuation, so it reported 4 occurrences and refused to start.
-The pre-flight and the patch must agree on what "exactly once" means, or the
-guard and the thing it guards drift -- so both count SUBSTRING occurrences in
-python, here and in patch_literal below.
+# The pre-flight and the patch must agree on what "exactly once" means, or the
+# guard and the thing it guards drift -- so both count SUBSTRING occurrences in
+# python, here and in patch_literal below.
 check_anchor() { # $1 = literal, $2 = description
   local n
   n="$(python3 -c 'import sys
@@ -393,7 +393,7 @@ A_RESIDUE='RESIDUE="$(LC_ALL=C comm -13 \
              <(LC_ALL=C sort "$UNTRACKED_BEFORE") \
              <(git status --porcelain --untracked-files=all | LC_ALL=C sort) \
            | grep -v '"'"'^ M'"'"' || true)"'
-A_ESCALATE="printf 'REGRESSED rc=%s (%s) -- was unproven, is now a real failure\\n' \"\$rc\" \"\$log\""
+A_ESCALATE="printf 'REGRESSED rc=%s (%s) -- was unproven, is now a real failure\\n' \"\$rc\" \"\$log\"\n          UNPROVEN=\$((UNPROVEN - 1))\n          FAILED=\$((FAILED + 1)) ;;"
 A_COVER='grep -qxF "$b" || UNDISPATCHED="$UNDISPATCHED $b"'
 check_anchor "$A_CLASSIFY" "N-A: the rc=2 UNPROVEN classification"
 check_anchor "$A_RERUN"   "N-B: the 2b re-run guard"
@@ -520,7 +520,7 @@ run_state "N-G" "end-of-run tree-hygiene assertion deleted" def_n_g "step_litter
 
 # N-H: the exact pre-fix 2b fail arm -- success/failure only, FAILED left at 0.
 reset_mutant
-patch_literal "$MUTANT" "$A_ESCALATE" "printf 'still rc=%s (%s)\\n' \"\$rc\" \"\$log\" ;;"
+patch_literal "$MUTANT" "$A_ESCALATE" "printf 'still rc=%s (%s) -- still unproven\\n' \"\$rc\" \"\$log\" ;;"
 verify_patched N-H
 run_state "N-H" "2b re-run's rc=1 arm is a no-op (pre-fix shape)" def_n_h "step_escalate" "$ALL_CURRENT"
 
