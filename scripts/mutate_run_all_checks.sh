@@ -664,7 +664,11 @@ verify_patched N-L
 # converse REJECTED it, so the evidence is the LOG: an always-firing detector must
 # print the notice, which is precisely what N-Kq's forbidden-marker check
 # consumes. Assert on that, not on a rc that a direct call cannot carry.
-run_rac "N-L" "step_ok" "$ALL_CURRENT" 0 "" "" ".baseline" >/dev/null
+# NOTE the argument shape: run_rac reads $6 as the log suffix, and $4/$5 are
+# the residue flags. Passing 0 "" "" ".baseline" would put ".baseline" in $7 and
+# write N-L.log instead -- which is exactly what the first version of this state
+# did, and the missing N-L.baseline.log is how it surfaced. Six args, not seven.
+run_rac "N-L" "step_ok" "$ALL_CURRENT" "" "" ".baseline" >/dev/null
 if ! grep -q 'HEAD MOVED under this run' "$WORK/N-L.baseline.log"; then
   echo "FAIL: the N-L converse baseline did not REJECT an always-firing detector." >&2
   echo "  An always-firing detector must make N-Kq's forbidden-marker check abort." >&2
