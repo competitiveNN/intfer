@@ -439,15 +439,33 @@ A_ESCALATE="printf 'REGRESSED rc=%s (%s) -- was unproven, is now a real failure\
           UNPROVEN=\$((UNPROVEN - 1))
           FAILED=\$((FAILED + 1)) ;;"
 A_COVER='grep -qxF "$b" || UNDISPATCHED="$UNDISPATCHED $b"'
-# N-K: the WHOLE detector block, guard + assignment + report + increment. Removing
-# only the announcement line would leave the increment dangling (syntax error), and
-# removing only the guard would leave a detector that never fires -- both are
-# harness-reported failures, not a scored state, so the anchor must cover the unit
-# that can actually be removed as one piece.
-A_HEADMOVE='HEAD_NOW="$(git rev-parse HEAD)"
+# N-K: the WHOLE detector block -- guard, assignment, report, increment and the
+# closing fi. Removing only the announcement leaves the increment dangling;
+# removing only the guard leaves a detector that never fires. Both are
+# harness-reported failures, not a scored state, so the anchor must cover the
+# unit that can actually be removed as ONE piece. (First version stopped at
+# "HEAD_MOVED=1" and orphaned the fi; verify_patched caught the syntax error,
+# which is the mechanism working.)
+#
+# Built by HEREDOC, not by wrapping the block in single quotes. The block
+# contains `'STALE'`, and hand-escaping those quotes inside a single-quoted
+# shell literal produced a syntax error in THIS script -- the same
+# anchor-covers-too-much failure as above, one level out. A quoted heredoc has no
+# escaping rules to get wrong, so the literal is exactly the target's bytes.
+read -r -d '' A_HEADMOVE <<'A_HEADMOVE_EOF' || true
 HEAD_MOVED=0
 if [ "$HEAD_NOW" != "$HEAD_SHA" ]; then
-  HEAD_MOVED=1'
+  HEAD_MOVED=1
+  echo "== 2c HEAD MOVED under this run =="
+  echo "  FAIL  HEAD changed during the run: started at $HEAD_SHORT, now ${HEAD_NOW:0:7}." >&2
+  echo "         Another writer committed to this clone while the stack was running." >&2
+  echo "         The stamps just written name the NEW commit, so 'STALE' below would" >&2
+  echo "         be an artifact of this race, not missing evidence -- and re-running" >&2
+  echo "         is NOT the fix. Either finish the concurrent commit first (single-" >&2
+  echo "         writer convention, AGENTS.md) or re-run now that the tree is settled." >&2
+  FAILED=$((FAILED + 1))
+fi
+A_HEADMOVE_EOF
 check_anchor "$A_CLASSIFY" "N-A: the rc=2 UNPROVEN classification"
 check_anchor "$A_RERUN"   "N-B: the 2b re-run guard"
 check_anchor "$A_FIND"    "N-C: the find-based stamp enumeration"
@@ -600,7 +618,7 @@ git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "drop dummy" -- 
 # UNREPORTED -- the run silently compares stamps against the commit it started on,
 # which is the race this state exists to prove is now loud.
 reset_mutant
-patch_literal "$MUTANT" "$A_HEADMOVE" 'HEAD_MOVED=0'
+patch_literal "$MUTANT" "$A_HEADMOVE" 'HEAD_MOVED=0  # detector removed; move now silent'
 verify_patched N-K
 run_state "N-K" "mid-run HEAD-moved detector deleted" def_n_k "step_ok step_commit" "$ALL_CURRENT"
 
