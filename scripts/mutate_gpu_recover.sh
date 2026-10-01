@@ -42,8 +42,54 @@ git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null || {
 # legitimate extra stamp inside a known one does not produce a false alarm.
 pop_dirs() { find "$BUILD_DIR" -name '*last_pass.stamp' 2>/dev/null \
               | xargs -r -n1 dirname | xargs -r -n1 basename | LC_ALL=C sort -u; }
+
+# The set of directories a matrix legitimately owns, DERIVED by reading each
+# mutate_*.sh's own path assignment (WORK=, LOG_DIR=, STAMP=) rather than
+# hand-listed -- the copy-drift family, and a hand-list turns every new matrix
+# into a false LEAK.
+known_dirs() {
+  grep -hoE '(WORK|LOG_DIR|STAMP)="[^"]*"' "$SCRIPT_DIR"/mutate_*.sh 2>/dev/null \
+    | sed -e 's/^[A-Z_]*="//' -e 's/"$//' \
+    | sed -e 's|${INTFER_BUILD_DIR:-$ROOT/build}/||' -e 's|\$BUILD_DIR/||' -e 's|\$ROOT/build/||' \
+    | grep -vE '^[\$/{]' \
+    | awk -F/ 'NF>0 {print $1}' \
+    | LC_ALL=C sort -u | tr '\n' ' '
+}
+
+# *** AS-FOUND ASSERTION, which the first version of this matrix lacked and
+# which MEASURED as a real hole: the population was only compared against ITSELF
+# (POP_BEFORE vs POP_AFTER), so a leak already present when the matrix started
+# was inside the baseline and the matrix exited 0. Planted by hand:
+#   mkdir -p build/leak_probe_fixture && touch build/leak_probe_fixture/last_pass.stamp
+#   -> mutate_gpu_recover.sh EXIT=0   <-- the leak check passed on a leak.
+# This is audit #19 again, verbatim, and the fix is the same: assert the
+# population AS FOUND against the known set BEFORE any state runs.
+asfound_leak() {
+  local dirs unknown
+  dirs="$(pop_dirs)"
+  unknown="$(printf '%s\n' "$dirs" | while read -r d; do
+              [ -n "$d" ] || continue
+              case " $(known_dirs) " in *" $d "*) ;; *) echo "$d" ;; esac
+            done)"
+  if [ -n "$unknown" ]; then
+    echo "  FAIL  stamp(s) in director(ies) no matrix owns, present AS FOUND:"
+    printf '%s\n' "$unknown" | sed 's/^/          /'
+    echo "        a checker is leaving fixture stamps in \$BUILD_DIR, so"
+    echo "        run_all_checks.sh step 3/3 would compare the wrong set."
+    return 1
+  fi
+  echo "  ok    as-found population: $(printf '%s\n' "$dirs" | grep -c .) dir(s), all owned by a known matrix"
+  return 0
+}
+
 POP_BEFORE="$(pop_dirs | tr '\n' ' ')"
 echo "== stamp dirs before: $POP_BEFORE"
+echo
+echo "== stamp-population leak assertion (AS FOUND, before any state) =="
+if ! asfound_leak; then
+  echo "RESULT: gpu_recover_mutate LEAK (pre-existing fixture stamp in \$BUILD_DIR)"
+  exit 1
+fi
 
 cp "$CHECK" "$SB/check_gpu_recover.sh"
 cp "$SCRIPT_DIR/gpu_recover.sh" "$SB/gpu_recover.sh"

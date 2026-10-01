@@ -1825,7 +1825,44 @@ e.g. S3's contract column is 40 not 42).
     that checker had a mutation state designed to make it fail. A checker with no
     matrix would have shipped all three.
 
-  - **AN INVERTED PREDICATE SCORES CORRECT CODE AS BROKEN — NAMED RULE, 3 FOR 3.**
+  - **AUDIT #21 (2026-10-01): A STUB-DRIVEN CHECKER MUST BE MUTATED BY
+    BREAKING THE FIXTURE, NOT THE CHECKER.** Writing the matrix for
+    `check_gpu_recover.sh` cost one wasted pass and the reason generalizes to
+    every fixture-driven checker in the tree.
+  My first four states made the CHECKER more permissive — drop an assertion, or
+  replace a condition with `if true`. Every stub the checker drives was CORRECT,
+  so the checker kept passing and **all four scored MISSED (0/4)**. The mutation
+  was unobservable. That is not a weak state, it is a no-op with extra steps, and
+  a matrix that reports it as "caught" would be a lie.
+  **THE RULE: if the artifact under test is correct by construction, weakening
+  the checker is unobservable. Mutate the ARTIFACT and require the checker to
+  REJECT it.** Then the predicate is "exits non-zero AND stops printing its ok
+  line", which is a real difference.
+  * checker-weakening states ARE valid when the artifact is itself defective —
+    that is what `mutate_gate_enum.sh` M-E and `mutate_doc_counts.sh` M-B do
+    (poison the artifact, checker untouched);
+  * checker-weakening states are VOID when the artifact is a correct run — so
+    `mutate_e2_ctx.sh` tests only the SELF-CHECK half, whose inputs are
+    synthetic. Its real-run half (prompt line, step count, id equality against
+    the actual model) is **not** mutation-testable at all, and the matrix says so
+    rather than pretending.
+  *** A STATE THAT CANNOT BE OBSERVED MUST BE EXCLUDED, NOT SCORED. *** The
+  gate-removal state in that matrix (`if ! selfcheck` -> `if false`) only becomes
+  visible if the run reaches the real-run half and produces a verdict, which
+  needs a GPU and the model; measured, it does not. It is excluded with the
+  reason in the file, and a note says where it could be added properly.
+  *** A DELETED CASE IS SILENT; AN INVERTED ONE IS NOT. *** My first M-B/M-C
+  removed a self-check case outright, which changes nothing observable. Inverting
+  it (`= "ACCEPT"` -> `!= "ACCEPT"`, or evaluating the case against the wrong
+  input) produces a real failure. Prefer inverting.
+  *** AND EXPECT THE PREDICATE YOU MEASURED, NOT THE ONE YOU EXPECTED. *** M-A
+  made the accept/reject predicate always-reject; cases (a) and (b) still
+  passed, because they WANT a rejection — only the CONVERSE broke. The state was
+  scored MISSED against an ok-line that was never going to move. Run the
+  mutated checker, read which line actually changed, and write the predicate
+  from THAT. This is the same discipline as AUDIT #3c's stale-anchor rule.
+
+- **AN INVERTED PREDICATE SCORES CORRECT CODE AS BROKEN — NAMED RULE, 3 FOR 3.**
     A mutation state that asserts "this marker is ABSENT" while the marker is
     the checker reporting the defect correctly is a state that can never pass.
   MEASURED THREE TIMES IN TWO SESSIONS, always in *working* code:
