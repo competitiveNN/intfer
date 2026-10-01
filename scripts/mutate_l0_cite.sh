@@ -18,9 +18,10 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SRC_TREE="${INTFER_CR_TREE:-$ROOT/build/cr}"
-STAMP="$ROOT/build/l0_cite_mutate"
-MUT="$ROOT/build/cr.mut"
+BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
+SRC_TREE="${INTFER_CR_TREE:-$BUILD_DIR/cr}"
+STAMP="$BUILD_DIR/l0_cite_mutate"
+MUT="$BUILD_DIR/cr.mut"
 LOG="$STAMP/states"
 
 # The checker itself must work before we judge its ability to fail.
@@ -40,7 +41,7 @@ caught=0; total=0
 # Hardcoding "6" is the hand-counted-total defect gate_inventory.sh exists to
 # catch -- adding a 7th matrix would make this assertion fire on a legitimate
 # tree, which is how a check gets "fixed" by weakening it.
-pop_total() { find "$ROOT/build" -name '*last_pass.stamp' 2>/dev/null | sort; }
+pop_total() { find "$BUILD_DIR" -name '*last_pass.stamp' 2>/dev/null | sort; }
 pop_names() { pop_total | xargs -r -n1 dirname 2>/dev/null | xargs -r -n1 basename 2>/dev/null | sort; }
 # BASENAME of the enclosing dir, which is what run_all_checks.sh reports and
 # what a human compares. Deriving this from the mutate_*.sh NAMES was wrong in
@@ -200,7 +201,7 @@ run_state "M-G" "3a xe rejects small BAR" \
 echo
 echo "M-H (leak proof): plant a fixture stamp under build/ and require the"
 echo "  leak assertion to REJECT it (the fixture is still present when it runs)"
-POISON="$ROOT/build/l0_cite_mutate_fixture/last_pass.stamp"
+POISON="$BUILD_DIR/l0_cite_mutate_fixture/last_pass.stamp"
 mkdir -p "$(dirname "$POISON")"
 echo "fixture" > "$POISON"
 
@@ -210,7 +211,7 @@ if printf '%s\n' "$leak_dirs" | grep -qx 'l0_cite_mutate_fixture'; then poisoned
 if [ "$poisoned" -eq 0 ]; then
   echo "  M-H UNREACHABLE -- pop_total cannot see the planted fixture, so the"
   echo "    assertion is vacuous against exactly the defect it exists to catch."
-  rm -rf "$ROOT/build/l0_cite_mutate_fixture"
+  rm -rf "$BUILD_DIR/l0_cite_mutate_fixture"
   echo "M-H  BROKEN  (pop_total blind to fixtures)" >> "$LOG/summary.txt"
   echo "RESULT: l0_cite_mutate FAIL (M-H vacuous - pop_total blind to fixtures)"
   exit 1
@@ -224,7 +225,7 @@ fi
 assert_rc=0
 leak_assert "poisoned by M-H" || assert_rc=1
 
-rm -rf "$ROOT/build/l0_cite_mutate_fixture"
+rm -rf "$BUILD_DIR/l0_cite_mutate_fixture"
 if [ "$assert_rc" -ne 0 ]; then
   echo "  M-H ok -- the fixture dir WAS visible to pop_dirs and the SHIPPED"
   echo "    assertion rejected it while it was on disk. It CAN go red."

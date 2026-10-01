@@ -34,7 +34,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PIN="63647bb8214cdc581d2bd5ed3822f157f7d34679"
 URL="https://github.com/intel/compute-runtime.git"
-WORK="${INTFER_CR_TREE:-$ROOT/build/cr}"
+WORK="${INTFER_CR_TREE:-${INTFER_BUILD_DIR:-$ROOT/build}/cr}"
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
 

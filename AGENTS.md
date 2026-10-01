@@ -129,9 +129,28 @@ single fact governs how every gate result in this file must be read:
     rather than a research-subagent transcript. Clones sparse on demand;
     if the pin cannot be resolved it exits 2 and the docs must then be read as
     UNVERIFIED.
-  - `scripts/mutate_l0_cite.sh` — mutation matrix for that checker, 7/7
-    states caught each for its own reason, stamped
-    `build/l0_cite_mutate/last_pass.stamp`.
+  - `scripts/mutate_l0_cite.sh` — mutation matrix for that checker, 7/7 states
+    caught each for its own reason, stamped `build/l0_cite_mutate/last_pass.stamp`.
+    It also carries a **stamp-population leak assertion** (`leak_assert()`),
+    called THREE times against ONE predicate — as-found (before any mutation),
+    poisoned-by-M-H (fixture still on disk), and after-states. Measured: clean
+    tree exit 0; a fixture pre-planted in `$BUILD_DIR` exit 1.
+  - `scripts/check_e2_ctx.sh` — the E2 long-context identity checker. The
+    `check_*` prefix is load-bearing: `gate_inventory.sh` derives the GATE
+    population from `ls scripts/test_*.sh`, so a `check_*` name cannot be
+    misclassified as a gate carrying no device guard (AUDIT #17), while
+    `run_all_checks.sh` 0b enumerates `check_*`/`mutate_*` and requires a
+    dispatch arm for each. **Both new checkers and their matrix honor
+    `INTFER_BUILD_DIR`** (AUDIT #8: an artifact consumer that ignores the
+    override silently validates the WRONG tree); verified by pointing the
+    override at an empty directory, which yields rc=2 SKIP rather than silently
+    falling back to the default tree.
+  - `scripts/gpu_driver_lib_ab.sh` — committed driver-lib A/B; exits 1
+    INCONCLUSIVE if both arms report the same driverVersion.
+  - `scripts/l0_enum_trace.sh` — debug-flag attempt; exits 3 INCONCLUSIVE when
+    the driver prints no skip reason.
+  Exit codes for all of the above are tabled in
+  `reports/2026-10-01-batch-e1-e2-e3-verdicts.md`.
   *** NEXT-SESSION TRIGGER — the one thing worth reopening. *** If
   `scripts/l0_enumerate.sh` ever prints **2** devices, the enumeration fault is
   gone. Immediately close the ONLY remaining unverified coverage, in order:
@@ -1684,6 +1703,48 @@ e.g. S3's contract column is 40 not 42).
     case where the check must fire AND a case where it must stay quiet, and the
     quiet case is the one that gets forgotten. `grep -c '^def_'` returning 0 is
     evidence about the SEARCH, not about the coverage.
+
+  - **AUDIT #19 (2026-10-01): A SELF-PROVING MUTATION STATE HIDES A BROKEN
+    ASSERTION — and the only cure is running the NEGATIVE direction by hand.**
+    Added a stamp-population leak check to `mutate_l0_cite.sh` so the matrix's
+    own fixtures cannot join the `find $BUILD_DIR -name '*last_pass.stamp'`
+    population that `run_all_checks.sh` step 3/3 enumerates (the AUDIT #17c leak
+    class). It took **three** attempts, and every one of them PASSED, because the
+    state that was supposed to prove the check could fail was itself keeping the
+    population clean. The three defects, in order:
+      * (a) The first version was a **print, not an assertion** — it echoed a
+        LEAK line and then exited 0 on the states, so a leaking run still read
+        as PASS. A comment with a shebang.
+      * (b) It probed for stamps **after `rm -rf`**, so even a real leak was
+        unobservable. A check that cannot fail.
+      * (c) It lived **after** the mutation states, and the state deleted its own
+        fixture before the assertion read the population. M-H planted a stamp,
+        counted, **deleted it**, then compared against a constant — i.e. against
+        its own doing rather than a property of the tree.
+    (d) Separately, `pop_total` and `known_dirs` were defined **after** their
+    callers, so M-H died with `pop_total: command not found` and then
+    `known_dirs: unbound variable`. Under `set -u` a helper referenced before it
+    exists turns into a FAILED state, which is the shell's version of the family-3
+    stale binary: the mutation appears to run and proves nothing.
+    (e) An inline **duplicate** of the predicate sat next to the late assertion,
+    so M-H proved the COPY while the shipped check stayed unproven — the AUDIT #3
+    "rule fixed at one site, re-derived at another" shape, in shell.
+    FIX, all of it: `leak_assert()` is now a **function called three times against
+    one predicate** (as-found, poisoned-by-M-H, after-states); it compares the
+    SET of stamp DIRECTORIES against a known-matrices list rather than a COUNT
+    (counting fired on a healthy tree, because `mutate_device_precond.sh` writes
+    TWO stamps; and a count-only fixture would cancel against a missing stamp);
+    and the fixture now STAYS planted while the assertion runs.
+    MEASURED both directions: clean tree **exit 0**; fixture pre-planted in
+    `$BUILD_DIR` **exit 1** ("[as found] FAIL ... LEAK").
+    *** THE GENERAL LESSON, which is the whole point. *** A self-proving
+    mutation state is not evidence: it validates the state, and a state that
+    cleans up after itself will happily "prove" a check that cannot fail. Every
+    time, the defect was found by **running the negative direction by hand** —
+    planting the fixture BEFORE invoking the script. A self-consistent M-H passed
+    all three times. When a mutation state cannot fail, prove the harness with a
+    case the harness did not set up. Related: AUDIT #17b's `verify_patched()`
+    (a mutation that does not reproduce its defect is worse than none).
 
   - **SINGLE WRITER: do not commit to this clone while `run_all_checks.sh` is
     running.** MEASURED, not hypothetical — a second agent session committed
