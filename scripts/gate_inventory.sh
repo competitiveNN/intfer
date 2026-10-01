@@ -423,6 +423,116 @@ else
     echo "           <-- VACUOUS: matched 0 tally sites, so nothing was verified." >&2
     VIOLATIONS=$((VIOLATIONS + 1))
   fi
+
+  # --- HAND-COUNTED TOTALS must be citations, not live claims ---------------
+  # The tally above is DERIVED (expected rc per gate from this file's own
+  # classification), so it can be reconciled against the source. A hand-counted
+  # total -- "45/45 scripts", "12 baselines", "29 artifact consumers" -- has no
+  # such source: it is a snapshot of one moment. Those are legitimate HISTORICAL
+  # records and must NOT be rewritten to match today (rewriting a true record is
+  # the same laundering failure in the other direction). The defect is different
+  # and narrower: presenting one as a claim about the CURRENT tree.
+  #
+  # That is not hypothetical. A session summary said "43/43 scripts" in one place
+  # and "45/45" in another in the same breath, and an AGENTS.md sentence still
+  # claimed "11 baselines" after N-Kq/N-L made it 12 -- which then went stale the
+  # moment it was corrected. Cost one commit (e482073) chasing a number nobody
+  # needed. A number in prose is a CITATION.
+  #
+  # Three exclusions, all measured BEFORE writing the check, so the rule is known
+  # to converge rather than to fire on everything:
+  #   (a) paragraph-scoped history, using this checker's OWN markers from the
+  #       tally loop above (audit-#, COUNTING TRAP) -- so the two sections cannot
+  #       disagree about what counts as history;
+  #   (b) an explicit citation marker in the same paragraph (HISTORICAL,
+  #       superseded, "read from", ...);
+  #   (c) a QUOTED claim, i.e. the doc is refuting the number rather than making
+  #       it. Without (c) the one live hit was '"4 gates is enough"' -- a claim
+  #       being argued against, and flagging it would be a false positive.
+  # Measured on the corpus as it stood: 20 sites, 3 cited, 14 paragraph-history,
+  # 1 quoted-and-refuted, 0 live. Sites are counted and asserted NON-ZERO, so a
+  # regex that matches nothing cannot pass as "0 stale".
+# The counting is done in python, not shell. The bash version word-split the
+  # matched phrase ("3 gates" -> "3", "gates"), so it reported 25 live sites on a
+  # corpus that measures 0 -- every one a false positive. Prose matching is
+  # exactly the case where a shell word loop is the wrong tool.
+  hc_out="$(python3 - "$ROOT" <<'PYEOF'
+import os, re, sys
+ROOT = sys.argv[1]
+docs = [os.path.join(ROOT, "AGENTS.md")]
+rd = os.path.join(ROOT, "reports")
+if os.path.isdir(rd):
+    docs += [os.path.join(rd, f) for f in sorted(os.listdir(rd)) if f.endswith(".md")]
+
+# The phrase is ONE token: number, optional /denominator, then the noun.
+PAT = re.compile(r'\b\d+(?:/\d+)?\s+(?:scripts\b|baselines?\b|artifact consumers\b|gates\b)')
+HIST = re.compile(r'audit-#|COUNTING TRAP', re.I)
+CITED = re.compile(r'HISTORICAL|CITATION|at the time|superseded|re-derive|read .* from', re.I)
+
+tot = live = hist = cited = quoted = 0
+for path in docs:
+    if not os.path.isfile(path):
+        continue
+    rel = os.path.relpath(path, ROOT)
+    lines = open(path, errors="replace").read().splitlines()
+    i = 0
+    while i < len(lines):
+        if not PAT.search(lines[i]):
+            i += 1
+            continue
+        j = i
+        while j > 0 and (lines[j-1].startswith("  ") or lines[j-1].startswith("- ")
+                         or not lines[j-1].strip()):
+            j -= 1
+        k = i
+        while k + 1 < len(lines) and (lines[k+1].startswith("  ")
+                                      or lines[k+1].startswith("- ")):
+            k += 1
+        para = "\n".join(lines[j:k+1])
+        for m in PAT.finditer(para):
+            tot += 1
+            if HIST.search(para):
+                hist += 1
+                continue
+            if CITED.search(para):
+                cited += 1
+                continue
+            # A QUOTED claim is one the doc REFUTES, not makes. Without this the
+            # single live hit was '"4 gates is enough"' -- argued against in
+            # reports/2026-09-30-dpas48-fold.md -- so flagging it is a false
+            # positive. Quoted spans are excluded explicitly rather than by
+            # loosening the pattern.
+            q = re.compile(r'["\u201c\u201d][^"\u201c\u201d]*' + re.escape(m.group(0)))
+            if q.search(para):
+                quoted += 1
+                continue
+            live += 1
+            print("           LIVE %s:%s  hand-counted total '%s' is not marked a citation"
+                  % (rel, i + 1, m.group(0)))
+        i = k + 1
+print("           handcounted_sites=%d history=%d cited=%d quoted=%d live=%d"
+      % (tot, hist, cited, quoted, live))
+print("HC_LIVE=%d" % live)
+print("HC_TOTAL=%d" % tot)
+PYEOF
+)"
+  printf '%s\n' "$hc_out" | grep -v '^HC_' || true
+  hc_live="$(printf '%s'   "$hc_out" | sed -n 's/^HC_LIVE=//p')"
+  hc_total="$(printf '%s'  "$hc_out" | sed -n 's/^HC_TOTAL=//p')"
+  # Both verdicts must be PRESENT: a python failure yields empty stdout, and
+  # `[ "" -eq 0 ]` is a bash error whose result is FALSE -- so without this the
+  # check would silently pass having verified nothing. Same class as
+  # gate_require_device's silent no-op, one function over.
+  if [ -z "$hc_live" ] || [ -z "$hc_total" ]; then
+    echo "           <-- hand-counted check produced NO verdict (python failed?)" >&2
+    VIOLATIONS=$((VIOLATIONS + 1))
+  elif [ "$hc_total" -eq 0 ]; then
+    echo "           <-- VACUOUS: matched 0 hand-counted-total sites, so this check" >&2
+    echo "               verified nothing and would report 0 live by default." >&2
+    VIOLATIONS=$((VIOLATIONS + 1))
+  else
+    VIOLATIONS=$((VIOLATIONS + hc_live))
+  fi
 fi
 
 echo
