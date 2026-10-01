@@ -243,6 +243,17 @@ consumer_state "M-G" "$SB/check_build_dir_consumers.sh" \
   'PASS \(0 consumer' \
   "the consumer harvest is empty"
 
+# M-I: a NON-NUMERIC harvest must fail closed THROUGH THE CONSUMER, not only in
+# the helper in isolation. check_gate_enum.sh proves the helper rejects "abc";
+# this proves the guarantee survives the call site, which is where a
+# `[ "" -gt 0 ]`-style test would quietly pass. Verified by hand first: forcing
+# either consumer's harvest to a non-numeric value gives rc=2 (consumer 1) and
+# rc=1 (consumer 2).
+consumer_state "M-I" "$SB/check_build_dir_consumers.sh" \
+  's|^N_TARGETS=.*|N_TARGETS="not-a-number"|' \
+  'BUILD-DIR CONSUMER CHECK: PASS' \
+  "a non-numeric harvest must not report success"
+
 # M-H: make check_doc_counts.sh's index harvest return 0 without the guard
 # noticing -- its "sites_found=0" twin.
 consumer_state "M-H" "$SB/check_doc_counts.sh" \

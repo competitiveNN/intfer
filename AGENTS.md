@@ -109,6 +109,24 @@ single fact governs how every gate result in this file must be read:
   4. If the BARs are fine, the next step is a DEBUG build of compute-runtime to
      get the skip reason printed — not more guessing from this container.
   REPRODUCE ALL OF IT (committed scripts, not prose):
+
+**The vacuous-green tooling (AUDIT #20).** Shared guard, its self-check, its
+matrix, and the shared patch helper — all dispatched steps of
+`run_all_checks.sh`, so section 0b fails if any loses its arm:
+  - `scripts/_gate_enum.sh` — `enum_require_nonempty` / `enum_require_min`, the
+    ONE home for "a checker that cannot harvest its subject cannot certify it".
+    Sourced by `check_doc_counts.sh`, `check_build_dir_consumers.sh` and
+    `gate_inventory.sh`.
+  - `scripts/check_gate_enum.sh` — behavioural self-check for that guard, with
+    the required CONVERSE: must REJECT 0/empty/non-numeric/below-minimum, and
+    must ACCEPT well-formed input SILENTLY.
+  - `scripts/mutate_gate_enum.sh` — mutation matrix for both, and for the two
+    CONSUMERS, because both historical vacuous-greens lived in the consumers
+    rather than in the helper. Patches sandbox copies under the build tree.
+  - `scripts/_gate_patch.sh` — `patch_literal` (exact, must occur exactly once),
+    `verify_patched`, `residue_scan`. New matrices source this instead of
+    adding another copy; the three remaining duplicates are a recorded decision
+    with explicit conversion triggers, see the `patch_literal` note below.
   - `scripts/l0_enumerate.sh` — device count + uuid at the driver API. Honours
     INTFER_L0_DRIVER_LIB and prints driverVersion so a no-op lib swap is
     visible. Deletes its own output and refuses to run a stale binary.
@@ -1785,7 +1803,30 @@ e.g. S3's contract column is 40 not 42).
     that checker had a mutation state designed to make it fail. A checker with no
     matrix would have shipped all three.
 
-  - **A GUARD SOURCED INSIDE A CONDITIONAL IS A GUARD THAT IS USUALLY ABSENT.**
+  - **`patch_literal` IS STILL DUPLICATED IN THREE MATRICES — DELIBERATE, WITH A
+    TRIGGER.** `scripts/_gate_patch.sh` (added AUDIT #20) owns `patch_literal`,
+    `verify_patched` and `residue_scan` for NEW matrices. `mutate_fold_matrix.sh`,
+    `mutate_device_precond.sh` and `mutate_run_all_checks.sh` still carry their own
+    copies. **This is a known, accepted duplication, not an oversight**, and the
+    reason is worth stating so the next session does not "fix" it casually:
+    converting them means editing the source of three PASSING, mutation-proven
+    matrices, and a refactor that breaks a matrix is strictly worse than the
+    drift it removes — the drift is bounded (one function, ~10 lines, three
+    copies) and every copy is exercised whenever its matrix runs.
+    **CONVERT WHEN ANY OF THESE IS TRUE, one matrix at a time, each with its own
+    re-run and stamp:**
+      * a copy is edited and the edit is made to only one of them (then the
+        copies have genuinely diverged and the shared helper is now a *bug*
+        source, not a dedup opportunity);
+      * a fifth matrix is added (the count is what makes the hand-maintenance
+        cost real);
+      * one of the three is next being modified anyway, so the review cost is
+        already being paid.
+    `mutate_gate_inventory.sh` uses its own `patch_once`, which is a DIFFERENT
+    function (per-hunk, not whole-block) and is not a candidate for this helper.
+    Do NOT convert it "for consistency".
+
+- **A GUARD SOURCED INSIDE A CONDITIONAL IS A GUARD THAT IS USUALLY ABSENT.**
     While routing `gate_inventory.sh` through `_gate_enum.sh`, the `.` landed
     inside its `if ! command -v sycl-ls` block, so the helper existed **only when
     sycl-ls was missing from PATH** — and the call site 400 lines below failed
