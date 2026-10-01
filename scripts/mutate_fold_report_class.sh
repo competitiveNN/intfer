@@ -147,7 +147,7 @@ run_state "M-C" 'MUT_C' 'ok    no stamp at all -> rc=2'
 # M-A/M-B/M-C "correctly" while never confirming the healthy case passes.
 MUTATE_FN() {
   patch_literal "$SB/scripts/check_fold_report_class.sh" \
-    'restore; expect "clean summary + current stamp"        0 "$(run_rc)"' \
+    'expect "clean summary + current stamp" 0 "$(run_rc)"' \
     ': # MUT_D -- the healthy direction is no longer asserted' \
     && verify_patched "$SB/scripts/check_fold_report_class.sh" 'MUT_D'
 }
