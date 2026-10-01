@@ -107,6 +107,15 @@ for f in $CONSUMERS; do
 done
 
 echo
+# The classifier loop must actually have INSPECTED something. This branch used
+# to report "PASS (0 consumer(s), all honor INTFER_BUILD_DIR)" -- a green
+# verdict over an empty census -- when the self-exclusion was widened until it
+# skipped everything. That is AUDIT #14's shape exactly, in a checker written to
+# prevent it, so it gets the shared guard rather than a hand-rolled copy.
+enum_require_nonempty "inspected-scripts" "$checked" "scripts classified" || {
+  echo "RESULT: build-dir consumers VACUOUS PASS ($checked scripts inspected)"
+  exit 1
+}
 echo "-- derived from CMake: $N_TARGETS target(s); scripts inspected: $checked"
 if [ "$bad" -eq 0 ]; then
   echo

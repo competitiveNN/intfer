@@ -94,6 +94,84 @@ run_state "M-B" "bench_reports_batch.sh *FAIL" \
 total=$((total+1)); caught=$((caught+1))
 echo "  M-C control -- a checker that always passes would score M-A as MISSED; see M-A caught"
 
+# ---- states 3..5: the ENUMERATION seam and the EXCLUSION logic ---------------
+# M-A/M-B only prove the per-line classifier can spot a re-hardcoded path. They
+# say nothing about the two mechanisms that could quietly stop it looking at
+# anything at all:
+#   * the shared vacuity guard (scripts/_gate_enum.sh) -- if that stops firing,
+#     an empty harvest reports "no violations" and the checker exits 0 while
+#     verifying nothing. That is the AUDIT #14 class, and it is the exact defect
+#     that bit this repo when `awk '{print $2}'` failed to split on '('.
+#   * the exclusions -- this script skips itself, and it must skip the
+#     mutation matrix's MUTANT payload lines. If either exclusion stops applying
+#     for the right reason, it will start flagging the very files it is meant to
+#     exempt, or (worse) stop flagging something it should.
+# Each is asserted with a positive predicate, and each gets a converse so an
+# always-red reading cannot pass.
+
+# mut_checker <id> <sed-on-checker> <expect-re> <why>
+mut_checker() {
+  local id="$1" expr="$2" expect="$3" why="$4"
+  total=$((total+1))
+  restore
+  CB2="$(mktemp "${TMPDIR:-/tmp}/bdc_chk.XXXXXX")"
+  cp "$CHECK" "$CB2"
+  sed -i "$expr" "$CHECK" 2>/dev/null
+  if cmp -s "$CB2" "$CHECK"; then
+    echo "  $id MISSED -- checker mutation did not apply"
+    echo "$id MISSED (no apply)" >> "$LOG/summary.txt"; rm -f "$CB2"; return 1
+  fi
+  # poison the TARGET at the same time, so the neutered checker has something
+  # it ought to catch
+  sed -i '22s|.*|LOG="$ROOT/build/bench_${BATCH}.log"|' "$ROOT/$TARGET" 2>/dev/null  # MUTANT payload
+  local o r
+  o="$("$CHECK" 2>&1)"; r=$?
+  printf '%s\n' "$o" > "$LOG/$id.log"
+  cp "$CB2" "$CHECK"; rm -f "$CB2"; restore
+  if [ "$r" -eq 0 ]; then
+    echo "  $id MISSED -- checker exited 0 although $why"
+    echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; return 1
+  fi
+  if printf '%s\n' "$o" | grep -qE "$expect"; then
+    echo "  $id MISSED -- still reports '$expect'"
+    echo "$id MISSED (marker survived)" >> "$LOG/summary.txt"; return 1
+  fi
+  echo "  $id caught -- rc=$r, marker gone ($why)"
+  echo "$id caught" >> "$LOG/summary.txt"; caught=$((caught+1)); return 0
+}
+
+# M-D: the vacuity guard neutered. With it gone, an empty CMake harvest no
+# longer exits 2, so a checker that finds nothing reports success.
+mut_checker "M-D" \
+  's|^enum_require_min "cmake-targets" "\$N_TARGETS" 1 \|\||if false; then :; elif false; then|' \
+  'BUILD-DIR CONSUMER CHECK: PASS' \
+  "the enumeration guard is gone and a re-hardened tree passes"
+
+# M-E: the "this script skips itself" exclusion widened to skip EVERY script, so
+# nothing is ever classified. The FIRST version of this state expected the
+# "all honor INTFER_BUILD_DIR" line to disappear -- and the checker exited 0
+# WITH it still printed, because it went on to print a PASS over an empty
+# census ("PASS (0 consumer(s), all honor INTFER_BUILD_DIR)"). That is exactly
+# the vacuous-green the state was built to expose, in a checker written to
+# prevent it. The checker now carries the shared inspected-scripts guard, so the
+# correct predicate is the VACUOUS-PASS line, and the state catches it.
+mut_checker "M-E" \
+  's|if \[ "\$b" = "\$(basename "\$0")" \]; then|if true; then|' \
+  'PASS \(0 consumer' \
+  "every script is skipped by the self-exclusion"
+
+# CONVERSE for the exclusions: the MUTANT payload tag must still be excluded,
+# or the matrix's own sed lines get flagged as hardcoded paths and the checker
+# fails on its own test data.
+total=$((total+1))
+if ./scripts/check_build_dir_consumers.sh 2>&1 | grep -q 'mutate_build_dir_consumers.sh *FAIL'; then
+  echo "  M-F MISSED -- the MUTANT payload exclusion stopped working"
+  echo "M-F MISSED (payload flagged)" >> "$LOG/summary.txt"
+else
+  echo "  M-F caught -- converse: the MUTANT payload is correctly excluded"
+  echo "M-F caught (converse)" >> "$LOG/summary.txt"; caught=$((caught+1))
+fi
+
 restore
 echo
 echo "== summary =="
