@@ -129,32 +129,38 @@ run_state() { # $1 id, $2 marker, $3 absent-RE
 echo
 echo "== states =="
 
+# *** patch_literal takes THREE arguments: file, exact-old, exact-new. ***
+# The first version of this matrix passed FIVE -- one quoted string per line --
+# because each quoted string is a separate ARGUMENT, not a concatenation. It
+# therefore replaced the echo line with the counter increment, never wrote the
+# marker, and all five states reported "PATCH VERIFY FAIL: NOT present" while
+# patch_literal itself succeeded. Found with `bash -x`, not by guessing.
+# A single-quoted bash string MAY span lines, so old and new each carry the
+# WHOLE case as one argument. That is the form below.
+#
 # Each state removes ONE case: its echo line and its own counter increment.
-# The counters are n_a..n_e precisely so each removal has a UNIQUE single-line
-# anchor; a shared counter cannot be targeted (five identical increments), which
-# is why the first pass of this matrix scored 0/5 rather than catching anything.
-# Removing a measurement must be observable -- a case that is deleted, rather than
-# failing, used to leave the checker exiting 0.
+# The counters are n_a..n_e precisely so each removal has a UNIQUE anchor; a
+# shared counter cannot be targeted (five identical increments).
 
 # M-A: the prefix-form case -- the FALSE LEAK this helper shipped ($PWD/build assumed
 # where the matrices write $ROOT/build)
 MUTATE_FN() {
   patch_literal "$SB/check_gate_pop.sh" \
-    'echo "  ok    all four prefix forms recognised: $got"' \
-    '  n_a=$((n_a+1))' \
-    ': # MUT_A -- this case is no longer measured' \
-    '  n_a=$((n_a))' \
+    'echo "  ok    all four prefix forms recognised: $got"
+  n_a=$((n_a+1))' \
+    ': # MUT_A -- this case is no longer measured
+  n_a=$((n_a))' \
   && verify_patched "$SB/check_gate_pop.sh" 'MUT_A'
 }
 run_state "M-A" 'MUT_A' 'ok    all four prefix forms recognised'
 
-# M-B: the CONVERSE -- without it, a checker that rejects everything passes the rest
+# M-B: the CONVERSE -- without it a checker that rejects everything passes the rest
 MUTATE_FN() {
   patch_literal "$SB/check_gate_pop.sh" \
-    'echo "  ok    ok -- the assertion stays SILENT on a clean tree"' \
-    '  n_b=$((n_b+1))' \
-    ': # MUT_B -- this case is no longer measured' \
-    '  n_b=$((n_b))' \
+    'echo "  ok    ok -- the assertion stays SILENT on a clean tree"
+  n_b=$((n_b+1))' \
+    ': # MUT_B -- this case is no longer measured
+  n_b=$((n_b))' \
   && verify_patched "$SB/check_gate_pop.sh" 'MUT_B'
 }
 run_state "M-B" 'MUT_B' 'stays SILENT on a clean tree'
@@ -162,10 +168,10 @@ run_state "M-B" 'MUT_B' 'stays SILENT on a clean tree'
 # M-C: the can-go-red direction -- without it a stub always returning 0 would pass
 MUTATE_FN() {
   patch_literal "$SB/check_gate_pop.sh" \
-    'echo "  ok    rejected, and it named fixture_leak"' \
-    '  n_c=$((n_c+1))' \
-    ': # MUT_C -- this case is no longer measured' \
-    '  n_c=$((n_c))' \
+    'echo "  ok    rejected, and it named fixture_leak"
+  n_c=$((n_c+1))' \
+    ': # MUT_C -- this case is no longer measured
+  n_c=$((n_c))' \
   && verify_patched "$SB/check_gate_pop.sh" 'MUT_C'
 }
 run_state "M-C" 'MUT_C' 'named fixture_leak'
@@ -174,10 +180,10 @@ run_state "M-C" 'MUT_C' 'named fixture_leak'
 # report itself vacuous
 MUTATE_FN() {
   patch_literal "$SB/check_gate_pop.sh" \
-    'echo "  ok    both shapes enumerate the same $r1 dir(s)"' \
-    '  n_d=$((n_d+1))' \
-    ': # MUT_D -- this case is no longer measured' \
-    '  n_d=$((n_d))' \
+    'echo "  ok    both shapes enumerate the same $r1 dir(s)"
+  n_d=$((n_d+1))' \
+    ': # MUT_D -- this case is no longer measured
+  n_d=$((n_d))' \
   && verify_patched "$SB/check_gate_pop.sh" 'MUT_D'
 }
 run_state "M-D" 'MUT_D' 'both shapes enumerate the same'
@@ -185,10 +191,10 @@ run_state "M-D" 'MUT_D' 'both shapes enumerate the same'
 # M-E: the fail-closed case -- the third defect, an empty path enumerated at rc=0
 MUTATE_FN() {
   patch_literal "$SB/check_gate_pop.sh" \
-    'echo "  ok    refused (rc=$rc) instead of reporting an empty population as ok"' \
-    '  n_e=$((n_e+1))' \
-    ': # MUT_E -- this case is no longer measured' \
-    '  n_e=$((n_e))' \
+    'echo "  ok    refused (rc=$rc) instead of reporting an empty population as ok"
+  n_e=$((n_e+1))' \
+    ': # MUT_E -- this case is no longer measured
+  n_e=$((n_e))' \
   && verify_patched "$SB/check_gate_pop.sh" 'MUT_E'
 }
 run_state "M-E" 'MUT_E' 'refused \(rc='
