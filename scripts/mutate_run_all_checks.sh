@@ -360,12 +360,20 @@ fi
 echo "sandbox hygiene: ok (clean after $NBASE baselines)"
 
 # --- anchor pre-flight (checked against the PRISTINE target) ---------------
+# Counted with the SAME mechanism patch_literal uses, deliberately. Two earlier
+# versions of this helper were wrong in ways that mattered:
+#   * `grep -cF ... || echo 0` -- grep -c prints "0" AND exits 1 on no match, so
+#     every miss reported "found 0\n0 times".
+#   * `grep -cF` itself counts LINES, and one anchor (A_RESIDUE) is a four-line
+#     continuation, so it reported 4 occurrences and refused to start.
+The pre-flight and the patch must agree on what "exactly once" means, or the
+guard and the thing it guards drift -- so both count SUBSTRING occurrences in
+python, here and in patch_literal below.
 check_anchor() { # $1 = literal, $2 = description
-  # `grep -c` prints "0" AND exits 1 when nothing matches, so `|| echo 0` used to
-  # append a SECOND "0" and every miss reported "found 0\n0 times". It failed
-  # closed either way, but the diagnostic IS the product of a mutation harness --
-  # three sibling sites already use `|| true`, which is the correct form.
-  local n; n="$(grep -cF -- "$1" "$TARGET" 2>/dev/null || true)"
+  local n
+  n="$(python3 -c 'import sys
+src = open(sys.argv[1]).read()
+print(src.count(sys.argv[2]))' "$TARGET" "$1" 2>/dev/null || echo COUNT-FAILED)"
   if [ "$n" != "1" ]; then
     echo "FAIL: anchor for $2 found $n times in $TARGET, want 1" >&2
     echo "  Target: $1" >&2; exit 1
