@@ -562,6 +562,33 @@ pending a quiet-box wall-time read. E3 counters: `nk` 13440 / 17856 / 21888 /
 27840 across BASE/DPAS48/FOLD/FOLDPREQ, consistent with FOLD's one extra launch
 per DPAS GEMM.
 
+## Exit codes of the harnesses cited here
+
+These are diagnostic tools, not gates, so their non-zero exits are part of what
+they MEAN. Measured, so a reader does not have to guess:
+
+| script | rc | meaning |
+|---|---|---|
+| `scripts/l0_enumerate.sh` | 0 | driver API returned >=1 device |
+| `scripts/gpu_driver_lib_ab.sh` | 0 | >=2 arms with DISTINCT driverVersions, same count => version not the cause |
+| `scripts/gpu_driver_lib_ab.sh` | 1 | both arms same driverVersion => A/B proved nothing (vacuous) |
+| `scripts/gpu_health_check.sh` | 0 | cards symmetric in the checked attributes |
+| `scripts/gpu_health_check.sh` | 1 | card1-specific read failure found (**the current, expected state here**) |
+| `scripts/l0_enum_trace.sh` | 0 | both devices, or a skip diagnostic printed (information obtained) |
+| `scripts/l0_enum_trace.sh` | **3** | ran, no skip reason printed => **INCONCLUSIVE**, not success (**current state here**) |
+| `scripts/check_l0_cite.sh` | 0 | every cited line verified at the pin |
+| `scripts/check_l0_cite.sh` | 1 | a cited line does NOT read as quoted, OR the tree is not at the pin |
+| `scripts/check_l0_cite.sh` | 2 | pin unresolvable (no network) => citations **UNVERIFIED** |
+| `scripts/mutate_l0_cite.sh` | 0 | 7/7 claim states caught + leak assertion proven both directions |
+| `scripts/mutate_l0_cite.sh` | 1 | a state missed, baseline failed, or a fixture stamp sits in `$BUILD_DIR` |
+
+**How the suite treats them.** `run_all_checks.sh` classifies rc=2 as
+**UNPROVEN**, not a failure, and re-runs unproven steps in phase 2b. Measured
+end-to-end with an unresolvable pin: prints `UNPROVEN rc=2 (stale evidence, not
+a regression ...)` and the suite exits **2**, not 1 — an offline box is
+distinguishable from a real regression. That distinguishability is the entire
+reason rc=2 exists, so it was measured rather than asserted.
+
 ## Verification state of this batch
 
 Measured after the reports were written, not asserted:
