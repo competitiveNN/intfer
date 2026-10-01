@@ -19,7 +19,7 @@ BATCH="${1:-}"
 ROUNDS="${2:-3}"
 QLOAD="${INTFER_QUIET_LOAD:-2.0}"
 QWAIT="${INTFER_QUIET_WAIT:-3600}"
-LOG="${INTFER_BENCH_LOG:-$ROOT/build/bench_${BATCH}.log}"
+LOG="${INTFER_BENCH_LOG:-${INTFER_BUILD_DIR:-$ROOT/build}/bench_${BATCH}.log}"
 
 [ -n "$BATCH" ] || { echo "usage: $0 <E1|E2|E3> [ROUNDS]"; exit 1; }
 [ -x "$BIN" ] || { echo "FAIL: cli missing: $BIN"; exit 1; }
