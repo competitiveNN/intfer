@@ -43,16 +43,19 @@ echo "== GATE POP SELF-CHECK (_gate_pop.sh) =="
 
 # ---- (a) every REAL prefix form a matrix actually uses must be recognised ---
 echo "-- (a) prefix forms: every form a real matrix writes is OWNED --"
-cat > "$SYN/mutate_m1.sh" <<'EOF'
+# The heredocs below carry the literal prefix forms ON PURPOSE -- they are the
+# fixtures under test, not paths this script resolves. Tagged so the
+# build-dir consumer checker does not read them as an AUDIT #8 violation.
+cat > "$SYN/mutate_m1.sh" <<'EOF'   # MUTANT payload
 LOG_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/device_precond_matrix"
 EOF
-cat > "$SYN/mutate_m2.sh" <<'EOF'
+cat > "$SYN/mutate_m2.sh" <<'EOF'   # MUTANT payload
 STAMP="$BUILD_DIR/fold_matrix"
 EOF
-cat > "$SYN/mutate_m3.sh" <<'EOF'
+cat > "$SYN/mutate_m3.sh" <<'EOF'   # MUTANT payload
 WORK="$BUILD_DIR/run_all_mutate"
 EOF
-cat > "$SYN/mutate_m4.sh" <<'EOF'
+cat > "$SYN/mutate_m4.sh" <<'EOF'   # MUTANT payload
 STAMP="$PWD/build/l0_cite_mutate"
 EOF
 mkdir -p "$BD"/{device_precond_matrix,fold_matrix,run_all_mutate,l0_cite_mutate}
@@ -66,7 +69,7 @@ for d in device_precond_matrix fold_matrix run_all_mutate l0_cite_mutate; do
 done
 if [ -n "$miss" ]; then
   echo "  FAIL  these REAL matrix directories are not recognised as owned:$miss"
-  echo "        that is the \$PWD/build vs \$ROOT/build defect, and it makes the"
+  echo "        that is the PWD-vs-ROOT build-prefix defect, and it makes the"
   echo "        leak check always-red on a clean tree."
   bad=$((bad+1))
 else
