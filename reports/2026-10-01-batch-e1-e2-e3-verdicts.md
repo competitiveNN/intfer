@@ -589,6 +589,20 @@ a regression ...)` and the suite exits **2**, not 1 — an offline box is
 distinguishable from a real regression. That distinguishability is the entire
 reason rc=2 exists, so it was measured rather than asserted.
 
+### What `run_all_checks.sh: PASS` does and does not certify
+
+`RUN ALL CHECKS: PASS` with every stamp naming HEAD certifies the **verification
+tooling**, not GPU coverage. It means: the tree is clean, the classifier
+self-check holds, every `check_*`/`mutate_*` has a dispatch arm, the correctness
+gates and mutation matrices behaved as characterized, the stamp set has no
+fixture leak, and nothing changed during the run. It says **nothing** about TP=2.
+
+The gate tally remains **7 PASS, 2 PARTIAL, 1 SKIPPED** (rc 0/2/2) and **TP=2
+remains UNVERIFIED**: `gpu_optin` and `device_argmax` run every TP=1 arm and skip
+only their `--tp 2` ones, and `tp2_27b` is skipped outright, because Level Zero
+enumerates one device on this box. Every 27B `--tp 2` command in these reports is
+unrunnable, and **no gate was relaxed to make a 1-GPU box look green**.
+
 ## Verification state of this batch
 
 Measured after the reports were written, not asserted:
