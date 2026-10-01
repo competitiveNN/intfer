@@ -200,9 +200,10 @@ every gate still passes.
 
 ---
 
-## 8. Blocked follow-on: a bytes-transferred bucket (E6, scoped, NOT implemented)
+## 8. E6 — a bytes-transferred bucket: DECLINED, not deferred
 
-**Do not go looking for a flag — none exists and no code has been written.**
+**No flag, no code, and that is a decision rather than a backlog item** — see the
+DECISION block at the end of this section.
 
 E5 cannot be judged from counters, for the structural reason in §5: the saving
 is bytes on a D2H whose *count* is unchanged, so `nr` cannot see it. The fix is
@@ -222,6 +223,36 @@ Scoping notes, so this is not re-derived wrongly:
   must not perturb the stream-identity arms, and the gate is what proves it.
 
 `RESULT:` (bytes bucket, only after it exists): OFF ______ B/token, ON ______ B/token
+
+### DECISION (2026-10-01): not implementing it. Said once, here, on purpose.
+
+This section has now deferred E6 twice, and repeated deferral is how a permanently
+unreachable item quietly becomes indistinguishable from a merely-pending one. So:
+**E6 is declined, not deferred.** E5 stays permanently unmeasured, which the §5
+status table already states correctly. Reasons, so this is not re-litigated:
+
+1. **It touches profiling source for a default-off lever that is already
+   correctness-gated and free while disabled.** The default-off experiment costs
+   nothing and is not a regression risk, so the return on instrumenting it is low.
+2. **The honest measurement still needs the quiet box.** `d2h_bytes` would prove
+   the *mechanism* (bytes fall ~3000x), not the *value*. Only wall time decides
+   whether +1 submit/token is repaid, and that is a quiet-box A/B. E6 narrows the
+   question; it does not answer it.
+3. **Every counter it adds is one more thing that can drift** from the code it
+   measures — the family this repo keeps auditing. Adding an un-gated profiling
+   field to make one lever legible trades a known state for a new one.
+
+If E6 is ever revived, the concrete change is small and the sites are known:
+`uint64_t d2h_bytes` beside `readback_count` in `GpuProfile`
+(`src/engine/engine.cpp:127`), incremented by the byte count at the two lm_head
+D2H sites (`main.cpp:1775` scalar `Nlt*sizeof(sycl::half)`, `:2313` M-row
+`M*sizeof(int)` + `M*sizeof(float)`), printed beside `readback_count` in the
+`[GPU profile]` line (`main.cpp:9890`). Expected signature if the lever works:
+bytes fall from `~N*2` to `~8*ntiles` per token while `nr` stays flat.
+
+**Do not implement this speculatively.** Re-open it only if a quiet-box A/B shows
+the lever's wall time is actually close to break-even, because then the mechanism
+is load-bearing enough to be worth proving cheaply.
 
 ---
 

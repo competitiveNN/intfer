@@ -778,8 +778,12 @@ e.g. S3's contract column is 40 not 42).
    other direction, and it destroys the only record of what the tree looked like.
    Conversely do not quote one as present-day coverage. Derive the live numbers
    from source when they are needed: `ls scripts/*.sh | wc -l` for the syntax
-   sweep, and `scripts/gate_inventory.sh` for gate/consumer classification.
-   from the CMake `add_executable` list, not from a remembered name list).
+   sweep, and `scripts/gate_inventory.sh` for gate/consumer classification
+   (re-enumerated from the CMake `add_executable` list, not from a remembered
+   name list). **`gate_inventory.sh` now ENFORCES this rule**: it fails when a
+   hand-counted total is presented as a live claim, excluding paragraph-scoped
+   history, explicitly-cited lines, and quoted claims the doc is refuting.
+   (882a0c2). A number in prose is a citation.
    They are blocked on a second GPU, not on missing work. Do not let any
    future summary fold "skipped" into "covered" — the correct phrasing is
    "7 PASS, 2 PARTIAL, 1 SKIPPED, E1-E5 unmeasured". Itemized table of exactly
