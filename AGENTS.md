@@ -41,11 +41,32 @@ single fact governs how every gate result in this file must be read:
   uuid. A card1 device would carry group 4 == 8600 and is **ABSENT**. So the
   loss is NOT in SYCL, NOT in UR, and NOT in device_manager.cpp:37 (same path
   sycl-ls uses) — **the L0 driver's own zeDeviceGet does not return card1.**
-  Why it skips 86:00.0 is still unknown; do not guess. Also negative, so they
-  are not retried: ONEAPI_DEVICE_SELECTOR in {level_zero:gpu, level_zero:*,
-  *:gpu, level_zero:0, *} and SYCL_DEVICE_FILTER in {level_zero:gpu, *} all
-  still yield 1; /dev/accel/accel0 is the 265KF's INTEGRATED gpu at
-  0000:00:0b.0, not a B580.
+  REPRODUCE: `scripts/l0_enumerate.sh` (and with
+  `INTFER_L0_DRIVER_LIB=/run/host/usr/lib64` to test a different driver lib).
+  *** DRIVER-LIBRARY VERSION RULED OUT, measured. *** Container
+  libze_intel_gpu 1.15.38646 (driverVersion 0x10396f6) and host 1.17.39758
+  (0x1039b4e) BOTH return exactly 1 device, same uuid. The probe prints
+  driverVersion precisely so a non-vacuous swap is visible.
+  *** ONE card1-ONLY KERNEL ANOMALY (a LEAD, not a cause). ***
+  `scripts/gpu_health_check.sh` diffs the two cards' sysfs: exactly four
+  attributes fail on card1 and only card1 —
+  tile0/gt{0,1}/freq0/{min,max}_freq return **ECANCELED (errno 125)**, 8/8
+  reproducible, while cur_freq/rp0_freq/num_csiles/ccs_mode match card0 exactly.
+  Those min/max reads are the GuC-mediated RAPL limit reads, so this is
+  CONSISTENT WITH card1's GuC not being functional. NOT PROVEN to be the cause
+  of the enumeration drop: nobody has read the xe/L0 enumeration path, and it is
+  unshown that device enumeration consults these files. Do not upgrade it to
+  "the cause" — that is the AUDIT #9 mistake again.
+  *** CANNOT BE DIAGNOSED OR FIXED FROM THIS CONTAINER (all measured). ***
+  dmesg = EPERM (no kernel log, so no xe GuC/reset failure message is visible);
+  writing remove/rescan/reset = EACCES (unprivileged), so a rebind of 86:00.0
+  cannot even be TESTED here. Next step is host-side: `dmesg | grep -i 'xe.*
+  86:00'` for a GuC-firmware/reset failure, then rebind/rescan and re-run
+  scripts/l0_enumerate.sh. That is a measurement PLAN, not a diagnosis.
+  Also negative, so they are not retried: ONEAPI_DEVICE_SELECTOR in
+  {level_zero:gpu, level_zero:*, *:gpu, level_zero:0, *} and SYCL_DEVICE_FILTER
+  in {level_zero:gpu, *} all still yield 1; /dev/accel/accel0 is the 265KF's
+  INTEGRATED gpu at 0000:00:0b.0, not a B580.
   CONSEQUENCE (reproduced 2026-10-01): 27B at --tp 2 clamps to TP=1, preloads
   18751 MiB onto a 12216 MiB card, dies `signal 6` / rc=139. Every 27B `--tp 2`
   command in reports/ is unrunnable until enumeration is restored.

@@ -87,6 +87,81 @@ selector surfaces a second one. `/dev/accel/accel0` exists but maps to PCI
 `0000:00:0b.0` — the **integrated** iGPU of the 265KF, not a B580, and it is the
 only accel node, so the DRM accel subsystem is not the B580 path here.
 
+### Driver-library version: RULED OUT at the driver API (not just via sycl-ls)
+
+The earlier "forcing the host's newer lib still yields 1" went through
+SYCL/UR/`sycl-ls`, which cannot attribute the result. Re-run against the raw
+probe, and — importantly — **with the swap made verifiable** so the test is not
+vacuous. The probe prints `driverVersion` from `zeDriverGetProperties`, so a
+result where the version did not actually change is visible as such:
+
+| driver lib | `driverVersion` | devices | uuid |
+|---|---|---|---|
+| container `1.15.38646` | `0x10396f6` | **1** | `...-0400-...` (card0) |
+| host `1.17.39758` | `0x1039b4e` | **1** | `...-0400-...` (card0) |
+
+The versions genuinely differ and **both return one device**. **The driver
+library version is eliminated.** Note the first attempt at this comparison was
+worthless and was discarded: an earlier edit of the probe failed to compile, the
+*old* binary ran, and I was about to read two identical UUIDs as a result. The
+probe now `rm -f`s its output and refuses to run unless a fresh binary appears
+(`scripts/l0_enumerate.sh`), because a probe that silently re-runs yesterday's
+build is worse than no probe.
+
+### The ONE card1-specific anomaly at the kernel layer (a lead, not a cause)
+
+`dmesg` is **EPERM** in this container and `journalctl -k` yields nothing, so the
+kernel message that would *name* the mechanism is unavailable. Instead the two
+cards' sysfs trees were diffed attribute by attribute. Reproduce with
+**`scripts/gpu_health_check.sh`** (exit 1 on anomaly, 2 if <2 cards):
+
+```
+attr                              card0        card1
+tile0/gt0/freq0/cur_freq           400          400
+tile0/gt0/freq0/min_freq           400          !ERR:ECANCELED   <<<
+tile0/gt0/freq0/max_freq           2850         !ERR:ECANCELED   <<<
+tile0/gt0/freq0/rp0_freq           2850         2850
+tile0/gt1/freq0/cur_freq           1200         1200
+tile0/gt1/freq0/min_freq           1200         !ERR:ECANCELED   <<<
+tile0/gt1/freq0/max_freq           1500         !ERR:ECANCELED   <<<
+tile0/gt1/freq0/rp0_freq           1500         1500
+tile0/gt0/num_cslices              2            2
+tile0/gt0/ccs_mode                 1            1
+```
+
+**Exactly four attributes fail on card1 and only card1**, and they are
+deterministic — 8/8 consecutive reads returned `ECANCELED` (errno 125) on card1
+while card0 read cleanly 8/8. `cur_freq` and `rp0_freq` read fine on both, and
+`EACCES` appears on *both* cards for many other paths (that is just container
+permission, not a fault).
+
+**What this does and does not establish.** `min_freq`/`max_freq` are the RAPL
+frequency-limit reads, which on the xe driver are serviced through the **GuC**
+microcode. `ECANCELED` from those specific files while `cur_freq`/`rp0_freq`
+still work is therefore *consistent with* card1's GuC not being functional. That
+is a **lead, not a proven cause** of the L0 enumeration drop: I have not read the
+xe/Level Zero enumeration path, and I have not shown that a driver enumerating a
+device consults these files. Treating this as the mechanism would be exactly the
+AUDIT #9 mistake again. It is the most specific lead found so far and it is
+reproducible on demand; it is not an answer.
+
+### What this container cannot do (measured, so nobody re-derives it)
+
+```
+rebind card1 (write remove/rescan)   ! EACCES
+reset card1                          ! EACCES
+write any sysfs GT control           ! EACCES
+kernel log (dmesg)                   ! EPERM
+```
+
+The container is unprivileged. **The obvious remedy therefore cannot even be
+tested from here** — a rebind/rescan of 86:00.0 would have to be run on the host,
+and it remains a *candidate* to try, explicitly **not** a validated fix. What is
+needed next is host-side: (a) `dmesg | grep -i 'xe.*86:00'` for a GuC-firmware or
+reset failure, and (b) if one is found, a rebind/rescan of 86:00.0 followed by
+`scripts/l0_enumerate.sh` to see whether the device returns. That is a
+measurement plan, not a diagnosis.
+
 * Consequence, reproduced: `--tp 2` on 27B prints
   `WARNING: TP=2 requested but only 1 Arc GPU(s) discovered`, preloads
   **18751 MiB** onto a **12216 MiB** card, then dies `signal 6`, **rc=139**.
