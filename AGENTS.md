@@ -33,6 +33,19 @@ single fact governs how every gate result in this file must be read:
   suggestion to investigate, not a diagnosed remedy, and may be wrong. Read the
   xe/Level Zero enumeration path before trusting any of it. Details + the full
   exclusion list: reports/2026-10-01-batch-e1-e2-e3-verdicts.md.
+  *** LOCALIZED, 2026-10-01 (later, and stronger than the line above). *** A raw
+  Level Zero probe bypassing SYCL/UR (zeInit -> zeDriverGet -> zeDeviceGet on
+  libze_loader) returns **1 driver, 1 device**, uuid
+  86800be2-0000-0000-0400-000000000000. Group 4 of an Intel L0 UUID encodes
+  PCI bus:dev:function, so that is **04:00.0 = card0**; xpu-smi reports the same
+  uuid. A card1 device would carry group 4 == 8600 and is **ABSENT**. So the
+  loss is NOT in SYCL, NOT in UR, and NOT in device_manager.cpp:37 (same path
+  sycl-ls uses) — **the L0 driver's own zeDeviceGet does not return card1.**
+  Why it skips 86:00.0 is still unknown; do not guess. Also negative, so they
+  are not retried: ONEAPI_DEVICE_SELECTOR in {level_zero:gpu, level_zero:*,
+  *:gpu, level_zero:0, *} and SYCL_DEVICE_FILTER in {level_zero:gpu, *} all
+  still yield 1; /dev/accel/accel0 is the 265KF's INTEGRATED gpu at
+  0000:00:0b.0, not a B580.
   CONSEQUENCE (reproduced 2026-10-01): 27B at --tp 2 clamps to TP=1, preloads
   18751 MiB onto a 12216 MiB card, dies `signal 6` / rc=139. Every 27B `--tp 2`
   command in reports/ is unrunnable until enumeration is restored.

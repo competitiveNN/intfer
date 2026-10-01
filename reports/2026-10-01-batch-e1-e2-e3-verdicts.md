@@ -44,6 +44,49 @@ The reports target **27B `--tp 2`**. That cannot run. Verified, not assumed:
 > it may simply be wrong. Whoever picks this up should read the xe/Level Zero
 > enumeration path rather than trusting this paragraph.
 
+### The layer is now pinned to the Level Zero DRIVER, not to SYCL/UR (2026-10-01, measured)
+
+The paragraph above rested on "two stacks agree", which is inference. That has
+now been replaced with a direct measurement at the **driver API**, bypassing SYCL
+and UR entirely. A probe calling `zeInit` -> `zeDriverGet` -> `zeDeviceGet` on
+the raw L0 loader (`build/l0probe2.c`, links `libze_loader` directly, no SYCL):
+
+```
+zeInit rc=0
+zeDriverGet(count) rc=0 ndrivers=1
+zeDriverGet(list)  rc=0 ndrivers=1
+  driver[0] zeDeviceGet rc=0 DEVICES=1
+    dev[0] type=1 vendorId=0x8086 deviceId=0xe20b
+          uuid=86800be2-0000-0000-0400-000000000000
+TOTAL LEVEL ZERO DEVICES: 1
+```
+
+Two things follow, and the second is the useful one:
+
+1. The L0 **driver** reports exactly **one** device. So the loss is *not* in
+   SYCL, not in UR, and not in this project's `sycl::device::get_devices(gpu)`
+   (`src/device/device_manager.cpp:37` is the same path `sycl-ls` uses). The
+   drop happens at or below the driver's own device scan.
+2. **The UUID identifies WHICH GPU survived.** Group 4 of an Intel L0 UUID
+   encodes bus:device:function, and it is `0400` -> **PCI 04:00.0 = card0**.
+   `xpu-smi --list-gpus` independently reports the same UUID
+   (`GPU-86800be2-0000-0000-0400-000000000000`). A card1 (86:00.0) device would
+   have group 4 == `8600`; it is **absent from enumeration entirely**.
+
+So this is no longer "two stacks happen to agree". It is: *the driver returns
+card0 and does not return card1.* **What causes the driver's scan to skip 86:00.0
+is still not known to me** — I have not read the xe/Level Zero enumeration path,
+and I am not going to guess at it a second time. But the fault is now localized
+to a specific layer and a specific device, which is where the host-side
+investigation should start.
+
+Also tested and negative, so nobody repeats them: `ONEAPI_DEVICE_SELECTOR` in
+`{level_zero:gpu, level_zero:*, *:gpu, level_zero:0, *}` and
+`SYCL_DEVICE_FILTER` in `{level_zero:gpu, *}` all still yield **1** device. No
+selector surfaces a second one. `/dev/accel/accel0` exists but maps to PCI
+`0000:00:0b.0` — the **integrated** iGPU of the 265KF, not a B580, and it is the
+only accel node, so the DRM accel subsystem is not the B580 path here.
+
 * Consequence, reproduced: `--tp 2` on 27B prints
   `WARNING: TP=2 requested but only 1 Arc GPU(s) discovered`, preloads
   **18751 MiB** onto a **12216 MiB** card, then dies `signal 6`, **rc=139**.
