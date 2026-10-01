@@ -116,7 +116,10 @@ fi
 # anchor matching several sites proves nothing about which is being mutated.
 check_anchor() { # $1 = file, $2 = literal text, $3 = description
   local n
-  n="$(grep -cF -- "$2" "$1" 2>/dev/null || echo 0)"
+  # `grep -c` prints "0" AND exits 1 on no match, so `|| echo 0` appended a
+  # second "0" and a miss reported "found 0\n0 times". Fails closed either way,
+  # but a harness's diagnostic is part of what it certifies.
+  n="$(grep -cF -- "$2" "$1" 2>/dev/null || true)"
   if [ "$n" != "1" ]; then
     echo "FAIL: anchor for $3 found $n times in $1, want 1." >&2
     echo "  Target: $2" >&2

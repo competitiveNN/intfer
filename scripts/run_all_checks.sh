@@ -80,6 +80,29 @@ fi
 HEAD_SHA="$(git rev-parse HEAD)"
 HEAD_SHORT="${HEAD_SHA:0:7}"
 echo "run_all_checks: tree clean, HEAD=$HEAD_SHORT"
+
+# --- snapshot the UNTRACKED set, so "did a step leave something behind" is a
+# DIFF rather than a hand-picked directory -------------------------------------
+# The end-of-run hygiene check used to run `git status ... -- scripts/` and call
+# that the whole tree. It was not: scripts/ was the directory where an EARLIER
+# version of mutate_run_all_checks.sh kept its mutant, and the scope was never
+# revisited after the sandbox removed that file. Measured, before the fix: a
+# step that littered the repository ROOT left the run printing "no untracked
+# residue in scripts/" and exiting 0 = PASS. A matrix (or any step) that wrote
+# into src/ or examples/ was equally invisible.
+#
+# So the whole work tree is snapshotted here and compared at the end. A DIFF, not
+# a tally: pre-existing untracked files are the developer's business and must not
+# fail the run, which is also what the start-of-run message promises ("Untracked
+# files are fine"). Ignored paths (build/, *.intfer, ...) are excluded by git,
+# so the build tree and the lock directory never appear.
+UNTRACKED_BEFORE="$BUILD_DIR/.run_all_untracked_before"
+git status --porcelain --untracked-files=all >"$UNTRACKED_BEFORE" || {
+  echo "FAIL: could not snapshot the untracked set ($UNTRACKED_BEFORE)." >&2
+  echo "  Without it the end-of-run residue check cannot be a diff, and would" >&2
+  echo "  silently degrade to no check at all." >&2
+  exit 1
+}
 [ "${INTFER_QUICK:-0}" = "1" ] && echo "run_all_checks: INTFER_QUICK=1 -- checkers only, NO mutation matrices"
 
 # --- run a step, record its rc ---------------------------------------------
@@ -223,6 +246,43 @@ if ! selfcheck; then
 fi
 echo "  ok    sc_ok->ok, sc_unproven->unproven, sc_fail->fail"
 
+# --- 0b dispatch coverage, derived by ENUMERATION ----------------------------
+# dispatch() and STEPS are hand-written lists. So a new check_*.sh or
+# mutate_*.sh that nobody remembers to add to them is not "a step that fails" --
+# it is a step that NEVER RUNS, and this entry point would still print PASS and
+# exit 0. That is the audits #7/#8 shape ("closed" was an overclaim) one level
+# up, and the whole reason the stamp list above is found with find(1).
+#
+# The arm list is extracted from dispatch()'s own case block, not retyped, so the
+# two cannot drift. If the extraction yields nothing, every file reads as
+# undispatched and this FAILS LOUDLY -- a coverage check that silently passes
+# because it parsed nothing is worse than no check.
+echo "== 0b dispatch coverage (every check_*/mutate_* must have a dispatch arm) =="
+ARMS="$(sed -n '/^dispatch() {/,/^}$/p' "$0" \
+        | grep -oE '^[[:space:]]+[^[:space:]]+\.sh\)' \
+        | tr -d '[:blank:])' | LC_ALL=C sort -u)"
+UNDISPATCHED=""
+N_DISPATCHABLE=0
+for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
+  [ -f "$f" ] || continue
+  b="$(basename "$f")"
+  N_DISPATCHABLE=$((N_DISPATCHABLE + 1))
+  printf '%s\n' "$ARMS" | grep -qxF "$b" || UNDISPATCHED="$UNDISPATCHED $b"
+done
+if [ -z "$ARMS" ]; then
+  echo "  FAIL  could not extract dispatch()'s arm list -- coverage is UNCHECKED." >&2
+  exit 1
+fi
+if [ -n "$UNDISPATCHED" ]; then
+  echo "  FAIL  no dispatch() arm for:$UNDISPATCHED" >&2
+  echo "        They exist in scripts/ as checkers/matrices, but this entry point" >&2
+  echo "        would never run them and would still report PASS. Add a dispatch()" >&2
+  echo "        arm (and a STEPS entry)." >&2
+  FAILED=$((FAILED + 1))
+else
+  echo "  ok    $N_DISPATCHABLE check_*/mutate_* script(s), all dispatched"
+fi
+
 # The step list, overridable so the self-check and its mutation matrix can run
 # this script in seconds instead of 45 minutes.
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
@@ -255,13 +315,29 @@ if [ "${INTFER_QUICK:-0}" != "1" ]; then
     for label in $UNPROVEN_LABELS; do
       printf '  %-34s ' "$label (re-run)"
       log="$BUILD_DIR/run_all_$(printf '%s' "$label" | tr -c 'a-zA-Z0-9' '_')_rerun.log"
-      if dispatch "$label" >"$log" 2>&1; then
-        printf 'ok (evidence now current)\n'
-        UNPROVEN=$((UNPROVEN - 1))
-      else
-        rc=$?
-        printf 'still rc=%s (%s)\n' "$rc" "$log"
-      fi
+      dispatch "$label" >"$log" 2>&1
+      rc=$?
+      case "$(classify_rc "$rc")" in
+        ok)
+          printf 'ok (evidence now current)\n'
+          UNPROVEN=$((UNPROVEN - 1)) ;;
+        unproven)
+          printf 'still rc=%s (%s)\n' "$rc" "$log" ;;
+        fail)
+          # A re-run that turns STALE EVIDENCE into a REAL FAILURE is a
+          # regression, not missing evidence. The first version only branched on
+          # success/failure and left FAILED at 0 either way, so a step that
+          # answered rc=2 on the first pass and rc=1 on the re-run produced the
+          # line "still rc=1" and then the final verdict "RUN ALL CHECKS: ... NOT
+          # a regression: ... Nothing is wrong with the code" with exit 2 -- the
+          # script calling a checker failure healthy, which is the one thing this
+          # script exists to prevent. Proven before the fix (a synthetic step
+          # exiting 2 then 1). The three verdicts come from the SAME classifier
+          # the main loop uses, so this cannot disagree with it.
+          printf 'REGRESSED rc=%s (%s) -- was unproven, is now a real failure\n' "$rc" "$log"
+          UNPROVEN=$((UNPROVEN - 1))
+          FAILED=$((FAILED + 1)) ;;
+      esac
     done
   fi
 fi
@@ -302,9 +378,13 @@ fi
 # verifies the files IT declared as targets. A matrix that accidentally dirtied
 # something else -- a wrong `$SRC`, a target list that lost an entry, an applier
 # that writes outside its scope -- would leave no trace in its own report. And
-# untracked residue matters too: mutate_run_all_checks.sh creates
-# scripts/_rac_mutant.sh, and a mutated copy left behind would poison every later
-# check that globs scripts/.
+# untracked residue matters too: a scratch file left in scripts/, in src/, or at
+# the repository root would be picked up by whatever globs it next (several gates
+# enumerate scripts/*.sh and build targets from the CMake graph).
+#
+# The untracked half is a DIFF against the snapshot taken before step 1, over the
+# WHOLE work tree -- not a tally of one directory. See the snapshot's comment for
+# the measurement that forced this.
 #
 # Placed HERE, once, rather than copied into four matrices: "nine hand-rolled
 # copies of the block is precisely how the family reopened" (audit #7). The driver
@@ -318,14 +398,18 @@ else
   git status --porcelain --untracked-files=no >&2
   FAILED=$((FAILED + 1))
 fi
-RESIDUE="$(git status --porcelain --untracked-files=all -- scripts/ | grep -v '^ M' || true)"
+RESIDUE="$(LC_ALL=C comm -13 \
+             <(LC_ALL=C sort "$UNTRACKED_BEFORE") \
+             <(git status --porcelain --untracked-files=all | LC_ALL=C sort) \
+           | grep -v '^ M' || true)"
 if [ -n "$RESIDUE" ]; then
-  echo "  FAIL  untracked residue left in scripts/ -- a later check that globs" >&2
-  echo "         that directory would run against it:" >&2
+  echo "  FAIL  untracked residue left behind by this run -- a later check that" >&2
+  echo "         globs those paths (several enumerate scripts/*.sh or the CMake" >&2
+  echo "         build graph) would run against it:" >&2
   printf '%s\n' "$RESIDUE" | sed 's/^/         /' >&2
   FAILED=$((FAILED + 1))
 else
-  echo "  ok    no untracked residue in scripts/"
+  echo "  ok    no new untracked files anywhere in the work tree"
 fi
 
 # --- verdict ----------------------------------------------------------------

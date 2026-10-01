@@ -263,7 +263,11 @@ baseline "N-G" "step_ok"     "$ALL_CURRENT" 1 "untracked residue left in scripts
 
 # --- anchor pre-flight (checked against the PRISTINE target) ---------------
 check_anchor() { # $1 = literal, $2 = description
-  local n; n="$(grep -cF -- "$1" "$TARGET" 2>/dev/null || echo 0)"
+  # `grep -c` prints "0" AND exits 1 when nothing matches, so `|| echo 0` used to
+  # append a SECOND "0" and every miss reported "found 0\n0 times". It failed
+  # closed either way, but the diagnostic IS the product of a mutation harness --
+  # three sibling sites already use `|| true`, which is the correct form.
+  local n; n="$(grep -cF -- "$1" "$TARGET" 2>/dev/null || true)"
   if [ "$n" != "1" ]; then
     echo "FAIL: anchor for $2 found $n times in $TARGET, want 1" >&2
     echo "  Target: $1" >&2; exit 1
@@ -332,7 +336,10 @@ run_state() { # $1 id, $2 desc, $3 predicate, $4 steps, $5 stampdir, $6 dirty?
   else
     printf '  MISSED %-4s defect NOT reproduced: %s\n' "$id" "$desc"
   fi
-  printf '  ok    %-4s mutant discarded (tracked tree never dirtied)\n' "$id"
+  # Printed unconditionally, so it must not carry an "ok" verdict: the first
+  # version prefixed it "ok", which printed "ok" directly under a MISSED line and
+  # read as a second verdict for a state that had just failed.
+  printf '       %-4s sandbox mutant only; the real tracked tree is never written\n' "$id"
 }
 
 echo "== MUTATION MATRIX: run_all_checks.sh (sandbox mutant) =="
