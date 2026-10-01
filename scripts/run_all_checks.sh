@@ -380,15 +380,23 @@ fi
 # matrix when one is added. STAMP_DIR is overridable so the mutation matrix can
 # point this at a synthetic stamp population and observe the enumeration.
 #
-# The comparison uses $HEAD_NOW, not $HEAD_SHA: if 2c found a move, the honest
-# question is what the evidence actually covers. Comparing against the commit
-# this run STARTED on would report STALE for stamps that are perfectly current
-# for the tree now on disk, which is the misleading-verdict shape above.
+# The comparison uses $HEAD_NOW, not the start-of-run $HEAD_SHA. Measured, and it
+# is the bug this very line used to have: the first version read
+#   [ "$HEAD_MOVED" -eq 1 ] || HEAD_SHA="$HEAD_NOW"
+# which assigns ONLY when HEAD did NOT move -- the exact inverse of the intent,
+# and a no-op in the healthy case (where the two are equal anyway). So on a real
+# mid-run move, step 3 compared against the commit the run STARTED on and printed
+# "STALE ... (want <dead sha>)" for stamps that were current for the tree on disk.
+# Observed live: a concurrent commit landed, 2c correctly reported the move, and
+# then all five stamps were reported STALE naming a commit that no longer
+# existed -- the misleading-verdict shape, reintroduced one line below the fix
+# for it. `&&` is the correct polarity: adopt the current HEAD exactly when it
+# moved.
 STAMP_DIR="${INTFER_RUN_ALL_STAMP_DIR:-$BUILD_DIR}"
 echo "== 3/3 stamp assertion (enumerated from $STAMP_DIR) =="
 STALE=0
 STAMP_COUNT=0
-[ "$HEAD_MOVED" -eq 1 ] || HEAD_SHA="$HEAD_NOW"
+[ "$HEAD_MOVED" -eq 1 ] && HEAD_SHA="$HEAD_NOW"
 while IFS= read -r stamp; do
   [ -n "$stamp" ] || continue
   STAMP_COUNT=$((STAMP_COUNT + 1))
