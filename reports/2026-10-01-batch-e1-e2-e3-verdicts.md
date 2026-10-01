@@ -610,8 +610,8 @@ Measured after the reports were written, not asserted:
 | check | result |
 |---|---|
 | `git status --porcelain` | 0 modified (tree clean) |
-| check stamps vs HEAD | **5/5 CURRENT** (`device_precond_matrix`, `device_precond_matrix/mutate`, `fold_matrix`, `gate_inventory_matrix`, `run_all_mutate`) |
-| `scripts/gate_inventory.sh` | **rc=0**, `sites_found=9`, `stale_tally_sites=0`; every gate builds its own target, no whole-gate skip strands 1-GPU arms |
+| check stamps vs HEAD | **all CURRENT** — the live figure is the `ok`/`STALE` lines `run_all_checks.sh` step 3/3 prints, and the authoritative set is `find "$INTFER_BUILD_DIR" -name '*last_pass.stamp'`. **No count is quoted here on purpose**: this row used to read "5/5 CURRENT" with five directory names, which went stale the moment two more matrices were added, and a hand-written count in a table is exactly what `gate_inventory.sh`'s hand-counted-total rule exists to catch. Derive it, do not transcribe it. |
+| `scripts/gate_inventory.sh` | **rc=0**, `stale_tally_sites=0`, `live=0`; every gate builds its own target, no whole-gate skip strands 1-GPU arms. (`sites_found` is likewise derived at run time — the same reason.) |
 | doc tally | `7 PASS, 2 PARTIAL, 1 SKIPPED` reconciles with the source classification for 1 visible GPU |
 
 **How the stamps were refreshed — and a caveat worth stating.** The first
