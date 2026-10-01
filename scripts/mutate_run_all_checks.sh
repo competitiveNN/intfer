@@ -51,6 +51,27 @@
 #        The mutation matrices restore with `git checkout --`, so without this
 #        guard a run over uncommitted work DESTROYS it. Detected behaviourally: a
 #        step that writes a sentinel must not run at all.
+#   N-E  neutralise the SELF-CHECK, compound with the N-A classification break
+#        The matrix proves the step CLASSIFIER can fail, but nothing yet proved
+#        the self-check that watches it can fail -- the always-red lesson applied
+#        one level in. N-A alone cannot answer that: its detection mechanism IS
+#        the self-check, so neutralising the self-check is invisible while
+#        classify_rc is correct. So N-E breaks BOTH: a misclassification the
+#        self-check must catch, and a self-check that cannot. If the run reports
+#        no SELFCHECK line, the self-check is not load-bearing.
+#   N-F  break the 2b re-run's DERIVATION, not its guard
+#        N-B deletes the re-run block. This keeps the block and breaks the
+#        accumulated $UNPROVEN_LABELS set it iterates, so the re-run finds nothing
+#        to do. Same observable as N-B, different mechanism: the audits #7/#8
+#        "enumerate, never remember" discipline proven load-bearing in the re-run
+#        path too, not merely present.
+#   N-G  delete the end-of-run tree-hygiene assertion
+#        run_all_checks refuses to START dirty, but that does not prove a step
+#        left the tree as it found it. Each matrix only verifies the files it
+#        declared as targets, so a step that dirtied something else leaves no
+#        trace in its own report. With the assertion gone, untracked residue in
+#        scripts/ (which is what a mutated _rac_mutant.sh would be) goes unnoticed
+#        and the run passes.
 #
 # GOTCHA, learned the first time this was run: THIS SCRIPT MUST BE COMMITTED
 # BEFORE IT CAN RUN. It drives run_all_checks.sh, which fails closed on ANY dirty
@@ -72,6 +93,7 @@ WORK="$BUILD_DIR/run_all_mutate"
 STAMP="$WORK/last_pass.stamp"
 LOCK="$WORK/.lock"
 PROBE="scripts/_rac_dirty_probe.md"
+RESIDUE_PROBE="scripts/_rac_residue_probe.md"
 # The SYNTHETIC world deliberately lives OUTSIDE the build tree. Two reasons, both
 # learned the hard way:
 #   * run_all_checks.sh enumerates stamps with `find "$BUILD_DIR" -name
@@ -94,7 +116,7 @@ fi
 # Always clean up the mutant, even on an abort: it lives in scripts/, and leaving
 # a mutated copy there would poison every later check that globs that directory.
 cleanup() {
-  rm -f "$MUTANT" "$PROBE"
+  rm -f "$MUTANT" "$PROBE" "$RESIDUE_PROBE"
   git reset -- "$PROBE" 2>/dev/null
   rmdir "$LOCK" 2>/dev/null || true
   rm -rf "$SYNTH"
@@ -129,23 +151,26 @@ ALL_CURRENT="$SYNTH/stamps_all_current"; mk_stamps "$ALL_CURRENT" current
 HAS_STALE="$SYNTH/stamps_with_stale";    mk_stamps "$HAS_STALE" stale
 
 reset_mutant() { rm -f "$MUTANT"; cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"; }
-run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir
-  local id="$1" steps="$2" sdir="$3"
-  rm -f "$SYNTH/step_sentinel.ran" "$SYNTH/step_flaky2.count"
+run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
+  local id="$1" steps="$2" sdir="$3" residue="${4:-}"
+  rm -f "$SYNTH/step_sentinel.ran" "$SYNTH/step_flaky2.count" "$RESIDUE_PROBE"
+  [ -n "$residue" ] && { printf 'residue\n' >"$RESIDUE_PROBE"; git add -N -- "$RESIDUE_PROBE" 2>/dev/null; }
   # INTFER_BUILD_DIR is redirected so the mutant's lock is not the outer run's.
   INTFER_BUILD_DIR="$SYNTH/inner" \
   INTFER_RUN_ALL_STEPS="$steps" INTFER_RUN_ALL_EXTRA_STEPS_DIR="$STEPS" \
     INTFER_RUN_ALL_STAMP_DIR="$sdir" \
     timeout 600 bash "$MUTANT" >"$WORK/$id.log" 2>&1
-  return $?
+  local rc=$?
+  rm -f "$RESIDUE_PROBE"; git reset -q -- "$RESIDUE_PROBE" 2>/dev/null || git reset -- "$RESIDUE_PROBE" 2>/dev/null
+  return $rc
 }
 
 # --- baselines: correct behaviour must be observable BEFORE any mutation ----
 # $1 id, $2 steps, $3 stampdir, $4 want rc, $5 marker that MUST be present
 baseline() {
-  local id="$1" steps="$2" sdir="$3" want="$4" marker="$5" rc
+  local id="$1" steps="$2" sdir="$3" want="$4" marker="$5" residue="${6:-}" rc
   reset_mutant
-  run_rac "$id" "$steps" "$sdir"; rc=$?
+  run_rac "$id" "$steps" "$sdir" "$residue"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "FAIL: baseline $id reached rc=$rc, want $want -- the CASE is broken, not" >&2
     echo "  the mutation. ($WORK/$id.log)" >&2; exit 1
@@ -164,6 +189,9 @@ def_n_a() { grep -q 'SELFCHECK: sc_unproven' "$WORK/N-A.log"; }
 def_n_b() { grep -q '1 step(s) unproven' "$WORK/N-B.log" && ! grep -q '(re-run)' "$WORK/N-B.log"; }
 def_n_c() { ! grep -q 'c/last_pass.stamp' "$WORK/N-C.log"; }   # 3rd stamp not enumerated
 def_n_d() { [ -f "$SYNTH/step_sentinel.ran" ]; }                  # a step ran on a dirty tree
+def_n_e() { ! grep -q 'SELFCHECK' "$WORK/N-E.log"; }            # the self-check did not fire
+def_n_f() { grep -q 'step(s) unproven' "$WORK/N-F.log" && ! grep -q '(re-run)' "$WORK/N-F.log"; }
+def_n_g() { ! grep -q 'untracked residue' "$WORK/N-G.log"; }    # hygiene assertion absent
 
 echo "== BASELINES (unmutated run_all_checks must be CORRECT in each setup) =="
 baseline "N-A" "step_ok"     "$ALL_CURRENT" 0 ""
@@ -172,6 +200,9 @@ baseline "N-C" "step_ok"     "$HAS_STALE"   2 "STALE c/last_pass.stamp"      # 3
 printf 'probe\n' >"$PROBE"; git add -- "$PROBE"   # a genuinely TRACKED, dirty file
 baseline "N-D" "step_sentinel" "$ALL_CURRENT" 1 "uncommitted changes"
 git reset -- "$PROBE"; rm -f "$PROBE"
+baseline "N-E" "step_ok"     "$ALL_CURRENT" 0 ""                              # self-check passes
+baseline "N-F" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"       # re-run works
+baseline "N-G" "step_ok"     "$ALL_CURRENT" 1 "untracked residue left in scripts" yes
 
 # --- anchor pre-flight (checked against the PRISTINE target) ---------------
 check_anchor() { # $1 = literal, $2 = description
@@ -185,11 +216,17 @@ A_CLASSIFY="2) printf 'unproven\\n' ;;"
 A_RERUN='if [ -n "$UNPROVEN_LABELS" ]; then'
 A_FIND="find \"\$STAMP_DIR\" -name '*last_pass.stamp' -type f 2>/dev/null | sort"
 A_GUARD='if ! git diff --quiet || ! git diff --cached --quiet; then'
+A_SELFCHK='return $bad'
+A_DERIVE='UNPROVEN_LABELS="$UNPROVEN_LABELS $label"'
+A_RESIDUE="RESIDUE=\"\$(git status --porcelain --untracked-files=all -- scripts/ | grep -v '^ M' || true)\""
 check_anchor "$A_CLASSIFY" "N-A: the rc=2 UNPROVEN classification"
 check_anchor "$A_RERUN"   "N-B: the 2b re-run guard"
 check_anchor "$A_FIND"    "N-C: the find-based stamp enumeration"
 check_anchor "$A_GUARD"   "N-D: the dirty-tree guard"
-echo "anchor pre-flight: ok (4/4 targets located exactly once)"
+check_anchor "$A_SELFCHK" "N-E: the self-check verdict"
+check_anchor "$A_DERIVE"  "N-F: the re-run set derivation"
+check_anchor "$A_RESIDUE" "N-G: the tree-hygiene residue probe"
+echo "anchor pre-flight: ok (7/7 targets located exactly once)"
 
 # Exact literal replacement -- no delimiter that can occur inside the pattern
 # (audit #17b: a sed delimiter inside an ERE alternation killed a state, and a
@@ -219,10 +256,12 @@ verify_patched() { # $1 = state id -- the MUTANT copy must differ from the targe
 
 CAUGHT=0; TOTAL=0
 run_state() { # $1 id, $2 desc, $3 predicate, $4 steps, $5 stampdir, $6 dirty?
+              # $7 residue?  $8/$9 optional SECOND (old,new) patch pair, for N-E
   local id="$1" desc="$2" pred="$3" steps="$4" sdir="$5" dirty="${6:-}"
+  local residue="${7:-}" old2="${8:-}" new2="${9:-}"
   TOTAL=$((TOTAL + 1))
   [ "$dirty" = "dirty" ] && { printf 'probe\n' >"$PROBE"; git add -- "$PROBE"; }
-  run_rac "$id" "$steps" "$sdir"
+  run_rac "$id" "$steps" "$sdir" "$residue"
   [ "$dirty" = "dirty" ] && { git reset -- "$PROBE"; rm -f "$PROBE"; }
   if $pred; then
     CAUGHT=$((CAUGHT + 1))
@@ -255,6 +294,22 @@ verify_patched N-D
 run_state "N-D" "dirty-tree guard deleted; a step ran over uncommitted work" def_n_d \
   "step_sentinel" "$ALL_CURRENT" "dirty"
 
+reset_mutant
+patch_literal "$MUTANT" "$A_CLASSIFY" "2) printf 'fail\\n' ;;"
+patch_literal "$MUTANT" "$A_SELFCHK" "return 0  # MUTATION: self-check disarmed"
+verify_patched N-E
+run_state "N-E" "self-check disarmed while classify_rc is wrong" def_n_e "step_ok" "$ALL_CURRENT"
+
+reset_mutant
+patch_literal "$MUTANT" "$A_DERIVE" 'UNPROVEN_LABELS=""'
+verify_patched N-F
+run_state "N-F" "re-run block present but its set derivation is broken" def_n_f "step_flaky2" "$ALL_CURRENT"
+
+reset_mutant
+patch_literal "$MUTANT" "$A_RESIDUE" 'RESIDUE=""'
+verify_patched N-G
+run_state "N-G" "end-of-run tree-hygiene assertion deleted" def_n_g "step_ok" "$ALL_CURRENT" "" "yes"
+
 rm -f "$MUTANT"
 # The synthetic population must never have leaked into the real one, or the real
 # enumeration counts fixture stamps as matrix evidence.
@@ -269,13 +324,14 @@ if [ "$CAUGHT" -eq "$TOTAL" ]; then
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "states=N-A,N-B,N-C,N-D"
+    echo "states=N-A,N-B,N-C,N-D,N-E,N-F,N-G"
     echo "caught=$CAUGHT/$TOTAL"
-    echo "baselines=4/4 rc+marker correct before mutation"
+    echo "baselines=7/7 rc+marker correct before mutation"
   } >"$STAMP"
-  echo "RUN-ALL MUTATION: PASS ($CAUGHT/$TOTAL caught, 4/4 baselines correct)"
-  echo "  run_all_checks.sh can fail: its rc=2 verdict, its 2b re-run, its stamp"
-  echo "  enumeration and its dirty-tree guard are each observable to break."
+  echo "RUN-ALL MUTATION: PASS ($CAUGHT/$TOTAL caught, 7/7 baselines correct)"
+  echo "  run_all_checks.sh can fail: its rc=2 verdict, its 2b re-run (guard AND"
+  echo "  derivation), its stamp enumeration, its dirty-tree guard, its classifier"
+  echo "  self-check, and its end-of-run tree-hygiene assertion."
   echo "  The tracked tree is never modified -- the mutation lives in an untracked"
   echo "  copy, so the target's own dirty-tree guard stays armed during every case."
   echo "  stamp: $STAMP"

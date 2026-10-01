@@ -294,6 +294,40 @@ if [ "$STAMP_COUNT" -eq 0 ]; then
   STALE=$((STALE + 1))
 fi
 
+# --- 4. did this run leave the tree as it found it? --------------------------
+# The entry point already refuses to START on a dirty tree. This is the other
+# half of that invariant, and it is the one that covers every matrix at once.
+#
+# Every mutation matrix edits tracked source and restores it, but each one only
+# verifies the files IT declared as targets. A matrix that accidentally dirtied
+# something else -- a wrong `$SRC`, a target list that lost an entry, an applier
+# that writes outside its scope -- would leave no trace in its own report. And
+# untracked residue matters too: mutate_run_all_checks.sh creates
+# scripts/_rac_mutant.sh, and a mutated copy left behind would poison every later
+# check that globs scripts/.
+#
+# Placed HERE, once, rather than copied into four matrices: "nine hand-rolled
+# copies of the block is precisely how the family reopened" (audit #7). The driver
+# is the thing that ran them all, so the driver is what checks they cleaned up.
+echo "== 4/4 tree hygiene (this run must leave the tree as it found it) =="
+if git diff --quiet && git diff --cached --quiet; then
+  echo "  ok    tracked tree clean"
+else
+  echo "  FAIL  the tracked tree is DIRTY after this run." >&2
+  echo "         A step mutated something it did not restore." >&2
+  git status --porcelain --untracked-files=no >&2
+  FAILED=$((FAILED + 1))
+fi
+RESIDUE="$(git status --porcelain --untracked-files=all -- scripts/ | grep -v '^ M' || true)"
+if [ -n "$RESIDUE" ]; then
+  echo "  FAIL  untracked residue left in scripts/ -- a later check that globs" >&2
+  echo "         that directory would run against it:" >&2
+  printf '%s\n' "$RESIDUE" | sed 's/^/         /' >&2
+  FAILED=$((FAILED + 1))
+else
+  echo "  ok    no untracked residue in scripts/"
+fi
+
 # --- verdict ----------------------------------------------------------------
 echo
 if [ "$FAILED" -ne 0 ]; then

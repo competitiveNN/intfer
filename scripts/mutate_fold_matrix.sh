@@ -240,14 +240,44 @@ mkdir -p "$LOG_DIR" || exit 1
 # this one is older. M1/M2 previously signalled failure only as a bare trailing
 # `grep` exit code with no diagnostic, unlike M4/M5/M6, so a stale anchor
 # produced an unexplained "M1 did not apply" from the call site.
+#
+# These are patch_literal() exact replacements, not `sed s|...|...|`. Two concrete
+# reasons, both learned:
+#   * M5's pattern CONTAINS `||`, so it only worked because the delimiter was
+#     escaped to `\|`. That is the audit-#17b delimiter collision class, sitting
+#     live in a passing state: a small edit to that line can silently stop the sed
+#     from matching, and the state then reports "not load-bearing" -- a verdict
+#     about the checker when the fault is in the state.
+#   * sed replaces the FIRST match and says nothing about how many there were.
+#     M6's anchor is a PREFIX of M4's, so after M4 runs, M6's pattern still matches
+#     the M4-mutated line. Nothing caught that; states happen to restore in
+#     between. patch_literal REQUIRES exactly one match, so an ambiguous anchor is
+#     now a hard stop instead of a silent wrong-site patch.
+patch_literal() { # $1 = file, $2 = exact old text, $3 = exact new text
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(path).read()
+n = src.count(old)
+if n != 1:
+    sys.stderr.write("patch_literal: anchor found %d times in %s, want 1: %r\n"
+                     % (n, path, old[:80]))
+    sys.exit(1)
+open(path, "w").write(src.replace(old, new))
+PY
+}
 apply_m1() {
-  sed -i 's|return (fold_stride == 0) ? 2u \* nOp : fold_stride;|return (fold_stride == 0) ? nOp : fold_stride;  /*M1*/|' "$HDR"
+  patch_literal "$HDR" \
+    'return (fold_stride == 0) ? 2u * nOp : fold_stride;' \
+    'return (fold_stride == 0) ? nOp : fold_stride;  /*M1*/'
   grep -q '/\*M1\*/' "$HDR" || { echo "  M1: shared stride default not mutated (anchor stale?)" >&2; return 1; }
   return 0
 }
 # M2: fold_readable stops validating the stride.
 apply_m2() {
-  sed -i 's|return fold_stride_ok(fold_stride, nOp) ? usm : nullptr;|return usm;  /*M2*/|' "$HDR"
+  patch_literal "$HDR" \
+    'return fold_stride_ok(fold_stride, nOp) ? usm : nullptr;' \
+    'return usm;  /*M2*/'
   grep -q '/\*M2\*/' "$HDR" || { echo "  M2: fold_readable stride validation not removed" >&2; return 1; }
   return 0
 }
@@ -259,7 +289,9 @@ apply_m2() {
 # device readback. That combination is precisely what S4 demonstrates, and it
 # is why the index is now gated without needing a device launch.
 apply_m4() {
-  sed -i 's|  return m \* (std::size_t)fold_stride + (std::size_t)nOp + (std::size_t)o;|  return m * (std::size_t)fold_stride + (std::size_t)o;  /*M4*/|' "$HDR"
+  patch_literal "$HDR" \
+    '  return m * (std::size_t)fold_stride + (std::size_t)nOp + (std::size_t)o;' \
+    '  return m * (std::size_t)fold_stride + (std::size_t)o;  /*M4*/'
   grep -q '/\*M4\*/' "$HDR" || { echo "  M4: fold_index_sfull not mutated" >&2; return 1; }
   # The S0 helper must be untouched, so an over-broad sed is caught here.
   if grep -A3 'fold_index_s0(std::size_t m' "$HDR" | grep -q 'M4'; then
@@ -277,7 +309,11 @@ apply_m4() {
 # so before this state existed, the writer's copy of the rule was verified by
 # exactly two hand-picked probe rows and by nothing else.
 apply_m5() {
-  sed -i 's|if (!fold_usm \|\| !fold_stride_ok(fold_stride, nOp)) return dep;|if (!fold_usm \|\| false) return dep;  /*M5*/|' "$SRC"
+  # The literal below contains `||` -- the reason this used to be an escaped
+  # `sed s|...|...|` and why that was fragile.
+  patch_literal "$SRC" \
+    'if (!fold_usm || !fold_stride_ok(fold_stride, nOp)) return dep;' \
+    'if (!fold_usm || false) return dep;  /*M5*/'
   grep -q '/\*M5\*/' "$SRC" || { echo "  M5: writer gate not mutated" >&2; return 1; }
   return 0
 }
@@ -290,7 +326,9 @@ apply_m5() {
 # tree and the host-side index check is its ONLY gate -- which is the strongest
 # argument for having added that check.
 apply_m6() {
-  sed -i 's|  return m \* (std::size_t)fold_stride + (std::size_t)o;|  return (std::size_t)o;  /*M6*/|' "$HDR"
+  patch_literal "$HDR" \
+    '  return m * (std::size_t)fold_stride + (std::size_t)o;' \
+    '  return (std::size_t)o;  /*M6*/'
   grep -q '/\*M6\*/' "$HDR" || { echo "  M6: fold_index_s0 not mutated" >&2; return 1; }
   if grep -A3 'fold_index_sfull(std::size_t m' "$HDR" | grep -q 'M6'; then
     echo "  M6: fold_index_sfull was also hit -- anchor too broad" >&2; return 1
