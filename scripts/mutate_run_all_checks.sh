@@ -669,7 +669,13 @@ patch_literal "$MUTANT" \
 # The predicate is POSITIVE: the stray-argument run must FAIL, and it must fail
 # with the path-shaped error rather than for an unrelated reason. Asserting only
 # "rc != 0" would let this pass because the matrix broke some other way.
-def_n_m() { grep -qE 'No such file or directory|mutate_gate_pop.sh.*: ' "$WORK/N-M.log"; }
+# The predicate had to be written from what the STACK LOG actually contains.
+# My first version grepped for "No such file or directory" -- which is printed by
+# the STEP's own log, not by the stack, so the state reported MISSED even though
+# the defect reproduced perfectly (step_current FAIL rc=97, and the run ended
+# "FAIL (1 step(s) FAILED)"). Write the predicate from the observed output, not
+# from the output you expect (the same lesson as M-A's polarity).
+def_n_m() { grep -qE 'step_current +FAIL rc=|RUN ALL CHECKS: FAIL \(1 step' "$WORK/N-M.log"; }
 run_state "N-M" "dispatch() arm given a stray argument" def_n_m "step_ok step_current" "$ALL_CURRENT"
 
 # N-L: the detector hard-wired to ALWAYS fire. This state exists so the N-Kq
