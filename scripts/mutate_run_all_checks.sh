@@ -295,7 +295,7 @@ baseline() {
   local lit="(none)"
   [ -n "$residue" ] && lit="$([ "$where" = root ] && echo "sandbox ROOT" || echo "scripts/")"
   printf '  ok    baseline %-4s rc=%s, correct marker present, litter=%s\n' "$id" "$rc" "$lit"
-  printf '  ok    baseline %-4s rc=%s, correct marker present\n' "$id" "$rc"
+printf '  ok    baseline %-4s rc=%s, correct marker present, litter=%s\n' "$id" "$rc" "$lit"
 }
 
 # --- defect predicates: return 0 ONLY when the defect is really present -----
