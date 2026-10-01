@@ -1520,6 +1520,13 @@ e.g. S3's contract column is 40 not 42).
   checkers + 4 matrices green, **5/5 enumerated stamps naming HEAD**, tracked
   tree clean, and no new untracked file anywhere in the work tree;
   `mutate_run_all_checks.sh` is **11/11 caught with 11/11 baselines correct**
+  *** HISTORICAL CITATION — superseded. As of 2026-10-01 the matrix has 12
+  baselines: N-Kq and N-L add the CONVERSE half of the mid-run HEAD-moved
+  detector (it must stay silent when HEAD holds still, and an always-firing
+  detector must be rejected). So the current figures are 11/11 caught, 12/12
+  baselines. Read them from `build/run_all_mutate/last_pass.stamp`
+  (`states=`, `caught=`, `baselines=`), never from here — this paragraph is a
+  citation and cannot track the tree. ***
   (each baseline requires the correct marker PRESENT, so no predicate can be
   satisfied by an early abort). Two earlier drafts of this paragraph quoted
   `c693f95` and then `baf6a85` — **both stale by construction**, since
@@ -1547,7 +1554,8 @@ e.g. S3's contract column is 40 not 42).
     evidence nor a regression, and the two call for opposite actions). The
     comparison uses `$HEAD_NOW`, so a moved HEAD is not additionally misreported
     as 5 phantom STALE stamps. Mutated by state **N-K** in
-    `scripts/mutate_run_all_checks.sh` (11/11, 11 baselines; a synthetic
+    `scripts/mutate_run_all_checks.sh` (11/11 caught, 12 baselines — the extra two
+   are the N-K converse; read the live figures from its stamp; a synthetic
     `step_commit` makes the move reproducible without disarming the mutant's
     dirty-tree guard). If you see "HEAD MOVED under this run", finish the other
     commit and re-run — do not debug the stamps.
