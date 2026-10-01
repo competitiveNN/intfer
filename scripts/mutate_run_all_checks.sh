@@ -193,7 +193,21 @@ printf '#!/usr/bin/env bash\n: >"%s/step_sentinel.ran"\nexit 0\n' "$SYNTH" >"$ST
 # both snapshots and correctly reads as "not left behind". That first version
 # of the N-G baseline scored rc=0 for exactly that reason -- the case was broken,
 # and the baseline caught it.
-printf '#!/usr/bin/env bash\nprintf "litter\\n" >"\${INTFER_RAC_LITTER:?no litter path}"\nexit 0\n' >"$STEPS/step_litter"
+#
+# A heredoc, not a printf format. The format was written with '\${...}' inside
+# single quotes, which printf emitted VERBATIM, so the step created a file
+# literally named '${INTFER_RAC_LITTER:?no litter path}' in the sandbox root
+# instead of the intended path. N-G still "caught" (the assertion fires on ANY
+# new untracked file) and N-I then read rc=0 -- because that stray survived
+# run_rac's cleanup and was therefore already present in the NEXT run's
+# before-snapshot. A false catch on one state silently disarming the next; the
+# N-I baseline caught it.
+cat >"$STEPS/step_litter" <<EOF
+#!/usr/bin/env bash
+[ -n "\${INTFER_RAC_LITTER:-}" ] || exit 3
+printf 'litter\n' >"\$INTFER_RAC_LITTER"
+exit 0
+EOF
 # N-H: unproven on the FIRST pass, a REAL failure on the re-run. The only
 # shape that distinguishes "missing evidence" from "a regression appeared while
 # we were re-measuring", and therefore the only shape that exercises the
@@ -254,9 +268,10 @@ run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
 # $1 id, $2 steps, $3 stampdir, $4 want rc, $5 marker that MUST be present
 baseline() {
   local id="$1" steps="$2" sdir="$3" want="$4" marker="$5" residue="${6:-}" rc
+  local where="${7:-}"   # litter site: "" = scripts/, "root" = sandbox repo root
   NBASE=$((NBASE + 1))
   reset_mutant
-  run_rac "$id" "$steps" "$sdir" "$residue"; rc=$?
+  run_rac "$id" "$steps" "$sdir" "$residue" "$where"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "FAIL: baseline $id reached rc=$rc, want $want -- the CASE is broken, not" >&2
     echo "  the mutation. ($WORK/$id.log)" >&2; exit 1
