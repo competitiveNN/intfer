@@ -185,6 +185,23 @@ matrix, and the shared patch helper — all dispatched steps of
     rather than a research-subagent transcript. Clones sparse on demand;
     if the pin cannot be resolved it exits 2 and the docs must then be read as
     UNVERIFIED.
+  - `scripts/check_checker_matrix_coverage.sh` — DERIVES the "every checker has
+    a dispatched mutation matrix" claim from `scripts/` instead of trusting a
+    hand-written total. It exists because that claim had only ever been prose,
+    and the property is load-bearing: three vacuous-greens shipped green
+    because no matrix made them fail. Deliberately has **no** "orphan matrix"
+    rule — `mutate_fold_matrix.sh`, `mutate_gate_inventory.sh` and
+    `mutate_run_all_checks.sh` have no same-named checker because they check
+    OTHER files, and flagging them produced three false alarms on a healthy
+    tree. A check that cries wolf is the mirror defect.
+  - `scripts/mutate_checker_matrix_coverage.sh` — its matrix, 3/3. Each state
+    does BOTH things: it plants a checker with no matrix in the sandbox tree AND
+    removes the requirement that would catch it. Weakening alone is
+    UNOBSERVABLE while the real tree has full coverage (AUDIT #21) — the first
+    attempt at this matrix scored 0/3 for exactly that reason and was reverted.
+    States judge on the VERDICT line, not on the table: the table still prints
+    "MISSING" for the planted checker even with the requirement removed, so only
+    the `bad` increment and exit code disappear.
   - `scripts/mutate_l0_cite.sh` — mutation matrix for that checker, 7/7 states
     caught each for its own reason, stamped `build/l0_cite_mutate/last_pass.stamp`.
     It also carries a **stamp-population leak assertion** (`leak_assert()`),

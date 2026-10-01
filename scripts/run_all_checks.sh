@@ -165,6 +165,12 @@ dispatch() { # $1 = label -> runs it
       # produced during conversion (false LEAK, vacuous assertion) plus the
       # fail-closed case its own check then found.
       timeout 300 bash "$SCRIPT_DIR/check_gate_pop.sh"; return $? ;;
+    check_checker_matrix_coverage.sh)
+      # Derives "every checker has a dispatched matrix" from scripts/ rather than
+      # trusting a hand-written total. Wired, and its own matrix is
+      # mutate_checker_matrix_coverage.sh -- otherwise this checker would be the
+      # very drift it reports.
+      timeout 600 bash "$SCRIPT_DIR/check_checker_matrix_coverage.sh"; return $? ;;
     check_gpu_recover.sh)
       # Stubbed probe; nothing real is modified. Pins the RECOVERY TOOL's exit
       # codes, especially 2=unmeasurable vs 1=still-broken -- the distinction
@@ -203,13 +209,18 @@ dispatch() { # $1 = label -> runs it
       # the expectation instead, so a direction the checker quietly stopped
       # testing must show up as a missing ok line.
       timeout 1800 bash "$SCRIPT_DIR/mutate_fold_report_class.sh"; return $? ;;
+    mutate_checker_matrix_coverage.sh)
+      # Each state BOTH poisons the tree with an unmated checker AND removes the
+      # requirement that would catch it -- weakening alone is unobservable while
+      # the real tree has full coverage (AUDIT #21).
+      timeout 1800 bash "$SCRIPT_DIR/mutate_checker_matrix_coverage.sh"; return $? ;;
     mutate_gate_pop.sh)
       # Removes ONE case (its echo AND its own counter) from check_gate_pop.sh.
       # patch_literal is called with THREE arguments -- file, exact-old,
       # exact-new -- and old/new each span a literal newline. Passing one quoted
       # string per LINE was the original bug: five states, all "PATCH VERIFY
       # FAIL", found with bash -x rather than by guessing.
-      timeout 1800 bash "$SCRIPT_DIR/mutate_gate_pop.sh"; return $? ;;
+      timeout 1800 bash "$SCRIPT_DIR/mutate_gate_pop.sh mutate_checker_matrix_coverage.sh"; return $? ;;
     mutate_gate_enum.sh)
       # Patches SANDBOX COPIES under the build tree, never scripts/, so a
       # mutated helper cannot leak into a later glob of that directory.
@@ -368,11 +379,11 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_build_dir_consumers.sh check_doc_counts.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_checker_matrix_coverage.sh"
 fi
 echo "== 1/2 checkers =="
 for label in $STEPS; do step "$label"; done
