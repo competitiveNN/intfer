@@ -88,12 +88,23 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT" || exit 1
 BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
 TARGET="scripts/run_all_checks.sh"
-MUTANT="scripts/_rac_mutant.sh"      # UNTRACKED on purpose -- see the header
+# The mutant lives in a SANDBOX GIT REPO, not in the real tree. It used to be an
+# untracked copy at scripts/_rac_mutant.sh, which put it inside the very
+# directory run_all_checks.sh now asserts has no untracked residue -- so every
+# baseline read the harness's own file as leftover residue. Exempting it by name
+# would be a hand-maintained list, i.e. the copy-drift family again.
+#
+# A sandbox removes the need for an exemption AND stops the matrix touching the
+# real repo at all: its own `git diff`/`git rev-parse` resolve inside the sandbox,
+# whose HEAD is a throwaway commit. The stamps are built from the SANDBOX head, so
+# they are self-consistent with the code under test.
+SB="$SYNTH/root"
+MUTANT="$SB/scripts/run_all_checks.sh"
 WORK="$BUILD_DIR/run_all_mutate"
 STAMP="$WORK/last_pass.stamp"
 LOCK="$WORK/.lock"
-PROBE="scripts/_rac_dirty_probe.md"
-RESIDUE_PROBE="scripts/_rac_residue_probe.md"
+PROBE="$SB/scripts/_rac_dirty_probe.md"
+RESIDUE_PROBE="$SB/scripts/_rac_residue_probe.md"
 # The SYNTHETIC world deliberately lives OUTSIDE the build tree. Two reasons, both
 # learned the hard way:
 #   * run_all_checks.sh enumerates stamps with `find "$BUILD_DIR" -name
@@ -106,8 +117,14 @@ RESIDUE_PROBE="scripts/_rac_residue_probe.md"
 #     made every inner run exit 1 with "another run_all_checks.sh is running", and
 #     the matrix correctly reported that as a broken CASE.
 SYNTH="$(mktemp -d "${TMPDIR:-/tmp}/rac_mut.XXXXXX")" || exit 1
-mkdir -p "$SYNTH/inner"
+mkdir -p "$SYNTH/inner" "$SB/scripts"
 rm -rf "$WORK"; mkdir -p "$WORK" || exit 1
+cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"
+git init -q "$SB" || { echo "FAIL: could not init sandbox repo $SB" >&2; exit 1; }
+git -C "$SB" -c user.email=m@x -c user.name=matrix add -A >/dev/null 2>&1
+git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m sandbox >/dev/null 2>&1
+SB_HEAD="$(git -C "$SB" rev-parse HEAD)" || { echo "FAIL: sandbox has no HEAD" >&2; exit 1; }
+export GIT_CONFIG_NOSYSTEM=1
 
 if ! mkdir "$LOCK" 2>/dev/null; then
   echo "FAIL: another mutate_run_all_checks.sh is running (lock: $LOCK)" >&2
@@ -116,14 +133,13 @@ fi
 # Always clean up the mutant, even on an abort: it lives in scripts/, and leaving
 # a mutated copy there would poison every later check that globs that directory.
 cleanup() {
-  rm -f "$MUTANT" "$PROBE" "$RESIDUE_PROBE"
-  git reset -- "$PROBE" 2>/dev/null
+  rm -f "$PROBE" "$RESIDUE_PROBE"
   rmdir "$LOCK" 2>/dev/null || true
   rm -rf "$SYNTH"
 }
 trap cleanup EXIT
 
-[ -e "$MUTANT" ] && { echo "FAIL: $MUTANT already exists; refusing to overwrite" >&2; exit 1; }
+[ -e "$TARGET" ] || { echo "FAIL: $TARGET missing" >&2; exit 1; }
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "FAIL: the tracked tree has uncommitted changes." >&2
   echo "  The mutant inherits that dirtiness, so every case would read the dirty" >&2
@@ -141,27 +157,27 @@ chmod +x "$STEPS"/*
 
 mk_stamps() { # $1 = dir, $2 = "stale" to make c/ stale
   mkdir -p "$1/a" "$1/b" "$1/c"
-  printf 'sha=%s\n' "$(git rev-parse HEAD)" >"$1/a/last_pass.stamp"
-  printf 'sha=%s\n' "$(git rev-parse HEAD)" >"$1/b/last_pass.stamp"
-  printf 'sha=%s\n' "$(git rev-parse HEAD)" >"$1/c/last_pass.stamp"
+  printf 'sha=%s\n' "$SB_HEAD" >"$1/a/last_pass.stamp"
+  printf 'sha=%s\n' "$SB_HEAD" >"$1/b/last_pass.stamp"
+  printf 'sha=%s\n' "$SB_HEAD" >"$1/c/last_pass.stamp"
   [ "$2" = "stale" ] && printf 'sha=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' >"$1/c/last_pass.stamp"
   return 0
 }
 ALL_CURRENT="$SYNTH/stamps_all_current"; mk_stamps "$ALL_CURRENT" current
 HAS_STALE="$SYNTH/stamps_with_stale";    mk_stamps "$HAS_STALE" stale
 
-reset_mutant() { rm -f "$MUTANT"; cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"; }
+reset_mutant() { cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"; git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -am mutant >/dev/null 2>&1 || true; }
 run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
   local id="$1" steps="$2" sdir="$3" residue="${4:-}"
   rm -f "$SYNTH/step_sentinel.ran" "$SYNTH/step_flaky2.count" "$RESIDUE_PROBE"
-  [ -n "$residue" ] && { printf 'residue\n' >"$RESIDUE_PROBE"; git add -N -- "$RESIDUE_PROBE" 2>/dev/null; }
+  [ -n "$residue" ] && { printf 'residue\n' >"$RESIDUE_PROBE"; git -C "$SB" add -N -- "$RESIDUE_PROBE" 2>/dev/null; }
   # INTFER_BUILD_DIR is redirected so the mutant's lock is not the outer run's.
   INTFER_BUILD_DIR="$SYNTH/inner" \
   INTFER_RUN_ALL_STEPS="$steps" INTFER_RUN_ALL_EXTRA_STEPS_DIR="$STEPS" \
     INTFER_RUN_ALL_STAMP_DIR="$sdir" \
     timeout 600 bash "$MUTANT" >"$WORK/$id.log" 2>&1
   local rc=$?
-  rm -f "$RESIDUE_PROBE"; git reset -q -- "$RESIDUE_PROBE" 2>/dev/null || git reset -- "$RESIDUE_PROBE" 2>/dev/null
+  rm -f "$RESIDUE_PROBE"; git -C "$SB" reset -q -- "$RESIDUE_PROBE" 2>/dev/null || true
   return $rc
 }
 
@@ -197,9 +213,9 @@ echo "== BASELINES (unmutated run_all_checks must be CORRECT in each setup) =="
 baseline "N-A" "step_ok"     "$ALL_CURRENT" 0 ""
 baseline "N-B" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"   # 2b re-run visible
 baseline "N-C" "step_ok"     "$HAS_STALE"   2 "STALE c/last_pass.stamp"      # 3rd stamp enumerated
-printf 'probe\n' >"$PROBE"; git add -- "$PROBE"   # a genuinely TRACKED, dirty file
+printf 'probe\n' >"$PROBE"; git -C "$SB" add -- "$PROBE"   # a genuinely TRACKED, dirty file
 baseline "N-D" "step_sentinel" "$ALL_CURRENT" 1 "uncommitted changes"
-git reset -- "$PROBE"; rm -f "$PROBE"
+git -C "$SB" reset -q -- "$PROBE"; rm -f "$PROBE"
 baseline "N-E" "step_ok"     "$ALL_CURRENT" 0 ""                              # self-check passes
 baseline "N-F" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"       # re-run works
 baseline "N-G" "step_ok"     "$ALL_CURRENT" 1 "untracked residue left in scripts" yes
@@ -241,6 +257,12 @@ if n != 1:
     sys.exit("patch_literal: anchor found %d times, want 1" % n)
 open(path, "w").write(src.replace(old, new))
 PY
+  # Commit the patch. In the sandbox the mutant is a TRACKED file, so patching it
+  # leaves the tree dirty -- and the mutant's own start-of-run guard would then
+  # abort every case before the defect could appear. That is precisely the masking
+  # that broke the FIRST version of this matrix, reappearing one level down; the
+  # sandbox removes it only if each patched state is committed.
+  git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -am patched >/dev/null 2>&1 || true
 }
 verify_patched() { # $1 = state id -- the MUTANT copy must differ from the target
   if cmp -s "$MUTANT" "$TARGET"; then
@@ -260,9 +282,9 @@ run_state() { # $1 id, $2 desc, $3 predicate, $4 steps, $5 stampdir, $6 dirty?
   local id="$1" desc="$2" pred="$3" steps="$4" sdir="$5" dirty="${6:-}"
   local residue="${7:-}" old2="${8:-}" new2="${9:-}"
   TOTAL=$((TOTAL + 1))
-  [ "$dirty" = "dirty" ] && { printf 'probe\n' >"$PROBE"; git add -- "$PROBE"; }
+  [ "$dirty" = "dirty" ] && { printf 'probe\n' >"$PROBE"; git -C "$SB" add -- "$PROBE"; }
   run_rac "$id" "$steps" "$sdir" "$residue"
-  [ "$dirty" = "dirty" ] && { git reset -- "$PROBE"; rm -f "$PROBE"; }
+  [ "$dirty" = "dirty" ] && { git -C "$SB" reset -q -- "$PROBE"; rm -f "$PROBE"; }
   if $pred; then
     CAUGHT=$((CAUGHT + 1))
     printf '  ok    %-4s defect reproduced: %s\n' "$id" "$desc"
