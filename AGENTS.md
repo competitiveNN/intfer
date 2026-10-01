@@ -1369,6 +1369,80 @@ e.g. S3's contract column is 40 not 42).
   ALSO CORRECTED: the matrix header and PASS message still described the removed
   untracked-copy design — stale prose about a mechanism that no longer exists is
   the same defect as a stamp that does not match the code.
+- **AUDIT #18: THE ENTRY POINT REPORTED A REAL FAILURE AS HEALTHY.** (run_all_checks.sh
+  exit-code class + residue scope + dispatch coverage; mutate_run_all_checks 7→**10/10**
+  states; two diagnostic fixes; no engine/quant/schedule code touched.)
+  Read #17's work back with the question "what does this claim, and can it be
+  false?", rather than re-running the same checks.
+    (1) **THE SERIOUS ONE — the 2b re-run classified a regression as missing
+  evidence.** The re-run branched only on success/failure and left `FAILED` at 0
+  either way. Measured with a synthetic step that answers rc=2 on the first pass
+  and rc=1 on the re-run: it printed `still rc=1` and then the final verdict
+  **"RUN ALL CHECKS: … NOT a regression: Nothing is wrong with the code"**,
+  exit 2 — the script calling a checker failure healthy, in a script whose whole
+  reason for existing is keeping that apart. The re-run now routes through the
+  SAME `classify_rc` as the main loop and escalates `fail` → `FAILED`, printing
+  `REGRESSED rc=… -- was unproven, is now a real failure`. Post-fix: exit 1,
+  "FAIL (1 step(s) FAILED)". This is the 1-vs-2 doctrine violation measured on
+  the doctrine's own enforcement point.
+    (2) **The residue assertion was scoped to ONE DIRECTORY.** The end-of-run
+  check ran `git status -- scripts/` and called it "no untracked residue in
+  scripts/". `scripts/` is where the *previous* version of the matrix kept its
+  mutant; the scope was never revisited after the sandbox removed that file.
+  Measured: a step that littered the **repository root** left the run printing
+  "ok no untracked residue" and **exiting 0 = PASS**. Now the whole work tree is
+  SNAPSHOT before step 1 and DIFFed after — a diff, not a tally, so pre-existing
+  untracked files (which the start-of-run message promises are fine) still do not
+  fail the run. Ignored paths are excluded by git, so the build tree and the lock
+  never appear.
+    (3) **dispatch()/STEPS were hand lists.** A new `check_*`/`mutate_*` nobody
+  remembered to add is not a step that FAILS, it is a step that NEVER RUNS — and
+  this entry point would still print PASS. Section `0b` now enumerates
+  `check_*.sh`/`mutate_*.sh` and requires a dispatch arm for each, extracting the
+  arm list from `dispatch()` itself (so the two cannot drift) and failing LOUDLY
+  if the extraction yields nothing.
+    (4) **Three new states, each with the pre-fix defect verbatim as its patch,
+  not a proxy for it.** N-H patches the 2b rc=1 arm back to its old shape; N-I
+  patches the residue check back to `git status -- scripts/` and litters the
+  sandbox root; N-J neuters the coverage enumeration and drops an undispatched
+  `mutate_dummy.sh` into the sandbox's `scripts/`, COMMITTED so the residue diff
+  cannot be what fails.
+    **FIVE HARNESS DEFECTS THE NEW STATES EXPOSED — every one of them a state
+  reporting on a broken harness rather than on the checker**
+      * **A stray `rm` disarmed four states.** The N-J baseline removed the
+  sandbox dummy with `rm -f`, leaving a DELETION in the sandbox working tree, so
+  every later state aborted at the top on the mutant's own dirty-tree guard:
+  N-A, N-B, N-E and N-F all scored MISSED. The removal is committed, and a
+  derived `sandbox is clean after the baselines` assertion (`git status`, not a
+  file list) now catches the class independently.
+      * **A converse assertion satisfied by an abort.** The N-A converse only
+  required `'1/2 checkers'` to be ABSENT — which an early abort satisfies
+  trivially — so it printed `ok` while four states were failing. It now first
+      requires the self-check to have actually run, pinning the absence to the
+  gating decision and nothing else.
+      * **The litter had to be created BY THE STEP.** The end-of-run check is a
+  diff, so a file the harness created *beforehand* is in both snapshots and
+  correctly reads as "not left behind" — the N-G baseline scored rc=0 and caught
+  it. Littering now happens during the run, via a synthetic step.
+      * **Two anchors covered less than the code they patched.** `A_RESIDUE`
+  matched line 1 of a 4-line continuation and `A_ESCALATE` one line of a 3-line
+  arm; the patches left dangling fragments and `verify_patched` correctly aborted
+  on a syntax error. Anchors are now whole blocks.
+      * **The pre-flight counted LINES, the patch counts OCCURRENCES.**
+  `check_anchor` used `grep -cF`, so a multi-line anchor reported "4 times" and
+  refused to start, while `patch_literal` — the thing that actually has to find
+  it — counts substrings. A guard and the thing it guards must agree on what
+  "exactly once" means, so both now count occurrences in python. (Earlier,
+  `grep -c ... || echo 0` appended a second `0` on every miss, since `grep -c`
+  prints 0 *and* exits 1.) Also: `run_state` printed an `ok` line directly under
+  MISSED verdicts — a harness's diagnostic is part of what it certifies.
+    **VERIFIED at c693f95**: `run_all_checks.sh` full stack (not QUICK) rc=0 in
+  8m09s — 3 checkers + 4 matrices, 5/5 enumerated stamps at HEAD, tracked tree
+  clean, no new untracked file anywhere; `mutate_run_all_checks` 10/10 caught with
+  **10/10 baselines correct** (each requiring the correct marker PRESENT, so no
+  predicate can be satisfied by an early abort). No wall-time or throughput claim
+  is made anywhere above: the box was loaded (loadavg ~9) and this audit changed
+  no engine code.
 
 
 
