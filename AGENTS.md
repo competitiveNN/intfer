@@ -1542,6 +1542,31 @@ e.g. S3's contract column is 40 not 42).
   No wall-time or throughput claim is made anywhere above: the box was loaded
   (loadavg ~9) and this audit changed no engine code.
 
+  - **THE CONVERSE FAMILY IS ALREADY CLOSED TREE-WIDE (2026-10-01, measured —
+    a suggestion to extend it was DISPROVEN, do not re-open).** The always-red
+    lesson was found in `mutate_run_all_checks.sh` (N-Kq/N-L, 2026-10-01), and
+    the obvious next move is to extend the same converse treatment to the other
+    three matrices. Measured instead of assumed: they already have it, in the
+    structures those matrices actually use (which differ — `run_state` with an
+    expected-reason argument, not `def_` predicates, so grepping for `def_`
+    returns zero and wrongly reads as "no coverage").
+    * `check_device_precond.sh` (driven by `mutate_device_precond.sh`): the
+      strongest instance in the tree — a three-case behavioural self-check at
+      `:189-237` whose case (c) requires the **CORRECT cause to be ACCEPTED**,
+      which is precisely what makes the always-red cases (a)/(b) meaningful.
+      Exercised by mutation M-F, which rewords only that case.
+    * `mutate_gate_inventory.sh`: `selfcheck()` asserts `rc_class` is not a
+      constant function and that the anchor pre-flight must both REJECT a
+      duplicated anchor AND still ACCEPT the real target; plus M4/M9/M7 covering
+      the self-check's own failure modes.
+    * `mutate_fold_matrix.sh`: `selfcheck()` seeds each mutation marker to prove
+      the residue scan detects it, then asserts it does **not** false-positive on
+      clean input; plus the `S0_clean` state, which is the healthy direction.
+    The general form, worth reusing rather than re-deriving: a converse needs a
+    case where the check must fire AND a case where it must stay quiet, and the
+    quiet case is the one that gets forgotten. `grep -c '^def_'` returning 0 is
+    evidence about the SEARCH, not about the coverage.
+
   - **SINGLE WRITER: do not commit to this clone while `run_all_checks.sh` is
     running.** MEASURED, not hypothetical — a second agent session committed
     three times during one ~45 min stack here. HEAD then moved between the
