@@ -173,6 +173,11 @@ dispatch() { # $1 = label -> runs it
       # Re-derives the report's commit count with git and fails if the stated
       # number disagrees, or if the gate tally / TP=2 UNVERIFIED wording moved.
       timeout 900 bash "$SCRIPT_DIR/check_doc_counts.sh"; return $? ;;
+    mutate_gpu_recover.sh)
+      # Fixtures live in a mktemp sandbox OUTSIDE $BUILD_DIR, and the matrix
+      # asserts the enumerated stamp-DIRECTORY set is unchanged, so its own
+      # artefacts cannot join the population step 3/3 compares.
+      timeout 1800 bash "$SCRIPT_DIR/mutate_gpu_recover.sh"; return $? ;;
     mutate_gate_enum.sh)
       # Patches SANDBOX COPIES under the build tree, never scripts/, so a
       # mutated helper cannot leak into a later glob of that directory.
@@ -335,7 +340,7 @@ else
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh"
 fi
 echo "== 1/2 checkers =="
 for label in $STEPS; do step "$label"; done
