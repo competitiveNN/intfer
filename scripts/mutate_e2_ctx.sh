@@ -28,6 +28,8 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/_gate_patch.sh"
 # shellcheck source=scripts/_gate_pred.sh
 . "$SCRIPT_DIR/_gate_pred.sh"
+# shellcheck source=scripts/_gate_pop.sh
+. "$SCRIPT_DIR/_gate_pop.sh"
 
 CHECK="$SCRIPT_DIR/check_e2_ctx.sh"
 BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
@@ -41,14 +43,6 @@ trap 'rm -rf "$SB"' EXIT
 git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null || {
   echo "FAIL: $CHECK is dirty; this matrix edits a sandbox copy."; exit 2; }
 
-pop_dirs() { find "$BUILD_DIR" -name '*last_pass.stamp' 2>/dev/null \
-              | xargs -r -n1 dirname | xargs -r -n1 basename | LC_ALL=C sort -u; }
-known_dirs() {
-  grep -hoE '(WORK|LOG_DIR|STAMP)="[^"]*"' "$SCRIPT_DIR"/mutate_*.sh 2>/dev/null \
-    | sed -e 's/^[A-Z_]*="//' -e 's/"$//' \
-    | sed -e 's|${INTFER_BUILD_DIR:-$ROOT/build}/||' -e 's|\$BUILD_DIR/||' -e 's|\$ROOT/build/||' \
-    | grep -vE '^[\$/{]' | awk -F/ 'NF>0 {print $1}' | LC_ALL=C sort -u | tr '\n' ' '
-}
 POP_BEFORE="$(pop_dirs | tr '\n' ' ')"
 # The checker sources scripts/_gate_precond.sh and resolves BIN from
 # INTFER_BUILD_DIR, so the sandbox needs those too. Sourcing failed with

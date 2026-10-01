@@ -19,6 +19,11 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
+# Shared stamp-population enumeration (pop_dirs / known_dirs / pop_assert_no_leak),
+# so this matrix is not a fourth copy of that derivation -- the same
+# "rule fixed at one site, re-derived at another" shape as patch_literal.
+# shellcheck source=scripts/_gate_pop.sh
+. "$SCRIPT_DIR/_gate_pop.sh"
 SRC_TREE="${INTFER_CR_TREE:-$BUILD_DIR/cr}"
 STAMP="$BUILD_DIR/l0_cite_mutate"
 MUT="$BUILD_DIR/cr.mut"
@@ -42,7 +47,6 @@ caught=0; total=0
 # catch -- adding a 7th matrix would make this assertion fire on a legitimate
 # tree, which is how a check gets "fixed" by weakening it.
 pop_total() { find "$BUILD_DIR" -name '*last_pass.stamp' 2>/dev/null | sort; }
-pop_names() { pop_total | xargs -r -n1 dirname 2>/dev/null | xargs -r -n1 basename 2>/dev/null | sort; }
 # BASENAME of the enclosing dir, which is what run_all_checks.sh reports and
 # what a human compares. Deriving this from the mutate_*.sh NAMES was wrong in
 # both directions: mutate_device_precond.sh stamps device_precond_matrix/
@@ -52,7 +56,6 @@ pop_names() { pop_total | xargs -r -n1 dirname 2>/dev/null | xargs -r -n1 basena
 # nothing is wrong is the mirror defect, and it is how an assertion teaches
 # people to ignore it. Census the ACTUAL directories instead and compare the
 # SET, which is the thing the suite's step 3/3 enumerates.
-pop_dirs() { pop_names | sort -u; }
 # The set of stamp directories a matrix legitimately owns. Defined up here
 # because BOTH the leak assertion and state M-H evaluate the same predicate
 # against it; when it lived only next to the assertion, M-H ran first and died
@@ -76,14 +79,6 @@ pop_dirs() { pop_names | sort -u; }
 # then reported a LEAK on the fifth's healthy output.
 # $WORK/$LOG_DIR indirections resolve to nothing on their own, so a value that
 # is still a bare variable after substitution is dropped.
-known_dirs() {
-  grep -hoE '(WORK|LOG_DIR|STAMP)="[^"]*"' "$SCRIPT_DIR"/mutate_*.sh 2>/dev/null \
-    | sed -e 's/^[A-Z_]*="//' -e 's/"$//' \
-    | sed -e 's|${INTFER_BUILD_DIR:-$ROOT/build}/||' -e 's|\$BUILD_DIR/||' -e 's|\$ROOT/build/||' \
-    | grep -vE '^[\$/{]' \
-    | awk -F/ 'NF>0 {print $1}' \
-    | LC_ALL=C sort -u | tr '\n' ' '
-}
 
 # pop_total is deliberately defined HERE, before any state runs: M-H calls it,
 # and a first version of that state called it ~100 lines later, so bash printed

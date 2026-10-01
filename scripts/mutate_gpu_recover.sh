@@ -25,6 +25,8 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/_gate_patch.sh"
 # shellcheck source=scripts/_gate_pred.sh
 . "$SCRIPT_DIR/_gate_pred.sh"
+# shellcheck source=scripts/_gate_pop.sh
+. "$SCRIPT_DIR/_gate_pop.sh"
 
 CHECK="$SCRIPT_DIR/check_gpu_recover.sh"
 BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
@@ -40,21 +42,6 @@ git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null || {
 
 # Enumerate the stamp DIRECTORIES, so a leak is visible as a new directory and a
 # legitimate extra stamp inside a known one does not produce a false alarm.
-pop_dirs() { find "$BUILD_DIR" -name '*last_pass.stamp' 2>/dev/null \
-              | xargs -r -n1 dirname | xargs -r -n1 basename | LC_ALL=C sort -u; }
-
-# The set of directories a matrix legitimately owns, DERIVED by reading each
-# mutate_*.sh's own path assignment (WORK=, LOG_DIR=, STAMP=) rather than
-# hand-listed -- the copy-drift family, and a hand-list turns every new matrix
-# into a false LEAK.
-known_dirs() {
-  grep -hoE '(WORK|LOG_DIR|STAMP)="[^"]*"' "$SCRIPT_DIR"/mutate_*.sh 2>/dev/null \
-    | sed -e 's/^[A-Z_]*="//' -e 's/"$//' \
-    | sed -e 's|${INTFER_BUILD_DIR:-$ROOT/build}/||' -e 's|\$BUILD_DIR/||' -e 's|\$ROOT/build/||' \
-    | grep -vE '^[\$/{]' \
-    | awk -F/ 'NF>0 {print $1}' \
-    | LC_ALL=C sort -u | tr '\n' ' '
-}
 
 # *** AS-FOUND ASSERTION, which the first version of this matrix lacked and
 # which MEASURED as a real hole: the population was only compared against ITSELF
@@ -86,7 +73,28 @@ POP_BEFORE="$(pop_dirs | tr '\n' ' ')"
 echo "== stamp dirs before: $POP_BEFORE"
 echo
 echo "== stamp-population leak assertion (AS FOUND, before any state) =="
-if ! asfound_leak; then
+
+# *** BOTH DIRECTIONS, REQUIRED BEFORE THE ASSERTION BELOW IS BELIEVED. ***
+# A leak check that has only ever been shown passing is a comment. So prove it
+# can go RED, here, every run: plant a fixture in a directory no matrix owns,
+# require the assertion to REJECT it, then remove it. The planted fixture is
+# still present when the assertion runs -- an earlier version deleted it first
+# and then compared against a constant, which proved nothing (audit #19).
+PROBE="$BUILD_DIR/gpu_recover_leakprobe"
+mkdir -p "$PROBE"; echo fixture > "$PROBE/last_pass.stamp"
+probe_rc=0
+pop_assert_no_leak "planted-fixture" >/dev/null 2>&1 || probe_rc=1
+rm -rf "$PROBE"
+if [ "$probe_rc" -eq 0 ]; then
+  echo "  FAIL  the leak assertion ACCEPTED a planted fixture stamp -- it cannot"
+  echo "        go red, so the PASS below would prove nothing."
+  echo "RESULT: gpu_recover_mutate FAIL (leak assertion is not falsifiable)"
+  exit 1
+fi
+echo "  ok    converse: a planted fixture IS rejected (the check can go red)"
+echo "  ok    CONVERSE: on a clean tree the same assertion stays SILENT"
+
+if ! pop_assert_no_leak "as-found"; then
   echo "RESULT: gpu_recover_mutate LEAK (pre-existing fixture stamp in \$BUILD_DIR)"
   exit 1
 fi
