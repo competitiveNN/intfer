@@ -56,7 +56,12 @@ expect() { # $1 label, $2 want, $3 got
 }
 
 echo "-- the four classification directions --"
-restore; expect "clean summary + current stamp"        0 "$(run_rc)"
+# The stamp is set EXPLICITLY rather than inherited from the ambient one. At
+# phase 1/2 of run_all_checks.sh this script runs BEFORE mutate_fold_matrix, so
+# the on-disk stamp is still the previous run's and predates HEAD -- the case
+# then read rc=2 and failed for a reason that had nothing to do with the
+# classifier. A case must control its own fixture.
+restore; set_sha "$HEAD_SHA"; expect "clean summary + current stamp" 0 "$(run_rc)"
 restore; damaged; set_sha "$CLEAN_SHA"
 expect "damaged summary + STALE stamp (was rc=1)"     2 "$(run_rc)"
 restore; damaged; set_sha "$HEAD_SHA"
