@@ -159,18 +159,34 @@ chmod +x "$STEPS"/*
 
 mk_stamps() { # $1 = dir, $2 = "stale" to make c/ stale
   mkdir -p "$1/a" "$1/b" "$1/c"
-  printf 'sha=%s\n' "$SB_HEAD" >"$1/a/last_pass.stamp"
-  printf 'sha=%s\n' "$SB_HEAD" >"$1/b/last_pass.stamp"
-  printf 'sha=%s\n' "$SB_HEAD" >"$1/c/last_pass.stamp"
-  [ "$2" = "stale" ] && printf 'sha=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' >"$1/c/last_pass.stamp"
+  # The sandbox head ADVANCES with every patch, so the stamps are (re)written
+  # per run from the head in force NOW. Baking them once at setup made every
+  # state after the first read as STALE -- the evidence describing older code,
+  # which is the family-3 lesson in miniature.
+  local h; h="$(git -C "$SB" rev-parse HEAD)"
+  printf 'sha=%s\n' "$h" >"$1/a/last_pass.stamp"
+  printf 'sha=%s\n' "$h" >"$1/b/last_pass.stamp"
+  printf 'sha=%s\n' "$h" >"$1/c/last_pass.stamp"
+  case "$1" in *stale*)
+    printf 'sha=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' >"$1/c/last_pass.stamp" ;;
+  esac
   return 0
 }
 ALL_CURRENT="$SYNTH/stamps_all_current"; mk_stamps "$ALL_CURRENT" current
 HAS_STALE="$SYNTH/stamps_with_stale";    mk_stamps "$HAS_STALE" stale
 
-reset_mutant() { cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"; git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -am mutant >/dev/null 2>&1 || true; }
+# Path-limited on purpose. 'git commit -a' would ALSO commit the deliberately
+# dirty probe file, which silently disarms N-D: the tree came back clean, the
+# start-of-run guard never fired, and the state scored as a broken CASE rather
+# than as the defect it tests.
+commit_mutant() { # $1 = message
+  git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$MUTANT" >/dev/null 2>&1
+  git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "$1" -- "$MUTANT" >/dev/null 2>&1 || true
+}
+reset_mutant() { cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"; commit_mutant mutant; }
 run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
   local id="$1" steps="$2" sdir="$3" residue="${4:-}"
+  mk_stamps "$sdir"
   rm -f "$SYNTH/step_sentinel.ran" "$SYNTH/step_flaky2.count" "$RESIDUE_PROBE"
   [ -n "$residue" ] && { printf 'residue\n' >"$RESIDUE_PROBE"; git -C "$SB" add -N -- "$RESIDUE_PROBE" 2>/dev/null; }
   # INTFER_BUILD_DIR is redirected so the mutant's lock is not the outer run's.
@@ -264,7 +280,7 @@ PY
   # abort every case before the defect could appear. That is precisely the masking
   # that broke the FIRST version of this matrix, reappearing one level down; the
   # sandbox removes it only if each patched state is committed.
-  git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -am patched >/dev/null 2>&1 || true
+  commit_mutant patched
 }
 verify_patched() { # $1 = state id -- the MUTANT copy must differ from the target
   if cmp -s "$MUTANT" "$TARGET"; then
