@@ -34,6 +34,38 @@ mkdir -p "$LOG"
 : > "$LOG/summary.txt"
 caught=0; total=0
 
+# The population this matrix requires, derived from what legitimately stamps
+# rather than hardcoded: every run_all_checks.sh mutation matrix writes exactly
+# one last_pass.stamp, and the census below confirms which directories those are.
+# Hardcoding "6" is the hand-counted-total defect gate_inventory.sh exists to
+# catch -- adding a 7th matrix would make this assertion fire on a legitimate
+# tree, which is how a check gets "fixed" by weakening it.
+pop_total() { find "$ROOT/build" -name '*last_pass.stamp' 2>/dev/null | sort; }
+pop_names() { pop_total | xargs -r -n1 dirname 2>/dev/null | xargs -r -n1 basename 2>/dev/null | sort; }
+# BASENAME of the enclosing dir, which is what run_all_checks.sh reports and
+# what a human compares. Deriving this from the mutate_*.sh NAMES was wrong in
+# both directions: mutate_device_precond.sh stamps device_precond_matrix/
+# mutate_last_pass.stamp (two stamps, two names) while mutate_fold_matrix.sh
+# stamps fold_matrix/last_pass.stamp -- so a name-derived census said 5 for a
+# correct 6 and the assertion fired on a healthy tree. A check that fails when
+# nothing is wrong is the mirror defect, and it is how an assertion teaches
+# people to ignore it. Census the ACTUAL directories instead and compare the
+# SET, which is the thing the suite's step 3/3 enumerates.
+pop_dirs() { pop_names | sort -u; }
+# The set of stamp directories a matrix legitimately owns. Defined up here
+# because BOTH the leak assertion and state M-H evaluate the same predicate
+# against it; when it lived only next to the assertion, M-H ran first and died
+# with "known_dirs: unbound variable", which set -u turns into a failed state.
+# A helper referenced before it exists is the shell equivalent of a stale
+# binary: the caller appears to run and proves nothing.
+known_dirs="device_precond_matrix fold_matrix gate_inventory_matrix l0_cite_mutate run_all_mutate"
+
+# pop_total is deliberately defined HERE, before any state runs: M-H calls it,
+# and a first version of that state called it ~100 lines later, so bash printed
+# "pop_total: command not found" and the state scored nothing. A helper
+# referenced before it exists is the shell equivalent of a stale binary -- the
+# mutation appears to run and proves nothing.
+
 # run_state <id> <expect-substring-in-FAIL-line> <mutation-command...>
 run_state() {
   local id="$1" expect="$2"; shift 2
@@ -74,6 +106,43 @@ fi
 echo "  ok    baseline passes (so a FAIL below is caused by the mutation, not by the tree)"
 
 echo
+# ---- the assertion itself, defined as a FUNCTION and called EARLY ----------
+# ORDERING, third version. The assertion used to sit AFTER the mutation states
+# as inline code, which meant a pre-existing leak in build/ was DELETED by M-H's
+# `rm -rf` before the assertion read the population -- so planting a fixture
+# before invoking the script still exited 0. Caught by running the negative
+# direction BY HAND, twice: a self-consistent M-H keeps passing, because it only
+# ever inspects a population it has just made clean itself.
+#
+# As a function it is (a) callable at the top against the tree AS FOUND, before
+# anything mutates anything, and (b) callable by M-H against a deliberately
+# poisoned population. One predicate, proven in both directions, one home.
+leak_assert() { # $1 = label for the message
+  local dirs unknown
+  dirs="$(pop_dirs)"
+  unknown="$(printf '%s\n' "$dirs" | while read -r d; do
+              [ -n "$d" ] || continue
+              case " $known_dirs " in *" $d "*) ;; *) echo "$d" ;; esac
+            done)"
+  if [ -n "$unknown" ]; then
+    echo "  FAIL  [$1] stamp(s) in director(ies) no matrix owns:"
+    printf '%s\n' "$unknown" | sed 's/^/          /'
+    echo "        a checker is leaving fixture stamps in \$BUILD_DIR; run_all_checks"
+    echo "        step 3/3 would then compare the wrong set. Full list:"
+    pop_total | sed 's/^/          /'
+    return 1
+  fi
+  echo "  ok    [$1] $(printf '%s\n' "$dirs" | grep -c .) stamp dirs, all owned by a known matrix ($(pop_total | wc -l) stamps)"
+  return 0
+}
+
+echo
+echo "== stamp-population leak assertion (BEFORE any mutation) =="
+if ! leak_assert "as found"; then
+  echo "RESULT: l0_cite_mutate LEAK (pre-existing fixture stamp in \$BUILD_DIR)"
+  exit 1
+fi
+
 echo "== states =="
 
 # 3a: xe accepts small BAR -> the xe-vs-i915 asymmetry disappears
@@ -112,19 +181,91 @@ run_state "M-F" "6 no GuC firmware code in driver" \
 run_state "M-G" "3a xe rejects small BAR" \
   rm -f shared/source/os_interface/linux/xe/ioctl_helper_xe.h
 
+# M-H is NOT a claim mutation: it poisons the stamp population so the leak
+# assertion must go RED. Without it the assertion is a comment.
+#
+# ORDERING, and this is the bug the first version of M-H shipped with. It
+# planted the fixture, counted, then REMOVED it, and only THEN compared the
+# count against $expected_pop -- which is a constant of this script, not a
+# measurement of anything happening now. So with a real leak already present in
+# build/ the state printed "ok -- population grew to 7" and the run exited 0
+# anyway: the mutation was applied, observed, and then erased before the thing
+# that could go red ran. Caught by running the negative test by HAND (planting
+# the fixture before invoking the script), which is the only reason it was
+# found; a self-consistent M-H would have kept passing.
+#
+# Fixed: the fixture stays planted across the assertion, the assertion runs
+# while it is present, and its rc is required to be non-zero. M-H passes only
+# when the assertion FAILS.
+echo
+echo "M-H (leak proof): plant a fixture stamp under build/ and require the"
+echo "  leak assertion to REJECT it (the fixture is still present when it runs)"
+POISON="$ROOT/build/l0_cite_mutate_fixture/last_pass.stamp"
+mkdir -p "$(dirname "$POISON")"
+echo "fixture" > "$POISON"
+
+leak_dirs="$(pop_dirs)"
+poisoned=0
+if printf '%s\n' "$leak_dirs" | grep -qx 'l0_cite_mutate_fixture'; then poisoned=1; fi
+if [ "$poisoned" -eq 0 ]; then
+  echo "  M-H UNREACHABLE -- pop_total cannot see the planted fixture, so the"
+  echo "    assertion is vacuous against exactly the defect it exists to catch."
+  rm -rf "$ROOT/build/l0_cite_mutate_fixture"
+  echo "M-H  BROKEN  (pop_total blind to fixtures)" >> "$LOG/summary.txt"
+  echo "RESULT: l0_cite_mutate FAIL (M-H vacuous - pop_total blind to fixtures)"
+  exit 1
+fi
+
+# Call the SAME leak_assert() against the POISONED population, while the
+# fixture is still on disk. No second copy of the predicate: the first version
+# inlined a duplicate here, so the state proved the DUPLICATE could fail while
+# the shipped assertion stayed unproven -- the audit #3 "rule fixed at one site
+# and re-derived at another" shape, in shell.
+assert_rc=0
+leak_assert "poisoned by M-H" || assert_rc=1
+
+rm -rf "$ROOT/build/l0_cite_mutate_fixture"
+if [ "$assert_rc" -ne 0 ]; then
+  echo "  M-H ok -- the fixture dir WAS visible to pop_dirs and the SHIPPED"
+  echo "    assertion rejected it while it was on disk. It CAN go red."
+else
+  echo "  M-H MISSED -- the fixture was on disk yet the assertion accepted it"
+  echo "M-H  MISSED  (assertion accepted a leaked population)" >> "$LOG/summary.txt"
+  echo "RESULT: l0_cite_mutate FAIL (M-H missed - leak assertion cannot fail)"
+  exit 1
+fi
+
 rm -rf "$MUT"
 
-# STAMP-POPULATION LEAK CHECK. run_all_checks.sh enumerates the stamp set with
+# ---- STAMP-POPULATION LEAK ASSERTION (fail-closed, not a note) -------------
+# snap the population AT THIS POINT in the run, not by re-deriving it from a
+# constant. The first version compared the live count against the hardcoded
+# $expected_pop=6, so with a pre-existing leak the run still exited 0: it
+# printed "ok population is exactly 6" while seven stamps were on disk, because
+# M-H had already deleted the fixture it planted and the count it compared was
+# therefore its own doing rather than a property of the tree. Caught by running
+# the negative test by HAND.
+# run_all_checks.sh enumerates the stamp set with
 # `find $BUILD_DIR -name '*last_pass.stamp'`, so this matrix's own fixtures --
 # which necessarily live under build/ because they are mutated COPIES of the
 # pinned tree -- must not add anything to that population. AUDIT #17c's leak
-# class: an enumerator measuring its own test data. The copy is named
-# build/cr.mut precisely so a stray stamp inside it would be attributable.
-before_after="$(find "$ROOT/build" -name '*last_pass.stamp' 2>/dev/null | wc -l)"
-leak="$(find "$ROOT/build/cr.mut" -name '*last_pass.stamp' 2>/dev/null | head -3)"
-if [ -n "$leak" ]; then
-  echo "LEAK: the mutation workspace added stamp(s) to the population:"
-  printf '%s\n' "$leak" | sed 's/^/  /'
+# class: an enumerator measuring its own test data.
+#
+# This is an ASSERTION with its own exit code, not a printed note. The first
+# version only echoed a LEAK line and then exited 0 on the states, which means a
+# leaking run still read as PASS -- a comment with a shebang, the same defect
+# shape as AUDIT #7. It also FAILED CLOSED on the wrong trigger: it probed for
+# stamps inside build/cr.mut AFTER `rm -rf`, so it could never observe anything
+# even if a state leaked, i.e. a check that cannot fail. State M-H poisons the
+# population deliberately to prove this now goes red.
+# SECOND CALL, after all states have run and restored. The early call guards the
+# tree as FOUND; this one guards what the matrix itself left behind. The inline
+# duplicate that used to live here is GONE -- it was a second copy of the
+# predicate, so the early assertion and this one could disagree, and M-H would
+# have proven the copy rather than the shipped check (the audit #3 shape).
+if ! leak_assert "after states"; then
+  echo "RESULT: l0_cite_mutate LEAK (a state left a fixture stamp behind)"
+  exit 1
 fi
 
 echo
