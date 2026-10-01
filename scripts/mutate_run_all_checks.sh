@@ -408,7 +408,11 @@ A_RESIDUE='RESIDUE="$(LC_ALL=C comm -13 \
 A_ESCALATE="printf 'REGRESSED rc=%s (%s) -- was unproven, is now a real failure\\n' \"\$rc\" \"\$log\"
           UNPROVEN=\$((UNPROVEN - 1))
           FAILED=\$((FAILED + 1)) ;;"
-A_COVER='grep -qxF "$b" || UNDISPATCHED="$UNDISPATCHED $b"'
+# REPOINTED: the arm lookup now classifies grep's rc (1 = no match,
+# >=2 = the query failed) instead of collapsing both into "no dispatch
+# arm", so the old unclassified anchor no longer exists. The pre-flight
+# caught that, which is exactly what it is for.
+A_COVER='elif [ "$grc" -eq 1 ]; then'
 # N-K: the WHOLE detector block -- guard, assignment, report, increment and the
 # closing fi. Removing only the announcement leaves the increment dangling;
 # removing only the guard leaves a detector that never fires. Both are
