@@ -61,7 +61,23 @@ echo "-- the four classification directions --"
 # the on-disk stamp is still the previous run's and predates HEAD -- the case
 # then read rc=2 and failed for a reason that had nothing to do with the
 # classifier. A case must control its own fixture.
-restore; set_sha "$HEAD_SHA"; expect "clean summary + current stamp" 0 "$(run_rc)"
+# BOTH fixtures are WRITTEN, never inherited. The stamp is pinned to HEAD
+# (phase 1/2 runs before the matrix re-stamps, so the on-disk one predates HEAD)
+# and the summary is written as a known-good 7-AS-EXPECTED set. An earlier
+# version inherited both, and when build/fold_matrix/summary.txt happened to be
+# empty the "clean" case had nothing clean to read and reported a phantom
+# failure. A case must control its own fixture end to end.
+clean_summary() {
+  local n=0
+  : > "$STAMP_DIR/summary.txt"
+  for s in S0_clean S1_M1_default_only S2_M2_noval_only S3_M1_and_M2 \
+           S4_reader_index S5_m5_s6_s7 S6_index_s0; do
+    printf '%s AS EXPECTED\n' "$s" >> "$STAMP_DIR/summary.txt"; n=$((n+1))
+  done
+  echo "$n"
+}
+restore; set_sha "$HEAD_SHA"; clean_summary >/dev/null
+expect "clean summary + current stamp" 0 "$(run_rc)"
 restore; damaged; set_sha "$CLEAN_SHA"
 expect "damaged summary + STALE stamp (was rc=1)"     2 "$(run_rc)"
 restore; damaged; set_sha "$HEAD_SHA"
