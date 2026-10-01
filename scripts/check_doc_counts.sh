@@ -28,6 +28,10 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT" || exit 2
 REPORT="reports/2026-10-01-batch-e1-e2-e3-verdicts.md"
 
+# The shared enumeration guard (AUDIT #14's sites_found=0 class).
+. "$SCRIPT_DIR/_gate_enum.sh"
+enum_reset
+
 [ -f "$REPORT" ] || { echo "SKIP: $REPORT absent -- nothing to check"; exit 2; }
 echo "== DOC COUNT CHECK: $(basename "$REPORT") =="
 
@@ -55,6 +59,9 @@ fi
 # the number the report claims, taken from the sentence that states it
 claimed="$(grep -oE 'agree at \*\*[0-9]+\*\*' "$REPORT" | grep -oE '[0-9]+' | head -1)"
 idx_rows="$(grep -cE '^\| `[0-9a-f]{7,40}` \|' "$REPORT")"
+# Fail closed if the index harvest is empty: with no rows there is nothing to
+# reconcile, so every check below would be vacuous.
+enum_require_nonempty "commit-index rows" "$idx_rows" "index rows in $REPORT" || true
 if [ -n "$claimed" ]; then
   # THE PRIMARY CHECK: the stated count must equal the number of rows the
   # table actually lists. This is the defect class this session produced twice
@@ -85,7 +92,16 @@ if [ -n "$claimed" ]; then
     echo "         reported, never failed on."
   fi
 else
-  echo "   WARN no 'agree at **N**' sentence found to check (skip, not silently pass)"
+  # A MISSING COUNT SENTENCE IS NOT A WARNING. It is the vacuous-pass case
+  # AUDIT #14 records: a regex that matches nothing once reported "0 stale"
+  # while verifying nothing. Measured -- reworded the sentence so the pattern
+  # matched nothing and this checker still exited 0, because the "WARN ... skip"
+  # path skipped the one assertion it exists to make.
+  # So the count is REQUIRED, not optional.
+  echo "   FAIL no 'agree at **N**' sentence found -- the derived count this"
+  echo "        checker exists to verify is ABSENT, so a PASS would be vacuous"
+  echo "        (AUDIT #14's sites_found=0 class). Restore the sentence."
+  bad=$((bad+1))
 fi
 
 # ---- 2. the commit INDEX rows must match the actual log ---------------------

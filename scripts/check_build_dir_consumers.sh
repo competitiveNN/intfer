@@ -28,6 +28,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT" || exit 2
 
+# The shared enumeration guard (AUDIT #14's sites_found=0 class).
+. "$SCRIPT_DIR/_gate_enum.sh"
+enum_reset
+
 echo "== BUILD-DIR CONSUMER CHECK =="
 
 # ---- population, part 1: from the CMake target list ------------------------
@@ -40,20 +44,25 @@ TARGETS="$(grep -rhoE 'add_executable\([A-Za-z0-9_]+' --include=CMakeLists.txt .
            | awk -F'(' '{print $2}' | LC_ALL=C sort -u)"
 N_TARGETS="$(printf '%s\n' "$TARGETS" | grep -c .)"
 echo "-- population part 1: $N_TARGETS CMake add_executable target(s)"
-if [ "$N_TARGETS" -eq 0 ]; then
-  echo "  FAIL could not derive any target from the CMakeLists (enumeration is BROKEN,"
-  echo "       so a vacuous pass is possible) -- not reporting 'no consumers'."
+# Shared guard: an EMPTY harvest cannot certify "no consumers ignore the
+# override". This branch previously carried its own hand-rolled copy of that
+# rule; one home now, so the next enumerator cannot reintroduce the defect
+# (the awk-splits-on-'(' bug that made this exact check harvest 0 targets and
+# look healthy while verifying nothing).
+enum_require_min "cmake-targets" "$N_TARGETS" 1 || {
+  echo "RESULT: build-dir consumers ENUMERATION BROKEN (0 CMake targets)"
   exit 2
-fi
+}
 
 # ---- population, part 2: every script that references a build tree -----------
 CONSUMERS="$(grep -rlE '(INTFER_BUILD_DIR|\$ROOT/build|\$\{INTFER_BUILD_DIR|\$\{ROOT\}/build|build/)' \
              scripts/*.sh 2>/dev/null | LC_ALL=C sort)"
 N_CONSUMERS="$(printf '%s\n' "$CONSUMERS" | grep -c .)"
 echo "-- population part 2: $N_CONSUMERS script(s) reference a build tree"
-if [ "$N_CONSUMERS" -eq 0 ]; then
-  echo "  FAIL no consumers found -- a vacuous pass is possible"; exit 2
-fi
+enum_require_min "consumer-scripts" "$N_CONSUMERS" 1 || {
+  echo "RESULT: build-dir consumers ENUMERATION BROKEN (0 consumer scripts)"
+  exit 2
+}
 
 # ---- classify each consumer -------------------------------------------------
 bad=0; checked=0
