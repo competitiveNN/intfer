@@ -193,8 +193,7 @@ and is not a bug. If DPAS48+PREQ and DPAS48 print different token ids, stop —
 that is a real regression in the pre-pass.
 
 ### Gates already passed (my side, load-insensitive)
-*(Re-verified at audit #13 on the current 1-GPU box: **7 PASS, 2 PARTIAL,
-1 SKIPPED**, tallied by gate exit code. Anything below marked “era: 2-GPU box”
+*(Re-verified at audit #13 on the 1-GPU box: **7 PASS, 2 PARTIAL, 1 SKIPPED** [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED] — tallied by gate exit code. Anything below marked “era: 2-GPU box”
 records a run from when the box still had two devices — true then, and NOT a
 claim about the current tree.)*
 - `scripts/test_ga64_recip.sh` — 480,645 slices / 30.7M elements bit-identical; 192,000 tie slices verified to be 1-ulp-discriminating
@@ -500,7 +499,7 @@ skip only their `--tp 2` arms, and exit **2 = PARTIAL**; `test_tp2_27b.sh` has
 no 1-GPU arm at all and exits **2 = SKIPPED**. None exit 0 (which would claim
 coverage nobody got) and none exit 1 (indistinguishable from a real regression,
 and it trains everyone to ignore red gates). So a full run on this box reads
-**7 PASS, 2 PARTIAL, 1 SKIPPED**.
+**7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED]**.
 
 Two things audit #13 corrected, both worth knowing before you touch these
 scripts:
@@ -529,7 +528,7 @@ described as covered by them until they have actually run.
 | E5 `INTFER_DEVICE_ARGMAX=1` | every tok/s number — the lever is **default-off and has never been benchmarked**, only correctness-gated | needs a quiet window (load1 < 2). Does **NOT** need a second GPU: the flag declines TP>1 (`:1913`), so it is TP=1-only by construction. But the 27B target is unreachable either way — TP=1-on-one-B580 OOMs on the lm_head tile (AUDIT #11) — so E5 is honestly a 0.8B measurement, not a 27B one. See `2026-10-01-device-argmax.md` |
 
 If a future session cannot get a second GPU, the correct statement is
-"7 PASS, 2 PARTIAL, 1 SKIPPED, E1-E5 unmeasured" — **not** a full pass, and
+"7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED], E1-E5 unmeasured" — **not** a full pass, and
 never a tok/s figure from a 1-GPU or loaded window.
 
 ### Self-check for the fold matrix (run it after any refactor of that code)

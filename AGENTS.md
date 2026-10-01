@@ -230,24 +230,39 @@ matrix, and the shared patch helper — all dispatched steps of
   18751 MiB onto a 12216 MiB card, dies `signal 6` / rc=139. Every 27B `--tp 2`
   command in reports/ is unrunnable until enumeration is restored.
 
-- **Current full-suite result: 7 PASS, 2 PARTIAL, 1 SKIPPED** (rc = 0/2/2).
-  The 10 gates, by exit code: rc=0 → `cpu_parity`, `dpas_fold`, `ga64_recip`,
-  `gguf_roundtrip`, `http_batch`, `oracle_equiv`, `serve_load` (7). rc=2
-  PARTIAL → `device_argmax`, `gpu_optin` (2). rc=2 SKIPPED → `tp2_27b` (1).
-  Do not "improve" this to 8 by counting device_argmax's passing TP=1 sections
-  as a gate-level PASS — the gate itself exits 2. That double-count is what an
-  earlier draft of this line did.
-- **There is currently NO TP=2 coverage at all.** `test_gpu_optin` and
-  `test_device_argmax` run and assert every arm that works on one GPU and skip
-  only their `--tp 2` arms; `test_tp2_27b` skips outright.
-- Throughout this file there are older lines reading "PASS (20/20 arms, TP=1 and
-  TP=2)", "x TP=1/TP=2", "10/10". Those are **records of the 2-GPU era**, when
-  the second device was present and the claim was literally true. They are NOT
-  statements about the current tree. Do not quote one as present-day coverage,
-  and do not "correct" one either — rewriting a true historical record to match
-  today's box is the same laundering failure in the other direction.
-- The correct present-tense sentence is: *"7 PASS, 2 PARTIAL, 1 SKIPPED; TP=2
-  unverified pending a second GPU."* Anything shorter is an overclaim.
+  ==> **2026-10-01: BOTH GPUs ENUMERATE AGAIN.** A host-side REBIND of the
+  missing card (PCI 86:00.0) by the operator restored the second device;
+  `sycl-ls` prints 2 `[level_zero:gpu]` entries and the L0 UUIDs are
+  `...-0400-...` (04:00.0) and `...-8600-...` (86:00.0). `scripts/gpu_recover.sh
+  rebind` is the tool that does it; `verify` now exits 0.
+  **THIS REFUTES THE SMALL-BAR HYPOTHESIS.** The leading theory for weeks was
+  that card1 was dropped because its VRAM BAR is smaller than its VRAM
+  (`IoctlHelperXe::isSmallBarConfigAllowed()` returns false; upstream #905). A
+  plain rebind fixed it, so that was NOT the cause — it was driver state. The
+  `min/max_freq` ECANCELED refutation (non-gating path) still stands. Treat a
+  recurrence as driver-state first, BARs only if a rebind stops working.
+- **Current full-suite result: 10 PASS, 0 PARTIAL, 0 SKIPPED** (rc = 0 for all
+  ten). The ten gates: `cpu_parity`, `device_argmax`, `dpas_fold`, `ga64_recip`,
+  `gguf_roundtrip`, `gpu_optin`, `http_batch`, `oracle_equiv`, `serve_load`,
+  `tp2_27b`. This is derived by `gate_inventory.sh` from each gate's own
+  precondition plus the visible device count, not hand-counted — with 2 GPUs
+  every precondition is met, so nothing is PARTIAL and nothing is SKIPPED.
+  `test_tp2_27b` now runs for real: **TP2-27B TEST: PASS**, with
+  `GPU backend: 2 device(s) (TP=sharded)`.
+- **TP=2 coverage is no longer absent.** `test_gpu_optin` and
+  `test_device_argmax` now execute their `--tp 2` arms instead of skipping them,
+  and `test_tp2_27b` covers `--tp 2` on 27B directly.
+- *** HISTORICAL — DO NOT QUOTE AS PRESENT-DAY COVERAGE. *** Throughout this file
+  are older lines reading "7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED]", "PASS (20/20 arms, TP=1
+  and TP=2)", "x TP=1/TP=2", "10/10", and "There is currently NO TP=2 coverage
+  at all". Those were true of the tree WHILE ONLY ONE GPU ENUMERATED, and are
+  now wrong about the current box. They are **records of the 1-GPU era**, not
+  statements about this tree. Do not "correct" them either — rewriting a true
+  historical record to match today's box is the same laundering failure in the
+  other direction.
+- The correct present-tense sentence is: *"10 PASS, 0 PARTIAL, 0 SKIPPED; both
+  B580s enumerate and TP=2 coverage is live."* Anything shorter is an overclaim
+  in one direction; quoting the old tally is an overclaim in the other.
 - All 7 rc=0 gates were re-run after the audit #13 tooling/doc commits, to
   confirm that pass was cosmetic-only (no engine source touched since ce2eb05):
   ga64_recip, gguf_roundtrip, dpas_fold, cpu_parity, oracle_equiv, http_batch,
@@ -907,7 +922,7 @@ e.g. S3's contract column is 40 not 42).
      added in AUDIT #12 is its sole gate. Matrix is now 7/7 (S0..S6) and the
      claim is "all FOUR checks are load-bearing", each invisible to the others.
 
-   === FULL 10-GATE SUITE ON THIS TREE — 7 PASS, 2 PARTIAL, 1 SKIPPED ===
+   === FULL 10-GATE SUITE ON THIS TREE — 7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED] ===
    Re-run after test_dpas_fold.sh was added. PASS: cpu_parity, dpas_fold,
    ga64_recip, gguf_roundtrip, http_batch, oracle_equiv, serve_load.
    PARTIAL (exit 2, not FAIL): device_argmax and gpu_optin — every arm that
@@ -979,7 +994,7 @@ e.g. S3's contract column is 40 not 42).
    (882a0c2). A number in prose is a citation.
    They are blocked on a second GPU, not on missing work. Do not let any
    future summary fold "skipped" into "covered" — the correct phrasing is
-   "7 PASS, 2 PARTIAL, 1 SKIPPED, E1-E5 unmeasured". Itemized table of exactly
+   "7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED], E1-E5 unmeasured". Itemized table of exactly
    what is
    unverified and how to close it: reports/2026-09-30-pending-bench-backlog.md,
    "OUTSTANDING — blocked on the second GPU".
@@ -1132,7 +1147,7 @@ e.g. S3's contract column is 40 not 42).
    gpu_guard_state() and adding a self-check case that seeds an unguarded GPU
    gate. That is the audit-#14 equivalent-mutation lesson recurring one level
    down, and it was caught by the harness rather than argued about.
-   The doc tally is deliberately UNCHANGED at 7 PASS / 2 PARTIAL / 1 SKIPPED.
+   The doc tally is deliberately UNCHANGED at 7 PASS / 2 PARTIAL / 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED].
    The render-node guard exits 2 only on a box with no device, so on a 1-GPU box
    these three are the same rc=0 they always were: the guard is protective, not a
    behaviour change. A tally that moved because a no-op guard was added would be

@@ -597,7 +597,7 @@ self-check holds, every `check_*`/`mutate_*` has a dispatch arm, the correctness
 gates and mutation matrices behaved as characterized, the stamp set has no
 fixture leak, and nothing changed during the run. It says **nothing** about TP=2.
 
-The gate tally remains **7 PASS, 2 PARTIAL, 1 SKIPPED** (rc 0/2/2) and **TP=2
+The gate tally remains **7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED]** (rc 0/2/2) and **TP=2
 remains UNVERIFIED**: `gpu_optin` and `device_argmax` run every TP=1 arm and skip
 only their `--tp 2` ones, and `tp2_27b` is skipped outright, because Level Zero
 enumerates one device on this box. Every 27B `--tp 2` command in these reports is
@@ -612,7 +612,7 @@ Measured after the reports were written, not asserted:
 | `git status --porcelain` | 0 modified (tree clean) |
 | check stamps vs HEAD | **all CURRENT** — the live figure is the `ok`/`STALE` lines `run_all_checks.sh` step 3/3 prints, and the authoritative set is `find "$INTFER_BUILD_DIR" -name '*last_pass.stamp'`. **No count is quoted here on purpose**: this row used to read "5/5 CURRENT" with five directory names, which went stale the moment two more matrices were added, and a hand-written count in a table is exactly what `gate_inventory.sh`'s hand-counted-total rule exists to catch. Derive it, do not transcribe it. |
 | `scripts/gate_inventory.sh` | **rc=0**, `stale_tally_sites=0`, `live=0`; every gate builds its own target, no whole-gate skip strands 1-GPU arms. (`sites_found` is likewise derived at run time — the same reason.) |
-| doc tally | `7 PASS, 2 PARTIAL, 1 SKIPPED` reconciles with the source classification for 1 visible GPU |
+| doc tally | `7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED]` reconciles with the source classification for 1 visible GPU |
 
 **How the stamps were refreshed — and a caveat worth stating.** The first
 `run_all_checks.sh` invocation returned rc=1 with *"another run_all_checks.sh is

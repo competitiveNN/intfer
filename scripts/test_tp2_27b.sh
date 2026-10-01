@@ -51,6 +51,17 @@ gate_require_build intfer_cli || exit 1
 # a VRAM/box outcome, not a code failure, and reporting it as FAIL is what made
 # AGENTS.md carry a standing red item that was never a regression. Exit 2 = SKIP.
 . "$SCRIPT_DIR/_gate_precond.sh"
+# *** BOTH preconditions, and the count-only form was WRONG once the second GPU
+# came back. *** gate_require_gpus only COUNTS devices; it never opens the render
+# node. AUDIT #16 noted that for a ">= 2 GPUs" requirement both failure modes
+# collapse to `count < need`, so a node probe looked redundant -- but that only
+# holds on a 1-GPU box, where the count was already 0. With BOTH GPUs
+# enumerable, sycl-ls still reports 2 even when /dev/dri/renderD128 is
+# unreachable, so gate_require_gpus 2 PASSES and the gate proceeds and exits 0
+# with no device. Caught by check_device_precond.sh's node-unreachable direction,
+# which expects SKIP (2). The device precondition is now checked as the DEVICE
+# it is: node first, then the count.
+gate_require_device || exit 2
 gate_require_gpus 2 || exit 2
 
 LOG="$(mktemp --tmpdir="$TMPDIR" tp2_27b.XXXX.log)"
