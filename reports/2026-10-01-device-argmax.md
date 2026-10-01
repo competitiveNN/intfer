@@ -17,7 +17,7 @@ Target model is **27B**; the counters below are 0.8B, the only thing loadable on
 | | |
 |---|---|
 | Flag | `INTFER_DEVICE_ARGMAX=1` |
-| Kill switch | unset the variable (there is no `=0` form; presence enables) |
+| Kill switch | **`env -u INTFER_DEVICE_ARGMAX`** — there is no `=0` form; the read is presence-only (`:1900`), so `INTFER_DEVICE_ARGMAX=0` still ENABLES it. Measured: `=0` emits 1 `[argmax]` line, `env -u` emits 0 |
 | Default | **OFF** |
 | Declined by | `INTFER_TRACE_LMHEAD`, TP>1 (`:1913`), prefill rows in a mixed batch, any non-greedy row in the M-row path |
 | Bisection only | `INTFER_ARGMAX_PREFILL=1` restores prefill firing; `INTFER_ARGMAX_DBG=1` prints the `[argmax]` counter; `INTFER_ARGMAX_PARTS=1` dumps per-(device,tile) partials |
@@ -48,15 +48,40 @@ consumers at `:5165` (`step`, `greedy_only`), `:6188` (`score_row`, `all_greedy`
 
 ```bash
 # decode, TP=1, greedy (the only path that fires)
-INTFER_DEVICE_ARGMAX=0 ./build/examples/intfer_cli/intfer_cli --gpu --tp 1 \
+
+# OFF arm — the variable must be UNSET. `INTFER_DEVICE_ARGMAX=0` does NOT work:
+# the flag is read as presence-only (`std::getenv(...) != nullptr`, :1900 and
+# :2101), so `=0` still ENABLES the lever. Measured, not assumed: with
+# INTFER_ARGMAX_DBG=1, `INTFER_DEVICE_ARGMAX=0` emits 1 `[argmax]` line and
+# `env -u INTFER_DEVICE_ARGMAX` emits 0. A report that benchmarked `=0` would
+# have measured flag-vs-flag and read as a wash.
+env -u INTFER_DEVICE_ARGMAX ./build/examples/intfer_cli/intfer_cli --gpu --tp 1 \
   -m test/models/Qwen3.5-0.8B.intifer \
   --tokenizer-py scripts/bpe_tokenize.py --detok-py scripts/bpe_detokenize.py \
   -p "The capital of France is" -n 64
+
+# ON arm
 INTFER_DEVICE_ARGMAX=1 ./build/examples/intfer_cli/intfer_cli --gpu --tp 1 \
   -m test/models/Qwen3.5-0.8B.intifer \
   --tokenizer-py scripts/bpe_tokenize.py --detok-py scripts/bpe_detokenize.py \
   -p "The capital of France is" -n 64
 ```
+
+**Verify the OFF arm actually is OFF before trusting any A/B.** Cheap
+non-vacuity check, run it once:
+
+```bash
+env -u INTFER_DEVICE_ARGMAX INTFER_ARGMAX_DBG=1 ./build/examples/intfer_cli/intfer_cli \
+  --gpu --tp 1 -m test/models/Qwen3.5-0.8B.intifer \
+  --tokenizer-py scripts/bpe_tokenize.py --detok-py scripts/bpe_detokenize.py \
+  -p "The capital of France is" -n 4 2>&1 | grep -c argmax    # expect 0
+```
+
+Note the two conventions coexist in this codebase and only one is right per
+flag: `INTFER_DEVICE_ARGMAX` / `INTFER_ARGMAX_DBG` / `INTFER_ARGMAX_PARTS` /
+`INTFER_ARGMAX_PREFILL` are presence-only, whereas `INTFER_LMHEAD_DPAS` tests
+`[0]=='0'` (`:1903`). Do not generalize from one to the other — check the
+`getenv` at the site you are toggling.
 
 Interleave the two arms across ≥3 rounds; do not run them as blocks. For 27B use
 `scripts/serve_27b.sh` (`--tp 2`), but note **TP>1 declines the flag outright** (`:1913`)
@@ -67,6 +92,8 @@ The 27B number that matters is TP=1-on-one-B580, which OOMs on the lm_head tile
 ### 4. Load-insensitive counters I measured (box loadavg 12.95 — NOT a timing run)
 
 0.8B, TP=1, `-n 8`, `[GPU profile @decode]`:
+
+OFF arm = `env -u INTFER_DEVICE_ARGMAX` (see §3 — `=0` would NOT be OFF).
 
 | bucket | flag OFF | flag ON | delta |
 |---|---|---|---|
