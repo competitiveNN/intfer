@@ -57,8 +57,24 @@ claimed="$(grep -oE 'agree at \*\*[0-9]+\*\*' "$REPORT" | grep -oE '[0-9]+' | he
 if [ -n "$claimed" ]; then
   if [ "$claimed" = "$real_n" ]; then
     echo "   ok    report's claimed count ($claimed) == git ($real_n)"
+  elif [ "$claimed" -lt "$real_n" ] 2>/dev/null; then
+    # The index in $REPORT lists commits, so EVERY commit made after it was last
+    # refreshed invalidates the number it states -- including the commit that
+    # refreshed the checker itself. That is not a code regression and it must
+    # not be reported as one, or the remedy printed ("fix the number") sends
+    # the next person to edit a document that is about to be stale again.
+    # Exit 2 => UNPROVEN in run_all_checks.sh: "evidence is about an older
+    # tree", remedy "re-derive the count". This is the rc=1-vs-rc=2 doctrine
+    # (AUDIT #18) applied to documentation evidence.
+    echo "   UNPROVEN report claims $claimed, git now says $real_n -- the index"
+    echo "            was last refreshed $((real_n - claimed)) commit(s) ago."
+    echo "            This is STALE EVIDENCE, not a regression. Re-derive with:"
+    echo "              git log --oneline f047c42^..HEAD"
+    echo "RESULT: doc counts STALE (claimed $claimed, git $real_n)"
+    exit 2
   else
-    echo "   FAIL report claims $claimed commits, git says $real_n"; bad=$((bad+1))
+    echo "   FAIL report claims $claimed commits, git says $real_n -- the number is"
+    echo "        HIGHER than history, i.e. it was never derived"; bad=$((bad+1))
   fi
 else
   echo "   WARN no 'agree at **N**' sentence found to check (skip, not silently pass)"

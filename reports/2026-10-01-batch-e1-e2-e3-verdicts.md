@@ -652,7 +652,7 @@ cannot detect a gate that is green-numbered but red."*
 ## Commit index for this GPU investigation
 
 Derived, not hand-counted. `git rev-list --count f047c42^..HEAD` and
-`git log --oneline f047c42^..HEAD | wc -l` agree at **11**; a hand-written
+`git log --oneline f047c42^..HEAD | wc -l` agree at **12**; a hand-written
 "four commits" in an earlier summary of this same work was wrong twice over
 (it miscounted AND listed only two), which is why the number lives here with
 the command that produces it rather than in prose.
@@ -670,4 +670,4 @@ the command that produces it rather than in prose.
 | `e4d6a74` | indexed these commits with the command that derives the count |
 | `10b17a3` | `bench_reports_batch.sh`'s LOG path honored the override — found by the new consumer checker, not by reading |
 | `6b1bf32` | closed AUDIT #8 from the CMake source of truth; added `check_doc_counts.sh` and a behavioural self-check to `check_e2_ctx.sh`; wired all three into the suite |
-| _(see git)_ | hardened the leak assertion's `known_dirs` to be DERIVED from each matrix's own path assignment rather than hand-listed — adding a matrix had made it report a LEAK on a healthy tree |
+| `2442361` | derived the leak assertion's `known_dirs` from each matrix's own path assignment instead of hand-listing it; `check_doc_counts.sh` gained a STALE-vs-wrong distinction |
