@@ -79,9 +79,27 @@
 #        run_all_checks refuses to START dirty, but that does not prove a step
 #        left the tree as it found it. Each matrix only verifies the files it
 #        declared as targets, so a step that dirtied something else leaves no
-#        trace in its own report. With the assertion gone, untracked residue in
-#        scripts/ (which is what a mutated _rac_mutant.sh would be) goes unnoticed
-#        and the run passes.
+#        trace in its own report. With the assertion gone, untracked residue
+#        anywhere in the work tree goes unnoticed and the run passes.
+#   N-H  make the 2b re-run's rc=1 arm a no-op (the pre-fix shape)
+#        The re-run is where stale evidence is resolved, so it is also where a
+#        REAL failure can appear. Patched back to the first version -- branch on
+#        success/failure only, leave FAILED at 0 either way -- a step answering
+#        rc=2 then rc=1 prints "still rc=1" and the run exits 2 with "NOT a
+#        regression: Nothing is wrong with the code", i.e. a checker failure is
+#        reported as healthy. Measured before the fix.
+#   N-I  narrow the residue diff back to scripts/
+#        The bug the diff replaced: the assertion ran `git status -- scripts/`
+#        and called it the whole tree, because scripts/ is where an earlier
+#        version of this matrix kept its mutant. A step that litters the
+#        repository ROOT then leaves the run printing "no untracked residue in
+#        scripts/" and exiting 0 = PASS. Measured before the fix.
+#   N-J  neuter the dispatch-coverage enumeration
+#        dispatch() and STEPS are hand-written, so a new check_*/mutate_* nobody
+#        remembers to add is not a step that fails, it is a step that NEVER
+#        RUNS -- and this entry point would still print PASS. The state drops an
+#        undispatched mutate_dummy.sh into the sandbox's scripts/ and proves the
+#        coverage check is what notices.
 #
 # GOTCHA, learned the first time this was run: THIS SCRIPT MUST BE COMMITTED
 # BEFORE IT CAN RUN. It drives run_all_checks.sh, which fails closed on ANY dirty
@@ -129,6 +147,10 @@ STAMP="$WORK/last_pass.stamp"
 LOCK="$WORK/.lock"
 PROBE="$SB/scripts/_rac_dirty_probe.md"
 RESIDUE_PROBE="$SB/scripts/_rac_residue_probe.md"
+# A SECOND litter site, at the sandbox repo ROOT. The scripts/-only check that
+# N-I restores cannot see this one; the whole-work-tree diff can.
+ROOT_PROBE="$SB/_rac_root_litter.md"
+DUMMY="$SB/scripts/mutate_dummy.sh"
 mkdir -p "$SB/scripts"
 rm -rf "$WORK"; mkdir -p "$WORK" || exit 1
 cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"
@@ -145,7 +167,7 @@ fi
 # Always clean up the mutant, even on an abort: it lives in scripts/, and leaving
 # a mutated copy there would poison every later check that globs that directory.
 cleanup() {
-  rm -f "$PROBE" "$RESIDUE_PROBE"
+  rm -f "$PROBE" "$RESIDUE_PROBE" "$ROOT_PROBE" "$DUMMY"
   rmdir "$LOCK" 2>/dev/null || true
   rm -rf "$SYNTH"
 }
@@ -165,6 +187,11 @@ STEPS="$SYNTH/steps"; mkdir -p "$STEPS"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$STEPS/step_ok"
 printf '#!/usr/bin/env bash\nC="%s/step_flaky2.count"\nn=$(cat "$C" 2>/dev/null || echo 0)\necho $((n+1)) >"$C"\n[ "$n" -eq 0 ] && exit 2\nexit 0\n' "$SYNTH" >"$STEPS/step_flaky2"
 printf '#!/usr/bin/env bash\n: >"%s/step_sentinel.ran"\nexit 0\n' "$SYNTH" >"$STEPS/step_sentinel"
+# N-H: unproven on the FIRST pass, a REAL failure on the re-run. The only
+# shape that distinguishes "missing evidence" from "a regression appeared while
+# we were re-measuring", and therefore the only shape that exercises the
+# re-run's rc=1 arm.
+printf '#!/usr/bin/env bash\nC="%s/step_escalate.count"\nn=$(cat "$C" 2>/dev/null || echo 0)\necho $((n+1)) >"$C"\n[ "$n" -eq 0 ] && exit 2\nexit 1\n' "$SYNTH" >"$STEPS/step_escalate"
 chmod +x "$STEPS"/*
 
 mk_stamps() { # $1 = dir, $2 = "stale" to make c/ stale
@@ -195,21 +222,25 @@ commit_mutant() { # $1 = message
 }
 reset_mutant() { cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"; commit_mutant mutant; }
 run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
-  local id="$1" steps="$2" sdir="$3" residue="${4:-}"
+            # $5 = "root" to litter the sandbox repo ROOT instead of scripts/
+  local id="$1" steps="$2" sdir="$3" residue="${4:-}" where="${5:-}"
+  local litter="$RESIDUE_PROBE"
+  [ "$where" = "root" ] && litter="$ROOT_PROBE"
   mk_stamps "$sdir"
-  rm -f "$SYNTH/step_sentinel.ran" "$SYNTH/step_flaky2.count" "$RESIDUE_PROBE"
+  rm -f "$SYNTH/step_sentinel.ran" "$SYNTH/step_flaky2.count" \
+        "$SYNTH/step_escalate.count" "$RESIDUE_PROBE" "$ROOT_PROBE"
   # Deliberately NOT staged. The end-of-run assertion flags UNTRACKED residue,
   # and `git add -N` makes the file intent-to-add, which counts as staged dirt --
   # so the START guard rejected it first and the residue assertion was never
   # reached. Untracked means untracked.
-  [ -n "$residue" ] && printf 'residue\n' >"$RESIDUE_PROBE"
+  [ -n "$residue" ] && printf 'residue\n' >"$litter"
   # INTFER_BUILD_DIR is redirected so the mutant's lock is not the outer run's.
   INTFER_BUILD_DIR="$SYNTH/inner" \
   INTFER_RUN_ALL_STEPS="$steps" INTFER_RUN_ALL_EXTRA_STEPS_DIR="$STEPS" \
     INTFER_RUN_ALL_STAMP_DIR="$sdir" \
     timeout 600 bash "$MUTANT" >"$WORK/$id.log" 2>&1
   local rc=$?
-  rm -f "$RESIDUE_PROBE"
+  rm -f "$RESIDUE_PROBE" "$ROOT_PROBE"
   return $rc
 }
 
@@ -217,6 +248,7 @@ run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
 # $1 id, $2 steps, $3 stampdir, $4 want rc, $5 marker that MUST be present
 baseline() {
   local id="$1" steps="$2" sdir="$3" want="$4" marker="$5" residue="${6:-}" rc
+  NBASE=$((NBASE + 1))
   reset_mutant
   run_rac "$id" "$steps" "$sdir" "$residue"; rc=$?
   if [ "$rc" != "$want" ]; then
@@ -246,10 +278,24 @@ def_n_d() { [ -f "$SYNTH/step_sentinel.ran" ]; }                  # a step ran o
 def_n_e() { grep -q '1/2 checkers' "$WORK/N-E.log"; }
 def_n_f() { grep -q 'step(s) unproven' "$WORK/N-F.log" && ! grep -q '(re-run)' "$WORK/N-F.log"; }
 # Anchored on the FAIL line specifically. A bare grep for 'untracked residue'
-# also matches the SUCCESS branch ("ok  no untracked residue in scripts"), so the
+# also matches the SUCCESS branch ("ok  no new untracked files ..."), so the
 # predicate was never true -- the first version of this state could not be caught.
 def_n_g() { ! grep -qE 'FAIL +untracked residue' "$WORK/N-G.log"; }
+# N-H: the escalating step must be announced as a REGRESSION. Absence of the
+# line is the defect; the baseline below requires the line PRESENT, so the
+# predicate cannot be satisfied by a run that never got that far.
+def_n_h() { ! grep -q 'REGRESSED' "$WORK/N-H.log"; }
+# N-I: same shape as N-G, but the litter is at the sandbox repo ROOT, which the
+# pre-fix scripts/-only scope cannot see.
+def_n_i() { ! grep -qE 'FAIL +untracked residue' "$WORK/N-I.log"; }
+def_n_j() { ! grep -q 'no dispatch() arm for' "$WORK/N-J.log"; }
 
+# N-H/N-I/N-J need their litter/counter state cleared before each run, which
+# run_rac does; N-H also needs its own counter file reset because a leftover
+# count would make the first pass answer rc=1 (a plain failure) and never reach
+# the re-run. run_rac removes it, which is asserted by the N-H baseline marker.
+
+NBASE=0
 echo "== BASELINES (unmutated run_all_checks must be CORRECT in each setup) =="
 baseline "N-A" "step_ok"     "$ALL_CURRENT" 0 ""
 baseline "N-B" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"   # 2b re-run visible
@@ -259,7 +305,19 @@ baseline "N-D" "step_sentinel" "$ALL_CURRENT" 1 "uncommitted changes"
 git -C "$SB" reset -q -- "$PROBE"; rm -f "$PROBE"
 baseline "N-E" "step_ok"     "$ALL_CURRENT" 0 ""                              # self-check passes
 baseline "N-F" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"       # re-run works
-baseline "N-G" "step_ok"     "$ALL_CURRENT" 1 "untracked residue left in scripts" yes
+baseline "N-G" "step_ok"     "$ALL_CURRENT" 1 "untracked residue left behind" yes
+baseline "N-H" "step_escalate" "$ALL_CURRENT" 1 "REGRESSED rc=1"
+# The litter goes to the sandbox ROOT, and the baseline must prove the check
+# still sees it there -- otherwise N-I's predicate would be satisfied by a run
+# that never littered anything.
+baseline "N-I" "step_ok"     "$ALL_CURRENT" 1 "untracked residue left behind" yes root
+# N-J: an undispatched matrix dropped into scripts/. COMMITTED, so the run's own
+# residue diff cannot be what fails -- only the coverage check can.
+printf '#!/usr/bin/env bash\nexit 0\n' >"$DUMMY"; chmod +x "$DUMMY"
+git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$DUMMY" >/dev/null 2>&1
+git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m dummy -- "$DUMMY" >/dev/null 2>&1
+baseline "N-J" "step_ok"     "$ALL_CURRENT" 1 "no dispatch() arm for: mutate_dummy.sh"
+rm -f "$DUMMY"
 
 # --- anchor pre-flight (checked against the PRISTINE target) ---------------
 check_anchor() { # $1 = literal, $2 = description
@@ -279,15 +337,19 @@ A_FIND="find \"\$STAMP_DIR\" -name '*last_pass.stamp' -type f 2>/dev/null | sort
 A_GUARD='if ! git diff --quiet || ! git diff --cached --quiet; then'
 A_SELFCHK='return $bad'
 A_DERIVE='UNPROVEN_LABELS="$UNPROVEN_LABELS $label"'
-A_RESIDUE="RESIDUE=\"\$(git status --porcelain --untracked-files=all -- scripts/ | grep -v '^ M' || true)\""
+A_RESIDUE='RESIDUE="$(LC_ALL=C comm -13 \'
+A_ESCALATE="printf 'REGRESSED rc=%s (%s) -- was unproven, is now a real failure\\n' \"\$rc\" \"\$log\""
+A_COVER='grep -qxF "$b" || UNDISPATCHED="$UNDISPATCHED $b"'
 check_anchor "$A_CLASSIFY" "N-A: the rc=2 UNPROVEN classification"
 check_anchor "$A_RERUN"   "N-B: the 2b re-run guard"
 check_anchor "$A_FIND"    "N-C: the find-based stamp enumeration"
 check_anchor "$A_GUARD"   "N-D: the dirty-tree guard"
 check_anchor "$A_SELFCHK" "N-E: the self-check verdict"
 check_anchor "$A_DERIVE"  "N-F: the re-run set derivation"
-check_anchor "$A_RESIDUE" "N-G: the tree-hygiene residue probe"
-echo "anchor pre-flight: ok (7/7 targets located exactly once)"
+check_anchor "$A_RESIDUE" "N-G: the tree-hygiene residue diff"
+check_anchor "$A_ESCALATE" "N-H: the 2b re-run's REGRESSED announcement"
+check_anchor "$A_COVER"   "N-J: the dispatch-coverage enumeration"
+echo "anchor pre-flight: ok (9/9 targets located exactly once)"
 
 # Exact literal replacement -- no delimiter that can occur inside the pattern
 # (audit #17b: a sed delimiter inside an ERE alternation killed a state, and a
@@ -323,12 +385,13 @@ verify_patched() { # $1 = state id -- the MUTANT copy must differ from the targe
 
 CAUGHT=0; TOTAL=0
 run_state() { # $1 id, $2 desc, $3 predicate, $4 steps, $5 stampdir, $6 dirty?
-              # $7 residue?  $8/$9 optional SECOND (old,new) patch pair, for N-E
+              # $7 residue?, $8 litter site ("root"), $9/$10 optional SECOND
+              # (old,new) patch pair, for N-E
   local id="$1" desc="$2" pred="$3" steps="$4" sdir="$5" dirty="${6:-}"
-  local residue="${7:-}" old2="${8:-}" new2="${9:-}"
+  local residue="${7:-}" where="${8:-}" old2="${9:-}" new2="${10:-}"
   TOTAL=$((TOTAL + 1))
   [ "$dirty" = "dirty" ] && { printf 'probe\n' >"$PROBE"; git -C "$SB" add -- "$PROBE"; }
-  run_rac "$id" "$steps" "$sdir" "$residue"
+  run_rac "$id" "$steps" "$sdir" "$residue" "$where"
   [ "$dirty" = "dirty" ] && { git -C "$SB" reset -q -- "$PROBE"; rm -f "$PROBE"; }
   if $pred; then
     CAUGHT=$((CAUGHT + 1))
@@ -390,6 +453,29 @@ patch_literal "$MUTANT" "$A_RESIDUE" 'RESIDUE=""'
 verify_patched N-G
 run_state "N-G" "end-of-run tree-hygiene assertion deleted" def_n_g "step_ok" "$ALL_CURRENT" "" "yes"
 
+# N-H: the exact pre-fix 2b fail arm -- success/failure only, FAILED left at 0.
+reset_mutant
+patch_literal "$MUTANT" "$A_ESCALATE" "printf 'still rc=%s (%s)\\n' \"\$rc\" \"\$log\" ;;"
+verify_patched N-H
+run_state "N-H" "2b re-run's rc=1 arm is a no-op (pre-fix shape)" def_n_h "step_escalate" "$ALL_CURRENT"
+
+# N-I: the exact pre-fix residue scope -- one hand-picked directory.
+reset_mutant
+patch_literal "$MUTANT" "$A_RESIDUE" \
+  "RESIDUE=\"\$(git status --porcelain --untracked-files=all -- scripts/ | grep -v '^ M' || true)\""
+verify_patched N-I
+run_state "N-I" "residue diff narrowed back to scripts/" def_n_i "step_ok" "$ALL_CURRENT" "" "yes" "root"
+
+# N-J: the coverage enumeration neutered; the undispatched dummy must be missed.
+reset_mutant
+patch_literal "$MUTANT" "$A_COVER" 'grep -qxF "$b" >/dev/null'
+verify_patched N-J
+printf '#!/usr/bin/env bash\nexit 0\n' >"$DUMMY"; chmod +x "$DUMMY"
+git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$DUMMY" >/dev/null 2>&1
+git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m dummy -- "$DUMMY" >/dev/null 2>&1
+run_state "N-J" "dispatch-coverage enumeration neutered" def_n_j "step_ok" "$ALL_CURRENT"
+rm -f "$DUMMY"
+
 rm -f "$MUTANT"
 # The synthetic population must never have leaked into the real one, or the real
 # enumeration counts fixture stamps as matrix evidence.
@@ -404,14 +490,15 @@ if [ "$CAUGHT" -eq "$TOTAL" ]; then
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "states=N-A,N-B,N-C,N-D,N-E,N-F,N-G"
+    echo "states=N-A,N-B,N-C,N-D,N-E,N-F,N-G,N-H,N-I,N-J"
     echo "caught=$CAUGHT/$TOTAL"
-    echo "baselines=7/7 rc+marker correct before mutation"
+    echo "baselines=$NBASE/$NBASE rc+marker correct before mutation"
   } >"$STAMP"
-  echo "RUN-ALL MUTATION: PASS ($CAUGHT/$TOTAL caught, 7/7 baselines correct)"
-  echo "  run_all_checks.sh can fail: its rc=2 verdict, its 2b re-run (guard AND"
-  echo "  derivation), its stamp enumeration, its dirty-tree guard, its classifier"
-  echo "  self-check, and its end-of-run tree-hygiene assertion."
+  echo "RUN-ALL MUTATION: PASS ($CAUGHT/$TOTAL caught, $NBASE baselines correct)"
+  echo "  run_all_checks.sh can fail: its rc=2 verdict, its 2b re-run (guard,"
+  echo "  derivation AND rc=1 escalation), its stamp enumeration, its dirty-tree"
+  echo "  guard, its classifier self-check, its end-of-run tree-hygiene diff over"
+  echo "  the WHOLE work tree, and its derived dispatch-coverage enumeration."
   echo "  The real repository is never modified: the mutant lives in a throwaway"
   echo "  git repo and each patched state is committed there, so the target's own"
   echo "  dirty-tree guard stays armed against N-D's deliberate dirtiness."
