@@ -40,6 +40,9 @@ load_helper() { ( set +u; . "$SYN/_gate_pop.sh"; ) >/dev/null 2>&1; }
 
 bad=0
 echo "== GATE POP SELF-CHECK (_gate_pop.sh) =="
+# Counted so the coverage assertion below can confirm every case was
+# REACHED, rather than trusting that the script ran to the end.
+n_cases=0   # incremented once per case that REACHED its ok branch
 
 # ---- (a) every REAL prefix form a matrix actually uses must be recognised ---
 echo "-- (a) prefix forms: every form a real matrix writes is OWNED --"
@@ -74,6 +77,7 @@ if [ -n "$miss" ]; then
   bad=$((bad+1))
 else
   echo "  ok    all four prefix forms recognised: $got"
+  n_cases=$((n_cases+1))
 fi
 
 # ---- (b) the converse: a clean synthetic tree must be QUIET ----------------
@@ -81,6 +85,7 @@ echo "-- (b) converse: a clean tree is NOT reported as leaking --"
 out="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; pop_assert_no_leak clean")"; rc=$?
 if [ "$rc" -eq 0 ]; then
   echo "  ok    ok -- the assertion stays SILENT on a clean tree"
+  n_cases=$((n_cases+1))
 else
   echo "  FAIL  rc=$rc; a clean tree was reported as a leak"; printf '%s\n' "$out" | sed 's/^/        /'
   bad=$((bad+1))
@@ -93,6 +98,7 @@ out="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; pop_assert_no_leak
 rm -rf "$BD/fixture_leak"
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'fixture_leak'; then
   echo "  ok    rejected, and it named fixture_leak"
+  n_cases=$((n_cases+1))
 else
   echo "  FAIL  rc=$rc (want non-zero); the foreign dir was not named"; printf '%s\n' "$out" | sed 's/^/        /'
   bad=$((bad+1))
@@ -106,6 +112,7 @@ r1="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; pop_dirs | wc -l")"
 r2="$(BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; pop_dirs | wc -l")"
 if [ "$r1" = "$r2" ] && [ "$r1" -gt 0 ]; then
   echo "  ok    both shapes enumerate the same $r1 dir(s)"
+  n_cases=$((n_cases+1))
 else
   echo "  FAIL  exported=$r1 local=$r2 -- the helper still requires one shape"
   bad=$((bad+1))
@@ -116,8 +123,20 @@ echo "-- (e) with neither variable set it must fail closed --"
 out="$(env -u INTFER_BUILD_DIR -u BUILD_DIR bash -c ". '$SYN/_gate_pop.sh'; pop_dirs" 2>&1)"; rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "  ok    refused (rc=$rc) instead of reporting an empty population as ok"
+  n_cases=$((n_cases+1))
 else
   echo "  FAIL  returned rc=0 with no build dir -- a vacuous enumeration"; printf '%s\n' "$out" | head -3 | sed 's/^/        /'
+  bad=$((bad+1))
+fi
+
+# A DROPPED CASE MUST FAIL. Each case bumps `bad` only when its assertion
+# FAILS; merely deleting a case removes an ok line and leaves bad=0, so the
+# checker still exited 0 with a measurement silently gone. Caught by
+# mutate_gate_pop.sh -- all five states scored MISSED until this existed.
+n_ok="$n_cases"
+if [ "$n_ok" -lt 5 ]; then
+  echo "  FAIL  [coverage] only $n_ok of 5 cases reached -- a case was"
+  echo "        deleted rather than failed. A removed measurement is not a pass."
   bad=$((bad+1))
 fi
 
