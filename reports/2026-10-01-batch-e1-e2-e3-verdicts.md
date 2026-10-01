@@ -314,10 +314,42 @@ pending a quiet-box wall-time read. E3 counters: `nk` 13440 / 17856 / 21888 /
 27840 across BASE/DPAS48/FOLD/FOLDPREQ, consistent with FOLD's one extra launch
 per DPAS GEMM.
 
+## Verification state of this batch
+
+Measured after the reports were written, not asserted:
+
+| check | result |
+|---|---|
+| `git status --porcelain` | 0 modified (tree clean) |
+| check stamps vs HEAD | **5/5 CURRENT** (`device_precond_matrix`, `device_precond_matrix/mutate`, `fold_matrix`, `gate_inventory_matrix`, `run_all_mutate`) |
+| `scripts/gate_inventory.sh` | **rc=0**, `sites_found=9`, `stale_tally_sites=0`; every gate builds its own target, no whole-gate skip strands 1-GPU arms |
+| doc tally | `7 PASS, 2 PARTIAL, 1 SKIPPED` reconciles with the source classification for 1 visible GPU |
+
+**How the stamps were refreshed — and a caveat worth stating.** The first
+`run_all_checks.sh` invocation returned rc=1 with *"another run_all_checks.sh is
+running"*. That was **correct behaviour, not a bug**: a second maki agent session
+was already running the suite (lock taken 06:40:58, actively inside
+`check_device_precond.sh`). I did **not** remove the lock — the mutation matrices
+edit tracked source and restore with `git checkout --`, so two concurrent runs
+would restore each other's mutations. I waited ~90 min for it to finish instead.
+It completed, refreshed all 5 stamps, and committed further gate commits on top
+of mine. `05024c9` and `a1ef1d9` are ancestors of the resulting HEAD and all
+three of my files are present at it.
+
+That session started ~5 min **before** my `a1ef1d9` commit, so its steps span
+two HEADs. The stamps it wrote are CURRENT against the final HEAD, which is what
+`run_all_checks.sh` step 3/3 enforces by enumeration.
+
+**No gate was re-run by me** — these stamps are that suite's output. Per its own
+printed caveat, the doc-tally reconciliation *"is not a re-run of the gates, so it
+cannot detect a gate that is green-numbered but red."*
+
 ## What to do next
 
-1. **Host-side**: restore 2-GPU Level Zero enumeration (`sycl-ls` must print 2
-   `[level_zero:gpu]` lines). Until then no 27B row in any report is obtainable.
+1. **Host-side**: investigate why the xe device at PCI 86:00.0 dropped out of
+   Level Zero enumeration (`sycl-ls` must print 2 `[level_zero:gpu]` lines). Until
+   then no 27B row in any report is obtainable. **The mechanism is a leading
+   hypothesis, not a diagnosed fault** — see BLOCKER 1 and the AGENTS.md note.
 2. **Quiet box**: get load1 < 2 (stop/finish the Planar.jl julia job; do not run
    two maki sessions' GPU work concurrently).
 3. Then run these three batches for real with `--tp 2` on 27B, interleaved,
