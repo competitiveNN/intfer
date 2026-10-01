@@ -100,7 +100,18 @@ if [ -f "$STAMP" ]; then
 else
   STALE=1
   echo
+  # EXPLAINED, not merely reported. A stamp absent at THIS point but present in
+  # step 3/3 of the same run was never lost: phase 1/2 runs the checkers BEFORE
+  # phase 2 runs the matrices, and the matrix is what WRITES the stamp. So
+  # "absent in 1/2, present in 3/3" is the expected shape of an unstamped tree,
+  # not a population bug. Discriminating check, if this is ever in doubt:
+  #   find "$BUILD_DIR" -name '*last_pass.stamp' | sort
+  # If the stamp is ENUMERATED there and still unreadable, it was deleted between
+  # phases -- that would be the real bug.
   echo "provenance: NO STAMP at $STAMP -- these logs have no recorded tree."
+  echo "  Expected in phase 1/2 of a fresh run: checkers run BEFORE the matrices,"
+  echo "  and the matrix writes the stamp, so 3/3 may show it present. This alone"
+  echo "  is NOT a lost stamp."
 fi
 
 echo
@@ -135,10 +146,33 @@ if [ -f "$LOG_DIR/summary.txt" ]; then
       echo "7/7 as characterized (summary.txt: $n_ok AS EXPECTED, $n_bad UNEXPECTED)"
     fi
   else
+    # *** ORDER-DEPENDENCY, MEASURED AND FIXED. *** The stale branch above was
+    # reachable ONLY when the summary was clean. So a run whose logs were left
+    # in a damaged state by a PREVIOUS failed run, and whose stamp therefore
+    # predates HEAD, fell through here and exited 1 -- "a real regression, go
+    # fix the code" -- when the truth was "the evidence is from an older tree,
+    # re-run the matrix". Those demand OPPOSITE actions and only one of the two
+    # printed remedies could ever help.
+    # The rule, stated once: a verdict about the CODE requires evidence from the
+    # CURRENT tree. Without it, there is nothing to call a regression.
+    if [ "$STALE" = "1" ]; then
+      echo "NOT VERIFIED (summary.txt: $n_ok AS EXPECTED, $n_bad UNEXPECTED)" >&2
+      echo "  ...but the stamp predates HEAD ($s_sha), so this summary is from an" >&2
+      echo "  OLDER tree and possibly a previous run left the logs in this state." >&2
+      echo "  This is NOT evidence of a regression. Re-run the matrix." >&2
+      echo "  Nothing is wrong with the code; the EVIDENCE is about an older tree." >&2
+      exit 2
+    fi
     echo "NOT VERIFIED (summary.txt: $n_ok AS EXPECTED, $n_bad UNEXPECTED)" >&2
     exit 1
   fi
 else
+  if [ "$STALE" = "1" ]; then
+    echo "NOT VERIFIED (no $LOG_DIR/summary.txt)" >&2
+    echo "  ...but the stamp predates HEAD ($s_sha), so the missing summary belongs" >&2
+    echo "  to an older tree. Re-run the matrix; this is not a regression." >&2
+    exit 2
+  fi
   echo "NOT VERIFIED (no $LOG_DIR/summary.txt)" >&2
   exit 1
 fi

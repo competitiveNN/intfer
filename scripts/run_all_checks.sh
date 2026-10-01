@@ -152,6 +152,13 @@ dispatch() { # $1 = label -> runs it
       # exits 2 if the pin cannot be resolved, which reads as UNPROVEN rather
       # than as a pass.
       timeout 1800 bash "$SCRIPT_DIR/check_l0_cite.sh"; return $? ;;
+    check_fold_report_class.sh)
+      # Asserts that fold_report_counts keeps rc=1 (real regression) apart from
+      # rc=2 (stale evidence) in BOTH directions. It WAS misclassified: the stale
+      # branch was reachable only with a clean summary, so logs damaged by a
+      # previous failed run reported a regression and printed the wrong remedy.
+      # Runs FIRST so its sandbox restore precedes the real matrix's re-run.
+      timeout 900 bash "$SCRIPT_DIR/check_fold_report_class.sh"; return $? ;;
     check_gate_pop.sh)
       # Self-check for the SHARED stamp-population helper. Synthetic tree, no
       # build state touched. Gated on the two defects the helper actually
@@ -347,7 +354,7 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_build_dir_consumers.sh check_doc_counts.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_build_dir_consumers.sh check_doc_counts.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
