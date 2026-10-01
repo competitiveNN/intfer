@@ -660,15 +660,21 @@ reset_mutant
 patch_literal "$MUTANT" 'if [ "$HEAD_NOW" != "$HEAD_SHA" ]; then' \
   'if [ "$HEAD_NOW" != "$HEAD_SHA" ] || true; then  # N-L: always fire'
 verify_patched N-L
-if ! run_rac "N-L" "step_ok" "$ALL_CURRENT" 0 "" "" ".baseline"; then
+# run_rac's return code is the MUTANT's rc and says nothing about whether the
+# converse REJECTED it, so the evidence is the LOG: an always-firing detector must
+# print the notice, which is precisely what N-Kq's forbidden-marker check
+# consumes. Assert on that, not on a rc that a direct call cannot carry.
+run_rac "N-L" "step_ok" "$ALL_CURRENT" 0 "" "" ".baseline" >/dev/null
+if ! grep -q 'HEAD MOVED under this run' "$WORK/N-L.baseline.log"; then
   echo "FAIL: the N-L converse baseline did not REJECT an always-firing detector." >&2
-  echo "  A baseline whose converse can never fire proves nothing; N-K alone" >&2
-  echo "  would have scored this mutation as a pass. ($WORK/N-L.baseline.log)" >&2
+  echo "  An always-firing detector must make N-Kq's forbidden-marker check abort." >&2
+  echo "  Note this calls run_rac directly, NOT baseline(): baseline() exits the" >&2
+  echo "  whole matrix on a forbidden marker, which is correct for N-Kq (a real" >&2
+  echo "  defect in the CASE) but wrong here, where the always-firing mutant IS" >&2
+  echo "  the thing under test and the rejection is the expected outcome." >&2
+  echo "  ($WORK/N-L.baseline.log)" >&2
   exit 1
 fi
-grep -q 'HEAD MOVED under this run' "$WORK/N-L.baseline.log" || {
-  echo "FAIL: N-L baseline did not show the always-firing detector's notice." >&2
-  echo "  ($WORK/N-L.baseline.log)" >&2; exit 1; }
 echo "  ok    baseline N-L   converse REJECTED an always-firing detector (as it must)"
 
 rm -f "$MUTANT"
