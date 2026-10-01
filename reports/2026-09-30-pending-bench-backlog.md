@@ -560,3 +560,95 @@ with them; either way they get folded into AGENTS.md. If an experiment comes
 out neutral or loses, it stays default-OFF and gets a "closed" row in the table
 above — that is the expected outcome for most of this list, and reporting it is
 what stops the next session from re-running it.
+
+---
+
+## ONE COMMAND FILLS EVERY `RESULT:` LINE ABOVE (added 2026-10-01)
+
+Six `RESULT:` lines in these two reports are blank because they need **wall
+time**, and the only measurement left on this box is a quiet one. All the
+load-INSENSITIVE evidence is already recorded (27B `--tp 2`, counters, in
+`reports/2026-10-01-batch-e1-e2-e3-verdicts.md`); nothing below re-derives it.
+
+Do not fill a `RESULT:` line from those counters. A tok/s figure derived from
+device-side `kernel`/`copy` is not a measurement of this system, and the whole
+class of retracted wall-time claims in this repo came from doing exactly that.
+
+```bash
+cd /var/home/fra/dev/intfer
+until awk '{exit !($1 < 2)}' /proc/loadavg; do sleep 30; done   # quiet-box rule
+echo "load1=$(awk '{print $1}' /proc/loadavg)"
+
+M=/var/home/fra/data/models/intfer/Qwen3.8-27B-int2.intifer
+BIN=build/examples/intfer_cli/intfer_cli
+TOK="--tokenizer-py scripts/bpe_tokenize.py --detok-py scripts/bpe_detokenize.py"
+LONG="$(python3 -c "print('The history of artificial intelligence and machine learning. '*400)")"
+export INTFER_KV_CAP=8192     # default 1024 aborts the long prompt
+
+# E1 (line 247) + E3 (dpas48-fold 332): decode --tp 2, 3 interleaved rounds
+for r in 1 2 3; do
+  echo "== round $r load1=$(awk '{print $1}' /proc/loadavg)"
+  for arm in BASE DPAS48 PREQ; do
+    case $arm in
+      BASE)  unset INTFER_DPAS48 INTFER_DPAS_PREQ ;;
+      DPAS48) export INTFER_DPAS48=1; unset INTFER_DPAS_PREQ ;;
+      PREQ)  export INTFER_DPAS48=1 INTFER_DPAS_PREQ=1 ;;
+    esac
+    $BIN --gpu --tp 2 -m $M -p "The capital of France is" -n 64 --no-stream $TOK 2>&1 \
+      | grep -aE 'decode: |@decode\]'
+  done
+done
+
+# E3 fold leg (dpas48-fold 332) -- FOLD vs DPAS48, same arm
+for arm in DPAS48 FOLD; do
+  case $arm in
+    DPAS48) unset INTFER_DPAS48_FOLD ;;
+    FOLD)   export INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1 ;;
+  esac
+  $BIN --gpu --tp 2 -m $M -p "The capital of France is" -n 64 --no-stream $TOK 2>&1 \
+    | grep -aE 'decode: |@decode\]'
+done
+
+# Prefill legs (lines 251 and 466): one 361-token chunk in a single pass
+P361="$(python3 -c "print('The history of artificial intelligence and machine learning. '*40)")"
+for arm in BASE DPAS48 FOLD; do
+  case $arm in
+    BASE)  unset INTFER_DPAS48 INTFER_DPAS48_FOLD ;;
+    DPAS48) export INTFER_DPAS48=1; unset INTFER_DPAS48_FOLD ;;
+    FOLD)   export INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1 ;;
+  esac
+  INTFER_PREFILL_CHUNK=1 INTFER_PREFILL_CHUNK_M=361 \
+    $BIN --gpu --tp 2 -m $M -p "$P361" -n 5 --no-stream $TOK 2>&1 \
+      | grep -aE 'prompt: |prefill|tokens in'
+done
+
+# E2 long-ctx (line 350): KV / KVQ8 vs base
+for arm in BASE KV KVQ8; do
+  case $arm in
+    BASE) unset INTFER_INT8_KV INTFER_KV_Q8 INTFER_KV_HAD ;;
+    KV)   export INTFER_INT8_KV=1; unset INTFER_KV_Q8 INTFER_KV_HAD ;;
+    KVQ8) export INTFER_INT8_KV=1 INTFER_KV_Q8=1 INTFER_KV_HAD=1 ;;
+  esac
+  $BIN --gpu --tp 2 -m $M -p "$LONG" -n 64 --no-stream $TOK 2>&1 \
+    | grep -aE 'prompt: |decode: |@decode\]'
+done
+```
+
+**What to check before believing any number**
+
+1. **Interleaved, 3 rounds, every round reported** — never the best one. An
+   earlier session's quoted figure here was withdrawn for exactly this.
+2. **`load1 < 2` at the START of every round**, printed above it. A tok/s from a
+   contended round is run variance; this repo has retracted several.
+3. **Identity first.** If the arms' token ids differ, stop — that is a
+   correctness failure, not a slow run. At 27B `--tp 2` the recorded
+   identities are: `BASE == DPAS48 == PREQ`, `FOLD == DPAS48`,
+   `KV == KVQ8 == BASE`.
+4. **Confirm the shape ran**: `grep 'GPU backend: 2 device(s) (TP=sharded)'`.
+   One device means the enumeration regressed — run
+   `scripts/gpu_recover.sh verify` (exit 0 = two devices).
+5. **Wall-time only.** Copy the `decode: N tokens in X ms (Y tok/s)` figures
+   into the `RESULT:` lines. Leave the buckets alone; they are not wall time.
+
+The box is currently at `load1 ~9.6` (a long-running `julia` job at 99.7% CPU),
+so this cannot run until that job finishes or is stopped.
