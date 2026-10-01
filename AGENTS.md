@@ -108,13 +108,45 @@ single fact governs how every gate result in this file must be read:
      remedy** — nothing here shows it would help.
   4. If the BARs are fine, the next step is a DEBUG build of compute-runtime to
      get the skip reason printed — not more guessing from this container.
-  REPRODUCE ALL OF IT: `scripts/l0_enumerate.sh` (device count + uuid at the
-  driver API; `INTFER_L0_DRIVER_LIB=/run/host/usr/lib64` to vary the driver
-  lib, and it prints driverVersion so a no-op swap is visible),
-  `scripts/gpu_health_check.sh` (card0-vs-card1 sysfs diff; self-checks that it
-  rejects DRM connector nodes before reading anything, and prints HEAD so its
-  output is attributable to a tree),
-  `scripts/l0_enum_trace.sh` (the debug-flag attempt).
+  REPRODUCE ALL OF IT (committed scripts, not prose):
+  - `scripts/l0_enumerate.sh` — device count + uuid at the driver API. Honours
+    INTFER_L0_DRIVER_LIB and prints driverVersion so a no-op lib swap is
+    visible. Deletes its own output and refuses to run a stale binary.
+  - `scripts/gpu_driver_lib_ab.sh` — the committed A/B over driver-lib versions.
+    **Exits 1 "INCONCLUSIVE" if both arms report the same driverVersion**, since
+    then the libraries were never actually swapped and the comparison proves
+    nothing. Negative-tested by pointing both arms at one lib. Measured
+    NEGATIVE: container 0x10396f6 and host 0x1039b4e both enumerate 1 device.
+  - `scripts/gpu_health_check.sh` — card0-vs-card1 sysfs diff. Runs a GATING
+    self-check first (seeds a `card0-DP-1` connector, requires it rejected),
+    and prints HEAD so its output is attributable to a tree.
+  - `scripts/l0_enum_trace.sh` — the debug-flag attempt. **Exits 3
+    = INCONCLUSIVE** when the driver prints no skip reason, so "no output" can
+    never be misread as "no information". Measured here: exit 3.
+  - `scripts/l0_cite_check.sh` — verifies every compute-runtime `file:line`
+    cited in AGENTS.md / the verdicts report against a **pinned commit
+    63647bb8214cdc581d2bd5ed3822f157f7d34679**, so the citations are checkable
+    rather than a research-subagent transcript. Clones sparse on demand;
+    if the pin cannot be resolved it exits 2 and the docs must then be read as
+    UNVERIFIED.
+  - `scripts/mutate_l0_cite_check.sh` — mutation matrix for that checker, 7/7
+    states caught each for its own reason, stamped
+    `build/l0_cite_mutate/last_pass.stamp`.
+  *** NEXT-SESSION TRIGGER — the one thing worth reopening. *** If
+  `scripts/l0_enumerate.sh` ever prints **2** devices, the enumeration fault is
+  gone. Immediately close the ONLY remaining unverified coverage, in order:
+  1. `sycl-ls | grep -c '\[level_zero:gpu\]'` must print 2, and
+     `scripts/run_all_checks.sh` must be re-run end-to-end so the stamps and
+     the doc tally are re-derived against the new box state. Expect `tp2_27b`
+     to stop skipping and `gpu_optin`/`device_argmax` to stop reporting
+     PARTIAL — i.e. the two PARTIAL arms gain exactly the TP=2 coverage they
+     currently lack.
+  2. Re-run `scripts/test_tp2_27b.sh`: its sole arm is `--tp 2` on 27B, so it is
+     the ONLY gate that can certify TP=2 coverage at all right now.
+  3. Then, and only then, fill the `RESULT:` lines in
+     `reports/2026-09-30-pending-bench-backlog.md` and
+     `reports/2026-09-30-dpas48-fold.md`, and re-decide the E1/E2/E3 verdicts at
+     27B — they currently rest on 0.8B counters alone.
   Also negative, so they are not retried: ONEAPI_DEVICE_SELECTOR in
   {level_zero:gpu, level_zero:*, *:gpu, level_zero:0, *} and SYCL_DEVICE_FILTER
   in {level_zero:gpu, *} all still yield 1; /dev/accel/accel0 is the 265KF's

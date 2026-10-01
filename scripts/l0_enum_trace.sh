@@ -23,7 +23,9 @@
 #
 # Usage: scripts/l0_enum_trace.sh
 # Env:   INTFER_L0_DRIVER_LIB=DIR   test a different libze_intel_gpu.so.1
-# Exit:  0 = ran (read the output), 1 = could not run, 2 = no driver found.
+# Exit: 0 = BOTH devices, or a skip diagnostic was printed (information obtained)
+#        1 = could not run, 2 = no driver found / did not run
+#        3 = RAN but printed no skip reason => INCONCLUSIVE (not success)
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/intfer_l0trace.XXXXXX")"
@@ -62,19 +64,48 @@ run "with NEOReadDebugKeys=1 PrintDebugMessages=1"
 
 echo
 echo "=== interpretation ==="
-n="$(env NEOReadDebugKeys=1 PrintDebugMessages=1 \
+# stderr is CAPTURED, not discarded: the skip reasons go to stderr, so
+# 2>/dev/null would throw away the only thing this script exists to see.
+trace="$(env NEOReadDebugKeys=1 PrintDebugMessages=1 \
        LD_LIBRARY_PATH="$(dirname "$DRV"):/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}" \
-       timeout 180 "$WORK/probe" 2>/dev/null | sed -n 's/^TOTAL LEVEL ZERO DEVICES: //p')"
+       timeout 180 "$WORK/probe" 2>&1)"
+n="$(printf '%s\n' "$trace" | sed -n 's/^TOTAL LEVEL ZERO DEVICES: //p')"
+# The skip reasons we are hunting for, per compute-runtime's own strings.
+diag="$(printf '%s\n' "$trace" | grep -iE 'FATAL|Resizable BAR|Unknown device|Cannot query|Caps reader|Topology|EUCount|Query mem' || true)"
+
 if [ -z "$n" ]; then
-  echo "no TOTAL line -- driver did not run"
-elif [ "$n" -ge 2 ]; then
-  echo "BOTH devices enumerate: the drop is NOT in this driver's discovery path"
-else
-  echo "still $n device(s)"
-  echo "The driver emitted NO skip diagnostics, which means the release build has"
-  echo "PrintDebugMessages compiled out. That is itself informative: these skip"
-  echo "points are silent by construction, so the remaining suspects must be"
-  echo "distinguished host-side (compare Resizable BAR / Region 2 size between"
-  echo "0000:04:00.0 and 0000:86:00.0) or with a debug build of compute-runtime."
+  echo "NO INFORMATION: driver produced no TOTAL line -- it did not run."
+  echo "RESULT: l0_enum_trace INCONCLUSIVE (driver did not run)"
+  exit 2
 fi
-exit 0
+
+if [ -n "$diag" ]; then
+  echo "SKIP DIAGNOSTIC(S) FOUND -- the driver named the failure:"
+  printf '%s\n' "$diag" | sed 's/^/  /'
+fi
+
+if [ "$n" -ge 2 ]; then
+  echo "BOTH devices enumerate ($n) -- the drop is NOT in this driver's discovery path."
+  echo "RESULT: l0_enum_trace BOTH_DEVICES ($n)"
+  exit 0
+fi
+
+# Fewer than 2 devices. Distinguish "we learned WHICH skip fired" from
+# "we learned nothing", because those demand different next steps and the
+# difference is invisible if both exit 0.
+if [ -n "$diag" ]; then
+  echo "still $n device(s), AND a skip diagnostic was printed above -- act on it."
+  echo "RESULT: l0_enum_trace DIAGNOSTIC ($n device, reason printed)"
+  exit 0
+fi
+
+echo "NO INFORMATION: still $n device(s), and the driver printed NO skip diagnostic."
+echo "  PrintDebugMessages is evidently compiled out of this release build, so"
+echo "  skips (c)/(d) are silent BY CONSTRUCTION. This run therefore says"
+echo "  NOTHING about which skip fired. The remaining suspects (small BAR on"
+echo "  card1; BMG deferred-engine-init) must be distinguished HOST-side by"
+echo "  comparing Resizable BAR / Region 2 size for 0000:04:00.0 vs 0000:86:00.0,"
+echo "  or with a DEBUG build of compute-runtime."
+echo "  Do not read 'no output' as 'no problem found'."
+echo "RESULT: l0_enum_trace INCONCLUSIVE ($n device, no skip reason printed)"
+exit 3

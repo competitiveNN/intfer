@@ -110,7 +110,12 @@ build is worse than no probe.
 
 ### 2026-10-01 LATER: the ECANCELED lead is **REFUTED** as the cause — read the code
 
-`drm_neo.cpp` device discovery was read (intel/compute-runtime). The
+`drm_neo.cpp` device discovery was read (intel/compute-runtime). **Every
+`file:line` cited in this section is machine-verified by
+`scripts/l0_cite_check.sh` against a pinned commit
+`63647bb8214cdc581d2bd5ed3822f157f7d34679`**, so these are checkable rather
+than a research transcript; `scripts/mutate_l0_cite_check.sh` proves that
+checker can fail (7/7 states). The
 `tile0/gt*/freq0/{min,max}_freq` anomaly **cannot** drop a device:
 
 ```
@@ -215,7 +220,9 @@ it but does not exclude it.
 `scripts/l0_enum_trace.sh` runs the real driver with `NEOReadDebugKeys=1
 PrintDebugMessages=1`, which is how (c)/(d) get printed. Measured result: the
 driver emits unrelated banners (`WARNING: Failed to request OCL Turbo Boost`,
-cache/pidfd notices) but **no skip diagnostic at all**, i.e. the release build
+cache/pidfd notices) but **no skip diagnostic at all** (so
+`scripts/l0_enum_trace.sh` now exits **3 = INCONCLUSIVE**, deliberately not 0,
+so "no output" can never be read as "no information"), i.e. the release build
 has `PrintDebugMessages` compiled out. The skip is silent by construction, so it
 cannot be observed from user space on this build. That is a real, measured limit
 on what can be learned here — not a failure to look.
