@@ -1482,7 +1482,7 @@ e.g. S3's contract column is 40 not 42).
   `scripts/run_all_checks.sh` (full, NOT `INTFER_QUICK=1`) exits **0**, with 3
   checkers + 4 matrices green, **5/5 enumerated stamps naming HEAD**, tracked
   tree clean, and no new untracked file anywhere in the work tree;
-  `mutate_run_all_checks.sh` is **10/10 caught with 10/10 baselines correct**
+  `mutate_run_all_checks.sh` is **11/11 caught with 11/11 baselines correct**
   (each baseline requires the correct marker PRESENT, so no predicate can be
   satisfied by an early abort). Two earlier drafts of this paragraph quoted
   `c693f95` and then `baf6a85` — **both stale by construction**, since
@@ -1493,6 +1493,30 @@ e.g. S3's contract column is 40 not 42).
   exactly that by enumeration. Read the sha from there, not from this paragraph.
   No wall-time or throughput claim is made anywhere above: the box was loaded
   (loadavg ~9) and this audit changed no engine code.
+
+  - **SINGLE WRITER: do not commit to this clone while `run_all_checks.sh` is
+    running.** MEASURED, not hypothetical — a second agent session committed
+    three times during one ~45 min stack here. HEAD then moved between the
+    start-of-run snapshot and the stamp assertion, so stamps naming the NEW
+    commit were compared against the OLD `$HEAD_SHA` and reported STALE: a
+    verdict that looks like missing evidence when the evidence is current, and
+    whose printed remedy ("re-run the named matrix") cannot possibly help.
+    Three ~45 minute re-runs were burned on this. The stamp standard is only
+    meaningful if the tree holds still while it is measured.
+    The failure is now LOUD rather than silent: step **2c** re-reads HEAD
+    immediately before the comparison and reports a move as its own condition
+    (counted FAILED, exit 1 — deliberately NOT folded into STALE and NOT
+    laundered into the rc=2 "unproven" tally, because a race is neither stale
+    evidence nor a regression, and the two call for opposite actions). The
+    comparison uses `$HEAD_NOW`, so a moved HEAD is not additionally misreported
+    as 5 phantom STALE stamps. Mutated by state **N-K** in
+    `scripts/mutate_run_all_checks.sh` (11/11, 11 baselines; a synthetic
+    `step_commit` makes the move reproducible without disarming the mutant's
+    dirty-tree guard). If you see "HEAD MOVED under this run", finish the other
+    commit and re-run — do not debug the stamps.
+    Related contention on this box, not in this clone: a Planar.jl container
+    holds a `julia` process near 100% CPU, which is why wall-time is unobtainable
+    (quiet rule `load1 < 2`).
 
 
 

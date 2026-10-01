@@ -289,6 +289,31 @@ result. Replaced with the derived rule (`arm == BASE && REF_ARM != BASE`).
 Both are the same species as the vacuous-gate family in AGENTS.md (audits #3/#3c,
 #14): a check that cannot fail, or a rule re-derived per call site instead of once.
 
+### The derived rule is now exercised by a differential test (2026-10-01)
+
+The derived rule had ONE data point (E1), which is not enough: the two batch
+shapes differ in exactly the way the rule branches on. E2 has `REF_ARM=BASE`,
+so BASE must be **identical**; E1/E3 have `REF_ARM=<quantizing arm>`, so BASE
+must **differ**. Run in `INTFER_BENCH_TIMING=0` (counters only, no tok/s):
+
+| batch | arms | BASE verdict | non-BASE invariant | rc |
+|---|---|---|---|---|
+| E1 | BASE DPAS48 PREQ | `OK BASE differs` | `PREQ == DPAS48` | 0 |
+| E2 | BASE KV KVQ8 | *(no exemption — all identical)* | `KV == BASE`, `KVQ8 == BASE` | 0 |
+| E3 | BASE DPAS48 FOLD FOLDPREQ | `OK BASE differs` | `FOLD == DPAS48`, `FOLDPREQ == DPAS48` | 0 |
+
+The branch therefore fires on E1/E3 and correctly does **not** fire on E2, which
+is the differential that a single E1 run could never have shown. A harness whose
+exemption fired unconditionally would also pass E1 and fail E2, so this is the
+test that distinguishes derived from hard-coded.
+
+E2 identity (0.8B TP=1 `-n 8`): all three arms `279 6511 314 279 3046 13 198 760`.
+E2 counters are flat across arms — `nk=13440 nw=8832 nr=4608` for BASE/KV/KVQ8 —
+i.e. INT8-KV is launch-neutral at 0.8B, which is why it stays default-off
+pending a quiet-box wall-time read. E3 counters: `nk` 13440 / 17856 / 21888 /
+27840 across BASE/DPAS48/FOLD/FOLDPREQ, consistent with FOLD's one extra launch
+per DPAS GEMM.
+
 ## What to do next
 
 1. **Host-side**: restore 2-GPU Level Zero enumeration (`sycl-ls` must print 2
