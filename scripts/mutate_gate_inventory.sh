@@ -137,7 +137,7 @@ ANCHOR_PATTERNS=(
   '  [ "$p" = "per-arm" ] ||'
   'grep -qE '"'"'SKIPPED_(TP2|SUB)|PARTIAL'"'"' ||'
   'unplaceable require classified'
-  '      sk="$(printf '"'"'%s'"'"' "$txt" | sed -nE '"'"'s/.*[,/] ?([0-9]+) SKIPPED.*/\1/p'"'"')"'
+  'PARSE_SK="$(printf '"'"'%s'"'"' "$txt" | sed -nE '"'"'s/.*[,/] ?([0-9]+) SKIPPED.*/\1/p'"'"')"'
   'doc-tally: SKIPPED'
   'if grep -qE '"'"'renderD|gate_require_render_node|gate_require_device'"'"' "$1"; then echo "render-node"'
   'gate_require_device || exit 2'
@@ -496,10 +496,15 @@ run_state M7 "disable the NEEDS-GPU-without-a-guard verdict" "CAUGHT-selfcheck" 
   if grep -qE 'renderD|gate_require_render_node|gate_require_device' "$1"; then echo "render-node"; else echo "not-gpu"; fi
 PATCH
 
+# The anchor was REPOINTED: the parser moved from an inline block inside the
+# tally loop into parse_tally_counts() so the checker's own self-check could
+# exercise it on a fixture. The anchor pre-flight caught the stale one by
+# refusing to run -- which is exactly what it exists for, and is why the state
+# was re-pointed rather than the pre-flight loosened.
 run_state M8 "make the tally parser comma-only again" "CAUGHT-selfcheck" <<'PATCH'
-      sk="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) SKIPPED.*/\1/p')"
+  PARSE_SK="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) SKIPPED.*/\1/p')"
 |||
-      sk="$(printf '%s' "$txt" | sed -nE 's/.*, ([0-9]+) SKIPPED.*/\1/p')"
+  PARSE_SK="$(printf '%s' "$txt" | sed -nE 's/.*, ([0-9]+) SKIPPED.*/\1/p')"
 PATCH
 
 run_gate_state M9 "strip the render-node guard from a GPU gate" "CAUGHT-selfcheck" <<'PATCH'
