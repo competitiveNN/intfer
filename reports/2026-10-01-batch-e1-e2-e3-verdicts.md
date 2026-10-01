@@ -646,3 +646,24 @@ cannot detect a gate that is green-numbered but red."*
    `reports/2026-09-30-pending-bench-backlog.md` and
    `reports/2026-09-30-dpas48-fold.md`.
 4. E2's long-ctx command needs `INTFER_KV_CAP` raised above the prompt length.
+
+---
+
+## Commit index for this GPU investigation
+
+Derived, not hand-counted. `git rev-list --count f047c42^..HEAD` and
+`git log --oneline f047c42^..HEAD | wc -l` agree at **8**; a hand-written
+"four commits" in an earlier summary of this same work was wrong twice over
+(it miscounted AND listed only two), which is why the number lives here with
+the command that produces it rather than in prose.
+
+| sha | what it established |
+|---|---|
+| `f047c42` | localized the drop to the L0 driver; ruled out driver version; found the card1-only `ECANCELED` reads |
+| `30db596` | read compute-runtime's discovery code; **REFUTED** the GuC/`max_freq` lead; named small BAR as the strongest candidate |
+| `9e279b5` | made the `file:line` citations checkable (`check_l0_cite.sh`) + 7-state mutation matrix |
+| `4926dd5` | wired both into `run_all_checks.sh`; renamed to the `check_`/`mutate_` convention |
+| `634604d` | turned the stamp-leak print into an assertion; AUDIT #19's three ordering defects |
+| `684a845` | tabled every harness exit code and how the suite classifies them |
+| `13a76db` | honored `INTFER_BUILD_DIR` (an AUDIT #8 violation I had reintroduced); propagated AUDIT #19 into AGENTS.md |
+| `53442b0` | recorded what a green `run_all_checks` does **not** certify |
