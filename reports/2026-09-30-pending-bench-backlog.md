@@ -74,6 +74,70 @@ it answers "0" regardless of the hardware. Do not trust `ls -la /dev/dri`
 either; use `find /dev/dri -maxdepth 1`. Both traps produced false readings
 during AUDIT #10/#11.
 
+## CANONICAL PREAMBLE — required before EVERY command block below
+
+Paste this once at the top of any shell where you intend to run any command in
+this file. It is deliberately self-guarding: a pasted block now fails loudly
+instead of producing a plausible-looking number.
+
+```bash
+export LD_LIBRARY_PATH=/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}
+
+# (1) DEVICE COUNT GATE. Every 27B command below is --tp 2. On a 1-GPU box
+# --tp 2 is CLAMPED to TP=1 with only a warning, 27B then preloads 18751 MiB
+# onto a 12216 MiB card and dies "signal 6" / rc=139 inside the Level Zero
+# page-fault manager. That is box state, not a regression -- but as a pasted
+# one-liner it is indistinguishable from one, so stop here instead.
+NDEV=$(sycl-ls | grep -c '\[level_zero:gpu\]')
+[ "$NDEV" -eq 2 ] || { echo "STOP: sycl-ls reports $NDEV level_zero gpu(s), need 2."
+  echo "      --tp 2 would clamp to TP=1 and 27B would OOM. Investigate the"
+  echo "      enumeration first (see AGENTS.md: hardware is fine, enumeration is down)."
+  exit 1; }
+
+# (2) KV CAPACITY GATE. INTFER_KV_CAP DEFAULTS TO 1024. Any prompt longer than
+# that aborts with "FATAL: pos N >= KV capacity 1024" BEFORE the first decode
+# step -- so the run emits no ids and no timing, and an id comparison then sees
+# two empty lists, calls them equal, and reports a PASS. Raise the cap above
+# your longest prompt. (The *400 long prompt below is 3601 tokens.)
+export INTFER_KV_CAP=${INTFER_KV_CAP:-8192}
+
+# (3) PER-RUN PROMPT ASSERTION. Include "prompt: [0-9]+ tokens" in every grep.
+# An aborted run has no such line; absence must never read as success.
+```
+
+`scripts/check_e2_ctx.sh` automates (1)+(2)+(3) for the E2 long-context arms and
+exits 0/1/2 — run it before spending a quiet window on E2.
+
+### SINGLE NAMED PREREQUISITE (all of E1, E2, E3 depend on this, and only this)
+
+Every `RESULT:` line in this file is **blocked on one host-side condition**, and
+that condition is the same for all three experiments:
+
+> **`sycl-ls | grep -c '\[level_zero:gpu\]'` must print `2`.**
+
+Until it does, **do not fill in any `RESULT:` line in this file.** The reason is
+not merely that the number would be wrong: on a 1-GPU box `--tp 2` *silently
+clamps* to TP=1 and 27B OOMs, so a "result" filled in under those conditions is
+not a partial measurement, it is a different configuration wearing the label of
+the intended one. A partially filled `RESULT:` is therefore worse than a blank
+one — it reads as evidence.
+
+Second, independent prerequisite — the quiet-box rule (`load1 < 2`). On
+2026-10-01 `load1` sat at 7–18 for the whole session (a second maki session on
+the same GPU plus a Planar.jl `julia` job at 99.7% CPU), which is why that
+session produced counters only and **no** wall-time at all.
+
+**What is already measured without those two**, and needs no re-measuring: E1/E2/E3
+stream identity and the load-insensitive counters on 0.8B TP=1. See
+`reports/2026-10-01-batch-e1-e2-e3-verdicts.md`; E2's long-ctx identity is now
+re-derivable at any time with `scripts/check_e2_ctx.sh`.
+
+**Mechanism status, precisely:** the enumeration drop is a **LEADING HYPOTHESIS,
+NOT ESTABLISHED**. Both B580s are present and kernel-healthy; only the *compute
+runtime* view shows one. See the AGENTS.md READ FIRST note for the measured
+exclusion list and why "two independent driver stacks agree" is inference rather
+than a diagnosis.
+
 ---
 
 ## E1 — `INTFER_DPAS_PREQ=1` (device GA64 activation-quant pre-pass)
@@ -155,8 +219,11 @@ for r in 1 2 3; do
       DPAS48) export INTFER_DPAS48=1; unset INTFER_DPAS_PREQ ;;
       PREQ)  export INTFER_DPAS48=1 INTFER_DPAS_PREQ=1 ;;
     esac
+    # "prompt: N tokens" is ASSERTED, not just hoped for: it is absent on any run
+    # that aborted (e.g. the KV-capacity FATAL), and a run with no ids must
+    # never look like a completed measurement.
     $BIN --gpu --tp 2 -m $M -p "The capital of France is" -n 64 --no-stream $TOK 2>&1 \
-      | grep -aE "tokens in|decode:"
+      | grep -aE "prompt: [0-9]+ tokens|tokens in|decode:|FATAL"
   done
 done
 ```
@@ -164,9 +231,12 @@ Prefill leg (one 361-token chunk = whole prompt in a single pass):
 ```bash
 P361="$(python3 -c "print('The history of artificial intelligence and machine learning. '*40)")"
 INTFER_PREFILL_CHUNK=1 INTFER_PREFILL_CHUNK_M=361 \
-  $BIN --gpu --tp 2 -m $M -p "$P361" -n 5 --no-stream $TOK 2>&1 | grep -aE "tokens in"
+  $BIN --gpu --tp 2 -m $M -p "$P361" -n 5 --no-stream $TOK 2>&1 \
+    | grep -aE "prompt: [0-9]+ tokens|tokens in|FATAL"
 ```
-(`INTFER_DPAS48`/`INTFER_DPAS_PREQ` still come from the loop's env.)
+(`INTFER_DPAS48`/`INTFER_DPAS_PREQ` still come from the loop's env. Require the
+CANONICAL PREAMBLE above — this block is `--tp 2` and aborts without the
+`sycl-ls` device-count gate.)
 
 ### Decision rule
 - **WIN** — PREQ beats DPAS48 by >3% decode in 3+ rounds at load1 < 2, and
@@ -176,8 +246,12 @@ INTFER_PREFILL_CHUNK=1 INTFER_PREFILL_CHUNK_M=361 \
   That is the expected outcome, and it is why nothing about PREQ is on by default.
 
 RESULT (27B TP=2 decode, 3 rounds, load1 at each round):
+  <-- BLOCKED: do not fill until `sycl-ls | grep -c '[level_zero:gpu]'` prints 2 AND load1 < 2.
+      A partially filled RESULT is worse than a blank one; see SINGLE NAMED PREREQUISITE.
 
 RESULT (27B TP=2 prefill chunk361):
+  <-- BLOCKED: do not fill until `sycl-ls | grep -c '[level_zero:gpu]'` prints 2 AND load1 < 2.
+      A partially filled RESULT is worse than a blank one; see SINGLE NAMED PREREQUISITE.
 
 ---
 
@@ -228,9 +302,12 @@ for mode in "INTFER_INT8_KV=1" "INTFER_INT8_KV=1 INTFER_KV_Q8=1" \
             "INTFER_INT8_KV=1 INTFER_KV_Q8=1 INTFER_KV_HAD=1"; do
   echo "--- $mode ---"
   env $mode $BIN --gpu --tp 2 -m $M -p "The capital of France is" -n 8 \
-    --no-stream --ids $TOK 2>&1 | grep -a "decode step"
+    --no-stream --ids $TOK 2>&1 | grep -aE "prompt: [0-9]+ tokens|decode step|FATAL"
 done
 ```
+All four arms of this block are meant to be byte-identical (`base == KV == Q8 ==
+Q8+HAD`). If a grep returns NOTHING for an arm, that is a FAILED RUN, not a
+pass: the engine printed no ids, and an empty list equals an empty list.
 
 ### Commands (27B, TP=2, long context decode)
 ```bash
@@ -247,11 +324,20 @@ for r in 1 2 3; do
       KV)   export INTFER_INT8_KV=1; unset INTFER_KV_Q8 INTFER_KV_HAD ;;
       KVQ8) export INTFER_INT8_KV=1 INTFER_KV_Q8=1 INTFER_KV_HAD=1 ;;
     esac
+    # "prompt: N tokens" MUST appear (expect 3601). It is absent on an aborted
+    # run, and an aborted run must not be readable as a completed measurement.
     $BIN --gpu --tp 2 -m $M -p "$LONG" -n 64 --no-stream $TOK 2>&1 \
-      | grep -aE "tokens in|decode:"
+      | grep -aE "prompt: [0-9]+ tokens|tokens in|decode:|FATAL"
   done
 done
 ```
+Or just run `scripts/check_e2_ctx.sh` (needs 1 GPU, ~6 min, exits 0/1/2), which
+asserts per arm: rc==0 AND the prompt line AND all 8 decode steps, then compares
+ids. That is the same check this block is doing by hand, and it is non-vacuous:
+with `INTFER_KV_CAP=1024` it exits **1** and names the FATAL instead of passing.
+Note it runs TP=1 on 0.8B by default — it validates the KV-cap/identity path,
+not the 27B throughput.
+
 If a long prompt blows the KV cap, report that as a capacity finding rather
 than dropping the arm — the cap behaviour is part of what you are testing.
 
@@ -263,6 +349,8 @@ than dropping the arm — the cap behaviour is part of what you are testing.
 - **KILL** — no decode gain at long ctx, or any stream divergence.
 
 RESULT (27B TP=2 long-ctx decode, 3 rounds, load1 at each round):
+  <-- BLOCKED: do not fill until `sycl-ls | grep -c '[level_zero:gpu]'` prints 2 AND load1 < 2.
+      A partially filled RESULT is worse than a blank one; see SINGLE NAMED PREREQUISITE.
 
 ---
 
@@ -377,6 +465,8 @@ Stream identity is **reported, not asserted** — asserting it would be tie-luck
 the five conditions that would invalidate the tolerances.
 
 RESULT (27B TP=2 prefill chunk361, vs DPAS48 and DPAS48+FOLD baselines):
+  <-- BLOCKED: do not fill until `sycl-ls | grep -c '[level_zero:gpu]'` prints 2 AND load1 < 2.
+      A partially filled RESULT is worse than a blank one; see SINGLE NAMED PREREQUISITE.
 
 ---
 
