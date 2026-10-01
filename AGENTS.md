@@ -1295,6 +1295,80 @@ e.g. S3's contract column is 40 not 42).
   STEP of run_all_checks it reports `ok` and `gate_inventory.sh` also reports
   `ok` (proving the rc=97 fall-through is gone), the stamp population is exactly
   5 with the new `run_all_mutate/last_pass.stamp` enumerated and no fixtures.
+- **AUDIT #17d: FIVE MORE ITEMS, AND THE HYGIENE GATE EXPOSED THREE MORE BUGS**
+  (mutate_fold_matrix.sh uses patch_literal; NEW tree-hygiene gate in
+  run_all_checks.sh; mutate_run_all_checks now 7/7 in a SANDBOX repo; no
+  engine/quant/schedule code touched).
+    (1) **Item 2 — fold's `sed` delimiter hazard removed.** M5's anchor CONTAINS
+  `||`, so it only worked because the delimiter was escaped to `\|`: the
+  audit-#17b collision class sitting live inside a state that PASSES. A small edit
+  to that line could silently stop the sed matching, and the state would then
+  report "not load-bearing" — a verdict about the checker when the fault is in the
+  state. `sed` also replaces the FIRST match and reports nothing about how many
+  there were, and **M6's anchor is a PREFIX of M4's**, so after M4 ran, M6's
+  pattern still matched the M4-mutated line. Nothing caught that; states happen to
+  restore in between. All five appliers now use `patch_literal()`, which requires
+  EXACTLY ONE match, so an ambiguous anchor is a hard stop rather than a silent
+  wrong-site patch. Fold still 7/7.
+    (2) **Item 1 — the tree-hygiene invariant asserted ONCE, in the driver.**
+  `run_all_checks` already refuses to START dirty; that does not prove a step left
+  the tree as it found it. Each matrix verified only the files it declared as
+  targets, so a step that dirtied anything else left no trace in its own report,
+  and a mutated `_rac_mutant.sh` left behind would poison every later check that
+  globs `scripts/`. Placed in the driver, not copied into four matrices: "nine
+  hand-rolled copies of the block is precisely how the family reopened" (#7). The
+  driver ran them all, so the driver checks they cleaned up.
+    (3) **Items 3+4 — three more states (7/7, all 7/7 baselines correct):**
+      * **N-E** disarms the classifier SELF-CHECK while `classify_rc` is ALSO
+  wrong. N-A alone cannot prove the self-check can fail — its detection mechanism
+  IS the self-check, so disarming it is invisible while `classify_rc` is correct.
+  Compound, and the always-red lesson applied one level in.
+      * **N-F** keeps the 2b re-run block and breaks the `$UNPROVEN_LABELS`
+  derivation it iterates, so it finds nothing to do. Same observable as N-B,
+  different mechanism: "enumerate, never remember" proven load-bearing in the
+  re-run path, not merely present.
+      * **N-G** deletes the new hygiene assertion, so untracked residue in
+  `scripts/` goes unnoticed.
+    **THE HYGIENE GATE IMMEDIATELY EARNED ITS KEEP, AND FORCED A REDESIGN.**
+  On its first run it flagged the matrix's OWN untracked mutant as leftover
+  residue — the second version had moved the mutant to an untracked copy at
+  `scripts/_rac_mutant.sh`, which is untracked residue in precisely the directory
+  the new assertion polices. Exempting that filename would have been a
+  hand-maintained list, i.e. the copy-drift family again. So the mutant now lives
+  in a **throwaway git repo**: its `git diff`/`git rev-parse` resolve in the
+  sandbox, its stamps are built from the sandbox head, and the real repository is
+  never touched at all — not the mutant, not the probe files.
+  **FIVE MORE DEFECTS, all found by running it (three of them by the new gate)**
+    * Patching the sandbox mutant left the sandbox tree dirty, so the mutant's own
+  start-of-run guard aborted every case — the original masking, reappearing one
+  level down. Each patched state is now COMMITTED in the sandbox, so the guard
+  stays armed against what it is meant to catch (N-D's deliberate dirtiness).
+    * `reset_mutant` used `git commit -a`, which committed the deliberately dirty
+  probe as well. That silently **disarmed N-D**: the tree came back clean, the
+  guard never fired, and the state scored as a broken CASE. Commits are now
+  path-limited to the mutant.
+    * Stamps were baked from the sandbox's INITIAL head, but every patch creates a
+  commit, so the head advanced and every state after the first read as STALE —
+  the family-3 stale-artifact lesson in miniature. Stamps are rewritten per run
+  from the head in force at that moment.
+    * N-G's residue probe was `git add -N`'d, making it intent-to-add and
+  therefore STAGED dirt, so the START guard rejected it before the end-of-run
+  assertion it exists to exercise. Untracked means untracked. (It also
+  demonstrates the intended split: the start guard rejects TRACKED dirt, the
+  end-of-run assertion catches untracked leftovers.)
+    * **N-E and N-G predicates could never be true.** N-E looked for the absence
+  of a SELFCHECK line, but those print DURING the loop and appear even when the
+  self-check's return value is neutralised; the real defect is that the run
+  PROCEEDS past it. N-G grepped `untracked residue`, which also matches the
+  SUCCESS branch ("ok  no untracked residue"). Both were states that reported the
+  checker as fine while being broken. N-E's predicate is now only sound because
+  the CONVERSE is asserted too: N-A shows a misclassification stops the run before
+  the steps, so "reached the steps" cannot pass vacuously on a healthy run.
+  A mutation state whose predicate cannot be true is indistinguishable from a
+  checker that is not load-bearing.
+  ALSO CORRECTED: the matrix header and PASS message still described the removed
+  untracked-copy design — stale prose about a mechanism that no longer exists is
+  the same defect as a stamp that does not match the code.
 
 
 
