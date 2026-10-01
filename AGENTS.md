@@ -1929,6 +1929,33 @@ e.g. S3's contract column is 40 not 42).
   mutated checker, read which line actually changed, and write the predicate
   from THAT. This is the same discipline as AUDIT #3c's stale-anchor rule.
 
+- **SIXTH RECURRENCE OF THE SAME CLASS: I WROTE THE PREDICATE FOR THE OUTPUT I
+    EXPECTED, NOT THE ONE I OBSERVED.** Two more instances this session, both
+    found by a state reporting MISSED while its defect had reproduced perfectly:
+      * `mutate_checker_matrix_coverage.sh` M-A asserted "the table must not print
+        MISSING". It still does — the table row is independent of the
+        requirement; only the `bad` increment and the exit code disappear. The
+        observable is the VERDICT line, so the predicate now judges on that.
+      * `mutate_run_all_checks.sh` N-M asserted the run must contain "No such
+        file or directory". That string is printed by the STEP's own log, not by
+        the stack. N-M's actual evidence was `step_current FAIL rc=97` and
+        `RUN ALL CHECKS: FAIL (1 step(s) FAILED)`, and it reproduced on the first
+        run — the predicate was simply looking in the wrong file.
+    **RULE: when a state reports MISSED, read the state log and write the
+    predicate from what is ACTUALLY THERE, before touching the mechanism.**
+    A MISSED state with a reproduced defect is nearly always a predicate aimed
+    at the wrong evidence, not a state that fails to mutate. Two of the last
+    three "unobservable mutation" conclusions were this mistake.
+    N-M itself closes the class the full stack exposed on 2026-10-01: a `STEPS`
+    edit adding a matrix name ALSO matched inside a `dispatch()` arm, so the arm
+    ran as `bash $SCRIPT_DIR/mutate_gate_pop.sh mutate_checker_matrix_coverage.sh`
+    (rc=127, stale stamp). Every DIRECT invocation of that matrix passed; only the
+    end-to-end stack failed. N-M hands a dispatch arm a stray argument and
+    requires the run to go loud with that specific failure — note it leaves the
+    arm's LOGIC intact, so 0b's coverage enumeration and step 3/3 must NOT notice,
+    because the arm still exists and is dispatched; only its EXECUTION fails.
+    Read live figures from `build/run_all_mutate/last_pass.stamp`.
+
 - **AN INVERTED PREDICATE SCORES CORRECT CODE AS BROKEN — NAMED RULE, 3 FOR 3.**
     A mutation state that asserts "this marker is ABSENT" while the marker is
     the checker reporting the defect correctly is a state that can never pass.
