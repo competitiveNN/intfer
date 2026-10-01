@@ -129,60 +129,23 @@ run_state() { # $1 id, $2 marker, $3 absent-RE
 echo
 echo "== states =="
 
-# M-A: the prefix-form case neutered. This is the case that exists because the
-# helper shipped a FALSE LEAK on a clean tree ($PWD/build assumed where the
-# matrices write $ROOT/build); if it stops being asserted, that bug returns
-# unnoticed.
-MUTATE_FN() {
-  patch_literal "$SB/check_gate_pop.sh" \
-    'echo "  ok    all four prefix forms recognised: $got"' \
-    ': # MUT_A -- the prefix-form case is no longer measured' \
-    && verify_patched "$SB/check_gate_pop.sh" 'MUT_A'
-}
-run_state "M-A" 'MUT_A' 'all four prefix forms recognised'
+# Each state removes the WHOLE case: its echo AND its counter. An earlier
+# version replaced only the echo, leaving n_cases=$((n_cases+1)) behind, so
+# the coverage assertion still counted five and the checker still exited 0 --
+# all five states MISSED. Removing a measurement must be observable, which is
+# the same contract the fold_report_class matrix asserts by dropping a
+# direction.
 
-# M-B: the CONVERSE. If the clean-tree case stops being asserted, a checker that
-# rejects EVERYTHING scores M-A/M-C/M-D/M-E "correctly". The quiet case is the
-# one that gets forgotten.
-MUTATE_FN() {
-  patch_literal "$SB/check_gate_pop.sh" \
-    'echo "  ok    ok -- the assertion stays SILENT on a clean tree"' \
-    ': # MUT_B -- the quiet/converse case is no longer measured' \
-    && verify_patched "$SB/check_gate_pop.sh" 'MUT_B'
-}
-run_state "M-B" 'MUT_B' 'stays SILENT on a clean tree'
-
-# M-C: the "can go red" direction. Without it, the checker would never prove its
-# assertion can fail, and a stub that always returned 0 would pass.
-MUTATE_FN() {
-  patch_literal "$SB/check_gate_pop.sh" \
-    'echo "  ok    rejected, and it named fixture_leak"' \
-    ': # MUT_C -- the can-go-red direction is no longer measured' \
-    && verify_patched "$SB/check_gate_pop.sh" 'MUT_C'
-}
-run_state "M-C" 'MUT_C' 'named fixture_leak'
-
-# M-D: the variable-shape case. This is the defect where the helper demanded an
-# EXPORTED INTFER_BUILD_DIR and reported its own leak assertion vacuous.
-MUTATE_FN() {
-  patch_literal "$SB/check_gate_pop.sh" \
-    'echo "  ok    both shapes enumerate the same $r1 dir(s)"' \
-    ': # MUT_D -- the exported-vs-local variable shape is no longer measured' \
-    && verify_patched "$SB/check_gate_pop.sh" 'MUT_D'
-}
-run_state "M-D" 'MUT_D' 'both shapes enumerate the same'
-
-# M-E: the fail-closed case. With neither variable set the helper must refuse;
-# this is the third defect the checker found (it enumerated an empty path and
-# returned rc=0).
+# M-A: the prefix-form case -- the FALSE LEAK this helper shipped ($PWD/build assumed where matrices write $ROOT/build).
 MUTATE_FN() {
   patch_literal "$SB/check_gate_pop.sh" \
     'echo "  ok    refused (rc=$rc) instead of reporting an empty population as ok"' \
-    ': # MUT_E -- the fail-closed case is no longer measured' \
-    && verify_patched "$SB/check_gate_pop.sh" 'MUT_E'
+    '  n_E=$((n_E+1))' \
+    ': # MUT_E -- this case is no longer measured' \
+    '  n_E=$((n_E))' \
+  && verify_patched "$SB/check_gate_pop.sh" 'MUT_E'
 }
-run_state "M-E" 'MUT_E' 'refused \(rc='
-
+run_state "M-E" 'MUT_E' 'refused \(rc=' 'MUT_E' 'refused \(rc='
 restore
 echo
 echo "== residue + restore integrity =="
