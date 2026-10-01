@@ -129,23 +129,69 @@ run_state() { # $1 id, $2 marker, $3 absent-RE
 echo
 echo "== states =="
 
-# Each state removes the WHOLE case: its echo AND its counter. An earlier
-# version replaced only the echo, leaving n_cases=$((n_cases+1)) behind, so
-# the coverage assertion still counted five and the checker still exited 0 --
-# all five states MISSED. Removing a measurement must be observable, which is
-# the same contract the fold_report_class matrix asserts by dropping a
-# direction.
+# Each state removes ONE case: its echo line and its own counter increment.
+# The counters are n_a..n_e precisely so each removal has a UNIQUE single-line
+# anchor; a shared counter cannot be targeted (five identical increments), which
+# is why the first pass of this matrix scored 0/5 rather than catching anything.
+# Removing a measurement must be observable -- a case that is deleted, rather than
+# failing, used to leave the checker exiting 0.
 
-# M-A: the prefix-form case -- the FALSE LEAK this helper shipped ($PWD/build assumed where matrices write $ROOT/build).
+# M-A: the prefix-form case -- the FALSE LEAK this helper shipped ($PWD/build assumed
+# where the matrices write $ROOT/build)
+MUTATE_FN() {
+  patch_literal "$SB/check_gate_pop.sh" \
+    'echo "  ok    all four prefix forms recognised: $got"' \
+    '  n_a=$((n_a+1))' \
+    ': # MUT_A -- this case is no longer measured' \
+    '  n_a=$((n_a))' \
+  && verify_patched "$SB/check_gate_pop.sh" 'MUT_A'
+}
+run_state "M-A" 'MUT_A' 'ok    all four prefix forms recognised'
+
+# M-B: the CONVERSE -- without it, a checker that rejects everything passes the rest
+MUTATE_FN() {
+  patch_literal "$SB/check_gate_pop.sh" \
+    'echo "  ok    ok -- the assertion stays SILENT on a clean tree"' \
+    '  n_b=$((n_b+1))' \
+    ': # MUT_B -- this case is no longer measured' \
+    '  n_b=$((n_b))' \
+  && verify_patched "$SB/check_gate_pop.sh" 'MUT_B'
+}
+run_state "M-B" 'MUT_B' 'stays SILENT on a clean tree'
+
+# M-C: the can-go-red direction -- without it a stub always returning 0 would pass
+MUTATE_FN() {
+  patch_literal "$SB/check_gate_pop.sh" \
+    'echo "  ok    rejected, and it named fixture_leak"' \
+    '  n_c=$((n_c+1))' \
+    ': # MUT_C -- this case is no longer measured' \
+    '  n_c=$((n_c))' \
+  && verify_patched "$SB/check_gate_pop.sh" 'MUT_C'
+}
+run_state "M-C" 'MUT_C' 'named fixture_leak'
+
+# M-D: the exported-vs-local variable shape -- the defect that made an assertion
+# report itself vacuous
+MUTATE_FN() {
+  patch_literal "$SB/check_gate_pop.sh" \
+    'echo "  ok    both shapes enumerate the same $r1 dir(s)"' \
+    '  n_d=$((n_d+1))' \
+    ': # MUT_D -- this case is no longer measured' \
+    '  n_d=$((n_d))' \
+  && verify_patched "$SB/check_gate_pop.sh" 'MUT_D'
+}
+run_state "M-D" 'MUT_D' 'both shapes enumerate the same'
+
+# M-E: the fail-closed case -- the third defect, an empty path enumerated at rc=0
 MUTATE_FN() {
   patch_literal "$SB/check_gate_pop.sh" \
     'echo "  ok    refused (rc=$rc) instead of reporting an empty population as ok"' \
-    '  n_E=$((n_E+1))' \
+    '  n_e=$((n_e+1))' \
     ': # MUT_E -- this case is no longer measured' \
-    '  n_E=$((n_E))' \
+    '  n_e=$((n_e))' \
   && verify_patched "$SB/check_gate_pop.sh" 'MUT_E'
 }
-run_state "M-E" 'MUT_E' 'refused \(rc=' 'MUT_E' 'refused \(rc='
+run_state "M-E" 'MUT_E' 'refused \(rc='
 restore
 echo
 echo "== residue + restore integrity =="
