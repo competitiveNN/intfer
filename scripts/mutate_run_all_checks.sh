@@ -244,7 +244,12 @@ commit_mutant() { # $1 = message
 reset_mutant() { cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"; commit_mutant mutant; }
 run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
             # $5 = "root" to litter the sandbox repo ROOT instead of scripts/
-  local id="$1" steps="$2" sdir="$3" residue="${4:-}" where="${5:-}"
+            # $6 = log suffix. A baseline and the state of the same id used to
+            # share "$WORK/$id.log", so the STATE overwrote the baseline's log:
+            # the check still ran (baseline() greps before the state starts) but
+            # the evidence for "the baseline showed the correct marker" was gone
+            # by the time anyone looked. Two phases, two files.
+  local id="$1" steps="$2" sdir="$3" residue="${4:-}" where="${5:-}" logsuf="${6:-}"
   local litter="$RESIDUE_PROBE"
   [ "$where" = "root" ] && litter="$ROOT_PROBE"
   mk_stamps "$sdir"
@@ -258,7 +263,7 @@ run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
   INTFER_BUILD_DIR="$SYNTH/inner" \
   INTFER_RUN_ALL_STEPS="$steps" INTFER_RUN_ALL_EXTRA_STEPS_DIR="$STEPS" \
     INTFER_RUN_ALL_STAMP_DIR="$sdir" INTFER_RAC_LITTER="$litter" \
-    timeout 600 bash "$MUTANT" >"$WORK/$id.log" 2>&1
+    timeout 600 bash "$MUTANT" >"$WORK/$id$logsuf.log" 2>&1
   local rc=$?
   rm -f "$RESIDUE_PROBE" "$ROOT_PROBE"
   return $rc
@@ -271,16 +276,25 @@ baseline() {
   local where="${7:-}"   # litter site: "" = scripts/, "root" = sandbox repo root
   NBASE=$((NBASE + 1))
   reset_mutant
-  run_rac "$id" "$steps" "$sdir" "$residue" "$where"; rc=$?
+  run_rac "$id" "$steps" "$sdir" "$residue" "$where" ".baseline"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "FAIL: baseline $id reached rc=$rc, want $want -- the CASE is broken, not" >&2
-    echo "  the mutation. ($WORK/$id.log)" >&2; exit 1
+    echo "  the mutation. ($WORK/$id.baseline.log)" >&2; exit 1
   fi
-  if [ -n "$marker" ] && ! grep -qF -- "$marker" "$WORK/$id.log"; then
+  if [ -n "$marker" ] && ! grep -qF -- "$marker" "$WORK/$id.baseline.log"; then
     echo "FAIL: baseline $id did not show the CORRECT marker '$marker'." >&2
     echo "  Without this a predicate can be satisfied by an early abort and score" >&2
-    echo "  a false catch. ($WORK/$id.log)" >&2; exit 1
+    echo "  a false catch. ($WORK/$id.baseline.log)" >&2; exit 1
   fi
+  # The baseline's proof is that the CORRECT behaviour is observable -- for the
+  # residue states that includes WHICH file was littered, so a baseline that
+  # quietly littered scripts/ (as an earlier version of baseline() did, by
+  # accepting a litter-site argument and never forwarding it) is visibly
+  # indistinguishable from N-G. The marker cannot express that, so the litter
+  # site is echoed rather than left in the reader's imagination.
+  local lit="(none)"
+  [ -n "$residue" ] && lit="$([ "$where" = root ] && echo "sandbox ROOT" || echo "scripts/")"
+  printf '  ok    baseline %-4s rc=%s, correct marker present, litter=%s\n' "$id" "$rc" "$lit"
   printf '  ok    baseline %-4s rc=%s, correct marker present\n' "$id" "$rc"
 }
 
