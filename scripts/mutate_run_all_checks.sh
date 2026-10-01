@@ -227,9 +227,18 @@ def_n_a() { grep -q 'SELFCHECK: sc_unproven' "$WORK/N-A.log"; }
 def_n_b() { grep -q '1 step(s) unproven' "$WORK/N-B.log" && ! grep -q '(re-run)' "$WORK/N-B.log"; }
 def_n_c() { ! grep -q 'c/last_pass.stamp' "$WORK/N-C.log"; }   # 3rd stamp not enumerated
 def_n_d() { [ -f "$SYNTH/step_sentinel.ran" ]; }                  # a step ran on a dirty tree
-def_n_e() { ! grep -q 'SELFCHECK' "$WORK/N-E.log"; }            # the self-check did not fire
+# The defect is not "no SELFCHECK line": those are printed DURING the loop, so
+# they appear even when the self-check's return value is neutralised. The defect
+# is that the run PROCEEDS past the self-check while classify_rc is wrong. That
+# only means anything because N-A shows the converse -- with the self-check armed,
+# a misclassification never reaches "1/2 checkers". That converse is asserted
+# below, so this predicate cannot pass vacuously.
+def_n_e() { grep -q '1/2 checkers' "$WORK/N-E.log"; }
 def_n_f() { grep -q 'step(s) unproven' "$WORK/N-F.log" && ! grep -q '(re-run)' "$WORK/N-F.log"; }
-def_n_g() { ! grep -q 'untracked residue' "$WORK/N-G.log"; }    # hygiene assertion absent
+# Anchored on the FAIL line specifically. A bare grep for 'untracked residue'
+# also matches the SUCCESS branch ("ok  no untracked residue in scripts"), so the
+# predicate was never true -- the first version of this state could not be caught.
+def_n_g() { ! grep -qE 'FAIL +untracked residue' "$WORK/N-G.log"; }
 
 echo "== BASELINES (unmutated run_all_checks must be CORRECT in each setup) =="
 baseline "N-A" "step_ok"     "$ALL_CURRENT" 0 ""
@@ -321,6 +330,16 @@ reset_mutant
 patch_literal "$MUTANT" "$A_CLASSIFY" "2) printf 'fail\\n' ;;"
 verify_patched N-A
 run_state "N-A" "rc=2 no longer classified UNPROVEN" def_n_a "step_ok" "$ALL_CURRENT"
+# The converse def_n_e depends on: with the self-check ARMED, a misclassification
+# must stop the run BEFORE the steps. Without this assertion, def_n_e ("reached the
+# steps") would be satisfied by a healthy run and prove nothing.
+if grep -q '1/2 checkers' "$WORK/N-A.log"; then
+  echo "  MISSED N-A  the misclassification did NOT gate the run -- the run reached" >&2
+  echo "             the steps anyway, so the self-check is not load-bearing and" >&2
+  echo "             N-E's predicate would pass vacuously." >&2
+  exit 1
+fi
+echo "  ok    N-A    misclassification gated BEFORE the steps (makes def_n_e sound)"
 
 reset_mutant
 patch_literal "$MUTANT" "$A_RERUN" "if false; then"
