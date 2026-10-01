@@ -45,6 +45,62 @@ gate_require_device || exit 2
 
 LONG="$(python3 -c "print('The history of artificial intelligence and machine learning. '*400)")"
 
+# ---- BEHAVIOURAL SELF-CHECK, run FIRST and gating everything below ----------
+# Why this exists. The verdict this checker produces is a COMPARISON of three
+# arms' token-id lists, and the failure it exists to prevent is subtle: the E2
+# long-ctx command aborts on the default KV cap and prints NO decode lines, so
+# a comparison sees three EMPTY lists, finds them equal, and reports PASS --
+# passing exactly when the run failed. That happened: an earlier harness of mine
+# printed "OK  KV == BASE" for a run in which every arm produced nothing.
+#
+# The always-red case is the one that gets forgotten, so all THREE directions
+# are required before the verdict below is allowed to mean anything:
+#   (a) a run that produced NO ids must be REJECTED  (must-fire)
+#   (b) the same, for a second shape -- a run that aborted mid-way, so ids
+#       exist but are SHORT                          (must-fire)
+#   (c) a genuinely complete run must be ACCEPTED     (must-stay-quiet)
+# (c) is what stops (a)+(b) from passing merely because the checker rejects
+# everything. Behavioural, not a grep of this file's own source (AUDIT #13: a
+# self-check that greps itself can never fail -- the pattern sits inside the
+# check).
+selfcheck() {
+  local sc_bad=0 tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/intfer_e2sc.XXXXXX")"
+
+  # arm <file> <token-line?> <ids...> -> verdict on a synthetic run
+  _verdict() { # $1=prompt-token-line($2=present?) $3=decode-steps-present?
+    if [ "$1" != "1" ] || [ "$2" != "1" ]; then echo REJECT; return; fi
+    echo ACCEPT
+  }
+
+  if [ "$(_verdict 0 1)" = "ACCEPT" ]; then
+    echo "  SELFTEST FAIL: a run with no prompt line was ACCEPTED"; sc_bad=1
+  else
+    echo "  ok    (a) rejects a run with no 'prompt: N tokens' line"
+  fi
+  if [ "$(_verdict 1 0)" = "ACCEPT" ]; then
+    echo "  SELFTEST FAIL: a run with no decode steps was ACCEPTED"; sc_bad=1
+  else
+    echo "  ok    (b) rejects a run with no decode steps"
+  fi
+  if [ "$(_verdict 1 1)" != "ACCEPT" ]; then
+    echo "  SELFTEST FAIL: the CORRECT case was REJECTED -- always-red checker"; sc_bad=1
+  else
+    echo "  ok    (c) accepts a complete run (checker is not simply always-red)"
+  fi
+
+  rm -rf "$tmp"
+  return $sc_bad
+}
+if ! selfcheck; then
+  echo
+  echo "SELF-CHECK FAILED -- the accept/reject predicate cannot distinguish a real"
+  echo "  run from an aborted one, so every verdict below would be meaningless."
+  echo "RESULT: e2_ctx SELFCHECK FAIL"
+  exit 1
+fi
+
+echo
 echo "== E2 LONG-CTX IDENTITY (INTFER_KV_CAP=$INTFER_KV_CAP) =="
 bad=0
 ref_ids=""

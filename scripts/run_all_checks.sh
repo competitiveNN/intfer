@@ -152,10 +152,22 @@ dispatch() { # $1 = label -> runs it
       # exits 2 if the pin cannot be resolved, which reads as UNPROVEN rather
       # than as a pass.
       timeout 1800 bash "$SCRIPT_DIR/check_l0_cite.sh"; return $? ;;
+    check_build_dir_consumers.sh)
+      # Static: derives the artifact-consumer population from the CMake
+      # add_executable list plus every script touching a build tree, then fails
+      # on any that hardcodes one. No GPU, no build, seconds.
+      timeout 900 bash "$SCRIPT_DIR/check_build_dir_consumers.sh"; return $? ;;
+    check_doc_counts.sh)
+      # Re-derives the report's commit count with git and fails if the stated
+      # number disagrees, or if the gate tally / TP=2 UNVERIFIED wording moved.
+      timeout 900 bash "$SCRIPT_DIR/check_doc_counts.sh"; return $? ;;
     mutate_l0_cite.sh)
       # Mutates a COPY of the pinned upstream tree under build/, never tracked
       # source, so this matrix is safe to run alongside the rest of the stack.
       timeout 3600 bash "$SCRIPT_DIR/mutate_l0_cite.sh"; return $? ;;
+    mutate_build_dir_consumers.sh)
+      # Edits scripts/bench_reports_batch.sh and restores it from a backup.
+      timeout 1800 bash "$SCRIPT_DIR/mutate_build_dir_consumers.sh"; return $? ;;
     mutate_fold_matrix.sh)
       timeout 7200 bash "$SCRIPT_DIR/mutate_fold_matrix.sh"; return $? ;;
     mutate_gate_inventory.sh)
@@ -299,11 +311,11 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_build_dir_consumers.sh check_doc_counts.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh"
 fi
 echo "== 1/2 checkers =="
 for label in $STEPS; do step "$label"; done

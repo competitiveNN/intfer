@@ -652,7 +652,7 @@ cannot detect a gate that is green-numbered but red."*
 ## Commit index for this GPU investigation
 
 Derived, not hand-counted. `git rev-list --count f047c42^..HEAD` and
-`git log --oneline f047c42^..HEAD | wc -l` agree at **8**; a hand-written
+`git log --oneline f047c42^..HEAD | wc -l` agree at **10**; a hand-written
 "four commits" in an earlier summary of this same work was wrong twice over
 (it miscounted AND listed only two), which is why the number lives here with
 the command that produces it rather than in prose.
@@ -667,3 +667,5 @@ the command that produces it rather than in prose.
 | `684a845` | tabled every harness exit code and how the suite classifies them |
 | `13a76db` | honored `INTFER_BUILD_DIR` (an AUDIT #8 violation I had reintroduced); propagated AUDIT #19 into AGENTS.md |
 | `53442b0` | recorded what a green `run_all_checks` does **not** certify |
+| `e4d6a74` | indexed these commits with the command that derives the count |
+| `10b17a3` | `bench_reports_batch.sh`'s LOG path honored the override — found by the new consumer checker, not by reading |
