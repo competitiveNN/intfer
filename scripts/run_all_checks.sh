@@ -145,6 +145,8 @@ dispatch() { # $1 = label -> runs it
         timeout 3600 bash "$SCRIPT_DIR/check_device_precond.sh"
       fi
       return $? ;;
+    check_e2_ctx.sh)
+      timeout 3600 bash "$SCRIPT_DIR/check_e2_ctx.sh"; return $? ;;
     mutate_fold_matrix.sh)
       timeout 7200 bash "$SCRIPT_DIR/mutate_fold_matrix.sh"; return $? ;;
     mutate_gate_inventory.sh)
@@ -288,7 +290,7 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh"
 fi
