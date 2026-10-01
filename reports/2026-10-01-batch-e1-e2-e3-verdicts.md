@@ -24,21 +24,34 @@ The reports target **27B `--tp 2`**. That cannot run. Verified, not assumed:
   `bcs/ccs/rcs/vcs/vecs` engine topology. `/dev/dri/{card0,card1,renderD128,renderD129}`
   are all present and **open `O_RDWR` fine** (`226:0`, `226:1`, `226:128`, `226:129`).
 * The **compute runtime exposes one device**: `sycl-ls` prints 1
-  `[level_zero:gpu]`, `xpu-smi --list-gpus` prints `GPU 0` only. This is
-  independent of the container's L0 driver version — forcing the host's newer
+  `[level_zero:gpu]`, `xpu-smi --list-gpus` prints `GPU 0` only. Ruled out by
+  measurement: the container's L0 driver version (forcing the host's newer
   `libze_intel_gpu.so.1.17.39758` instead of the container's `1.15.38646` still
-  yields **1** device. OpenCL (`intel64.icd`, a completely separate stack) also
-  reports **1** GPU. Two independent driver stacks agreeing on 1 points at host
-  enumeration, not a driver-library bug, and it is not fixable from inside the
-  container.
+  yields **1** device); cgroup device policy (no `devices.list`, and both render
+  nodes open); NUMA (single node, both cards `numa=-1`); power state (both D0);
+  and another process holding GPU 1 (`fuser` shows no userspace holder on
+  `renderD129`).
+
+> **LEADING HYPOTHESIS — NOT ESTABLISHED: host-side enumeration.** The evidence
+> is that two *independent* driver stacks (Level Zero **and** OpenCL via the
+> unrelated `intel64.icd`) both report 1 GPU while both cards are healthy at
+> kernel level. That is *consistent with* a host/driver enumeration drop of PCI
+> 86:00.0, but it is inference from agreement, not from reading the code that
+> would have to be wrong — the exact mistake AUDIT #9 made and AUDIT #11 had to
+> retract. **I did not find the mechanism.** What I can state from measurement is
+> only the exclusion list above. The remedy ("host-side rebind/rescan of
+> 86:00.0") is therefore a *suggestion to investigate*, not a diagnosed fix, and
+> it may simply be wrong. Whoever picks this up should read the xe/Level Zero
+> enumeration path rather than trusting this paragraph.
+
 * Consequence, reproduced: `--tp 2` on 27B prints
   `WARNING: TP=2 requested but only 1 Arc GPU(s) discovered`, preloads
   **18751 MiB** onto a **12216 MiB** card, then dies `signal 6`, **rc=139**.
   That is the documented AUDIT #11 signature, not a regression.
 
-**Action for the operator:** this needs a host-side fix (rebind/rescan PCI
-86:00.0, or check why the xe device dropped out of Level Zero enumeration) before
-any 27B number in any of these reports can be produced.
+**Action for the operator:** investigate why the xe device at PCI 86:00.0 dropped
+out of Level Zero enumeration, before any 27B number in any of these reports can
+be produced. See the hypothesis caveat above.
 
 ## BLOCKER 2 — the box is contended, so wall-time is not obtainable
 
@@ -98,17 +111,36 @@ available, and the theory that rescues it (27B host-quant cost) is UNVERIFIED.**
 
 ## E2 — `INTFER_INT8_KV=1` (+ `KV_Q8`, `KV_HAD`) — bit-exact, but traffic goes UP
 
-Stream identity at **short ctx (5 tok)** — all three arms identical:
+Stream identity at **short ctx** — all three arms identical:
 
 ```
 BASE / KV / KVQ8   279 6511 314 279 3046 13 198 760
 ```
 
-Stream identity at **long ctx (3601 tok, `INTFER_KV_CAP=8192`)** — all three identical:
+Stream identity at **long ctx** — all three arms identical:
 
 ```
 BASE / KV / KVQ8   561 3712 314 19820 10903 321 5484 6618
 ```
+
+**The long-ctx claim is backed by per-arm evidence, not by a command that
+happened to print ids.** `scripts/verify_e2_ctx.sh` runs each arm and requires
+rc=0, its own `prompt: N tokens` line, and 8 completed decode steps:
+
+```
+INTFER_KV_CAP=8192
+
+BASE   rc=0  prompt: 3601 tokens    decode_steps=8
+       ids: 561 3712 314 19820 10903 321 5484 6618
+KV     rc=0  prompt: 3601 tokens    decode_steps=8
+       ids: 561 3712 314 19820 10903 321 5484 6618
+KVQ8   rc=0  prompt: 3601 tokens    decode_steps=8
+       ids: 561 3712 314 19820 10903 321 5484 6618
+```
+
+So: all three arms genuinely processed **3601 prompt tokens** and each completed
+its 8 decode steps with identical ids. Short-ctx arm prompt was 5 tokens
+(`The capital of France is`). Both contexts are bit-exact for all three arms.
 
 Long-ctx counters, `-n 64`, load1=18.13:
 
@@ -133,7 +165,7 @@ counters move against it.** The report's premise — that KV is the traffic shar
 INT2 weights do not already shrink — is **not supported at 0.8B** and remains
 untested at 27B.
 
-### Capacity finding (report asked for this to be reported, not dropped)
+### Capacity finding — the E2 long-ctx command AS WRITTEN ABORTS (fix the command first)
 
 A 3601-token prompt **aborts** on the default cache:
 
@@ -141,10 +173,53 @@ A 3601-token prompt **aborts** on the default cache:
 [intfer] FATAL: pos 1151 >= KV capacity 1024 (raise INTFER_KV_CAP, max 262144)
 ```
 
-`INTFER_KV_CAP` defaults to **1024**. The E2 report's own long-context command
-(*400 repetitions) cannot run without raising it. Any long-ctx test must set
-`INTFER_KV_CAP` explicitly; this is a real usability/capacity constraint for the
-long-context use case E2 is meant to serve.
+`INTFER_KV_CAP` defaults to **1024**. The long-context command in
+`reports/2026-09-30-pending-bench-backlog.md` (the `*400` repetition) **cannot run
+as written** — it aborts before the first decode step, and because my harness
+initially compared empty id lists it even reported a false `OK`. This is a real
+usability/capacity constraint for the long-context use case E2 exists to serve,
+and it is not specific to 0.8B: the cap is a flat position limit.
+
+**Corrected, verified-runnable long-ctx E2 command** (this is what produced the
+long-ctx numbers above — 0.8B TP=1, and it needs `INTFER_KV_CAP`):
+
+```bash
+BIN=build/examples/intfer_cli/intfer_cli
+M=test/models/Qwen3.5-0.8B.intifer
+TOK="--tokenizer-py scripts/bpe_tokenize.py --detok-py scripts/bpe_detokenize.py"
+LONG="$(python3 -c "print('The history of artificial intelligence and machine learning. '*400)")"
+# PROMPT IS 3601 TOKENS -> the default INTFER_KV_CAP=1024 ABORTS. Raise it.
+export INTFER_KV_CAP=8192
+for arm in BASE KV KVQ8; do
+  case $arm in
+    BASE) unset INTFER_INT8_KV INTFER_KV_Q8 INTFER_KV_HAD ;;
+    KV)   export INTFER_INT8_KV=1; unset INTFER_KV_Q8 INTFER_KV_HAD ;;
+    KVQ8) export INTFER_INT8_KV=1 INTFER_KV_Q8=1 INTFER_KV_HAD=1 ;;
+  esac
+  "$BIN" --gpu --tp 1 -m "$M" -p "$LONG" -n 64 --no-stream $TOK 2>&1 \
+    | grep -aE "prompt: [0-9]+ tokens|decode: [0-9]+ tokens in|@decode\]"
+done
+```
+
+Always assert the `prompt: N tokens` line is present in the output. A run that
+aborted on the KV cap produces no decode line, and that absence must not be
+allowed to read as a pass.
+
+### PRECONDITION on every `--tp 2` command in these reports
+
+All three reports' 27B commands are `--tp 2`, and **none of them can run on a
+1-GPU box**. Before spending any window on them:
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+export LD_LIBRARY_PATH=/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}
+sycl-ls | grep -c '\[level_zero:gpu\]'     # MUST print 2, else STOP
+```
+
+If it prints **1**, `--tp 2` silently clamps to TP=1 and 27B (19.9 GB) preloads
+18751 MiB onto a 12216 MiB card and dies `signal 6`/rc=139. Do not read that as
+a regression, and do not "fix" it by relaxing the command.
+
 
 ## E3 — `INTFER_DPAS48_FOLD=1` — bit-exact, and its report's numbers REPLICATE
 

@@ -235,6 +235,10 @@ done
 ### Commands (27B, TP=2, long context decode)
 ```bash
 LONG="$(python3 -c "print('The history of artificial intelligence and machine learning. '*400)")"
+# 2026-10-01: that LONG prompt is 3601 tokens and INTFER_KV_CAP DEFAULTS TO 1024,
+# so this command ABORTS as written with "FATAL: pos 1151 >= KV capacity 1024".
+# Raise the cap or the arm dies before its first decode step. Verified working:
+export INTFER_KV_CAP=8192
 for r in 1 2 3; do
   echo "== round $r load1=$(awk '{print $1}' /proc/loadavg) =="
   for arm in "BASE" "KV" "KVQ8"; do

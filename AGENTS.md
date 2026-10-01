@@ -7,6 +7,36 @@ Port ninfer (https://github.com/Neroued/ninfer) to our local setup made of intel
 is not currently visible — see AUDIT #11, where it vanished mid-session. That
 single fact governs how every gate result in this file must be read:
 
+  === 2026-10-01: THE HARDWARE IS FINE; ONLY THE *ENUMERATION* IS DOWN ===
+  Re-measured from scratch. This is NOT a "1-GPU machine" and must not be
+  described as one — that phrasing caused a wrong conclusion in this session.
+  BOTH B580s are present and healthy at kernel level:
+    * card0 -> 0000:04:00.0 and card1 -> 0000:86:00.0, on DIFFERENT PCI roots
+      (pci0000:00 and pci0000:80); both 8086:E20B, both DRIVER=xe, both
+      runtime_status=D0; both expose tile0 + gt0/gt1 + bcs/ccs/rcs/vcs/vecs
+    * /dev/dri/{card0,card1,renderD128,renderD129} all present (226:0, 226:1,
+      226:128, 226:129) and all open O_RDWR successfully
+  But the COMPUTE RUNTIME exposes one device: `sycl-ls` -> 1 [level_zero:gpu],
+  `xpu-smi --list-gpus` -> "GPU 0" only.
+  RULED OUT BY MEASUREMENT (do not re-try these): the L0 driver library version
+  — the container has libze_intel_gpu 1.15.38646 and the host has 1.17.39758, and
+  forcing the host's newer one onto LD_LIBRARY_PATH still yields 1 device;
+  cgroup device policy (no devices.list, and both render nodes open); NUMA (one
+  node, both cards numa=-1); power state (both D0); another process holding
+  GPU 1 (`fuser` shows no userspace holder on renderD129).
+  *** LEADING HYPOTHESIS, NOT ESTABLISHED: host-side enumeration. *** The only
+  real evidence is that Level Zero AND OpenCL (via the unrelated intel64.icd)
+  both report 1 GPU while both cards are kernel-healthy. That is CONSISTENT
+  WITH a host/driver enumeration drop of 86:00.0, but it is inference from
+  agreement — precisely the mistake AUDIT #9 made that AUDIT #11 had to retract.
+  **I did not find the mechanism.** Any "fix" (rebind/rescan 86:00.0) is a
+  suggestion to investigate, not a diagnosed remedy, and may be wrong. Read the
+  xe/Level Zero enumeration path before trusting any of it. Details + the full
+  exclusion list: reports/2026-10-01-batch-e1-e2-e3-verdicts.md.
+  CONSEQUENCE (reproduced 2026-10-01): 27B at --tp 2 clamps to TP=1, preloads
+  18751 MiB onto a 12216 MiB card, dies `signal 6` / rc=139. Every 27B `--tp 2`
+  command in reports/ is unrunnable until enumeration is restored.
+
 - **Current full-suite result: 7 PASS, 2 PARTIAL, 1 SKIPPED** (rc = 0/2/2).
   The 10 gates, by exit code: rc=0 → `cpu_parity`, `dpas_fold`, `ga64_recip`,
   `gguf_roundtrip`, `http_batch`, `oracle_equiv`, `serve_load` (7). rc=2
