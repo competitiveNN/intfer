@@ -189,8 +189,14 @@ run_state_stub() {
     echo "  $id MISSED -- coverage passed with a FAILING arm lookup"
     echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; return 1
   fi
-  if ! pred_expect_absent "$id query-failure" "$o" "$expect"; then
-    echo "$id MISSED (polarity or marker survived)" >> "$LOG/summary.txt"; return 1
+  # PRESENCE, not absence -- and this is the sixth instance of the same
+  # inversion. With the arm-drift rule removed and the query forced to fail, the
+  # checker MUST still refuse, and it signals refusal by PRINTING QUERY-FAILED.
+  # I asserted the marker would be absent, which scored the working guard as
+  # MISSED. Read the log, write the polarity from what it shows.
+  if ! pred_expect_present "$id query-failure" "$o" "$expect"; then
+    echo "$id MISSED (polarity: expected the refusal marker to be PRESENT)" \
+      >> "$LOG/summary.txt"; return 1
   fi
   echo "  $id caught -- rc=$r, verdict-polarity=expect-absent (query failure refused)"
   echo "$id caught" >> "$LOG/summary.txt"; caught=$((caught+1)); return 0
