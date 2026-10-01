@@ -162,6 +162,13 @@ DUMMY="$SB/scripts/mutate_dummy.sh"
 mkdir -p "$SB/scripts"
 rm -rf "$WORK"; mkdir -p "$WORK" || exit 1
 cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"
+# The mutant SOURCES scripts/_gate_enum.sh (grep rc-classification + the
+# anti-vacuity guard in section 0b). Both here AND in reset_mutant, because
+# reset_mutant re-commits: populating only one of the two left the sandbox
+# dirty after the baselines and the matrix refused to run its states.
+for sib in _gate_enum.sh _gate_precond.sh; do
+  [ -e "$SCRIPT_DIR/$sib" ] && cp "$SCRIPT_DIR/$sib" "$SB/scripts/$sib"
+done
 git init -q "$SB" || { echo "FAIL: could not init sandbox repo $SB" >&2; exit 1; }
 git -C "$SB" -c user.email=m@x -c user.name=matrix add -A >/dev/null 2>&1
 git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m sandbox >/dev/null 2>&1
