@@ -54,27 +54,35 @@ else
 fi
 # the number the report claims, taken from the sentence that states it
 claimed="$(grep -oE 'agree at \*\*[0-9]+\*\*' "$REPORT" | grep -oE '[0-9]+' | head -1)"
+idx_rows="$(grep -cE '^\| `[0-9a-f]{7,40}` \|' "$REPORT")"
 if [ -n "$claimed" ]; then
-  if [ "$claimed" = "$real_n" ]; then
-    echo "   ok    report's claimed count ($claimed) == git ($real_n)"
-  elif [ "$claimed" -lt "$real_n" ] 2>/dev/null; then
-    # The index in $REPORT lists commits, so EVERY commit made after it was last
-    # refreshed invalidates the number it states -- including the commit that
-    # refreshed the checker itself. That is not a code regression and it must
-    # not be reported as one, or the remedy printed ("fix the number") sends
-    # the next person to edit a document that is about to be stale again.
-    # Exit 2 => UNPROVEN in run_all_checks.sh: "evidence is about an older
-    # tree", remedy "re-derive the count". This is the rc=1-vs-rc=2 doctrine
-    # (AUDIT #18) applied to documentation evidence.
-    echo "   UNPROVEN report claims $claimed, git now says $real_n -- the index"
-    echo "            was last refreshed $((real_n - claimed)) commit(s) ago."
-    echo "            This is STALE EVIDENCE, not a regression. Re-derive with:"
-    echo "              git log --oneline f047c42^..HEAD"
-    echo "RESULT: doc counts STALE (claimed $claimed, git $real_n)"
-    exit 2
+  # THE PRIMARY CHECK: the stated count must equal the number of rows the
+  # table actually lists. This is the defect class this session produced twice
+  # ("four commits" over two, "five issues" over four) -- a number that
+  # disagrees with the items it purports to enumerate -- and it is STABLE: it
+  # does not change when some unrelated commit lands.
+  #
+  # The earlier version compared against `git rev-list --count` instead, which
+  # made the check structurally self-invalidating: the table lists commits, so
+  # every commit after its last refresh changed the answer, including the
+  # commit that refreshed the checker itself. It then sat permanently UNPROVEN
+  # (suite rc=2) with no remedy that could ever work. Comparing the number to
+  # the ROWS keeps the guarantee that matters and drops the part that could not
+  # be satisfied. Membership in history is checked separately below, which is
+  # what catches a fabricated or stale sha.
+  if [ "$claimed" = "$idx_rows" ]; then
+    echo "   ok    stated count ($claimed) == rows in the index ($idx_rows)"
   else
-    echo "   FAIL report claims $claimed commits, git says $real_n -- the number is"
-    echo "        HIGHER than history, i.e. it was never derived"; bad=$((bad+1))
+    echo "   FAIL stated count ($claimed) disagrees with the $idx_rows row(s)"
+    echo "        the table lists -- the 'a number in prose is a citation' defect"
+    bad=$((bad+1))
+  fi
+  # Informational only: the index is a curated set of commits, not every
+  # commit, so git's total may legitimately exceed it. Never a verdict.
+  if [ "$real_n" != "$idx_rows" ]; then
+    echo "   note  git has $real_n commit(s) in f047c42^..HEAD; the index lists"
+    echo "         $idx_rows. A curated index need not be exhaustive -- that is"
+    echo "         reported, never failed on."
   fi
 else
   echo "   WARN no 'agree at **N**' sentence found to check (skip, not silently pass)"
@@ -89,16 +97,23 @@ if [ "$idx_n" -eq 0 ]; then
   bad=$((bad+1))
 else
   echo "   ok    $idx_n index row(s) present"
-  # every sha in the index must exist in history
+  # Every sha in the index must exist in history. The verdict is CONDITIONAL:
+  # the first version printed "ok every cited sha resolves" unconditionally,
+  # immediately after the loop that had already printed FAIL lines -- so a
+  # fabricated sha produced "FAIL index cites deadbeef" AND "ok every cited sha
+  # resolves" in the same run, and the suite printed PASS off the ok. Measured.
+  # The summary line is now emitted only when nothing failed.
+  n_bad=0
   for sha in $(grep -oE '^\| `[0-9a-f]{7,40}`' "$REPORT" | tr -d '|` ' | cut -c1-12); do
-    if git cat-file -e "${sha}^{commit}" 2>/dev/null || \
-       git log --format=%H "$range" 2>/dev/null | grep -q "^${sha}"; then
-      :
-    else
-      echo "   FAIL index cites $sha which is not in history"; bad=$((bad+1))
+    if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+      echo "   FAIL index cites $sha which is not in git history"; n_bad=$((n_bad+1))
     fi
   done
-  echo "   ok    every cited sha resolves in git history"
+  if [ "$n_bad" -eq 0 ]; then
+    echo "   ok    every cited sha resolves in git history"
+  else
+    bad=$((bad+1))
+  fi
 fi
 
 # ---- 3. the tally must not have been edited into a live claim --------------
