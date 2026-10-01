@@ -393,7 +393,13 @@ A_RESIDUE='RESIDUE="$(LC_ALL=C comm -13 \
              <(LC_ALL=C sort "$UNTRACKED_BEFORE") \
              <(git status --porcelain --untracked-files=all | LC_ALL=C sort) \
            | grep -v '"'"'^ M'"'"' || true)"'
-A_ESCALATE="printf 'REGRESSED rc=%s (%s) -- was unproven, is now a real failure\\n' \"\$rc\" \"\$log\"\n          UNPROVEN=\$((UNPROVEN - 1))\n          FAILED=\$((FAILED + 1)) ;;"
+# A three-LINE block, not the announcement line alone: the replacement has to
+# absorb the two statements that follow it, or they are left dangling and
+# verify_patched aborts on a syntax error (which is correct, and is why the
+# state failed loudly rather than scoring a false catch).
+A_ESCALATE="printf 'REGRESSED rc=%s (%s) -- was unproven, is now a real failure\\n' \"\$rc\" \"\$log\"
+          UNPROVEN=\$((UNPROVEN - 1))
+          FAILED=\$((FAILED + 1)) ;;"
 A_COVER='grep -qxF "$b" || UNDISPATCHED="$UNDISPATCHED $b"'
 check_anchor "$A_CLASSIFY" "N-A: the rc=2 UNPROVEN classification"
 check_anchor "$A_RERUN"   "N-B: the 2b re-run guard"
