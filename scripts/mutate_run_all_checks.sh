@@ -257,7 +257,18 @@ commit_mutant() { # $1 = message
   git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$MUTANT" >/dev/null 2>&1
   git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "$1" -- "$MUTANT" >/dev/null 2>&1 || true
 }
-reset_mutant() { cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"; commit_mutant mutant; }
+reset_mutant() {
+  cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"
+  # The mutant SOURCES scripts/_gate_enum.sh (grep rc-classification +
+  # anti-vacuity guard in section 0b), so the sandbox needs that sibling.
+  # Without it every baseline died with "_gate_enum.sh: No such file or
+  # directory" and the matrix reported a broken CASE rather than its own
+  # defect -- the same missing-sibling class that has cost three detours.
+  for sib in _gate_enum.sh _gate_precond.sh; do
+    [ -e "$SCRIPT_DIR/$sib" ] && cp "$SCRIPT_DIR/$sib" "$SB/scripts/$sib"
+  done
+  commit_mutant mutant
+}
 run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
             # $5 = "root" to litter the sandbox repo ROOT instead of scripts/
             # $6 = log suffix. A baseline and the state of the same id used to
