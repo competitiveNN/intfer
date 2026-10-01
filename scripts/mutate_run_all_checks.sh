@@ -22,12 +22,22 @@
 #   * N-A and N-B scored MISSED, when in fact the states never ran.
 #   * N-C scored CAUGHT, and that was WORSE: its predicate was "no STALE line in
 #     the output", which a top-of-run abort trivially satisfies. A false catch.
-# So the mutation is applied to an UNTRACKED COPY at scripts/_rac_mutant.sh.
-# `git diff` ignores untracked files, so the tracked tree stays clean, the target's
-# dirty-tree guard does its real job, and the mutation is what we actually observe.
 # A mask that hides the defect under test is worse than no state at all, and a
 # predicate loose enough to be satisfied by an early abort is a check that cannot
 # fail.
+#
+# The SECOND version used an UNTRACKED copy at scripts/_rac_mutant.sh, which fixed
+# the masking -- and then immediately collided with the tree-hygiene assertion
+# this matrix also introduced, because that copy IS untracked residue in the very
+# directory the assertion polices. Exempting it by name would be a hand-maintained
+# list, i.e. the copy-drift family again.
+#
+# So the mutant now lives in a THROWAWAY GIT REPO (see $SB below). Its git diff
+# and git rev-parse resolve inside the sandbox, its stamps are built from the
+# sandbox head, and the real repository is never touched at all. Each patched state
+# is COMMITTED in the sandbox, so the mutant's own start-of-run guard stays armed
+# against what it is meant to catch (N-D's deliberate dirtiness) rather than
+# against the harness.
 #
 # Each state is judged by a DEFECT PREDICATE, and every predicate is a POSITIVE
 # assertion about the defect ("this specific evidence is ABSENT/BAD"), never the
@@ -325,7 +335,7 @@ run_state() { # $1 id, $2 desc, $3 predicate, $4 steps, $5 stampdir, $6 dirty?
   printf '  ok    %-4s mutant discarded (tracked tree never dirtied)\n' "$id"
 }
 
-echo "== MUTATION MATRIX: run_all_checks.sh (untracked mutant) =="
+echo "== MUTATION MATRIX: run_all_checks.sh (sandbox mutant) =="
 reset_mutant
 patch_literal "$MUTANT" "$A_CLASSIFY" "2) printf 'fail\\n' ;;"
 verify_patched N-A
@@ -395,8 +405,9 @@ if [ "$CAUGHT" -eq "$TOTAL" ]; then
   echo "  run_all_checks.sh can fail: its rc=2 verdict, its 2b re-run (guard AND"
   echo "  derivation), its stamp enumeration, its dirty-tree guard, its classifier"
   echo "  self-check, and its end-of-run tree-hygiene assertion."
-  echo "  The tracked tree is never modified -- the mutation lives in an untracked"
-  echo "  copy, so the target's own dirty-tree guard stays armed during every case."
+  echo "  The real repository is never modified: the mutant lives in a throwaway"
+  echo "  git repo and each patched state is committed there, so the target's own"
+  echo "  dirty-tree guard stays armed against N-D's deliberate dirtiness."
   echo "  stamp: $STAMP"
   exit 0
 fi
