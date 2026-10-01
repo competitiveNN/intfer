@@ -33,7 +33,7 @@ git -C "$ROOT" diff --quiet -- "$TARGET" 2>/dev/null || {
 
 CB="$(mktemp "${TMPDIR:-/tmp}/cdc.XXXXXX")"
 cp "$TARGET" "$CB"
-trap 'cp "$CB" "$TARGET"; rm -f "$CB"' EXIT
+trap 'cp "$CB" "$TARGET"; rm -rf "$WORK" "$CB"' EXIT
 restore() { cp "$CB" "$TARGET"; }
 
 echo "== baseline: clean tree must PASS =="
@@ -90,34 +90,151 @@ run_state "M-A" 'stated count .* == rows in the index' \
   's|\[ "\$claimed" = "\$idx_rows" \]|false|' \
   "the number no longer has to match the rows it enumerates"
 
-# M-B: the sha-history check is neutered. Note the exit code is UNCHANGED here
-# on a clean tree -- only a fabricated sha can see this -- which is exactly why
-# it needs a state rather than a passing run.
-run_state "M-B" 'every cited sha resolves in git history' \
-  's|^    echo "   ok    every cited sha resolves in git history"|    echo "   ok    sha check skipped"|' \
-  "a fabricated sha would no longer be caught"
+# The four states below POISON THE REPORT and NEUTER THE CHECK TOGETHER.
+#
+# My first version mutated only the CHECKER's printed message and required
+# rc!=0 -- and 4 of 6 states scored MISSED, correctly. Removing a message
+# changes nothing about behaviour: on a CLEAN tree a checker with a silenced
+# message SHOULD still exit 0. So those states proved only that the message
+# could be edited.
+#
+# The fix is to give the checker a real defect to miss. Each state writes the
+# defect into the REPORT (the poison) and disables the check that would have
+# caught it. If the checker still reports ok/rc=0 with the defect PRESENT, the
+# mechanism is provably not load-bearing -- which is the only way to test a
+# check whose healthy path is indistinguishable from a broken one by exit code
+# alone. Compare M-A/M-E, which mutate the COMPARISON rather than a message and
+# so are visible on a clean tree.
+REPORT_PATH="$ROOT/$REPORT"; export REPORT_PATH
+POISON_BAK="$(mktemp "${TMPDIR:-/tmp}/rep.XXXXXX")"
+cp "$ROOT/$REPORT" "$POISON_BAK"
+poison_restore() { cp "$POISON_BAK" "$ROOT/$REPORT"; }
+# Named poisons, each a small python script written to $WORK. NOT inline shell:
+# three earlier versions used sed expressions, and every one of them failed for
+# a DIFFERENT quoting reason -- a table row's literal `|` colliding with the
+# s|...| delimiter, ``**N**`` needing BRE escaping, and backticks in the anchor
+# being evaluated by the shell. Two states silently no-op'd, which is the AUDIT
+# #17 anchor lesson: an anchor that does not resolve proves nothing and must be
+# verified, not assumed.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/intfer_dcm.XXXXXX")"
+export REPORT_PATH="$ROOT/$REPORT"
 
-# M-C: the vacuous-harvest guard removed -> empty index could pass again.
-run_state "M-C" 'harvested 0 items' \
+cat > "$WORK/poison_fabricate_sha.py" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+anchor = "| `" + "f047c42" + "` |"
+poison = "| `" + "deadbeef1" + "` | fabricated |\n"
+if anchor not in s:
+    sys.exit(3)          # anchor vanished -> refuse, do not silently no-op
+open(p, "w").write(s.replace(anchor, poison + anchor, 1))
+PYEOF
+
+cat > "$WORK/poison_break_count_sentence.py" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+i = s.find("agree at **")
+if i < 0:
+    sys.exit(3)
+j = s.index("\n", i)
+open(p, "w").write(s[:i] + "agree at some number" + s[j:])
+PYEOF
+
+cat > "$WORK/poison_empty_index.py" <<'PYEOF'
+import sys, re
+p = sys.argv[1]
+s = open(p).read()
+# drop every commit-index row, leaving the index empty
+out = re.sub(r"^\| `[0-9a-f]{7,40}` \|.*$", "| (removed) |", s, flags=re.M)
+if out == s:
+    sys.exit(3)
+open(p, "w").write(out)
+PYEOF
+
+cat > "$WORK/poison_drop_unverified.py" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if "remains UNVERIFIED" not in s:
+    sys.exit(3)
+open(p, "w").write(s.replace("remains UNVERIFIED", "is fine", 1))
+PYEOF
+
+# run_poisoned <id> <poison-command> <check-sed|empty> <absent-re> <why>
+run_poisoned() {
+  local id="$1" psed="$2" csed="$3" expect="$4" why="$5"
+  total=$((total+1))
+  poison_restore; restore
+  # The poison is a SHELL COMMAND, not a sed expression. Two states silently
+  # no-op'd as sed because BRE-escaping markdown (`` **N** ``, a literal `|`
+  # inside a table row) is its own source of bugs -- the state reported MISSED
+  # for the wrong reason twice before this. python3 does a literal replace.
+  python3 "$psed" "$ROOT/$REPORT" || { echo "  $id MISSED -- poison script failed"
+    echo "$id MISSED (poison error)" >> "$LOG/summary.txt"; poison_restore; return 1; }
+  # "-" means POISON-ONLY: nothing in the checker is touched on purpose. The
+  # still-applied guard below is skipped for those states, because there is no
+  # checker edit to verify.
+  if [ "$csed" != "-" ]; then
+    sed -i "$csed" "$TARGET"
+    if cmp -s "$CB" "$TARGET"; then
+      echo "  $id MISSED -- check mutation did not apply"
+      echo "$id MISSED (no apply)" >> "$LOG/summary.txt"; poison_restore; return 1
+    fi
+  fi
+  if cmp -s "$POISON_BAK" "$ROOT/$REPORT"; then
+    echo "  $id MISSED -- POISON did not apply (state proves nothing)"
+    echo "$id MISSED (poison no-op)" >> "$LOG/summary.txt"; poison_restore; return 1
+  fi
+  local o r
+  o="$("$CHECK" 2>&1)"; r=$?
+  printf '%s\n' "$o" > "$LOG/$id.log"
+  poison_restore
+  # A MISS is: the checker exited 0 (or printed ok) while the defect is present.
+  if [ "$r" -eq 0 ]; then
+    echo "  $id MISSED -- checker exited 0 although $why"
+    echo "$id MISSED (blind to the defect)" >> "$LOG/summary.txt"; return 1
+  fi
+  if printf '%s\n' "$o" | grep -qE "$expect"; then
+    echo "  $id MISSED -- still claims '$expect' although $why"
+    echo "$id MISSED (marker survived)" >> "$LOG/summary.txt"; return 1
+  fi
+  echo "  $id caught -- rc=$r and the ok-marker is gone, though $why"
+  echo "$id caught" >> "$LOG/summary.txt"; caught=$((caught+1)); return 0
+}
+
+# M-B: sha-history check neutered + a fabricated sha added to the index.
+#      Only this pairing can see the defect: with no fabricated sha the check
+#      and the report both look healthy.
+# The anchor is a line that actually exists in the REPORT (my first two
+# attempts used strings that live in the CHECKER, so the poison never applied
+# and the state scored MISSED for the wrong reason -- a state that mutates
+# nothing proves nothing, which is why run_poisoned verifies the poison landed).
+# M-B: POISON ONLY. The sha-history check is load-bearing iff a fabricated sha
+#      makes the checker FAIL. No checker mutation needed -- and a checker that
+#      PASSES with a fabricated sha present is provably blind to it.
+run_poisoned "M-B" "$WORK/poison_fabricate_sha.py" \
+  '-' \
+  'every cited sha resolves' \
+  "a fabricated sha is in the index"
+#      that turns "no rows" from silent into a failure.
+run_poisoned "M-C" "$WORK/poison_empty_index.py" \
   's|^enum_require_nonempty "commit-index rows".*|true|' \
-  "an empty index harvest is accepted, so nothing is verified"
-
-# M-D: the 'count sentence is REQUIRED' rule downgraded back to a warning. This
-# is the state for the defect this matrix was born from: the checker printed
-# WARN+skip and exited 0 when its subject sentence was absent.
-run_state "M-D" 'ABSENT, so a PASS would be vacuous' \
-  "s|is ABSENT, so a PASS would be vacuous|is absent, continuing anyway|" \
-  "a missing count sentence is tolerated again"
-
-# M-E: the tally guard removed.
-run_state "M-E" 'tally still reads 7 PASS / 2 PARTIAL / 1 SKIPPED' \
-  's|7 PASS, 2 PARTIAL, 1 SKIPPED|9 PASS, 1 PARTIAL, 0 SKIPPED|' \
-  "an altered gate tally would be reported as intact"
-
-# M-F: the TP=2 UNVERIFIED guard removed -- the wording this repo must not lose.
-run_state "M-F" 'TP=2 still marked UNVERIFIED' \
-  's|TP=2 still marked UNVERIFIED|TP=2 fine|' \
-  "losing the TP=2 UNVERIFIED marker is no longer caught"
+  'harvested 0 items' \
+  "the index has no rows at all"
+#      pattern matches nothing. This is the exact defect the matrix was born
+#      from: WARN + skip + exit 0 with the subject absent.
+# Anchor on a whole line that EXISTS in the report (the count sentence wraps
+# across two lines, so a bare `agree at **N**` pattern is not a line anchor).
+run_poisoned "M-D" "$WORK/poison_break_count_sentence.py" \
+  's|is ABSENT, so a PASS would be vacuous|is absent, continuing anyway|' \
+  'ABSENT, so a PASS would be vacuous' \
+  "the count sentence is absent"
+run_poisoned "M-F" "$WORK/poison_drop_unverified.py" \
+  's|echo "   ok    TP=2 still marked UNVERIFIED"|echo "   ok    TP=2 fine"|' \
+  'TP=2 still marked UNVERIFIED' \
+  "the TP=2 UNVERIFIED wording is gone"
+rm -f "$POISON_BAK"
 
 restore
 echo

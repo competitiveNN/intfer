@@ -161,6 +161,10 @@ dispatch() { # $1 = label -> runs it
       # Re-derives the report's commit count with git and fails if the stated
       # number disagrees, or if the gate tally / TP=2 UNVERIFIED wording moved.
       timeout 900 bash "$SCRIPT_DIR/check_doc_counts.sh"; return $? ;;
+    mutate_doc_counts.sh)
+      # Poisons a COPY of the batch report, then restores it. Refuses to start
+      # if the report is dirty, and verifies every poison actually landed.
+      timeout 1800 bash "$SCRIPT_DIR/mutate_doc_counts.sh"; return $? ;;
     mutate_l0_cite.sh)
       # Mutates a COPY of the pinned upstream tree under build/, never tracked
       # source, so this matrix is safe to run alongside the rest of the stack.
@@ -315,7 +319,7 @@ else
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh"
 fi
 echo "== 1/2 checkers =="
 for label in $STEPS; do step "$label"; done
