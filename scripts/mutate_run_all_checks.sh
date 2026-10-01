@@ -479,7 +479,6 @@ baseline "N-K" "step_ok step_commit" "$ALL_CURRENT" 1 "HEAD MOVED under this run
 # runs on a tree that never moves -- so without this line "the detector is quiet
 # on a healthy run" was asserted nowhere. A detector hard-wired to always report a
 # move would pass N-K and turn every future stack run red.
-baseline "N-Kq" "step_ok" "$ALL_CURRENT" 0 "" "" "HEAD MOVED under this run"
 # `rm -f` alone leaves a DELETION in the sandbox's working tree, so every
 # subsequent state aborted at the top on the mutant's own dirty-tree guard and
 # scored MISSED -- four states (N-A, N-B, N-E, N-F) disarmed by one stray `rm`.
@@ -487,6 +486,7 @@ baseline "N-Kq" "step_ok" "$ALL_CURRENT" 0 "" "" "HEAD MOVED under this run"
 # class independently of this comment.
 rm -f "$DUMMY"
 git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "drop dummy" -- "$DUMMY" >/dev/null 2>&1
+baseline "N-Kq" "step_ok" "$ALL_CURRENT" 0 "" "" "HEAD MOVED under this run"
 
 # The baselines are where the sandbox is set up, so this is the last point at
 # which a stray staged change can be seen before the states start aborting on
