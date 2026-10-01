@@ -153,6 +153,19 @@ gpu_guard_state() { # $1 = comment-stripped code file
 # require PLUS per-arm machinery -- the combination that fooled the old check)
 # must classify WHOLE-gate, and a per-arm gate must not. If this ever cannot
 # fail, it is the vacuous-check trap again and it will say so.
+# The doc-tally parser, factored out so it can be PROVEN rather than inferred
+# from whatever happens to be in the docs. M8 (make this comma-only) was
+# unobservable once the expected tally moved to 10/0/0: every slash-form site in
+# the docs is HISTORICAL (7/2/1), so it read STALE with or without slash
+# tolerance. A mutation whose visibility depends on incidental document content
+# is a mutation that quietly stops being load-bearing -- the AUDIT #21 lesson.
+parse_tally_counts() {
+  local txt="$1"
+  PARSE_P="$(printf '%s' "$txt"  | sed -nE 's/.*[^0-9]([0-9]+) PASS.*/\1/p')"
+  PARSE_PA="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) PARTIAL.*/\1/p')"
+  PARSE_SK="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) SKIPPED.*/\1/p')"
+}
+
 selfcheck_classifier() {
   local bad=0 tmp w p r
   tmp="$(mktemp "${TMPDIR:-/tmp}/gate_inv_selfcheck.XXXXXX")"
@@ -229,6 +242,26 @@ GATE
   r="$(gpu_guard_state "$tmp.c")"
   [ "$r" = "not-gpu" ] || { echo "SELFCHECK: CPU gate read '$r', want not-gpu" >&2; bad=1; }
   rm -f "$tmp" "$tmp.c"
+  # M8's case, driven from a FIXTURE rather than from the documents. It used to
+  # depend on some site in AGENTS.md/reports using the slash form AND matching
+  # the CURRENT expected tally; when the expected tally moved to 10/0/0, no
+  # historical site could match, so the state silently stopped being able to
+  # fail. A mutation whose visibility rests on incidental document content is a
+  # mutation that quietly stops being load-bearing (AUDIT #21).
+  parse_tally_counts "Full-suite: 7 PASS / 2 PARTIAL / 1 SKIPPED today."
+  if [ "$PARSE_P" = 7 ] && [ "$PARSE_PA" = 2 ] && [ "$PARSE_SK" = 1 ]; then
+    echo "  M8: a slash-form doc tally is PARSED, not mis-read as 7/0/0"
+  else
+    echo "SELFCHECK: slash-form tally parsed as '$PARSE_P/$PARSE_PA/$PARSE_SK', want 7/2/1" >&2
+    bad=1
+  fi
+  parse_tally_counts "Full-suite: 7 PASS, 2 PARTIAL, 1 SKIPPED today."
+  if [ "$PARSE_P" = 7 ] && [ "$PARSE_PA" = 2 ] && [ "$PARSE_SK" = 1 ]; then
+    echo "  M8b: the comma form parses identically (the two forms agree)"
+  else
+    echo "SELFCHECK: comma-form tally parsed as '$PARSE_P/$PARSE_PA/$PARSE_SK', want 7/2/1" >&2
+    bad=1
+  fi
   return $bad
 }
 selfcheck_classifier || {
@@ -402,9 +435,8 @@ else
       # ("7 PASS / 2 PARTIAL / 1 SKIPPED") and was detected as a site but parsed
       # with a comma-only pattern, so a CORRECT line was reported STALE. A site
       # the checker finds but cannot parse is worse than not finding it.
-      p="$(printf '%s' "$txt"  | sed -nE 's/.*[^0-9]([0-9]+) PASS.*/\1/p')"
-      pa="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) PARTIAL.*/\1/p')"
-      sk="$(printf '%s' "$txt" | sed -nE 's/.*[,/] ?([0-9]+) SKIPPED.*/\1/p')"
+      parse_tally_counts "$txt"
+      p="$PARSE_P"; pa="$PARSE_PA"; sk="$PARSE_SK"
       [ -n "$p" ] || continue
       # (2) wrapped tally: pull SKIPPED off the FOLLOWING FILE LINE if absent.
       if [ -n "$pa" ] && [ -z "$sk" ] && [ "$ln" -lt "${#ALL[@]}" ]; then
