@@ -646,6 +646,32 @@ patch_literal "$MUTANT" "$A_HEADMOVE" 'HEAD_MOVED=0  # detector removed; move no
 verify_patched N-K
 run_state "N-K" "mid-run HEAD-moved detector deleted" def_n_k "step_ok step_commit" "$ALL_CURRENT"
 
+# N-M: a dispatch() arm given a STRAY ARGUMENT. This is the class the full
+# stack exposed on 2026-10-01: a STEPS-line edit that added a matrix name also
+# matched inside the mutate_gate_pop.sh dispatch arm, so it ran as
+#   bash $SCRIPT_DIR/mutate_gate_pop.sh mutate_checker_matrix_coverage.sh
+# Every DIRECT invocation of that matrix passed; only the end-to-end stack
+# failed (rc=127 plus a stale stamp). A matrix author fixing it by eye is not a
+# guard -- the same edit shape recurs.
+#
+# Under this mutation a dispatch arm is handed an extra word. Nothing about the
+# arm's logic changes, so 0b's coverage enumeration and step 3/3 must not notice:
+# the arm exists and is dispatched either way. What must catch it is the arm
+# EXECUTING, which dies with the argument as a path. So the observable is a
+# non-zero run with the "No such file or directory" shape -- i.e. the harness
+# already fails loudly, and this state proves it rather than assuming it.
+reset_mutant
+patch_literal "$MUTANT" \
+  'timeout 1800 bash "$SCRIPT_DIR/mutate_gate_pop.sh"; return $? ;;' \
+  'timeout 1800 bash "$SCRIPT_DIR/mutate_gate_pop.sh" stray_arg; return $? ;;' \
+  && verify_patched N-M
+
+# The predicate is POSITIVE: the stray-argument run must FAIL, and it must fail
+# with the path-shaped error rather than for an unrelated reason. Asserting only
+# "rc != 0" would let this pass because the matrix broke some other way.
+def_n_m() { grep -qE 'No such file or directory|mutate_gate_pop.sh.*: ' "$WORK/N-M.log"; }
+run_state "N-M" "dispatch() arm given a stray argument" def_n_m "step_ok step_current" "$ALL_CURRENT"
+
 # N-L: the detector hard-wired to ALWAYS fire. This state exists so the N-Kq
 # converse baseline is not another vacuous check -- without it, "the detector
 # stays silent on a healthy run" is a line nobody has ever seen fail. Under this
@@ -695,7 +721,7 @@ if [ "$CAUGHT" -eq "$TOTAL" ]; then
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "states=N-A,N-B,N-C,N-D,N-E,N-F,N-G,N-H,N-I,N-J,N-K"
+    echo "states=N-A,N-B,N-C,N-D,N-E,N-F,N-G,N-H,N-I,N-J,N-K,N-M"
     echo "caught=$CAUGHT/$TOTAL"
     echo "baselines=$NBASE/$NBASE rc+marker correct before mutation"
   } >"$STAMP"
