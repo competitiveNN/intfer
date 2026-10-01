@@ -3,6 +3,20 @@
 Date: 2026-09-30. Author: maki (agent). Nothing here has a wall-time number
 from me; every `RESULT:` line is deliberately blank and is yours to fill.
 
+> **2026-10-01 UPDATE — measured, verdicts recorded.**
+> See **`reports/2026-10-01-batch-e1-e2-e3-verdicts.md`**. E1/E2/E3 were run on
+> 0.8B TP=1 (correctness + load-insensitive counters only). Summary: all three are
+> **bit-exact**, all three stay **default-OFF**, and **none is promoted** — E1
+> measured *worse* (device kernel +11.3%), E2 is neutral with traffic *up*
+> (usm_write +3%, readback +4%), and only **E3** has a positive device-side delta
+> (-1.5%, replicating this repo's claimed -1.6%).
+> **No tok/s is claimed**: the box was contended (load1 8-18, a second agent
+> session running the same GPU) and **only 1 of 2 GPUs enumerates**, so every 27B
+> `--tp 2` command in this file is still unrunnable. `RESULT:` lines stay blank.
+> **New capacity finding:** `INTFER_KV_CAP` defaults to 1024, so the E2 long-ctx
+> command (*400) aborts with `FATAL: pos 1151 >= KV capacity 1024` unless the cap
+> is raised explicitly.
+
 Scope note (AGENTS.md): the optimization target is the **27B** model
 (`Qwen3.8-27B-int2.intifer`, 19 GB, INT2/G16+G32 + INT4/G64 + INT8/G32).
 The 0.8B numbers elsewhere in AGENTS.md are legacy reference only. On 27B,
