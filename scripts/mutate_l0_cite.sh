@@ -59,7 +59,31 @@ pop_dirs() { pop_names | sort -u; }
 # with "known_dirs: unbound variable", which set -u turns into a failed state.
 # A helper referenced before it exists is the shell equivalent of a stale
 # binary: the caller appears to run and proves nothing.
-known_dirs="device_precond_matrix fold_matrix gate_inventory_matrix l0_cite_mutate run_all_mutate"
+# DERIVED, not hand-listed. Each matrix declares where its own stamp lives
+# (STAMP=... or LOG_DIR=...), so read those rather than maintaining a list.
+# Hand-listing is what just broke: adding mutate_build_dir_consumers.sh made
+# this assertion report a LEAK on a completely healthy tree, because the new
+# matrix's build_dir_mutate/ dir was "unknown". That is the copy-drift family
+# AUDIT #14/#15 closed twice, and the cure is ENUMERATION, not another entry --
+# a false alarm here trains people to ignore the leak check.
+#
+# mutate_run_all_checks.sh stamps under a mktemp WORK dir, not the build tree,
+# so it contributes nothing here; that is correct, not an omission.
+# Read every path-shaped assignment to a build-tree root that a matrix makes --
+# WORK=, LOG_DIR=, STAMP= -- because which of the three each uses varies
+# (mutate_run_all_checks stamps via WORK, mutate_device_precond via LOG_DIR,
+# the others via STAMP). Collecting only STAMP/LOG_DIR found four of five and
+# then reported a LEAK on the fifth's healthy output.
+# $WORK/$LOG_DIR indirections resolve to nothing on their own, so a value that
+# is still a bare variable after substitution is dropped.
+known_dirs() {
+  grep -hoE '(WORK|LOG_DIR|STAMP)="[^"]*"' "$SCRIPT_DIR"/mutate_*.sh 2>/dev/null \
+    | sed -e 's/^[A-Z_]*="//' -e 's/"$//' \
+    | sed -e 's|${INTFER_BUILD_DIR:-$ROOT/build}/||' -e 's|\$BUILD_DIR/||' -e 's|\$ROOT/build/||' \
+    | grep -vE '^[\$/{]' \
+    | awk -F/ 'NF>0 {print $1}' \
+    | LC_ALL=C sort -u | tr '\n' ' '
+}
 
 # pop_total is deliberately defined HERE, before any state runs: M-H calls it,
 # and a first version of that state called it ~100 lines later, so bash printed
@@ -123,7 +147,7 @@ leak_assert() { # $1 = label for the message
   dirs="$(pop_dirs)"
   unknown="$(printf '%s\n' "$dirs" | while read -r d; do
               [ -n "$d" ] || continue
-              case " $known_dirs " in *" $d "*) ;; *) echo "$d" ;; esac
+              case " $(known_dirs) " in *" $d "*) ;; *) echo "$d" ;; esac
             done)"
   if [ -n "$unknown" ]; then
     echo "  FAIL  [$1] stamp(s) in director(ies) no matrix owns:"
