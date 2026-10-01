@@ -37,6 +37,43 @@ A="${CARDS[0]}"; B="${CARDS[1]}"
 slot() { grep -m1 PCI_SLOT_NAME "$1/uevent" 2>/dev/null | cut -d= -f2; }
 
 echo "== GPU HEALTH: $(basename "$(dirname "$A")")=$(slot "$A")  vs  $(basename "$(dirname "$B")")=$(slot "$B") =="
+echo "   (HEAD $(git -C "$SCRIPT_DIR/.." rev-parse --short HEAD 2>/dev/null || echo unknown))"
+
+# ---- ANTI-VACUITY SELF-CHECK, run FIRST and gating everything below ----------
+# The first version of this script globbed `card*/device`, which also matches
+# CONNECTOR nodes (card0-DP-1, card1-HDMI-A-5). Those have no tile0/, so every
+# attribute read as a card1-only ENOENT and the script reported 12 FABRICATED
+# anomalies. The "fix" `card[0-9]*` was also wrong: bash's glob `*` matches
+# "-DP-1" as well. A check whose SUBJECT is misidentified is worse than no
+# check, so the subject selection is now proven before any reading.
+selftest() {
+  local bad=0 tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/intfer_selftest.XXXXXX")"
+  mkdir -p "$tmp/card0/device/tile0" "$tmp/card0-DP-1/device" "$tmp/card1/device/tile0"
+  # a connector must be REJECTED, a real card ACCEPTED
+  for n in card0 card1; do
+    if ! ( cd "$tmp" && for p in card*/device; do
+             b="$(basename "$(dirname "$p")")"
+             [[ "$b" =~ ^card[0-9]+$ ]] && echo "$b"
+           done ) | grep -qx "$n"; then
+      echo "  SELFTEST FAIL: $n not selected by ^card[0-9]+\$"; bad=1
+    fi
+  done
+  if ( cd "$tmp" && for p in card*/device; do
+         b="$(basename "$(dirname "$p")")"
+         [[ "$b" =~ ^card[0-9]+$ ]] && echo "$b"
+       done ) | grep -qx 'card0-DP-1'; then
+    echo "  SELFTEST FAIL: connector card0-DP-1 was selected"; bad=1
+  fi
+  rm -rf "$tmp"
+  [ "$bad" -eq 0 ] && echo "  ok    subject selection rejects connectors, accepts cardN"
+  return $bad
+}
+if ! selftest; then
+  echo "SELF-CHECK FAILED -- subject selection is broken, so every reading below"
+  echo "  would be about the wrong device. Refusing to report."
+  exit 1
+fi
 
 read_attr() { # path -> value or !ERR:<errno>
   python3 - "$1" <<'PY'

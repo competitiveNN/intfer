@@ -108,7 +108,130 @@ probe now `rm -f`s its output and refuses to run unless a fresh binary appears
 (`scripts/l0_enumerate.sh`), because a probe that silently re-runs yesterday's
 build is worse than no probe.
 
-### The ONE card1-specific anomaly at the kernel layer (a lead, not a cause)
+### 2026-10-01 LATER: the ECANCELED lead is **REFUTED** as the cause — read the code
+
+`drm_neo.cpp` device discovery was read (intel/compute-runtime). The
+`tile0/gt*/freq0/{min,max}_freq` anomaly **cannot** drop a device:
+
+```
+// shared/source/os_interface/linux/product_helper_drm.cpp:85
+int maxGpuFreq = 0;
+drm->getMaxGpuFrequency(*outHwInfo, maxGpuFreq);   // return value DISCARDED
+```
+
+`getMaxGpuFrequency` → `IoctlHelperXe::getFileForMaxGpuFrequency*`
+(`xe/ioctl_helper_xe.cpp:2040`) → exactly the `max_freq` file that returns
+`ECANCELED` on card1. The read failing returns -1 and **the caller ignores it**.
+A sysfs read whose return value is discarded cannot gate enumeration.
+
+**The GuC hypothesis is also refuted.** `grep -rniE 'GuC|gu_com' shared/source/`
+returns only UAPI constant names (`XE_QUERY_UC_TYPE_GUC_SUBMISSION`, i915 PMU
+names). There is **no GuC firmware load, no GuC check, no `/sys/.../guc` read**
+anywhere in compute-runtime. The one GuC-dependent query on the path,
+`DRM_XE_DEVICE_QUERY_HWCONFIG`, has its return value **ignored** by user space.
+
+So the anomaly is real and reproducible but is **on a non-gating path**. It
+stays recorded (it is still a genuine card1/card0 difference worth knowing) and
+is **retired as a candidate cause**.
+
+#### The five places the driver can silently drop a card
+
+From `shared/source/os_interface/linux/drm_neo.cpp:740` `discoverDevices`. It
+scans **`/dev/dri/by-path`** (not `/sys/class/drm`) for `pci-<BDF>-render`,
+`open(O_RDWR)`, `DRM_IOCTL_VERSION`, then per card builds a root device. The
+device is dropped if:
+
+| # | condition | code | visible? |
+|---|---|---|---|
+| a | `open()` fails | `drm_neo.cpp:820` `continue` | silent |
+| b | `DRM_IOCTL_VERSION` name not exactly `"i915"`/`"xe"` | `drm_neo.cpp:2121` | silent |
+| c | `queryDeviceIdAndRevision()` fails (`DRM_IOCTL_XE_DEVICE_QUERY`) | `drm_neo_create.cpp:28` | prints only w/ `PrintDebugMessages` |
+| d | `setupHardwareInfo()` fails — unknown PCI id, caps reader, **small BAR**, topology/EU count | `drm_neo.cpp:507,544,576,585,608,639,679` | mostly silent |
+| e | `createRootDeviceFunc()` returns null, or `ZE_AFFINITY_MASK` filters the device out | `device_factory.cpp:378`, `execution_environment.cpp:331` | silent |
+
+Note (b) is already **excluded by measurement**: our cards report driver `xe`
+and are visible in sysfs. Note the loader itself does none of this — it only
+`dlopen`s the driver and returns a static list.
+
+#### Strongest remaining candidate: **small BAR on card1** (ReBAR)
+
+```
+// drm_neo.cpp:582-590
+else if (getMemoryInfo()->isSmallBarDetected()) {
+    fprintf(stderr, "WARNING: Resizable BAR not detected for device %s\n", getPciPath());
+    if (!ioctlHelper->isSmallBarConfigAllowed()) { return -1; }   // -> card DROPPED
+}
+```
+
+`isSmallBarDetected()` = any VRAM region with `cpu_visible_size < total_size`
+(`memory_info.cpp:37`), fed by `DRM_XE_DEVICE_QUERY_MEM_REGIONS`. And
+**`IoctlHelperXe::isSmallBarConfigAllowed()` returns `false`**
+(`xe/ioctl_helper_xe.h:155`) — while i915's returns `true`. So on the **xe**
+driver a card whose VRAM BAR is smaller than its VRAM is **silently not
+enumerated**, where the same card on i915 would enumerate.
+
+This is a real upstream defect, not a guess: compute-runtime issue **#905**,
+"root cause was not the xe driver itself, but the lack of Resizable BAR. With
+only 256MB BAR, the compute-runtime silently rejected the DG2 device when using
+the xe driver (while i915 worked fine with small BAR)."
+
+Our two cards sit on **different PCI roots** (`pci0000:00` vs `pci0000:80`) —
+primary x16 vs a slot under a different root complex, exactly where ReBAR
+support commonly differs per slot. **This is a testable prediction, not a
+conclusion.**
+
+**Could I test it here? No, and that is measured rather than assumed:**
+
+```
+lspci / setpci        not installed on this box
+/sys/.../resource0,2  open -> EACCES
+/sys/.../config       open OK, but only the first 64 bytes are readable;
+                      offsets 0x100+ (where PCIe ext caps live) return nothing
+```
+
+ReBAR is PCIe extended capability id `0x0015`, which lives at config offset
+`0x100+`. **An unprivileged reader cannot see it in this container**, and
+`lspci` is absent. So the ReBAR hypothesis is explicitly **NOT yet checked** and
+the check is **host-side**.
+
+#### Also not excluded: a BMG-specific enumeration defect on this silicon
+
+`0xE20B` is `IGFX_BMG` (`devices_base.inl:62`) — the B580 *is* BMG. compute-runtime
+issue **#921** ("Multi-BMG Level Zero device enumeration broken by deferred
+internal-engine init, regression NEO 25.40→25.44, Arc Pro B50/B60/B70") reports
+exactly 2× B-series enumerating as 1 with raw `zeDeviceGet` affected, and states
+that restoring `initializeInternalEngineImmediately()` to `true`
+(`bmg/os_agnostic_product_helper_bmg.inl:73`, currently `false`) brought back
+2 devices. **Caveats I am not glossing over:** in that thread the reporter's own
+raw-L0 probe *did* see 2 devices while the UR path failed, and the kernel-side
+`xe_vm_bind` `EINVAL` bug they isolated is a *different* failure (fixed in kernel
+7.1+). So #921 confirms a BMG-specific defect on the engine-init leg **exists**,
+but does not establish that it is *our* mechanism. Our driver is `1.15.38646`
+(≈ NEO 26.22), i.e. **after** the 25.44 regression point, which argues against
+it but does not exclude it.
+
+#### Attempted: make the driver name its own skip reason
+
+`scripts/l0_enum_trace.sh` runs the real driver with `NEOReadDebugKeys=1
+PrintDebugMessages=1`, which is how (c)/(d) get printed. Measured result: the
+driver emits unrelated banners (`WARNING: Failed to request OCL Turbo Boost`,
+cache/pidfd notices) but **no skip diagnostic at all**, i.e. the release build
+has `PrintDebugMessages` compiled out. The skip is silent by construction, so it
+cannot be observed from user space on this build. That is a real, measured limit
+on what can be learned here — not a failure to look.
+
+#### Host-side plan, in order (a plan, not a diagnosis)
+
+1. `dmesg | grep -iE 'xe.*86:00|resizable|rebar'` — a BAR or ReBAR complaint
+   would confirm/refute the strong candidate.
+2. Compare BAR sizes for the two slots (`lspci -vv -s 04:00.0` vs `-s 86:00.0`,
+   look at `Region 2`/`Resizable BAR` vs VRAM size). **Equal BARs refutes (d).**
+3. Only then consider a rebind/rescan of 86:00.0 and re-run
+   `scripts/l0_enumerate.sh`. **The rebind remains an untested candidate.**
+4. If BARs are fine, the next step is a **debug build of compute-runtime** to get
+   the skip reason printed, not more guessing from this container.
+
+### The one card1-specific anomaly at the kernel layer (still true; now refuted as a cause)
 
 `dmesg` is **EPERM** in this container and `journalctl -k` yields nothing, so the
 kernel message that would *name* the mechanism is unavailable. Instead the two

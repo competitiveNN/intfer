@@ -47,22 +47,74 @@ single fact governs how every gate result in this file must be read:
   libze_intel_gpu 1.15.38646 (driverVersion 0x10396f6) and host 1.17.39758
   (0x1039b4e) BOTH return exactly 1 device, same uuid. The probe prints
   driverVersion precisely so a non-vacuous swap is visible.
-  *** ONE card1-ONLY KERNEL ANOMALY (a LEAD, not a cause). ***
+  *** ONE card1-ONLY KERNEL ANOMALY — REAL, BUT NOW REFUTED AS THE CAUSE. ***
   `scripts/gpu_health_check.sh` diffs the two cards' sysfs: exactly four
   attributes fail on card1 and only card1 —
   tile0/gt{0,1}/freq0/{min,max}_freq return **ECANCELED (errno 125)**, 8/8
   reproducible, while cur_freq/rp0_freq/num_csiles/ccs_mode match card0 exactly.
-  Those min/max reads are the GuC-mediated RAPL limit reads, so this is
-  CONSISTENT WITH card1's GuC not being functional. NOT PROVEN to be the cause
-  of the enumeration drop: nobody has read the xe/L0 enumeration path, and it is
-  unshown that device enumeration consults these files. Do not upgrade it to
-  "the cause" — that is the AUDIT #9 mistake again.
+  **It cannot drop a device.** Reading compute-runtime's discovery code
+  (drm_neo.cpp) shows that exact file is read by getMaxGpuFrequency() and the
+  **return value is DISCARDED** at product_helper_drm.cpp:85 — a sysfs read
+  whose result is thrown away cannot gate enumeration. The companion GuC theory
+  is refuted too: `grep -rniE 'GuC' shared/source/` finds only UAPI constant
+  names, i.e. **no GuC load or check exists in the user-space driver**, and
+  DRM_XE_DEVICE_QUERY_HWCONFIG's return value is ignored. Kept recorded as a
+  genuine card0/card1 difference; do NOT re-offer it as the cause.
+  *** WHERE THE DROP ACTUALLY HAPPENS (code-read, 2026-10-01). *** The driver
+  scans **/dev/dri/by-path** (not /sys/class/drm), open(O_RDWR) +
+  DRM_IOCTL_VERSION, then a per-card root-device build. A card is SILENTLY
+  dropped on: (a) open() fails, (b) DRM_IOCTL_VERSION name not exactly
+  "i915"/"xe", (c) DRM_IOCTL_XE_DEVICE_QUERY fails, (d) setupHardwareInfo() fails
+  (unknown id / caps / **small BAR** / topology / EUCount==0), (e) root-device
+  creation fails or ZE_AFFINITY_MASK filters it. (b) is already excluded by
+  measurement (our driver is xe).
+  *** STRONGEST CANDIDATE: SMALL BAR on card1. *** drm_neo.cpp:582-590 returns
+  -1 (drop) when `isSmallBarDetected()` (any VRAM region with
+  cpu_visible_size < total_size) **and** !isSmallBarConfigAllowed() — and
+  `IoctlHelperXe::isSmallBarConfigAllowed()` returns **false** (i915's returns
+  true). This is a real upstream defect, not a guess: compute-runtime issue
+  #905 ("silently rejected the DG2 device when using the xe driver ... while
+  i915 worked fine with small BAR"). Our cards are on DIFFERENT PCI roots,
+  exactly where ReBAR often differs. **NOT YET CHECKED — the check is
+  host-side and CANNOT be done here (measured):** lspci/setpci not installed;
+  /sys/.../resource0,2 open -> EACCES; /sys/.../config readable but only the
+  first 64 bytes, and ReBAR is PCIe ext cap 0x0015 at offset 0x100+.
+  *** ALSO NOT EXCLUDED: a BMG-specific defect. *** 0xE20B IS IGFX_BMG
+  (devices_base.inl:62), so the B580 is BMG. compute-runtime issue #921 reports
+  exactly 2x B-series enumerating as 1 with raw zeDeviceGet affected, fixed by
+  restoring initializeInternalEngineImmediately() to true
+  (bmg/os_agnostic_product_helper_bmg.inl:73, now false). **But** our driver
+  1.15.38646 (~NEO 26.22) is AFTER the 25.44 regression point, and in that
+  thread the raw-L0 probe saw 2 devices while UR failed — so it is NOT
+  established as our mechanism. Do not assume it.
+  *** WHY WE CANNOT GET THE DRIVER TO SAY WHICH ONE. ***
+  `scripts/l0_enum_trace.sh` runs the real driver with
+  `NEOReadDebugKeys=1 PrintDebugMessages=1` (the flags that print skip (c)/(d)).
+  Measured: it prints unrelated banners but **no skip diagnostic** — the release
+  build has PrintDebugMessages compiled out, so the skip is silent by
+  construction on this build.
   *** CANNOT BE DIAGNOSED OR FIXED FROM THIS CONTAINER (all measured). ***
-  dmesg = EPERM (no kernel log, so no xe GuC/reset failure message is visible);
+  dmesg = EPERM (no kernel log, so no xe BAR/GuC/reset message is visible);
   writing remove/rescan/reset = EACCES (unprivileged), so a rebind of 86:00.0
-  cannot even be TESTED here. Next step is host-side: `dmesg | grep -i 'xe.*
-  86:00'` for a GuC-firmware/reset failure, then rebind/rescan and re-run
-  scripts/l0_enumerate.sh. That is a measurement PLAN, not a diagnosis.
+  cannot even be TESTED here.
+  *** HOST-SIDE PLAN, IN ORDER (this is a PLAN, not a diagnosis). ***
+  1. `dmesg | grep -iE 'xe.*86:00|resizable|rebar'` — a BAR/ReBAR complaint
+     confirms or refutes the strongest candidate.
+  2. Compare BAR sizes for the two slots: `lspci -vv -s 04:00.0` vs
+     `-s 86:00.0`, Region 2 / Resizable BAR vs VRAM size.
+     **Equal BAR sizes refutes the small-BAR candidate outright.**
+  3. Only then try a rebind/rescan of 86:00.0 and re-run
+     `scripts/l0_enumerate.sh`. **The rebind is an untested CANDIDATE, not a
+     remedy** — nothing here shows it would help.
+  4. If the BARs are fine, the next step is a DEBUG build of compute-runtime to
+     get the skip reason printed — not more guessing from this container.
+  REPRODUCE ALL OF IT: `scripts/l0_enumerate.sh` (device count + uuid at the
+  driver API; `INTFER_L0_DRIVER_LIB=/run/host/usr/lib64` to vary the driver
+  lib, and it prints driverVersion so a no-op swap is visible),
+  `scripts/gpu_health_check.sh` (card0-vs-card1 sysfs diff; self-checks that it
+  rejects DRM connector nodes before reading anything, and prints HEAD so its
+  output is attributable to a tree),
+  `scripts/l0_enum_trace.sh` (the debug-flag attempt).
   Also negative, so they are not retried: ONEAPI_DEVICE_SELECTOR in
   {level_zero:gpu, level_zero:*, *:gpu, level_zero:0, *} and SYCL_DEVICE_FILTER
   in {level_zero:gpu, *} all still yield 1; /dev/accel/accel0 is the 265KF's
