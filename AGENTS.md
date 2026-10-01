@@ -130,6 +130,28 @@ matrix, and the shared patch helper — all dispatched steps of
   - `scripts/l0_enumerate.sh` — device count + uuid at the driver API. Honours
     INTFER_L0_DRIVER_LIB and prints driverVersion so a no-op lib swap is
     visible. Deletes its own output and refuses to run a stale binary.
+  - `scripts/gpu_recover.sh` — **RUN THIS ON THE HOST, AS ROOT.** It exists
+    because two decisive measurements were blocked by the CONTAINER, not by the
+    problem: PCI config space reads only the first 64 bytes here and Resizable
+    BAR lives at offset 0x100+, and writes to `/sys/bus/pci/...` are EACCES, so
+    the remedy could not even be attempted. Subcommands: `diag` (read-only, no
+    root), `rebind` (root; unbind+rebind, recording the BAR layout before and
+    after), `verify` (re-count at the driver API).
+    | exit | meaning |
+    |---|---|
+    | 0 | 2+ devices enumerated — the fault is gone; follow the trigger |
+    | 1 | MEASURED, still 1 device — the fault persists |
+    | 2 | **UNMEASURABLE** — the probe could not count; *not* "1 device" |
+    | 3 | needs root (`rebind` only); nothing was touched |
+    `scripts/check_gpu_recover.sh` pins all four with a STUBBED probe.
+    *** `rebind` IS AN UNTESTED CANDIDATE, NOT A DIAGNOSED REMEDY. *** Nothing
+    here shows a rebind would help. And the strongest lead — a small VRAM BAR on
+    card1, which compute-runtime silently drops on xe because
+    `IoctlHelperXe::isSmallBarConfigAllowed()` returns false — **has NO
+    in-software fix at all**: it is a BIOS/slot setting (Above 4G Decoding +
+    Resizable BAR) or a different slot. `diag` prints `DECISIVE TEST NOT
+    MEASURED` when `lspci` is absent, because a check that cannot harvest the
+    BAR sizes must not certify that the theory was refuted (AUDIT #20).
   - `scripts/gpu_driver_lib_ab.sh` — the committed A/B over driver-lib versions.
     **Exits 1 "INCONCLUSIVE" if both arms report the same driverVersion**, since
     then the libraries were never actually swapped and the comparison proves

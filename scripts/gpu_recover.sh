@@ -43,6 +43,8 @@ is_root() { [ "$(id -u)" = "0" ]; }
 need_root() { is_root || { echo "ERROR: '$1' needs root (writes to /sys/bus/pci)."; exit 3; }; }
 
 # ---------------------------------------------------------------- diag
+BAR_STATE=NOT_MEASURED   # never assume the decisive test ran
+
 cmd_diag() {
   echo "=== GPU RECOVER: DIAG (read-only) ==="
 
@@ -84,6 +86,7 @@ cmd_diag() {
         | grep -iE 'Region 2|Resizable BAR|BAR2|physical' | sed 's/^/    /'
     done
     echo
+    BAR_STATE=MEASURED
     echo "  INTERPRET: if 86:00.0's Region 2 is SMALLER than 04:00.0's (or the"
     echo "  Resizable BAR line is missing on one), the small-BAR drop is the"
     echo "  cause. NO in-software fix exists for that -- it is a BIOS/slot"
@@ -91,9 +94,13 @@ cmd_diag() {
     echo "  If BARs are IDENTICAL, the small-BAR theory is refuted: go to"
     echo "  'rebind' and read the kernel log."
   else
-    echo "  lspci not installed. Install it (dnf install pciutils) or read the"
-    echo "  config space as root with setpci. Without this the BAR sizes -- the"
-    echo "  single decisive measurement -- cannot be compared."
+    # NOT an informational line. Without this measurement the small-BAR theory
+    # is UNTESTED, and reporting a verdict anyway is the vacuous-green class
+    # (AUDIT #20): the check cannot harvest its subject but certifies one.
+    echo "  !! DECISIVE TEST NOT MEASURED -- lspci is absent."
+    echo "     Install it (dnf install pciutils) or read config space as root."
+    echo "     Until then the small-BAR theory is UNTESTED, not refuted."
+    BAR_STATE=NOT_MEASURED
   fi
 
   echo
@@ -116,7 +123,18 @@ cmd_diag() {
     echo "  (no access to the kernel log here -- needs root)"
   fi
   echo
-  echo "Next: if the BARs are equal, run  scripts/gpu_recover.sh rebind"
+  echo
+  echo "-- 6. state of the DECISIVE TEST --"
+  if [ "$BAR_STATE" = MEASURED ]; then
+    echo "  MEASURED: the BAR comparison above is real. If the BARs are equal,"
+    echo "  the small-BAR theory is REFUTED and 'rebind' is the next step."
+  else
+    echo "  NOT MEASURED: no BAR data. The small-BAR theory is UNTESTED."
+    echo "  Do NOT read the absence of a complaint above as a refutation."
+  fi
+  echo
+  echo "Next: run 'rebind' if the BARs are equal OR unmeasured; the kernel log"
+  echo "in step 5 is what will actually name the fault."
 }
 
 # ---------------------------------------------------------------- rebind
@@ -168,15 +186,42 @@ cmd_rebind() {
 }
 
 # ---------------------------------------------------------------- verify
-cmd_verify() {
-  echo "=== GPU RECOVER: VERIFY (driver API) ==="
+# ONE place that runs the probe and separates the three outcomes that used to
+# collapse into "1 device(s)": MEASURED 1, MEASURED 2+, and UNMEASURABLE.
+# A helper that cannot count must never certify a count it did not take
+# (audit #14/#16). Prints "DEVICES=<n>" and returns:
+#   0 = measured, >=2 devices   1 = measured, fewer than 2   2 = UNMEASURABLE
+enum_devices() {
   [ -r /opt/intel/oneapi/setvars.sh ] && { set +u; . /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u; }
   export LD_LIBRARY_PATH="/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}"
+  # Honours the same overrides the probe does, so a run against an alternate
+  # build tree or driver lib is measured on THAT tree (audit #8).
+  local out n
   out="$("$ROOT/scripts/l0_enumerate.sh" 2>&1)"
   printf '%s\n' "$out" | grep -E 'driver\[|uuid|TOTAL' | sed 's/^/  /'
   n="$(printf '%s\n' "$out" | sed -n 's/^TOTAL LEVEL ZERO DEVICES: //p')"
+  if [ -z "$n" ] || ! printf '%s' "$n" | grep -qE '^[0-9]+$'; then
+    echo "  <-- UNMEASURABLE: the probe produced no TOTAL line"
+    printf 'DEVICES=UNMEASURABLE\n'
+    return 2
+  fi
+  echo "DEVICES=$n"
+  [ "$n" -ge 2 ] && return 0
+  return 1
+}
+
+cmd_verify() {
+  echo "=== GPU RECOVER: VERIFY (driver API) ==="
+  out="$(enum_devices)"; erc=$?
+  n="$(printf '%s\n' "$out" | sed -n 's/^DEVICES=//p')"
   echo
-  if [ "${n:-0}" -ge 2 ] 2>/dev/null; then
+  if [ "$erc" -eq 2 ]; then
+    echo "RESULT: UNMEASURABLE -- the driver API could not be counted at all."
+    echo "        This is NOT 'one device' and NOT a fix. Check that"
+    echo "        libze_intel_gpu is present and that /dev/dri/renderD128 opens."
+    exit 2
+  fi
+  if [ "$erc" -eq 0 ]; then
     echo "RESULT: 2 devices. The enumeration fault is GONE."
     echo "  Follow the next-session trigger in AGENTS.md:"
     echo "    1. sycl-ls | grep -c '\\[level_zero:gpu\\]'  -> must be 2"
@@ -186,7 +231,7 @@ cmd_verify() {
     echo "    4. then fill the RESULT: lines in reports/ and re-decide E1/E2/E3"
     exit 0
   fi
-  echo "RESULT: still ${n:-?} device(s). The rebind did not restore enumeration."
+  echo "RESULT: MEASURED ${n:-?} device(s). The rebind did not restore enumeration."
   echo "  Read the BAR comparison from 'diag' -- if Region 2 on $MISSING_SLOT is"
   echo "  smaller than on $PRESENT_SLOT, this is a BIOS/slot setting, not a"
   echo "  software bug: enable Above 4G Decoding + Resizable BAR, or move the"
