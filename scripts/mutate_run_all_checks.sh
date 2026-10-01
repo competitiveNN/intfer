@@ -100,6 +100,14 @@
 #        RUNS -- and this entry point would still print PASS. The state drops an
 #        undispatched mutate_dummy.sh into the sandbox's scripts/ and proves the
 #        coverage check is what notices.
+#   N-K  delete the mid-run HEAD-moved detector
+#        A second writer committing while this ~45 min stack runs moved HEAD
+#        between the start-of-run snapshot and the stamp assertion, so stamps
+#        naming the NEW commit were compared against the OLD $HEAD_SHA and
+#        reported STALE -- a verdict about a race wearing the costume of a
+#        verdict about coverage, with "re-run the matrix" as the wrong remedy.
+#        Measured: it invalidated the stamp set three times in one session. The
+#        state has a step that commits mid-run, so the move is reproducible.
 #
 # GOTCHA, learned the first time this was run: THIS SCRIPT MUST BE COMMITTED
 # BEFORE IT CAN RUN. It drives run_all_checks.sh, which fails closed on ANY dirty
@@ -187,6 +195,14 @@ STEPS="$SYNTH/steps"; mkdir -p "$STEPS"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$STEPS/step_ok"
 printf '#!/usr/bin/env bash\nC="%s/step_flaky2.count"\nn=$(cat "$C" 2>/dev/null || echo 0)\necho $((n+1)) >"$C"\n[ "$n" -eq 0 ] && exit 2\nexit 0\n' "$SYNTH" >"$STEPS/step_flaky2"
 printf '#!/usr/bin/env bash\n: >"%s/step_sentinel.ran"\nexit 0\n' "$SYNTH" >"$STEPS/step_sentinel"
+# N-K: a step that COMMITS to the sandbox, i.e. a concurrent writer landing
+# mid-run. This is the race that forced three wasted ~45 minute re-runs in one
+# session: HEAD moved between the start-of-run snapshot and the stamp assertion,
+# so stamps naming the NEW commit compared against the OLD $HEAD_SHA and were
+# reported STALE -- a verdict about a race dressed as a verdict about coverage.
+# The commit is a NEW untracked file, committed path-limited, so it moves HEAD
+# without dirtying the mutant (the dirty-tree guard must stay armed).
+printf '#!/usr/bin/env bash\ncd "%s" || exit 1\nprintf "concurrent\\n" > concurrent_writer.txt\ngit -c user.email=m@x -c user.name=matrix add -- concurrent_writer.txt >/dev/null 2>&1\ngit -c user.email=m@x -c user.name=matrix commit -q -m concurrent -- concurrent_writer.txt >/dev/null 2>&1\nexit 0\n' "$SB" >"$STEPS/step_commit"
 # N-G/N-I: a step that leaves residue DURING the run. It has to be the STEP that
 # litters, not the harness: the end-of-run check is a diff against a snapshot
 # taken before step 1, so a file the harness created beforehand is present in
@@ -323,6 +339,11 @@ def_n_h() { ! grep -q 'REGRESSED' "$WORK/N-H.log"; }
 # pre-fix scripts/-only scope cannot see.
 def_n_i() { ! grep -qE 'FAIL +untracked residue' "$WORK/N-I.log"; }
 def_n_j() { ! grep -q 'no dispatch() arm for' "$WORK/N-J.log"; }
+# N-K: the mid-run HEAD-change detector deleted. Predicate is POSITIVE ("this
+# specific evidence is ABSENT"), and the converse is asserted by the baseline: a
+# run WITH the detector prints the FAIL line and exits 1, so the state cannot be
+# scored by a top-of-run abort.
+def_n_k() { ! grep -q 'HEAD MOVED under this run' "$WORK/N-K.log"; }
 
 # N-H/N-I/N-J need their litter/counter state cleared before each run, which
 # run_rac does; N-H also needs its own counter file reset because a leftover
@@ -351,6 +372,10 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$DUMMY"; chmod +x "$DUMMY"
 git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$DUMMY" >/dev/null 2>&1
 git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m dummy -- "$DUMMY" >/dev/null 2>&1
 baseline "N-J" "step_ok"     "$ALL_CURRENT" 1 "no dispatch() arm for: mutate_dummy.sh"
+# N-K baseline: a step commits mid-run, so the DETECTOR must fire. rc=1, and the
+# marker must be the move notice -- without it, N-K's predicate is satisfied by
+# any run that happens to not print that line, including one that aborted early.
+baseline "N-K" "step_ok step_commit" "$ALL_CURRENT" 1 "HEAD MOVED under this run"
 # `rm -f` alone leaves a DELETION in the sandbox's working tree, so every
 # subsequent state aborted at the top on the mutant's own dirty-tree guard and
 # scored MISSED -- four states (N-A, N-B, N-E, N-F) disarmed by one stray `rm`.
@@ -414,6 +439,15 @@ A_ESCALATE="printf 'REGRESSED rc=%s (%s) -- was unproven, is now a real failure\
           UNPROVEN=\$((UNPROVEN - 1))
           FAILED=\$((FAILED + 1)) ;;"
 A_COVER='grep -qxF "$b" || UNDISPATCHED="$UNDISPATCHED $b"'
+# N-K: the WHOLE detector block, guard + assignment + report + increment. Removing
+# only the announcement line would leave the increment dangling (syntax error), and
+# removing only the guard would leave a detector that never fires -- both are
+# harness-reported failures, not a scored state, so the anchor must cover the unit
+# that can actually be removed as one piece.
+A_HEADMOVE='HEAD_NOW="$(git rev-parse HEAD)"
+HEAD_MOVED=0
+if [ "$HEAD_NOW" != "$HEAD_SHA" ]; then
+  HEAD_MOVED=1'
 check_anchor "$A_CLASSIFY" "N-A: the rc=2 UNPROVEN classification"
 check_anchor "$A_RERUN"   "N-B: the 2b re-run guard"
 check_anchor "$A_FIND"    "N-C: the find-based stamp enumeration"
@@ -423,7 +457,8 @@ check_anchor "$A_DERIVE"  "N-F: the re-run set derivation"
 check_anchor "$A_RESIDUE" "N-G: the tree-hygiene residue diff"
 check_anchor "$A_ESCALATE" "N-H: the 2b re-run's REGRESSED announcement"
 check_anchor "$A_COVER"   "N-J: the dispatch-coverage enumeration"
-echo "anchor pre-flight: ok (9/9 targets located exactly once)"
+check_anchor "$A_HEADMOVE" "N-K: the mid-run HEAD-moved detector"
+echo "anchor pre-flight: ok (10/10 targets located exactly once)"
 
 # Exact literal replacement -- no delimiter that can occur inside the pattern
 # (audit #17b: a sed delimiter inside an ERE alternation killed a state, and a
@@ -561,6 +596,14 @@ run_state "N-J" "dispatch-coverage enumeration neutered" def_n_j "step_ok" "$ALL
 rm -f "$DUMMY"
 git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "drop dummy" -- "$DUMMY" >/dev/null 2>&1
 
+# N-K: the mid-run HEAD-moved detector deleted. The concurrent commit must then go
+# UNREPORTED -- the run silently compares stamps against the commit it started on,
+# which is the race this state exists to prove is now loud.
+reset_mutant
+patch_literal "$MUTANT" "$A_HEADMOVE" 'HEAD_MOVED=0'
+verify_patched N-K
+run_state "N-K" "mid-run HEAD-moved detector deleted" def_n_k "step_ok step_commit" "$ALL_CURRENT"
+
 rm -f "$MUTANT"
 # The synthetic population must never have leaked into the real one, or the real
 # enumeration counts fixture stamps as matrix evidence.
@@ -575,7 +618,7 @@ if [ "$CAUGHT" -eq "$TOTAL" ]; then
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "states=N-A,N-B,N-C,N-D,N-E,N-F,N-G,N-H,N-I,N-J"
+    echo "states=N-A,N-B,N-C,N-D,N-E,N-F,N-G,N-H,N-I,N-J,N-K"
     echo "caught=$CAUGHT/$TOTAL"
     echo "baselines=$NBASE/$NBASE rc+marker correct before mutation"
   } >"$STAMP"

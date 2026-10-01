@@ -137,6 +137,28 @@ across 2 rounds. `[argmax]` counter fires on flag, silent on base.
 
 Do **not** read the 0.8B `-n 8` numbers as a throughput verdict.
 
+#### Why a quiet box is the wrong gate for E5 specifically
+
+For E1-E4 a counters-only reading is enough to tell a mechanism from a no-op.
+For E5 it is **structurally impossible**, and that is worth stating rather than
+leaving as "owed". The saving is a *bytes* reduction on a path whose D2H
+**count** does not change: the lever replaces `Nlt*2` bytes per tile-token with
+8, but there is still exactly one D2H per tile either way. Every existing
+bucket is a count or a duration of a kernel the counter already attributes:
+
+| observable | flag OFF | flag ON | resolves the saving? |
+|---|---|---|---|
+| `nr` (readbacks) | 576 | 576 | no — count is identical by construction |
+| `nk` (launches) | 1680 | 1712 | no — shows the +1 argmax *cost* only |
+| `readback` ms | 39.8 | 39.4 | no — below noise at loadavg ~13 |
+
+So no arrangement of the existing counters can judge E5; a bytes-transferred
+bucket would have to be **added** to the `[GPU profile]` block (instrument the
+`q.memcpy` byte counts at `:1775` and `:2313`), which touches profiling source
+and therefore needs its own gate. That work is **scoped, not started** — see
+§8. Until it exists, E5's verdict genuinely does require the quiet-box run, and
+the honest statement stays "unmeasured", not "counters looked neutral".
+
 ### 6. Gates already passed
 
 - `scripts/test_device_argmax.sh` — TP1/TP2 8-way matrix, `[argmax]` non-triviality
@@ -157,6 +179,31 @@ Do **not** read the 0.8B `-n 8` numbers as a throughput verdict.
 with and without `-DINTFER_PROFILE_GPU=1` (0 errors each), per the audit-#3c lesson
 that a helper inside the GPU-backend guard can break a stripped configuration while
 every gate still passes.
+
+---
+
+## 8. Blocked follow-on: a bytes-transferred bucket (E6, scoped, NOT implemented)
+
+**Do not go looking for a flag — none exists and no code has been written.**
+
+E5 cannot be judged from counters, for the structural reason in §5: the saving
+is bytes on a D2H whose *count* is unchanged, so `nr` cannot see it. The fix is
+one new counter in the `[GPU profile]` block — accumulate
+`q.memcpy` byte counts at the two lm_head D2H sites (`main.cpp:1775` scalar,
+`:2313` M-row) and print them beside `nr`. Expected signature if the lever
+works: `d2h_bytes` drops from `~N*2` per token to `~8*ntiles` per token, with
+`nr` unchanged.
+
+Scoping notes, so this is not re-derived wrongly:
+
+* It touches **profiling source**, so it needs its own gate before it can be
+  trusted, per the build-first rule every other gate follows.
+* It must be **load-insensitive by construction** (a byte count, not a duration)
+  or it inherits E5's quiet-box dependency and achieves nothing.
+* If added, re-run `scripts/test_device_argmax.sh` unchanged — the new bucket
+  must not perturb the stream-identity arms, and the gate is what proves it.
+
+`RESULT:` (bytes bucket, only after it exists): OFF ______ B/token, ON ______ B/token
 
 ---
 

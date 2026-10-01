@@ -342,14 +342,51 @@ if [ "${INTFER_QUICK:-0}" != "1" ]; then
   fi
 fi
 
+# --- 2c did HEAD move under us? -----------------------------------------------
+# MEASURED, not hypothetical. Three times in one session a SECOND writer (another
+# agent session on the same clone) committed while this ~45 minute stack was
+# running, so HEAD changed between the start-of-run snapshot and the stamp
+# assertion. Consequences, and they are not all benign:
+#   * the matrices stamped the LATER commit, so step 3 compared them against the
+#     EARLIER $HEAD_SHA and reported 5 STALE -- a correct-looking verdict about a
+#     tree that no longer existed;
+#   * the operator is told "re-run the named matrix", which is the wrong remedy:
+#     re-running cannot help, because the stamps already name the newer commit and
+#     the mismatch was an artifact of the snapshot, not of missing evidence.
+# A stamp check against a moved HEAD is exactly the "citation vs guess" line: it
+# looks like a verdict about coverage and is really a verdict about a race.
+#
+# So HEAD is re-read HERE, immediately before the comparison, and a move is its
+# own LOUD condition with its own remedy -- distinct from stale stamps, and NOT
+# folded into STALE, because the two call for opposite actions.
+HEAD_NOW="$(git rev-parse HEAD)"
+HEAD_MOVED=0
+if [ "$HEAD_NOW" != "$HEAD_SHA" ]; then
+  HEAD_MOVED=1
+  echo "== 2c HEAD MOVED under this run =="
+  echo "  FAIL  HEAD changed during the run: started at $HEAD_SHORT, now ${HEAD_NOW:0:7}." >&2
+  echo "         Another writer committed to this clone while the stack was running." >&2
+  echo "         The stamps just written name the NEW commit, so 'STALE' below would" >&2
+  echo "         be an artifact of this race, not missing evidence -- and re-running" >&2
+  echo "         is NOT the fix. Either finish the concurrent commit first (single-" >&2
+  echo "         writer convention, AGENTS.md) or re-run now that the tree is settled." >&2
+  FAILED=$((FAILED + 1))
+fi
+
 # --- 3. the stamp assertion, over an ENUMERATED set -------------------------
 # find, not a table. A hand-written list is a table that quietly stops covering a
 # matrix when one is added. STAMP_DIR is overridable so the mutation matrix can
 # point this at a synthetic stamp population and observe the enumeration.
+#
+# The comparison uses $HEAD_NOW, not $HEAD_SHA: if 2c found a move, the honest
+# question is what the evidence actually covers. Comparing against the commit
+# this run STARTED on would report STALE for stamps that are perfectly current
+# for the tree now on disk, which is the misleading-verdict shape above.
 STAMP_DIR="${INTFER_RUN_ALL_STAMP_DIR:-$BUILD_DIR}"
 echo "== 3/3 stamp assertion (enumerated from $STAMP_DIR) =="
 STALE=0
 STAMP_COUNT=0
+[ "$HEAD_MOVED" -eq 1 ] || HEAD_SHA="$HEAD_NOW"
 while IFS= read -r stamp; do
   [ -n "$stamp" ] || continue
   STAMP_COUNT=$((STAMP_COUNT + 1))
@@ -359,7 +396,7 @@ while IFS= read -r stamp; do
   if [ "$sha" = "$HEAD_SHA" ]; then
     printf '  ok    %-46s %s %s\n' "$rel" "${sha:0:7}" "$extra"
   else
-    printf '  STALE %-46s %s (want %s)\n' "$rel" "${sha:0:7}" "${HEAD_SHORT}"
+    printf '  STALE %-46s %s (want %s)\n' "$rel" "${sha:0:7}" "${HEAD_SHA:0:7}"
     STALE=$((STALE + 1))
   fi
 done <<EOF
