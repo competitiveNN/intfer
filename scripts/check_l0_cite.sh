@@ -25,7 +25,7 @@
 #   5. DRM_IOCTL_VERSION name must be exactly "i915" or "xe"
 #   6. no GuC firmware load/check exists in shared/source (the GuC theory is dead)
 #
-# Usage: scripts/l0_cite_check.sh [--keep]
+# Usage: scripts/check_l0_cite.sh [--keep]
 # Exit:  0 = every claim verified at the pin, 1 = a claim does NOT hold,
 #        2 = could not resolve the pin (no network, no git) -- in which case the
 #        docs must be read as UNVERIFIED, and the script says so.

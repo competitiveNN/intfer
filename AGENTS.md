@@ -123,13 +123,13 @@ single fact governs how every gate result in this file must be read:
   - `scripts/l0_enum_trace.sh` — the debug-flag attempt. **Exits 3
     = INCONCLUSIVE** when the driver prints no skip reason, so "no output" can
     never be misread as "no information". Measured here: exit 3.
-  - `scripts/l0_cite_check.sh` — verifies every compute-runtime `file:line`
+  - `scripts/check_l0_cite.sh` — verifies every compute-runtime `file:line`
     cited in AGENTS.md / the verdicts report against a **pinned commit
     63647bb8214cdc581d2bd5ed3822f157f7d34679**, so the citations are checkable
     rather than a research-subagent transcript. Clones sparse on demand;
     if the pin cannot be resolved it exits 2 and the docs must then be read as
     UNVERIFIED.
-  - `scripts/mutate_l0_cite_check.sh` — mutation matrix for that checker, 7/7
+  - `scripts/mutate_l0_cite.sh` — mutation matrix for that checker, 7/7
     states caught each for its own reason, stamped
     `build/l0_cite_mutate/last_pass.stamp`.
   *** NEXT-SESSION TRIGGER — the one thing worth reopening. *** If

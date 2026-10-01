@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mutation matrix for scripts/l0_cite_check.sh.
+# Mutation matrix for scripts/check_l0_cite.sh.
 #
 # WHY: the cite-checker is load-bearing for a claim this repo now depends on
 # ("the L0 driver silently drops card1, and the small-BAR branch at
@@ -13,7 +13,7 @@
 # for a different reason -- a checker that fails for an unrelated reason is
 # evidence of nothing.
 #
-# Usage: scripts/mutate_l0_cite_check.sh
+# Usage: scripts/mutate_l0_cite.sh
 # Exit:  0 = every state caught for its own reason, 1 = otherwise.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +26,7 @@ LOG="$STAMP/states"
 # The checker itself must work before we judge its ability to fail.
 if [ ! -d "$SRC_TREE/.git" ]; then
   echo "SKIP: no pinned compute-runtime tree at $SRC_TREE"
-  echo "      run scripts/l0_cite_check.sh first (it clones on demand)."
+  echo "      run scripts/check_l0_cite.sh first (it clones on demand)."
   exit 2
 fi
 
@@ -45,7 +45,7 @@ run_state() {
     return 1
   fi
   local out rc
-  out="$(INTFER_CR_TREE="$MUT" "$SCRIPT_DIR/l0_cite_check.sh" 2>&1)"; rc=$?
+  out="$(INTFER_CR_TREE="$MUT" "$SCRIPT_DIR/check_l0_cite.sh" 2>&1)"; rc=$?
   printf '%s\n' "$out" > "$LOG/$id.log"
   if [ "$rc" -eq 0 ]; then
     echo "$id  MISSED  (checker still passed)" >> "$LOG/summary.txt"
@@ -65,7 +65,7 @@ run_state() {
 }
 
 echo "== baseline: unmutated tree must PASS =="
-base="$(INTFER_CR_TREE="$SRC_TREE" "$SCRIPT_DIR/l0_cite_check.sh" 2>&1)"; brc=$?
+base="$(INTFER_CR_TREE="$SRC_TREE" "$SCRIPT_DIR/check_l0_cite.sh" 2>&1)"; brc=$?
 if [ "$brc" -ne 0 ]; then
   echo "BASELINE FAIL -- checker does not pass on the clean pinned tree."
   printf '%s\n' "$base" | tail -5
@@ -113,6 +113,19 @@ run_state "M-G" "3a xe rejects small BAR" \
   rm -f shared/source/os_interface/linux/xe/ioctl_helper_xe.h
 
 rm -rf "$MUT"
+
+# STAMP-POPULATION LEAK CHECK. run_all_checks.sh enumerates the stamp set with
+# `find $BUILD_DIR -name '*last_pass.stamp'`, so this matrix's own fixtures --
+# which necessarily live under build/ because they are mutated COPIES of the
+# pinned tree -- must not add anything to that population. AUDIT #17c's leak
+# class: an enumerator measuring its own test data. The copy is named
+# build/cr.mut precisely so a stray stamp inside it would be attributable.
+before_after="$(find "$ROOT/build" -name '*last_pass.stamp' 2>/dev/null | wc -l)"
+leak="$(find "$ROOT/build/cr.mut" -name '*last_pass.stamp' 2>/dev/null | head -3)"
+if [ -n "$leak" ]; then
+  echo "LEAK: the mutation workspace added stamp(s) to the population:"
+  printf '%s\n' "$leak" | sed 's/^/  /'
+fi
 
 echo
 echo "== summary =="

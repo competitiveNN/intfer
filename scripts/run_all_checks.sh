@@ -147,6 +147,15 @@ dispatch() { # $1 = label -> runs it
       return $? ;;
     check_e2_ctx.sh)
       timeout 3600 bash "$SCRIPT_DIR/check_e2_ctx.sh"; return $? ;;
+    check_l0_cite.sh)
+      # Needs network on first run (clones compute-runtime sparse, ~1 min) and
+      # exits 2 if the pin cannot be resolved, which reads as UNPROVEN rather
+      # than as a pass.
+      timeout 1800 bash "$SCRIPT_DIR/check_l0_cite.sh"; return $? ;;
+    mutate_l0_cite.sh)
+      # Mutates a COPY of the pinned upstream tree under build/, never tracked
+      # source, so this matrix is safe to run alongside the rest of the stack.
+      timeout 3600 bash "$SCRIPT_DIR/mutate_l0_cite.sh"; return $? ;;
     mutate_fold_matrix.sh)
       timeout 7200 bash "$SCRIPT_DIR/mutate_fold_matrix.sh"; return $? ;;
     mutate_gate_inventory.sh)
@@ -292,7 +301,9 @@ if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
 else
   STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh"
+    STEPS="$STEPS check_l0_cite.sh"
+  [ "${INTFER_QUICK:-0}" = "1" ] || \
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh"
 fi
 echo "== 1/2 checkers =="
 for label in $STEPS; do step "$label"; done
