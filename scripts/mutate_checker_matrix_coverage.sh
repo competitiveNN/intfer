@@ -154,6 +154,50 @@ MUTATE_FN() {
 }
 run_state "M-B" 'MUT_B' 'COVERAGE: PASS' "unmated checker planted, requirement 2 removed"
 
+# M-D: the ARM LOOKUP's QUERY fails. Per AUDIT #21 the SEAM is broken, not the
+# checker's leniency: here the query itself is made to FAIL, so a checker that
+# collapses "the query did not run" into "no dispatch arm" would report ordinary
+# drift for entirely the wrong reason. A stub grep exiting 2 stands in for a
+# malformed pattern or an unreadable file -- a real grep cannot be made to error
+# on a well-formed -F pattern.
+MUTATE_FN() {
+  mkdir -p "$SB/bin"
+  printf '#!/usr/bin/env bash\nexit 2   # the query did not run\n' > "$SB/bin/grep"
+  chmod +x "$SB/bin/grep"
+  patch_literal "$TGT" \
+    '  [ "$arm" = "NO" ] && bad=$((bad+1))' \
+    '  : # M_D -- the arm-drift requirement is no longer asserted' \
+    && verify_patched "$TGT" 'M_D'
+}
+
+# Same shape as run_state, but runs the checker with the failing grep on PATH.
+run_state_stub() {
+  local id="$1" expect="$2"
+  total=$((total+1)); restore
+  local before; before="$(cat "$TGT")"
+  if ! MUTATE_FN; then
+    echo "  $id MISSED -- mutation fn failed"; echo "$id MISSED (fn)" >> "$LOG/summary.txt"; restore; return 1
+  fi
+  cmp -s "$before" "$TGT" && { echo "  $id MISSED -- no-op"; restore; return 1; }
+  grep -q -- 'M_D' "$TGT" || {
+    echo "  $id MISSED -- marker absent (stale anchor)"; restore; return 1; }
+  bash -n "$TGT" 2>/dev/null || {
+    echo "  $id MISSED -- patch left the checker broken (STATE fault)"; restore; return 1; }
+  local o r; o="$(PATH="$SB/bin:$PATH" bash "$TGT" 2>&1)"; r=$?
+  printf '%s\n' "$o" > "$LOG/$id.log"; restore; rm -rf "$SB/bin"
+  if [ "$r" -eq 0 ]; then
+    echo "  $id MISSED -- coverage passed with a FAILING arm lookup"
+    echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; return 1
+  fi
+  if ! pred_expect_absent "$id query-failure" "$o" "$expect"; then
+    echo "$id MISSED (polarity or marker survived)" >> "$LOG/summary.txt"; return 1
+  fi
+  echo "  $id caught -- rc=$r, verdict-polarity=expect-absent (query failure refused)"
+  echo "$id caught" >> "$LOG/summary.txt"; caught=$((caught+1)); return 0
+}
+
+run_state_stub "M-D" 'QUERY-FAILED'
+
 # M-C: the enumeration guard itself. With it gone, a checker that harvests
 # NOTHING would classify nothing and report PASS -- the sites_found=0
 # vacuous-green, which is the class this whole tree keeps auditing.

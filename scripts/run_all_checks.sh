@@ -349,17 +349,55 @@ echo "  ok    sc_ok->ok, sc_unproven->unproven, sc_fail->fail"
 # undispatched and this FAILS LOUDLY -- a coverage check that silently passes
 # because it parsed nothing is worse than no check.
 echo "== 0b dispatch coverage (every check_*/mutate_* must have a dispatch arm) =="
+# shellcheck source=scripts/_gate_enum.sh
+. "$SCRIPT_DIR/_gate_enum.sh"
+enum_reset
+
+# *** THE QUERY'S OWN RESULT CLASS IS CHECKED, NOT JUST ITS OUTPUT. ***
+# grep returns 0 match / 1 no-match / >=2 THE GREP FAILED. The pipeline below
+# previously discarded that: a malformed pattern or a read error yielded an
+# EMPTY $ARMS, and the empty check turned it into "could not extract" -- while
+# the per-script loop had ALREADY reported every script as undispatched on the
+# strength of a query that never ran. Both answers were wrong for the same
+# reason. This bit this session twice, in my own tooling: a pattern containing
+# an unclosed ')' made grep exit 2 and the "no match" was read as real.
+grep_rc=0
 ARMS="$(sed -n '/^dispatch() {/,/^}$/p' "$0" \
         | grep -oE '^[[:space:]]+[^[:space:]]+\.sh\)' \
-        | tr -d '[:blank:])' | LC_ALL=C sort -u)"
+        | tr -d '[:blank:])' | LC_ALL=C sort -u)" || grep_rc=$?
+if [ "$grep_rc" -ge 2 ]; then
+  echo "  FAIL  the arm-list extraction QUERY FAILED (rc=$grep_rc) -- the grep did" >&2
+  echo "        not run, so coverage is UNKNOWN. This is not a coverage verdict." >&2
+  exit 1
+fi
+# Anti-vacuity (AUDIT #20): the extraction must have HARVESTED something before
+# any verdict about coverage is reported. Zero rows means the query ran and
+# found nothing -- which is a different fact from "every script has an arm".
+enum_require_nonempty "dispatch-arms" "$(printf '%s\n' "$ARMS" | grep -c . || true)" \
+  "dispatch() arm patterns" || exit 1
+
 UNDISPATCHED=""
+QUERY_FAILED=""
 N_DISPATCHABLE=0
 for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
   [ -f "$f" ] || continue
   b="$(basename "$f")"
   N_DISPATCHABLE=$((N_DISPATCHABLE + 1))
-  printf '%s\n' "$ARMS" | grep -qxF "$b" || UNDISPATCHED="$UNDISPATCHED $b"
+  grc=0
+  printf '%s\n' "$ARMS" | grep -qxF -- "$b" >/dev/null 2>&1 || grc=$?
+  if [ "$grc" -ge 2 ]; then
+    # The lookup failed; saying "no dispatch arm" here would be a verdict
+    # about a query that never ran.
+    QUERY_FAILED="$QUERY_FAILED $b"
+  elif [ "$grc" -eq 1 ]; then
+    UNDISPATCHED="$UNDISPATCHED $b"
+  fi
 done
+if [ -n "$QUERY_FAILED" ]; then
+  echo "  FAIL  the per-script arm lookup FAILED for:$QUERY_FAILED" >&2
+  echo "        grep did not run for those, so coverage is UNKNOWN, not absent." >&2
+  exit 1
+fi
 if [ -z "$ARMS" ]; then
   echo "  FAIL  could not extract dispatch()'s arm list -- coverage is UNCHECKED." >&2
   exit 1

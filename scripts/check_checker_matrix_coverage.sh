@@ -49,13 +49,22 @@ for c in $CHECKERS; do
   m="mutate_${stem}.sh"
   have="MISSING"
   printf '%s\n' "$MATRICES" | grep -qx "$m" && have="$m"
-  arm="NO"
-  grep -q "^    $m)" scripts/run_all_checks.sh 2>/dev/null && arm="yes"
+  # grep rc: 0 match, 1 no-match, >=2 the QUERY FAILED. A failed query must not
+  # become arm="NO" -- that is a verdict about code the query never examined,
+  # and it is the class that bit this session twice in my own tooling.
+  arm="NO"; arm_rc=0
+  grep -qxF -- "    $m)" scripts/run_all_checks.sh >/dev/null 2>&1 || arm_rc=$?
+  case "$arm_rc" in
+    0) arm="yes" ;;
+    1) arm="NO" ;;
+    *) arm="QUERY-FAILED" ;;
+  esac
   # REQUIREMENT 1: a checker with no matrix is drift -- nothing can falsify it.
   [ "$have" = "MISSING" ] && bad=$((bad+1))
   # REQUIREMENT 2: a matrix with no dispatch arm NEVER RUNS (audit #18), so the
   # suite would still print PASS. Also drift.
   [ "$arm" = "NO" ] && bad=$((bad+1))
+  [ "$arm" = "QUERY-FAILED" ] && bad=$((bad+1))
   printf '%-36s %-34s %s\n' "$c" "$have" "$arm"
 done
 

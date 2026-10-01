@@ -48,3 +48,35 @@ enum_require_min() { # $1 label, $2 count, $3 minimum
 
 enum_bad() { echo "$_enum_bad"; }
 enum_reset() { _enum_bad=0; }
+
+# ---- grep result-classification (AUDIT #21-adjacent tooling class) -----------
+# grep returns 0 = match, 1 = NO MATCH, and >=2 = THE GREP ITSELF FAILED (a
+# malformed pattern, a missing file, a bad option). Collapsing >=2 into "no
+# match" is a silent lie: the query never ran, and the caller reports a verdict
+# about code it never examined. This bit this session twice -- a pattern
+# containing an unclosed `)` made grep exit 2, and that was read as a legitimate
+# empty result rather than a broken query.
+#
+# grep_classify <fixed-string> <file>     -> 0 match, 1 no match, 2 query failed
+# Callers MUST distinguish 2 from 1; use grep_classify_ok for the boolean case
+# where an error should fail closed.
+grep_classify() { # $1 = fixed string, $2 = file (BRE, so no regex metachars)
+  local rc=0
+  grep -qxF -- "$1" "$2" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -ge 2 ]; then
+    echo "QUERY FAILED (grep rc=$rc) for '$1' in $2 -- the query did not run" >&2
+    return 2
+  fi
+  return "$rc"
+}
+
+grep_classify_ok() { # true only on a REAL match; an error is false
+  local rc=0
+  grep -qxF -- "$1" "$2" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ]
+}
+
+# True when grep's non-zero status was a genuine "no match" rather than a
+# failed query. Use after `grep ... || rc=$?` to refuse a verdict built on a
+# query that never ran.
+grep_rc_is_nomatch() { [ "$1" -eq 1 ]; }
