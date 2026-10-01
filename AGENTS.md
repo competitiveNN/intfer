@@ -742,7 +742,7 @@ e.g. S3's contract column is 40 not 42).
    from the CMake `add_executable` list, not from a remembered name list).
    They are blocked on a second GPU, not on missing work. Do not let any
    future summary fold "skipped" into "covered" — the correct phrasing is
-   "7 PASS, 2 PARTIAL, 1 SKIPPED, E1-E4 unmeasured". Itemized table of exactly
+   "7 PASS, 2 PARTIAL, 1 SKIPPED, E1-E5 unmeasured". Itemized table of exactly
    what is
    unverified and how to close it: reports/2026-09-30-pending-bench-backlog.md,
    "OUTSTANDING — blocked on the second GPU".

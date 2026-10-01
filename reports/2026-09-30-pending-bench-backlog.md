@@ -287,6 +287,21 @@ each is invisible to every check the others can see:
 
 So no single check covers the class, and **all four checks are load-bearing**.
 
+## E5 — `INTFER_DEVICE_ARGMAX=1` (per-row conditional device argmax)
+
+**Status: merged and correctness-gated; wall-time A/B still OWED.** Unlike E1-E4
+this one is not a proposal — `d460eb7` + `c2be7f5` shipped it in Sept 2026 with a
+gate (`test_device_argmax.sh`, itself PARTIAL on a 1-GPU box) but **no report**, so
+it was invisible in this pending list until 2026-10-01. Full report, including the
+load-insensitive bucket table and the blank `RESULT:` lines:
+`reports/2026-10-01-device-argmax.md`.
+
+Two things make it different from E1-E4 in the pending table: it does **not** need a
+second GPU (the flag declines TP>1 by construction, `:1913`), and it is
+**not measurable on the 27B target at all** — TP=1-on-one-B580 OOMs on the lm_head
+tile. So the honest scope of E5 is a 0.8B measurement. Do not report an E5 number
+as a 27B result.
+
 ## E4 — PROPOSED (not implemented): cooperative 2D-tiled DPAS block
 
 **Status: design only. There is no flag and no code yet — do not go looking for
@@ -403,9 +418,10 @@ described as covered by them until they have actually run.
 | `test_tp2_27b.sh` | everything: 27B TP=2 greedy decode vs oracle, and the ~19GB-vs-~12GB VRAM headroom claim | same condition, then `bash scripts/test_tp2_27b.sh` |
 | E1 / E2 / E3 A/Bs | every tok/s number in those sections | needs both GPUs *and* a quiet window (load1 < 2) |
 | E4 | unimplemented by design; no flag exists | pre-registered only, see above |
+| E5 `INTFER_DEVICE_ARGMAX=1` | every tok/s number — the lever is **default-off and has never been benchmarked**, only correctness-gated | needs a quiet window (load1 < 2). Does **NOT** need a second GPU: the flag declines TP>1 (`:1913`), so it is TP=1-only by construction. But the 27B target is unreachable either way — TP=1-on-one-B580 OOMs on the lm_head tile (AUDIT #11) — so E5 is honestly a 0.8B measurement, not a 27B one. See `2026-10-01-device-argmax.md` |
 
 If a future session cannot get a second GPU, the correct statement is
-"7 PASS, 2 PARTIAL, 1 SKIPPED, E1-E4 unmeasured" — **not** a full pass, and
+"7 PASS, 2 PARTIAL, 1 SKIPPED, E1-E5 unmeasured" — **not** a full pass, and
 never a tok/s figure from a 1-GPU or loaded window.
 
 ### Self-check for the fold matrix (run it after any refactor of that code)
