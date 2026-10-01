@@ -127,6 +127,22 @@ matrix, and the shared patch helper — all dispatched steps of
     `verify_patched`, `residue_scan`. New matrices source this instead of
     adding another copy; the three remaining duplicates are a recorded decision
     with explicit conversion triggers, see the `patch_literal` note below.
+  - `scripts/_gate_pred.sh` — `pred_expect_absent` / `pred_expect_present`, so a
+    comparison NAMES its polarity at the call site. See the inverted-predicate
+    rule below.
+  - `scripts/_gate_pop.sh` — `pop_dirs` / `known_dirs` / `pop_unknown_dirs` /
+    `pop_assert_no_leak`. The set of stamp directories a matrix legitimately
+    owns is **derived** from each `mutate_*.sh`'s own `WORK=`/`LOG_DIR=`/`STAMP=`
+    assignment, never hand-listed: an omission is silent, and the correct fix
+    (add the entry) is indistinguishable from the wrong one. It also covers the
+    three prefix forms real matrices write (`${INTFER_BUILD_DIR:-$ROOT/build}/`,
+    `$BUILD_DIR/`, `$PWD/build/`) and accepts EITHER `INTFER_BUILD_DIR` or a
+    local `BUILD_DIR`. `scripts/check_gate_pop.sh` is its own behavioural
+    self-check, written because the helper had already produced two defects
+    during conversion — a **false LEAK** on a clean tree from assuming
+    `$PWD/build`, and a **vacuous** assertion from demanding an exported
+    variable — and case (e) of that check then found a third: with neither
+    variable set it enumerated an empty path and still returned rc=0.
   - `scripts/l0_enumerate.sh` — device count + uuid at the driver API. Honours
     INTFER_L0_DRIVER_LIB and prints driverVersion so a no-op lib swap is
     visible. Deletes its own output and refuses to run a stale binary.
@@ -1908,6 +1924,15 @@ e.g. S3's contract column is 40 not 42).
     `mutate_gate_inventory.sh` uses its own `patch_once`, which is a DIFFERENT
     function (per-hunk, not whole-block) and is not a candidate for this helper.
     Do NOT convert it "for consistency".
+    *** THE TRIGGERS ARE CHECKED, NOT ASSUMED. *** As of 2026-10-01 none has
+    fired: the three are untouched by recent work (`mutate_fold_matrix.sh` last
+    changed at `b49e164`, `mutate_device_precond.sh` at `8d6ac55`,
+    `mutate_run_all_checks.sh` at `1adf06f`), and no copy has been edited
+    without the others, so there is no divergence to repair. To re-check before
+    assuming the decision still holds:
+        git log -1 --format=%h -- scripts/mutate_fold_matrix.sh   # etc.
+    If ANY of those shas has moved recently, trigger 2 has fired and the
+    conversion is due.
 
 - **A GUARD SOURCED INSIDE A CONDITIONAL IS A GUARD THAT IS USUALLY ABSENT.**
     While routing `gate_inventory.sh` through `_gate_enum.sh`, the `.` landed

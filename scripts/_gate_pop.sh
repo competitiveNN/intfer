@@ -28,10 +28,21 @@
 # the local), so accept either rather than forcing an export on each matrix --
 # that hard requirement broke mutate_l0_cite.sh, whose M-H then reported the
 # leak assertion as vacuous when the real cause was an unset variable.
-pop_build_dir() { echo "${INTFER_BUILD_DIR:-${BUILD_DIR:?BUILD_DIR or INTFER_BUILD_DIR must be set}}"; }
+pop_build_dir() {
+  if [ -n "${INTFER_BUILD_DIR:-}" ]; then echo "$INTFER_BUILD_DIR"; return 0; fi
+  if [ -n "${BUILD_DIR:-}" ]; then echo "$BUILD_DIR"; return 0; fi
+  # Fail LOUDLY and non-zero. The previous form used ${VAR:?msg} inside an echo,
+  # which printed the message and then went on to enumerate an EMPTY path --
+  # caught by check_gate_pop.sh case (e): it returned rc=0 over zero
+  # directories, i.e. a vacuous enumeration wearing a successful exit code.
+  echo "ERROR: neither INTFER_BUILD_DIR nor BUILD_DIR is set -- cannot enumerate" >&2
+  return 1
+}
 
 pop_dirs() {
-  find "$(pop_build_dir)" -name '*last_pass.stamp' 2>/dev/null \
+  local bd
+  bd="$(pop_build_dir)" || return 1
+  find "$bd" -name '*last_pass.stamp' 2>/dev/null \
     | xargs -r -n1 dirname | xargs -r -n1 basename | LC_ALL=C sort -u
 }
 
@@ -47,7 +58,8 @@ known_dirs() {
 
 # The members of the population that no matrix owns -- i.e. a fixture stamp.
 pop_unknown_dirs() {
-  local k; k="$(known_dirs)"
+  local k
+  k="$(known_dirs)" || return 1
   pop_dirs | while read -r d; do
     [ -n "$d" ] || continue
     case " $k " in *" $d "*) ;; *) echo "$d" ;; esac

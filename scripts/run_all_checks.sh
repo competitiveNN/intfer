@@ -152,6 +152,12 @@ dispatch() { # $1 = label -> runs it
       # exits 2 if the pin cannot be resolved, which reads as UNPROVEN rather
       # than as a pass.
       timeout 1800 bash "$SCRIPT_DIR/check_l0_cite.sh"; return $? ;;
+    check_gate_pop.sh)
+      # Self-check for the SHARED stamp-population helper. Synthetic tree, no
+      # build state touched. Gated on the two defects the helper actually
+      # produced during conversion (false LEAK, vacuous assertion) plus the
+      # fail-closed case its own check then found.
+      timeout 300 bash "$SCRIPT_DIR/check_gate_pop.sh"; return $? ;;
     check_gpu_recover.sh)
       # Stubbed probe; nothing real is modified. Pins the RECOVERY TOOL's exit
       # codes, especially 2=unmeasurable vs 1=still-broken -- the distinction
@@ -341,7 +347,7 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gpu_recover.sh check_build_dir_consumers.sh check_doc_counts.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_build_dir_consumers.sh check_doc_counts.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
