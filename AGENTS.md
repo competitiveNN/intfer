@@ -1803,7 +1803,31 @@ e.g. S3's contract column is 40 not 42).
     that checker had a mutation state designed to make it fail. A checker with no
     matrix would have shipped all three.
 
-  - **`patch_literal` IS STILL DUPLICATED IN THREE MATRICES — DELIBERATE, WITH A
+  - **AN INVERTED PREDICATE SCORES CORRECT CODE AS BROKEN — NAMED RULE, 3 FOR 3.**
+    A mutation state that asserts "this marker is ABSENT" while the marker is
+    the checker reporting the defect correctly is a state that can never pass.
+  MEASURED THREE TIMES IN TWO SESSIONS, always in *working* code:
+    1. `verify_patched()` failed when the marker WAS present — i.e. "the mutation
+       did not apply" for every mutation that applied. Five of six states scored
+       MISSED for an unrelated reason, and because they returned early they
+       skipped their restore, so a mutated helper leaked into the next run.
+    2. `residue_scan` returns **0 when clean**, and the call site branched on
+       success. Inverted, same commit.
+    3. State M-I asserted the guard's own FAIL line while the scorer checked
+       absence — but for that state the guard firing **IS** the success.
+  **RULE: a bare `grep -q "$expect"` is not an assertion, it is a convention
+  nobody can read.** Use `scripts/_gate_pred.sh`'s `pred_expect_absent` /
+  `pred_expect_present`, which NAME the polarity at the call site and print it
+  in the verdict (`verdict-polarity=expect-absent`). A state written for the
+  wrong polarity then fails LOUDLY with the polarity named instead of silently
+  reporting MISSED. Converted: `mutate_gate_enum.sh`,
+  `mutate_build_dir_consumers.sh`, `mutate_doc_counts.sh`, each re-run and
+  re-stamped individually. **Recognise this by the symptom, not by re-deriving
+  it:** "correct checker + MISSED state" is almost always an inverted
+  predicate, and the fix is to check which side the marker is on before
+  touching the checker.
+
+- **`patch_literal` IS STILL DUPLICATED IN THREE MATRICES — DELIBERATE, WITH A
     TRIGGER.** `scripts/_gate_patch.sh` (added AUDIT #20) owns `patch_literal`,
     `verify_patched` and `residue_scan` for NEW matrices. `mutate_fold_matrix.sh`,
     `mutate_device_precond.sh` and `mutate_run_all_checks.sh` still carry their own

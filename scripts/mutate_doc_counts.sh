@@ -19,6 +19,9 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/_gate_pred.sh
+. "$SCRIPT_DIR/_gate_pred.sh"
+
 CHECK="$SCRIPT_DIR/check_doc_counts.sh"
 REPORT="reports/2026-10-01-batch-e1-e2-e3-verdicts.md"
 BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
@@ -71,8 +74,10 @@ run_state() {
   o="$("$CHECK" 2>&1)"; r=$?
   printf '%s\n' "$o" > "$LOG/$id.log"
   # Positive predicate: the specific evidence must be GONE or WRONG.
-  if printf '%s\n' "$o" | grep -qE "$expect"; then
-    echo "  $id MISSED -- checker still produced '$expect'"
+  # POLARITY NAMED AT THE CALL SITE (AUDIT #20 pattern): a bare grep records
+  # nothing about which side the marker belongs on.
+  if ! pred_expect_absent "$id verdict" "$o" "$expect"; then
+    echo "  $id MISSED -- polarity or marker survived: '$expect'"
     echo "$id MISSED (marker survived)" >> "$LOG/summary.txt"; return 1
   fi
   if [ "$r" -eq 0 ]; then
@@ -196,8 +201,8 @@ run_poisoned() {
     echo "  $id MISSED -- checker exited 0 although $why"
     echo "$id MISSED (blind to the defect)" >> "$LOG/summary.txt"; return 1
   fi
-  if printf '%s\n' "$o" | grep -qE "$expect"; then
-    echo "  $id MISSED -- still claims '$expect' although $why"
+  if ! pred_expect_absent "$id poisoned-verdict ($why)" "$o" "$expect"; then
+    echo "  $id MISSED -- polarity or marker survived: '$expect' although $why"
     echo "$id MISSED (marker survived)" >> "$LOG/summary.txt"; return 1
   fi
   echo "  $id caught -- rc=$r and the ok-marker is gone, though $why"

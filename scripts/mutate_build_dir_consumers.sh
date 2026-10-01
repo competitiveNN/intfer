@@ -20,6 +20,9 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/_gate_pred.sh
+. "$SCRIPT_DIR/_gate_pred.sh"
+
 CHECK="$SCRIPT_DIR/check_build_dir_consumers.sh"
 BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
 STAMP="$BUILD_DIR/build_dir_mutate"
@@ -132,9 +135,11 @@ mut_checker() {
     echo "  $id MISSED -- checker exited 0 although $why"
     echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; return 1
   fi
-  if printf '%s\n' "$o" | grep -qE "$expect"; then
-    echo "  $id MISSED -- still reports '$expect'"
-    echo "$id MISSED (marker survived)" >> "$LOG/summary.txt"; return 1
+  # POLARITY NAMED AT THE CALL SITE (AUDIT #20 pattern): a bare
+  # `grep -qE "$expect"` records nothing about which side the marker belongs on,
+  # and an inverted one scores correct code as MISSED.
+  if ! pred_expect_absent "$id verdict ($why)" "$o" "$expect"; then
+    echo "$id MISSED (polarity or marker survived)" >> "$LOG/summary.txt"; return 1
   fi
   echo "  $id caught -- rc=$r, marker gone ($why)"
   echo "$id caught" >> "$LOG/summary.txt"; caught=$((caught+1)); return 0
@@ -143,7 +148,7 @@ mut_checker() {
 # M-D: the vacuity guard neutered. With it gone, an empty CMake harvest no
 # longer exits 2, so a checker that finds nothing reports success.
 mut_checker "M-D" \
-  's|^enum_require_min "cmake-targets" "\$N_TARGETS" 1 \|\||if false; then :; elif false; then|' \
+  's@enum_require_min "cmake-targets" "\$N_TARGETS" 1@enum_require_min "cmake-targets" "\$N_TARGETS" 0@' \
   'BUILD-DIR CONSUMER CHECK: PASS' \
   "the enumeration guard is gone and a re-hardened tree passes"
 
@@ -154,10 +159,11 @@ mut_checker "M-D" \
 # census ("PASS (0 consumer(s), all honor INTFER_BUILD_DIR)"). That is exactly
 # the vacuous-green the state was built to expose, in a checker written to
 # prevent it. The checker now carries the shared inspected-scripts guard, so the
-# correct predicate is the VACUOUS-PASS line, and the state catches it.
+# correct outcome is rc=1 + "VACUOUS PASS", and the ABSENT marker is the naive
+# success line -- which the guarded checker no longer prints.
 mut_checker "M-E" \
   's|if \[ "\$b" = "\$(basename "\$0")" \]; then|if true; then|' \
-  'PASS \(0 consumer' \
+  'all honor INTFER_BUILD_DIR' \
   "every script is skipped by the self-exclusion"
 
 # CONVERSE for the exclusions: the MUTANT payload tag must still be excluded,

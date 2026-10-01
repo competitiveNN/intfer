@@ -29,6 +29,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/_gate_patch.sh
 . "$SCRIPT_DIR/_gate_patch.sh"
+# shellcheck source=scripts/_gate_pred.sh
+. "$SCRIPT_DIR/_gate_pred.sh"
 
 CHECK="$SCRIPT_DIR/check_gate_enum.sh"
 HELPER="$SCRIPT_DIR/_gate_enum.sh"
@@ -113,7 +115,7 @@ run_state() {
     echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; return 1
   fi
   if printf '%s\n' "$o" | grep -qE "$expect"; then
-    echo "  $id caught -- rc=$r, and named the failure ($why)"
+    echo "  $id caught -- rc=$r, verdict-polarity=expect-absent, named the failure ($why)"
     echo "$id caught" >> "$LOG/summary.txt"; caught=$((caught+1)); return 0
   fi
   echo "  $id UNATTRIBUTED -- rc=$r but no '$expect' in the output"
@@ -223,11 +225,19 @@ consumer_state() { # $1 id, $2 consumer-copy, $3 sed-on-consumer, $4 expect, $5 
     echo "  $id MISSED -- consumer exited 0 although $why"
     echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; return 1
   fi
-  if printf '%s\n' "$o" | grep -qE "$expect"; then
-    echo "  $id MISSED -- still reports '$expect'"
-    echo "$id MISSED (marker survived)" >> "$LOG/summary.txt"; return 1
+  # POLARITY NAMED AT THE CALL SITE. The three inverted predicates this repo
+  # produced all lived in a bare `grep -q "$expect"` where nothing recorded
+  # which side the marker was meant to be on. pred_expect_absent says so, prints
+  # so, and therefore fails LOUDLY when a state was written for the other
+  # polarity instead of silently reporting MISSED.
+  if ! pred_expect_absent "$id verdict ($why)" "$o" "$expect"; then
+    echo "  $id MISSED -- the pattern above is PRESENT but this state scores"
+    echo "        'marker survived'. Either the state is written for"
+    echo "        pred_expect_present, or the checker still emits it."
+    echo "$id MISSED (polarity or marker survived)" >> "$LOG/summary.txt"
+    return 1
   fi
-  echo "  $id caught -- rc=$r, marker gone ($why)"
+  echo "  $id caught -- rc=$r, verdict-polarity=expect-absent, marker gone ($why)"
   echo "$id caught" >> "$LOG/summary.txt"; caught=$((caught+1)); return 0
 }
 
@@ -262,6 +272,8 @@ consumer_state "M-H" "$SB/check_doc_counts.sh" \
   "the consumer's own harvest is empty"
 
 # ---- residue + verdict ---------------------------------------------------
+# NOTE the polarity: residue_scan returns 0 when CLEAN, so the branch is on
+# NON-zero. Inverting this was the second of the three bugs.
 if ! residue_scan "$SB" 'MUT_A' 'MUT_B' 'MUT_C' 'MUT_D' 'MUT_E' 'MUT_F'; then
   echo
   echo "RESIDUE FAIL -- mutation markers survived the run; restore is incomplete."
