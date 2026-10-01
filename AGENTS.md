@@ -1428,6 +1428,18 @@ e.g. S3's contract column is 40 not 42).
   matched line 1 of a 4-line continuation and `A_ESCALATE` one line of a 3-line
   arm; the patches left dangling fragments and `verify_patched` correctly aborted
   on a syntax error. Anchors are now whole blocks.
+      * **An argument accepted and never forwarded.** `baseline()` took a
+  litter-site parameter and dropped it, so N-I's litter landed in `scripts/` —
+  the very directory the pre-fix `git status -- scripts/` watched — which made
+  N-I a duplicate of N-G rather than the root-litter case it claims to be. The
+  state still scored correctly (the narrowed check missed it, so the defect WAS
+  reproduced), so nothing went red: the fault was **invisible, not absent**. The
+  baseline line now echoes the litter site, and baselines and states write
+  different logs (`$WORK/$id.baseline.log`) because a state was overwriting its
+  own baseline's evidence — the transcript-vs-tree distinction this repo keeps
+  failing on, in the harness that exists to enforce it. Measured from the tree:
+  N-G's baseline flags `?? scripts/_rac_residue_probe.md`, N-I's flags
+  `?? _rac_root_litter.md`.
       * **The pre-flight counted LINES, the patch counts OCCURRENCES.**
   `check_anchor` used `grep -cF`, so a multi-line anchor reported "4 times" and
   refused to start, while `patch_literal` — the thing that actually has to find
@@ -1436,13 +1448,21 @@ e.g. S3's contract column is 40 not 42).
   `grep -c ... || echo 0` appended a second `0` on every miss, since `grep -c`
   prints 0 *and* exits 1.) Also: `run_state` printed an `ok` line directly under
   MISSED verdicts — a harness's diagnostic is part of what it certifies.
-    **VERIFIED at c693f95**: `run_all_checks.sh` full stack (not QUICK) rc=0 in
-  8m09s — 3 checkers + 4 matrices, 5/5 enumerated stamps at HEAD, tracked tree
-  clean, no new untracked file anywhere; `mutate_run_all_checks` 10/10 caught with
-  **10/10 baselines correct** (each requiring the correct marker PRESENT, so no
-  predicate can be satisfied by an early abort). No wall-time or throughput claim
-  is made anywhere above: the box was loaded (loadavg ~9) and this audit changed
-  no engine code.
+    **VERIFICATION, and why this line carries no sha.** The certified fact is:
+  `scripts/run_all_checks.sh` (full, NOT `INTFER_QUICK=1`) exits **0**, with 3
+  checkers + 4 matrices green, **5/5 enumerated stamps naming HEAD**, tracked
+  tree clean, and no new untracked file anywhere in the work tree;
+  `mutate_run_all_checks.sh` is **10/10 caught with 10/10 baselines correct**
+  (each baseline requires the correct marker PRESENT, so no predicate can be
+  satisfied by an early abort). Two earlier drafts of this paragraph quoted
+  `c693f95` and then `baf6a85` — **both stale by construction**, since
+  documenting a sha in prose moves HEAD the instant the prose is committed. The
+  single authoritative record is the stamp set itself:
+  `find "$INTFER_BUILD_DIR" -name '*last_pass.stamp'` must have every entry's
+  `sha=` equal to `git rev-parse HEAD`, and `run_all_checks.sh` step 3/3 enforces
+  exactly that by enumeration. Read the sha from there, not from this paragraph.
+  No wall-time or throughput claim is made anywhere above: the box was loaded
+  (loadavg ~9) and this audit changed no engine code.
 
 
 
