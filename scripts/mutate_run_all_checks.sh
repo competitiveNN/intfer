@@ -98,13 +98,6 @@ TARGET="scripts/run_all_checks.sh"
 # real repo at all: its own `git diff`/`git rev-parse` resolve inside the sandbox,
 # whose HEAD is a throwaway commit. The stamps are built from the SANDBOX head, so
 # they are self-consistent with the code under test.
-SB="$SYNTH/root"
-MUTANT="$SB/scripts/run_all_checks.sh"
-WORK="$BUILD_DIR/run_all_mutate"
-STAMP="$WORK/last_pass.stamp"
-LOCK="$WORK/.lock"
-PROBE="$SB/scripts/_rac_dirty_probe.md"
-RESIDUE_PROBE="$SB/scripts/_rac_residue_probe.md"
 # The SYNTHETIC world deliberately lives OUTSIDE the build tree. Two reasons, both
 # learned the hard way:
 #   * run_all_checks.sh enumerates stamps with `find "$BUILD_DIR" -name
@@ -116,8 +109,17 @@ RESIDUE_PROBE="$SB/scripts/_rac_residue_probe.md"
 #     lock is not the one the OUTER run_all_checks.sh already holds. Sharing it
 #     made every inner run exit 1 with "another run_all_checks.sh is running", and
 #     the matrix correctly reported that as a broken CASE.
+# Assigned BEFORE the sandbox paths below, which are expressed relative to it.
 SYNTH="$(mktemp -d "${TMPDIR:-/tmp}/rac_mut.XXXXXX")" || exit 1
-mkdir -p "$SYNTH/inner" "$SB/scripts"
+mkdir -p "$SYNTH/inner"
+SB="$SYNTH/root"
+MUTANT="$SB/scripts/run_all_checks.sh"
+WORK="$BUILD_DIR/run_all_mutate"
+STAMP="$WORK/last_pass.stamp"
+LOCK="$WORK/.lock"
+PROBE="$SB/scripts/_rac_dirty_probe.md"
+RESIDUE_PROBE="$SB/scripts/_rac_residue_probe.md"
+mkdir -p "$SB/scripts"
 rm -rf "$WORK"; mkdir -p "$WORK" || exit 1
 cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"
 git init -q "$SB" || { echo "FAIL: could not init sandbox repo $SB" >&2; exit 1; }
