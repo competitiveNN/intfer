@@ -542,9 +542,12 @@ PYEOF
   if [ -z "$hc_live" ] || [ -z "$hc_total" ]; then
     echo "           <-- hand-counted check produced NO verdict (python failed?)" >&2
     VIOLATIONS=$((VIOLATIONS + 1))
-  elif [ "$hc_total" -eq 0 ]; then
-    echo "           <-- VACUOUS: matched 0 hand-counted-total sites, so this check" >&2
-    echo "               verified nothing and would report 0 live by default." >&2
+  elif ! enum_require_nonempty "handcounted-total sites" "$hc_total" \
+          "hand-counted numeric totals in the docs"; then
+    # Shared guard (AUDIT #20): a hand-counted-total check that harvests nothing
+    # reports "0 live" by default. This branch was a hand-rolled copy of that
+    # rule, the same rule the tally loop above already routes through
+    # enum_require_nonempty -- two copies of one guard inside ONE file.
     VIOLATIONS=$((VIOLATIONS + 1))
   else
     VIOLATIONS=$((VIOLATIONS + hc_live))
