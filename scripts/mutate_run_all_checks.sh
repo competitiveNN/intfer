@@ -188,14 +188,18 @@ run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
   local id="$1" steps="$2" sdir="$3" residue="${4:-}"
   mk_stamps "$sdir"
   rm -f "$SYNTH/step_sentinel.ran" "$SYNTH/step_flaky2.count" "$RESIDUE_PROBE"
-  [ -n "$residue" ] && { printf 'residue\n' >"$RESIDUE_PROBE"; git -C "$SB" add -N -- "$RESIDUE_PROBE" 2>/dev/null; }
+  # Deliberately NOT staged. The end-of-run assertion flags UNTRACKED residue,
+  # and `git add -N` makes the file intent-to-add, which counts as staged dirt --
+  # so the START guard rejected it first and the residue assertion was never
+  # reached. Untracked means untracked.
+  [ -n "$residue" ] && printf 'residue\n' >"$RESIDUE_PROBE"
   # INTFER_BUILD_DIR is redirected so the mutant's lock is not the outer run's.
   INTFER_BUILD_DIR="$SYNTH/inner" \
   INTFER_RUN_ALL_STEPS="$steps" INTFER_RUN_ALL_EXTRA_STEPS_DIR="$STEPS" \
     INTFER_RUN_ALL_STAMP_DIR="$sdir" \
     timeout 600 bash "$MUTANT" >"$WORK/$id.log" 2>&1
   local rc=$?
-  rm -f "$RESIDUE_PROBE"; git -C "$SB" reset -q -- "$RESIDUE_PROBE" 2>/dev/null || true
+  rm -f "$RESIDUE_PROBE"
   return $rc
 }
 
