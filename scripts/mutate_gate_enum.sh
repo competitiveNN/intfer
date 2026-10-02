@@ -57,7 +57,7 @@ CA="$(cd "$(dirname "$CHECK")" && pwd)"
 
 git -C "$ROOT" diff --quiet -- scripts/check_gate_enum.sh scripts/_gate_enum.sh 2>/dev/null || {
   echo "FAIL: targets are dirty; this matrix edits copies of them."; exit 2; }
-trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf \"$SB\"' EXIT INT TERM
 
 restore() { cp "$ORIG" "$CHECK"; }
 

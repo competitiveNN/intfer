@@ -27,7 +27,7 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/intfer_pop.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf \"$WORK\"' EXIT INT TERM
 
 # A synthetic scripts/ holding the HELPER plus matrix-shaped files whose path
 # assignments we control. Pointing the helper at a synthetic tree is what makes

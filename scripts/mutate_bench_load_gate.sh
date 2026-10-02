@@ -35,7 +35,7 @@ git -C "$ROOT" diff --quiet -- scripts/ 2>/dev/null || {
   echo "FAIL: scripts/ is dirty; this matrix edits a sandbox copy."; exit 2; }
 
 SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_blg.XXXXXX")"
-trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf \"$SB\"' EXIT INT TERM
 mkdir -p "$SB/scripts" "$LOG"
 # Reset the summary. Without this it ACCUMULATES across runs and the printed
 # block contradicts its own verdict -- it listed "B-A MISSED (fn)" from the

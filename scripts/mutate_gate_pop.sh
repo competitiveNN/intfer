@@ -35,7 +35,7 @@ STAMP="$BUILD_DIR/gate_pop_mutate"
 LOG="$STAMP/states"
 SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_mgp.XXXXXX")"   # OUTSIDE $BUILD_DIR
 mkdir -p "$LOG"; : > "$LOG/summary.txt"
-trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf \"$SB\"' EXIT INT TERM
 
 [ -f "$CHECK" ] || { echo "SKIP: $CHECK missing"; exit 2; }
 git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null || {

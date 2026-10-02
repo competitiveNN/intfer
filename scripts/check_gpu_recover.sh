@@ -29,7 +29,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/intfer_gpur.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf \"$WORK\"' EXIT INT TERM
 
 bad=0
 mk_stub() { # $1 = body of the fake probe

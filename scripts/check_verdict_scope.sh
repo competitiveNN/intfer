@@ -190,7 +190,7 @@ if [ "${INTFER_VERDICT_SCOPE_CASES:-1}" != "1" ]; then
 else
 echo "-- (c) non-vacuity: a planted second emitter is REJECTED --"
 SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_vscope.XXXXXX")"
-trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf \"$SB\"' EXIT INT TERM
 mkdir -p "$SB/scripts"
 cp "$SD"/*.sh "$SD"/*.py "$SB/scripts/" 2>/dev/null
 # A second summariser, correct in every way except that nobody decided about it.

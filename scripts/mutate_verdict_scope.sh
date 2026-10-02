@@ -42,7 +42,7 @@ mkdir -p "$LOG"
 : > "$LOG/summary.txt"
 
 SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_vscope_mut.XXXXXX")"
-trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf \"$SB\"' EXIT INT TERM
 SBD="$SB/scripts"
 restore() { rm -rf "$SBD"; cp -a "$SCRIPT_DIR" "$SBD"; }
 # *** THE SANDBOX COPY IS WHAT RUNS, NOT THE REAL CHECKER. *** The first version

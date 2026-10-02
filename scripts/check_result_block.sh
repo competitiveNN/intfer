@@ -186,7 +186,7 @@ fi
 # The fixture is why this is not a flaky gate: it does not depend on whether the
 # box happens to be busy right now (which is why arm_run reads $LOADAVG).
 TDIR="$(mktemp -d "${TMPDIR:-/tmp}/rbtest.XXXXXX")"
-trap 'rm -rf "$TDIR"' EXIT
+trap 'rm -rf \"$TDIR\"' EXIT INT TERM
 FN="$(printf '%s\n' "$BLOCK" | awk '/^arm_run\(\) \{/{p=1} p{print} p&&/^\}$/{exit}')"
 if ! enum_require_nonempty "arm-run-extracted" "$(printf '%s\n' "$FN" | grep -c . || true)" \
      "lines of arm_run extracted from the block"; then
