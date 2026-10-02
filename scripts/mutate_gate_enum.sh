@@ -114,7 +114,11 @@ run_state() {
     echo "  $id MISSED -- harness exited 0 although $why"
     echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; return 1
   fi
-  if printf '%s\n' "$o" | grep -qE "$expect"; then
+  # Polarity NAMED. The message on the next line used to LABEL this
+  # "verdict-polarity=expect-absent" while the assertion actually requires the
+  # rejection marker to be PRESENT -- a label that described the opposite of what
+  # the code does, which is worse than no label.
+  if pred_expect_present "$id property" "$o" "$expect"; then
     echo "  $id caught -- rc=$r, verdict-polarity=expect-absent, named the failure ($why)"
     echo "$id caught" >> "$LOG/summary.txt"; caught=$((caught+1)); return 0
   fi

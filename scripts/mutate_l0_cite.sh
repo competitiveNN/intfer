@@ -24,6 +24,11 @@ BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
 # "rule fixed at one site, re-derived at another" shape as patch_literal.
 # shellcheck source=scripts/_gate_pop.sh
 . "$SCRIPT_DIR/_gate_pop.sh"
+# Predicates with POLARITY NAMED at the call site. Sourced at top level, never
+# inside a conditional: a guard sourced inside a conditional is a guard that is
+# usually absent (the recorded _gate_enum.sh lesson).
+# shellcheck source=scripts/_gate_pred.sh
+. "$SCRIPT_DIR/_gate_pred.sh"
 SRC_TREE="${INTFER_CR_TREE:-$BUILD_DIR/cr}"
 STAMP="$BUILD_DIR/l0_cite_mutate"
 MUT="$BUILD_DIR/cr.mut"
@@ -105,7 +110,10 @@ run_state() {
     return 1
   fi
   # right reason, not merely "non-zero"
-  if printf '%s\n' "$out" | grep -qE "$expect"; then
+  # Polarity NAMED at the call site (inverted-predicate rule). This file did not
+  # even source _gate_pred.sh, which is how it stayed invisible to the audit that
+  # claimed the conversion was done.
+  if pred_expect_present "$id property" "$out" "$expect"; then
     echo "$id  caught  ($expect)" >> "$LOG/summary.txt"
     echo "  $id caught -- $(printf '%s\n' "$out" | grep -m1 -E 'FAIL' | sed 's/^ *//')"
     caught=$((caught+1)); return 0

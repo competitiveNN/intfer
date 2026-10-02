@@ -68,7 +68,11 @@ run_state() { # $1=id $2=expected-substring $3=sed-expr
     echo "  $id MISSED -- checker passed on a re-hardened script"
     echo "$id MISSED (checker passed)" >> "$LOG/summary.txt"; return 1
   fi
-  if printf '%s\n' "$o" | grep -q "$expect"; then
+  # Polarity NAMED at the call site, per the inverted-predicate rule. A bare
+  # `grep -q "$expect"` reads as a convention nobody can audit, and this file was
+  # listed in AGENTS.md as ALREADY converted when the assertion was still bare --
+  # so the claim was false and only a grep found it.
+  if pred_expect_present "$id property" "$o" "$expect"; then
     echo "  $id caught -- $(printf '%s\n' "$o" | grep -m1 "$expect" | sed 's/^ *//')"
     echo "$id caught ($expect)" >> "$LOG/summary.txt"; caught=$((caught+1)); return 0
   fi
