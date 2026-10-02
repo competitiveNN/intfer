@@ -37,6 +37,14 @@ git -C "$ROOT" diff --quiet -- scripts/ 2>/dev/null || {
 SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_blg.XXXXXX")"
 trap 'rm -rf "$SB"' EXIT
 mkdir -p "$SB/scripts" "$LOG"
+# Reset the summary. Without this it ACCUMULATES across runs and the printed
+# block contradicts its own verdict -- it listed "B-A MISSED (fn)" from the
+# previous run directly above "B-A caught", under a "PASS (5/5)" line. That is
+# the self-contradicting-report class of AUDIT #22 (a summary listing 4 entries
+# beside a verdict claiming 8), and the in-memory counters are what make the
+# verdict correct, so only the EVIDENCE was wrong -- which is the worst place for
+# it to be wrong.
+: > "$LOG/summary.txt"
 cp "$SCRIPT_DIR"/*.sh "$SB/scripts/"          # copies, NOT symlinks -- see header
 TGT="$SB/scripts/check_bench_load_gate.sh"
 ORIG_T="$SB/.orig_target"
