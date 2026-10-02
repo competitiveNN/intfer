@@ -90,8 +90,14 @@ echo
 echo "== states (each damages a HARNESS, not the checker) =="
 
 # B-A: the harness stops routing through the shared gate -- the family reopening.
+# The anchor is UNINDENTED on purpose. An earlier version of this state carried
+# two leading spaces and matched 0 times, so B-A scored MISSED with the message
+# "mutation fn failed" -- which reads as "the harness cannot be damaged" when it
+# actually means "the anchor is wrong". patch_literal reports the count, so this
+# is loud, but it cost a full matrix run. Same lesson as the AUDIT #17 anchor
+# parser: confirm the anchor form mechanically, never by eye.
 MUTATE_FN() {
-  patch_literal "$H" '  . "$SCRIPT_DIR/_gate_loadlog.sh"' '  : # B_A removed the shared gate'
+  patch_literal "$H" '. "$SCRIPT_DIR/_gate_loadlog.sh"' ':   # B_A removed the shared gate'
   grep -q 'B_A' "$H"
 }
 run_state "B-A" 'B_A' 'NO -- it can publish a figure without the shared load gate' \
