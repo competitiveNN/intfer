@@ -177,6 +177,43 @@ measurably disagrees with the host on ~10% of elements (AGENTS.md AUDIT #2/#3).
 | `nk` (kernel launches) | 1116 | 1488 | +372 = 4 tok x 93 GEMM calls — the pre-pass really fires |
 | `nw` (host waits) | 744 | 744 | unchanged: no extra host round-trip |
 
+### MEASURED 2026-10-02 — 27B `--tp 2`, decode `-n64`, 3 interleaved rounds
+Run through `scripts/bench_reports_batch.sh E1 3` (per-arm continuous load
+sampling). **Every arm was `SKIPPED-CONTENDED`** (`max_load1` 3.60 / 4.44 / 6.54 /
+9.57 / 11.23 / 11.31 / 15.32 / 17.45), so **no tok/s is claimed and every
+`RESULT:` line stays blank.** Counters only; raw records in
+`build/bench_E1.log` and `build/bench_logs/E1_*/`.
+
+| round | BASE kernel | DPAS48 kernel | PREQ kernel | DPAS48 copy | PREQ copy |
+|---|---|---|---|---|---|
+| 1 | 18816.0 | 18217.9 | 18923.1 | 2707.4 | 2553.8 |
+| 2 | 16940.5 | 18233.8 | 19778.7 | 2481.0 | 2588.0 |
+| 3 | 17811.4 | 18297.6 | 18239.1 | 2772.6 | 2610.6 |
+
+`nk` = 63488 / 94208 / 124928, identical in all three rounds, so PREQ is
+**+30720 launches = +480 launches/token** over DPAS48. `nw`/`nr` unchanged
+(63488 / 22528).
+
+**The kernel column does NOT resolve PREQ's cost.** Per-round deltas vs DPAS48 are
+`+705.2 / +1544.9 / −58.5 ms` (signs `++−`) against PREQ's own round-to-round
+spread of **1539.6 ms (8.1 %)** — so report PREQ's device-kernel effect as **not
+resolvable**, not as a cost. `copy` behaves the same way: per-round deltas
+`−153.6 / +107.0 / −162.0 ms`, i.e. a ~100–160 ms saving with one round the wrong
+way. Do not quote either median.
+
+> **What is quotable from this run** is the `copy` bucket's *direction* against
+> DPAS48 (2 of 3 rounds, ~150 ms) and the exact `nk` delta. Note also that the
+> host buckets move a great deal between rounds and arms (`submit` alone ranges
+> 3403–7496 ms) — they are host wall clock and track the box, so they cannot
+> decide this A/B even though they look like the biggest numbers in the log.
+
+**Verdict: DO NOT PROMOTE (unchanged), now resting only on facts that survive the
+spread.** +480 launches/token is exact and repeatable; ~150 ms of `copy` against
+an 18.2 s kernel total and 10 s each of host `submit`/`waitblock` cannot reach the
+≥2 % rule. See the E1 row of
+`reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md`, whose single-shot
+`−16.8 ms` kernel figure sits inside this run's noise band and is reconciled there.
+
 ### Expected direction
 It removes part of the host `copy` bucket but **keeps** the O(M*K) host
 max-abs reduction (the price of shipping the exact reciprocal bits), so

@@ -308,10 +308,30 @@ for r in $(seq 1 "$ROUNDS"); do
 done
 
 # ---------------------------------------------------------------- 4. summary
-echo; echo "== SUMMARY (wall tok/s per round, then median; buckets are load-insensitive) =="
-python3 - "$LOG" "$ARMS" <<'PY'
+# *** THE HEADER USED TO CALL THE WHOLE ROW "LOAD-INSENSITIVE". IT IS NOT. ***
+# Only `kernel` is device-side event time. submit / waitblock / copy / readback /
+# usm_write / rebuild are HOST wall-clock accumulators, and this repo's own reports
+# already say so (`copy`, `usm_write` and `readback` are host-side and are NOT
+# load-insensitive). Printing them in the same voice as `kernel` is how a contended
+# run yields a "PREQ saves 3.9 s of submit" reading that is pure box load: the
+# 2026-10-02 E1 run shows exactly that (submit 7308.5 -> 3403.6 ms at load1 4-17),
+# and it is an artifact. A mislabelled table invites the wrong verdict; it does not
+# merely mislabel one.
+#
+# *** AND A MEDIAN HIDES THE SPREAD, WHICH IS LARGER THAN THE EFFECTS BEING TESTED. ***
+# The old table printed one median per bucket. On 27B, kernel ranges 16940-18816 ms
+# across three rounds of the SAME arm and flags -- a 10.5% spread -- so a median
+# delta of +689 ms reads as a measured cost when the per-round deltas are -58,
+# +705 and +1545. Every bucket is now printed per round with its spread, and the
+# delta table below states explicitly whether a median delta clears that spread.
+echo; echo "== SUMMARY (wall tok/s per round, then median) =="
+echo "   kernel + nk/nw/nr : DEVICE-side or exact -- may be believed."
+echo "   submit/waitblock/copy/readback/usm_write : HOST wall clock, NOT"
+echo "   load-insensitive. On a contended box they track the load and cannot"
+echo "   decide a verdict. Shown as medians only, for completeness."
+python3 - "$LOG" "$ARMS" "$REF_ARM" <<'PY'
 import re, sys, statistics
-log, arms = sys.argv[1], sys.argv[2].split()
+log, arms, ref = sys.argv[1], sys.argv[2].split(), sys.argv[3]
 recs = []
 for line in open(log, errors="replace"):
     if not line.startswith("ARM="):
@@ -320,53 +340,128 @@ for line in open(log, errors="replace"):
     # BUCKETS carries the whole bucket line, which CONTAINS SPACES. Whitespace
     # splitting truncated it at the first space, so BUCKETS became "@decode]" and
     # every nk/nw/nr/kernel column in the summary printed "-" for every batch --
-    # i.e. the load-insensitive columns, the entire point of counters-only mode,
-    # were structurally incapable of populating. Quoted at the writer, extracted
-    # by regex here.
+    # i.e. the device-side columns, the entire point of counters-only mode, were
+    # structurally incapable of populating. Quoted at the writer, extracted by
+    # regex here.
     m = re.search(r'BUCKETS="([^"]*)"', line)
     if m:
         d["BUCKETS"] = m.group(1)
     recs.append(d)
 
-def num(rec, key, pat):
-    m = re.search(pat, rec.get(key, "") or "")
-    return float(m.group(1)) if m else None
+P = {"kernel": r"\bkernel=([\d.]+)ms",
+     "submit": r"\bsubmit=([\d.]+)ms",
+     "waitblock": r"\bwaitblock=([\d.]+)ms",
+     "copy": r"\bcopy=([\d.]+)ms",
+     "readback": r"\breadback=([\d.]+)ms",
+     "usm_write": r"\busm_write=([\d.]+)ms",
+     "nk": r"\bnk=(\d+)", "nw": r"\bnw=(\d+)", "nr": r"\bnr=(\d+)"}
+
+
+def series(arm, key):
+    """Per-round values, in file order. Per-round, not median: the spread is the
+    quantity that decides whether a delta is a result at all."""
+    out = []
+    for r in recs:
+        if r.get("ARM") != arm:
+            continue
+        m = re.search(P[key], r.get("BUCKETS", "") or "")
+        if m:
+            out.append(float(m.group(1)))
+    return out
+
+
+def med(v):
+    return statistics.median(v) if v else None
+
+
+def num(v):
+    return ("%.1f" % v) if v is not None else "-"
+
+
+def cnt(v):
+    # nk/nw/nr are exact integer counters; printing them as "63488.0" implies a
+    # measurement precision they do not have, which is the same overclaim as the
+    # 6-decimal millisecond table this replaced.
+    return ("%d" % v) if v is not None else "-"
+
+
+def spr(v):
+    return (max(v) - min(v)) if len(v) > 1 else 0.0
+
 
 for a in arms:
-    rs = [r for r in recs if r["ARM"] == a]
+    rs = [r for r in recs if r.get("ARM") == a]
+    if not rs:
+        print("%-9s (no data)" % a)
+        continue
     tps = []
     for r in rs:
         try:
             tps.append(float(r["TPS"]))
         except (ValueError, KeyError):
             pass
-    # bucket medians: nk/nw/nr are exact counters, kernel is device-side ms
-    def medb(pat):
-        v = [num(r, "BUCKETS", pat) for r in rs]
-        v = [x for x in v if x is not None]
-        return statistics.median(v) if v else None
-    nk, nw, nr = medb(r"\bnk=(\d+)"), medb(r"\bnw=(\d+)"), medb(r"\bnr=(\d+)")
-    kern, subm, wait, copy, rb, usm = (medb(r"\bkernel=([\d.]+)ms"), medb(r"\bsubmit=([\d.]+)ms"),
-                                       medb(r"\bwaitblock=([\d.]+)ms"), medb(r"\bcopy=([\d.]+)ms"),
-                                       medb(r"\breadback=([\d.]+)ms"), medb(r"\busm_write=([\d.]+)ms"))
-    f = lambda x, w=6: ("%*.*f" % (w, w, x)) if x is not None else " " * (w - 1) + "-"
-    g = lambda x: ("%d" % x) if x is not None else "-"
-    if not rs:
-        print(f"{a:9s} (no data)"); continue
     if tps:
         held = len(rs) - len(tps)
         # AUDIT #23: say how many rounds were withheld. A median over the
         # surviving rounds, printed without this, reads exactly like a median
         # over all of them -- and "never the best one" is this repo's rule for a
         # reason. A partial withholding must be visible in the table.
-        extra = f"   [{held}/{len(rs)} round(s) WITHHELD: box contended]" if held else ""
-        print(f"{a:9s} tok/s {'  '.join('%6.2f' % t for t in tps)}  median={statistics.median(tps):6.2f}{extra}")
+        extra = ""
+        if held:
+            extra = "   [%d/%d round(s) WITHHELD: box contended]" % (held, len(rs))
+        print("%-9s tok/s %s  median=%6.2f%s" %
+              (a, "  ".join("%6.2f" % t for t in tps), statistics.median(tps), extra))
     else:
-        print(f"{a:9s} (wall-time withheld: box contended, {len(rs)}/{len(rs)} rounds)")
-    print(f"{'':9s}   nk={g(nk):>6} nw={g(nw):>6} nr={g(nr):>6} kernel={f(kern)}ms submit={f(subm)}ms "
-          f"wait={f(wait)}ms copy={f(copy)}ms rb={f(rb)}ms usmw={f(usm)}ms")
+        print("%-9s (wall-time withheld: box contended, %d/%d rounds)" % (a, len(rs), len(rs)))
+    print("          exact  : nk=%s nw=%s nr=%s" %
+          tuple(cnt(med(series(a, k))) for k in ("nk", "nw", "nr")))
+    k = series(a, "kernel")
+    if k:
+        pct = (100.0 * spr(k) / med(k)) if med(k) else 0.0
+        print("          kernel : %s ms   median=%s  spread=%s (%.1f%%)" %
+              (" ".join("%.1f" % x for x in k), num(med(k)), num(spr(k)), pct))
+    print("          host   : %s   (NOT load-insensitive)" %
+          " ".join("%s=%s" % (b, num(med(series(a, b)))) for b in
+                   ("submit", "waitblock", "copy", "readback", "usm_write")))
+
+# ---- the delta table: does the effect clear the run-to-run spread?
+rk = series(ref, "kernel")
+rounds = max([len(series(a, "kernel")) for a in arms] or [0])
+print()
+if rounds < 2:
+    print("== kernel delta vs %s : SINGLE ROUND per arm, no spread estimate ==" % ref)
+    print("   A one-shot delta cannot be separated from run-to-run noise. Report the")
+    print("   value as a single shot, never as a measured cost or saving.")
+else:
+    print("== kernel delta vs %s, PER ROUND (median delta inside the spread is NOT a result) ==" % ref)
+    print("   noise floor per row = max(spread of the two arms being compared), i.e.")
+    print("   the same arm+flags re-measured. Spread is the ONLY available noise")
+    print("   estimate, so it bounds what can be claimed, it does not prove noise.")
+for a in arms:
+    if a == ref:
+        continue
+    ak = series(a, "kernel")
+    n = min(len(ak), len(rk))
+    if not n:
+        print("   %-9s (no paired rounds)" % a)
+        continue
+    ds = [ak[i] - rk[i] for i in range(n)]
+    md = statistics.median(ds)
+    noise = max(spr(ak), spr(rk))
+    if rounds < 2:
+        v = "single shot -- not a result"
+    elif abs(md) > noise:
+        agree = all([(d > 0) == (md > 0) for d in ds])
+        v = ("CLEARS the spread: report %+.1f ms (%+.2f%%); every round agrees in sign: %s"
+             % (md, 100.0 * md / statistics.median(rk), "yes" if agree else "NO -- a single"
+                " outlier round is carrying it, so treat it as unresolved"))
+    else:
+        v = ("INSIDE the spread (|%.1f| <= %.1f): NOT a result. Signs across rounds: %s"
+             % (abs(md), noise, "".join("+" if d > 0 else "-" for d in ds)))
+    print("   %-9s d=%s  median=%+.1f ms  -> %s" %
+          (a, " ".join("%+.1f" % d for d in ds), md, v))
 if recs:
-    print(f"\n(n={len(recs)} runs, load1 at each run is in {log})")
+    print("\n(n=%d runs, load1 at each run is in %s)" % (len(recs), log))
 PY
 echo
 echo "RESULT ($BATCH, $(basename "$MODEL") tp=$TP, devices=$NDEV) - NO wall-time claimed:"

@@ -2485,6 +2485,72 @@ e.g. S3's contract column is 40 not 42).
       contended (load1 8.79, the standing julia blocker), and nothing engine-related
       was touched.
 
+- **AUDIT #26 (2026-10-02): THE BENCH SUMMARY LABELLED HOST BUCKETS
+      "LOAD-INSENSITIVE" AND PRINTED ONLY MEDIANS — SO A DELTA SMALLER THAN THE
+      SPREAD READ AS A RESULT. No engine/quant/schedule code touched.**
+  Audited this session's own work with the standing question, "what does this
+  claim, and can it be false?" and read the numbers back off disk instead of
+  off the transcript.
+    - **THE MEASUREMENT THAT DID NOT EXIST.** The 2026-10-02 3-round E1 run
+      (27B TP=2, `-n64`, raw log `build/bench_E1.log`) was summarised to me as
+      "PREQ costs **+689 ms** of device kernel". Every arm was
+      `SKIPPED-CONTENDED` (`load1` 3.60–17.45) so no tok/s was claimable, and the
+      kernel figure is **not a measurement either**. Per-round deltas vs DPAS48 are
+      `+705.2 / +1544.9 / −58.5 ms` (signs `++−`), and PREQ's own round-to-round
+      spread is **1539.6 ms = 8.1 %** of an 18.2 s total. The median delta sits
+      *inside* the spread of the same arm re-measured. **Correct statement:
+      PREQ's device-kernel effect at 27B is NOT RESOLVABLE.** The verdict
+      (DO NOT PROMOTE) survives unchanged, but only because `nk` +30720
+      (= **+480 launches/token**, byte-identical in all three rounds) is exact and
+      buys a ~150 ms `copy` saving whose per-round deltas are `−153.6 / +107.0 /
+      −162.0 ms` — one round the WRONG WAY, so even that saving is ~100–160 ms,
+      not a median to quote. **Now recorded in
+      `reports/2026-09-30-pending-bench-backlog.md` (E1) and reconciled against
+      the archived single-shot table in
+      `reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md`**, which recorded
+      PREQ at `−16.8 ms` kernel from one shot — a number inside that same band.
+      **A MEASUREMENT THAT IS NOT WRITTEN DOWN IS A MEASUREMENT THAT NEVER
+      HAPPENED**, whatever the session summary says about it.
+    - **THE TOOL DEFECT THAT PRODUCED IT, AND IT IS WORSE THAN THE CLAIM.**
+      `scripts/bench_reports_batch.sh`'s summary header read *"buckets are
+      load-insensitive"* over a row containing `submit`, `waitblock`, `copy`,
+      `readback`, `usm_write`. **Only `kernel` is** — the rest are HOST wall-clock
+      accumulators, as this very file says elsewhere. Concretely, the same run
+      shows PREQ `submit` 3403.6 ms against DPAS48's 7308.5 ms, a "**−53 %**"
+      submit saving that is pure box load. The table was not merely mislabelled,
+      it was **inviting that number to be read as the result** — the strongest
+      reason to fix a label.
+      And the median-only format hid the very spread that decides the question.
+      Fixed: buckets are grouped into **exact** (`nk`/`nw`/`nr`, integers — the
+      old code printed `nk=63488.0`), **device** (`kernel`, printed **per round**
+      with `spread` and its percentage) and **host** (`NOT load-insensitive`,
+      medians, labelled); precision is 1 decimal instead of 6; and a **per-round
+      delta table vs `$REF_ARM`** ends the report with an explicit verdict —
+      `CLEARS the spread` (plus whether every round agrees in sign) or
+      **`INSIDE the spread … NOT a result`**, using
+      `max(spread of the two arms compared)` as the noise floor. A **single-round**
+      or **empty** log now says it cannot support a delta instead of printing one
+      (verified against a 1-round, a counters-only and an empty log, all rc=0 with
+      no crash). **This is the AUDIT #20 rule applied to a table: say which cells
+      may be believed, and never print a central value without the spread that
+      bounds it.**
+    - **INSTALLING IT WHILE A BENCHMARK WAS RUNNING.** The fix had to reach a file
+      the live driver was executing. Do **not** edit a running shell script in
+      place — bash re-reads it by byte offset. It was staged in `build/` and moved
+      over with `mv`, which replaces the **directory entry** and leaves the runner
+      on its **old inode**: measured, the in-flight E3 kept running the old code to
+      completion and only the next batch (`E2`) picked up the new summary. **For
+      any "self-healing" replacement of a file in use, write-then-`mv`, not
+      write-in-place.**
+    - **TOOLING NOTE, RECORDED BECAUSE IT PRODUCED A FALSE "IT DIED".** `ps -eo
+      pid,ppid,stat,etime,comm` and `ps -eo … | grep -c bench_reports_batch` both
+      returned **nothing** for a driver that was demonstrably alive and writing
+      (`ps -ef | grep …` found it immediately; `find -printf %T@` on its arm logs
+      showed it advancing). The plain `ps -ef` form is the reliable one here — the
+      same class as the recorded `ls` wrapper hiding `/dev/dri` entries. **Confirm a
+      long job is dead by its OUTPUT (file mtimes advancing), never by one `ps`
+      invocation that came back empty.**
+
 - **THE STANDING BLOCKER ON 27B WALL-TIME — *SUPERSEDED 2026-10-02, READ THE ENTRY
       BELOW; THIS TEXT IS THE RECORD OF A PROCESS THAT NO LONGER EXISTS*.**
       Measured 2026-10-02: `load1 = 13.18`, driven by **PID 274320, a `julia`

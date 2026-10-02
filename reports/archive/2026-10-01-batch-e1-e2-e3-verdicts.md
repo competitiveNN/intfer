@@ -697,6 +697,24 @@ Decode, 64 tokens, 27B `--tp 2`. `kernel` is device-side event time; `copy`,
 | E3 +FOLD | 116736 | 63488 | 22528 | **17884.1 ms** | 2835.1 ms | 1652.8 | 3055.6 |
 | E3 +FOLD+PREQ | 147456 | 63488 | 22528 | **17868.1 ms** | 2521.8 ms | 1725.5 | 3542.8 |
 
+> **RECONCILED 2026-10-02 — the single-shot `kernel` column above cannot decide a
+> per-arm delta, and one reading of it already was wrong.** A 3-round re-run of the
+> E1 arms (`scripts/bench_reports_batch.sh E1 3`, 27B TP=2, `-n64`, raw log
+> `build/bench_E1.log`) measures PREQ's own round-to-round `kernel` spread at
+> **1539.6 ms = 8.1 %** of an 18.2 s total, with per-round deltas vs DPAS48 of
+> `+705 / +1545 / −59 ms` (signs `++−`). So the `18197.7 vs 18214.5` pair above
+> must be read as **not resolvable**, not as PREQ being 16.8 ms cheaper: one shot
+> inside a 1.5 s band is not a 16.8 ms measurement.
+> **`BASE` is inside its own noise too** — spread 1875.5 ms (10.5 %) — so the
+> +1774 ms `BASE → DPAS48` gap in this table is likewise *not* a resolved
+> per-round delta, even though its sign agrees with every other record.
+> **None of the three DO-NOT-PROMOTE conclusions changes**, because none of them
+> rested on the kernel column alone: they rest on the **exact** launch counters
+> (E1 `+30720` = +480/token, E2 `nk`/`nw`/`nr` byte-identical, E3 `+22528` with
+> `nw`/`nr` unchanged). **What changes is what may be claimed**: a kernel delta
+> below the arm's own spread is "not resolvable", and the harness summary now says
+> so explicitly instead of printing one median per bucket.
+
 ### Stream identity at 27B (the gate before any timing)
 
     E1  BASE == DPAS48 == PREQ   11751 13 198 760 6511 314 9338 369
