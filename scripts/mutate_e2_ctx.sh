@@ -37,7 +37,7 @@ STAMP="$BUILD_DIR/e2_ctx_mutate"
 LOG="$STAMP/states"
 SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_me2c.XXXXXX")"   # OUTSIDE $BUILD_DIR
 mkdir -p "$LOG"; : > "$LOG/summary.txt"
-trap 'rm -rf \"$SB\"' EXIT INT TERM
+trap 'rm -rf "$SB"' EXIT INT TERM
 
 [ -f "$CHECK" ] || { echo "SKIP: $CHECK missing"; exit 2; }
 git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null || {

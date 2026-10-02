@@ -167,7 +167,7 @@ done
 # is the exact defect. Both directions are required: a gate that can only say
 # USABLE is the bug, and one that can only say CONTENDED is useless.
 TDIR="$(mktemp -d "${TMPDIR:-/tmp}/blg.XXXXXX")"
-trap 'rm -rf \"$TDIR\"' EXIT INT TERM
+trap 'rm -rf "$TDIR"' EXIT INT TERM
 if [ ! -f "$HELPER" ]; then
   echo "  FAIL  $HELPER is missing -- the shared home does not exist"
   bad=$((bad+1))
