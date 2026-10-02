@@ -400,9 +400,27 @@ each is invisible to every check the others can see:
 
 So no single check covers the class, and **all four checks are load-bearing**.
 
-## E5 — `INTFER_DEVICE_ARGMAX=1` (per-row conditional device argmax)
+## E5 — `INTFER_DEVICE_ARGMAX=1` — **DECIDED 2026-10-02: KILL. NOT PENDING.**
 
-**Status: merged and correctness-gated; wall-time A/B still OWED.** Unlike E1-E4
+**Do not benchmark this.** The A/B was run on 2026-10-02 (3 interleaved rounds, 0.8B
+TP=1, `-n 64`, streams identical, non-vacuity probe 0/1) and the verdict is **KILL**.
+Verdict, counters and reasoning: `reports/archive/2026-10-01-device-argmax.md`.
+
+The one line that matters: the lever's premise was that it would "save part of the
+bulk D2H", and **`nr` — the readback count — is IDENTICAL, 4608 vs 4608.** The
+promised saving did not occur. What remains is `nk` **+4 launches/token** (exact,
+identical in all 3 rounds) and **+0.036 ms/token** of device kernel time, with no
+bucket anywhere decreased. Against this repo's bar (win = decode ≥2%, ≈ 0.74
+ms/token) that is unreachable, so no quiet-box run is worth spending on it. Leave it
+default-off, and do not implement the deferred E6 instrumentation either — its
+payoff bucket (`nr`) is now provably flat.
+
+Its three host-side buckets were disproved as noise *by that same run*: paired
+per-round sums of **+45.1 / +11.2 / +39.2 ms** for three rounds of identical work.
+**No tok/s is claimed** — every arm was `SKIPPED-CONTENDED` at load1 11-18.
+
+**Original status, kept as the record:** merged and correctness-gated; wall-time
+A/B still OWED. Unlike E1-E4
 this one is not a proposal — `d460eb7` + `c2be7f5` shipped it in Sept 2026 with a
 gate (`test_device_argmax.sh`, itself PARTIAL on a 1-GPU box) but **no report**, so
 it was invisible in this pending list until 2026-10-01. Full report, including the
