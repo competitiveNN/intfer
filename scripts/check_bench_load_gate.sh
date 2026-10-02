@@ -30,13 +30,21 @@
 # This file STRIPS comments before matching; its sibling
 # scripts/check_build_dir_consumers.sh does NOT. Both choices are right for their
 # own question, and a previous round of this audit proved the difference the hard
-# way: a usage comment in _gate_loadlog.sh containing `build/bench_logs/run1` was
+# way: a usage comment in _gate_loadlog.sh that spelled out a build-tree path was
 # graded as a build-path consumer and turned the stack red, because that
 # classifier does not strip. Here, NOT stripping would pull run_all_checks.sh into
 # the population over a prose mention of "tok/s" and demand a load gate from a
 # script that publishes no figure. So: strip when the match decides MEMBERSHIP of
 # a population, because a comment is not a behaviour; do not strip when the match
 # is only a hint. Do not "harmonise" these two without re-deriving both.
+#
+# *** AND A NOTE ON WRITING THIS NOTE, WHICH COST A FULL STACK RUN. ***
+# The first draft of the paragraph above QUOTED the offending path verbatim, and
+# that made THIS file a build-dir consumer, so check_build_dir_consumers.sh failed
+# on it -- the third instance of the same class, and the second caused by
+# documentation. A checker that spells out another checker's literal patterns will
+# be graded by them. So the paths are described, never quoted, and if you need the
+# exact spelling, read the sibling.
 #
 # Usage: scripts/check_bench_load_gate.sh
 # Exit: 0 = every harness gated, 1 = drift, 2 = setup.

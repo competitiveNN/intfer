@@ -2043,6 +2043,16 @@ e.g. S3's contract column is 40 not 42).
       floor (`enum_require_min ... 3`, AUDIT #20): a population of zero would
       make every assertion below vacuously true and report PASS over an empty
       census.
+      *** WIDENED THE SAME DAY, AND THE WIDENING IS NOW A TEST. *** The pattern
+      above keyed on RATES only (`tok/s`, `tokens in`), so `bench_chat.sh` — which
+      publishes TTFT / TPOT / E2E in SECONDS off the SSE stream and quotes no rate
+      token at all — was invisible to it. That is this file's own lesson closing
+      on itself: the derivation missed a harness for exactly the reason a
+      remembered list would have. The pattern now reads
+      `tok/s|tokens in|TTFT|TPOT|E2E`, the population is **seven**, and state
+      **B-G** plants a harness matching ONLY the latency arm to prove the widened
+      criterion can actually fail — if the derivation still keyed on rates, that
+      plant would be invisible and B-G could never pass.
     - **THE THREE HAND-ROLLED QUIET GATES, ALL DOING THE SAME WRONG THING.**
       `bench_quiet_ab.sh`, `bench_quiet_l4_ab.sh` and `bench_reports_batch.sh`
       each printed `WARN: box never quieted (load1=$L >= $QLOAD)` — and then
@@ -2103,9 +2113,14 @@ e.g. S3's contract column is 40 not 42).
       must WITHHOLD, and against a quiet fixture and must PUBLISH — both
       directions required, since a gate that can only say USABLE is the bug and one
       that can only say CONTENDED is useless (always-red converse).
-      `scripts/mutate_bench_load_gate.sh` is **5/5** (states B-A..B-E; read live
+      `scripts/mutate_bench_load_gate.sh` is **7/7** (states B-A..B-G; read live
       figures from `build/bench_load_gate_mutate/last_pass.stamp`, never from
-      here). The model is AUDIT #21 applied to the ARTIFACT: the harnesses are
+      here). `B-F` regresses `bench_chat.sh` to publishing unconditionally — TWO
+      hunks, because removing only the branch would leave the helper sourced and
+      the state invisible (the AUDIT #17 mutual-masking shape) — and is marked on
+      the harness NAME, which is unique to it: `B-A` trips the same property on a
+      different file, and a shared marker would let one state's catch be scored as
+      another's. The model is AUDIT #21 applied to the ARTIFACT: the harnesses are
       CORRECT after this change, so weakening the CHECKER is unobservable — each
       state damages a harness in a sandbox COPY of `scripts/` (never a symlink,
       which would edit the real tree) and requires the checker to reject it.
@@ -2153,12 +2168,24 @@ e.g. S3's contract column is 40 not 42).
       population derivation would otherwise demand a load gate from
       `run_all_checks.sh` over a prose mention. Both choices are recorded at their
       call sites.
-    - **SCOPED, NOT DONE: `scripts/bench_chat.sh`.** It measures HTTP TTFT / TPOT
-      / E2E in seconds off the SSE stream rather than scraping a CLI tok/s, so it
-      falls outside the derived population (its only `tok/s` is prose in comments,
-      which the comment strip removes) and was NOT wired this round. Precise
-      wording: **out of scope of the derivation, not exempt by judgement** — it is
-      a wall-time measurement harness and wiring it is a mechanical follow-up.
+    - **`bench_chat.sh` IS NOW WIRED — the "SCOPED, NOT DONE" note that stood here
+      for one commit was STALE THE MOMENT THE DERIVATION WAS WIDENED, which is the
+      point.** It runs under `loadlog_arm`, so the load is sampled for the whole
+      run and judged on the maximum; the per-turn TTFT/TPOT/E2E lines stay in a
+      log and are printed ONLY when the run stayed under the threshold, otherwise
+      they are named as diagnosis-only. **The parity assertion runs either way** —
+      a withheld figure is not a failed correctness check, and conflating the two
+      would lose a real signal. The prefix-cache A/B in `reports/2026-09-26` is
+      read off exactly these numbers, which is why it was worth the follow-up
+      rather than leaving as a note.
+    - **THE MARKER-CONTRACT TRAP, HIT TWICE IN ONE SESSION, BOTH TIMES BY ME.**
+      AUDIT #22 recorded that a mutation state's expected-regex is a contract with
+      the checker's FAIL wording. Twenty minutes after writing that, renaming one
+      FAIL message scored `B-B` MISSED — a state that had done exactly what it was
+      built to prove. The fix is the same both times and is not optional: **when a
+      checker's message changes, grep its matrix for the old string in the same
+      commit.** A false MISSED is the safe direction, but it costs a full matrix
+      run to discover and it trains you to distrust the matrix.
 
 - **SIXTH RECURRENCE OF THE SAME CLASS: I WROTE THE PREDICATE FOR THE OUTPUT I
     EXPECTED, NOT THE ONE I OBSERVED.** Two more instances this session, both

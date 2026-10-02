@@ -55,6 +55,26 @@ enum_require_min "cmake-targets" "$N_TARGETS" 1 || {
 }
 
 # ---- population, part 2: every script that references a build tree -----------
+# *** CRITERION DISAGREEMENT WITH check_bench_load_gate.sh, DELIBERATE. ***
+# This classifier does NOT strip comments before matching; its sibling
+# scripts/check_bench_load_gate.sh DOES. Both are right for their own question.
+#
+# This exact difference turned the stack red once (AUDIT #23): a usage comment in
+# scripts/_gate_loadlog.sh that spelled out a build-tree path was graded as a
+# build-path consumer, and this checker plus its matrix both failed behind it. The
+# fix applied then was to correct the COMMENT (the helper consumes no artifact at
+# all -- its caller passes the directory), NOT to teach this classifier to strip.
+# It happened a THIRD time immediately after, to the note written at the sibling's
+# call site, so the paths here are described rather than quoted: a checker that
+# spells out this classifier's literals gets graded by them.
+#
+# The rule that reconciles them: strip comments when the match decides MEMBERSHIP
+# of a population, because a comment is not a behaviour. Here the match is only a
+# hint -- the real test is the per-script override check below -- so a comment
+# costs one extra row, not a wrong verdict. Over there the match IS the
+# population, so an unstripped comment would add a script that publishes no
+# figure. Do not "harmonise" the two without re-deriving both; the reasoning is
+# duplicated at check_bench_load_gate.sh's own call site on purpose.
 CONSUMERS="$(grep -rlE '(INTFER_BUILD_DIR|\$ROOT/build|\$\{INTFER_BUILD_DIR|\$\{ROOT\}/build|build/)' \
              scripts/*.sh 2>/dev/null | LC_ALL=C sort)"
 N_CONSUMERS="$(printf '%s\n' "$CONSUMERS" | grep -c .)"
