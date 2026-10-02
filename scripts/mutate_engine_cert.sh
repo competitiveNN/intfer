@@ -106,6 +106,59 @@ check_state "E-B" 1 'certification STALE' "an engine input changed since the cer
 rm -f "$SB/ten_gates/HEAD"
 check_state "E-C" 2 'UNPROVEN' "no artifact at all is unproven, not a regression"
 
+# E-E: an artifact naming a commit THIS REPOSITORY DOES NOT CONTAIN is UNPROVEN,
+# not "carries". Added because the audit found the checker answering rc=0 "carries"
+# for a 40-zero sha, printing "0 file(s) changed ... (List: )" -- it certified an
+# engine it could not compare. `git diff` exits 128 with empty stdout and the old
+# `|| true` turned that into an empty harvest, i.e. a clean tree.
+#
+# *** THIS IS AN ARTIFACT-DEFECT STATE, WHICH IS THE FORM AUDIT #21 REQUIRES. ***
+# The checker here is CORRECT by construction -- every other state plants a real
+# revision -- so weakening the checker would have been unobservable (0/4 is exactly
+# what AUDIT #21's wasted pass looked like). The defect had to be put in the
+# ARTIFACT, and the checker had to reject it.
+#
+# The converse is already covered by E-A: a real revision that legitimately carries
+# is still accepted, so E-E cannot be satisfied by an always-refusing checker.
+plant "0000000000000000000000000000000000000000"
+check_state "E-E" 2 'UNPROVEN' "a cert naming a commit this repo does not contain is unmeasurable, not a certification"
+
+# E-F: THE CONVERSE -- the new guards must not refuse a certification that is
+# genuinely fine. Two distinct shas with an IDENTICAL tree (an empty commit on top
+# of HEAD) mean the certified source IS this source, so carrying is CORRECT.
+#
+# *** THIS STATE IS WHY E-E MEANS ANYTHING, AND IT IS ALSO THE RECORD OF A GUARD
+# THAT WAS WRITTEN AND THEN REMOVED. *** The fix's first version added
+# enum_require_nonempty on the changed-file count -- the AUDIT #20 rule, applied
+# where it does not apply. Measured: `git diff --name-only` between same-tree commits
+# emits a single "\n" and no filenames, so a legitimately clean comparison harvests
+# ZERO files and the guard refused valid evidence. A converse is what catches that;
+# had E-E been the only state, the over-assertion would have shipped green as a
+# "fix". The quiet case is the one that gets forgotten (the named rule), and here it
+# is the one that had to be invented before the firing case could be trusted.
+total=$((total+1))
+restore_check
+SAME_TREE_SHA="$(git -C "$ROOT" commit-tree "$(git -C "$ROOT" rev-parse HEAD^{tree})" \
+  -p "$(git -C "$ROOT" rev-parse HEAD)" -m "engine-cert: empty commit, same tree as HEAD" 2>/dev/null || true)"
+if [ -z "$SAME_TREE_SHA" ]; then
+  echo "  E-F MISSED -- could not mint a same-tree commit (STATE fault)"
+  echo "E-F MISSED (mint)" >> "$LOG/summary.txt"
+else
+  plant "$SAME_TREE_SHA"
+  o="$(run_check)"; r=$?
+  printf '%s\n' "$o" > "$LOG/E-F.log"
+  if [ "$r" -eq 0 ] && pred_expect_present "E-F property" "$o" 'carries to HEAD'; then
+    echo "  E-F caught -- a same-tree certification still CARRIES, so the new guards"
+    echo "        reject an unresolvable sha without refusing valid evidence"
+    echo "E-F caught" >> "$LOG/summary.txt"; caught=$((caught+1))
+  else
+    echo "  E-F MISSED -- rc=$r, want 0 'carries to HEAD'. The guards over-refuse: an"
+    echo "        empty harvest between two identical trees is a legitimate carry."
+    printf '%s\n' "$o" | tail -4 | sed 's/^/        /'
+    echo "E-F MISSED (rc=$r)" >> "$LOG/summary.txt"
+  fi
+fi
+
 # E-D: weaken the engine-input filter while the artifact is STALE.
 #
 # *** THE REPLACEMENT MUST MATCH NOTHING, AND THE FIRST ATTEMPT DID NOT. *** It

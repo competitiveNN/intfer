@@ -2399,6 +2399,92 @@ e.g. S3's contract column is 40 not 42).
       `git diff` still resolve) under a leading underscore, so it is invisible to
       every `check_*`/`mutate_*` glob the stack enumerates.
 
+- **AUDIT #25 (2026-10-02): THE CHECKER ADDED BY AUDIT #24 CERTIFIED THE ONE
+      THING IT WAS SUPPOSED TO REFUSE — AND ITS OWN COMMENT NAMED THE HOLE.**
+  Read AUDIT #24's work back with the question "what does this claim, and can it be
+  false?", rather than re-running the same checks. No engine, quant or schedule code
+  touched; this is the tooling auditing itself, one round down.
+    - **THE DEFECT, MEASURED NOT ARGUED.** `check_engine_cert.sh` verified that the
+      artifact's `HEAD=` sha was **at least 7 characters long** and then compared it
+      with `git diff --name-only "$CERT_SHA"..HEAD 2>/dev/null || true`. For a sha
+      this repository does not contain, git exits **128**, writes **nothing** to
+      stdout, and `|| true` discards the failure — so the changed-file set came back
+      empty, `n_touched` was 0, and the verdict was **"carries", rc=0**, printed as
+      `0 file(s) changed ... (List: )`. Reproduced by planting a 40-zero sha:
+        before: `RESULT: engine certification carries to HEAD` **rc=0**
+        after:  `RESULT: UNPROVEN -- the certification artifact does not describe
+                 this repository` **rc=2**
+      The checker meant to stop a stale engine certification being carried forward
+      was **certifying** an engine it could not compare. This is the AUDIT #14/#20
+      vacuous-green class: a harvest that matched nothing reported "nothing to fix"
+      while verifying nothing.
+    - **AND IT IS THE *SAME* HOLE ONE LINE UP, WHICH IS THE PART WORTH KEEPING.**
+      The file already carried this exact guard, twenty lines above the defect:
+      *"The git side must work from the real tree, so refuse early if it does not —
+      otherwise a non-repo checkout silently produces an EMPTY changed-file list,
+      which would make a STALE artifact look like it carries."* That reasoning was
+      applied to `git rev-parse HEAD` and **not to the revision it is actually
+      about**. A rule fixed at one site and merely assumed at the adjacent one —
+      AUDITs #3, #12 and #19's shape, reproduced inside the checker that AUDIT #24
+      added to close the same species. **When a guard's stated rationale is about an
+      EMPTY HARVEST, check what the harvest is compared against, not just that git
+      runs.**
+    - **REACHABLE, NOT HYPOTHETICAL.** `INTFER_BUILD_DIR` is a documented override
+      (README), so a tree certified by a different clone, a shallow or rebased
+      history, or a hand-edited artifact all land here.
+    - **rc=2 (UNPROVEN), NOT rc=1.** Same distinction `scripts/gpu_recover.sh`
+      already draws (2 = UNMEASURABLE, explicitly *not* "1 device"): an artifact
+      that cannot be located in this repository is neither a stale certification nor
+      a certification — it is the **absence of evidence**, and `run_all_checks.sh`
+      already routes 2 into its UNPROVEN bucket, whose remedy is "re-run the runner".
+    - *** A GUARD THAT LOOKS LIKE THE AUDIT #20 RULE AND IS WRONG, REMOVED BEFORE IT
+      SHIPPED. *** The first version of this fix added `enum_require_nonempty` on the
+      changed-file count — the shared anti-vacuity guard, applied where it does not
+      apply. **Measured:** for two commits with the **same tree**, `git diff
+      --name-only` emits a single `"\n"` and no filenames at all, so a legitimately
+      clean comparison harvests **zero** files; and two distinct shas with an
+      identical tree is a case where carrying is **CORRECT** (the certified source
+      *is* this source). The guard would have refused valid evidence, and over-
+      assertion is how a correctness gate becomes a flaky gate and a false refusal
+      trains people to disable it. The **explicit rc check** is the precise guard,
+      because it distinguishes "the query did not run" from "the query ran and found
+      nothing" — which a count structurally cannot. **A count cannot tell a failed
+      query from an empty answer; only the rc can.**
+    - *** AND THE STATE I WROTE FOR IT COULD NOT FAIL — CAUGHT BY MEASURING FIRST. ***
+      The obvious extra state (E-F: "a sha that resolves but cannot be diffed must
+      also refuse") is **unobservable**: measured, `git diff A..B` succeeds for any
+      two commits present in the object store, *regardless of reachability*, so an
+      orphan/dangling commit diffs cleanly and the state would have scored MISSED —
+      or worse, been written to pass. Per AUDIT #21 ("a state that cannot be
+      observed must be EXCLUDED, not scored") it was **replaced**, not kept:
+        - **E-E** (new) plants a sha this repo does not contain and requires
+          **rc=2 UNPROVEN**. This is an **artifact-defect** state, which is the form
+          AUDIT #21 requires — the checker here is otherwise correct by construction,
+          so weakening it would have been unobservable, exactly the 0/4 pass AUDIT
+          #21's wasted attempt looked like.
+        - **E-F** (new, and it is the one that matters) is the **CONVERSE**: an
+          empty commit minted on top of HEAD has an **identical tree**, so carrying
+          is correct and the checker must still say **rc=0 "carries"**. *That state
+          is why E-E means anything* — had E-E been the only state, the
+          over-asserting guard above would have shipped green as a "fix". The named
+          rule holds: a converse needs a case where the check must fire **and** a
+          case where it must stay quiet, and the quiet case is the one that gets
+          forgotten — here it had to be invented before the firing case could be
+          trusted.
+      Matrix now **6/6** (E-A..E-F). Read the live tally from
+      `build/engine_cert_mutate/last_pass.stamp` (`states=`, `caught=`), never from
+      prose. The NEGATIVE direction was additionally verified **by hand**, planting
+      the 40-zero sha before invoking the checker — the AUDIT #19 rule: a
+      self-proving state validates the state, not the checker.
+    - **ALL FOUR VERDICT PATHS RE-MEASURED** after the fix: names HEAD → 0; older,
+      no engine input moved → 0 carries; older, engine input moved → 1 STALE; no
+      artifact → 2 UNPROVEN; unresolvable sha → 2 UNPROVEN (was 0 carries). The real
+      artifact (naming `e27391b`) still CARRIES to HEAD across this commit, which is
+      correct: neither the checker nor its matrix is an engine input.
+      **No wall-time or throughput claim is made anywhere above** — the box was
+      contended (load1 8.79, the standing julia blocker), and nothing engine-related
+      was touched.
+
 - **THE STANDING BLOCKER ON 27B WALL-TIME, AS A DIAGNOSIS TO INHERIT RATHER THAN
       A WALL TO REDISCOVER.** Measured 2026-10-02: `load1 = 13.18`, driven by
       **PID 274320, a `julia` process at 99.7% CPU, elapsed 1d23h** (a sibling

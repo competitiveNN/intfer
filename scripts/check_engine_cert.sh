@@ -72,7 +72,40 @@ CERT_SHORT="$(printf '%s' "$CERT_SHA" | cut -c1-7)"
 enum_require_min "cert-sha-length" "${#CERT_SHA}" 7 || {
   echo "  FAIL  $ART does not name a usable HEAD"
   echo "RESULT: engine certification artifact is malformed"
-  exit 1; }
+  exit 2; }
+# *** THE SHA MUST RESOLVE, NOT MERELY BE THE RIGHT SHAPE. *** This guard did not
+# exist and the checker CERTIFIED on an unresolvable one. `enum_require_min` above
+# only asks "is it at least 7 characters long", which a 40-zero sha satisfies; then
+#   CHANGED="$(git diff --name-only "$CERT_SHA"..HEAD 2>/dev/null || true)"
+# exits 128 ("fatal: Invalid revision range"), writes nothing to stdout, and `|| true`
+# threw the failure away -- so n_touched became 0 and the verdict was "carries", rc=0,
+# printed as "0 file(s) changed ... (List: )". Measured on the unpatched tree.
+#
+# That is the AUDIT #14/#20 vacuous-green class, and it is the SAME hole the guard
+# 20 lines above was written to close: "a non-repo checkout silently produces an
+# EMPTY changed-file list, which would make a STALE artifact look like it carries."
+# That reasoning was applied to `git rev-parse HEAD` and not to the revision it is
+# actually about. A rule fixed at one site and merely assumed at the adjacent one --
+# AUDITs #3, #12 and #19's shape, in the checker added by AUDIT #24 itself.
+#
+# Reachable: INTFER_BUILD_DIR is a DOCUMENTED override (README), so pointing it at a
+# tree certified by a different clone, a shallow checkout, a rebased history or a
+# hand-edited artifact all land here -- and the answer must not be "certified".
+#
+# rc=2 = UNPROVEN, not 1. Same distinction scripts/gpu_recover.sh already draws
+# (2 = UNMEASURABLE, explicitly NOT "1 device"): an artifact that cannot be located in
+# this repository is neither a stale certification (1) nor a certification (0). It is
+# the absence of evidence, and run_all_checks.sh already routes 2 into its UNPROVEN
+# bucket whose remedy is "re-run the runner".
+if ! git cat-file -e "${CERT_SHA}^{commit}" 2>/dev/null; then
+  echo "  FAIL  the artifact names ${CERT_SHORT:-<none>}, which does not RESOLVE to a"
+  echo "        commit in THIS repository. A certification of a tree this clone does"
+  echo "        not contain cannot be compared to HEAD, and must not be carried."
+  echo "        (Usually a stale INTFER_BUILD_DIR pointing at another clone's tree, a"
+  echo "        shallow/rebased history, or a hand-edited artifact.)"
+  echo "RESULT: UNPROVEN -- the certification artifact does not describe this repository"
+  exit 2
+fi
 CERT_TALLY="$(sed -n 's/^pass=//p' "$ART" | head -1)"
 echo "  artifact: $ART"
 echo "  certified tree: $CERT_SHORT   tally: pass=$CERT_TALLY ..."
@@ -86,7 +119,28 @@ if [ "$CERT_SHA" = "$HEAD_SHA" ]; then
 fi
 
 # Older than HEAD. Does the difference touch anything a gate reads?
-CHANGED="$(git diff --name-only "$CERT_SHA"..HEAD 2>/dev/null || true)"
+#
+# The rc is checked EXPLICITLY rather than swallowed with `|| true`, because git's
+# failure mode here is SILENT: `git diff <bad>..HEAD` exits 128, writes NOTHING to
+# stdout, and `|| true` discarded that -- an unknown difference then read as a clean
+# tree. That is the unresolvable-sha defect above, one line down.
+#
+# *** AND THE OBVIOUS anti-vacuity GUARD IS DELIBERATELY NOT HERE. *** The first
+# version of this fix added enum_require_nonempty on the changed-file count, which
+# looks like the AUDIT #20 rule and is WRONG here. Measured: for two commits with the
+# same tree, `git diff --name-only` emits a single "\n" and nothing else, so a
+# legitimately clean comparison harvests zero files -- and two distinct shas with an
+# IDENTICAL tree is a case where carrying is CORRECT (the certified source IS this
+# source). The guard would have refused valid evidence: over-assertion is how a
+# correctness gate becomes a flaky gate, and a false refusal trains people to
+# disable it. The rc check is the precise guard, because it distinguishes "the query
+# did not run" from "the query ran and found nothing" -- which a count cannot.
+if ! CHANGED="$(git diff --name-only "$CERT_SHA..HEAD" 2>/dev/null)"; then
+  echo "  FAIL  git diff $CERT_SHORT..HEAD failed; the changed-file set is unknown."
+  echo "        An UNKNOWN difference is not a clean tree -- refusing to certify."
+  echo "RESULT: UNPROVEN -- the certification could not be compared to HEAD"
+  exit 2
+fi
 TOUCHED="$(printf '%s\n' "$CHANGED" | grep -E '^(src/|examples/|include/|scripts/test_|scripts/_gate_precond\.sh|scripts/_gate_build\.sh|scripts/setvars\.sh)' || true)"
 n_touched="$(printf '%s\n' "$TOUCHED" | grep -c . || true)"
 
