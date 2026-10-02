@@ -34,7 +34,12 @@ cd "$ROOT" || exit 2
 . "$SCRIPT_DIR/_gate_enum.sh"
 enum_reset
 
-ART="$ROOT/build/ten_gates/HEAD"
+# The artifact lives under the BUILD tree, and INTFER_BUILD_DIR is honoured for it
+# like everywhere else in this repo. That is what makes the checker redirectable
+# into a test sandbox: without the seam the only way to exercise it is to mutate
+# the REAL certification artifact, which would leave a planted file behind on any
+# abnormal exit and make the next session's stack report a run it never measured.
+ART="${INTFER_BUILD_DIR:-$ROOT/build}/ten_gates/HEAD"
 echo "== ENGINE CERTIFICATION CHECK =="
 
 # What the correctness gates actually read. Derived from the gate population
@@ -51,6 +56,15 @@ if [ ! -f "$ART" ]; then
   echo "  note  run scripts/run_ten_gates.sh (tens of minutes, needs both GPUs)"
   echo "RESULT: UNPROVEN -- no engine certification on disk (not a regression)"
   exit 2
+fi
+
+# The git side must work from the real tree, so refuse early if it does not --
+# otherwise a non-repo checkout silently produces an EMPTY changed-file list,
+# which would make a STALE artifact look like it "carries".
+if ! git rev-parse HEAD >/dev/null 2>&1; then
+  echo "  FAIL  not a git work tree -- the staleness comparison cannot run"
+  echo "RESULT: cannot compare the certification to a tree"
+  exit 1
 fi
 
 CERT_SHA="$(sed -n 's/^HEAD=//p' "$ART" | head -1)"
