@@ -576,8 +576,23 @@ class of retracted wall-time claims in this repo came from doing exactly that.
 
 ```bash
 cd /var/home/fra/dev/intfer
-until awk '{exit !($1 < 2)}' /proc/loadavg; do sleep 30; done   # quiet-box rule
-echo "load1=$(awk '{print $1}' /proc/loadavg)"
+
+# *** A QUIET BOX IS A HARD PRECONDITION, SO IT FAILS RATHER THAN WARNS. ***
+# The first version of this block used `until ...; do sleep 30; done` ONCE at the
+# top, and each round merely PRINTED its load1. That contradicts the note above
+# it ("each round gated on load1 < 2") and is exactly the retracted-wall-time
+# failure mode: a contended round looks like a number. The gate is now called
+# before EVERY round and ABORTS the run if the box is busy.
+require_quiet() { # $1 = label
+  local l; l="$(awk '{print $1}' /proc/loadavg)"
+  echo "== $1 load1=$l"
+  if ! awk -v l="$l" 'BEGIN{exit !(l < 2)}'; then
+    echo "ABORT: $1 -- load1=$l is NOT < 2. A tok/s measured now is run variance," >&2
+    echo "  not signal, and several claims in this repo were retracted for exactly" >&2
+    echo "  that. Re-run when the box is quiet. No figure from this round is usable." >&2
+    exit 1
+  fi
+}
 
 M=/var/home/fra/data/models/intfer/Qwen3.8-27B-int2.intifer
 BIN=build/examples/intfer_cli/intfer_cli
@@ -587,7 +602,7 @@ export INTFER_KV_CAP=8192     # default 1024 aborts the long prompt
 
 # E1 (line 247) + E3 (dpas48-fold 332): decode --tp 2, 3 interleaved rounds
 for r in 1 2 3; do
-  echo "== round $r load1=$(awk '{print $1}' /proc/loadavg)"
+  require_quiet "E1 round $r"
   for arm in BASE DPAS48 PREQ; do
     case $arm in
       BASE)  unset INTFER_DPAS48 INTFER_DPAS_PREQ ;;
@@ -600,6 +615,7 @@ for r in 1 2 3; do
 done
 
 # E3 fold leg (dpas48-fold 332) -- FOLD vs DPAS48, same arm
+require_quiet "E3 FOLD leg"
 for arm in DPAS48 FOLD; do
   case $arm in
     DPAS48) unset INTFER_DPAS48_FOLD ;;
@@ -611,6 +627,7 @@ done
 
 # Prefill legs (lines 251 and 466): one 361-token chunk in a single pass
 P361="$(python3 -c "print('The history of artificial intelligence and machine learning. '*40)")"
+require_quiet "prefill legs"
 for arm in BASE DPAS48 FOLD; do
   case $arm in
     BASE)  unset INTFER_DPAS48 INTFER_DPAS48_FOLD ;;
@@ -623,6 +640,7 @@ for arm in BASE DPAS48 FOLD; do
 done
 
 # E2 long-ctx (line 350): KV / KVQ8 vs base
+require_quiet "E2 long-ctx"
 for arm in BASE KV KVQ8; do
   case $arm in
     BASE) unset INTFER_INT8_KV INTFER_KV_Q8 INTFER_KV_HAD ;;
