@@ -2330,6 +2330,66 @@ e.g. S3's contract column is 40 not 42).
           self-naming, and the AGENTS.md/MEMORY advice was not enough on its own —
           a rule that exists only in a document is not a check.
 
+- **AUDIT #24 (2026-10-02): THE ENGINE CERTIFICATION IS NOW A CHECKED ARTIFACT,
+      NOT A HAND-MADE ARGUMENT.** The previous round's last weak point was that
+      "10 PASS / 0 PARTIAL / 0 SKIPPED" was reconciled with the tooling stamps by
+      ME, by hand, with a diff argument. Sound reasoning; still not evidence.
+    - **`scripts/check_engine_cert.sh` mechanises exactly that argument**, so it
+      cannot be skipped or forgotten. Four verdicts, all exercised:
+      artifact names HEAD → **certified here** (0); artifact older and **no engine
+      input moved** → the evidence **CARRIES** (0); artifact older **and an engine
+      input moved** → **STALE, re-run** (1); no artifact → **UNPROVEN** (2, never
+      a silent pass and never a false FAIL). The middle case is the point: a
+      docs-only commit must NOT invalidate a 45-minute engine run, because a check
+      that fires on every commit is a check people learn to ignore — which is how
+      such a check gets "fixed" by weakening it.
+      The "engine input" set is **derived**, not listed: `src/`, `examples/`,
+      `include/`, `scripts/test_*` and the shared gate helpers those tests source.
+    - **`scripts/run_ten_gates.sh` HAS A SELF-CHECK, AND THE STACK ENFORCES IT.**
+      `--self-check` drives the tally with STUBS in seconds — no engine, no GPU —
+      and proves pass / fail / PARTIAL(rc=2) / empty-census all classify. This
+      needed a redirectable gate glob (`INTFER_GATE_GLOB`, `INTFER_GATE_DIR`),
+      because the one runner in the tree whose failure path nobody had ever watched
+      execute is exactly the always-green harness the AUDIT #14 vacuity class
+      describes. Two defects found by RUNNING it, both of which would have shipped:
+      the tally globals were set inside a **subshell** and so were lost to the
+      parent (the recorded "verdict recorded in a global, silently lost in $(…)"
+      class), and the self-check never created its **output directories**, so the
+      log redirect failed before any stub ran and all three cases failed at once.
+      **COVERAGE STATUS, DECIDED RATHER THAN LEFT AMBIGUOUS:** the self-check is a
+      stack step; the gates themselves are not, and there is deliberately **no
+      mutation matrix** for `run_ten_gates.sh` — its subject is the ENGINE, and
+      the "does it classify correctly" question is answered by its self-check
+      instead. Revisit if it is ever made a `check_*`, which would oblige a matrix.
+    - **THE TOOLING CAUGHT MY OWN OMISSION IMMEDIATELY, WHICH IS THE POINT.**
+      `check_engine_cert.sh` + `mutate_engine_cert.sh` were added with the matrix
+      listed in `STEPS` but **no `dispatch()` arm** — so the matrix would never
+      have run and the stack would still have printed PASS. That is the AUDIT #18
+      property ("a matrix with no dispatch arm NEVER RUNS"), and
+      `check_checker_matrix_coverage.sh` flagged it on the first run after the
+      change. Now 13/13 checkers with a dispatched matrix.
+      Two more defects in the new matrix, both found by running it: (a) the sandbox
+      copy could not resolve `_gate_enum.sh` **and** counted zero gate scripts, so
+      a healthy checker reported "the input set did not enumerate" — the
+      missing-sibling class, sixth occurrence, fixed by mirroring `scripts/`; (b)
+      state **E-D** weakened the input filter to `docs/|reports/`, but the artifact
+      is planted at the ROOT commit and this repo really does have doc changes
+      since then, so the weakened filter still matched and the state reported "the
+      filter is not load-bearing" — a confident false conclusion about a mechanism
+      that HAD been broken. **A weakening must be provably total, not merely
+      weaker.** Same commit also fixed E-D not incrementing `total`, which made the
+      tally say 3/3 PASS while the summary listed E-D MISSED — the
+      self-contradicting-report class, reintroduced by a state that bypassed the
+      shared `check_state()` helper.
+    - **AND THE MATRIX NEVER TOUCHES THE REAL ARTIFACT.** It plants
+      `ten_gates/HEAD` into a sandbox build dir through the `INTFER_BUILD_DIR` seam
+      the checker honours. An earlier draft planted into the real file and restored
+      from a backup, which works but can leave a **fabricated certification** on
+      disk for the next session to read — the worst possible residue for this
+      particular artifact. The mutant copy lives in `scripts/` (so `ROOT` and
+      `git diff` still resolve) under a leading underscore, so it is invisible to
+      every `check_*`/`mutate_*` glob the stack enumerates.
+
 - **SIXTH RECURRENCE OF THE SAME CLASS: I WROTE THE PREDICATE FOR THE OUTPUT I
     EXPECTED, NOT THE ONE I OBSERVED.** Two more instances this session, both
     found by a state reporting MISSED while its defect had reproduced perfectly:

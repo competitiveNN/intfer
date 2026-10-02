@@ -186,6 +186,15 @@ dispatch() { # $1 = label -> runs it
       # Read-only, no GPU, no build. rc=2 (no artifact) is UNPROVEN, not a
       # regression, and the 2b re-run path handles it.
       timeout 300 bash "$SCRIPT_DIR/check_engine_cert.sh"; return $? ;;
+    run_ten_gates.sh)
+      # AUDIT #24 -- SELF-CHECK ONLY, never the gates themselves. run_ten_gates.sh
+      # runs the engine on both GPUs for tens of minutes and is deliberately NOT a
+      # step of this stack (see the "WHY IT IS NOT A STEP" block in that file: a
+      # check slow enough to be skipped gets skipped). Its SELF-CHECK is seconds of
+      # stubs and is what the stack enforces -- otherwise the one runner in the tree
+      # whose failure path nobody has ever watched execute is exactly the always-green
+      # harness the AUDIT #14 vacuity class describes.
+      timeout 300 bash "$SCRIPT_DIR/run_ten_gates.sh" --self-check; return $? ;;
     check_checker_matrix_coverage.sh)
       # Derives "every checker has a dispatched matrix" from scripts/ rather than
       # trusting a hand-written total. Wired, and its own matrix is
@@ -240,6 +249,13 @@ dispatch() { # $1 = label -> runs it
       # sharp state: the helper stops withholding while every text property
       # still passes, so only the behavioural probe can see it.
       timeout 1800 bash "$SCRIPT_DIR/mutate_bench_load_gate.sh"; return $? ;;
+    mutate_engine_cert.sh)
+      # AUDIT #24. Plants ten_gates/HEAD into a SANDBOX build dir (via
+      # INTFER_BUILD_DIR) so the real certification is never touched, and drives
+      # the four verdict paths. Its own E-D state weakens the input filter while
+      # the artifact is deliberately stale -- legitimate only because the planted
+      # artifact is itself defective (the AUDIT #21 rule).
+      timeout 900 bash "$SCRIPT_DIR/mutate_engine_cert.sh"; return $? ;;
     mutate_checker_matrix_coverage.sh)
       # Each state BOTH poisons the tree with an unmated checker AND removes the
       # requirement that would catch it -- weakening alone is unobservable while
@@ -449,6 +465,7 @@ if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
   STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh"
+STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
