@@ -55,17 +55,26 @@ GPASS=0; GPARTIAL=0; GSKIP=0; GFAIL=0; GFAILED=""
 run_gates() {
   local out="$1" g name rc
   GPASS=0; GPARTIAL=0; GSKIP=0; GFAIL=0; GFAILED=""
+  # Record the box conditions the run happened under. The correctness gates are
+  # load-INSENSITIVE (they classify stream identity and exact counters), so this
+  # does NOT qualify their verdicts -- and that is precisely why it belongs in the
+  # artifact. Without it a later reader cannot tell a certification taken on a
+  # quiet box from one taken at load 9 beside a 99.7% julia job, and has to guess
+  # which kind of claim the run can support. The verdict is about CORRECTNESS; the
+  # conditions are about what else the run must never be used for.
+  LL_START="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"
+  LL_PEAK="$LL_START"
   {
     echo "=== ten correctness gates $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
     echo "HEAD=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "gate glob: $GATE_GLOB in $GATE_DIR"
+    echo "load1 at start: ${LL_START:-unknown}"
   } > "$out/gates.log"
   for g in $GATE_DIR/$GATE_GLOB; do
     [ -f "$g" ] || continue
     name="$(basename "$g" .sh)"; name="${name#test_}"
     printf '== %s ==\n' "$name" >> "$out/gates.log"
     timeout "$GATE_TIMEOUT" bash "$g" >> "$out/gates.log" 2>&1; rc=$?
-    printf 'GATE_RESULT %s rc=%s\n' "$name" "$rc" >> "$out/gates.log"
     case "$rc" in
       0)   GPASS=$((GPASS+1));    echo "  ok    $name" ;;
       2)   GPARTIAL=$((GPARTIAL+1)); echo "  PART  $name (rc=2: a coverage precondition was unmet)" ;;
@@ -74,7 +83,18 @@ run_gates() {
       *)   GFAIL=$((GFAIL+1));    GFAILED="$GFAILED $name"
             echo "  FAIL  $name (rc=$rc)" ;;
     esac
+    # Sample BETWEEN gates, after the classification, so a box that went busy
+    # mid-run is visible and not just one that was busy at the start. A start-only
+    # sample is the AUDIT #23 defect in a new place: certify the instant, then
+    # measure for an hour. (The first attempt at this put the sample ABOVE the
+    # classification, and its `*)` arm then swallowed rc=0, so every passing gate
+    # counted as a failure. Order is load-bearing, which is worth a comment.)
+    LL_NOW="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"
+    LL_PEAK="$(awk -v a="${LL_PEAK:-0}" -v b="${LL_NOW:-0}" 'BEGIN{print (a+0>b+0)?a:b}')"
+    printf 'GATE_RESULT %s rc=%s\n' "$name" "$rc" >> "$out/gates.log"
   done
+  LL_END="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"
+  echo "load1 at end: ${LL_END:-unknown} (peak between gates: ${LL_PEAK:-unknown})" >> "$out/gates.log"
   printf 'TALLY pass=%s partial=%s skip=%s fail=%s\n' \
     "$GPASS" "$GPARTIAL" "$GSKIP" "$GFAIL" >> "$out/gates.log"
 }
@@ -183,6 +203,11 @@ run_gates "$OUT"
   echo "gates=$n_gates"
   echo "pass=$GPASS partial=$GPARTIAL skip=$GSKIP fail=$GFAIL"
   echo "failed=${GFAILED:-none}"
+  echo "load1_start=${LL_START:-unknown}"
+  echo "load1_end=${LL_END:-unknown}"
+  echo "load1_peak_between_gates=${LL_PEAK:-unknown}"
+  echo "note=correctness gates are load-insensitive; this records the CONDITIONS,"
+  echo "note=so a reader knows no TIMING may be quoted from this run."
   echo "log=$OUT/gates.log"
 } > "$OUT/HEAD"
 

@@ -2399,6 +2399,35 @@ e.g. S3's contract column is 40 not 42).
       `git diff` still resolve) under a leading underscore, so it is invisible to
       every `check_*`/`mutate_*` glob the stack enumerates.
 
+- **THE STANDING BLOCKER ON 27B WALL-TIME, AS A DIAGNOSIS TO INHERIT RATHER THAN
+      A WALL TO REDISCOVER.** Measured 2026-10-02: `load1 = 13.18`, driven by
+      **PID 274320, a `julia` process at 99.7% CPU, elapsed 1d23h** (a sibling
+      agent's Planar.jl container; a second `julia` precompiling alongside it).
+      This is the **sole** reason the 27B `--tp 2` quiet-box A/B cannot run and
+      the six `RESULT:` lines in `reports/2026-09-30-pending-bench-backlog.md` and
+      `reports/2026-09-30-dpas48-fold.md` stay blank. Both B580s enumerate fine
+      (`sycl-ls` → 2 devices), so this is **not** the AUDIT #9/#11 enumeration
+      fault and must not be diagnosed as one.
+      **Recovery, exactly:** stop or let PID 274320 finish, confirm
+      `awk '{print $1}' /proc/loadavg` stays **below 2** for a whole session, then
+      `scripts/bench_when_quiet.sh`. Do NOT kill it — it is another agent's work and
+      killing it is not ours to do without asking. **Until then no tok/s may be
+      written to `reports/`, and every figure already in there is counter-based on
+      purpose.**
+      *** AND NOTE WHAT THE LOAD-INSENSITIVE CERTIFICATION DOES AND DOES NOT
+      COVER. *** The ten correctness gates ran green at `e27391b` **on this busy
+      box**, and that is legitimate: they classify stream identity and exact
+      counters, so `load1` does not qualify their verdicts. What it does qualify
+      is what else that run may be used for — **no timing may be quoted from it.**
+      `scripts/run_ten_gates.sh` now records `load1_start` / `load1_end` /
+      `load1_peak_between_gates` **in the artifact itself** for that reason, because
+      a reader who cannot see the conditions has to guess which kind of claim a
+      certification supports. The load is sampled BETWEEN gates, not only at the
+      start: certifying the instant and then measuring for an hour is the AUDIT #23
+      defect in a new place, and the first attempt at it put the sample above the
+      classification, where its `*)` arm swallowed `rc=0` and counted every passing
+      gate as a failure. Order is load-bearing.
+
 - **SIXTH RECURRENCE OF THE SAME CLASS: I WROTE THE PREDICATE FOR THE OUTPUT I
     EXPECTED, NOT THE ONE I OBSERVED.** Two more instances this session, both
     found by a state reporting MISSED while its defect had reproduced perfectly:
