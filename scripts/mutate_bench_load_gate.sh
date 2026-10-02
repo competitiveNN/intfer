@@ -160,12 +160,12 @@ run_state "B-D" 'B_D' 'still prints the warn-and-continue line' \
 # gets recorded as a figure.
 MUTATE_FN() {
   patch_literal "$SB/scripts/_gate_loadlog.sh" \
-    '  if [ "$_LL_USABLE" = 1 ]; then || return 1
+    '  if [ "$_LL_USABLE" = 1 ]; then
     printf '"'"'%s'"'"' "$1"
   else
     printf '"'"'SKIPPED-CONTENDED'"'"'
   fi' \
-    '  printf '"'"'%s'"'"' "$1"   # B_E never withholds'
+    '  printf '"'"'%s'"'"' "$1"   # B_E never withholds' || return 1
   grep -q 'B_E' "$SB/scripts/_gate_loadlog.sh"
 }
 run_state "B-E" 'B_E' 'published a figure for a drifting arm' \
@@ -221,7 +221,7 @@ run_state "B-G" 'B_G' 'bench_fake_latency' \
 # folded into B-E.
 MUTATE_FN() {
   patch_literal "$SB/scripts/_gate_loadlog.sh" \
-    '  _ll_need _LL_USABLE || return 1 || return 1
+    '  _ll_need _LL_USABLE || return 1
   if [ "$_LL_USABLE" = 1 ]; then' \
     '  if [ "${_LL_USABLE-}" = 1 ]; then   # B_H guard removed' || return 1
   grep -q 'B_H' "$SB/scripts/_gate_loadlog.sh"
