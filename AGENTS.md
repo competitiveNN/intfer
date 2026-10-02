@@ -1929,6 +1929,104 @@ e.g. S3's contract column is 40 not 42).
   mutated checker, read which line actually changed, and write the predicate
   from THAT. This is the same discipline as AUDIT #3c's stale-anchor rule.
 
+- **AUDIT #22 (2026-10-02): THE REPORTED 27B WALL-TIME WAS NEVER MEASURED, AND
+  NO CHECKER COULD HAVE TOLD ME.** The third retracted wall-time claim in this
+  repo, and the first one where the *checker meant to prevent it* was structurally
+  incapable of seeing it. Read this before quoting ANY tok/s from
+  `reports/2026-09-30-pending-bench-backlog.md`.
+    - **THE FINDING, stated as measured rather than inferred.** Commits `bc18e15`
+      ("2 runs, agreeing to ~1%") and `26a6c4b` ("3 quiet runs") added a per-arm
+      tok/s table (BASE 2.78 / 2.81 / 2.79, DPAS48 2.44, PREQ 2.50). **No artifact
+      produced any of them.** The runs' own logs are
+      `build/bench_E1_27b.log.counters` and `build/bench_E3_27b.log.counters`, and
+      both record `TPS=SKIPPED-CONTENDED` on **every** line with `LOAD1=4.67 /
+      4.41 / 4.71` (E1) and `17.04 / 4.41 / 5.50 / 18.26` (E3) — the harness
+      correctly REFUSED to emit a figure and recorded why.
+      `build/bench_when_quiet.log` holds **no measurement at all** (287 bytes,
+      ending at the round-1 header). The claimed "loads at the start of each run:
+      1.84 / 1.98 / 1.72" directly contradicts the run's own `LOAD1`.
+      The only real 2.78 on the box is `build_tmp/ab27b_tab.err` (2026-09-28) — a
+      DIFFERENT experiment, four days earlier, where 2.78 is the **`tab` arm** and
+      BASE is 2.63 / 2.67 / 2.68. So the table is not a rounding of a real run
+      either. Withdrawn; the `RESULT:` lines stay BLANK.
+    - **WHAT SURVIVES, because it is load-insensitive and sourced:** DPAS48's host
+      act-quant costs 2559.2 ms per 64-token decode (11.7 ms -> 2559.2 ms) and
+      +30,720 launches; **PREQ recovers 52.7 ms of that and pays another +30,720**,
+      so it cannot win at 27B and must not be promoted. E3's FOLD removes 331.8 ms
+      of device kernel (-1.8%), replicating the 0.8B -1.6% at 27B scale. The
+      "PREQ cannot win" conclusion never needed a tok/s.
+    - **ROOT CAUSE 1 — THE QUIET GATE SAMPLED THE WRONG INSTANT.** It read `load1`
+      at the START of a round and then measured for minutes. This box moves from
+      `load1` 1.94 to 10.69 in under two minutes; a run was observed in flight at
+      `load1` 10.69 whose round had passed at 1.94. **A start-of-round pass
+      certified nothing about the measurement.** Fixed: every arm samples `load1`
+      every second for its whole duration and is judged on the MAXIMUM.
+    - **ROOT CAUSE 2 — NO ARM WROTE A LOG.** Output went to a pipe, so a figure
+      could only be read off a terminal and nothing on disk could contradict it.
+      Fixed: every arm tees to `build/bench_logs/<run>/<arm>.log` with a per-arm
+      load trace, and a contended arm's figure is emitted TAGGED
+      (`[CONTENDED -- NOT quotable]`) so it cannot be copied as a result.
+    - **ROOT CAUSE 3 — THE CHECKER'S SCOPE WAS THE FENCE, NOT THE REPORT.**
+      `check_result_block.sh` (b) greps for a numeric tok/s **inside the fenced
+      bash block**. The table was written to the report BODY, ninety lines away,
+      and the checker stayed green through the entire incident. The property
+      wanted is "this report asserts no unmeasured wall-time"; the property
+      implemented was "this fenced region contains no number". **Scope, not logic.**
+      It also could not tell a FILLED `RESULT:` stanza from a blank one, so the
+      protocol's core invariant ("a partially filled RESULT is worse than a blank
+      one") was UNCHECKABLE. Both closed: stanzas are now checked where the
+      numbers go, and every arm is required to route through `arm_run`.
+    - **THE CHECKS ARE NOW MUTATION-PROVEN 9/9** (`mutate_result_block.sh`,
+      states R-A..R-I), including **R-H, which pastes a figure into a `RESULT:`
+      stanza and is the retracted defect reproduced**. `R-E` is the sharp one: it
+      reverts the criterion to the FIRST load sample while LEAVING the max line in
+      place, so the text check stays green and only the BEHAVIOURAL test sees it —
+      the AUDIT #12 S4 shape. The behavioural test extracts `arm_run` from the
+      block and RUNS it against a fixture loadavg that **drifts** (0.5 -> 7.5
+      mid-arm), in three cases: quiet-then-contended must reject, quiet must
+      accept, contended must reject with the figure tagged. `arm_run` reads
+      `$LOADAVG` (default `/proc/loadavg`) for exactly this — the same
+      redirectable-seam rationale as `INTFER_SYCL_LS`: a test that depends on the
+      box being busy is a flaky gate.
+    - **FOUR DEFECTS FOUND BY RUNNING THAT MATRIX, THREE IN CODE I HAD JUST
+      WRITTEN.** (1) The matrix body was **DUPLICATED verbatim**, so the four
+      states ran twice, `total` counted 8 while the summary listed 4 — a
+      self-contradicting report, the AUDIT #12 shape — and the second `mktemp -d`
+      reassigned `SB` without removing the first, **leaking a sandbox into /tmp on
+      every run**. (2) `fake_measure` read `"${4:-}"`, but `arm_run` invokes its
+      command as `"$@"` after shifting its own label, so `$4` is
+      `fake_measure`'s fourth argument and always unset: the fixture never rose
+      and the case passed **VACUOUSLY**, unable to detect the defect it was
+      written for. (3) "No arm pipes `$BIN` into grep" was a same-line regex, but
+      every arm wraps with a trailing backslash so the `|` is on the next line —
+      it matched **ZERO lines even on the healthy block** and could not fail. (4)
+      The call-site count was printed by an UNCONDITIONAL `echo "  ok  $n_arms
+      arm_run call sites"` after the min-check, so a run where the minimum FAILED
+      still printed an `ok` line naming the failing count — AUDIT #12's
+      self-contradicting verdict line, committed a second time.
+    - **A FIFTH CLASS OF MISCLASSIFIED STATE, distinct from the three the harness
+      distinguishes (not load-bearing / wrong reason / unattributed): R-I was
+      scored MISSED on a MARKER TYPO.** The checker did catch it (`FAIL 4 arm(s)
+      invoke $BIN directly but only 3 go through arm_run`) but the expected-regex
+      said `unlogged, ungated` while the message reads `unlogged and ungated`. It
+      fails in the SAFE direction — a false MISSED, never a false catch — but it
+      costs a full ~4 minute matrix run to find, and the ONLY reason it surfaced
+      is that I read the per-state log instead of re-hypothesising the mechanism.
+      **The expected-regex is a CONTRACT with the checker's message wording:
+      rename a FAIL message and you can silently un-score a state. Edit both
+      together or not at all.**
+    - **WHY THIS ONE GOT THROUGH WHERE AUDITS #14/#20/#21 WERE CAUGHT:** those
+      audits hardened checks against defects the CHECKER could detect. This defect
+      lived in the gap between the check's SCOPE and the artifact, so no amount of
+      tightening inside the fence would have found it. **Ask what a checker cannot
+      SEE, not only whether its assertions are right — and when a number is at
+      stake, require that a number be traceable to an artifact on disk.**
+    - **STALE STAMPS ARE A FINDING TOO.** On arrival, **14 of 15** enumerated
+      stamps cited `bc18e15` — the very commit that carried the fabricated table —
+      because that session committed without re-running the stack. Per this file's
+      own rule that is UNPROVEN, not wrong; re-running is the remedy, and
+      `mutate_fold_matrix.sh` re-stamped 7/7 at the new HEAD.
+
 - **SIXTH RECURRENCE OF THE SAME CLASS: I WROTE THE PREDICATE FOR THE OUTPUT I
     EXPECTED, NOT THE ONE I OBSERVED.** Two more instances this session, both
     found by a state reporting MISSED while its defect had reproduced perfectly:
