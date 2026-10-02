@@ -484,6 +484,86 @@ else
     bad=$((bad + 1))
   fi
 
+  # (8) *** END-TO-END THROUGH THE REAL HARNESS, WITH A STUB CLI. *** Everything
+  # above drives scripts/_bench_summary.py directly, and (7d) checks the
+  # propagation STATICALLY. Neither proves that running the harness for real
+  # refuses -- and AUDIT #27 is precisely a defect that a fixture-only test suite
+  # passed, because the only way to drive the summary was to run a 27B benchmark.
+  # A stub CLI closes that: it satisfies the harness's preconditions and emits a
+  # controlled stream of token ids (so the IDENTITY phase passes) plus, or
+  # deliberately without, a `[GPU profile @decode]` line. No engine, no GPU work,
+  # no model read -- measured at 0.9 s per invocation, so the matrix can afford it
+  # in every state.
+  #
+  # BOTH DIRECTIONS ARE REQUIRED. A one-case test here is satisfiable by a harness
+  # that always refuses, which would be worse than no test.
+  #
+  # *** NO RENDER NODE IS rc=2, NOT rc=0. *** The harness bails at its own
+  # precondition with exit 2, which is the SAME code the refusal uses -- so on a
+  # GPU-less box this case is indistinguishable from a pass unless the TEXT is
+  # checked, and the honest outcome is "unproven", never a green line. That is the
+  # AUDIT #3c family ("a gate that cannot exercise the configuration cannot
+  # protect it") and the reason the verdict block below can exit 2.
+  if ! python3 -c "open('/dev/dri/renderD128','rb').close()" 2>/dev/null; then
+    echo "  UNPROVEN  e2e-harness-refusal: no render node, so the harness stops at"
+    echo "            its precondition and this case cannot run. The rest of this"
+    echo "            checker is still graded; this one is NOT certified."
+    e2e_unproven=1
+  else
+    e2e_unproven=0
+    STUBDIR="$TDIR/stub/examples/intfer_cli"
+    mkdir -p "$STUBDIR"
+    : > "$TDIR/model.intifer"          # the harness only checks it exists
+    write_stub() { # $1 = emit a profile line? (1 = yes)
+      cat > "$STUBDIR/intfer_cli" <<STUB
+#!/usr/bin/env bash
+# STUB CLI for case (8). Emits token ids so the IDENTITY phase passes.
+while [ \$# -gt 0 ]; do case "\$1" in -n) want="\$2"; shift 2 ;; *) shift ;; esac; done
+i=0; while [ "\$i" -lt "\${want:-8}" ]; do i=\$((i + 1)); echo "decode step \$i: token=\$((279 + i))"; done
+echo "tok/s: (99.00 tok/s)"
+[ "$1" = "1" ] && echo "[GPU profile @decode] kernel=1800.0ms submit=700.0ms waitblock=900.0ms rebuild=0.0ms(0) usm_write=300.0ms readback=300.0ms copy=10.0ms nk=1000 nw=900 nr=90"
+exit 0
+STUB
+      chmod +x "$STUBDIR/intfer_cli"
+    }
+    run_harness() { # $1 profile? -> writes $TDIR/e2e.out, returns the harness rc
+      INTFER_BUILD_DIR="$TDIR/stub" INTFER_08B="$TDIR/model.intifer" \
+        timeout 300 bash "$SCRIPT_DIR/bench_reports_batch.sh" E2 1 \
+        > "$TDIR/e2e.out" 2>&1
+    }
+    # -- firing direction: no profile line, so every arm dies --
+    write_stub 0
+    run_harness; e2e_dead_rc=$?
+    if pred_expect_present "e2e-dead-stub-rc2" "$e2e_dead_rc" '^2$' \
+       && pred_expect_present "e2e-dead-stub-says-not-a-result" \
+            "$(grep -c 'THIS BATCH IS NOT A RESULT' "$TDIR/e2e.out" || true)" '^[1-9]' \
+       && pred_expect_present "e2e-dead-stub-names-the-signature" \
+            "$(grep -c 'no_@decode_line_in_arm_output' "$TDIR/e2e.out" || true)" '^[1-9]'; then
+      echo "  ok    e2e: the REAL harness refuses a batch whose arms all died (rc=2)"
+    else
+      echo "  FAIL  e2e-dead-stub: the harness did not refuse a batch in which"
+      echo "        every arm produced no measurement (rc=$e2e_dead_rc). This is"
+      echo "        the AUDIT #27 defect, driven through the real script. Got:"
+      tail -12 "$TDIR/e2e.out" | sed 's/^/          /'
+      bad=$((bad + 1))
+    fi
+    # -- converse: a profile line, so every arm measures --
+    write_stub 1
+    run_harness; e2e_ok_rc=$?
+    if pred_expect_present "e2e-healthy-stub-rc0" "$e2e_ok_rc" '^0$' \
+       && pred_expect_present "e2e-healthy-stub-not-refused" \
+            "$(grep -c 'NO wall-time claimed' "$TDIR/e2e.out" || true)" '^[1-9]' \
+       && pred_expect_present "e2e-healthy-stub-quiet" \
+            "$(grep -c 'THIS BATCH IS NOT A RESULT' "$TDIR/e2e.out" || true)" '^0$'; then
+      echo "  ok    converse: a batch whose arms all measure is accepted (rc=0)"
+    else
+      echo "  FAIL  e2e-healthy-stub: rc=$e2e_ok_rc. A harness that refuses"
+      echo "        everything would pass the case above, so this one is required."
+      tail -12 "$TDIR/e2e.out" | sed 's/^/          /'
+      bad=$((bad + 1))
+    fi
+  fi
+
   # (7d) *** THE HARNESS MUST HONOUR THE SUMMARY'S VERDICT. *** STATIC, and
   # labelled so: driving the harness end-to-end needs a GPU and a model, and a
   # comment-shaped check would be worse than none (see the note at the top about
@@ -529,9 +609,16 @@ fi
 
 echo
 if [ "$bad" -eq 0 ]; then
+  if [ "${e2e_unproven:-0}" -eq 1 ]; then
+    echo "BENCH LOAD-GATE CHECK: UNPROVEN (case (8) could not run -- no render node)"
+    echo "RESULT: every other property held, but the end-to-end refusal path was"
+    echo "RESULT: NOT exercised, so this checker certifies nothing about it."
+    exit 2
+  fi
   echo "BENCH LOAD-GATE CHECK: PASS ($n_pop harness(es), one shared home, no bare"
   echo "  throughput field, the maximum-over-arm criterion proven in both directions,"
-  echo "  and a batch that lost an arm refused)"
+  echo "  a batch that lost an arm refused, and the refusal proven END-TO-END"
+  echo "  through the real harness with a stub CLI)"
   echo "RESULT: every wall-time harness logs its arms, withholds contended figures,"
   echo "RESULT: and refuses to certify a batch whose arms produced no data"
   exit 0

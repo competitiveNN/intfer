@@ -403,6 +403,29 @@ MUTATE_FN() {
 run_state "B-N" 'B_N' 'neither captures nor refuses' \
   "the harness no longer propagates the summary's refusal"
 
+# B-O: *** THE SHARP STATE, AND THE ONE THAT NEEDED CASE (8). *** B-N removes the
+# capture, so the STATIC check in (7d) fires and the end-to-end case never gets a
+# turn. This one keeps every token (7d) looks for -- `SUM_RC=$?` and the
+# `[ "$SUM_RC" -ne 0 ]` test are both still there -- and changes only the EXIT
+# CODE the refusal takes. Every text property therefore still passes, and the only
+# thing that can catch it is driving the real harness and reading `$?`: the
+# B-E shape ("only the behavioural probe can see it") applied to a defect that is
+# behavioural all the way down. Before case (8) existed this state was
+# unobservable, which is precisely why the case was worth adding.
+MUTATE_FN() {
+  patch_literal "$H" \
+    '  exit 2
+fi
+echo "RESULT ($BATCH, $(basename "$MODEL") tp=$TP, devices=$NDEV) - NO wall-time claimed:"' \
+    '  exit 0   # B_O the refusal still prints, but it no longer fails the run
+fi
+echo "RESULT ($BATCH, $(basename "$MODEL") tp=$TP, devices=$NDEV) - NO wall-time claimed:"' || return 1
+  bash -n "$H" || return 1
+  grep -q 'B_O' "$H"
+}
+run_state "B-O" 'B_O' 'e2e-dead-stub-rc2' \
+  "the refusal prints but exits 0 -- invisible to every text property"
+
 restore
 echo
 echo "== residue + restore integrity =="
