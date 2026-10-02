@@ -120,7 +120,7 @@ MUTATE_FN() {
   patch_literal "$H" '  field="$(loadlog_tps_field "${tps:-NA}")"' '  field="${tps:-NA}"   # B_B raw'
   grep -q 'B_B' "$H"
 }
-run_state "B-B" 'B_B' 'NO -- it builds a throughput figure without the gate that withholds' \
+run_state "B-B" 'B_B' 'NO -- it emits a figure without consulting the gate that withholds' \
   "a harness publishes a figure without passing the gate"
 
 # B-C: the criterion is redefined in a harness, so property (1) -- "does it source
@@ -199,7 +199,6 @@ run_state "B-G" 'B_G' 'bench_fake_latency' \
 
 restore
 echo
-echo "== states (each damages a HARNESS, not the checker) =="
 echo "== residue + restore integrity =="
 git -C "$ROOT" diff --quiet -- scripts/ 2>/dev/null \
   && echo "  ok    the tracked tree was never modified" || { echo "  FAIL tracked modified"; exit 1; }
