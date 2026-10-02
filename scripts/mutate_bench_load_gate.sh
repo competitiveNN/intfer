@@ -50,16 +50,22 @@ TGT="$SB/scripts/check_bench_load_gate.sh"
 ORIG_T="$SB/.orig_target"
 ORIG_H="$SB/.orig_helper"
 cp "$TARGET" "$ORIG_T"
-# The HELPER must be restored too, not just the target and the checker. B-E and
-# B-H both mutate scripts/_gate_loadlog.sh, and with it out of scope B-E's damage
-# leaked into every later state: B-H then reported its anchor missing when the
-# anchor was fine. States that contaminate each other are not independent
-# evidence, and "MISSED (fn)" is the least informative way to find that out.
 cp "$SCRIPT_DIR/_gate_loadlog.sh" "$ORIG_H"
-restore() { cp "$ORIG_T" "$SB/scripts/$(basename "$TARGET")"
-            cp "$CHECK" "$TGT"
-            cp "$ORIG_H" "$SB/scripts/_gate_loadlog.sh"
-            rm -f "$SB/scripts/bench_fake_latency.sh"; }
+# *** RESTORE THE DIRECTORY, NOT A LIST OF FILES. ***
+# Two rounds of this exact defect, and the second one is why the first fix was
+# wrong. Round 1: restore() covered the target and the checker but not the HELPER,
+# and B-E mutates the helper -- so B-E's damage leaked into B-F..B-H and B-H
+# reported its anchor missing when the anchor was fine. Round 2, after adding a
+# state that damages a SECOND harness: the helper was restored and
+# bench_chat.sh was not, so B-F's damage leaked into B-I and B-I died with
+# "anchor found 0 times" -- on an anchor that was present and correct in the real
+# tree. Extending a hand-list once per new state guarantees the third round.
+# A pristine copy of the whole sandbox scripts/ directory is snapshotted instead,
+# so any file any state touches is covered without knowing which.
+PRISTINE="$SB/.pristine_scripts"
+cp -a "$SB/scripts" "$PRISTINE"
+restore() { rm -rf "$SB/scripts"; cp -a "$PRISTINE" "$SB/scripts"
+            TGT="$SB/scripts/check_bench_load_gate.sh"; }
 run_check() { ( cd "$SB" && bash "$TGT" 2>&1 ); }
 # The harness a state damages, as a sandbox path.
 H="$SB/scripts/$(basename "$TARGET")"
