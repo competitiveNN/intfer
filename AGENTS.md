@@ -2297,12 +2297,28 @@ e.g. S3's contract column is 40 not 42).
   `pred_expect_present`, which NAME the polarity at the call site and print it
   in the verdict (`verdict-polarity=expect-absent`). A state written for the
   wrong polarity then fails LOUDLY with the polarity named instead of silently
-  reporting MISSED. Converted: `mutate_gate_enum.sh`,
-  `mutate_build_dir_consumers.sh`, `mutate_doc_counts.sh`, each re-run and
-  re-stamped individually. **Recognise this by the symptom, not by re-deriving
-  it:** "correct checker + MISSED state" is almost always an inverted
-  predicate, and the fix is to check which side the marker is on before
-  touching the checker.
+  reporting MISSED. Converted: `mutate_result_block.sh`,
+  `mutate_bench_load_gate.sh`, `mutate_gate_pop.sh`,
+  `mutate_run_all_checks.sh`, `mutate_gate_enum.sh`,
+  `mutate_build_dir_consumers.sh`, `mutate_l0_cite.sh`, each re-run and
+  re-stamped individually.
+  *** THE "CONVERTED" LIST WAS PARTLY FALSE FOR A FULL ROUND, AND ONLY A GREP
+  FOUND IT. *** This paragraph claimed three files were converted; a later audit
+  that was told to "route every remaining bare `grep -q "$expect"` through
+  `pred_expect_*`" found TWO of the three still doing exactly that, and
+  `mutate_l0_cite.sh` had not even sourced `_gate_pred.sh` — so the assertion was
+  invisible to the very mechanism meant to find it. `mutate_gate_enum.sh` was
+  worse than merely un-converted: its message LABELLED the assertion
+  `verdict-polarity=expect-absent` while the code required the rejection marker to
+  be PRESENT, i.e. the label described the opposite of the behaviour, which is
+  worse than no label at all. All three converted and re-run: 6/6, 9/9, 7/7.
+  **THE LESSON IS THE ONE THIS FILE KEEPS RE-LEARNING, IN A NEW SHAPE: a list of
+  completed conversions is a CLAIM, not a derivation, and the conversion pattern is
+  mechanically greppable. Check it — and if the grep is hard to write, that is
+  itself the finding.**
+  **Recognise this by the symptom, not by re-deriving it:** "correct checker +
+  MISSED state" is almost always an inverted predicate, and the fix is to check
+  which side the marker is on before touching the checker.
 
 - **`patch_literal` IS STILL DUPLICATED IN THREE MATRICES — DELIBERATE, WITH A
     TRIGGER.** `scripts/_gate_patch.sh` (added AUDIT #20) owns `patch_literal`,
@@ -2326,6 +2342,17 @@ e.g. S3's contract column is 40 not 42).
     `mutate_gate_inventory.sh` uses its own `patch_once`, which is a DIFFERENT
     function (per-hunk, not whole-block) and is not a candidate for this helper.
     Do NOT convert it "for consistency".
+    *** TRIGGERS CHECKED 2026-10-02, NONE FIRED — measured, not assumed. ***
+        git log -1 --format=%h -- scripts/mutate_fold_matrix.sh       -> b49e164
+        git log -1 --format=%h -- scripts/mutate_device_precond.sh    -> 8d6ac55
+        git log -1 --format=%h -- scripts/mutate_run_all_checks.sh    -> bfa7d26
+    All three are exactly where they were when this decision was written, so
+    trigger 1 (a copy edited without the others) has NOT happened, no divergence
+    exists to repair, and trigger 3 did not apply this round. Trigger 2 still has
+    headroom: the count that matters is matrices carrying their OWN copy, and that
+    is still three — `mutate_bench_load_gate.sh` is new but SOURCES the shared
+    helper, so it raises the number of consumers, not the number of copies.
+    Re-run the three lines above before assuming this decision still holds.
     *** `patch_literal` TAKES EXACTLY THREE ARGS — and now ASSERTS IT. ***
     `file`, `exact-old`, `exact-new`. This was violated and cost a long hunt:
     a matrix author passed FIVE arguments — one single-quoted string per LINE of
