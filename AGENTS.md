@@ -2703,16 +2703,43 @@ e.g. S3's contract column is 40 not 42).
     B-M restores the crashing dict parse, B-N restores the discarded rc. Each was
     caught for its own reason.
   - **B-J's ANCHOR HAD GONE STALE, AND THAT IS THE LESSON.** Re-writing the record
-    parse deleted the two lines B-J mutated, so the state scored **MISSED (fn)** —
-    the AUDIT #17 anchor class, one level down — but only **after nine baselines**
+    parse deleted the text B-J mutated, so the state scored **MISSED (fn)** — the
+    AUDIT #17 anchor class, one level down — but only **after nine baselines**
     had each executed a full mutant run. `patch_literal` refused loudly, which is
     what it is for; it is just loud **late**. This matrix now **pre-flights every
     anchor before the baseline**, asserting it occurs **exactly once** (twice would
     mean the patch rewrites whichever comes first — a different state than the one
-    described). **Non-vacuity proven by hand**, per AUDIT #19: with one anchor
-    repointed to a wrong literal the matrix refuses in the first second —
-    `ANCHOR STALE in _bench_summary.py: found 0 occurrence(s), want 1`, rc=1.
-    **Re-point an anchor when it fires; never loosen the check.**
+    described). It **runs**, and its line is in the 14/14 output:
+    `== anchor pre-flight ==` / `ok every AUDIT-#28 anchor occurs exactly once in
+    its sandbox file`. **Re-point an anchor when it fires; never loosen the check.**
+    *** NON-VACUITY, REDONE PROPERLY — AND THE FIRST ATTEMPT WAS WORTHLESS. ***
+    The first demonstration **staged** the drift with `git add` so that the
+    matrix's own dirty-tree guard (`git diff --quiet -- scripts/`, worktree vs
+    **index**) would not stop it first, and reported the refusal that followed as
+    proof. **It proved nothing about the pre-flight** — it proved the guard can be
+    slipped past, which the guard was never claiming to be unslippable. Discarded,
+    per the AUDIT #19 rule that a self-made proof must not be manufactured by a
+    trick. The clean version costs two commits and one matrix run: commit the
+    drift (`e63fbdd`), run, observe
+      `== anchor pre-flight ==`
+      `ANCHOR STALE in _bench_summary.py: found 0 occurrence(s), want 1.`
+      `  first line:     if len(common) < 99:`
+      **rc=1, and no `== baseline ==` line at all** (log:
+      `build/anchor_nv_proof.log`), then revert (`14253a3`). That is the whole
+    demonstration: it refuses in the first second, before any work.
+    *** AND A REFUSED MATRIX RUN WRITES NO STAMP *** — verified while doing it:
+    `build/bench_load_gate_mutate/last_pass.stamp` still read `states=14
+    caught=14 sha=a3edcde` (the earlier good run) after the refusing run. So a
+    refusal cannot be mistaken for a pass by anything that reads stamps, which is
+    what `run_all_checks.sh` step 3/3 does.
+  - *** A `grep` THAT REPORTS 0 MATCHES FOR A PATTERN WITH AN UNESCAPED `(` IS
+    EVIDENCE ABOUT THE REGEX, NOT ABOUT THE FILE. *** While verifying the revert I
+    searched for the literal `if len(common) < 2:` and the tool wrapper answered
+    **"0 matches"** — the `(` opens a group, the pattern is invalid, and nothing
+    was searched for. `git show HEAD:… | grep -cF` answers **2**. Same family as
+    the recorded `ls` wrapper hiding `/dev/dri` entries and `ps` reporting nothing
+    for a live job: **for a literal anchor use `grep -F`, and when a count is 0,
+    re-check the pattern before believing the file.**
   - **THREE OF MY OWN NEW PREDICATES FAILED THE FIRST CHECKER RUN**, and each was a
     mis-written *expectation*, not a mechanism: two inverted
     `pred_expect_absent` calls (asserting a count is `0` with the polarity that

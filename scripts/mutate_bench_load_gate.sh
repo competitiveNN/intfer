@@ -91,6 +91,10 @@ pop_assert_no_leak "before" || exit 1
 # first, which is a different state than the one described).
 check_anchor() { # $1 file, $2 anchor text (multi-line, as one quoted arg)
   local n
+  # Counted with python .count(), NOT `grep -c`: grep counts LINES (a 5-line
+  # anchor reports 1), and `grep -c` also prints 0 *and* exits 1 on a miss, so a
+  # `|| echo 0` guard silently appends a second line. A guard and the thing it
+  # guards must agree on what "exactly once" means.
   n="$(python3 -c 'import sys;print(open(sys.argv[1]).read().count(sys.argv[2]))' \
         "$1" "$2")"
   if [ "$n" != "1" ]; then
@@ -102,8 +106,6 @@ check_anchor() { # $1 file, $2 anchor text (multi-line, as one quoted arg)
   fi
 }
 preflight_anchors() {
-  local f
-  for f in "$SB"/scripts/*.sh "$SB"/scripts/*.py; do :; done
   check_anchor "$SB/scripts/_bench_summary.py" \
     '        if not b:
             sig = "no_bucket_data_in_record"' || return 1
