@@ -2245,6 +2245,35 @@ e.g. S3's contract column is 40 not 42).
           checker needs the classification, or one of the two is being modified
           anyway. An earlier draft claimed "both choices are recorded at their call
           sites" when they were not — grep the tree, do not trust the prose.
+        - **THE INCOMPLETE-RESTORE DEFECT, TWICE — AND THE FIRST FIX WAS THE WRONG
+          SHAPE.** Round 1: `mutate_bench_load_gate.sh`'s `restore()` covered the
+          target and the checker but **not the helper**, which B-E mutates, so B-E's
+          damage leaked into B-F…B-H and B-H died with "anchor found 0 times" on an
+          anchor that was correct. I "fixed" it by adding the helper to the
+          restore list. Round 2: after adding a state that damages a *second*
+          harness, the helper was restored and `bench_chat.sh` was not, so B-F's
+          damage leaked into B-I and B-I died the same way. **Extending a hand-list
+          once per new state guarantees round 3**, so the sandbox now snapshots the
+          whole `scripts/` directory and restores it wholesale: any file any state
+          touches is covered without the harness having to know which. The general
+          rule, and it is the same one as everywhere else in this file: *a list of
+          things to restore is a claim; a snapshot is a mechanism.* Note the
+          symptom was `MISSED (fn)` both times — the least informative message
+          available, which is why the anchor pre-flight work below exists.
+        - **`_ll_need` IS FIXTURE-ONLY COVERAGE, AND THAT IS NOW A CHECKED
+          INVARIANT RATHER THAN AN IMPLICIT ONE.** The fail-loud guard is never
+          reached by a real run, which is correct: it exists to catch a *wiring*
+          error, and it is unreachable precisely because every harness consults the
+          verdict after `loadlog_arm` has set it. Reverse that order and every real
+          figure would be **REFUSED** — a loud, total failure. So "the gate is
+          consulted after the arm" is now property (6) of
+          `check_bench_load_gate.sh`, derived per harness, and state **B-I** moves a
+          harness's gate above its arm to prove the property can fail.
+          *** The comment strip in that property was added because the check
+          reproduced, on its first run, the very bug it exists to prevent: it
+          flagged `bench_chat.sh` GATE-BEFORE-ARM on a COMMENT that merely mentions
+          the verdict variable. Third instance of that class, and the first one I
+          wrote myself after writing the rule down.
         - **AND THE RULE THAT CLOSES THE CLASS, AS A CHECK RATHER THAN AS PROSE:**
           *a checker that spells out another checker's literal patterns gets graded
           by them.* It cost two full stack runs this session (a usage comment, then
