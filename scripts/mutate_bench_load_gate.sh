@@ -108,7 +108,7 @@ preflight_anchors() {
     '        if not b:
             sig = "no_bucket_data_in_record"' || return 1
   check_anchor "$SB/scripts/_bench_summary.py" \
-    '    if len(common) < 2:' || return 1
+    '    if len(common) < 99:' || return 1
   check_anchor "$SB/scripts/_bench_summary.py" \
     '            miss = [k for k in REQUIRED if field(b, k) is None]' || return 1
   check_anchor "$SB/scripts/_bench_summary.py" \
@@ -352,7 +352,7 @@ run_state "B-J" 'B_J' 'summary-dead-rc3' \
 # 0.0 and print "CLEARS the spread ... every round agrees in sign: yes".
 MUTATE_FN() {
   patch_literal "$SB/scripts/_bench_summary.py" \
-    '    if len(common) < 2:' \
+    '    if len(common) < 99:' \
     '    if rounds < 2:   # B_K gates on the batch, not on the paired rounds' || return 1
   grep -q 'B_K' "$SB/scripts/_bench_summary.py"
 }
