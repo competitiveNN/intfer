@@ -514,14 +514,31 @@ else
     STUBDIR="$TDIR/stub/examples/intfer_cli"
     mkdir -p "$STUBDIR"
     : > "$TDIR/model.intifer"          # the harness only checks it exists
-    write_stub() { # $1 = emit a profile line? (1 = yes)
+    write_stub() { # $1 = 0 no profile line | 1 complete profile line | 2 INCOMPLETE
+      # *** THE MODE IS BAKED IN AT GENERATION TIME. *** The first version wrote
+      # `case "$1" in` into the stub and escaped it as \$1, so the stub read the
+      # CLI's own first argument ("--gpu") at RUN time, matched no case, emitted
+      # no profile line in any direction, and the checker reported BOTH the
+      # incomplete and the healthy direction refusing -- an always-red half that
+      # looked like two harness defects. Assigning MODE="$1" here bakes the value
+      # into the file; the stub then reads its own MODE.
+      local mode="$1"
       cat > "$STUBDIR/intfer_cli" <<STUB
 #!/usr/bin/env bash
 # STUB CLI for case (8). Emits token ids so the IDENTITY phase passes.
+MODE=$mode
 while [ \$# -gt 0 ]; do case "\$1" in -n) want="\$2"; shift 2 ;; *) shift ;; esac; done
 i=0; while [ "\$i" -lt "\${want:-8}" ]; do i=\$((i + 1)); echo "decode step \$i: token=\$((279 + i))"; done
 echo "tok/s: (99.00 tok/s)"
-[ "$1" = "1" ] && echo "[GPU profile @decode] kernel=1800.0ms submit=700.0ms waitblock=900.0ms rebuild=0.0ms(0) usm_write=300.0ms readback=300.0ms copy=10.0ms nk=1000 nw=900 nr=90"
+case "\$MODE" in
+  1) echo "[GPU profile @decode] kernel=1800.0ms submit=700.0ms waitblock=900.0ms rebuild=0.0ms(0) usm_write=300.0ms readback=300.0ms copy=10.0ms nk=1000 nw=900 nr=90" ;;
+  # 2: a profile line with NO exact counters. This is the direction that reaches
+  # the SUMMARY-PROPAGATION branch rather than finish_batch: note_arm finds the
+  # line, so the shell counts NO dead arm (ARM_FAILS=0), while the summariser --
+  # which requires kernel AND nk/nw/nr -- refuses. State B-O damages exactly
+  # that branch's exit code, and it is invisible to the other two directions.
+  2) echo "[GPU profile @decode] kernel=1800.0ms submit=700.0ms waitblock=900.0ms" ;;
+esac
 exit 0
 STUB
       chmod +x "$STUBDIR/intfer_cli"
@@ -544,6 +561,27 @@ STUB
       echo "  FAIL  e2e-dead-stub: the harness did not refuse a batch in which"
       echo "        every arm produced no measurement (rc=$e2e_dead_rc). This is"
       echo "        the AUDIT #27 defect, driven through the real script. Got:"
+      tail -12 "$TDIR/e2e.out" | sed 's/^/          /'
+      bad=$((bad + 1))
+    fi
+    # -- the direction that exercises the PROPAGATION branch specifically --
+    write_stub 2
+    run_harness; e2e_inc_rc=$?
+    if pred_expect_present "e2e-incomplete-rc2" "$e2e_inc_rc" '^2$' \
+       && pred_expect_present "e2e-incomplete-uses-the-propagation-branch" \
+            "$(grep -c 'NOT A RESULT -- see the refusal block above' "$TDIR/e2e.out" || true)" '^[1-9]' \
+       && pred_expect_present "e2e-incomplete-names-the-missing-fields" \
+            "$(grep -c 'incomplete_bucket_line_missing' "$TDIR/e2e.out" || true)" '^[1-9]' \
+       && pred_expect_present "e2e-incomplete-is-not-the-dead-arm-branch" \
+            "$(grep -c 'arm run(s) produced NO measurement at all' "$TDIR/e2e.out" || true)" '^0$'; then
+      echo "  ok    e2e: the harness refuses on the SUMMARY's verdict alone"
+      echo "        (shell counted no dead arm; the branch under test is the one"
+      echo "        that makes B-O observable)"
+    else
+      echo "  FAIL  e2e-incomplete: rc=$e2e_inc_rc. This direction exists because"
+      echo "        the other two cannot reach the propagation branch at all --"
+      echo "        finish_batch exits 2 first, so a defect in the summary's exit"
+      echo "        code is invisible without it. Got:"
       tail -12 "$TDIR/e2e.out" | sed 's/^/          /'
       bad=$((bad + 1))
     fi
