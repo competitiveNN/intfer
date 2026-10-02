@@ -6,6 +6,27 @@ without one is an unfinished batch.
 
 Naming: `reports/<YYYY-MM-DD>-<batch-slug>.md`.
 
+## `reports/` holds ONLY batches that have NOT been benchmarked yet
+
+Once a batch has been benchmarked and a verdict is recorded, **move it to
+`reports/archive/`** (`git mv`, so history follows). `reports/` is a work queue:
+the user's pending-test list is read off it, and a decided batch sitting there
+makes the queue lie about what is left to do.
+
+Two consequences, both deliberate:
+
+- **`gate_inventory.sh` globs `reports/*.md` non-recursively** to reconcile the
+  doc tallies. Archived reports therefore drop out of that scan automatically,
+  which is correct: a decided batch must not keep driving the live tally.
+- **`check_doc_counts.sh` / `mutate_doc_counts.sh` point at one specific report
+  by path** (the E1/E2/E3 verdicts, which moved to `archive/`). Any script that
+  cites a report path must be updated in the same commit that moves the file —
+  a dangling citation is a green checker reading a file that is not there.
+
+**Archiving, not deleting.** The repo's standing rule is that a true record must
+not be erased: rewriting history to match today's state destroys the only
+evidence that the mistake or the dead end happened. `archive/` keeps it.
+
 Every experiment in a report must state:
 
 1. flag + kill switch + default state

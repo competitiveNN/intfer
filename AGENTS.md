@@ -32,7 +32,7 @@ single fact governs how every gate result in this file must be read:
   **I did not find the mechanism.** Any "fix" (rebind/rescan 86:00.0) is a
   suggestion to investigate, not a diagnosed remedy, and may be wrong. Read the
   xe/Level Zero enumeration path before trusting any of it. Details + the full
-  exclusion list: reports/2026-10-01-batch-e1-e2-e3-verdicts.md.
+  exclusion list: reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md.
   *** LOCALIZED, 2026-10-01 (later, and stronger than the line above). *** A raw
   Level Zero probe bypassing SYCL/UR (zeInit -> zeDriverGet -> zeDeviceGet on
   libze_loader) returns **1 driver, 1 device**, uuid
@@ -230,7 +230,7 @@ matrix, and the shared patch helper — all dispatched steps of
   - `scripts/l0_enum_trace.sh` — debug-flag attempt; exits 3 INCONCLUSIVE when
     the driver prints no skip reason.
   Exit codes for all of the above are tabled in
-  `reports/2026-10-01-batch-e1-e2-e3-verdicts.md`.
+  `reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md`.
   *** NEXT-SESSION TRIGGER — the one thing worth reopening. *** If
   `scripts/l0_enumerate.sh` ever prints **2** devices, the enumeration fault is
   gone. Immediately close the ONLY remaining unverified coverage, in order:
@@ -2485,21 +2485,38 @@ e.g. S3's contract column is 40 not 42).
       contended (load1 8.79, the standing julia blocker), and nothing engine-related
       was touched.
 
-- **THE STANDING BLOCKER ON 27B WALL-TIME, AS A DIAGNOSIS TO INHERIT RATHER THAN
-      A WALL TO REDISCOVER.** Measured 2026-10-02: `load1 = 13.18`, driven by
-      **PID 274320, a `julia` process at 99.7% CPU, elapsed 1d23h** (a sibling
-      agent's Planar.jl container; a second `julia` precompiling alongside it).
-      This is the **sole** reason the 27B `--tp 2` quiet-box A/B cannot run and
-      the six `RESULT:` lines in `reports/2026-09-30-pending-bench-backlog.md` and
-      `reports/2026-09-30-dpas48-fold.md` stay blank. Both B580s enumerate fine
-      (`sycl-ls` → 2 devices), so this is **not** the AUDIT #9/#11 enumeration
+- **THE STANDING BLOCKER ON 27B WALL-TIME — *SUPERSEDED 2026-10-02, READ THE ENTRY
+      BELOW; THIS TEXT IS THE RECORD OF A PROCESS THAT NO LONGER EXISTS*.**
+      Measured 2026-10-02: `load1 = 13.18`, driven by **PID 274320, a `julia`
+      process at 99.7% CPU, elapsed 1d23h** (a sibling agent's Planar.jl
+      container). Kept rather than deleted, because "we believed this for a day and
+      it was wrong" is exactly the record this file keeps demanding — the same rule
+      as the era-marked TP=2 lines above, applied to a diagnosis.
+      **PID 274320 NO LONGER EXISTS (verified 2026-10-02, `ps` → no such process).
+      Do not go looking for it and do not repeat it as the blocker.**
+- **THE CURRENT BLOCKER ON WALL-TIME (measured 2026-10-02 ~17:43; supersedes the
+      julia note above).** `load1` swings **11–18** across benchmark runs, and the
+      cause is **no longer one external job**: it is bursty CPU from **sibling
+      `maki` agent sessions** — at sampling, PID 2064428 was at **202.2%
+      instantaneous CPU** and PID 2460963 at 38.5%, with `zen-bin` (2d elapsed) and
+      a chromium isolate behind them. Critically the box is **not saturated**:
+      `%Cpu(s)` read **84.6% idle** at the same instant, with **0 tasks in D
+      state**. So the load is **bursty, not sustained**, and a quiet window
+      (`load1 < 2`) is **reachable** — overnight, or between agent sessions. The
+      earlier belief that a 2-day background job made this box permanently
+      unmeasurable was simply wrong, and cost a day of not asking.
+      **In order:** (1) `awk '{print $1}' /proc/loadavg` — under 2 means run the
+      batch now; (2) otherwise `scripts/bench_when_quiet.sh`, the single place that
+      waits. **Do NOT kill the `maki` processes** — by the same reasoning that
+      protected the julia job, they are other agents' work. Both B580s enumerate
+      fine (`sycl-ls` → 2 devices), so none of this is the AUDIT #9/#11 enumeration
       fault and must not be diagnosed as one.
-      **Recovery, exactly:** stop or let PID 274320 finish, confirm
-      `awk '{print $1}' /proc/loadavg` stays **below 2** for a whole session, then
-      `scripts/bench_when_quiet.sh`. Do NOT kill it — it is another agent's work and
-      killing it is not ours to do without asking. **Until then no tok/s may be
-      written to `reports/`, and every figure already in there is counter-based on
-      purpose.**
+      *** AND THE HARNESSES NO LONGER WAIT (2026-10-02). *** The three wall-time
+      harnesses no longer block for a quiet window; they print the load, say they
+      are not waiting, and run. **Per-arm withholding is untouched** — an arm whose
+      *maximum* load crosses 2.0 still records `SKIPPED-CONTENDED`, so removing the
+      wait bought speed, not quotable numbers. What remains is finding a quiet
+      window, which is a scheduling problem, not a code one.
       *** AND NOTE WHAT THE LOAD-INSENSITIVE CERTIFICATION DOES AND DOES NOT
       COVER. *** The ten correctness gates ran green at `e27391b` **on this busy
       box**, and that is legitimate: they classify stream identity and exact

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Re-derive the E2 long-context STREAM-IDENTITY evidence as a repeatable checker.
 #
-# WHY THIS EXISTS. reports/2026-10-01-batch-e1-e2-e3-verdicts.md claims E2 is
+# WHY THIS EXISTS. reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md claims E2 is
 # bit-exact "at short and long ctx". That claim originally rested on a chat
 # transcript, which is the defect class this repo audits repeatedly (a proof
 # that lives only in a transcript is not re-runnable). This script makes it

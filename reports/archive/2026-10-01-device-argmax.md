@@ -279,10 +279,66 @@ is load-bearing enough to be worth proving cheaply.
 
 ---
 
+## MEASURED 2026-10-02 (load-INSENSITIVE counters only — no tok/s claimed)
+
+Run: `bench_reports_batch.sh ARGMAX 3`, 0.8B TP=1, `-n 64`, 3 interleaved rounds,
+streams identical (`279 6511 314 279 3046 13 198 760` both arms), non-vacuity
+probe 0/1 counters. **Every arm was withheld** (`SKIPPED-CONTENDED`, load1 11-18),
+so the tok/s lines below stay blank. These are the counters, which stay valid
+under load because the two arms are interleaved and nk/nw/nr are exact counts.
+
+| metric | BASE | ARGMAX | delta | reliable? |
+|---|---|---|---|---|
+| `nk` launches | 13440 | 13696 | **+256 (+4.00/token, identical in all 3 rounds)** | **yes — exact counter** |
+| `nw` waits | 8832 | 8832 | **0** | **yes** |
+| `nr` readbacks | 4608 | 4608 | **0** | **yes** |
+| `kernel` (device-side) | 639.3ms | 641.6ms | +2.3ms = **+0.036 ms/token** | yes — tight across rounds (639.1/639.3/639.3 vs 641.9/641.6/641.6) |
+| `submit` | 742.8ms | 754.2ms | +11.4ms | **no** |
+| `usm_write` | 356.2ms | 369.5ms | +13.3ms | **no** |
+| `readback` | 318.7ms | 325.0ms | +6.3ms | **no** |
+| `copy` | 0.8ms | 0.8ms | 0.0ms | flat |
+
+**The three host-side buckets are NOISE, and the run proves it.** Summing the bucket
+deltas *within* each round — same round, same contention, identical work — gives
+**+45.1 / +11.2 / +39.2 ms** for r1/r2/r3. A 4× spread across three runs of
+identical work is host-side scheduling noise, not an effect. `nk` is +256 in all
+three. So do not read "+11.4ms submit" as a cost of the lever.
+
+### VERDICT: KILL for 0.8B. The promised saving is absent from every bucket.
+
+The mechanism's premise (§1: "adds +1 submit and +2 small D2H per tile to **save
+part of the bulk D2H**") is contradicted by its own counters:
+
+- **`nr` is IDENTICAL (4608 vs 4608).** `nr` is the readback count. The claimed
+  saving was a reduction in D2H, and the readback count did not fall by one.
+- **`copy` is flat, `nw` is flat.** No other bucket moved in the lever's favour.
+- What remains is **+4 launches/token and +0.036 ms/token of device kernel time**,
+  with nothing anywhere offsetting it.
+
+Against the §7 decision rule — **win = decode tok/s up ≥2%** — a 2% move at
+~37 ms/token is a **0.74 ms/token** budget. The only uncontaminated cost is
+**0.036 ms/token**, about 5% of that budget, and there is no saving to draw the
+rest from. **≥2% faster is not reachable**, so no quiet-box run is worth scheduling
+to confirm it. Keep it default-off; do not spend E6 on proving a mechanism whose
+payoff bucket (`nr`) is provably flat.
+
+**This is a counters conclusion, and it is deliberately not dressed up as a tok/s
+one.** It does not depend on the noisy host buckets: `nw`, `nr` flat, `nk` exact,
+kernel +0.036 ms/token, and *no bucket decreased*. A lever that adds work and saves
+nothing measurable cannot be ≥2% faster. What a quiet box would add is a precise
+*size* for a loss already established in kind.
+
+---
+
 ## RESULT:
 
 - 0.8B `-n 64` TP=1, quiet box, interleaved ≥3 rounds: OFF ______ tok/s, ON ______ tok/s
-- Stream identity confirmed on the quiet-box run: YES / NO
+  (still blank — every 2026-10-02 arm was `SKIPPED-CONTENDED` at load1 11-18. The
+  verdict above does not need them; see VERDICT.)
+- Stream identity confirmed: **YES**, on the contended run too
+  (`279 6511 314 279 3046 13 198 760` both arms).
+- Counters verdict (2026-10-02): **KILL for 0.8B** — `nk +4/token`, `nw`/`nr` flat,
+  device kernel +0.036 ms/token, no bucket improved; ≥2% win unreachable.
 - 27B: **not measurable here** — TP>1 declines the flag (`:1913`) and TP=1-on-one-B580
   OOMs on the lm_head tile. State this rather than reporting a 0.8B number as the
   27B result.

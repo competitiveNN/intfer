@@ -4,7 +4,7 @@ Date: 2026-09-30. Author: maki (agent). Nothing here has a wall-time number
 from me; every `RESULT:` line is deliberately blank and is yours to fill.
 
 > **2026-10-01 UPDATE — measured, verdicts recorded.**
-> See **`reports/2026-10-01-batch-e1-e2-e3-verdicts.md`**. E1/E2/E3 were run on
+> See **`reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md`**. E1/E2/E3 were run on
 > 0.8B TP=1 (correctness + load-insensitive counters only). Summary: all three are
 > **bit-exact**, all three stay **default-OFF**, and **none is promoted** — E1
 > measured *worse* (device kernel +11.3%), E2 is neutral with traffic *up*
@@ -137,7 +137,7 @@ session produced counters only and **no** wall-time at all.
 
 **What is already measured without those two**, and needs no re-measuring: E1/E2/E3
 stream identity and the load-insensitive counters on 0.8B TP=1. See
-`reports/2026-10-01-batch-e1-e2-e3-verdicts.md`; E2's long-ctx identity is now
+`reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md`; E2's long-ctx identity is now
 re-derivable at any time with `scripts/check_e2_ctx.sh`.
 
 **Mechanism status, precisely:** the enumeration drop is a **LEADING HYPOTHESIS,
@@ -407,7 +407,7 @@ this one is not a proposal — `d460eb7` + `c2be7f5` shipped it in Sept 2026 wit
 gate (`test_device_argmax.sh`, itself PARTIAL on a 1-GPU box) but **no report**, so
 it was invisible in this pending list until 2026-10-01. Full report, including the
 load-insensitive bucket table and the blank `RESULT:` lines:
-`reports/2026-10-01-device-argmax.md`.
+`reports/archive/2026-10-01-device-argmax.md`.
 
 Two things make it different from E1-E4 in the pending table: it does **not** need a
 second GPU (the flag declines TP>1 by construction, `:1913`), and it is
@@ -665,7 +665,7 @@ Two defects, both fixed in the block below and in `scripts/check_result_block.sh
 Six `RESULT:` lines in these two reports are blank because they need **wall
 time**, and the only measurement left on this box is a quiet one. All the
 load-INSENSITIVE evidence is already recorded (27B `--tp 2`, counters, in
-`reports/2026-10-01-batch-e1-e2-e3-verdicts.md`); nothing below re-derives it.
+`reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md`); nothing below re-derives it.
 
 Do not fill a `RESULT:` line from those counters. A tok/s figure derived from
 device-side `kernel`/`copy` is not a measurement of this system, and the whole

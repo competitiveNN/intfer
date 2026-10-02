@@ -61,7 +61,7 @@ case "$BATCH" in
       arm_env_FOLDPREQ="INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1 INTFER_DPAS_PREQ=1"
       REF_ARM="DPAS48" ;;  # FOLD/FOLDPREQ must equal DPAS48
   # Device-argmax. NOT an E-batch: it is a separate lever with its own report
-  # (reports/2026-10-01-device-argmax.md), so it is named after the flag rather
+  # (reports/archive/2026-10-01-device-argmax.md), so it is named after the flag rather
   # than given an E-number -- E4 is already taken by the DPAS 2D numerics contract,
   # which has no flag at all and is therefore not benchable.
   #

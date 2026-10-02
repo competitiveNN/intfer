@@ -26,7 +26,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT" || exit 2
-REPORT="reports/2026-10-01-batch-e1-e2-e3-verdicts.md"
+REPORT="reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md"
 
 # The shared enumeration guard (AUDIT #14's sites_found=0 class).
 . "$SCRIPT_DIR/_gate_enum.sh"

@@ -23,7 +23,7 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/_gate_pred.sh"
 
 CHECK="$SCRIPT_DIR/check_doc_counts.sh"
-REPORT="reports/2026-10-01-batch-e1-e2-e3-verdicts.md"
+REPORT="reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md"
 BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
 STAMP="$BUILD_DIR/doc_counts_mutate"
 LOG="$STAMP/states"
