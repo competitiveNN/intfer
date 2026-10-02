@@ -82,6 +82,47 @@ HC="$SB/scripts/bench_chat.sh"
 echo "== stamp-population leak assertion (AS FOUND) =="
 pop_assert_no_leak "before" || exit 1
 
+# *** ANCHOR PRE-FLIGHT, BEFORE THE BASELINE (AUDIT #17's rule, added in #28). ***
+# B-J scored MISSED (fn) after AUDIT #28's rewrite deleted its anchor text: nine
+# baselines had already executed before the drift surfaced. patch_literal refuses
+# a wrong or ambiguous anchor, which is loud, but it is loud LATE. Every state's
+# anchor is asserted here -- present, and occurring EXACTLY ONCE (once is not a
+# nicety: an anchor matching twice means patch_literal would patch whichever comes
+# first, which is a different state than the one described).
+check_anchor() { # $1 file, $2 anchor text (multi-line, as one quoted arg)
+  local n
+  n="$(python3 -c 'import sys;print(open(sys.argv[1]).read().count(sys.argv[2]))' \
+        "$1" "$2")"
+  if [ "$n" != "1" ]; then
+    echo "ANCHOR STALE in $(basename "$1"): found $n occurrence(s), want 1."
+    echo "  Re-point the state; do NOT loosen the check -- a loosened anchor is how"
+    echo "  a mutation silently stops mutating."
+    printf '  first line: %s\n' "$(printf '%s' "$2" | head -1)"
+    return 1
+  fi
+}
+preflight_anchors() {
+  local f
+  for f in "$SB"/scripts/*.sh "$SB"/scripts/*.py; do :; done
+  check_anchor "$SB/scripts/_bench_summary.py" \
+    '        if not b:
+            sig = "no_bucket_data_in_record"' || return 1
+  check_anchor "$SB/scripts/_bench_summary.py" \
+    '    if len(common) < 2:' || return 1
+  check_anchor "$SB/scripts/_bench_summary.py" \
+    '            miss = [k for k in REQUIRED if field(b, k) is None]' || return 1
+  check_anchor "$SB/scripts/_bench_summary.py" \
+    '        else:
+            # Not a crash. Recorded so the refusal below can NAME the defect
+            # instead of aborting on it.
+            d.setdefault("MALFORMED", kv)' || return 1
+  check_anchor "$SB/scripts/bench_reports_batch.sh" 'SUM_RC=$?' || return 1
+  echo "  ok    every AUDIT-#28 anchor occurs exactly once in its sandbox file"
+}
+echo
+echo "== anchor pre-flight =="
+preflight_anchors || exit 1
+
 echo
 echo "== baseline =="
 restore
@@ -284,9 +325,16 @@ run_state "B-I" 'B_I' 'GATE-BEFORE-ARM' \
 # exactly what the lost E2 batch left on disk) summarises cleanly again and the
 # batch reports itself as a completed measurement.
 MUTATE_FN() {
+  # ANCHOR RE-POINTED (AUDIT #28). It read
+  #   `if r.get("FAILED") or not (r.get("BUCKETS") or "").strip():`
+  # which AUDIT #28's rewrite of the record parse deleted, so this state scored
+  # MISSED (fn) -- the stale-anchor class of AUDIT #17, one level down. The rule
+  # from there is explicit: NEVER loosen the check, RE-POINT the anchor, because a
+  # loosened anchor is how a mutation silently stops mutating.
   patch_literal "$SB/scripts/_bench_summary.py" \
-    '    if r.get("FAILED") or not (r.get("BUCKETS") or "").strip():' \
-    '    if r.get("FAILED"):   # B_J untagged dead records are no longer diagnosed' || return 1
+    '        if not b:
+            sig = "no_bucket_data_in_record"' \
+    '        # B_J untagged dead records are no longer diagnosed' || return 1
   grep -q 'B_J' "$SB/scripts/_bench_summary.py"
 }
 run_state "B-J" 'B_J' 'summary-dead-rc3' \
