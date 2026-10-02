@@ -2829,6 +2829,35 @@ e.g. S3's contract column is 40 not 42).
     generation time now. And B-O first patched `$H`, which is this matrix's default
     TARGET (`bench_quiet_ab.sh`), not the batch harness — `patch_literal` reported
     0 occurrences and the state scored MISSED, correctly, as a STATE fault.
+  - *** AND THE ONE THAT MATTERS MOST, because it is A GAP IN THE HARNESS THAT
+    CERTIFIES EVERYTHING: 0b CHECKED ARMS, NOT SCHEDULING. *** The new checker and
+    matrix got their `dispatch()` arms, so 0b reported **"31 script(s), all
+    dispatched"** — and `STEPS`, the list the run actually **iterates**, had
+    neither. So the matrix **never ran**, and step 3/3 reported its stamp STALE:
+    a symptom that reads like "the evidence is older than the tree", with
+    "re-run the named matrix" as the printed remedy, when the truth is that the
+    step was never scheduled and re-running changes nothing. **Section 0c** closes
+    it — same derived population, compared against `STEPS`, with a loud skip (never
+    a quiet one) when `INTFER_RUN_ALL_STEPS` is set. Non-vacuity proven **with real
+    commits and no trick** (`build/0c_nv_proof.log`): drop the one STEPS entry →
+    `FAIL never scheduled, so this run will NOT execute: mutate_verdict_scope.sh`,
+    **rc=1**; revert → OK. `INTFER_RUN_ALL_COVERAGE_ONLY=1` runs sections 0/0b/0c
+    and stops, because otherwise proving 0c can fail costs a 45-minute stack.
+  - *** 0c's FIRST PROOF ATTEMPT WAS VACUOUS, AND WHY IS THE LESSON. *** The
+    deliberate drift removed `check_verdict_scope.sh` from STEPS and changed
+    **nothing**, because I had put it in **two** STEPS lines — so every full stack
+    ran that checker twice, idempotent but double the wall time, with a duplicated
+    step line. **A list re-derived at a second site with nothing asserting the two
+    agree** (the AUDIT #3 shape), and it made the drift test unfalsifiable until it
+    was removed. 0c only requires *membership*, so it cannot see a duplicate — it is
+    the wrong instrument for that question, and the duplicate was deleted rather
+    than papered over with a de-dup rule.
+  - **A MISSING QUOTE MADE `bash -n` REPORT AN UNRELATED LINE.** `if [ -n
+    "$UNSCHEDULED ]; then` — one missing `"` — and the parser pointed three lines
+    later at an innocent `(` in an `echo`. Bisecting by odd-quote-count per line
+    found it in one pass. **This is the repo's own rule paying out**: `bash -n` on
+    every edited script is not optional, and a script that was clean at HEAD and
+    dirty after an edit means the edit, not the repo.
 
 - **THE STANDING BLOCKER ON 27B WALL-TIME — *SUPERSEDED 2026-10-02, READ THE ENTRY
       BELOW; THIS TEXT IS THE RECORD OF A PROCESS THAT NO LONGER EXISTS*.**
