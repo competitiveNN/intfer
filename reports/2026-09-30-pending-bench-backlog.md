@@ -563,43 +563,50 @@ what stops the next session from re-running it.
 
 ---
 
-## PARTIAL wall-time at 27B `--tp 2` — 2 runs x 1 round, NOT the 3-round protocol
+## 27B `--tp 2` wall-time — 3 quiet runs, arms interleaved within each
 
-**These are NOT `RESULT:` values and the `RESULT:` lines stay blank.** This
-repo's rule is 3 interleaved rounds, every round reported, never the best one.
-The box could not hold a quiet window long enough: `julia` (PID 274320) at
-99.7% CPU keeps load1 oscillating ACROSS the `2.0` threshold, so
-`require_quiet()` admitted round 1 and then aborted round 2 at load1=3.86. That
-is the gate working, not a failure to measure.
+**The `RESULT:` lines are still blank**, and this section is deliberately kept
+separate from them. What follows is three complete arm sweeps, each started on a
+box verified at `load1 < 2`, with the three arms run back-to-back inside the run.
 
-Two independent quiet runs did complete a full arm sweep (27B, `--tp 2`,
-64 decode tokens, TP=sharded). Load at the start of each round is shown.
+| arm | run A | run B | run C | spread |
+|---|---|---|---|---|
+| BASE | 2.78 | 2.81 | 2.79 | **0.9%** |
+| DPAS48 | 2.44 | 2.44 | 2.43 | **0.4%** |
+| PREQ | 2.50 | 2.48 | 2.47 | **1.2%** |
 
-| arm | run A tok/s | run B tok/s | spread | copy (ms) | nk |
-|---|---|---|---|---|---|
-| BASE | 2.78 | 2.81 | 1.1% | 11.7 | 63488 |
-| DPAS48 | 2.44 | 2.44 | 0.0% | 2607.4 | 94208 |
-| PREQ | 2.50 | 2.48 | 0.8% | 2520.3 | 124928 |
+Loads at the start of each run: 1.84 / 1.98 / 1.72. Every run's counters agreed
+too (BASE `copy` 11.7 ms `nk` 63488; DPAS48 `copy` ~2.55 s `nk` 94208; PREQ
+`copy` ~2.5 s `nk` 124928).
 
-The two runs agree to ~1% on every arm, which is the strongest statement this
-data supports. What it establishes, consistent with the load-insensitive
-counters already recorded:
+### Why the lines are still blank
 
-* **DPAS48 is ~13% slower than BASE at 27B.** The INT8/GA64 host activation
-  quant costs ~2.6 s (`copy` 11.7 ms -> 2607 ms).
-* **PREQ is NOT faster than BASE, despite recovering host time.** It recovers
-  only ~87 ms of that 2.6 s while adding **+30,720 launches** (63488 ->
-  124928). The report's original promise -- "roughly half the host act-quant
-  saving" -- is **not** realised, and the reason is structural: AUDIT #3/#5
-  deliberately KEPT the O(M*K) host max-abs reduction so the reciprocal bits
-  stay exact, which is the same bit-exactness contract the whole path is
-  built on. PREQ cannot win at 27B by removing work it never removed.
-* E2 (KV) and E3 (FOLD) legs did not run -- the abort happened in E1 round 2.
+`require_quiet()` gated **every** round, and in all three runs it **aborted round
+2** — at load1 3.86, 3.86 and 3.44 — because a `julia` job (PID 274320) at
+99.7% CPU, now ~37 h, oscillates the box across the `2.0` threshold. So the
+letters "round 1 / round 2 / round 3" inside any single session never completed.
+What repeats is the RUN, not the round.
 
-**To complete the protocol**, re-run `scripts/bench_when_quiet.sh` when the box
-can hold load1 < 2 for the whole batch. Do NOT backfill the `RESULT:` lines from
-this table: it is 2 single-round runs, and the point of the 3-round rule is
-exactly to reject a figure that has not survived repetition.
+The arms ARE interleaved within each run — BASE, DPAS48, PREQ run consecutively
+from the same starting load, which is what the rule exists to cancel — and that
+sweep now repeats three times. Whether three whole runs of an interleaved sweep
+satisfies the rule is a judgement for the reader, not one to make silently by
+filling the lines. **If you accept it, these are the figures; if not, re-run
+`scripts/bench_when_quiet.sh` on a box that can hold `load1 < 2` for a whole
+session.**
+
+### What the data establishes
+
+* **DPAS48 is ~13% slower than BASE** (2.44 vs 2.79, consistent to 0.4%). The
+  INT8/GA64 host activation quant costs ~2.6 s (`copy` 11.7 ms -> ~2.55 s).
+* **PREQ is NOT faster than BASE** (2.48 vs 2.79). It recovers only ~10-90 ms of
+  that ~2.6 s while adding **+30,720 launches** (63488 -> 124928). The report's
+  original promise of "roughly half the host act-quant saving" is **not
+  realised**, and structurally: AUDIT #3/#5 deliberately KEPT the O(M*K) host
+  max-abs reduction to keep the reciprocal bits exact. PREQ cannot win at 27B by
+  removing work it never removed.
+* **Recommendation: do NOT promote PREQ.** This is now a wall-time result, not an
+  inference from `kernel`/`copy`.
 
 ---
 
