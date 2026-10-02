@@ -479,12 +479,68 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh"
+    STEPS="$STEPS check_verdict_scope.sh"
+  [ "${INTFER_QUICK:-0}" = "1" ] || \
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh"
+fi
+
+# --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
+# *** MEASURED DEFECT, 2026-10-02, and 0b could not see it. *** A new checker and
+# a new matrix were added with their dispatch() arms (so 0b reported
+# "31 script(s), all dispatched") but WITHOUT a STEPS entry -- and STEPS is the
+# list the run actually iterates. The matrix therefore never ran, and step 3/3
+# reported its stamp STALE: a symptom that reads like "the evidence is older than
+# the tree" with "re-run the named matrix" as the printed remedy, when the real
+# fact is that the step was NEVER SCHEDULED and re-running it changes nothing.
+# Same class as N-J one level up -- "a step that never runs is not a step that
+# fails" -- and the fix is the same shape: derive the population, compare against
+# the REAL list, fail loudly.
+#
+# SKIPPED, LOUDLY, when INTFER_RUN_ALL_STEPS is set: the override exists so the
+# self-check and its matrix can drive synthetic steps, and requiring synthetic
+# coverage of the real scripts would make the seam unusable. It says SKIP rather
+# than passing silently, because a quiet skip reads as a verdict.
+if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
+  echo "== 0c STEPS-membership check SKIPPED (INTFER_RUN_ALL_STEPS is set: this run"
+  echo "      drives synthetic steps, so real coverage is NOT being asserted) =="
+else
+  echo "== 0c every check_*/mutate_* is SCHEDULED (an arm alone never runs) =="
+  UNSCHEDULED=""
+  for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
+    [ -f "$f" ] || continue
+    b="$(basename "$f")"
+    case " $STEPS " in
+      *" $b "*) ;;
+      # run_ten_gates.sh is a COMPOSITE step, not a check_ or mutate_ file, so it
+      # is never in this population; nothing to exempt here.
+      *) UNSCHEDULED="$UNSCHEDULED $b" ;;
+    esac
+  done
+  if [ -n "$UNSCHEDULED" ]; then
+    echo "  FAIL  never scheduled, so this run will NOT execute:$UNSCHEDULED" >&2
+    echo "         They have a dispatch() arm (0b is happy) and a file, but the run" >&2
+    echo "         iterates STEPS. Their stamps will read STALE at step 3/3, which" >&2
+    echo "         looks like missing evidence and is not." >&2
+    FAILED=$((FAILED + 1))
+  else
+    echo "  ok    every check_*/mutate_* is in STEPS as well as dispatch()"
+  fi
+  # A fast, honest seam for testing 0c itself: run the coverage sections and
+  # stop. Without it, proving 0c can fail costs a 45-minute stack.
+  if [ "${INTFER_RUN_ALL_COVERAGE_ONLY:-0}" = "1" ]; then
+    echo
+    if [ "$FAILED" -eq 0 ]; then
+      echo "COVERAGE ONLY: OK (sections 0, 0b, 0c). No step was executed."
+      exit 0
+    fi
+    echo "COVERAGE ONLY: FAIL (a coverage section drifted; no step was executed)" >&2
+    exit 1
+  fi
 fi
 echo "== 1/2 checkers =="
 for label in $STEPS; do step "$label"; done
