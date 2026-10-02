@@ -411,15 +411,43 @@ echo; echo "== SUMMARY (wall tok/s per round, then median) =="
 echo "   kernel + nk/nw/nr : DEVICE-side or exact -- may be believed."
 echo "   submit/waitblock/copy/readback/usm_write : HOST wall clock, NOT"
 echo "   load-insensitive. On a contended box they track the load and cannot"
-echo "   decide a verdict. Shown as medians only, for completeness."
+echo "   decide a verdict. Shown as median(spread), for completeness."
 # The summary lives in scripts/_bench_summary.py, NOT in a heredoc, so it can be
 # driven against fixtures without a GPU -- see that file's docstring. Extracting
 # it is what made the failed-arm defect below testable at all.
+#
+# *** ITS EXIT CODE IS PROPAGATED (AUDIT #28). *** It used to be discarded, which
+# left TWO independent rules for "this batch is not a result": ARM_FAILS in the
+# shell (an arm output with no @decode] line) and the summariser's own diagnosis
+# (a record with no usable bucket data). They agreed on the measured failure, but
+# a malformed record made the summariser raise -- printing NO summary at all --
+# and the harness exited 0 having printed nothing. A rule enforced at two sites
+# where only one site's verdict is checked is the AUDIT #3 shape; now there is
+# one rule and the harness honours its verdict, whatever the cause.
 python3 "$SCRIPT_DIR/_bench_summary.py" "$LOG" "$ARMS" "$REF_ARM"
-echo
+SUM_RC=$?
+if [ "$SUM_RC" -ne 0 ] && [ "$ARM_FAILS" -eq 0 ]; then
+  # The shell counted no dead arm but the summary refused: do not explain which
+  # is right. Report BOTH verdicts and refuse.
+  echo
+  echo "RESULT: the summary refused this batch (exit $SUM_RC) although no arm run"
+  echo "RESULT: was flagged as dead by the harness, so the two disagree about what"
+  echo "RESULT: was measured. The batch is NOT A RESULT either way. Re-read the"
+  echo "RESULT: log above: a record with unusable bucket data is named in the"
+  echo "RESULT: refusal block the summary printed."
+fi
 # Refuse to certify a batch that lost an arm -- checked LAST so the summary above
 # is still printed (it is diagnostic) but the exit code cannot read as success.
 finish_batch
+# And refuse when the SUMMARY refused and the shell did not: same rc=2, for the
+# same reasons (rc=1 is reserved for a code regression, rc=0 would certify
+# coverage nobody got). This branch is load-bearing, not defensive -- without it
+# the script falls through to its last `echo`, which exits 0.
+if [ "$SUM_RC" -ne 0 ]; then
+  echo
+  echo "RESULT: NOT A RESULT -- see the refusal block above."
+  exit 2
+fi
 echo "RESULT ($BATCH, $(basename "$MODEL") tp=$TP, devices=$NDEV) - NO wall-time claimed:"
 echo "RESULT:"
 fi

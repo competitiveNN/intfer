@@ -292,6 +292,67 @@ MUTATE_FN() {
 run_state "B-J" 'B_J' 'summary-dead-rc3' \
   "a batch whose arms produced no data is summarised as a result again"
 
+# ---------------------------------------------------------------- AUDIT #28 states
+# Four more defects were found by reading the code AUDIT #27 shipped, and each is
+# measured rather than argued (the measurements are quoted in the state). They are
+# ARTIFACT-defect states for the same reason as B-J: the summariser and the harness
+# are correct after this commit, so weakening the checker is unobservable.
+
+# B-K: THE VERDICT IS GATED ON THE BATCH'S ROUND COUNT AGAIN. Reverts the gate from
+# the rounds the two arms hold IN COMMON to the batch-wide round count (the max
+# over arms), which is what let a one-round delta be scored against a spread of
+# 0.0 and print "CLEARS the spread ... every round agrees in sign: yes".
+MUTATE_FN() {
+  patch_literal "$SB/scripts/_bench_summary.py" \
+    '    if len(common) < 2:' \
+    '    if rounds < 2:   # B_K gates on the batch, not on the paired rounds' || return 1
+  grep -q 'B_K' "$SB/scripts/_bench_summary.py"
+}
+run_state "B-K" 'B_K' 'summary-oneround-refused' \
+  "a one-round delta is scored against a zero noise floor again"
+
+# B-L: A PARTIALLY-WRITTEN RECORD IS DATA AGAIN. Drops the required-field test, so
+# a record whose bucket line lost nk/nw/nr counts as a good round and its
+# exact-counter columns print '-' -- the silent-dash table AUDIT #27 closed.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/_bench_summary.py" \
+    '            miss = [k for k in REQUIRED if field(b, k) is None]' \
+    '            miss = []  # B_L a partial bucket line counts as a measurement' || return 1
+  grep -q 'B_L' "$SB/scripts/_bench_summary.py"
+}
+run_state "B-L" 'B_L' 'summary-trunc-rc3' \
+  "a partially-written record summarises into dashes again"
+
+# B-M: THE READER CRASHES ON A MALFORMED RECORD INSTEAD OF NAMING IT. Reverts to
+# splitting the whole record and building a dict, which raises ValueError on the
+# first token without '='. MEASURED on the pre-fix file: traceback, no summary at
+# all, exit 1 -- and the harness discarded the rc, so the batch exited 0.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/_bench_summary.py" \
+    '        else:
+            # Not a crash. Recorded so the refusal below can NAME the defect
+            # instead of aborting on it.
+            d.setdefault("MALFORMED", kv)' \
+    '        else:
+            raise ValueError("B_M malformed record token: %s" % kv)   # B_M' || return 1
+  grep -q 'B_M' "$SB/scripts/_bench_summary.py"
+}
+run_state "B-M" 'B_M' 'summary-malformed-rc3' \
+  "one malformed record aborts the whole summary instead of naming itself"
+
+# B-N: THE HARNESS DISCARDS THE SUMMARY'S VERDICT AGAIN. The harness captured the
+# summariser's rc and refused on it; this drops both, which is how a summary that
+# raised a traceback produced no table while the batch still exited 0.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/bench_reports_batch.sh" \
+    'SUM_RC=$?' \
+    'SUM_RC=0   # B_N the summary'"'"'s verdict is discarded' || return 1
+  bash -n "$SB/scripts/bench_reports_batch.sh" || return 1
+  grep -q 'B_N' "$SB/scripts/bench_reports_batch.sh"
+}
+run_state "B-N" 'B_N' 'neither captures nor refuses' \
+  "the harness no longer propagates the summary's refusal"
+
 restore
 echo
 echo "== residue + restore integrity =="

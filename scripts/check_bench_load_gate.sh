@@ -348,7 +348,9 @@ else
   rc_part=$?
   if pred_expect_present "summary-partial-rc3" "$rc_part" '^3$' \
      && pred_expect_present "summary-partial-pairs-by-round" \
-          "$(grep -c 'd=-100.0 -100.0 (rounds 1,3)' "$FIX/partial.out" || true)" '^[1-9]'; then
+          "$(grep -c 'd=-100.0 -100.0 (rounds 1,3)' "$FIX/partial.out" || true)" '^[1-9]' \
+     && pred_expect_present "summary-partial-verdict-3rounds" \
+          "$(grep -cE '\-> (CLEARS|INSIDE)' "$FIX/partial.out" || true)" '^[1-9]'; then
     echo "  ok    behavioural: a half-dead arm is paired by ROUND (1,3) and refused"
   else
     echo "  FAIL  partial-death handling is wrong (rc=$rc_part). Positional pairing"
@@ -356,6 +358,156 @@ else
     sed 's/^/          /' "$FIX/partial.out"
     bad=$((bad + 1))
   fi
+
+  # (7a) *** A SINGLE ROUND IN COMMON MUST NOT CLEAR ANYTHING. *** AUDIT #28,
+  # MEASURED. The delta verdict was gated on the batch's round count -- the MAX
+  # over arms -- while the delta itself is computed over the rounds the two arms
+  # hold in COMMON. So an arm with one surviving round was scored against a
+  # spread of 0.0, and the table printed
+  #   d=+98.0 (rounds 2) ... -> CLEARS the spread: report +98.0 ms (+0.60%);
+  #   every round agrees in sign: yes
+  # which is precisely the false claim AUDIT #26 retracted for E1, arriving
+  # through a different door -- and the sign check was vacuous, since one round
+  # always agrees with itself.
+  : > "$FIX/one.log"
+  rec "$FIX/one.log" BASE 1 1800.0; rec "$FIX/one.log" VAR 1 ""
+  rec "$FIX/one.log" BASE 2 1801.0; rec "$FIX/one.log" VAR 2 1701.0
+  rec "$FIX/one.log" BASE 3 1802.0; rec "$FIX/one.log" VAR 3 ""
+  python3 "$SUM" "$FIX/one.log" "BASE VAR" BASE > "$FIX/one.out" 2>&1
+  rc_one=$?
+  # Polarity matters here, so it is NAMED: a `grep -q CLEARS` alone would also
+  # match the explanatory header line, and this is the inverted-predicate trap
+  # (AGENTS.md: an inverted predicate scores correct code as broken). The verdict
+  # lines are the ones that begin `-> `.
+  if pred_expect_present "summary-oneround-rc3" "$rc_one" '^3$' \
+     && pred_expect_present "summary-oneround-refused" \
+          "$(grep -cE '\-> NO SPREAD ESTIMATE' "$FIX/one.out" || true)" '^[1-9]' \
+     && pred_expect_present "summary-oneround-clears-count-zero" \
+          "$(grep -cE '\-> CLEARS' "$FIX/one.out" || true)" '^0$'; then
+    echo "  ok    behavioural: ONE round in common is refused, never 'CLEARS'"
+  else
+    echo "  FAIL  a one-round delta was scored against a zero noise floor"
+    echo "        (rc=$rc_one). That reports a cost or a saving with no spread"
+    echo "        estimate at all. Got:"
+    sed 's/^/          /' "$FIX/one.out"
+    bad=$((bad + 1))
+  fi
+
+  # (7b) *** THE CONVERSE OF (7a): a real 3-round clearing pair MUST still be
+  # reported as clearing. *** Without this, (7a) would also be satisfied by a
+  # summary that never says CLEARS -- the check would be unfalsifiable in the
+  # direction that matters (AUDIT #19: prove the harness with a case it did not
+  # set up).
+  if pred_expect_present "summary-converse-clears" \
+       "$(grep -cE '\-> CLEARS the spread' "$FIX/partial.out" || true)" '^[1-9]'; then
+    echo "  ok    converse: a 3-round pair with a 100 ms effect does say CLEARS"
+  else
+    echo "  FAIL  a healthy 3-round pair with a 100 ms effect did not CLEAR, so"
+    echo "        the refusal in (7a) could be an unfalsifiable always-refuse. Got:"
+    grep -E '\-> (CLEARS|INSIDE|NO SPREAD)' "$FIX/partial.out" | sed 's/^/          /'
+    bad=$((bad + 1))
+  fi
+  # And its mirror: a 3-round pair whose effect is INSIDE the run's own spread
+  # must say INSIDE, not CLEARS. The healthy fixture above is a clearing case,
+  # so without this one the table could refuse every delta and still pass (7a).
+  : > "$FIX/noise.log"
+  rec "$FIX/noise.log" BASE 1 1800.0; rec "$FIX/noise.log" VAR 1 1800.4
+  rec "$FIX/noise.log" BASE 2 1801.0; rec "$FIX/noise.log" VAR 2 1799.6
+  rec "$FIX/noise.log" BASE 3 1802.0; rec "$FIX/noise.log" VAR 3 1801.4
+  python3 "$SUM" "$FIX/noise.log" "BASE VAR" BASE > "$FIX/noise.out" 2>&1
+  rc_noise=$?
+  if pred_expect_present "summary-converse-healthy-rc0" "$rc_noise" '^0$' \
+     && pred_expect_present "summary-converse-inside" \
+          "$(grep -cE '\-> INSIDE the spread' "$FIX/noise.out" || true)" '^[1-9]'; then
+    echo "  ok    converse: a 3-round pair inside its own spread says INSIDE (rc=0)"
+  else
+    echo "  FAIL  a healthy batch whose delta sits inside its own spread was not"
+    echo "        reported as INSIDE (rc=$rc_noise). That is how the AUDIT #26"
+    echo "        'median +689 ms' reading was manufactured. Got:"
+    grep -E '\-> (CLEARS|INSIDE|NO SPREAD)' "$FIX/noise.out" | sed 's/^/          /'
+    bad=$((bad + 1))
+  fi
+
+  # (7c) *** A RECORD WHOSE BUCKETS ARE ONLY PARTIALLY RECOVERABLE IS A FAILED
+  # RECORD, NOT A DASH. *** AUDIT #28, MEASURED: the reader used to split the
+  # whole record on whitespace and build a dict, so the first token without '='
+  # raised ValueError -- a batch printed NO summary and the harness exited 0
+  # (see (7d)). The same truncation that produced the crash also used to yield
+  # '-' in the exact-counter columns of an otherwise "good" round. Here the write
+  # is cut mid-line, which is what a killed arm leaves behind.
+  : > "$FIX/trunc.log"
+  rec "$FIX/trunc.log" BASE 1 1800.0
+  printf 'ARM=VAR ROUND=1 TPS=SKIPPED-CONTENDED LOAD1=3.10 BUCKETS="@decode] kernel=1700.0ms submit=700.0ms nk=1000"\n' >> "$FIX/trunc.log"
+  python3 "$SUM" "$FIX/trunc.log" "BASE VAR" BASE > "$FIX/trunc.out" 2>&1
+  rc_tr=$?
+  if pred_expect_present "summary-trunc-rc3" "$rc_tr" '^3$' \
+     && pred_expect_present "summary-trunc-names-missing" \
+          "$(grep -c 'incomplete_bucket_line_missing' "$FIX/trunc.out" || true)" '^[1-9]' \
+     && pred_expect_present "summary-trunc-no-traceback" \
+          "$(grep -c 'Traceback' "$FIX/trunc.out" || true)" '^0$'; then
+    echo "  ok    behavioural: a partially-written record is NAMED, not a dash"
+  else
+    echo "  FAIL  a partially-written record summarised cleanly or crashed"
+    echo "        (rc=$rc_tr). Either way it is not a measurement. Got:"
+    sed 's/^/          /' "$FIX/trunc.out"
+    bad=$((bad + 1))
+  fi
+
+  # (7e) *** A RECORD WITH A MALFORMED TOKEN IS NAMED, NOT FATAL. *** AUDIT #28,
+  # MEASURED: the reader used to build a dict from every whitespace token of the
+  # record, so a single token without '=' raised ValueError -- traceback, no table
+  # at all, exit 1, and the harness discarded the rc (see (7d)), so the batch
+  # exited 0 having printed nothing. One bad record must cost that record, not the
+  # whole batch. The stray `OK` is what a future positional field in the bucket
+  # line would look like.
+  : > "$FIX/malformed.log"
+  rec "$FIX/malformed.log" BASE 1 1800.0; rec "$FIX/malformed.log" BASE 2 1801.0
+  rec "$FIX/malformed.log" BASE 3 1802.0
+  rec "$FIX/malformed.log" VAR 1 1701.0
+  printf 'ARM=VAR ROUND=2 TPS=SKIPPED-CONTENDED LOAD1=3.10 BUCKETS="@decode] kernel=1702.0ms submit=700.0ms waitblock=900.0ms copy=10.0ms readback=300.0ms usm_write=300.0ms nk=1000 nw=900 nr=90" OK\n' >> "$FIX/malformed.log"
+  rec "$FIX/malformed.log" VAR 3 1703.0
+  python3 "$SUM" "$FIX/malformed.log" "BASE VAR" BASE > "$FIX/malformed.out" 2>&1
+  rc_mal=$?
+  if pred_expect_present "summary-malformed-rc3" "$rc_mal" '^3$' \
+     && pred_expect_present "summary-malformed-names-token" \
+          "$(grep -c 'malformed_record_token' "$FIX/malformed.out" || true)" '^[1-9]' \
+     && pred_expect_present "summary-malformed-no-traceback" \
+          "$(grep -c 'Traceback' "$FIX/malformed.out" || true)" '^0$' \
+     && pred_expect_present "summary-malformed-keeps-other-rounds" \
+          "$(grep -c 'd=-99.0 -99.0 (rounds 1,3)' "$FIX/malformed.out" || true)" '^[1-9]'; then
+    echo "  ok    behavioural: one malformed record costs that record, not the batch"
+  else
+    echo "  FAIL  a malformed record aborted the summary or was summarised cleanly"
+    echo "        (rc=$rc_mal). A crash prints NO table, which is strictly worse"
+    echo "        than a named refusal. Got:"
+    sed 's/^/          /' "$FIX/malformed.out"
+    bad=$((bad + 1))
+  fi
+
+  # (7d) *** THE HARNESS MUST HONOUR THE SUMMARY'S VERDICT. *** STATIC, and
+  # labelled so: driving the harness end-to-end needs a GPU and a model, and a
+  # comment-shaped check would be worse than none (see the note at the top about
+  # checks that read prose). So the population is DERIVED -- every harness that
+  # invokes _bench_summary.py -- and each must both capture its exit code and
+  # refuse on it. AUDIT #28: it did neither, so a summary that raised a
+  # traceback produced no table and the batch still exited 0.
+  n_sum=0
+  for f in $POP; do
+    strip_comments "$f" | grep -q '_bench_summary\.py' || continue
+    n_sum=$((n_sum + 1))
+    body="$(strip_comments "$f")"
+    if printf '%s' "$body" | grep -q 'SUM_RC=\$?' \
+       && printf '%s' "$body" | grep -q 'SUM_RC" -ne 0'; then
+      printf '  %-4s %-34s %s\n' "ok" "$(basename "$f")" \
+        "propagates the summary's refusal (static)"
+    else
+      printf '  %-4s %-34s %s\n' "FAIL" "$(basename "$f")" \
+        "runs _bench_summary.py but neither captures nor refuses on its exit code"
+      bad=$((bad + 1))
+    fi
+  done
+  enum_require_min "summary-caller-rc-propagation" "$n_sum" 1 \
+    "no harness invokes _bench_summary.py, so the propagation rule is unchecked"
 
   # And the harness side: a harness that writes MACHINE-READABLE per-arm records
   # must refuse a batch that lost an arm. Scoped by DERIVATION, not by name: only
