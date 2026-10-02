@@ -2378,9 +2378,18 @@ e.g. S3's contract column is 40 not 42).
       filter is not load-bearing" — a confident false conclusion about a mechanism
       that HAD been broken. **A weakening must be provably total, not merely
       weaker.** Same commit also fixed E-D not incrementing `total`, which made the
-      tally say 3/3 PASS while the summary listed E-D MISSED — the
+      run's own tally read a clean PASS while the summary listed E-D MISSED — the
       self-contradicting-report class, reintroduced by a state that bypassed the
       shared `check_state()` helper.
+      *** AND A LAST IRONY WORTH RECORDING: *** the sentence above originally
+      spelled that tally as a slash-form "N PASS" count, and `gate_inventory.sh`
+      flagged it as a STALE doc tally — it parsed the phrase as a gate count and
+      compared it against the derived ten. Correct behaviour, and this file's own
+      rule: **a number in prose is a citation**, and I had written a number that
+      meant something else entirely. Note the irony compounded: the first fix
+      QUOTED the offending string inside its own explanation and was flagged again
+      on the next line. Reworded rather than excluded, because the exclusion list
+      is where stale claims go to hide.
     - **AND THE MATRIX NEVER TOUCHES THE REAL ARTIFACT.** It plants
       `ten_gates/HEAD` into a sandbox build dir through the `INTFER_BUILD_DIR` seam
       the checker honours. An earlier draft planted into the real file and restored
