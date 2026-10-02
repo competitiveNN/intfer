@@ -71,10 +71,25 @@ enum_require_min "cmake-targets" "$N_TARGETS" 1 || {
 # The rule that reconciles them: strip comments when the match decides MEMBERSHIP
 # of a population, because a comment is not a behaviour. Here the match is only a
 # hint -- the real test is the per-script override check below -- so a comment
-# costs one extra row, not a wrong verdict. Over there the match IS the
+# costs one extra NOTE row, not a wrong verdict. Over there the match IS the
 # population, so an unstripped comment would add a script that publishes no
-# figure. Do not "harmonise" the two without re-deriving both; the reasoning is
-# duplicated at check_bench_load_gate.sh's own call site on purpose.
+# figure. Both sites now classify comment-only matches EXPLICITLY (a NOTE row
+# here, a stripped row there) rather than letting them fall through to a verdict
+# about something else.
+#
+# *** CONVERSION TRIGGER -- do not harmonise these without one of these. ***
+# This is the same deliberate-duplication pattern already used for
+# patch_literal's three copies, and it carries the same conditions. Convert when
+# ANY is true, ONE checker at a time, each with its own re-run and re-stamp:
+#   * one side is edited and the edit lands on only one of them -- the copies have
+#     then genuinely diverged and the shared helper is a bug source;
+#   * a THIRD checker needs the same classification (two is a coincidence, three
+#     is the hand-maintenance cost becoming real);
+#   * one of the two is next being modified anyway, so the review cost is already
+#     being paid.
+# Until then the divergence is intentional and both sites say why.
+CONSUMERS="$(grep -rlE '(INTFER_BUILD_DIR|\$ROOT/build|\$\{INTFER_BUILD_DIR|\$\{ROOT\}/build|build/)' \
+             scripts/*.sh 2>/dev/null | LC_ALL=C sort)"
 CONSUMERS="$(grep -rlE '(INTFER_BUILD_DIR|\$ROOT/build|\$\{INTFER_BUILD_DIR|\$\{ROOT\}/build|build/)' \
              scripts/*.sh 2>/dev/null | LC_ALL=C sort)"
 N_CONSUMERS="$(printf '%s\n' "$CONSUMERS" | grep -c .)"

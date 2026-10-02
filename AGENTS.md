@@ -2187,6 +2187,72 @@ e.g. S3's contract column is 40 not 42).
       commit.** A false MISSED is the safe direction, but it costs a full matrix
       run to discover and it trains you to distrust the matrix.
 
+- **AUDIT #23 FOLLOW-UP (same day, 4 more defects, 2 of them latent rather
+      than historical).**
+        - **THE `set -u` GAP WAS REAL, AND NOT FIXABLE WHERE IT LOOKED.**
+          `bench_chat.sh` had `set -o pipefail` but no `set -u`, so `$_LL_USABLE`
+          was safe only *by accident*. The obvious fix — add `set -u` — would have
+          BROKEN the script, and the tree says why: `bench_gpu_ab.sh:22` records
+          that `setvars.sh` is not `set -u`-clean, and **every** harness here that
+          enables nounset wraps its `setvars` source in `set +u … set -u`.
+          `bench_chat.sh:29` sourced it bare, so it was the last harness outside
+          the idiom. Both ends fixed: the source is now wrapped, `set -u` is on,
+          and the branch reads `if loadlog_usable; then`.
+        - **THE VERDICT WAS FAILING SILENTLY, NOT SAFELY.** With no `set -u`, an
+          unset `_LL_USABLE` compared unequal to `"1"` and `loadlog_field`
+          returned `SKIPPED-CONTENDED` — the SAFE direction, but a **silent** one:
+          a harness wired wrong would withhold every figure forever and never say
+          why. `_ll_need` now refuses and names the cause, and
+          `check_bench_load_gate.sh` proves it BEHAVIOURALLY by consuming a figure
+          with no preceding `loadlog_arm` and requiring rc=1 plus the message.
+          State **B-H** removes the guard. This is the AUDIT #20 shape applied to
+          a value: a guard that cannot fail is not a guard, and neither is an
+          empty verdict.
+        - **TWO DEFECTS IN THE MATRIX HARNESS, BOTH FOUND BY B-H FAILING.** (a)
+          `restore()` restored the target and the checker but **not the helper**,
+          and B-E mutates the helper — so B-E's damage leaked into B-F…B-H and
+          B-H reported its anchor missing when the anchor was fine. States that
+          contaminate each other are not independent evidence, and `MISSED (fn)`
+          is the least informative way to find that out. (b) **A failed
+          intermediate `patch_literal` was masked by a succeeding `grep`**, because
+          `MUTATE_FN`'s exit status is its LAST command's: B-F scored **CAUGHT**
+          with one of its two hunks never applied, i.e. caught for the wrong
+          reason. Every hunk is now `|| return 1`. This is the same shape as the
+          recorded "an argument accepted and never forwarded" — `patch_literal`
+          refusing to patch is only useful if the caller BELIEVES it.
+        - **THE "COMMENT-ONLY CONSUMER" VERDICT, AND A VACUOUS PASS FOUND WHILE
+          FIXING IT.** A script matching only on a comment fell through to
+          "references a build tree, honors NO override" — true-ish and completely
+          misleading, and the obvious "fix" (add a fake `INTFER_BUILD_DIR`
+          reference) would have satisfied it while fixing nothing. Such scripts now
+          get their own `NOTE` verdict. **Planting the negative direction BY HAND
+          then found the worse bug in the opposite direction:** a comment that
+          merely *names* `INTFER_BUILD_DIR` was being graded `ok — routes through
+          a documented override`, because `honors` counted comment lines. A
+          vacuous PASS is more dangerous than the misleading FAIL it replaced.
+          `honors` now ignores comment lines, and state **M-G** in
+          `mutate_build_dir_consumers.sh` plants both shapes and requires NOTE
+          **and not ok** — the NOTE branch is dead code on a clean tree, so without
+          a state that fires it, it would ship unexercised.
+        - **THE COMMENT-STRIPPING DIVERGENCE IS NOW A DECISION WITH A TRIGGER, NOT
+          AN OPEN QUESTION.** `check_build_dir_consumers.sh` does not strip
+          comments; `check_bench_load_gate.sh` does. Both are right: strip when the
+          match decides POPULATION MEMBERSHIP (a comment is not a behaviour), do
+          not when it is only a hint (the real test is the per-script override
+          check, so a comment costs one NOTE row). Recorded at **both** call sites
+          with the same **conversion trigger** the `patch_literal` triplication
+          uses: harmonise only if one side is edited without the other, a THIRD
+          checker needs the classification, or one of the two is being modified
+          anyway. An earlier draft claimed "both choices are recorded at their call
+          sites" when they were not — grep the tree, do not trust the prose.
+        - **AND THE RULE THAT CLOSES THE CLASS, AS A CHECK RATHER THAN AS PROSE:**
+          *a checker that spells out another checker's literal patterns gets graded
+          by them.* It cost two full stack runs this session (a usage comment, then
+          the note written to describe the first one). Both notes now describe the
+          paths instead of quoting them, `NOTE` makes the next occurrence
+          self-naming, and the AGENTS.md/MEMORY advice was not enough on its own —
+          a rule that exists only in a document is not a check.
+
 - **SIXTH RECURRENCE OF THE SAME CLASS: I WROTE THE PREDICATE FOR THE OUTPUT I
     EXPECTED, NOT THE ONE I OBSERVED.** Two more instances this session, both
     found by a state reporting MISSED while its defect had reproduced perfectly:
