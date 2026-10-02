@@ -46,6 +46,27 @@ consumers at `:5165` (`step`, `greedy_only`), `:6188` (`score_row`, `all_greedy`
 
 ### 3. Benchmark command (quiet-box rule: load1 < 2)
 
+> **PREFER THE HARNESS (added 2026-10-02).** The raw commands kept below are
+> UNGATED — no load sampling, no per-arm log — which is the AUDIT #22 defect: a
+> figure with no artifact behind it. Use:
+>
+> ```bash
+> bash scripts/bench_reports_batch.sh ARGMAX 3
+> ```
+>
+> It runs both arms, checks stream identity first, refuses `TP>1` outright (the
+> flag declines there, so such an A/B is a no-op that reads as a wash), and
+> **proves the flag toggles before timing anything** — OFF must emit 0 `[argmax]`
+> counters, ON must emit ≥1. It also handles the presence-only trap below for you,
+> via `env -u` on every arm. Figures land in `build/bench_ARGMAX.log` plus
+> per-arm logs; any arm whose *maximum* load1 crossed 2.0 is withheld as
+> `SKIPPED-CONTENDED`. Log the whole tree clean (`build/bench_logs/ARGMAX_*/`).
+>
+> `INTFER_BENCH_TIMING=0` gives counters only (nk/nw/nr + device-side ms) and is
+> the right mode on a busy box, since it deliberately quotes no tok/s.
+
+<details><summary>Raw commands (ungated — the original text)</summary>
+
 ```bash
 # decode, TP=1, greedy (the only path that fires)
 
@@ -76,6 +97,8 @@ env -u INTFER_DEVICE_ARGMAX INTFER_ARGMAX_DBG=1 ./build/examples/intfer_cli/intf
   --tokenizer-py scripts/bpe_tokenize.py --detok-py scripts/bpe_detokenize.py \
   -p "The capital of France is" -n 4 2>&1 | grep -c argmax    # expect 0
 ```
+
+</details>
 
 Note the two conventions coexist in this codebase and only one is right per
 flag: `INTFER_DEVICE_ARGMAX` / `INTFER_ARGMAX_DBG` / `INTFER_ARGMAX_PARTS` /
