@@ -413,15 +413,20 @@ run_state "B-N" 'B_N' 'neither captures nor refuses' \
 # behavioural all the way down. Before case (8) existed this state was
 # unobservable, which is precisely why the case was worth adding.
 MUTATE_FN() {
-  patch_literal "$H" \
+  # NOTE THE PATH: $H is this matrix's default TARGET (bench_quiet_ab.sh), NOT the
+  # batch harness. The first version patched "$H", patch_literal found 0
+  # occurrences and returned 1, and the state scored "MISSED -- mutation fn
+  # failed (STATE fault)" -- correct scoring, wrong file. $H is a per-state
+  # convenience, not a name for "the harness under test".
+  patch_literal "$SB/scripts/bench_reports_batch.sh" \
     '  exit 2
 fi
 echo "RESULT ($BATCH, $(basename "$MODEL") tp=$TP, devices=$NDEV) - NO wall-time claimed:"' \
     '  exit 0   # B_O the refusal still prints, but it no longer fails the run
 fi
 echo "RESULT ($BATCH, $(basename "$MODEL") tp=$TP, devices=$NDEV) - NO wall-time claimed:"' || return 1
-  bash -n "$H" || return 1
-  grep -q 'B_O' "$H"
+  bash -n "$SB/scripts/bench_reports_batch.sh" || return 1
+  grep -q 'B_O' "$SB/scripts/bench_reports_batch.sh"
 }
 run_state "B-O" 'B_O' 'e2e-dead-stub-rc2' \
   "the refusal prints but exits 0 -- invisible to every text property"
