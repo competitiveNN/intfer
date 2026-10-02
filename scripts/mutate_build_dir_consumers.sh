@@ -178,6 +178,38 @@ else
   echo "M-F caught (converse)" >> "$LOG/summary.txt"; caught=$((caught+1))
 fi
 
+# M-G: the COMMENT-ONLY verdict must actually fire. The NOTE branch is dead code
+# on a clean tree -- every offender was fixed the day it was written -- so without
+# a state that plants one, the branch would ship unexercised, which is exactly how
+# a check nobody has ever seen pass becomes a check nobody can trust.
+#
+# The plant is a real untracked script with a build path in a COMMENT and no
+# override anywhere. Two things must hold, and the state checks both:
+#   1. it is reported NOTE ("matched on a COMMENT line only"), NOT FAIL -- the
+#      misleading verdict that cost two full stack runs this session;
+#   2. it is NOT graded "ok -- routes through a documented override", because a
+#      comment naming the override does not honour it. That direction is the
+#      dangerous one: it is a vacuous PASS. A comment-only plant that mentions
+#      INTFER_BUILD_DIR used to produce exactly that.
+total=$((total+1))
+PLANT="$ROOT/scripts/_mutg_comment_only.sh"
+printf '#!/usr/bin/env bash\n# M-G: old default was $ROOT/build/examples, or INTFER_BUILD_DIR=...\necho hi\n' > "$PLANT"
+g_out="$(./scripts/check_build_dir_consumers.sh 2>&1)"
+rm -f "$PLANT"
+if printf '%s\n' "$g_out" | grep -q '_mutg_comment_only.sh *NOTE'; then
+  if printf '%s\n' "$g_out" | grep -q '_mutg_comment_only.sh *ok'; then
+    echo "  M-G MISSED -- reported NOTE and also ok: a comment naming the override was"
+    echo "        graded as honouring it, which is a vacuous PASS"
+    echo "M-G MISSED (vacuous ok)" >> "$LOG/summary.txt"
+  else
+    echo "  M-G caught -- converse: a comment-only consumer is NOTE, never ok or FAIL"
+    echo "M-G caught" >> "$LOG/summary.txt"; caught=$((caught+1))
+  fi
+else
+  echo "  M-G MISSED -- the comment-only verdict did not fire (branch is dead code)"
+  echo "M-G MISSED (NOTE absent)" >> "$LOG/summary.txt"
+fi
+
 restore
 echo
 echo "== summary =="

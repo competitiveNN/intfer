@@ -85,7 +85,7 @@ enum_require_min "consumer-scripts" "$N_CONSUMERS" 1 || {
 }
 
 # ---- classify each consumer -------------------------------------------------
-bad=0; checked=0
+bad=0; checked=0; notes=0
 printf '\n%-34s %-8s %s\n' "script" "verdict" "evidence"
 printf '%-34s %-8s %s\n' "----------------------------------" "--------" "------------------------------"
 for f in $CONSUMERS; do
@@ -103,7 +103,17 @@ for f in $CONSUMERS; do
   # (INTFER_QUANT_REAL_BIN) rather than INTFER_BUILD_DIR. Honoring only one
   # flagged 4 already-correct scripts -- a false alarm teaches people to ignore
   # the check, which is how such a check gets "fixed" by weakening it.
-  honors="$(grep -cE 'INTFER_BUILD_DIR|INTFER_QUANT_REAL_BIN' "$f")"
+  # A COMMENT that names an override does not HONOUR it. Counting comment lines
+  # here produced a vacuous PASS: a script whose only mention of
+  # INTFER_BUILD_DIR sat in prose was graded "ok -- routes through a documented
+  # override", which is the worse direction, because the misleading FAIL I was
+  # fixing became a silently wrong ok. Found by planting the negative direction by
+  # hand rather than by reasoning about it (the AUDIT #19 rule).
+  # `grep -vc` prints 0 AND exits 1 when nothing matches, so `|| true` and NOT
+  # `|| echo 0` -- appending 0 would make the count the two-line string "0\n0"
+  # (AUDIT #14).
+  honors="$(grep -nE 'INTFER_BUILD_DIR|INTFER_QUANT_REAL_BIN' "$f" 2>/dev/null \
+            | grep -vcE ':[[:space:]]*#' || true)"
   # Root-relative build paths the override cannot reach. A line that READS an
   # override is the correct default-form and is excluded. Comment/PROSE lines
   # are not paths the script resolves (this very script quotes $ROOT/build in
@@ -112,6 +122,22 @@ for f in $CONSUMERS; do
   hard="$(grep -nE '(\$ROOT/build|\$\{ROOT\}/build)' "$f" \
           | grep -vE 'INTFER_BUILD_DIR|INTFER_QUANT_REAL_BIN' \
           | grep -vE ':[[:space:]]*#' | grep -v 'MUTANT payload' | wc -l)"
+  # Population match vs CODE match. A script whose ONLY match is a COMMENT is not a
+  # consumer: it resolves no path at run time. Without this distinction it fell
+  # through to "references a build tree, honors NO override", which is what
+  # happened TWICE this session, both times on documentation that spelled out a
+  # build path -- once in a usage comment, once in the note recording this very
+  # criterion split. The verdict was true-ish and completely misleading, and the
+  # obvious "fix" (add a fake INTFER_BUILD_DIR reference) would have satisfied it
+  # while fixing nothing.
+  cmt="$(grep -nE '(\$ROOT/build|\$\{ROOT\}/build|build/|INTFER_BUILD_DIR)' "$f" 2>/dev/null \
+         | grep -cE ':[[:space:]]*#' || true)"
+  if [ "$honors" -eq 0 ] && [ "$hard" -eq 0 ] && [ "$cmt" -gt 0 ]; then
+    notes=$((notes+1))
+    printf '%-34s %-8s %s\n' "$b" "NOTE" \
+      "matched on a COMMENT line only ($cmt) -- not a real consumer"
+    continue
+  fi
   checked=$((checked+1))
   if [ "$honors" -gt 0 ] && [ "$hard" -eq 0 ]; then
     printf '%-34s %-8s %s\n' "$b" "ok" "routes through a documented override"
