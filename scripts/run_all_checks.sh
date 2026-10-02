@@ -470,6 +470,17 @@ if [ -n "$UNDISPATCHED" ]; then
   echo "        would never run them and would still report PASS. Add a dispatch()" >&2
   echo "        arm (and a STEPS entry)." >&2
   FAILED=$((FAILED + 1))
+elif [ "$N_DISPATCHABLE" -eq 0 ]; then
+  # *** MEASURED, and it is AUDIT #20 one level up. *** The sandbox run behind state
+  # N-P held only run_all_checks.sh in its scripts/, so this glob matched NOTHING
+  # and the section printed "0 check_*/mutate_* script(s), all dispatched" -- a
+  # green verdict over an empty census. The arm-list extraction above is guarded by
+  # enum_require_nonempty; the PER-SCRIPT harvest was not, so the guard covered the
+  # QUERY and not the population the query is about.
+  echo "  FAIL  no check_*/mutate_* files were found in $SCRIPT_DIR -- coverage is" >&2
+  echo "         UNKNOWN, not complete. 'All dispatched' over an empty set is not" >&2
+  echo "         a result." >&2
+  FAILED=$((FAILED + 1))
 else
   echo "  ok    $N_DISPATCHABLE check_*/mutate_* script(s), all dispatched"
 fi
@@ -509,9 +520,11 @@ if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
 else
   echo "== 0c every check_*/mutate_* is SCHEDULED (an arm alone never runs) =="
   UNSCHEDULED=""
+  N_SCHEDULABLE=0
   for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
     [ -f "$f" ] || continue
     b="$(basename "$f")"
+    N_SCHEDULABLE=$((N_SCHEDULABLE + 1))
     case " $STEPS " in
       *" $b "*) ;;
       # run_ten_gates.sh is a COMPOSITE step, not a check_ or mutate_ file, so it
@@ -525,8 +538,38 @@ else
     echo "         iterates STEPS. Their stamps will read STALE at step 3/3, which" >&2
     echo "         looks like missing evidence and is not." >&2
     FAILED=$((FAILED + 1))
+  elif [ "$N_SCHEDULABLE" -eq 0 ]; then
+    # The same empty-census trap as 0b, in this section: "every script is
+    # scheduled" over ZERO scripts is a tautology, not a result.
+    echo "  FAIL  no check_*/mutate_* files were found in $SCRIPT_DIR -- 'every" >&2
+    echo "         one is scheduled' over an empty set proves nothing." >&2
+    FAILED=$((FAILED + 1))
   else
     echo "  ok    every check_*/mutate_* is in STEPS as well as dispatch()"
+  fi
+  # *** 0c DOES NOT DETECT A DUPLICATE, AND THAT IS A RECORDED LIMITATION, NOT AN
+  # OMISSION. *** It answers "is it scheduled", not "is it scheduled twice".
+  # Measured on this very session: a checker was added to BOTH STEPS lines, so
+  # every full stack ran it twice -- idempotent, but double the wall time and a
+  # duplicated step line -- and 0c stayed green, which is correct for the question
+  # it was built to answer (a matrix that NEVER RAN). Deleting the duplicate was
+  # the right fix; making this section reject duplicates would be scope creep on
+  # the section that exists because a step was silently unscheduled. So a
+  # duplicate is reported as a NOTE that names the file and the count, without
+  # failing.
+  # *** CONVERSION TRIGGER: promote the NOTE to a FAIL the moment any step becomes
+  # NON-IDEMPOTENT -- one that stamps, writes, takes the lock, or mutates source.
+  # Then running it twice stops being cosmetic and becomes a wrong verdict.
+  DUPED=""
+  for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
+    [ -f "$f" ] || continue
+    b="$(basename "$f")"
+    n="$(printf '%s' "$STEPS" | tr ' ' '\n' | grep -cxF -- "$b" || true)"
+    [ "${n:-0}" -gt 1 ] && DUPED="$DUPED $b(x${n})"
+  done
+  if [ -n "$DUPED" ]; then
+    echo "  NOTE  scheduled MORE THAN ONCE -- harmless only while every step is"
+    echo "        idempotent (conversion trigger in the source):$DUPED"
   fi
   # A fast, honest seam for testing 0c itself: run the coverage sections and
   # stop. Without it, proving 0c can fail costs a 45-minute stack.

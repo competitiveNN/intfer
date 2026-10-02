@@ -169,6 +169,15 @@ cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"
 for sib in _gate_enum.sh _gate_precond.sh; do
   [ -e "$SCRIPT_DIR/$sib" ] && cp "$SCRIPT_DIR/$sib" "$SB/scripts/$sib"
 done
+# *** THE SANDBOX NEEDS A POPULATION FOR 0b/0c TO GRADE. *** Measured: the sandbox
+# held only run_all_checks.sh and two sourced helpers, so `$SCRIPT_DIR/check_*.sh`
+# matched NOTHING and both coverage sections printed their green line over an empty
+# set -- "0 check_*/mutate_* script(s), all dispatched". That is the AUDIT #20
+# vacuous-harvest class inside the harness that certifies every other checker, and
+# it surfaced only because state N-P needed the population to exist. Every real
+# check_*/mutate_* is copied in (they are never EXECUTED here -- section 0 stops
+# the run), and committed, so the residue diff stays quiet.
+cp "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh "$SB/scripts/" 2>/dev/null || true
 git init -q "$SB" || { echo "FAIL: could not init sandbox repo $SB" >&2; exit 1; }
 git -C "$SB" -c user.email=m@x -c user.name=matrix add -A >/dev/null 2>&1
 git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m sandbox >/dev/null 2>&1
