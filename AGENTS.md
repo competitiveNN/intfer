@@ -2858,6 +2858,46 @@ e.g. S3's contract column is 40 not 42).
     found it in one pass. **This is the repo's own rule paying out**: `bash -n` on
     every edited script is not optional, and a script that was clean at HEAD and
     dirty after an edit means the edit, not the repo.
+  - **0c NOW HAS A COMMITTED NON-VACUITY STATE (N-P), not a transcript.** Its only
+    evidence was `build/0c_nv_proof.log`, i.e. the AUDIT #17/#19 class this file
+    keeps citing. State N-P drops ONE STEPS entry while **keeping the dispatch arm
+    — asserted, not assumed**, because without that assertion it would be N-J again
+    (a missing arm) and would prove nothing about scheduling. It needs its own
+    runner: `run_rac` always sets `INTFER_RUN_ALL_STEPS`, which is exactly the
+    variable that makes 0c SKIP, so the state drives the mutant with
+    `INTFER_RUN_ALL_COVERAGE_ONLY=1` and no override — seconds, not 45 minutes.
+    `mutate_run_all_checks.sh` is **13/13 with 13 correct baselines**.
+  - *** AND THAT STATE FOUND A VACUOUS GREEN IN THE HARNESS ITSELF. *** Its
+    sandbox holds only `run_all_checks.sh`, so the `check_*.sh` glob matched
+    **nothing** and both coverage sections printed their green line over an empty
+    census: `ok 0 check_*/mutate_* script(s), all dispatched`. That is AUDIT #20
+    inside the harness that certifies every other checker, and it survived because
+    `enum_require_nonempty` guarded the **arm-list query** while the **per-script
+    harvest** was unguarded — the guard covered the query and not the population the
+    query is about. Both sections now refuse an empty census; the sandbox carries
+    the real `scripts/`.
+  - **0c'S BLIND SPOT IS A RECORDED DECISION WITH A TRIGGER, at the call site.**
+    0c answers "is it scheduled", not "is it scheduled twice". A duplicate is a
+    **NOTE naming the file and the count**, not a FAIL: this section exists because
+    a step NEVER RAN, and rejecting duplicates there would be scope creep. **Trigger
+    for promoting it to a FAIL: the moment any step becomes NON-IDEMPOTENT — one
+    that stamps, writes, takes the lock, or mutates source.** Then twice is a wrong
+    verdict rather than cosmetic.
+  - **THE THREE COUNTS TRAVEL IN THE CERTIFICATE, BECAUSE QUOTING THEM IS HOW THEY
+    GO STALE.** A summary here said "14 checkers, 18 matrices" while 0b derived
+    **31** (= 14 + 17) and step 3/3 counted **18 stamp FILES** — a fourth
+    quantity, because `device_precond_matrix` writes TWO stamp files into ONE
+    directory. No number was wrong; three numbers with three meanings were quoted
+    instead of derived. `build/stack_cert/cert` now carries `scripts=`, `checks=`,
+    `matrices=`, `stamp_dirs=` beside `stamps=`, so the census is read from one
+    artifact. **Do not transcribe these into prose — read the certificate.**
+  - **430 MB OF /tmp LITTER, AND THE MECHANISM BEHIND IT.** 461 of 470
+    `/tmp/intfer_*` sandboxes were created by this session. Every owning script has
+    `trap … EXIT`, so the cause is not a forgotten trap: **an EXIT trap does not
+    run when the shell is killed by an untrapped signal**, and the matrices are
+    wrapped in `timeout`, which sends SIGTERM. Sixteen scripts now trap
+    `EXIT INT TERM`, proven by `timeout -s TERM` (the temp dir survives with EXIT
+    only, and does not with the new form).
 
 - **THE STANDING BLOCKER ON 27B WALL-TIME — *SUPERSEDED 2026-10-02, READ THE ENTRY
       BELOW; THIS TEXT IS THE RECORD OF A PROCESS THAT NO LONGER EXISTS*.**
