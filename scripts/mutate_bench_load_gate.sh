@@ -46,6 +46,13 @@ mkdir -p "$SB/scripts" "$LOG"
 # it to be wrong.
 : > "$LOG/summary.txt"
 cp "$SCRIPT_DIR"/*.sh "$SB/scripts/"          # copies, NOT symlinks -- see header
+# *** .py TOO, SINCE THE SUMMARY MOVED OUT OF THE HARNESS. *** The sandbox mirrored
+# only `*.sh`, so when the summary became scripts/_bench_summary.py -- a real file,
+# precisely so the failed-arm guard could be driven against fixtures with no GPU --
+# the sandbox checker reported "summary missing" and would have failed the BASELINE
+# and every state for a reason unrelated to any mutation. A sandbox that does not
+# contain the files under test tests nothing.
+( shopt -s nullglob; cp "$SCRIPT_DIR"/*.py "$SB/scripts/" )
 TGT="$SB/scripts/check_bench_load_gate.sh"
 ORIG_T="$SB/.orig_target"
 ORIG_H="$SB/.orig_helper"
@@ -267,6 +274,23 @@ else' \
 }
 run_state "B-I" 'B_I' 'GATE-BEFORE-ARM' \
   "the harness consults the load verdict before running its arm"
+
+# B-J: THE FAILED-ARM GUARD IS REMOVED FROM THE SUMMARY. *** AN ARTIFACT-DEFECT
+# STATE, NOT A CHECKER-WEAKENING ONE. *** The summary is correct by construction
+# once written, so weakening the checker that tests it is UNOBSERVABLE -- which is
+# AUDIT #21's wasted 0/4 attempt, and its rule: mutate the ARTIFACT and require the
+# checker to REJECT it. The patch drops the clause that treats a record with no
+# bucket data as a failure, so the OLD log shape (`BUCKETS=""`, no FAILED tag --
+# exactly what the lost E2 batch left on disk) summarises cleanly again and the
+# batch reports itself as a completed measurement.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/_bench_summary.py" \
+    '    if r.get("FAILED") or not (r.get("BUCKETS") or "").strip():' \
+    '    if r.get("FAILED"):   # B_J untagged dead records are no longer diagnosed' || return 1
+  grep -q 'B_J' "$SB/scripts/_bench_summary.py"
+}
+run_state "B-J" 'B_J' 'summary-dead-rc3' \
+  "a batch whose arms produced no data is summarised as a result again"
 
 restore
 echo

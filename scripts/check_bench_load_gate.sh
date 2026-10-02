@@ -264,13 +264,127 @@ for f in $POP; do
   fi
 done
 
+# ---- (7) BEHAVIOURAL: an arm that produced NO data is a FAILED record ---------
+# *** MEASURED DEFECT, 2026-10-02, DURING THE E2 BATCH. *** Two E2 arms died with
+# `UR_RESULT_ERROR_DEVICE_LOST`, so the CLI emitted no `[GPU profile @decode]` line
+# at all. The harness recorded each of them as an ordinary row with `BUCKETS=""`,
+# printed a summary full of dashes, and **exited 0**. A batch whose arms all died
+# therefore reported itself as a completed measurement -- the AUDIT #20
+# vacuous-green class one level above the checkers: absence of data written down
+# as data. The load gate could never have caught it, because the gate withholds a
+# figure it HAS; it has no opinion on a figure that was never produced.
+#
+# This runs scripts/_bench_summary.py (extracted from the harness precisely so it
+# is drivable without a GPU) against fixtures in BOTH directions. The converse is
+# not optional: a guard that fires on everything would satisfy a one-case test and
+# make every healthy batch look broken.
+SUM="$SCRIPT_DIR/_bench_summary.py"
+FIX="$TDIR"
+rec() { # $1=path $2=arm $3=round $4=kernel-ms ("" = the arm produced nothing)
+  if [ -z "$4" ]; then
+    printf 'ARM=%s ROUND=%s TPS=SKIPPED-CONTENDED LOAD1=3.10 BUCKETS=""\n' "$2" "$3" >> "$1"
+  else
+    printf 'ARM=%s ROUND=%s TPS=SKIPPED-CONTENDED LOAD1=3.10 BUCKETS="@decode] kernel=%sms submit=700.0ms waitblock=900.0ms copy=10.0ms readback=300.0ms usm_write=300.0ms nk=1000 nw=900 nr=90"\n' \
+      "$2" "$3" "$4" >> "$1"
+  fi
+}
+if [ ! -f "$SUM" ]; then
+  echo "  FAIL  $SUM is missing -- the summary cannot be tested, so it is unchecked"
+  bad=$((bad + 1))
+else
+  # Round-major interleaved, both arms in ONE log -- the shape the harness writes.
+  # (The first version of this fixture put each arm in its OWN file and pointed the
+  # summary at one of them, so the second arm had no records at all and the
+  # healthy direction failed for a reason that had nothing to do with the summary.)
+  : > "$FIX/ok.log"
+  rec "$FIX/ok.log" BASE 1 1800.0; rec "$FIX/ok.log" VAR 1 1700.0
+  rec "$FIX/ok.log" BASE 2 1801.0; rec "$FIX/ok.log" VAR 2 1701.0
+  rec "$FIX/ok.log" BASE 3 1802.0; rec "$FIX/ok.log" VAR 3 1702.0
+  python3 "$SUM" "$FIX/ok.log" "BASE VAR" BASE > "$FIX/ok.out" 2>&1
+  rc_ok=$?
+  # The converse: a healthy 3-round pair must print normally and stay silent.
+  if pred_expect_present "summary-healthy-rc0" "$rc_ok" '^0$' \
+     && pred_expect_absent "summary-healthy-notamarker" \
+          "$(grep -c 'NOT A RESULT' "$FIX/ok.out" || true)" '^[1-9]' \
+     && pred_expect_present "summary-healthy-delta" \
+          "$(grep -c 'rounds 1,2,3' "$FIX/ok.out" || true)" '^[1-9]'; then
+    echo "  ok    converse: a healthy 3-round batch prints a delta and stays quiet"
+  else
+    echo "  FAIL  the healthy direction is wrong (rc=$rc_ok). An always-red summary"
+    echo "        would make this whole section prove nothing. Got:"
+    sed 's/^/          /' "$FIX/ok.out"
+    bad=$((bad + 1))
+  fi
+
+  # The firing direction: ONE arm of two lost every round, written in the OLD log
+  # shape (`BUCKETS=""` with no FAILED tag) because that is exactly what is
+  # already on disk from the lost E2 batch.
+  : > "$FIX/dead.log"
+  rec "$FIX/dead.log" BASE 1 ""; rec "$FIX/dead.log" VAR 1 ""
+  python3 "$SUM" "$FIX/dead.log" "BASE VAR" BASE > "$FIX/dead.out" 2>&1
+  rc_dead=$?
+  if pred_expect_present "summary-dead-rc3" "$rc_dead" '^3$' \
+     && pred_expect_present "summary-dead-marker" \
+          "$(grep -c 'THIS BATCH IS NOT A RESULT' "$FIX/dead.out" || true)" '^[1-9]' \
+     && pred_expect_present "summary-dead-names-arm" \
+          "$(grep -c 'VAR r1: no_bucket_data_in_record' "$FIX/dead.out" || true)" '^[1-9]'; then
+    echo "  ok    behavioural: a batch whose arms produced no data is REFUSED (rc=3)"
+  else
+    echo "  FAIL  a batch with a dead arm summarised cleanly (rc=$rc_dead). That is"
+    echo "        the E2 defect: absence of data reported as a result. Got:"
+    sed 's/^/          /' "$FIX/dead.out"
+    bad=$((bad + 1))
+  fi
+
+  # And a PARTIAL death: VAR loses round 2 only. The delta must be computed over
+  # the rounds BOTH arms have, paired by round identity, and the batch still
+  # refused. Positional pairing would silently compare VAR's round 3 against
+  # BASE's round 2.
+  : > "$FIX/partial.log"
+  rec "$FIX/partial.log" BASE 1 1800.0; rec "$FIX/partial.log" VAR 1 1700.0
+  rec "$FIX/partial.log" BASE 2 1801.0; rec "$FIX/partial.log" VAR 2 ""
+  rec "$FIX/partial.log" BASE 3 1802.0; rec "$FIX/partial.log" VAR 3 1702.0
+  python3 "$SUM" "$FIX/partial.log" "BASE VAR" BASE > "$FIX/partial.out" 2>&1
+  rc_part=$?
+  if pred_expect_present "summary-partial-rc3" "$rc_part" '^3$' \
+     && pred_expect_present "summary-partial-pairs-by-round" \
+          "$(grep -c 'd=-100.0 -100.0 (rounds 1,3)' "$FIX/partial.out" || true)" '^[1-9]'; then
+    echo "  ok    behavioural: a half-dead arm is paired by ROUND (1,3) and refused"
+  else
+    echo "  FAIL  partial-death handling is wrong (rc=$rc_part). Positional pairing"
+    echo "        would compare VAR round 3 against BASE round 2. Got:"
+    sed 's/^/          /' "$FIX/partial.out"
+    bad=$((bad + 1))
+  fi
+
+  # And the harness side: a harness that writes MACHINE-READABLE per-arm records
+  # must refuse a batch that lost an arm. Scoped by DERIVATION, not by name: only
+  # a harness that writes `ARM=` records can accumulate absence-of-data into a
+  # summary, and asserting the refusal of all seven harnesses would have produced
+  # six false alarms on a healthy tree -- a check that cries wolf is the mirror
+  # defect (AUDIT #15), and it would have trained everyone to ignore this line.
+  for f in $POP; do
+    strip_comments "$f" | grep -q 'ARM=' || continue
+    if strip_comments "$f" | grep -q 'finish_batch'; then
+      printf '  %-4s %-34s %s\n' "ok" "$(basename "$f")" "refuses a batch that lost an arm"
+    else
+      printf '  %-4s %-34s %s\n' "FAIL" "$(basename "$f")" \
+        "writes ARM= records but never refuses a lost arm"
+      bad=$((bad + 1))
+    fi
+  done
+fi
+
 echo
 if [ "$bad" -eq 0 ]; then
   echo "BENCH LOAD-GATE CHECK: PASS ($n_pop harness(es), one shared home, no bare"
-  echo "  throughput field, and the maximum-over-arm criterion proven in both directions)"
-  echo "RESULT: every wall-time harness logs its arms and withholds contended figures"
+  echo "  throughput field, the maximum-over-arm criterion proven in both directions,"
+  echo "  and a batch that lost an arm refused)"
+  echo "RESULT: every wall-time harness logs its arms, withholds contended figures,"
+  echo "RESULT: and refuses to certify a batch whose arms produced no data"
   exit 0
 fi
 echo "BENCH LOAD-GATE CHECK: FAIL ($bad property/properties drifted)"
-echo "RESULT: a wall-time harness can publish a figure without a load gate or a log"
+echo "RESULT: a wall-time harness can publish a figure without a load gate or a log,"
+echo "RESULT: or can summarise a batch whose arms produced no data"
 exit 1

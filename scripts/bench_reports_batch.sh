@@ -206,6 +206,63 @@ run_arm() {  # $1=arm $2=ntok [$3=log label]  -> stdout = raw CLI output
 
 load1() { awk '{print $1}' /proc/loadavg; }
 
+# ------------------------------------------------- a FAILED ARM IS NOT A DATA ROW
+# *** MEASURED, 2026-10-02, DURING THE E2 BATCH. *** The E2 arms died with
+# `UR_RESULT_ERROR_DEVICE_LOST` / `FATAL: signal 6`, so the CLI printed **no
+# `[GPU profile @decode]` line at all** -- and the harness recorded each of those
+# arms as a perfectly ordinary row with `BUCKETS=""`, then printed a summary and
+# exited **0**. That is the AUDIT #20 vacuous-green class one level above the
+# checkers: a harvest that returned nothing was written down as if it had
+# returned something, and the batch reported "done" for a batch where **nothing
+# was measured**. The identity gate did not catch it either, because the
+# identity phase runs 8 tokens and *did* succeed -- the device was lost later.
+#
+# So a missing bucket line is now a FIRST-CLASS outcome:
+#   * the record carries `FAILED=<signature>` (spaces folded to `_`, because the
+#     log format is whitespace-separated and a value containing one would make the
+#     summariser's `kv.split("=", 1)` raise);
+#   * it is counted and echoed loudly at the moment it happens;
+#   * the batch ends rc=2 and says the batch is NOT A RESULT.
+#
+# *** rc=2, NOT rc=1, AND NOT rc=0. *** rc=0 would certify coverage nobody got;
+# rc=1 would be indistinguishable from a code regression. And the harness
+# deliberately does **not** diagnose the signature: `UR_RESULT_ERROR_DEVICE_LOST`
+# is box state, but asserting that from a log line is the AUDIT #9/#11 mistake
+# (a plausible mechanism recorded as a verified one). It prints the signature
+# verbatim and points at the runbook instead.
+ARM_FAILS=0
+FAILED_ARMS=""
+FAILED_SIGS=""
+ARM_LINE=""
+ARM_SIG=""
+note_arm() { # $1=arm $2=round-label $3=raw arm output -> sets ARM_LINE / ARM_SIG
+  ARM_LINE="$(printf '%s\n' "$3" | grep -aoE '@decode\] .*' | head -1)"
+  ARM_SIG=""
+  [ -n "$ARM_LINE" ] && return 0
+  ARM_SIG="$(printf '%s\n' "$3" \
+    | grep -aoE 'UR_RESULT_ERROR_[A-Z_]+|terminate called|signal [0-9]+|out of memory|std::[a-z_]+_error' \
+    | head -2 | tr ' \n' '__')"
+  [ -n "$ARM_SIG" ] || ARM_SIG="no_@decode_line_in_arm_output"
+  ARM_FAILS=$((ARM_FAILS + 1))
+  case " $FAILED_ARMS " in *" $1 "*) ;; *) FAILED_ARMS="$FAILED_ARMS $1" ;; esac
+  FAILED_SIGS="$FAILED_SIGS
+  $1/$2: $ARM_SIG"
+}
+
+finish_batch() { # refuse to certify a batch that lost an arm
+  [ "$ARM_FAILS" -gt 0 ] || return 0
+  echo
+  echo "RESULT: $ARM_FAILS arm run(s) produced NO measurement at all, so this batch is"
+  echo "RESULT: NOT A RESULT and its summary above is not evidence. Arms:$FAILED_ARMS"
+  printf '%s\n' "$FAILED_SIGS" | sed 's/^/RESULT:   /'
+  echo "RESULT: Do NOT diagnose from that signature. A driver error such as"
+  echo "RESULT: UR_RESULT_ERROR_DEVICE_LOST is BOX STATE, not a code regression:"
+  echo "RESULT:   scripts/gpu_recover.sh diag          (read-only, no root)"
+  echo "RESULT:   sudo scripts/gpu_recover.sh rebind   (the remedy that worked before)"
+  echo "RESULT:   scripts/gpu_recover.sh verify        (0 = 2 devices, 1 = still 1)"
+  exit 2
+}
+
 # ---------------------------------------------------------------- 2. identity
 echo; echo "== STREAM IDENTITY (before any timing) =="
 declare -A IDS
@@ -262,10 +319,16 @@ if [ "${INTFER_BENCH_TIMING:-1}" != "1" ]; then
   : > "$CNTLOG"
   for arm in $ARMS; do
     run_arm_capture "$arm" 64 "cnt_${arm}"; out="$ARM_OUT"
-    line="$(printf '%s\n' "$out" | grep -aoE '@decode\] .*' | head -1)"
-    printf 'ARM=%s TPS=%s LOAD1=%s BUCKETS="%s"\n' \
-      "$arm" "$(loadlog_tps_field '')" "$_LL_MAX" "$line" >> "$CNTLOG"
-    echo "  $arm  $line"
+    note_arm "$arm" "counters" "$out"; line="$ARM_LINE"
+    if [ -n "$ARM_SIG" ]; then
+      printf 'ARM=%s TPS=NOT-A-RESULT LOAD1=%s BUCKETS="" FAILED=%s\n' \
+        "$arm" "$_LL_MAX" "$ARM_SIG" >> "$CNTLOG"
+      echo "  !! $arm produced NO measurement: $ARM_SIG"
+    else
+      printf 'ARM=%s TPS=%s LOAD1=%s BUCKETS="%s"\n' \
+        "$arm" "$(loadlog_tps_field '')" "$_LL_MAX" "$line" >> "$CNTLOG"
+      echo "  $arm  $line"
+    fi
   done
   LOG="$CNTLOG"
 else
@@ -306,7 +369,13 @@ for r in $(seq 1 "$ROUNDS"); do
     # machine-readable record that a human then pasted into a report.
     run_arm_capture "$arm" 64 "t${r}_${arm}"; out="$ARM_OUT"
     tps="$(printf '%s\n' "$out" | grep -aoE '\([0-9.]+ tok/s\)' | head -1 | tr -d '() tok/s')"
-    line="$(printf '%s\n' "$out" | grep -aoE '@decode\] .*' | head -1)"
+    note_arm "$arm" "r$r" "$out"; line="$ARM_LINE"
+    if [ -n "$ARM_SIG" ]; then
+      printf 'ARM=%s ROUND=%s TPS=NOT-A-RESULT LOAD1=%s BUCKETS="" FAILED=%s\n' \
+        "$arm" "$r" "$_LL_MAX" "$ARM_SIG" >> "$LOG"
+      echo "  !! r$r $arm produced NO measurement: $ARM_SIG"
+      continue
+    fi
     printf 'ARM=%s ROUND=%s TPS=%s LOAD1=%s BUCKETS="%s"\n' \
       "$arm" "$r" "$(loadlog_tps_field "${tps:-NA}")" "$_LL_MAX" "$line" >> "$LOG"
     echo "  r$r $arm  max_load1=$_LL_MAX  $(loadlog_tps_field "${tps:-NA} tok/s")"
@@ -343,146 +412,16 @@ echo "   kernel + nk/nw/nr : DEVICE-side or exact -- may be believed."
 echo "   submit/waitblock/copy/readback/usm_write : HOST wall clock, NOT"
 echo "   load-insensitive. On a contended box they track the load and cannot"
 echo "   decide a verdict. Shown as medians only, for completeness."
-python3 - "$LOG" "$ARMS" "$REF_ARM" <<'PY'
-import re, sys, statistics
-log, arms, ref = sys.argv[1], sys.argv[2].split(), sys.argv[3]
-recs = []
-for line in open(log, errors="replace"):
-    if not line.startswith("ARM="):
-        continue
-    d = dict(kv.split("=", 1) for kv in line.split())
-    # BUCKETS carries the whole bucket line, which CONTAINS SPACES. Whitespace
-    # splitting truncated it at the first space, so BUCKETS became "@decode]" and
-    # every nk/nw/nr/kernel column in the summary printed "-" for every batch --
-    # i.e. the device-side columns, the entire point of counters-only mode, were
-    # structurally incapable of populating. Quoted at the writer, extracted by
-    # regex here.
-    m = re.search(r'BUCKETS="([^"]*)"', line)
-    if m:
-        d["BUCKETS"] = m.group(1)
-    recs.append(d)
-
-P = {"kernel": r"\bkernel=([\d.]+)ms",
-     "submit": r"\bsubmit=([\d.]+)ms",
-     "waitblock": r"\bwaitblock=([\d.]+)ms",
-     "copy": r"\bcopy=([\d.]+)ms",
-     "readback": r"\breadback=([\d.]+)ms",
-     "usm_write": r"\busm_write=([\d.]+)ms",
-     "nk": r"\bnk=(\d+)", "nw": r"\bnw=(\d+)", "nr": r"\bnr=(\d+)"}
-
-
-def series(arm, key):
-    """Per-round values, in file order. Per-round, not median: the spread is the
-    quantity that decides whether a delta is a result at all."""
-    out = []
-    for r in recs:
-        if r.get("ARM") != arm:
-            continue
-        m = re.search(P[key], r.get("BUCKETS", "") or "")
-        if m:
-            out.append(float(m.group(1)))
-    return out
-
-
-def med(v):
-    return statistics.median(v) if v else None
-
-
-def num(v):
-    return ("%.1f" % v) if v is not None else "-"
-
-
-def cnt(v):
-    # nk/nw/nr are exact integer counters; printing them as "63488.0" implies a
-    # measurement precision they do not have, which is the same overclaim as the
-    # 6-decimal millisecond table this replaced.
-    return ("%d" % v) if v is not None else "-"
-
-
-def spr(v):
-    return (max(v) - min(v)) if len(v) > 1 else 0.0
-
-
-for a in arms:
-    rs = [r for r in recs if r.get("ARM") == a]
-    if not rs:
-        print("%-9s (no data)" % a)
-        continue
-    tps = []
-    for r in rs:
-        try:
-            tps.append(float(r["TPS"]))
-        except (ValueError, KeyError):
-            pass
-    if tps:
-        held = len(rs) - len(tps)
-        # AUDIT #23: say how many rounds were withheld. A median over the
-        # surviving rounds, printed without this, reads exactly like a median
-        # over all of them -- and "never the best one" is this repo's rule for a
-        # reason. A partial withholding must be visible in the table.
-        extra = ""
-        if held:
-            extra = "   [%d/%d round(s) WITHHELD: box contended]" % (held, len(rs))
-        print("%-9s tok/s %s  median=%6.2f%s" %
-              (a, "  ".join("%6.2f" % t for t in tps), statistics.median(tps), extra))
-    else:
-        print("%-9s (wall-time withheld: box contended, %d/%d rounds)" % (a, len(rs), len(rs)))
-    print("          exact  : nk=%s nw=%s nr=%s" %
-          tuple(cnt(med(series(a, k))) for k in ("nk", "nw", "nr")))
-    k = series(a, "kernel")
-    if k:
-        pct = (100.0 * spr(k) / med(k)) if med(k) else 0.0
-        print("          kernel : %s ms   median=%s  spread=%s (%.1f%%)" %
-              (" ".join("%.1f" % x for x in k), num(med(k)), num(spr(k)), pct))
-    print("          host   : %s   (NOT load-insensitive)" %
-          " ".join("%s=%s" % (b, num(med(series(a, b)))) for b in
-                   ("submit", "waitblock", "copy", "readback", "usm_write")))
-
-# ---- the delta table: does the effect clear the run-to-run spread?
-rk = series(ref, "kernel")
-rounds = max([len(series(a, "kernel")) for a in arms] or [0])
-print()
-if rounds < 2:
-    print("== kernel delta vs %s : SINGLE ROUND per arm, no spread estimate ==" % ref)
-    print("   A one-shot delta cannot be separated from run-to-run noise. Report the")
-    print("   value as a single shot, never as a measured cost or saving.")
-else:
-    print("== kernel delta vs %s, PER ROUND (median delta inside the spread is NOT a result) ==" % ref)
-    print("   noise floor per row = max(spread of the two arms being compared), i.e.")
-    print("   the same arm+flags re-measured. Spread is the ONLY available noise")
-    print("   estimate, so it bounds what can be claimed, it does not prove noise.")
-    print("   *** AND THE SPREAD IS A PROPERTY OF THIS RUN, NOT OF THE ARM. ***")
-    print("   Measured 2026-10-02, same model/shape/rounds: BASE spread 1875.5 ms in")
-    print("   the E1 run and 64.5 ms in the E3 run -- an order of magnitude apart.")
-    print("   So 'CLEARS the spread' means 'clears the noise actually observed here'.")
-    print("   Quote it with the run's spreads, never as the arm's noise.")
-for a in arms:
-    if a == ref:
-        continue
-    ak = series(a, "kernel")
-    n = min(len(ak), len(rk))
-    if not n:
-        print("   %-9s (no paired rounds)" % a)
-        continue
-    ds = [ak[i] - rk[i] for i in range(n)]
-    md = statistics.median(ds)
-    noise = max(spr(ak), spr(rk))
-    if rounds < 2:
-        v = "single shot -- not a result"
-    elif abs(md) > noise:
-        agree = all([(d > 0) == (md > 0) for d in ds])
-        v = ("CLEARS the spread: report %+.1f ms (%+.2f%%); every round agrees in sign: %s"
-             % (md, 100.0 * md / statistics.median(rk), "yes" if agree else "NO -- a single"
-                " outlier round is carrying it, so treat it as unresolved"))
-    else:
-        v = ("INSIDE the spread (|%.1f| <= %.1f): NOT a result. Signs across rounds: %s"
-             % (abs(md), noise, "".join("+" if d > 0 else "-" for d in ds)))
-    print("   %-9s d=%s  median=%+.1f ms  -> %s" %
-          (a, " ".join("%+.1f" % d for d in ds), md, v))
-if recs:
-    print("\n(n=%d runs, load1 at each run is in %s)" % (len(recs), log))
-PY
+# The summary lives in scripts/_bench_summary.py, NOT in a heredoc, so it can be
+# driven against fixtures without a GPU -- see that file's docstring. Extracting
+# it is what made the failed-arm defect below testable at all.
+python3 "$SCRIPT_DIR/_bench_summary.py" "$LOG" "$ARMS" "$REF_ARM"
 echo
+# Refuse to certify a batch that lost an arm -- checked LAST so the summary above
+# is still printed (it is diagnostic) but the exit code cannot read as success.
+finish_batch
 echo "RESULT ($BATCH, $(basename "$MODEL") tp=$TP, devices=$NDEV) - NO wall-time claimed:"
 echo "RESULT:"
 fi
+# Same refusal on the counters-only path, which has no summary block of its own.
+[ "${INTFER_BENCH_TIMING:-1}" = "1" ] || finish_batch
