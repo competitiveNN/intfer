@@ -177,6 +177,15 @@ dispatch() { # $1 = label -> runs it
       # the maximum-over-arm criterion proven BEHAVIOURALLY in both directions.
       # Read-only, no GPU, no build.
       timeout 600 bash "$SCRIPT_DIR/check_bench_load_gate.sh"; return $? ;;
+    check_engine_cert.sh)
+      # AUDIT #24. run_all_checks certifies the TOOLING; scripts/run_ten_gates.sh
+      # certifies the ENGINE. This is what stops the two being reconciled by
+      # hand -- it mechanises the "nothing the gates read has changed" argument,
+      # so a 45-minute engine certification is not silently carried over an
+      # engine edit, nor needlessly invalidated by a docs-only one.
+      # Read-only, no GPU, no build. rc=2 (no artifact) is UNPROVEN, not a
+      # regression, and the 2b re-run path handles it.
+      timeout 300 bash "$SCRIPT_DIR/check_engine_cert.sh"; return $? ;;
     check_checker_matrix_coverage.sh)
       # Derives "every checker has a dispatched matrix" from scripts/ rather than
       # trusting a hand-written total. Wired, and its own matrix is
@@ -439,11 +448,11 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_checker_matrix_coverage.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh"
 fi
 echo "== 1/2 checkers =="
 for label in $STEPS; do step "$label"; done
