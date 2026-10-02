@@ -541,6 +541,16 @@ adding PREQ, though PREQ adds +30720 more launches for less benefit (see E1).
 > So "−2.05 %, clears the spread" means "−2.05 %, clearing the noise this run
 > actually showed". Quote the two spreads alongside the delta; do not cache one.
 
+> **RE-DERIVED 2026-10-02 with the AUDIT #28-fixed summariser, not assumed.** The
+> whole table above was regenerated from `build/bench_E3.log` after the delta
+> verdict was re-gated on the rounds the two arms hold **in common** (it had been
+> gated on the batch-wide round count, so an arm with one surviving round was
+> scored against a noise floor of **0.0** and "cleared" it). Both recorded verdicts
+> **reproduce exactly**: `FOLD −2.05 %` (floor 89.0 ms, 3/3 rounds same sign) and
+> `FOLDPREQ −1.57 %` (floor 122.7 ms); `E1 PREQ` still reads **INSIDE the spread**
+> (|705.2| ≤ 1539.6, signs `++-`). So no number above needed correcting — that is a
+> result, not an absence of one.
+
 ### Its 0.8B table above is single-shot — flag it as such
 The §4 numbers in `reports/2026-09-30-dpas48-fold.md` (`−1.6 %` decode, `−1.7 %`
 prefill) are **one measurement each, with no spread measured**, so they carry no

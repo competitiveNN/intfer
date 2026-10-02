@@ -2644,6 +2644,87 @@ e.g. S3's contract column is 40 not 42).
       stands, now resting on the exact launch counters rather than on the archived
       "kernel flat within ~18 ms", which was a single shot.
 
+- **AUDIT #28 (2026-10-02): A ONE-ROUND DELTA "CLEARED THE SPREAD" AGAINST A NOISE
+  FLOOR OF ZERO — AND ONE BAD RECORD ERASED THE WHOLE TABLE.** No engine/quant/
+  schedule code touched. Found by re-reading the machinery AUDIT #27 shipped and
+  driving it against fixtures in both directions, **not** by a new run: every
+  defect below is measured against `_bench_summary.py`'s own log format, which is
+  exactly the property that makes it testable without a GPU.
+  - **(1) THE VERDICT WAS GATED ON THE BATCH, NOT ON THE PAIRED ROUNDS.** The
+    delta is computed over the rounds the two arms hold **in common**, but the
+    round-count gate was the **batch-wide maximum** over arms. An arm with one
+    surviving round was therefore scored against `spr()` of a 1-element list =
+    **0.0**, and any non-zero delta won. Measured, on the pre-fix file:
+    `KV d=+98.0 (rounds 2)  median=+98.0 ms -> CLEARS the spread: report +98.0 ms
+    (+0.60%); every round agrees in sign: yes`. **This is the exact claim AUDIT #26
+    retracted for E1 (+689 ms), arriving through a different door**, and the sign
+    check was **vacuous** — one round always agrees with itself. Now gated on
+    `len(common) < 2` and the verdict says **NO SPREAD ESTIMATE**, because a single
+    paired delta has no noise floor to clear.
+  - **(2) ONE MALFORMED RECORD ERASED THE WHOLE TABLE, AND THE HARNESS DISMISSED
+    IT.** The reader built a dict from *every whitespace token* of the record
+    (`dict(kv.split("=",1) for kv in line.split())`), so the first token without
+    `=` raised `ValueError` — **traceback, no summary at all, exit 1** — and
+    `bench_reports_batch.sh` **discarded the summariser's rc**, so the batch exited
+    **0 having printed nothing**. Two rules for "not a result" were enforced at two
+    sites and only one site's verdict was checked; records are now parsed by
+    **character span** (`BUCKETS="` … next quote), a malformed token is recorded
+    and **named**, and the harness **propagates the refusal** (rc=2, same reasons
+    as a lost arm: rc=1 is a code regression, rc=0 certifies coverage nobody got).
+    The span parse matters in its own right: the writer emits `FAILED=` **after**
+    the span, so a head-only key parse silently lost the failure tag — measured,
+    caught by the checker's own fixture, and the reason the fixture exists.
+  - **(3) A PARTIAL RECORD PRINTED DASHES AND COUNTED AS DATA.** A bucket line only
+    half recovered kept its `kernel` value and lost `nk`/`nw`/`nr`, so the row was
+    a good round with `-` in the exact-counter columns — the silent-dash table
+    AUDIT #27 closed, re-opened one field away. A record now counts as data only if
+    it carries **`kernel` AND `nk`/`nw`/`nr`**; anything else is a FAILED record that
+    **names what is missing** (`incomplete_bucket_line_missing:nw+nr`).
+  - **(4) HOST BUCKETS PRINTED A BARE MEDIAN.** AUDIT #26's own rule is that a
+    central value is never printed without the spread that bounds it, and the
+    retracted "−53 % submit saving" was computed from exactly those numbers.
+    `submit`/`waitblock`/`copy`/`readback`/`usm_write` are now `median(spread)`.
+  - **THE FIX IS ONE RULE, NOT FOUR PATCHES:** "what counts as a measurement" and
+    "what a verdict may say" are decided once, on the **data**, and every print
+    path reads them. Three of the four defects were different symptoms of a record
+    being *parsed* at one site and *judged* at another.
+  - **CHECKER (`check_bench_load_gate.sh` section (7)): 6 new properties, both
+    directions.** A one-round delta is refused and `-> CLEARS` is **absent**; a
+    3-round pair with a 100 ms effect **does** say CLEARS; a 3-round pair inside its
+    own spread **does** say INSIDE at rc=0 (**both converses are required** — a
+    summary that always refused would satisfy the first alone); a truncated record
+    is named with **no traceback**; a malformed token costs **that record, not the
+    batch** (its other rounds still pair and print); and a harness that runs the
+    summary must capture **and** refuse on its rc — **derived** from the scripts,
+    with `enum_require_min` so the population cannot be empty (static, and labelled
+    `static` in the verdict, because driving it end-to-end needs a GPU + a model).
+  - **MATRIX: 14/14.** Four **artifact**-defect states, `B-K`..`B-N`, per AUDIT #21:
+    B-K restores the batch-wide round gate, B-L restores "a partial record is data",
+    B-M restores the crashing dict parse, B-N restores the discarded rc. Each was
+    caught for its own reason.
+  - **B-J's ANCHOR HAD GONE STALE, AND THAT IS THE LESSON.** Re-writing the record
+    parse deleted the two lines B-J mutated, so the state scored **MISSED (fn)** —
+    the AUDIT #17 anchor class, one level down — but only **after nine baselines**
+    had each executed a full mutant run. `patch_literal` refused loudly, which is
+    what it is for; it is just loud **late**. This matrix now **pre-flights every
+    anchor before the baseline**, asserting it occurs **exactly once** (twice would
+    mean the patch rewrites whichever comes first — a different state than the one
+    described). **Non-vacuity proven by hand**, per AUDIT #19: with one anchor
+    repointed to a wrong literal the matrix refuses in the first second —
+    `ANCHOR STALE in _bench_summary.py: found 0 occurrence(s), want 1`, rc=1.
+    **Re-point an anchor when it fires; never loosen the check.**
+  - **THREE OF MY OWN NEW PREDICATES FAILED THE FIRST CHECKER RUN**, and each was a
+    mis-written *expectation*, not a mechanism: two inverted
+    `pred_expect_absent` calls (asserting a count is `0` with the polarity that
+    means "the pattern must not match"), and one expecting `d=-100.0` where the
+    fixture's arithmetic gives `-99.0`. The standing rule held and paid again:
+    **read what is actually printed before touching the mechanism.**
+  - **THE RECORDED VERDICTS SURVIVE THE FIXED TOOL** (re-derived, not assumed):
+    `E3 FOLD -2.05 %` (floor 89.0 ms, 3/3 rounds same sign) and `FOLDPREQ -1.57 %`
+    (floor 122.7 ms) reproduce exactly from `build/bench_E3.log`, and `E1 PREQ`
+    still reads **INSIDE the spread** (|705.2| ≤ 1539.6, signs `++-`). So the
+    docs needed **no** number corrected — which is a result, not an absence of one.
+
 - **THE STANDING BLOCKER ON 27B WALL-TIME — *SUPERSEDED 2026-10-02, READ THE ENTRY
       BELOW; THIS TEXT IS THE RECORD OF A PROCESS THAT NO LONGER EXISTS*.**
       Measured 2026-10-02: `load1 = 13.18`, driven by **PID 274320, a `julia`
