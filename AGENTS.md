@@ -2027,6 +2027,139 @@ e.g. S3's contract column is 40 not 42).
       own rule that is UNPROVEN, not wrong; re-running is the remedy, and
       `mutate_fold_matrix.sh` re-stamped 7/7 at the new HEAD.
 
+- **AUDIT #23 (2026-10-02): AUDIT #22'S TWO ROOT CAUSES HAD REOPENED ACROSS THE
+  WALL-TIME HARNESS FAMILY, AND THE FIX WAS A SINGLE HOME.** The quiet gate that
+  sampled load1 once at the START of a round, and the "no arm writes a log" gap,
+  were closed for the backlog block only. Every OTHER harness that can publish a
+  tok/s still had the original defect, because the family was never enumerated.
+    - **THE FAMILY, DERIVED FROM scripts/ AND NOT REMEMBERED.** A non-gate script
+      that scrapes a timing figure out of CLI output. `check_/test_/mutate_` are
+      excluded, the helper excludes itself, and **comment lines are stripped
+      first**, because a prose mention of "tok/s" is not a figure — the AUDIT #21
+      rule; without the strip the derivation would pull in `run_all_checks.sh`
+      over a comment. That yields exactly six: `bench_gpu_ab.sh`,
+      `bench_quiet_ab.sh`, `bench_quiet_l4_ab.sh`, `bench_reports_batch.sh`,
+      `bench_serve.sh`, `xmx_profile.sh`. The derivation carries an anti-vacuity
+      floor (`enum_require_min ... 3`, AUDIT #20): a population of zero would
+      make every assertion below vacuously true and report PASS over an empty
+      census.
+    - **THE THREE HAND-ROLLED QUIET GATES, ALL DOING THE SAME WRONG THING.**
+      `bench_quiet_ab.sh`, `bench_quiet_l4_ab.sh` and `bench_reports_batch.sh`
+      each printed `WARN: box never quieted (load1=$L >= $QLOAD)` — and then
+      measured and published anyway. Named by script, NOT by line: the edits
+      moved the lines, and a citation pointing at a line that no longer holds the
+      sentence is the stale-citation trap this file keeps recording.
+      `bench_reports_batch.sh` was the worst of the three: its TIMING loop
+      scraped tok/s UNCONDITIONALLY into a machine-readable
+      `ARM=... TPS=... LOAD1=...` field — exactly the route the retracted 27B
+      table took, a figure on a record a human then pasted into a report.
+      **A warning that does not change behaviour is a comment.** All three keep
+      the wait, then route every arm through the shared gate, and the warn text
+      now states the consequence that actually happens (the leg's `TPS` is
+      recorded `SKIPPED-CONTENDED`).
+    - **THE SINGLE HOME: `scripts/_gate_loadlog.sh`.** `loadlog_arm <label> <cmd…>`
+      samples load1 every `$INTFER_LOAD_SAMPLE` sec for the arm's WHOLE duration
+      into `<dir>/<label>.load`, runs the command tee'd to `<dir>/<label>.log`, and
+      publishes `_LL_LOG` / `_LL_MAX` / `_LL_USABLE`; usable iff the MAXIMUM over
+      the arm is under `$INTFER_QUIET_LOAD` (default 2). `loadlog_tps_field`
+      returns `SKIPPED-CONTENDED` for a contended arm — **the same token the
+      counters-only mode has always written**, so the two modes agree by
+      construction instead of by convention. Seams `$LOADAVG`,
+      `$INTFER_QUIET_LOAD`, `$INTFER_LOAD_SAMPLE`, `$LOADLOG_DIR`, so a test can
+      drive them (the `INTFER_SYCL_LS` rationale: an assumption the harness cannot
+      redirect is one it cannot test). *"Nine hand-rolled copies of the block is
+      precisely how the family reopened"* (AUDIT #7) — **and the family DID
+      reopen, three times**, so the three copies were DELETED rather than
+      documented as accepted drift. `bench_serve.sh` additionally skips its
+      throughput FLOOR on a contended run (a stall guard that on a loaded box can
+      only raise a false alarm) while its token-count and per-request-id
+      assertions still run and still mean something.
+    - **`bench_when_quiet.sh` NO LONGER DEPENDS ON THE OPERATOR REMEMBERING
+      `nohup ... > log 2>&1 &`.** AUDIT #22 root cause 2 was operator-enforced
+      here: the run's stdout only reached a file if someone remembered the
+      redirect, which is why the one `bench_when_quiet` log on the box held no
+      measurement. It now captures ITSELF to a per-run artifact named
+      `<utc>_HEAD_<pid>.log`, with a header carrying HEAD, the threshold and the
+      starting load1, and **refuses to report a run whose artifact is missing or
+      empty** (AUDIT #20: "found nothing to look at" and "found nothing wrong" are
+      different claims — without it the tee could silently no-op and the run would
+      look measured exactly as it did on arrival).
+      **TWO DEFECTS FOUND BY TESTING, NOT READING.** (a) `exec > >(tee)` was the
+      fragile way to capture; it is now `| tee -a` with `PIPESTATUS[0]`, which
+      preserves the BLOCK's exit code instead of tee's. (b) a second-resolution
+      timestamp let two runs in the same second produce the SAME path, so the
+      second APPENDED to the first and the artifact could no longer say which run
+      produced which line — an ambiguous log is the artifact problem all over
+      again. Hence HEAD and PID in the name.
+    - **CHECKER + MATRIX, and the population is derived so a new harness is
+      covered automatically.** `scripts/check_bench_load_gate.sh` asserts four
+      things per derived harness: it routes through the one helper; its figure
+      comes from `$(loadlog_tps_field …)`; it does not REDEFINE
+      `loadlog_arm`/`loadlog_tps_field` (a redefinition would leave the first
+      property saying "yes" while the criterion has a second home — the
+      copy-drift family caught at the DEFINITION, AUDITs #3/#12); and the
+      warn-and-continue line is gone. Plus one **BEHAVIOURAL** property: the
+      helper is RUN against a fixture loadavg that drifts 0.5 → 7.5 mid-arm and
+      must WITHHOLD, and against a quiet fixture and must PUBLISH — both
+      directions required, since a gate that can only say USABLE is the bug and one
+      that can only say CONTENDED is useless (always-red converse).
+      `scripts/mutate_bench_load_gate.sh` is **5/5** (states B-A..B-E; read live
+      figures from `build/bench_load_gate_mutate/last_pass.stamp`, never from
+      here). The model is AUDIT #21 applied to the ARTIFACT: the harnesses are
+      CORRECT after this change, so weakening the CHECKER is unobservable — each
+      state damages a harness in a sandbox COPY of `scripts/` (never a symlink,
+      which would edit the real tree) and requires the checker to reject it.
+      **On its FIRST run the checker found `xmx_profile.sh` ungated**, which is
+      the argument for deriving the population instead of naming it.
+      `B-E` is the sharp state — the helper stops withholding, so every TEXT
+      property still passes and only the behavioural probe can see it (the
+      AUDIT #12 S4 shape, with the always-red converse already in place).
+    - **THE "NO BARE THROUGHPUT WRITE" CHECK WAS A FALSE-POSITIVE MACHINE, RECORDED
+      SO NOBODY REINSTATES IT.** The first draft tried to detect a bare throughput
+      write line-by-line and flagged every LEGITIMATE shape: the scrape itself
+      (`tps="$(grep -aoE tok/s …)"`), a printf whose format says `TPS=%s` while the
+      VALUE arrives from `loadlog_tps_field` on the NEXT line, and an
+      already-gated `tok/s=$TPS_FIELD`. Replaced by the robust composition: **a
+      harness can only obtain its figure from the function that withholds, and the
+      behavioural property proves that function withholds.** A check that cries
+      wolf is the mirror defect.
+    - **TWO DEFECTS IN THE NEW MATRIX ITSELF, both found by running it.** (a)
+      state B-A's anchor was INDENTED and matched 0 times, so the state scored
+      MISSED with `mutation fn failed` — a message that reads as "the harness
+      cannot be damaged" when it means "the anchor is wrong". Same lesson as the
+      AUDIT #17 anchor parser: confirm the anchor form mechanically, never by eye.
+      (b) `summary.txt` was never truncated between runs, so it ACCUMULATED and the
+      printed summary listed `B-A MISSED (fn)` from the PREVIOUS run directly above
+      `B-A caught`, under a `PASS (5/5)` line — the self-contradicting-report
+      class of AUDIT #22, and the worst place for it: the in-memory counters make
+      the VERDICT correct, so only the EVIDENCE was wrong.
+    - **AND THE STACK CAUGHT A REGRESSION OF MINE, WHICH IS THE POINT OF IT.**
+      The first full run after this change reported `RUN ALL CHECKS: FAIL (2
+      step(s) FAILED)` — `check_build_dir_consumers.sh` rc=1, with
+      `mutate_build_dir_consumers.sh` failing its baseline behind it — and
+      correctly classified it as a real regression, not unproven evidence. Cause:
+      `_gate_loadlog.sh` consumes NO build artifact (the caller picks the
+      directory), but its usage comment showed `loadlog_init
+      build/bench_logs/run1`, and the consumer classifier matches `build/`
+      WITHOUT stripping comments, so a prose example was graded as a consumer.
+      All six real callers write `${INTFER_BUILD_DIR:-$ROOT/build}/bench_logs/…`
+      and all six passed, which is what localised it to the comment. Fixed by
+      making the example a variable and stating the real contract: the CALLER owns
+      the path and must honour `INTFER_BUILD_DIR`.
+      The tempting fix — teach the classifier to strip comments — was **DECLINED**:
+      that checker and its matrix are green, and this is a documentation bug, not a
+      classification bug. Note the two checks now disagree on principle:
+      `check_bench_load_gate.sh` DOES strip comments before matching, because its
+      population derivation would otherwise demand a load gate from
+      `run_all_checks.sh` over a prose mention. Both choices are recorded at their
+      call sites.
+    - **SCOPED, NOT DONE: `scripts/bench_chat.sh`.** It measures HTTP TTFT / TPOT
+      / E2E in seconds off the SSE stream rather than scraping a CLI tok/s, so it
+      falls outside the derived population (its only `tok/s` is prose in comments,
+      which the comment strip removes) and was NOT wired this round. Precise
+      wording: **out of scope of the derivation, not exempt by judgement** — it is
+      a wall-time measurement harness and wiring it is a mechanical follow-up.
+
 - **SIXTH RECURRENCE OF THE SAME CLASS: I WROTE THE PREDICATE FOR THE OUTPUT I
     EXPECTED, NOT THE ONE I OBSERVED.** Two more instances this session, both
     found by a state reporting MISSED while its defect had reproduced perfectly:
