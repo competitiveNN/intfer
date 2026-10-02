@@ -733,6 +733,11 @@ property of the prompt, not evidence that DPAS48 is a no-op.
   with `nw`/`nr` **unchanged** -- the dep-chain design scales. The 0.8B figure was
   -1.5% and the report's own claim -1.6%; three independent scales now agree.
   **KEEP, default-OFF** -- still the only candidate with positive evidence.
+  **CONFIRMED ON THREE INTERLEAVED ROUNDS 2026-10-02:** `FOLD` = **-2.05 %**
+  device kernel (per-round deltas -343.9 / -388.7 / -410.8 ms, **all three the
+  same sign**) against arm spreads of 34.9 ms (FOLD) and 89.0 ms (DPAS48), with
+  `nk` +22528 and `nw`/`nr` unchanged. The single-shot -1.8 % above is therefore
+  a real effect, not a lucky sample.
 * **E1 `PREQ` does not pay at 27B either.** It recovers only ~53 ms of `copy`
   against DPAS48 while adding **+30720 launches** (480/token) and 16.8 ms of
   kernel. The theory it was built for (host act-quant dominating) does not
@@ -748,3 +753,23 @@ property of the prompt, not evidence that DPAS48 is a no-op.
 Wall-time (`RESULT:` lines) needs a quiet box, load1 < 2, 3+ interleaved rounds.
 What is now ANSWERED at 27B TP=2 is identity + counters + launch accounting; what
 is NOT answered is whether any of it converts to tok/s.
+
+**2026-10-02: the counter leg is now closed for E3 too.** A 3-round interleaved
+re-run (`bench_reports_batch.sh E3 3`, 12 arms, every arm `SKIPPED-CONTENDED` at
+`max_load1` 4.36-23.37) confirms E3's verdict above on 3 rounds instead of 1, and
+**shows what a spread-aware reading changes**: E3's `FOLD` delta clears its noise
+floor by ~4x, so it is a result, while E1's `PREQ` delta does **not** clear its own
+(per-round `+705 / +1545 / -59 ms` against a 1539.6 ms spread -- signs `++-`).
+The E1 and E3 **verdicts are unchanged**; what changed is that E1's kernel claim
+is now labelled *not resolvable* and rests only on its exact `nk` delta, while E3's
+is promoted from a single shot to a resolvable -2.05 %. Full tables in
+`reports/2026-09-30-pending-bench-backlog.md` (E1 and E3 sections) and in
+`build/bench_E1.log` / `build/bench_E3.log`.
+
+**A LIMITATION OF THE NOISE FLOOR, MEASURED, NOT ASSUMED.** The spread is a
+property of *the run*, not of the arm: the same BASE arm measured **1875.5 ms** of
+round-to-round spread in the E1 run and **64.5 ms** in the E3 run -- same model,
+same `-n64` shape, same round count, ~29x apart. So "clears the spread" is a
+statement about the noise actually observed in that run, and any delta must be
+quoted with the two spreads beside it. `scripts/bench_reports_batch.sh` now prints
+that caveat in its own output so the claim cannot travel without it.

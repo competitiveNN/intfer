@@ -331,6 +331,13 @@ done
 # delta of +689 ms reads as a measured cost when the per-round deltas are -58,
 # +705 and +1545. Every bucket is now printed per round with its spread, and the
 # delta table below states explicitly whether a median delta clears that spread.
+#
+# *** AND THE NOISE FLOOR ITSELF IS A PROPERTY OF THE RUN, NOT OF THE ARM. ***
+# Measured the same day: the BASE arm's round-to-round kernel spread was 1875.5 ms
+# in the E1 run and 64.5 ms in the E3 run (identical model, shape and round count),
+# so the same arm's noise differs by ~29x between runs. The delta verdict is
+# therefore conditional on the spreads shown beside it, and the table says so. Do
+# not cache a spread, and do not quote "CLEARS the spread" without it.
 echo; echo "== SUMMARY (wall tok/s per round, then median) =="
 echo "   kernel + nk/nw/nr : DEVICE-side or exact -- may be believed."
 echo "   submit/waitblock/copy/readback/usm_write : HOST wall clock, NOT"
@@ -444,6 +451,11 @@ else:
     print("   noise floor per row = max(spread of the two arms being compared), i.e.")
     print("   the same arm+flags re-measured. Spread is the ONLY available noise")
     print("   estimate, so it bounds what can be claimed, it does not prove noise.")
+    print("   *** AND THE SPREAD IS A PROPERTY OF THIS RUN, NOT OF THE ARM. ***")
+    print("   Measured 2026-10-02, same model/shape/rounds: BASE spread 1875.5 ms in")
+    print("   the E1 run and 64.5 ms in the E3 run -- an order of magnitude apart.")
+    print("   So 'CLEARS the spread' means 'clears the noise actually observed here'.")
+    print("   Quote it with the run's spreads, never as the arm's noise.")
 for a in arms:
     if a == ref:
         continue

@@ -437,6 +437,52 @@ each is invisible to every check the others can see:
 
 So no single check covers the class, and **all four checks are load-bearing**.
 
+### MEASURED 2026-10-02 — 27B `--tp 2`, decode `-n64`, 3 interleaved rounds
+Run through `scripts/bench_reports_batch.sh E3 3`, 12 arms (4 arms × 3 rounds,
+round-major interleaved). Stream identity held on all four arms
+(`11751 13 198 760 6511 314 9338 369`). **Every arm was `SKIPPED-CONTENDED`**
+(`max_load1` 4.36–23.37), so **no tok/s is claimed and the `RESULT:` lines stay
+blank.** Device-side `kernel` only, with each arm's own round-to-round spread;
+raw records in `build/bench_E3.log` + `build/bench_logs/E3_*/`.
+
+| arm | `nk` | kernel per round (ms) | median | spread |
+|---|---|---|---|---|
+| BASE | 63488 | 17086.5 / 17022.0 / 17086.4 | 17086.4 | 64.5 (0.4 %) |
+| DPAS48 | 94208 | 18860.5 / 18940.2 / 18949.5 | 18940.2 | 89.0 (0.5 %) |
+| **FOLD** | 116736 (**+22528**) | 18516.6 / 18551.5 / 18538.7 | 18538.7 | 34.9 (0.2 %) |
+| FOLDPREQ | 147456 | 18562.9 / 18621.7 / 18685.6 | 18621.7 | 122.7 (0.7 %) |
+
+Per-round `kernel` delta vs DPAS48, paired inside each round:
+
+| arm | r1 | r2 | r3 | median | verdict |
+|---|---|---|---|---|---|
+| BASE | −1774.0 | −1918.2 | −1863.1 | **−1863.1 ms (−9.84 %)** | clears the spread, all rounds agree |
+| **FOLD** | −343.9 | −388.7 | −410.8 | **−388.7 ms (−2.05 %)** | **clears the spread, all rounds agree** |
+| FOLDPREQ | −297.6 | −318.5 | −263.9 | −297.6 ms (−1.57 %) | clears the spread, all rounds agree |
+
+**This CONFIRMS the archived single-shot verdict on three rounds instead of one.**
+The 2026-10-01 record claimed `FOLD` −1.8 % device kernel from a single shot; three
+interleaved rounds give **−2.05 %**, with the spread (34.9 / 89.0 ms) an order of
+magnitude below the delta and **all three rounds the same sign**. `nw`/`nr` are
+unchanged, exactly as the hoist's dep-chain design predicts. **KEEP,
+default-OFF — still the only lever of the three with positive evidence.**
+`FOLDPREQ` is also net-positive vs DPAS48 (−1.57 %), i.e. FOLD's saving survives
+adding PREQ, though PREQ adds +30720 more launches for less benefit (see E1).
+
+> **Read the spread caveat with the number.** The noise floor above is the spread
+> observed *in this run*, and the spread is **not a constant of the arm**: the same
+> BASE arm measured **1875.5 ms** of spread in the E1 run earlier the same day and
+> **64.5 ms** here, on the same model, shape and round count — a ~29× difference.
+> So "−2.05 %, clears the spread" means "−2.05 %, clearing the noise this run
+> actually showed". Quote the two spreads alongside the delta; do not cache one.
+
+### Its 0.8B table above is single-shot — flag it as such
+The §4 numbers in `reports/2026-09-30-dpas48-fold.md` (`−1.6 %` decode, `−1.7 %`
+prefill) are **one measurement each, with no spread measured**, so they carry no
+noise estimate at all. They are consistent in sign and magnitude with the 27B
+three-round result above; that agreement is why they were worth trusting, but it
+was not evidence on its own.
+
 ## E5 — `INTFER_DEVICE_ARGMAX=1` — **DECIDED 2026-10-02: KILL. NOT PENDING.**
 
 **Do not benchmark this.** The A/B was run on 2026-10-02 (3 interleaved rounds, 0.8B
