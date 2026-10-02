@@ -777,6 +777,18 @@ write_cert() { # $1 rc, $2 one-word verdict
     echo "stale=$STALE"
     echo "unproven=$UNPROVEN"
     echo "stamps=$STAMP_COUNT"
+    # *** THE THREE DERIVED COUNTS TRAVEL TOGETHER, BECAUSE TRANSCRIBING THEM IS
+    # HOW A HAND-COUNTED TOTAL GOES STALE. *** Measured confusion this session: a
+    # summary said "14 checkers, 18 matrices" while 0b derived 31 (=14+17) and
+    # step 3/3 counted 18 STAMP FILES -- a third, different quantity, because
+    # device_precond_matrix writes TWO stamp files into ONE directory. Nothing was
+    # wrong except that three numbers with three meanings were quoted in prose.
+    # The certificate is the artifact of record, so the census belongs here.
+    echo "scripts=$N_DISPATCHABLE"
+    echo "checks=$(ls "$SCRIPT_DIR"/check_*.sh 2>/dev/null | wc -l | tr -d ' ')"
+    echo "matrices=$(ls "$SCRIPT_DIR"/mutate_*.sh 2>/dev/null | wc -l | tr -d ' ')"
+    echo "stamp_dirs=$(find "$STAMP_DIR" -name '*last_pass.stamp' -type f 2>/dev/null \
+      | sed 's|/[^/]*$||' | sort -u | wc -l | tr -d ' ')"
     echo "quick=${INTFER_QUICK:-0}"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "$CERT.tmp" 2>/dev/null && mv "$CERT.tmp" "$CERT"
