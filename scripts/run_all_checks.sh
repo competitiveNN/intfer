@@ -165,6 +165,11 @@ dispatch() { # $1 = label -> runs it
       # produced during conversion (false LEAK, vacuous assertion) plus the
       # fail-closed case its own check then found.
       timeout 300 bash "$SCRIPT_DIR/check_gate_pop.sh"; return $? ;;
+    check_result_block.sh)
+      # Asserts the RESULT-filling benchmark block still names only flags that
+      # exist in source, still anchors every blank RESULT line, and still
+      # contains NO numeric tok/s. Read-only, no GPU, no build.
+      timeout 600 bash "$SCRIPT_DIR/check_result_block.sh"; return $? ;;
     check_checker_matrix_coverage.sh)
       # Derives "every checker has a dispatched matrix" from scripts/ rather than
       # trusting a hand-written total. Wired, and its own matrix is
@@ -209,6 +214,10 @@ dispatch() { # $1 = label -> runs it
       # the expectation instead, so a direction the checker quietly stopped
       # testing must show up as a missing ok line.
       timeout 1800 bash "$SCRIPT_DIR/mutate_fold_report_class.sh"; return $? ;;
+    mutate_result_block.sh)
+      # Damages the REPORTS in a sandbox, never the checker (AUDIT #21: the
+      # reports are correct, so weakening the checker is unobservable).
+      timeout 1800 bash "$SCRIPT_DIR/mutate_result_block.sh"; return $? ;;
     mutate_checker_matrix_coverage.sh)
       # Each state BOTH poisons the tree with an unmated checker AND removes the
       # requirement that would catch it -- weakening alone is unobservable while
@@ -417,11 +426,11 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_checker_matrix_coverage.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_checker_matrix_coverage.sh"
 fi
 echo "== 1/2 checkers =="
 for label in $STEPS; do step "$label"; done
