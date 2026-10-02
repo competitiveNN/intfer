@@ -53,9 +53,23 @@ ORIG_B="$SB/.orig_b"; ORIG_F="$SB/.orig_f"; ORIG_C="$SB/.orig_c"
 cp "$SB/reports/2026-09-30-pending-bench-backlog.md" "$ORIG_B"
 cp "$SB/reports/2026-09-30-dpas48-fold.md" "$ORIG_F"
 cp "$TGT" "$ORIG_C"
-restore() { cp "$ORIG_B" "$SB/reports/2026-09-30-pending-bench-backlog.md"
-            cp "$ORIG_F" "$SB/reports/2026-09-30-dpas48-fold.md"
-            cp "$ORIG_C" "$TGT"; }
+# *** RESTORE THE DIRECTORIES, NOT A LIST OF FILES. ***
+# This had a 3-file restore list (two reports + the checker) while carrying NINE
+# states, five of which were added later. That is the exact shape that leaked
+# state twice in mutate_bench_load_gate.sh -- and the fix there was to add the
+# missing file to the list, which guaranteed the next round. A list is a claim
+# about which files a state's damage lands in; a snapshot needs no such knowledge.
+# mutate_bench_load_gate.sh leaked B-E into B-H and then B-F into B-I for exactly
+# this reason, both times surfacing as "anchor found 0 times" on an anchor that
+# was correct in the real tree.
+PRISTINE="$SB/.pristine"
+mkdir -p "$PRISTINE"
+cp -a "$SB/scripts" "$PRISTINE/scripts"
+cp -a "$SB/reports" "$PRISTINE/reports"
+restore() { rm -rf "$SB/scripts" "$SB/reports"
+            cp -a "$PRISTINE/scripts" "$SB/scripts"
+            cp -a "$PRISTINE/reports" "$SB/reports"
+            TGT="$SB/scripts/check_result_block.sh"; }
 run_check() { ( cd "$SB" && bash "$TGT" 2>&1 ); }
 
 echo "== stamp-population leak assertion (AS FOUND) =="

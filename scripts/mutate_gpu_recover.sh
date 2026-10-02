@@ -105,7 +105,19 @@ ORIG="$SB/.orig"; ORIGT="$SB/.origtool"
 cp "$SB/check_gpu_recover.sh" "$ORIG"; cp "$SB/gpu_recover.sh" "$ORIGT"
 # The checker resolves its sibling scripts through $SCRIPT_DIR, so the sandbox
 # needs a copy of the tool it drives as well; both sit side by side.
-restore() { cp "$ORIG" "$SB/check_gpu_recover.sh"; cp "$ORIGT" "$SB/gpu_recover.sh"; }
+# *** RESTORE THE DIRECTORY, NOT A TWO-FILE LIST. *** mutate_bench_load_gate.sh
+# leaked state into the next state TWICE with a hand-maintained restore list (B-E
+# into B-H, then B-F into B-I), each time surfacing as "anchor found 0 times" on
+# an anchor that was correct in the real tree. Fixing it there by adding the
+# missing file to the list guaranteed the next round, so the list was replaced by
+# a snapshot. Same here: the sandbox directory is snapshotted, so a state that
+# damages a file nobody listed cannot leak into its successor.
+SBPRIS="$SB/.pristine_sb"
+cp -a "$SB" "$SBPRIS" 2>/dev/null
+restore() { local f
+            for f in "$SB"/*.sh; do rm -f "$f"; done
+            for f in "$SBPRIS"/*.sh; do cp -a "$f" "$SB/"; done
+            CKB="$SB/check_gpu_recover.sh"; }
 run_check() { ( cd "$SB" && bash "$SB/check_gpu_recover.sh" 2>&1 ); }
 
 echo "== baseline: clean checker must PASS, and must print the converse =="

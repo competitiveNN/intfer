@@ -2274,6 +2274,54 @@ e.g. S3's contract column is 40 not 42).
           flagged `bench_chat.sh` GATE-BEFORE-ARM on a COMMENT that merely mentions
           the verdict variable. Third instance of that class, and the first one I
           wrote myself after writing the rule down.
+        - **THE RESTORE-STRATEGY AUDIT, DERIVED — AND THE AUDIT ITSELF WAS WRONG FIRST.**
+          `scripts/run_ten_gates.sh` is a better tool than the argument it replaced,
+          but the class-closing move was applying the snapshot lesson to every
+          other matrix. Enumerated from `scripts/mutate_*.sh`, not remembered:
+            SNAPSHOT (mechanism):  mutate_bench_load_gate.sh, mutate_run_all_checks.sh
+            git checkout (tracked): mutate_device_precond.sh, mutate_fold_matrix.sh,
+                                    mutate_gate_inventory.sh
+            throwaway tree:         mutate_l0_cite.sh (no restore needed)
+            LIST of 1:              build_dir_consumers, checker_matrix_coverage,
+                                    doc_counts, e2_ctx, fold_report_class,
+                                    gate_enum, gate_pop
+            LIST of 2:              gpu_recover          -> CONVERTED this round
+            LIST of 3:              result_block         -> CONVERTED this round
+          The two widest were converted and re-run (4/4, 9/9). A one-file list is
+          left deliberately: its failure mode is narrow, and a snapshot buys
+          nothing until a state damages a second file. **Re-derive the table rather
+          than trusting it** — the count grows with the state count, so a converted
+          matrix can become the widest one again.
+          *** AND THE AUDIT THAT PRODUCED IT WAS WRONG ON ITS FIRST RUN, IN THE
+          VERY SHAPE IT WAS AUDITING. *** It read each `restore()` with
+          `/^{/,/^}/`, but several are ONE LINE (`restore() { cp "$ORIG" "$CHECK"; }`),
+          so the range never closed, ran to end of file, and reported a **7-file
+          list for a matrix that restores exactly one file**. Near enough to be
+          believed — and a false risk profile is worse than none, because it
+          invites converting matrices that cannot leak. Fixed by delimiting on the
+          closing brace and counting DISTINCT destinations.
+- **THE TEN CORRECTNESS GATES ARE NOW AN ARTIFACT, NOT A DIFF ARGUMENT.**
+          A session reported "10 PASS / 0 PARTIAL / 0 SKIPPED" justified by "the
+          files that changed since the gates ran are not engine inputs". That is
+          sound reasoning and it is NOT evidence — it is AUDIT #22's shape exactly:
+          a number whose backing is an argument about the tree rather than a file
+          on disk. `scripts/run_ten_gates.sh` now derives the gate population from
+          `scripts/test_*.sh` (never a list of ten names, which would rot when a
+          gate is added), tallies **by exit code** — the only non-double-countable
+          measure, per the AUDIT #13 trap — and writes `build/ten_gates/gates.log`
+          plus `build/ten_gates/HEAD` naming the tree it certified.
+          *** DELIBERATELY NOT NAMED `last_pass.stamp`. *** `run_all_checks.sh`
+          enumerates `find build -name '*last_pass.stamp'` and fails on any
+          directory it does not recognise; `_gate_pop.sh` derives that set from
+          `mutate_*.sh` alone, so a stamp from a suite that is not a mutation
+          matrix would be reported as a LEAK, and the only escapes would be
+          loosening a green guard or reclassifying this as a matrix. Neither is
+          right: **the tooling stack and the engine certification are DIFFERENT
+          evidence classes**, and conflating them is what made the original gap
+          hard to see in the first place. It is also deliberately NOT a step of
+          `run_all_checks.sh` — it runs the engine, takes tens of minutes, and
+          belongs to the slow half of certification rather than to every tooling
+          edit.
         - **AND THE RULE THAT CLOSES THE CLASS, AS A CHECK RATHER THAN AS PROSE:**
           *a checker that spells out another checker's literal patterns gets graded
           by them.* It cost two full stack runs this session (a usage comment, then
