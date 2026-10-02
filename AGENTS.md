@@ -2569,6 +2569,81 @@ e.g. S3's contract column is 40 not 42).
       long job is dead by its OUTPUT (file mtimes advancing), never by one `ps`
       invocation that came back empty.**
 
+- **AUDIT #27 (2026-10-02): A BENCH BATCH IN WHICH *EVERY* ARM DIED WAS RECORDED
+      AS A COMPLETED MEASUREMENT, AND EXITED 0.** No engine/quant/schedule code
+      touched; this is the AUDIT #20 vacuous-green class one level **above** the
+      checkers, found by the batch actually dying rather than by reading.
+    - **WHAT HAPPENED.** During `bench_reports_batch.sh E2 2`, the three
+      **round-1** arms terminated with `UR_RESULT_ERROR_DEVICE_LOST` /
+      `FATAL: signal 6`, so the CLI emitted **no `[GPU profile @decode]` line at
+      all**. The harness recorded each as an ordinary row with `BUCKETS=""`,
+      printed a summary of dashes, and **exited 0** — so `E2 rc=0` in
+      `build/bench_remaining.log` certifies a batch where a third of the runs
+      measured nothing. **Neither existing gate could have caught it**: the load
+      gate withholds a figure it HAS and has no opinion on one never produced,
+      and the identity gate passed because the 8-token identity phase succeeded
+      and the device was lost *later*. The summary is read by a human pasting
+      numbers, so the failure surfaces days later as "E2 measured nothing".
+    - **FIXED IN THREE PARTS, AND PART 3 IS THE ONE THAT MATTERS.**
+      (a) A missing bucket line is a first-class outcome: the record carries
+      `FAILED=<signature>` (spaces folded to `_` — the log format is
+      whitespace-separated and a value with a space makes the summariser's
+      `kv.split("=", 1)` raise), it is counted and echoed at the moment it
+      happens, and the batch ends **rc=2** saying the batch is NOT A RESULT. rc=2
+      not rc=1 (indistinguishable from a code regression) and not rc=0 (coverage
+      nobody got), and the harness **does not diagnose the signature**: asserting
+      "that is box state" from a log line is the AUDIT #9/#11 mistake.
+      (b) **Rounds are paired by IDENTITY, not position.** The log is round-major,
+      so the i-th row of each arm was the same round *while both arms had every
+      round*; with FAILED rows present, an arm missing round 1 would shift every
+      later row down one and turn the comparison into "round 2 vs round 1". A
+      fixture that loses round 2 only requires the delta over rounds **1,3**.
+      (c) **The summary moved out of the harness into `scripts/_bench_summary.py`.**
+      That is the testability half: as a heredoc the only way to drive it was to
+      run a 27B benchmark, which is exactly why this survived until a real run
+      died. *An assumption the harness cannot redirect is one it cannot test* —
+      the same rule as `INTFER_SYCL_LS` and `INTFER_BUILD_DIR`. It exits **3** when
+      any record carried no data, and it flags a record with **empty `BUCKETS`**
+      as well as a tagged one, so the log the lost E2 batch already left on disk
+      is diagnosed instead of summarised into dashes.
+    - **`check_bench_load_gate.sh` section (7)** drives it against fixtures in
+      **both** directions — healthy 3-round pair must print a delta and stay
+      silent, fully dead batch must exit 3 and name the arm, half-dead arm must
+      pair by round and still be refused. The converse is not optional: a guard
+      that fires on everything satisfies a one-case test and makes every healthy
+      batch look broken. **Two checker bugs were found by writing it, both mine:**
+      the first fixture put each arm in its own file and pointed the summary at
+      one of them, so the **healthy** direction failed for a reason unrelated to
+      the summary; and the harness-side refusal property was first asserted of all
+      seven harnesses, producing **six false FAILs on a healthy tree**. It is now
+      scoped by derivation (a harness that writes `ARM=` records) — a check that
+      cries wolf is the mirror defect and would have trained everyone to ignore the
+      line. **Matrix state B-J**, an **artifact**-defect state per AUDIT #21 (the
+      summary is correct by construction, so weakening the checker would be
+      unobservable); it drops the empty-bucket clause and requires the checker to
+      REJECT it. **10/10.** The sandbox also mirrored only `*.sh`, so it never had
+      the new `.py` and would have failed the **baseline** for an unrelated reason.
+    - **BOX STATE, MEASURED: THE DRM MINOR MOVED.** After the device-lost event the
+      second B580 came back as **`/dev/dri/card2` + `renderD130` (226:2)** where it
+      had been `card1` + `renderD129` (226:1). Both GPUs enumerate again
+      (`sycl-ls` 2, `xpu-smi` 2, UUIDs still `…-0400-…` and `…-8600-…`), and
+      `/dev/dri/by-path/pci-0000:86:00.0-*` plus `renderD128` (card0, 04:00.0) are
+      unchanged. **So any script naming a card by DRM minor is now wrong**, and two
+      were — found by enumerating `renderD129|card1` across `scripts/`, not by
+      guessing: `gpu_recover.sh`'s unbind-failure hint pointed the operator at
+      `/dev/dri/renderD129`, and `gpu_health_check.sh`'s embedded diagnostic
+      hardcoded `/sys/class/drm/card1/device/{rescan,reset}` while the rest of that
+      same script derived `$A`/`$B` **by glob** — so it was reporting `EACCES`
+      about a node that did not exist. Both now derive the name. `renderD128` is
+      the stable probe and every device gate already uses it.
+    - **RE-DERIVING E2 FROM THE HALF-DEAD LOG** (what the fix makes possible):
+      `BASE`/`KV`/`KVQ8` `nk`/`nw`/`nr` are **byte-identical in every surviving
+      round** (63488 / 63488 / 16384), and the per-round kernel deltas are
+      −53.0 / +7.4 ms (`KV`) and −60.3 / +7.2 ms (`KVQ8`) against a ~679 ms spread
+      — **inside the noise**, so "no resolvable kernel effect". **DO NOT PROMOTE**
+      stands, now resting on the exact launch counters rather than on the archived
+      "kernel flat within ~18 ms", which was a single shot.
+
 - **THE STANDING BLOCKER ON 27B WALL-TIME — *SUPERSEDED 2026-10-02, READ THE ENTRY
       BELOW; THIS TEXT IS THE RECORD OF A PROCESS THAT NO LONGER EXISTS*.**
       Measured 2026-10-02: `load1 = 13.18`, driven by **PID 274320, a `julia`

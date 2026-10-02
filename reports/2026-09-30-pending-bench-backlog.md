@@ -316,6 +316,43 @@ Every perf lever tried so far attacks **launch/submit overhead**
 KV reads, and KV is the part of that traffic the current INT2/G16 weights do
 not already shrink. This is also the flag that buys headroom for long contexts
 and for concurrency on a ~12 GB/card TP=2 split.
+and for concurrency on a ~12 GB/card TP=2 split.
+
+### MEASURED 2026-10-02 — 27B `--tp 2`, decode `-n64` — **ROUND 1 OF ALL THREE ARMS DIED; NOT A RESULT**
+Run through `scripts/bench_reports_batch.sh E2 2`. The three **round-1** arms
+terminated with `UR_RESULT_ERROR_DEVICE_LOST` / `FATAL: signal 6` and printed no
+`[GPU profile @decode]` line at all (`build/bench_logs/E2_20261002T181022Z/t1_*.log`).
+Rounds 2 and 3 ran clean on all three arms. So the batch is **not a result**, and
+the summary says so:
+
+| arm | `nk` | `nw` | `nr` | kernel r2 / r3 (ms) | spread |
+|---|---|---|---|---|---|
+| BASE | 63488 | 63488 | 16384 | 17036.0 / 16356.7 | 679.3 (4.1 %) |
+| KV | 63488 | 63488 | 16384 | 16983.0 / 16364.1 | 618.9 (3.7 %) |
+| KVQ8 | 63488 | 63488 | 16384 | 16975.7 / 16363.9 | 611.8 (3.7 %) |
+
+Per-round kernel delta vs BASE over the two surviving rounds: `KV` **−53.0 /
++7.4 ms**, `KVQ8` **−60.3 / +7.2 ms** (signs differ) against a ~679 ms spread —
+**inside the noise, so "no resolvable kernel effect", not "flat within 18 ms".**
+
+**What survives is the exact part, and it is unchanged from the archived verdict:**
+`nk`/`nw`/`nr` are **byte-identical across all three arms in every round**. The
+lever's whole premise was to reduce KV traffic, and the launch/readback counters
+do not move at all. **DO NOT PROMOTE** — and note this is now a claim about
+counters, not a claim about a measurement that was refused.
+
+> **The device-lost event is box state, not a code regression**, and the harness
+> deliberately does not diagnose it from the log line. Run
+> `scripts/gpu_recover.sh diag` (read-only) then `verify`. One concrete
+> consequence, measured: **the second card's DRM minor changed.** It came back as
+> `/dev/dri/card2` + `renderD130` (226:2) where it had been `card1` + `renderD129`
+> (226:1). `/dev/dri/by-path/pci-0000:86:00.0-*` and `renderD128` (card0, 04:00.0)
+> are unchanged, and both GPUs enumerate again (`sycl-ls` 2, `xpu-smi` 2, UUIDs
+> still `…-0400-…` and `…-8600-…`). **Anything that names a card by DRM minor is
+> now wrong**; two such places were found by enumerating, not by guessing, and
+> fixed to derive the name (`scripts/gpu_recover.sh`'s unbind-failure hint, and
+> the "what this container CANNOT do" block in `scripts/gpu_health_check.sh`,
+> which had been reporting `EACCES` about a node that no longer existed).
 
 ### Expected direction
 - decode: improves, and the effect should **grow with context length** (test

@@ -162,7 +162,12 @@ cmd_rebind() {
     echo "-- unbinding $MISSING_SLOT from $drv"
     if ! echo "$MISSING_SLOT" > "/sys/bus/pci/drivers/$drv/unbind"; then
       echo "   unbind FAILED. If the device is in use, that is the cause:"
-      echo "   find the holder with  fuser -v /dev/dri/renderD129"
+      # DERIVED, NOT HARDCODED: a re-bind renumbers the DRM minor. Measured
+      # 2026-10-02 -- after a device-lost event the second card came back as
+      # /dev/dri/card2 + renderD130 where it had been card1 + renderD129, so the
+      # old literal pointed the operator at a node that no longer exists. The
+      # by-path symlink is named for the PCI slot and survives the rename.
+      echo "   find the holder with  fuser -v /dev/dri/by-path/pci-0000:${MISSING_SLOT#0000:}-render"
       exit 1
     fi
     sleep 2

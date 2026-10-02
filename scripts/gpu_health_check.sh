@@ -107,16 +107,21 @@ done
 
 echo
 echo "-- what this container CANNOT do (all measured, not assumed) --"
-python3 - <<'PY'
-import errno
-checks = [("dmesg / kernel log", "/proc/sys/kernel/"), ]
-try:
-    open("/sys/class/drm/card1/device/reset").close() and None
-except Exception:
-    pass
-import os
-for name, path in (("rebind card1 (write remove/rescan)", "/sys/class/drm/card1/device/rescan"),
-                   ("reset card1", "/sys/class/drm/card1/device/reset")):
+# *** THE SECOND CARD'S PATH IS PASSED IN, NOT HARDCODED AS `card1`. *** Measured
+# 2026-10-02: after a device-lost event the second B580 came back as
+# /dev/class/drm/card2 (226:2) where it had been card1 (226:1), so the literal
+# below pointed at a node that does not exist and this section reported
+# "cannot test from here" about a path that was never the right one to test --
+# a FALSE diagnostic, worse than printing nothing. The main body of this script
+# already derives $A/$B by glob; this embedded block was the one place that had
+# not been converted, which is the AUDIT #3/#12 shape again: the rule held at one
+# site and was re-derived (wrongly) at the next.
+GPU_HEALTH_CARD_B="$B" python3 - <<'PY'
+import errno, os
+b = os.environ["GPU_HEALTH_CARD_B"]
+name_b = os.path.basename(os.path.dirname(b))
+for name, path in ((f"rebind {name_b} (write rescan)", b + "/rescan"),
+                   (f"reset {name_b}", b + "/reset")):
     try:
         fd = os.open(path, os.O_WRONLY); os.close(fd)
         print(f"  {name:44s} writable")
