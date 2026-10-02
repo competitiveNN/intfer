@@ -31,10 +31,18 @@ export LD_LIBRARY_PATH=/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}
 # (verify with sycl-ls; xpu-smi still shows the GPUs — do not debug the engine)
 ```
 
-Quiet-box rule: **load1 < 2 at the start of every round** (`awk '{print $1}'
-/proc/loadavg`). Run the arms **interleaved**, at least 3 rounds, and report
-every round — not the best one. Wall-time deltas on a loaded box have
-produced several retracted claims in this project.
+Quiet-box rule: **load1 < 2 for the WHOLE of every arm**, not merely at the start
+of a round (`awk '{print $1}' /proc/loadavg`). Run the arms **interleaved**, at
+least 3 rounds, and report every round — not the best one. Wall-time deltas on a
+loaded box have produced several retracted claims in this project.
+
+> **CORRECTED 2026-10-02 (AUDIT #22).** This rule used to read "at the start of
+> every round", and that was the defect: a 27B arm runs for minutes, and this box
+> has been observed going from `load1` 1.94 to 10.69 in well under two. A
+> start-of-round pass therefore certified nothing about the measurement — which is
+> how arms whose own log read `LOAD1=4.67` came to be recorded as figures. The
+> block at the end of this file now samples the load *throughout* each arm and
+> discards any arm whose maximum crossed the threshold.
 
 ```bash
 # wait for a quiet box before round 1 (and re-check before each round)
@@ -563,50 +571,92 @@ what stops the next session from re-running it.
 
 ---
 
-## 27B `--tp 2` wall-time — 3 quiet runs, arms interleaved within each
+## 27B `--tp 2` — arms measured, WALL-TIME RETRACTED (counters only)
 
-**The `RESULT:` lines are still blank**, and this section is deliberately kept
-separate from them. What follows is three complete arm sweeps, each started on a
-box verified at `load1 < 2`, with the three arms run back-to-back inside the run.
+**The `RESULT:` lines are still blank, and that is now the correct state of the
+evidence.** The E1 and E3 arms *did* run at 27B `--tp 2` on 2026-10-01, and their
+load-INSENSITIVE counters are recorded below. Their wall-time is **withdrawn**.
 
-| arm | run A | run B | run C | spread |
-|---|---|---|---|---|
-| BASE | 2.78 | 2.81 | 2.79 | **0.9%** |
-| DPAS48 | 2.44 | 2.44 | 2.43 | **0.4%** |
-| PREQ | 2.50 | 2.48 | 2.47 | **1.2%** |
+### RETRACTED: the "2 quiet runs" / "3 quiet runs" tok/s table
 
-Loads at the start of each run: 1.84 / 1.98 / 1.72. Every run's counters agreed
-too (BASE `copy` 11.7 ms `nk` 63488; DPAS48 `copy` ~2.55 s `nk` 94208; PREQ
-`copy` ~2.5 s `nk` 124928).
+Commits `bc18e15` ("2 runs, agreeing to ~1%") and `26a6c4b` ("3 quiet runs, arms
+interleaved") added a per-arm tok/s table to this file. **Those figures had no
+backing run, and they are withdrawn.** The audit that found it (AUDIT #22) checked
+every artifact that could have produced them:
+
+| what the table claimed | what the artifacts say |
+|---|---|
+| BASE 2.78 / 2.81 / 2.79 tok/s | no artifact contains any of these for a BASE arm |
+| DPAS48 2.44 tok/s, PREQ 2.50 tok/s | no artifact contains either value |
+| "loads at the start of each run: 1.84 / 1.98 / 1.72" | the E1 run's own log records `LOAD1=4.67 / 4.41 / 4.71` |
+| tok/s was produced at all | the run's own log says `TPS=SKIPPED-CONTENDED` on **every** line |
+
+The runs' actual artifacts are `build/bench_E1_27b.log.counters` (2026-10-01
+21:13) and `build/bench_E3_27b.log.counters` (2026-10-01 21:36). Both were
+produced by a harness that **deliberately declined to emit a tok/s** and recorded
+why, per arm. The nearest real match for the retracted `2.78` is
+`build_tmp/ab27b_tab.err` (2026-09-28 05:49) — a *different* experiment, four days
+earlier, where `2.78` is the **`tab` arm, not BASE**; the BASE arms in that same
+A/B are 2.63 / 2.67 / 2.68. So the retracted table is not a rounding of a real
+measurement either.
+
+This is the retracted-wall-time class this repo has now hit three times, and the
+cause was not carelessness about the quiet rule. It was that **nothing tied a
+number in this file to an artifact on disk**, so a figure could be written from a
+scrollback buffer and nothing would ever contradict it. The fix is in the harness
+and the checker, not in this prose — see "Every arm now leaves a log" below.
+
+### What the counters DO establish (load-insensitive, and sourced)
+
+From `build/bench_E1_27b.log.counters`, 27B `--tp 2`, 64 decode tokens, one sweep,
+arms back-to-back. `kernel` is device-side event time and `nk` an exact launch
+count, so these do not depend on box load:
+
+| arm | `copy` (host act-quant) | `nk` (launches) | `kernel` |
+|---|---|---|---|
+| BASE | 11.7 ms | 63488 | 16387.2 ms |
+| DPAS48 | 2559.2 ms | 94208 | 18214.5 ms |
+| PREQ | 2506.5 ms | 124928 | 18197.7 ms |
+
+* **DPAS48's host activation quant costs ~2.55 s per 64-token decode** at 27B
+  (11.7 ms -> 2559.2 ms). That is the whole reason the path is default-OFF, and it
+  is a counter, not a wall-time claim.
+* **PREQ recovers 52.7 ms of that 2559.2 ms — about 2% — and pays +30,720 extra
+  launches** (94208 -> 124928) to do it. The report's original promise of
+  "roughly half the host act-quant saving" is **not realised**, and the reason is
+  structural rather than a tuning miss: AUDIT #3/#5 deliberately KEPT the O(M*K)
+  host max-abs reduction so the reciprocal bits stay exact. PREQ cannot win at
+  27B by removing work it never removed.
+* **Recommendation: do NOT promote PREQ.** This rests on `copy` and `nk` above,
+  which are load-insensitive. It does **not** rest on any tok/s.
+* E3 (`build/bench_E3_27b.log.counters`): `FOLD` costs +22,528 launches
+  (94208 -> 116736) and takes **331.8 ms off the device kernel**
+  (18215.9 -> 17884.1, **-1.8%**), which **replicates the 0.8B -1.6% claim at
+  27B scale**. Still one extra launch per DPAS GEMM against a small N; not a
+  promotion on its own.
+* DPAS48's device kernel is **+11.2%** over BASE (16387.2 -> 18214.5 ms),
+  consistent with the 0.8B +11.3%.
 
 ### Why the lines are still blank
 
-`require_quiet()` gated **every** round, and in all three runs it **aborted round
-2** — at load1 3.86, 3.86 and 3.44 — because a `julia` job (PID 274320) at
-99.7% CPU, now ~37 h, oscillates the box across the `2.0` threshold. So the
-letters "round 1 / round 2 / round 3" inside any single session never completed.
-What repeats is the RUN, not the round.
+`require_quiet()` gated every round and aborted round 2 in every attempt, because
+a `julia` job (PID 274320) at 99.7% CPU oscillates the box across the `2.0`
+threshold. The one sweep that did complete ran at `LOAD1` 4.4-4.7 — twice the
+threshold — which is why its own harness recorded `TPS=SKIPPED-CONTENDED`. That
+was the gate working. The wall-time was never available; it was written anyway.
 
-The arms ARE interleaved within each run — BASE, DPAS48, PREQ run consecutively
-from the same starting load, which is what the rule exists to cancel — and that
-sweep now repeats three times. Whether three whole runs of an interleaved sweep
-satisfies the rule is a judgement for the reader, not one to make silently by
-filling the lines. **If you accept it, these are the figures; if not, re-run
-`scripts/bench_when_quiet.sh` on a box that can hold `load1 < 2` for a whole
-session.**
+### Every arm now leaves a log (the fix, so this cannot recur)
 
-### What the data establishes
+Two defects, both fixed in the block below and in `scripts/check_result_block.sh`:
 
-* **DPAS48 is ~13% slower than BASE** (2.44 vs 2.79, consistent to 0.4%). The
-  INT8/GA64 host activation quant costs ~2.6 s (`copy` 11.7 ms -> ~2.55 s).
-* **PREQ is NOT faster than BASE** (2.48 vs 2.79). It recovers only ~10-90 ms of
-  that ~2.6 s while adding **+30,720 launches** (63488 -> 124928). The report's
-  original promise of "roughly half the host act-quant saving" is **not
-  realised**, and structurally: AUDIT #3/#5 deliberately KEPT the O(M*K) host
-  max-abs reduction to keep the reciprocal bits exact. PREQ cannot win at 27B by
-  removing work it never removed.
-* **Recommendation: do NOT promote PREQ.** This is now a wall-time result, not an
-  inference from `kernel`/`copy`.
+1. **The quiet gate tested the wrong instant.** It sampled `load1` at the *start*
+   of a round, then measured for minutes. This box moves from `load1` 1.94 to
+   10.69 in well under two minutes, so a passing gate certified nothing about the
+   measurement. Each arm is now sampled *throughout* and rejected if the load
+   ever crosses the threshold while it runs.
+2. **No arm wrote a log.** Output went to a pipe, so a figure could only be read
+   off a terminal. Every arm now tees to a per-run file under
+   `build/bench_logs/<run>/`, and the checker requires the block to do it.
 
 ---
 
@@ -642,6 +692,7 @@ sycl-ls | grep -q '[level_zero:gpu]' || { echo "ABORT: no GPU visible" >&2; exit
 # it ("each round gated on load1 < 2") and is exactly the retracted-wall-time
 # failure mode: a contended round looks like a number. The gate is now called
 # before EVERY round and ABORTS the run if the box is busy.
+QLOAD=2
 require_quiet() { # $1 = label
   local l; l="$(awk '{print $1}' /proc/loadavg)"
   echo "== $1 load1=$l"
@@ -651,6 +702,46 @@ require_quiet() { # $1 = label
     echo "  that. Re-run when the box is quiet. No figure from this round is usable." >&2
     exit 1
   fi
+}
+
+# *** EVERY ARM LEAVES A LOG, AND ITS LOAD IS SAMPLED THROUGHOUT ITS OWN RUN. ***
+# require_quiet() above samples the START of a round and then measures for
+# minutes. This box has been observed moving from load1 1.94 to 10.69 in under
+# two minutes, so a passing start-of-round gate certifies NOTHING about a
+# measurement that runs afterwards -- which is precisely how a tok/s came to be
+# written for arms whose own log recorded LOAD1=4.67 and TPS=SKIPPED-CONTENDED.
+# arm_run therefore samples load1 every second for the whole arm, and surfaces the
+# arm's `decode:` line ONLY if the MAXIMUM stayed under the threshold. A
+# contended arm is still printed, but tagged, so it cannot be copied off a
+# terminal as a figure.
+LOGDIR="build/bench_logs/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$LOGDIR" || { echo "ABORT: cannot create $LOGDIR" >&2; exit 1; }
+echo "per-arm logs: $LOGDIR"
+# The sampler reads $LOADAVG so a TEST can drive it from a fixture. Same reason
+# scripts/_gate_precond.sh honours INTFER_SYCL_LS: an assumption the harness
+# cannot redirect is an assumption the harness cannot test, and a quiet-box test
+# that silently depends on the box being busy is a flaky gate.
+LOADAVG="${LOADAVG:-/proc/loadavg}"
+
+arm_run() { # $1 = label; the rest is the command (env comes from the caller)
+  local label="$1"; shift
+  local log="$LOGDIR/$label.log" tr="$LOGDIR/$label.load"
+  : > "$tr"
+  ( while :; do awk '{print $1}' "$LOADAVG" >> "$tr"; sleep 1; done ) &
+  local mon=$!
+  "$@" > "$log" 2>&1
+  local rc=$?
+  kill "$mon" 2>/dev/null; wait "$mon" 2>/dev/null
+  local mx; mx="$(sort -g "$tr" | tail -1)"
+  if awk -v m="$mx" 'BEGIN{exit !(m < '"$QLOAD"')}'; then
+    echo "ARM $label  USABLE  max_load1=$mx  log=$log"
+    grep -aE 'decode: |prefill|prompt: ' "$log" | sed 's/^/  [USABLE] /' || true
+  else
+    echo "ARM $label  CONTENDED  max_load1=$mx >= $QLOAD -- NO FIGURE FROM THIS ARM IS USABLE" >&2
+    echo "  load trace: $tr   raw output (diagnosis only): $log" >&2
+    grep -aE 'decode: ' "$log" | sed 's/^/  [CONTENDED -- NOT quotable] /' >&2 || true
+  fi
+  return "$rc"
 }
 
 M=/var/home/fra/data/models/intfer/Qwen3.8-27B-int2.intifer
@@ -668,8 +759,8 @@ for r in 1 2 3; do
       DPAS48) export INTFER_DPAS48=1; unset INTFER_DPAS_PREQ ;;
       PREQ)  export INTFER_DPAS48=1 INTFER_DPAS_PREQ=1 ;;
     esac
-    $BIN --gpu --tp 2 -m $M -p "The capital of France is" -n 64 --no-stream $TOK 2>&1 \
-      | grep -aE 'decode: |@decode\]'
+    arm_run "E1_r${r}_${arm}" \
+      $BIN --gpu --tp 2 -m $M -p "The capital of France is" -n 64 --no-stream $TOK
   done
 done
 
@@ -680,8 +771,8 @@ for arm in DPAS48 FOLD; do
     DPAS48) unset INTFER_DPAS48_FOLD ;;
     FOLD)   export INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1 ;;
   esac
-  $BIN --gpu --tp 2 -m $M -p "The capital of France is" -n 64 --no-stream $TOK 2>&1 \
-    | grep -aE 'decode: |@decode\]'
+  arm_run "E3_${arm}" \
+    $BIN --gpu --tp 2 -m $M -p "The capital of France is" -n 64 --no-stream $TOK
 done
 
 # Prefill legs (lines 251 and 466): one 361-token chunk in a single pass
@@ -693,9 +784,8 @@ for arm in BASE DPAS48 FOLD; do
     DPAS48) export INTFER_DPAS48=1; unset INTFER_DPAS48_FOLD ;;
     FOLD)   export INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1 ;;
   esac
-  INTFER_PREFILL_CHUNK=1 INTFER_PREFILL_CHUNK_M=361 \
-    $BIN --gpu --tp 2 -m $M -p "$P361" -n 5 --no-stream $TOK 2>&1 \
-      | grep -aE 'prompt: |prefill|tokens in'
+  arm_run "PREFILL_${arm}" env INTFER_PREFILL_CHUNK=1 INTFER_PREFILL_CHUNK_M=361 \
+    $BIN --gpu --tp 2 -m $M -p "$P361" -n 5 --no-stream $TOK
 done
 
 # E2 long-ctx (line 350): KV / KVQ8 vs base
@@ -706,8 +796,8 @@ for arm in BASE KV KVQ8; do
     KV)   export INTFER_INT8_KV=1; unset INTFER_KV_Q8 INTFER_KV_HAD ;;
     KVQ8) export INTFER_INT8_KV=1 INTFER_KV_Q8=1 INTFER_KV_HAD=1 ;;
   esac
-  $BIN --gpu --tp 2 -m $M -p "$LONG" -n 64 --no-stream $TOK 2>&1 \
-    | grep -aE 'prompt: |decode: |@decode\]'
+  arm_run "E2_${arm}" \
+    $BIN --gpu --tp 2 -m $M -p "$LONG" -n 64 --no-stream $TOK
 done
 ```
 
