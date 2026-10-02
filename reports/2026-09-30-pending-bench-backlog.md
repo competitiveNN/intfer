@@ -563,6 +563,46 @@ what stops the next session from re-running it.
 
 ---
 
+## PARTIAL wall-time at 27B `--tp 2` — 2 runs x 1 round, NOT the 3-round protocol
+
+**These are NOT `RESULT:` values and the `RESULT:` lines stay blank.** This
+repo's rule is 3 interleaved rounds, every round reported, never the best one.
+The box could not hold a quiet window long enough: `julia` (PID 274320) at
+99.7% CPU keeps load1 oscillating ACROSS the `2.0` threshold, so
+`require_quiet()` admitted round 1 and then aborted round 2 at load1=3.86. That
+is the gate working, not a failure to measure.
+
+Two independent quiet runs did complete a full arm sweep (27B, `--tp 2`,
+64 decode tokens, TP=sharded). Load at the start of each round is shown.
+
+| arm | run A tok/s | run B tok/s | spread | copy (ms) | nk |
+|---|---|---|---|---|---|
+| BASE | 2.78 | 2.81 | 1.1% | 11.7 | 63488 |
+| DPAS48 | 2.44 | 2.44 | 0.0% | 2607.4 | 94208 |
+| PREQ | 2.50 | 2.48 | 0.8% | 2520.3 | 124928 |
+
+The two runs agree to ~1% on every arm, which is the strongest statement this
+data supports. What it establishes, consistent with the load-insensitive
+counters already recorded:
+
+* **DPAS48 is ~13% slower than BASE at 27B.** The INT8/GA64 host activation
+  quant costs ~2.6 s (`copy` 11.7 ms -> 2607 ms).
+* **PREQ is NOT faster than BASE, despite recovering host time.** It recovers
+  only ~87 ms of that 2.6 s while adding **+30,720 launches** (63488 ->
+  124928). The report's original promise -- "roughly half the host act-quant
+  saving" -- is **not** realised, and the reason is structural: AUDIT #3/#5
+  deliberately KEPT the O(M*K) host max-abs reduction so the reciprocal bits
+  stay exact, which is the same bit-exactness contract the whole path is
+  built on. PREQ cannot win at 27B by removing work it never removed.
+* E2 (KV) and E3 (FOLD) legs did not run -- the abort happened in E1 round 2.
+
+**To complete the protocol**, re-run `scripts/bench_when_quiet.sh` when the box
+can hold load1 < 2 for the whole batch. Do NOT backfill the `RESULT:` lines from
+this table: it is 2 single-round runs, and the point of the 3-round rule is
+exactly to reject a figure that has not survived repetition.
+
+---
+
 ## ONE COMMAND FILLS EVERY `RESULT:` LINE ABOVE (added 2026-10-01)
 
 Six `RESULT:` lines in these two reports are blank because they need **wall
