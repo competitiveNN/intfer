@@ -177,6 +177,13 @@ dispatch() { # $1 = label -> runs it
       # the maximum-over-arm criterion proven BEHAVIOURALLY in both directions.
       # Read-only, no GPU, no build.
       timeout 600 bash "$SCRIPT_DIR/check_bench_load_gate.sh"; return $? ;;
+    check_verdict_scope.sh)
+      # AUDIT #29. Closes AUDIT #28 defect #1 as a FAMILY: every non-verifier in
+      # scripts/ that emits a spread-bounded verdict must be the one owner or a
+      # declared site, and the owner's gate must be over the rounds the two arms
+      # hold IN COMMON. Read-only, no GPU, no build; plants its own counter-
+      # examples in a temp tree.
+      timeout 600 bash "$SCRIPT_DIR/check_verdict_scope.sh"; return $? ;;
     check_engine_cert.sh)
       # AUDIT #24. run_all_checks certifies the TOOLING; scripts/run_ten_gates.sh
       # certifies the ENGINE. This is what stops the two being reconciled by
@@ -249,6 +256,14 @@ dispatch() { # $1 = label -> runs it
       # sharp state: the helper stops withholding while every text property
       # still passes, so only the behavioural probe can see it.
       timeout 1800 bash "$SCRIPT_DIR/mutate_bench_load_gate.sh"; return $? ;;
+    mutate_verdict_scope.sh)
+      # AUDIT #29. Every state damages the TREE the checker grades, in a copy of
+      # scripts/, and the checker that runs is the sandbox's OWN copy -- the
+      # first version ran the real checker, which made its two checker-patching
+      # states unobservable by construction. V-F is an isolation case, not a
+      # mutation: it empties the harvest with the self-tests disabled so the
+      # enumeration guard is the only thing that can fire.
+      timeout 900 bash "$SCRIPT_DIR/mutate_verdict_scope.sh"; return $? ;;
     mutate_engine_cert.sh)
       # AUDIT #24. Plants ten_gates/HEAD into a SANDBOX build dir (via
       # INTFER_BUILD_DIR) so the real certification is never touched, and drives
@@ -637,17 +652,54 @@ else
 fi
 
 # --- verdict ----------------------------------------------------------------
+# *** THE VERDICT IS WRITTEN TO DISK, WITH ITS OWN EXIT CODE. *** Measured gap,
+# 2026-10-02: after a full PASS run the only artifact was a log file whose final
+# line said PASS, and the operator's next probe ("grep -c 'RUN ALL CHECKS:
+# PASS'") printed a COUNT, which is not an exit code -- so the script's own `$?`
+# existed nowhere. A printed verdict is the script talking about itself; this is
+# the AUDIT #22 traceable-artifact rule applied to the harness that certifies
+# everything else ("a number in prose is a citation"), and it is what lets a later
+# session say "the stack passed at c57f2bf" by reading a file.
+#
+# *** DELIBERATELY NOT NAMED *last_pass.stamp. *** That suffix is the stamp
+# vocabulary the stamp assertion enumerates, and a stack certification is not a
+# matrix pass: it would join the population it is supposed to be asserting about
+# and be graded by the same rules (one home per stamp dir, known-matrix
+# ownership). It is a CERTIFICATION, a different artifact, in its own directory.
+CERT_DIR="$BUILD_DIR/stack_cert"
+CERT="$CERT_DIR/cert"
+mkdir -p "$CERT_DIR" 2>/dev/null || true
+write_cert() { # $1 rc, $2 one-word verdict
+  {
+    echo "stamp=stack_cert"
+    echo "sha=$HEAD_SHA"
+    echo "short=$HEAD_SHORT"
+    echo "rc=$1"
+    echo "verdict=$2"
+    echo "failed=$FAILED"
+    echo "stale=$STALE"
+    echo "unproven=$UNPROVEN"
+    echo "stamps=$STAMP_COUNT"
+    echo "quick=${INTFER_QUICK:-0}"
+    echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$CERT.tmp" 2>/dev/null && mv "$CERT.tmp" "$CERT"
+}
+
 echo
 if [ "$FAILED" -ne 0 ]; then
+  write_cert 1 FAIL
   echo "RUN ALL CHECKS: FAIL ($FAILED step(s) FAILED) -- a real regression." >&2
   [ "$UNPROVEN" -ne 0 ] && echo "  plus $UNPROVEN step(s) unproven (stale evidence)." >&2
+  echo "  certified in $CERT (rc=1)" >&2
   exit 1
 fi
 if [ "$STALE" -ne 0 ] || [ "$UNPROVEN" -ne 0 ]; then
+  write_cert 2 UNPROVEN
   echo "RUN ALL CHECKS: $STAMP_COUNT stamp(s) checked, $STALE STALE, $UNPROVEN step(s) unproven, for $HEAD_SHORT." >&2
   echo "  NOT a regression: the evidence does not cover this commit. Nothing is" >&2
   echo "  wrong with the code; the proof is just older than the tree." >&2
   echo "  Re-run the named matrix (or all of them) so its stamp names $HEAD_SHORT." >&2
+  echo "  certified in $CERT (rc=2)" >&2
   exit 2
 fi
 echo "RUN ALL CHECKS: PASS ($STAMP_COUNT stamp(s), all at $HEAD_SHORT)"
@@ -656,4 +708,6 @@ if [ "${INTFER_QUICK:-0}" = "1" ]; then
   echo "  NOTE: INTFER_QUICK=1 -- no matrix was RE-RUN, so only pre-existing stamps"
   echo "  were asserted. That is weaker than a full run: re-run without the flag."
 fi
+write_cert 0 PASS
+echo "  certified in $CERT (rc=0)"
 exit 0
