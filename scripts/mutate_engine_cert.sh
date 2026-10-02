@@ -107,6 +107,20 @@ rm -f "$SB/ten_gates/HEAD"
 check_state "E-C" 2 'UNPROVEN' "no artifact at all is unproven, not a regression"
 
 # E-D: weaken the engine-input filter while the artifact is STALE.
+#
+# *** THE REPLACEMENT MUST MATCH NOTHING, AND THE FIRST ATTEMPT DID NOT. *** It
+# weakened the filter to docs/|reports/|\.md$ -- but the artifact is planted at the
+# ROOT commit, and this repo really does have doc and report changes since then, so
+# the weakened filter still found "touched" files and still returned STALE. The
+# state then reported "the filter is not load-bearing", which was a confident false
+# conclusion about a mechanism that HAD been broken. A weakening must be provably
+# total, not merely weaker.
+#
+# `total` was also not incremented on this branch, so the tally said 3/3 PASS while
+# the summary listed E-D MISSED -- the self-contradicting-report class this repo
+# has now fixed three times, reintroduced by a state that bypasses the shared
+# check_state() helper. Every state now increments `total`, by construction here.
+total=$((total+1))
 restore_check; plant "$OLD"
 if ! pred_expect_present "E-D patch" "$(cat "$MUT")" 'examples/'; then
   echo "  E-D MISSED -- the input-filter anchor is gone (STATE fault)"
@@ -117,7 +131,7 @@ import os, sys
 p = os.environ["MUT"]
 s = open(p).read()
 old = "grep -E '"'"'^(src/|examples/|include/|scripts/test_|scripts/_gate_precond\\.sh|scripts/_gate_build\\.sh|scripts/setvars\\.sh)'"'"'"
-new = "grep -E '"'"'^(docs/|reports/|\\.md$)'"'"'"
+new = "grep -E '"'"'^(ZZZ_NEVER_MATCHES_THIS)'"'"'"
 assert s.count(old) == 1, "anchor count %d" % s.count(old)
 open(p, "w").write(s.replace(old, new))
 ' || { echo "  E-D MISSED -- patch did not apply (STATE fault)"; echo "E-D MISSED (patch)" >> "$LOG/summary.txt"; }
