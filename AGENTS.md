@@ -2531,9 +2531,27 @@ e.g. S3's contract column is 40 not 42).
       `max(spread of the two arms compared)` as the noise floor. A **single-round**
       or **empty** log now says it cannot support a delta instead of printing one
       (verified against a 1-round, a counters-only and an empty log, all rc=0 with
-      no crash). **This is the AUDIT #20 rule applied to a table: say which cells
+      no crash). **      This is the AUDIT #20 rule applied to a table: say which cells
       may be believed, and never print a central value without the spread that
       bounds it.**
+    - **THE DISCIPLINE ALREADY EXISTED IN ONE REPORT — WHICH IS WHY THE FAMILY HAD
+      TO BE ENUMERATED, NOT INHERITED FROM THE FIRST BUG.** The ARGMAX report
+      (`reports/archive/2026-10-01-device-argmax.md`) was written **by hand, a day
+      earlier, with all of it**: a per-column "**reliable?** yes/no" verdict,
+      `submit`/`usm_write`/`readback` marked **no**, the kernel column quoted as
+      **per-round values** (639.1/639.3/639.3 vs 641.9/641.6/641.6) so its 2.3 ms
+      delta can be seen to clear a 0.2 ms spread, and a noise **proof** by summing
+      the deltas *within* each round (+45.1/+11.2/+39.2 ms for three rounds of
+      identical work). So one report already met the standard the machine-written
+      summary contradicted — which is exactly the shape of AUDITs #3/#12/#19 (the
+      rule held at one site and was merely assumed at the next). Grepping for
+      `load-insensitive` across `scripts/` found **two more instances in the same
+      file**, both fixed: the header comment ("wall time AND the load-insensitive
+      [GPU profile] buckets") and the usage string, which still said
+      `<E1|E2|E3>` although the `case` had accepted `ARGMAX` for days. **No other
+      harness prints a bucket table** (`xmx_profile.sh` and `test_tp2_27b.sh` only
+      re-emit raw `[GPU profile]` lines and make no claim), so the family is closed
+      — by enumeration of the claim, not of the files the first fix touched.
     - **INSTALLING IT WHILE A BENCHMARK WAS RUNNING.** The fix had to reach a file
       the live driver was executing. Do **not** edit a running shell script in
       place — bash re-reads it by byte offset. It was staged in `build/` and moved

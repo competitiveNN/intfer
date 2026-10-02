@@ -5,9 +5,14 @@
 #   1. device preconditions, quiet gate (load1 < INTFER_QUIET_LOAD)
 #   2. STREAM IDENTITY FIRST, on every arm, before any timing is believed
 #   3. interleaved rounds (round-major, arm-minor), every round reported
-#   4. wall time AND the load-insensitive [GPU profile] buckets side by side
+#   4. wall time AND the [GPU profile] buckets side by side -- but SEPARATED BY
+#      WHETHER THEY MAY BE BELIEVED: `nk`/`nw`/`nr` are exact counters and
+#      `kernel` is device-side event time, while `submit`/`waitblock`/`copy`/
+#      `readback`/`usm_write` are HOST wall clock and track the box. This line
+#      used to call the whole set "load-insensitive", which is false, and the
+#      summary it heads repeated it until AUDIT #26.
 #
-# Usage: scripts/bench_reports_batch.sh <E1|E2|E3> [ROUNDS]
+# Usage: scripts/bench_reports_batch.sh <E1|E2|E3|ARGMAX> [ROUNDS]
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -33,7 +38,9 @@ QLOAD="${INTFER_QUIET_LOAD:-2.0}"
 # error.
 LOG="${INTFER_BENCH_LOG:-${INTFER_BUILD_DIR:-$ROOT/build}/bench_${BATCH}.log}"
 
-[ -n "$BATCH" ] || { echo "usage: $0 <E1|E2|E3> [ROUNDS]"; exit 1; }
+# ARGMAX is a real batch here (the case below accepts it); the usage string said
+# E1|E2|E3 only, so a user reading it would not know the lever's own batch name.
+[ -n "$BATCH" ] || { echo "usage: $0 <E1|E2|E3|ARGMAX> [ROUNDS]"; exit 1; }
 [ -x "$BIN" ] || { echo "FAIL: cli missing: $BIN"; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL"; exit 1; }
 python3 -c "open('/dev/dri/renderD128','rb').close()" 2>/dev/null \
