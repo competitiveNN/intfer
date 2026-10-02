@@ -757,13 +757,21 @@ reset_mutant
 # gives 0b and 0c an empty census -- the exact condition they must refuse.
 # Committed, not mutated: the defect is the tree, and there is no patch to apply.
 #
+# *** AND IT MUST LIVE INSIDE THE SANDBOX GIT REPO. *** The first version put it at
+# $SYNTH/empty/scripts, which is not a work tree, so the harness's dirty-tree guard
+# died at its own `git diff --quiet` and the state scored rc=1 for a reason that had
+# nothing to do with the census -- a state failing for an unrelated cause, which the
+# predicate below correctly refused to score as a catch. ROOT is dirname(SCRIPT_DIR),
+# so the directory has to be a checkout; $SB/emptysb is inside the sandbox repo, and
+# UNTRACKED files there are fine (the guard rejects tracked changes only).
+#
 # *** BOTH GUARDS ARE REQUIRED, not just one. *** 0b harvests the per-script
 # population and 0c harvests the scheduled one; they are separate loops with
 # separate counters, and fixing only the first is exactly what happened in the
 # first commit. N-P's baseline is the converse -- the same two guards must stay
 # SILENT on a populated census -- and it now asserts that as ABSENCE, so neither
 # half of this can be satisfied by a guard that always fires.
-EQ="$SYNTH/empty/scripts"
+EQ="$SB/emptysb/scripts"
 mkdir -p "$EQ"
 cp "$MUTANT" "$EQ/run_all_checks.sh"; chmod +x "$EQ/run_all_checks.sh"
 for sib in _gate_enum.sh _gate_precond.sh; do
