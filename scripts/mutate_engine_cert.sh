@@ -45,6 +45,14 @@ trap 'cp "$BAK" "$ART"; rm -f "$BAK"' EXIT
 
 SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_ec.XXXXXX")"
 TGT="$SB/check_engine_cert.sh"
+# *** THE SANDBOX MUST MIRROR scripts/ -- the missing-sibling class, AGAIN. ***
+# The checker resolves SCRIPT_DIR from its OWN location, so a bare copy finds no
+# _gate_enum.sh (fails with "command not found" and then wrongly reports that the
+# gate population did not enumerate) AND counts zero test_*.sh. Both are
+# artefact-shaped failures of a healthy checker. Symlink every script, then
+# overwrite the checker itself with the copy under test.
+for f in "$SCRIPT_DIR"/*.sh; do ln -sf "$f" "$SB/$(basename "$f")"; done
+rm -f "$TGT"
 cp "$CHECK" "$TGT"
 ORIG_C="$SB/.orig_check"; cp "$CHECK" "$ORIG_C"
 restore_check() { cp "$ORIG_C" "$TGT"; }
