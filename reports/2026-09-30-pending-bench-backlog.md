@@ -355,6 +355,33 @@ counters, not a claim about a measurement that was refused.
 > the "what this container CANNOT do" block in `scripts/gpu_health_check.sh`,
 > which had been reporting `EACCES` about a node that no longer existed).
 
+### RE-RUN 2026-10-02 (18:32Z) — COMPLETE 3-ROUND BATCH, all nine arms healthy
+`bench_reports_batch.sh E2 2` again, after the device-lost event, on a box that
+reported **2 devices**. No arm died, so the batch exits **rc=0** and the AUDIT #27
+guard stayed silent — which is the other half of the proof: it does not fire on a
+healthy run. Still **no tok/s**: every arm was `SKIPPED-CONTENDED`
+(`max_load1` 2.97–15.24).
+
+| arm | `nk` | `nw` | `nr` | kernel per round (ms) | median | spread |
+|---|---|---|---|---|---|---|
+| BASE | 63488 | 63488 | 16384 | 16366.8 / 16378.5 / 16375.4 | 16375.4 | 11.7 (0.1 %) |
+| KV | 63488 | 63488 | 16384 | 16369.8 / 16373.0 / 16367.4 | 16369.8 | 5.6 (0.0 %) |
+| KVQ8 | 63488 | 63488 | 16384 | 16369.5 / 16377.6 / 16373.6 | 16373.6 | 8.1 (0.0 %) |
+
+Per-round kernel delta vs BASE: `KV` **+3.0 / −5.5 / −8.0 ms** (median −5.5),
+`KVQ8` **+2.7 / −0.9 / −1.8 ms** (median −0.9). Both are **inside the 11.7 ms
+spread** and the signs differ round to round → **not a result**. This run's spread
+is 160× tighter than the first E2 attempt's (11.7 ms vs 679.3 ms) and 160×
+tighter than the E1 run's BASE spread (1875.5 ms) — a third independent
+confirmation that **the spread is a property of the run, not the arm**, so no
+"noise floor" may be quoted without the run it came from.
+
+**Verdict: DO NOT PROMOTE, now on a complete batch.** `nk`/`nw`/`nr` are
+**byte-identical across all three arms in all three rounds** — the exact part, and
+the part the lever's premise (`save part of the bulk D2H`) predicted would move.
+It did not move by one. `kernel` is unresolvable at this spread. There is nothing
+left for a quiet-box run to confirm.
+
 ### Expected direction
 - decode: improves, and the effect should **grow with context length** (test
   long ctx, not just a 5-token prompt — at short ctx the KV share is tiny and
