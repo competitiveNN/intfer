@@ -53,7 +53,20 @@ export INTFER_BENCH_URL="$URL" INTFER_BENCH_TURNS="$TURNS" INTFER_BENCH_MT="$MT"
 # texts are appended (one line per turn) for cache-ON vs cache-OFF diffing.
 # When INTFER_BENCH_PARITY_EXPECT is set, each turn's text must equal the
 # corresponding line or the script fails (multi-turn parity assertion).
-python3 - <<'EOF'
+
+# AUDIT #23 follow-up. This harness publishes TTFT / TPOT / E2E in SECONDS off the
+# SSE stream rather than a CLI tok/s, which is why it fell outside the original
+# derivation and was recorded as SCOPED, NOT DONE. It is a wall-time harness all
+# the same, and the prefix-cache A/B in reports/2026-09-26 is read off exactly
+# these numbers. So: sample the load for the WHOLE run and judge on the maximum,
+# keep the raw per-turn lines in a log, and surface them ONLY when the run stayed
+# under the threshold. The parity assertion still runs either way -- a withheld
+# figure is not a failed correctness check.
+# shellcheck source=scripts/_gate_loadlog.sh
+. "$SCRIPT_DIR/_gate_loadlog.sh"
+loadlog_init "${INTFER_BUILD_DIR:-$ROOT/build}/bench_logs/chat_$(date -u +%Y%m%dT%H%M%SZ)" >/dev/null
+
+loadlog_arm chat_runs python3 - <<'EOF'
 import json, os, urllib.request, time, sys
 URL=os.environ["INTFER_BENCH_URL"]; TURNS=int(os.environ["INTFER_BENCH_TURNS"]); MT=int(os.environ["INTFER_BENCH_MT"])
 par_out=os.environ.get("INTFER_BENCH_PARITY_OUT","")
@@ -93,3 +106,18 @@ for turn,p in enumerate(prompts):
 if outh: outh.close()
 sys.exit(fail)
 EOF
+rc=$?
+echo "  leg chat_runs  max_load1=$_LL_MAX  log=$_LL_LOG"
+# The per-turn lines are figures. Print them only when the run stayed under the
+# threshold; otherwise name the withheld state and point at the log. Quoting a
+# TTFT measured on a box that swung past the threshold mid-run is the same defect
+# as quoting a contended tok/s, just in different units.
+if [ "$_LL_USABLE" = 1 ]; then
+  grep -aE '^turn[0-9]+:' "$_LL_LOG" | sed 's/^/  /' || true
+  echo "  FIGURES USABLE (max_load1=$_LL_MAX < $INTFER_QUIET_LOAD)"
+else
+  echo "  FIGURES WITHHELD: load1 reached $_LL_MAX >= $INTFER_QUIET_LOAD during the run."
+  echo "  Raw per-turn lines are in $_LL_LOG for DIAGNOSIS ONLY -- not quotable."
+  echo "  headline: $(loadlog_field "TTFT/TPOT/E2E over ${TURNS} turn(s)")"
+fi
+exit "$rc"

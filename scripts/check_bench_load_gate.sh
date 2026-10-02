@@ -21,10 +21,22 @@
 #      arm whose MAXIMUM load crossed the threshold.
 #
 # The population is DERIVED from the scripts themselves, never from a list of
-# names this file remembers: a non-gate script that scrapes a timing figure out
-# of CLI output. Comment lines are stripped first, because a prose mention of
-# "tok/s" is not a figure -- the AUDIT #21 rule, and without it this checker
-# would demand a load gate from run_all_checks.sh over a comment.
+# names this file remembers: a non-gate script that scrapes a timing figure.
+# Comment lines are stripped first, because a prose mention of "tok/s" is not a
+# figure -- the AUDIT #21 rule, and without it this checker would demand a load
+# gate from run_all_checks.sh over a comment.
+#
+# *** CRITERION DISAGREEMENT, RECORDED HERE BECAUSE IT IS DELIBERATE. ***
+# This file STRIPS comments before matching; its sibling
+# scripts/check_build_dir_consumers.sh does NOT. Both choices are right for their
+# own question, and a previous round of this audit proved the difference the hard
+# way: a usage comment in _gate_loadlog.sh containing `build/bench_logs/run1` was
+# graded as a build-path consumer and turned the stack red, because that
+# classifier does not strip. Here, NOT stripping would pull run_all_checks.sh into
+# the population over a prose mention of "tok/s" and demand a load gate from a
+# script that publishes no figure. So: strip when the match decides MEMBERSHIP of
+# a population, because a comment is not a behaviour; do not strip when the match
+# is only a hint. Do not "harmonise" these two without re-deriving both.
 #
 # Usage: scripts/check_bench_load_gate.sh
 # Exit: 0 = every harness gated, 1 = drift, 2 = setup.
@@ -51,7 +63,13 @@ for f in scripts/*.sh; do
     scripts/test_*|scripts/check_*|scripts/mutate_*) continue ;;
   esac
   [ "$f" = "$HELPER" ] && continue          # the helper IS the home, not a consumer
-  if strip_comments "$f" | grep -qE 'tok/s|tokens in'; then
+  # A "timing figure" is a RATE (tok/s, "tokens in") or a LATENCY (TTFT, TPOT,
+  # E2E). The latency arm was added when bench_chat.sh was wired: it measures
+  # seconds off the SSE stream and quotes none of the rate tokens, so the original
+  # pattern excluded a genuine wall-time harness -- which is precisely the
+  # "derive, do not remember" lesson closing on itself. State B-G proves this
+  # widened arm can fail.
+  if strip_comments "$f" | grep -qE 'tok/s|tokens in|TTFT|TPOT|E2E'; then
     POP="$POP $f"
   fi
 done
@@ -76,24 +94,27 @@ for f in $POP; do
   fi
 done
 
-# ---- (2) every harness routes its throughput figure through the gate -------
+# ---- (2) every harness routes its FIGURE through the gate ------------------
+# Two accepted forms of "the figure was consulted before it was emitted", both
+# real, neither a loophole:
+#   $(loadlog_field ...)  a value routed through the withholding primitive
+#   $_LL_USABLE           an emission gated on the arm's verdict (bench_chat.sh
+#                         withholds a whole block of per-turn figures at once,
+#                         so there is no single field to wrap)
+#
 # An earlier version of this property tried to detect "a bare throughput write"
 # line-by-line. It was a FALSE-POSITIVE MACHINE and is recorded here so nobody
 # reinstates it: the legit shapes all trip it -- the scrape itself
 # (`tps="$(grep -aoE tok/s ...)"`), a printf whose format says `TPS=%s` while the
 # VALUE arrives from loadlog_tps_field on the NEXT line, and `tok/s=$TPS_FIELD`
 # which is already gated. A check that cries wolf is the mirror defect.
-#
-# The robust version states what actually guarantees the property: a harness can
-# only obtain its figure from the function that withholds, and (4) proves that
-# function withholds. Composition, not pattern-matching.
-printf '\n%-4s %-34s %s\n' "" "harness" "figure obtained via loadlog_tps_field"
+printf '\n%-4s %-34s %s\n' "" "harness" "figure consulted before emission"
 for f in $POP; do
-  if strip_comments "$f" | grep -q '\$(loadlog_tps_field'; then
+  if strip_comments "$f" | grep -qE '\$\(loadlog_(tps_)?field|_LL_USABLE'; then
     printf '  %-4s %-34s %s\n' "ok" "$(basename "$f")" "yes"
   else
     printf '  %-4s %-34s %s\n' "FAIL" "$(basename "$f")" \
-      "NO -- it builds a throughput figure without the gate that withholds"
+      "NO -- it emits a figure without consulting the gate that withholds"
     bad=$((bad+1))
   fi
 done

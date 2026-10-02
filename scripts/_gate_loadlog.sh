@@ -86,14 +86,18 @@ loadlog_arm() { # $1 = label; the rest is the command (env comes from the caller
   return "$rc"
 }
 
-# The field a caller should WRITE for tok/s. A contended arm yields the same
-# SKIPPED-CONTENDED token the counters-only mode has always written, so the two
-# modes cannot disagree and a reader cannot mistake a busy-box number for a
-# measurement.
-loadlog_tps_field() { # $1 = the scraped "N.N tok/s" text (may be empty)
+# THE primitive: a value a caller is about to publish, or the withheld token.
+# Every figure this repo quotes goes through here, whatever its unit -- a tok/s, a
+# TTFT in seconds, an aggregate rate. One primitive means one definition of
+# "withheld", so two harnesses cannot invent two spellings of it.
+loadlog_field() { # $1 = the value (may be empty)
   if [ "$_LL_USABLE" = 1 ]; then
     printf '%s' "$1"
   else
     printf 'SKIPPED-CONTENDED'
   fi
 }
+
+# The tok/s spelling, kept as a named alias because every caller reads better with
+# it and the counters-only mode's field is literally called TPS.
+loadlog_tps_field() { loadlog_field "$1"; }

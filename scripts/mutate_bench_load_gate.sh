@@ -50,10 +50,13 @@ TGT="$SB/scripts/check_bench_load_gate.sh"
 ORIG_T="$SB/.orig_target"
 cp "$TARGET" "$ORIG_T"
 restore() { cp "$ORIG_T" "$SB/scripts/$(basename "$TARGET")"
-            cp "$CHECK" "$TGT"; }
+            cp "$CHECK" "$TGT"
+            rm -f "$SB/scripts/bench_fake_latency.sh"; }
 run_check() { ( cd "$SB" && bash "$TGT" 2>&1 ); }
 # The harness a state damages, as a sandbox path.
 H="$SB/scripts/$(basename "$TARGET")"
+# The latency-unit harness, for the states that target the widened derivation.
+HC="$SB/scripts/bench_chat.sh"
 
 echo "== stamp-population leak assertion (AS FOUND) =="
 pop_assert_no_leak "before" || exit 1
@@ -160,8 +163,43 @@ MUTATE_FN() {
 run_state "B-E" 'B_E' 'published a figure for a drifting arm' \
   "the helper stops withholding; only the behavioural probe can see it"
 
+# B-F: the newly-wired LATENCY harness regresses to publishing unconditionally --
+# i.e. exactly the defect it was wired to remove. Two hunks, because removing only
+# the branch would leave the helper sourced and the state invisible, which is the
+# AUDIT #17 mutual-masking shape. Marked on the harness NAME, which is unique to
+# this state: B-A trips the same property on a different file, and a shared
+# marker would let one state's catch be scored as another's.
+MUTATE_FN() {
+  patch_literal "$HC" 'if [ "$_LL_USABLE" = 1 ]; then' 'if true; then   # B_F always publishes'
+  patch_literal "$HC" '. "$SCRIPT_DIR/_gate_loadlog.sh"' ':   # B_F removed the shared gate'
+  grep -q 'B_F' "$HC"
+}
+run_state "B-F" 'B_F' 'bench_chat\.sh' \
+  "the latency harness stops gating its TTFT/TPOT/E2E figures"
+
+# B-G: *** PROVES THE WIDENED DERIVATION CAN FAIL. *** A plant that matches ONLY
+# the latency arm of the criterion -- TTFT/TPOT/E2E, and not one rate token. If
+# the population still keyed on `tok/s|tokens in` this file would be INVISIBLE to
+# the checker and the state could never pass, so B-G is the state that makes the
+# widening load-bearing rather than decorative. It is also the audit's own lesson
+# closing on itself: bench_chat.sh was missed by the original derivation for
+# exactly this reason, so the miss is now the test.
+MUTATE_FN() {
+  cat > "$SB/scripts/bench_fake_latency.sh" <<'PLANT'
+#!/usr/bin/env bash
+# B_G plant: a wall-time harness in LATENCY units only -- no tok/s, no
+# "tokens in". If the derivation still keyed on rates alone this file would be
+# invisible, and this state could never pass.
+echo "turn0: TTFT=1.2s TPOT=0.05s/tok E2E=3.4s toks=64"
+PLANT
+  grep -q 'TTFT' "$SB/scripts/bench_fake_latency.sh"
+}
+run_state "B-G" 'B_G' 'bench_fake_latency' \
+  "an ungated latency-only harness is INVISIBLE to the derivation"
+
 restore
 echo
+echo "== states (each damages a HARNESS, not the checker) =="
 echo "== residue + restore integrity =="
 git -C "$ROOT" diff --quiet -- scripts/ 2>/dev/null \
   && echo "  ok    the tracked tree was never modified" || { echo "  FAIL tracked modified"; exit 1; }
