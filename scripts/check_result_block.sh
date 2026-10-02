@@ -128,16 +128,24 @@ else
   echo "  FAIL  block does not define arm_run -- arms are unlogged and ungated"
   bad=$((bad+1))
 fi
-n_bare="$(printf '%s\n' "$BLOCK" | grep -cE '^[[:space:]]*(\$BIN|env INTFER_).*\|' || true)"
-if pred_expect_absent "no-bare-piped-arm" "$n_bare" '^[1-9]'; then
-  echo "  ok    no arm pipes \$BIN straight into grep (all route via arm_run)"
+# Count, do not pattern-match. A same-line regex for "a bare piped arm" was
+# tried first and was VACUOUS: every arm in this block wraps with a trailing
+# backslash, so the `|` lands on the NEXT line, and the pattern matched ZERO
+# lines even on the healthy block -- it could not fail, and state R-I proved it.
+# Counting is also the stronger statement: every line that invokes $BIN must BE
+# an arm_run call, so the two totals must be equal.
+n_arms="$(printf '%s\n' "$BLOCK" | grep -cE '^[[:space:]]*arm_run ' || true)"
+n_bin="$(printf '%s\n' "$BLOCK" | grep -cE '^[[:space:]]*(\$BIN|env INTFER_)' || true)"
+if [ "$n_bin" -eq "$n_arms" ] && [ "$n_arms" -ge 4 ]; then
+  echo "  ok    all $n_arms arms route through arm_run (each \$BIN line is an arm_run call)"
 else
-  echo "  FAIL  $n_bare arm(s) still pipe \$BIN into a pipe: unlogged, ungated"
+  # This verdict line used to be an unconditional `ok` echo, so a run where the
+  # min-check had just FAILED still printed "ok 3 arm_run call sites" -- the
+  # self-contradicting output line recorded in AUDIT #12, committed a second time.
+  echo "  FAIL  $n_bin arm(s) invoke \$BIN directly but only $n_arms go through arm_run."
+  echo "        An arm that pipes straight to grep is unlogged and ungated."
   bad=$((bad+1))
 fi
-n_arms="$(printf '%s\n' "$BLOCK" | grep -cE '^[[:space:]]*arm_run ' || true)"
-enum_require_min "arm-run-callsites" "$n_arms" 4 || bad=$((bad+1))
-echo "  ok    $n_arms arm_run call sites (E1, E3, prefill, E2)"
 
 # ---- (g) arm_run persists the arm's own output and load trace --------------
 # Family 3 (stale/absent artifact) in its purest form: a measurement with no
@@ -245,6 +253,14 @@ else
     echo "  ok    behavioural: the accepted arm wrote a per-arm log"
   else
     echo "  FAIL  the accepted arm wrote no log"
+    bad=$((bad+1))
+  fi
+  # The load trace is asserted BEHAVIOURALLY too, not only by the text check: the
+  # sampler has to have produced one for the verdict to be a maximum at all.
+  if pred_expect_present "arm-gate-loadtrace" "$out_c3" '\.load'; then
+    echo "  ok    behavioural: a judged arm reports a per-arm load trace"
+  else
+    echo "  FAIL  no per-arm load trace -- nothing records what the arm was measured at"
     bad=$((bad+1))
   fi
 fi
