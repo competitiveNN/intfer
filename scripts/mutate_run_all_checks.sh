@@ -707,12 +707,16 @@ run_rac_cov "N-P" ".baseline"; npb=$?
 if [ "$npb" -ne 0 ] \
    || ! grep -q 'every check_\*/mutate_\* is in STEPS as well as dispatch()' \
         "$WORK/N-P.baseline.log" \
-   || grep -q 'never scheduled' "$WORK/N-P.baseline.log"; then
+   || grep -q 'never scheduled' "$WORK/N-P.baseline.log" \
+   || grep -qF 'no check_*/mutate_* files were found' "$WORK/N-P.baseline.log" \
+   || grep -qF 'over an empty set proves nothing' "$WORK/N-P.baseline.log"; then
   echo "FAIL: baseline N-P rc=$npb -- 0c must be SILENT and green on a healthy" >&2
   echo "  tree, or the state below cannot distinguish '0c fired' from 'the run" >&2
   echo "  died'. ($WORK/N-P.baseline.log)" >&2; exit 1
 fi
 echo "  ok    baseline N-P: 0c is silent and rc=0 on a healthy tree"
+echo "  ok    CONVERSE for N-Q: the EMPTY-CENSUS guards stayed quiet on a"
+echo "        populated census (asserted as ABSENCE above, not just rc=0)"
 
 A_STEPS_ENTRY='mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh"'
 reset_mutant
@@ -735,6 +739,52 @@ else
 fi
 printf '       %-4s sandbox mutant only; the real tracked tree is never written\n' "N-P"
 reset_mutant
+
+# ---------------------------------------------------------------------------
+# N-Q: THE EMPTY-CENSUS GUARD MUST FIRE. *** THE STATE THAT KEEPS A FIXED BRANCH
+# FROM SHIPPING UNEXERCISED. ***
+#
+# N-P DISCOVERED that both coverage sections printed their green line over an empty
+# population ("0 check_*/mutate_* script(s), all dispatched"), and the fix did TWO
+# things: added the guards, and gave the sandbox a real scripts/ so the scenario
+# stops happening. *** The second half made the new guards unreachable. *** A guard
+# nothing can exercise is the dead-branch class this repo audits constantly, and it
+# would have shipped with a plausible-looking message and no proof it works.
+#
+# So the scenario is rebuilt deliberately, as an ARTIFACT defect rather than a
+# mutation: a checkout whose scripts/ holds ONLY the mutant and the two helpers it
+# sources. SCRIPT_DIR is derived from $0, so running the mutant from THAT directory
+# gives 0b and 0c an empty census -- the exact condition they must refuse.
+# Committed, not mutated: the defect is the tree, and there is no patch to apply.
+#
+# *** BOTH GUARDS ARE REQUIRED, not just one. *** 0b harvests the per-script
+# population and 0c harvests the scheduled one; they are separate loops with
+# separate counters, and fixing only the first is exactly what happened in the
+# first commit. N-P's baseline is the converse -- the same two guards must stay
+# SILENT on a populated census -- and it now asserts that as ABSENCE, so neither
+# half of this can be satisfied by a guard that always fires.
+EQ="$SYNTH/empty/scripts"
+mkdir -p "$EQ"
+cp "$MUTANT" "$EQ/run_all_checks.sh"; chmod +x "$EQ/run_all_checks.sh"
+for sib in _gate_enum.sh _gate_precond.sh; do
+  [ -e "$SCRIPT_DIR/$sib" ] && cp "$SCRIPT_DIR/$sib" "$EQ/$sib"
+done
+TOTAL=$((TOTAL + 1))
+INTFER_BUILD_DIR="$SYNTH/inner3" INTFER_RUN_ALL_COVERAGE_ONLY=1 \
+  timeout 300 bash "$EQ/run_all_checks.sh" >"$WORK/N-Q.log" 2>&1
+nq_rc=$?
+nq_0b=0; nq_0c=0
+grep -qF 'no check_*/mutate_* files were found' "$WORK/N-Q.log" && nq_0b=1
+grep -qF 'over an empty set proves nothing' "$WORK/N-Q.log" && nq_0c=1
+if [ "$nq_rc" -ne 0 ] && [ "$nq_0b" -eq 1 ] && [ "$nq_0c" -eq 1 ]; then
+  CAUGHT=$((CAUGHT + 1))
+  printf '  ok    %-4s defect reproduced: an EMPTY census is refused by 0b AND 0c\n' "N-Q"
+  printf '       %-4s rc=%s, both guards named the empty set (not just one)\n' "N-Q" "$nq_rc"
+else
+  printf '  MISSED %-4s defect NOT reproduced: rc=%s 0b-guard=%s 0c-guard=%s\n' \
+    "N-Q" "$nq_rc" "$nq_0b" "$nq_0c"
+  printf '       %-4s both guards are required; see %s\n' "N-Q" "$WORK/N-Q.log"
+fi
 
 # N-M: a dispatch() arm given a STRAY ARGUMENT. This is the class the full
 # stack exposed on 2026-10-01: a STEPS-line edit that added a matrix name also
