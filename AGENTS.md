@@ -2747,10 +2747,88 @@ e.g. S3's contract column is 40 not 42).
     fixture's arithmetic gives `-99.0`. The standing rule held and paid again:
     **read what is actually printed before touching the mechanism.**
   - **THE RECORDED VERDICTS SURVIVE THE FIXED TOOL** (re-derived, not assumed):
-    `E3 FOLD -2.05 %` (floor 89.0 ms, 3/3 rounds same sign) and `FOLDPREQ -1.57 %`
+    `E3 FOLD -2.05 %` (floor 89.0 ms, 3/3 rounds same sign) and `FOLDPREP -1.57 %`
     (floor 122.7 ms) reproduce exactly from `build/bench_E3.log`, and `E1 PREQ`
     still reads **INSIDE the spread** (|705.2| ≤ 1539.6, signs `++-`). So the
     docs needed **no** number corrected — which is a result, not an absence of one.
+
+- **AUDIT #29 (2026-10-02): DEFECT #1 WAS A SHAPE, AND THE STACK HAD NO EXIT CODE
+  ON DISK.** Two follow-ups, both from re-reading AUDIT #28's own output.
+  - **THE FAMILY IS NOW CLOSED, NOT THE INSTANCE.** `scripts/check_verdict_scope.sh`
+    **derives** the population of files that emit a spread-bounded verdict
+    (`CLEARS the spread` / `INSIDE the spread` / `NO SPREAD ESTIMATE`), requires
+    every non-verifier to be the single OWNER (`_bench_summary.py`) or a DECLARED
+    site, and pins the owner's paired-round gate plus its two verdict branches.
+    **A hand-enumerated "there is only one" is a citation, not a guard** — the next
+    summariser would have arrived unflagged. Enumerated by hand first, and the
+    result is recorded: `_gate_loadlog.sh`'s MAXIMUM is over one arm's own load
+    samples (the intended population), `fold_report_counts.sh` judges stamps not
+    data, `bench_quiet_ab.sh` and `bench_chat.sh` print no verdict at all.
+    **Its scope is stated, not implied:** `check_*`/`mutate_*` are excluded as
+    VERIFIERS by name prefix — load-bearing for the same reason it is in
+    `gate_inventory.sh` (`ls scripts/test_*.sh` DEFINES the gate population,
+    AUDIT #17) — and the cost is named: a `check_*` that genuinely re-derived the
+    rule would be excluded too. A checker claiming completeness it lacks is worse
+    than one that names its scope.
+  - **NON-VACUITY IS A PLANTED INSTANCE AND ITS CONVERSE.** Case (b) plants a
+    second emitter and requires rejection; case (c) plants a **comment** that
+    merely mentions the vocabulary and requires it to be IGNORED (comments are not
+    mechanisms), because a classifier that cries wolf is the mirror defect. Both
+    run the checker against a temp `scripts/` tree via `INTFER_SCRIPTS_DIR`.
+    *** THE SELF-TESTS NEED A RECURSION GUARD, and finding that out cost a hang:
+    *** case (b) invokes THIS script, so without `INTFER_VERDICT_SCOPE_CASES=0` it
+    invoked itself, which invoked itself. The inner run grades the population
+    only and **says so in its own output**, so an outer run can never claim the
+    cases ran when they were skipped (the `ddea91d` defect).
+  - **`mutate_verdict_scope.sh`: 6/6, and four of the states were wrong before
+    they were run.** (i) The matrix ran the **real** checker with only its subject
+    redirected, so the two checker-patching states were unobservable **by
+    construction** and scored MISSED; it now runs the sandbox's own copy, so
+    subject and grader come from one tree. (ii) The residue scan grepped the whole
+    tree and matched **the matrix's own source** — it is per-file now, plus an
+    existence check for the planted file. (iii) `enum_require_min` was called with
+    **FOUR** arguments, so the reason it was given was printed nowhere, and
+    `_enum_bad` was **never folded into the verdict**: the harvest guard PRINTED
+    `FAIL … harvested 0 items` and the checker still exited 0 — *a guard whose
+    verdict nobody reads is a comment with a shebang*. V-E went red for a
+    different reason and scored **UNATTRIBUTED**, which is how it surfaced. (iv)
+    State V-C's second branch did not repeat the prefix the checker counts, so the
+    count stayed at 1: a state that fails to **reproduce** its defect is worse
+    than no state. **V-F now isolates the fold** (empty harvest, self-tests
+    disabled, so the guard is the only thing that can fire) — the AUDIT #19 shape.
+  - **THE STACK NOW CERTIFIES ITSELF TO DISK.** The only artifact of a PASS run was
+    a log whose last line said PASS, and the natural next probe
+    (`grep -c 'RUN ALL CHECKS: PASS'`) returns a **count, not an exit code**, so
+    `run_all_checks.sh`'s own `$?` existed nowhere. It now writes
+    `build/stack_cert/cert` (`sha`, `rc`, `verdict`, `failed`/`stale`/`unproven`,
+    `stamps`, `quick`, date) on **every** verdict path, write-then-`mv`. **It is
+    deliberately NOT named `*last_pass.stamp`** — that suffix is the vocabulary
+    the stamp assertion enumerates, and a stack certification is not a matrix pass;
+    it would have joined the population it exists to assert about.
+  - **THE BATCH REFUSAL IS NOW PROVEN END-TO-END, AND THAT NEEDED A NEW STATE.**
+    Everything above about the refusal was fixtures plus a **static** check of the
+    rc propagation — and the static check is the wrong instrument for this defect:
+    it verifies the harness *captures* the summary's verdict and *tests* it, never
+    that the batch actually fails. Case (8) runs the **real**
+    `bench_reports_batch.sh` against a **stub CLI** in a temp tree (0.9 s per
+    invocation, measured), with three directions: no profile line (refused by
+    `finish_batch`), a profile line **missing `nk`/`nw`/`nr`** (refused by the
+    **propagation branch** alone, because the shell counts no dead arm), and a
+    complete line (**rc=0** — the converse, since a harness that refuses everything
+    satisfies the first case). **No render node is rc=2 UNPROVEN, never rc=0**:
+    the harness bails at its precondition with the *same* exit code the refusal
+    uses, so on a GPU-less box the case is indistinguishable from a pass unless the
+    text is checked. State **B-O** keeps every token the static check greps for and
+    changes only the refusal's **exit code**, so all text properties pass and the
+    e2e run is the sole witness — the B-E shape one level down. `mutate_bench_load_gate.sh`
+    is **15/15**.
+  - **TWO MORE OF MY OWN, both found by a checker going red where it should have
+    been green:** the stub read `$1` at **run** time (the CLI's own `--gpu`), so no
+    direction emitted a profile line and the incomplete *and* healthy directions
+    both "refused" — two apparent harness defects, one bug; the mode is baked in at
+    generation time now. And B-O first patched `$H`, which is this matrix's default
+    TARGET (`bench_quiet_ab.sh`), not the batch harness — `patch_literal` reported
+    0 occurrences and the state scored MISSED, correctly, as a STATE fault.
 
 - **THE STANDING BLOCKER ON 27B WALL-TIME — *SUPERSEDED 2026-10-02, READ THE ENTRY
       BELOW; THIS TEXT IS THE RECORD OF A PROCESS THAT NO LONGER EXISTS*.**

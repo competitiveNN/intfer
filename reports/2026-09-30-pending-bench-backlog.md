@@ -146,6 +146,27 @@ runtime* view shows one. See the AGENTS.md READ FIRST note for the measured
 exclusion list and why "two independent driver stacks agree" is inference rather
 than a diagnosis.
 
+### SCHEDULING CONSTRAINT, not missing work (2026-10-02)
+The `RESULT:` lines in this file are **DEFERRED, not pending**. The difference
+matters for the next session reading this file:
+
+- **Device prerequisite: MET as of 2026-10-02.** `sycl-ls` prints 2
+  `[level_zero:gpu]` and E1/E2/E3 were each benchmarked at `--tp 2` on 27B. The
+  two blocks above are the **record** of a condition that has since cleared.
+- **Quiet-box prerequisite: NOT met, and it is not this project's to fix.**
+  `load1` is driven by **sibling agent sessions** on this host, not by a stale
+  background job: a `julia` container was measured at 99.7 % CPU for 1d23h and is
+  gone; what remains is bursty CPU from concurrent sessions. A wall-time A/B
+  needs the box to itself.
+- **Therefore: do not start a wall-time run on a busy box, and do not treat the
+  blank `RESULT:` lines as an oversight.** Every arm already reports
+  `TPS=SKIPPED-CONTENDED` when its own maximum load crosses the threshold, so a
+  contended run cannot produce a quotable number even if one is started. When you
+  do have the box, run `scripts/bench_when_quiet.sh` — that is the ONE place that
+  waits — then `scripts/bench_reports_batch.sh <E1|E2|E3> 3`, and report the
+  device-side `kernel` delta **with both arms' spreads**, never the tok/s alone
+  and never a median without them.
+
 ---
 
 ## E1 — `INTFER_DPAS_PREQ=1` (device GA64 activation-quant pre-pass)
