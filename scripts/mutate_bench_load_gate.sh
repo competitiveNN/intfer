@@ -48,9 +48,17 @@ mkdir -p "$SB/scripts" "$LOG"
 cp "$SCRIPT_DIR"/*.sh "$SB/scripts/"          # copies, NOT symlinks -- see header
 TGT="$SB/scripts/check_bench_load_gate.sh"
 ORIG_T="$SB/.orig_target"
+ORIG_H="$SB/.orig_helper"
 cp "$TARGET" "$ORIG_T"
+# The HELPER must be restored too, not just the target and the checker. B-E and
+# B-H both mutate scripts/_gate_loadlog.sh, and with it out of scope B-E's damage
+# leaked into every later state: B-H then reported its anchor missing when the
+# anchor was fine. States that contaminate each other are not independent
+# evidence, and "MISSED (fn)" is the least informative way to find that out.
+cp "$SCRIPT_DIR/_gate_loadlog.sh" "$ORIG_H"
 restore() { cp "$ORIG_T" "$SB/scripts/$(basename "$TARGET")"
             cp "$CHECK" "$TGT"
+            cp "$ORIG_H" "$SB/scripts/_gate_loadlog.sh"
             rm -f "$SB/scripts/bench_fake_latency.sh"; }
 run_check() { ( cd "$SB" && bash "$TGT" 2>&1 ); }
 # The harness a state damages, as a sandbox path.
@@ -108,7 +116,7 @@ echo "== states (each damages a HARNESS, not the checker) =="
 # is loud, but it cost a full matrix run. Same lesson as the AUDIT #17 anchor
 # parser: confirm the anchor form mechanically, never by eye.
 MUTATE_FN() {
-  patch_literal "$H" '. "$SCRIPT_DIR/_gate_loadlog.sh"' ':   # B_A removed the shared gate'
+  patch_literal "$H" '. "$SCRIPT_DIR/_gate_loadlog.sh"' ':   # B_A removed the shared gate' || return 1
   grep -q 'B_A' "$H"
 }
 run_state "B-A" 'B_A' 'NO -- it can publish a figure without the shared load gate' \
@@ -117,7 +125,7 @@ run_state "B-A" 'B_A' 'NO -- it can publish a figure without the shared load gat
 # B-B: the harness builds its own figure, bypassing loadlog_tps_field, which is
 # the ONLY thing that withholds. This is the retracted-defect shape.
 MUTATE_FN() {
-  patch_literal "$H" '  field="$(loadlog_tps_field "${tps:-NA}")"' '  field="${tps:-NA}"   # B_B raw'
+  patch_literal "$H" '  field="$(loadlog_tps_field "${tps:-NA}")"' '  field="${tps:-NA}"   # B_B raw' || return 1
   grep -q 'B_B' "$H"
 }
 run_state "B-B" 'B_B' 'NO -- it emits a figure without consulting the gate that withholds' \
@@ -127,7 +135,7 @@ run_state "B-B" 'B_B' 'NO -- it emits a figure without consulting the gate that 
 # the helper" -- still says yes while the behaviour has a second home. The
 # copy-drift family, caught at the DEFINITION rather than at the call.
 MUTATE_FN() {
-  patch_literal "$H" 'load1() { loadlog_load1; }' 'loadlog_tps_field() { printf "%s" "$1"; }   # B_C second home
+  patch_literal "$H" 'load1() { loadlog_load1; }' 'loadlog_tps_field() { printf "%s" "$1"; }   # B_C second home || return 1
 load1() { loadlog_load1; }'
   grep -q 'B_C' "$H"
 }
@@ -138,7 +146,7 @@ run_state "B-C" 'B_C' 'REDEFINES loadlog_arm/loadlog_tps_field' \
 # printed exactly this and then measured anyway.
 MUTATE_FN() {
   patch_literal "$H" '  echo "WARN: box never quieted (load1=$L >= $QLOAD). The run continues so the"' \
-    '  echo "WARN: box never quieted (load1=$L >= $QLOAD); results are variance, not signal."   # B_D'
+    '  echo "WARN: box never quieted (load1=$L >= $QLOAD); results are variance, not signal."   # B_D' || return 1
   grep -q 'B_D' "$H"
 }
 run_state "B-D" 'B_D' 'still prints the warn-and-continue line' \
@@ -152,7 +160,7 @@ run_state "B-D" 'B_D' 'still prints the warn-and-continue line' \
 # gets recorded as a figure.
 MUTATE_FN() {
   patch_literal "$SB/scripts/_gate_loadlog.sh" \
-    '  if [ "$_LL_USABLE" = 1 ]; then
+    '  if [ "$_LL_USABLE" = 1 ]; then || return 1
     printf '"'"'%s'"'"' "$1"
   else
     printf '"'"'SKIPPED-CONTENDED'"'"'
@@ -170,8 +178,14 @@ run_state "B-E" 'B_E' 'published a figure for a drifting arm' \
 # this state: B-A trips the same property on a different file, and a shared
 # marker would let one state's catch be scored as another's.
 MUTATE_FN() {
-  patch_literal "$HC" 'if [ "$_LL_USABLE" = 1 ]; then' 'if true; then   # B_F always publishes'
-  patch_literal "$HC" '. "$SCRIPT_DIR/_gate_loadlog.sh"' ':   # B_F removed the shared gate'
+  # EVERY hunk is `|| return 1`. Without that the function's exit status is its
+  # LAST command's, so a hunk that failed to apply was masked by the succeeding
+  # grep and the state was scored CAUGHT on the surviving hunk alone -- B-F did
+  # exactly that, and the checker caught the damage for the wrong reason. The
+  # repo has hit this shape before ("an argument accepted and never forwarded");
+  # patch_literal refusing to patch is only useful if the caller BELIEVES it.
+  patch_literal "$HC" 'if loadlog_usable; then' 'if true; then   # B_F always publishes' || return 1
+  patch_literal "$HC" '. "$SCRIPT_DIR/_gate_loadlog.sh"' ':   # B_F removed the shared gate' || return 1
   grep -q 'B_F' "$HC"
 }
 run_state "B-F" 'B_F' 'bench_chat\.sh' \
@@ -207,9 +221,9 @@ run_state "B-G" 'B_G' 'bench_fake_latency' \
 # folded into B-E.
 MUTATE_FN() {
   patch_literal "$SB/scripts/_gate_loadlog.sh" \
-    '  _ll_need _LL_USABLE || return 1
+    '  _ll_need _LL_USABLE || return 1 || return 1
   if [ "$_LL_USABLE" = 1 ]; then' \
-    '  if [ "${_LL_USABLE-}" = 1 ]; then   # B_H guard removed'
+    '  if [ "${_LL_USABLE-}" = 1 ]; then   # B_H guard removed' || return 1
   grep -q 'B_H' "$SB/scripts/_gate_loadlog.sh"
 }
 run_state "B-H" 'B_H' 'did not fail loudly' \
