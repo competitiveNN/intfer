@@ -794,6 +794,52 @@ else
   printf '       %-4s both guards are required; see %s\n' "N-Q" "$WORK/N-Q.log"
 fi
 
+# ---------------------------------------------------------------------------
+# N-R / N-S: THE STALE-LOCK SELF-HEAL, IN BOTH DIRECTIONS. *** AN UNTESTED
+# SELF-HEAL IS AN UNCONDITIONAL DELETE WITH EXTRA STEPS. ***
+#
+# MEASURED HAZARD, twice this session: a run killed mid-stack left the lock behind,
+# and the documented remedy was `rm -f $LOCK`, which will happily delete a LIVE
+# run's lock and let a second stack restore another run's mutations over its own.
+# The lock now records its owner's pid and self-heals only after `kill -0` proves
+# the owner is dead.
+#
+# Both directions are states, and both plant the LOCK rather than patching anything
+# -- the defect is the filesystem, not the text. N-R plants a DEAD owner and
+# requires the self-heal; N-S plants a LIVE owner (this very matrix process) and
+# requires a REFUSAL. N-S is the half that matters: without it, a self-heal that
+# fires unconditionally would score as a pass and delete a live run's lock.
+LOCKP="$SYNTH/lockprobe/.run_all_checks.lock"
+cov_run() { # $1 = log name  -> runs the mutant with COVERAGE_ONLY in a probe dir
+  INTFER_BUILD_DIR="$SYNTH/lockprobe" INTFER_RUN_ALL_COVERAGE_ONLY=1 \
+    timeout 300 bash "$MUTANT" >"$WORK/$1" 2>&1
+}
+
+TOTAL=$((TOTAL + 1)); reset_mutant
+rm -rf "$SYNTH/lockprobe"; mkdir -p "$LOCKP"; echo 999999 > "$LOCKP/pid"
+cov_run "N-R.log"; nr_rc=$?
+if [ "$nr_rc" -eq 0 ] && grep -qF 'STALE LOCK' "$WORK/N-R.log"; then
+  CAUGHT=$((CAUGHT + 1))
+  printf '  ok    %-4s defect reproduced: a lock whose owner is DEAD self-heals\n' "N-R"
+else
+  printf '  MISSED %-4s defect NOT reproduced: rc=%s (a stale lock must be taken over)\n' \
+    "N-R" "$nr_rc"
+fi
+
+TOTAL=$((TOTAL + 1)); reset_mutant
+rm -rf "$SYNTH/lockprobe"; mkdir -p "$LOCKP"; echo $$ > "$LOCKP/pid"
+cov_run "N-S.log"; ns_rc=$?
+if [ "$ns_rc" -eq 1 ] && grep -qF 'another run_all_checks.sh holds' "$WORK/N-S.log" \
+   && ! grep -qF 'STALE LOCK' "$WORK/N-S.log"; then
+  CAUGHT=$((CAUGHT + 1))
+  printf '  ok    %-4s defect reproduced: a lock whose owner is LIVE is REFUSED, not taken\n' "N-S"
+else
+  printf '  MISSED %-4s defect NOT reproduced: rc=%s (a LIVE lock must refuse; deleting it is\n' \
+    "N-S" "$ns_rc"
+  printf '       %-4s the one action that corrupts a concurrent run'"'"'s tree)\n' "N-S"
+fi
+rm -rf "$SYNTH/lockprobe"
+
 # N-M: a dispatch() arm given a STRAY ARGUMENT. This is the class the full
 # stack exposed on 2026-10-01: a STEPS-line edit that added a matrix name also
 # matched inside the mutate_gate_pop.sh dispatch arm, so it ran as
