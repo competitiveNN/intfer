@@ -2896,8 +2896,66 @@ e.g. S3's contract column is 40 not 42).
     `trap … EXIT`, so the cause is not a forgotten trap: **an EXIT trap does not
     run when the shell is killed by an untrapped signal**, and the matrices are
     wrapped in `timeout`, which sends SIGTERM. Sixteen scripts now trap
-    `EXIT INT TERM`, proven by `timeout -s TERM` (the temp dir survives with EXIT
-    only, and does not with the new form).
+    `EXIT INT TERM`.
+  - *** AND THAT 16-FILE FIX WAS WRONG IN EVERY FILE — MY OWN REGRESSION. *** The
+    python edit used a raw string, so it wrote a literal backslash:
+    `trap 'rm -rf \"$SB\"' EXIT INT TERM`. Inside single quotes those backslashes
+    are literal, so the trap ran `rm -rf \"$SB\"` — a filename that does not exist —
+    and **nothing was ever removed, on SIGTERM or on a clean EXIT**. The change
+    made cleanup *worse* than the EXIT-only version it replaced, and `bash -n`
+    stayed green because the file is syntactically valid and semantically wrong.
+    It surfaced for one reason only: I **counted the litter afterwards** (27
+    directories in the 40 minutes after the "fix", versus hundreds before it)
+    instead of asserting the patch had applied. Same family this file already
+    records twice — a tool reporting success while the bytes on disk are not what
+    was meant. **A syntax check cannot catch this class; only running the thing
+    can.** Corrected and re-proven on BOTH paths (temp dir removed on SIGTERM and
+    on normal EXIT), then confirmed end-to-end: re-running the three trap-owning
+    checkers/matrices produced `intfer_*` delta = **0**.
+  - **RULE FOR /tmp ON A SHARED HOST, after doing it the wrong way once.** Do
+    **not** clean up with `find /tmp -name 'intfer*' -newermt '-2 hours' | xargs
+    -0 rm -rf`: on a machine running sibling agent sessions, a time window will
+    eventually match a **live** sandbox belonging to someone else. I did exactly
+    that, and it happened to be harmless only because nothing else was running.
+    The safe order is: **(1)** make the owning script clean up after itself, which
+    is the only durable fix; **(2)** if a sweep is still needed, delete only
+    directories whose owning process is provably gone, or directories the current
+    shell recorded at creation — never a time window over a shared `/tmp`.
+- **THE STALE LOCK WAS A HAZARD *IN THE TOOL'S OWN ADVICE*, not in my procedure.**
+  I ran `rm -f build/.run_all_checks.lock` before two stack launches. The problem is
+  that the script's refusal message **instructed exactly that**: *"If no run is
+  active, remove $LOCK and re-run."* A killed run leaves the lock, and the
+  documented remedy will happily delete a **live** run's lock and let a second stack
+  restore another run's mutations over its own. The lock now **records its owner's
+  pid** and self-heals **only** after `kill -0` proves that owner is dead, with a
+  loud line naming the pid; a **recycled** pid reads as live and the run refuses
+  (fail-closed: annoying, never dangerous). The refusal message now says explicitly
+  not to delete the lock. States **N-R** (dead owner → self-heal) and **N-S** (live
+  owner → refuse) plant the lock in both directions — an untested self-heal is an
+  unconditional delete with extra steps, and **N-S is the half that matters**.
+- **THE EMPTY-CENSUS GUARDS SHIPPED UNEXERCISED, and N-Q is what stops that
+  happening again.** N-P's fix did two things: added the guards, **and** gave the
+  sandbox a real `scripts/` so the scenario stopped occurring. The second half made
+  the new guards unreachable — a fix that leaves its own evidence behind, i.e. the
+  dead-branch class. State **N-Q** rebuilds the scenario deliberately as an
+  *artifact* defect (a `scripts/` holding only the mutant and the two helpers it
+  sources; `SCRIPT_DIR` comes from `$0`, so running the mutant from there gives an
+  empty census) and requires **both** guards to fire — 0b and 0c are separate loops
+  with separate counters, and fixing only 0b is precisely what the first commit did.
+  N-P's baseline is the converse and now asserts those messages are **absent** on a
+  populated census, so neither half can be satisfied by a guard that always fires.
+- **TWO STATE FAILURES WORTH RECORDING, because both were the harness's own guards
+  firing for the wrong reason — and the predicate caught it.**
+  - N-Q first scored rc=1 with **neither** guard message: the empty sandbox was not
+    a git work tree, so the dirty-tree guard died at its own `git diff --quiet`
+    before 0b or 0c ran. `ROOT` is `dirname(SCRIPT_DIR)`, so that directory has to
+    be a *checkout*; it now lives inside the sandbox repo, where untracked files
+    are fine. A state that fails for an unrelated cause is worse than a MISSED one.
+  - The 12/13 `MISSED N-P` result in the record is **resolved**: the sandbox
+    population fix landed in `edfa21b`, after which the matrix reported
+    `caught=13/13 baselines=13/13`, and it now reports **16/16** (N-P, N-Q, N-R,
+    N-S added). Read the live figures from `build/run_all_mutate/last_pass.stamp`,
+    never from a paragraph like this one.
 
 - **THE STANDING BLOCKER ON 27B WALL-TIME — *SUPERSEDED 2026-10-02, READ THE ENTRY
       BELOW; THIS TEXT IS THE RECORD OF A PROCESS THAT NO LONGER EXISTS*.**
