@@ -22,7 +22,12 @@ MODEL="${INTFER_08B:-$ROOT/test/models/Qwen3.5-0.8B.intifer}"
 TOK="--tokenizer-py $SCRIPT_DIR/bpe_tokenize.py --detok-py $SCRIPT_DIR/bpe_detokenize.py"
 ROUNDS="${1:-2}"
 QLOAD="${INTFER_QUIET_LOAD:-2.0}"
-QWAIT="${INTFER_QUIET_WAIT:-3600}"
+# QWAIT / INTFER_QUIET_WAIT are GONE, not defaulted: the blocking wait they
+# configured was removed (see the load-notification block below), and leaving a
+# dead "QWAIT=0" behind would be a variable that reads as a knob and does nothing.
+# scripts/bench_when_quiet.sh is now the single place that waits. Old command lines
+# that still export INTFER_QUIET_WAIT are harmless -- an unread env var is not an
+# error.
 
 [ -x "$BIN" ] || { echo "FAIL: cli missing: $BIN"; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL"; exit 1; }
@@ -54,23 +59,26 @@ run_leg() { # $1 = label; the rest is the command
 }
 
 load1() { loadlog_load1; }
-echo "== quiet gate: waiting for load1 < $QLOAD (max ${QWAIT}s) =="
- waited=0
-while [ "$waited" -lt "$QWAIT" ]; do
-  L="$(load1)"
-  if awk -v l="$L" -v q="$QLOAD" 'BEGIN{exit !(l < q)}'; then
-    echo "quiet: load1=$L after ${waited}s"; break
-  fi
-  [ $((waited % 300)) -eq 0 ] && echo "... load1=$L after ${waited}s"
-  sleep 30; waited=$((waited + 30))
-done
+# ---- load: NOTIFY ONLY, NEVER WAIT (the blocking wait was removed 2026-10-02) --
+# WHY IT WENT. This loop blocked for up to QWAIT (default 3600s) and then measured
+# ANYWAY, so on a box held busy by a long-running neighbour it cost an hour and
+# bought nothing. It was also a hand-rolled copy in three harnesses -- the AUDIT #7
+# shape. There is now ONE home for "run this when the box is quiet":
+# scripts/bench_when_quiet.sh.
+#
+# *** THE PROTECTION IS A DIFFERENT MECHANISM AND IS UNTOUCHED. *** Whether a figure
+# is quotable is decided per-arm by loadlog_arm, on the MAXIMUM load over the whole
+# arm -- not here, and not by this print. Removing the wait does not make a contended
+# measurement quotable; it makes it visible sooner.
 L="$(load1)"
-echo "starting A/B at load1=$L"
-if ! awk -v l="$L" -v q="$QLOAD" 'BEGIN{exit !(l < q)}'; then
-  echo "WARN: box never quieted (load1=$L >= $QLOAD). The run continues so the"
-  echo "  CONTENDERS still load and stream-identity still get checked, but every"
-  echo "  leg below that crosses the threshold has its TPS recorded as"
-  echo "  SKIPPED-CONTENDED, so no figure can be quoted from a busy box."
+echo "starting A/B at load1=$L (not waiting)"
+if awk -v l="$L" -v q="$QLOAD" 'BEGIN{exit !(l<q)}'; then
+  echo "load1=$L is under $QLOAD"
+else
+  echo "load1=$L is >= $QLOAD. NOT waiting -- running anyway."
+  echo "  Each leg whose MAXIMUM load crosses $QLOAD has its figure withheld as"
+  echo "  SKIPPED-CONTENDED, so a busy box cannot produce a quotable number."
+  echo "  For a quiet-window run use scripts/bench_when_quiet.sh."
 fi
 
 P361="$(python3 -c "print('The history of artificial intelligence and machine learning. '*40)")"

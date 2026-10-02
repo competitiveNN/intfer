@@ -25,7 +25,12 @@ ROUNDS="${2:-3}"
 # and the A/B measures flag-vs-flag and reads as a wash.
 UNSET_VARS=""
 QLOAD="${INTFER_QUIET_LOAD:-2.0}"
-QWAIT="${INTFER_QUIET_WAIT:-3600}"
+# QWAIT / INTFER_QUIET_WAIT are GONE, not defaulted: the blocking wait they
+# configured was removed (see the load-notification block below), and leaving a
+# dead "QWAIT=0" behind would be a variable that reads as a knob and does nothing.
+# scripts/bench_when_quiet.sh is now the single place that waits. Old command lines
+# that still export INTFER_QUIET_WAIT are harmless -- an unread env var is not an
+# error.
 LOG="${INTFER_BENCH_LOG:-${INTFER_BUILD_DIR:-$ROOT/build}/bench_${BATCH}.log}"
 
 [ -n "$BATCH" ] || { echo "usage: $0 <E1|E2|E3> [ROUNDS]"; exit 1; }
@@ -257,17 +262,27 @@ if [ "${INTFER_BENCH_TIMING:-1}" != "1" ]; then
   done
   LOG="$CNTLOG"
 else
-echo; echo "== quiet gate: waiting for load1 < $QLOAD (max ${QWAIT}s) =="
-waited=0
-while [ "$waited" -lt "$QWAIT" ]; do
-  L="$(load1)"
-  if awk -v l="$L" -v q="$QLOAD" 'BEGIN{exit !(l<q)}'; then echo "quiet: load1=$L after ${waited}s"; break; fi
-  [ $((waited % 300)) -eq 0 ] && echo "... load1=$L after ${waited}s"
-  sleep 30; waited=$((waited+30))
-done
+# ---- load: NOTIFY ONLY, NEVER WAIT (the blocking wait was removed 2026-10-02) --
+# WHY IT WENT. This loop blocked for up to QWAIT (default 3600s) and then measured
+# ANYWAY, so on a box held busy by a long-running neighbour it cost an hour and
+# bought nothing. It was also a hand-rolled copy in three harnesses -- the AUDIT #7
+# shape ("nine hand-rolled copies of the block is precisely how the family
+# reopened"). There is now ONE home for "run this when the box is quiet":
+# scripts/bench_when_quiet.sh.
+#
+# *** THE PROTECTION IS A DIFFERENT MECHANISM AND IS UNTOUCHED. *** Whether a figure
+# is quotable is decided per-arm by loadlog_arm, on the MAXIMUM load over the whole
+# arm -- not here, and not by this print. Removing the wait does not make a contended
+# measurement quotable; it makes it visible sooner. Deleting the withholding would
+# have been the AUDIT #22 defect re-opened, so it was NOT done.
 L="$(load1)"
-if ! awk -v l="$L" -v q="$QLOAD" 'BEGIN{exit !(l<q)}'; then
-  echo "WARN: box never quieted (load1=$L >= $QLOAD) - wall deltas are VARIANCE, not signal."
+if awk -v l="$L" -v q="$QLOAD" 'BEGIN{exit !(l<q)}'; then
+  echo "load1=$L at start: under $QLOAD"
+else
+  echo "load1=$L at start is >= $QLOAD. NOT waiting -- running anyway."
+  echo "  Each arm whose MAXIMUM load crosses $QLOAD has its figure withheld as"
+  echo "  SKIPPED-CONTENDED, so a busy box cannot produce a quotable number."
+  echo "  For a quiet-window run use scripts/bench_when_quiet.sh."
 fi
 
 # ---------------------------------------------------------------- 3. timing

@@ -150,8 +150,22 @@ run_state "B-C" 'B_C' 'REDEFINES loadlog_arm/loadlog_tps_field' \
 
 # B-D: the warn-and-continue line comes back. All three original harnesses
 # printed exactly this and then measured anyway.
+#
+# *** RE-ANCHORED, AND THAT WAS FORCED BY A REAL EDIT. *** This state used to patch
+# the literal line the harnesses shipped with -- `echo "WARN: box never quieted
+# ... The run continues so the"`. Removing the blocking wait (2026-10-02) deleted
+# that line and the warn block with it, so the anchor became STALE and
+# patch_literal (which requires EXACTLY ONE match) would have refused to run.
+#
+# A stale anchor is not cosmetic: a mutation that silently stops mutating reports a
+# confident verdict about a mechanism that is fine (the AUDIT #3c / E-D lesson, and
+# the same trap this repo records for mutate_fold_matrix.sh's apply_m4). Re-anchored
+# onto the line that REPLACED it, which is the honest formulation of the same
+# defect: the harness announces a busy box and then measures anyway, licensing a
+# figure the per-arm gate would otherwise withhold. The replacement text is
+# deliberately still a warning -- so the state's meaning did not have to change.
 MUTATE_FN() {
-  patch_literal "$H" '  echo "WARN: box never quieted (load1=$L >= $QLOAD). The run continues so the"' \
+  patch_literal "$H" '  echo "load1=$L is >= $QLOAD. NOT waiting -- running anyway."' \
     '  echo "WARN: box never quieted (load1=$L >= $QLOAD); results are variance, not signal."   # B_D' || return 1
   grep -q 'B_D' "$H"
 }
