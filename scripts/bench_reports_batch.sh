@@ -52,9 +52,24 @@ case "$BATCH" in
 esac
 
 PROMPT="${INTFER_PROMPT:-The capital of France is}"
-run_arm() {  # $1=arm $2=ntok  -> stdout = raw CLI output
-  local arm="$1" ntok="$2" e
+# shellcheck source=scripts/_gate_loadlog.sh
+. "$SCRIPT_DIR/_gate_loadlog.sh"
+# Per-arm logs + load traces live beside $LOG, not in the build root, so a figure
+# can always be traced back to the arm that produced it (AUDIT #22 root cause 2).
+loadlog_init "$(dirname "$LOG")/bench_logs/${BATCH}_$(date -u +%Y%m%dT%H%M%SZ)" >/dev/null
+
+run_arm() {  # $1=arm $2=ntok [$3=log label]  -> stdout = raw CLI output
+  local arm="$1" ntok="$2" e rc
   e="$(eval echo "\$arm_env_$arm")"
+  if [ "$#" -ge 3 ]; then
+    # Logged + continuously sampled. The raw output is still echoed to stdout so
+    # every existing caller keeps working, and the CLI's exit status is preserved
+    # rather than being swallowed by the cat.
+    loadlog_arm "$3" env $e timeout 900 "$BIN" --gpu --tp "$TP" -m "$MODEL" \
+      -p "$PROMPT" -n "$ntok" --no-stream $TOK || rc=$?
+    cat "$_LL_LOG"
+    return "${rc:-0}"
+  fi
   # shellcheck disable=SC2086
   env $e timeout 900 "$BIN" --gpu --tp "$TP" -m "$MODEL" \
     -p "$PROMPT" -n "$ntok" --no-stream $TOK 2>&1
@@ -117,10 +132,10 @@ if [ "${INTFER_BENCH_TIMING:-1}" != "1" ]; then
   CNTLOG="$LOG.counters"
   : > "$CNTLOG"
   for arm in $ARMS; do
-    out="$(run_arm "$arm" 64)"
+    out="$(run_arm "$arm" 64 "cnt_${arm}")"
     line="$(printf '%s\n' "$out" | grep -aoE '@decode\] .*' | head -1)"
     printf 'ARM=%s TPS=%s LOAD1=%s BUCKETS=%s\n' \
-      "$arm" "SKIPPED-CONTENDED" "$(load1)" "$line" >> "$CNTLOG"
+      "$arm" "$(loadlog_tps_field '')" "$_LL_MAX" "$line" >> "$CNTLOG"
     echo "  $arm  $line"
   done
   LOG="$CNTLOG"
@@ -145,13 +160,17 @@ if [ "${INTFER_BENCH_TIMING:-1}" = "1" ]; then
 echo; echo "== TIMING: decode -n64, interleaved, $ROUNDS rounds =="
 for r in $(seq 1 "$ROUNDS"); do
   for arm in $ARMS; do
-    out="$(run_arm "$arm" 64)"
+    # AUDIT #22/#23: the arm is logged and its load sampled CONTINUOUSLY, and the
+    # TPS field is SKIPPED-CONTENDED unless the MAXIMUM load over the whole arm
+    # stayed under the threshold. This loop used to scrape tok/s unconditionally
+    # and record it, so a figure measured on a busy box landed in $LOG as a
+    # machine-readable record that a human then pasted into a report.
+    out="$(run_arm "$arm" 64 "t${r}_${arm}")"
     tps="$(printf '%s\n' "$out" | grep -aoE '\([0-9.]+ tok/s\)' | head -1 | tr -d '() tok/s')"
     line="$(printf '%s\n' "$out" | grep -aoE '@decode\] .*' | head -1)"
-    # one machine-readable record per run: ARM, round, tok/s, load1, buckets
     printf 'ARM=%s ROUND=%s TPS=%s LOAD1=%s BUCKETS=%s\n' \
-      "$arm" "$r" "${tps:-NA}" "$(load1)" "$line" >> "$LOG"
-    echo "  r$r $arm  load1=$(load1)  ${tps:-NA} tok/s"
+      "$arm" "$r" "$(loadlog_tps_field "${tps:-NA}")" "$_LL_MAX" "$line" >> "$LOG"
+    echo "  r$r $arm  max_load1=$_LL_MAX  $(loadlog_tps_field "${tps:-NA} tok/s")"
     echo "     $line"
   done
 done
@@ -194,9 +213,15 @@ for a in arms:
     if not rs:
         print(f"{a:9s} (no data)"); continue
     if tps:
-        print(f"{a:9s} tok/s {'  '.join('%6.2f' % t for t in tps)}  median={statistics.median(tps):6.2f}")
+        held = len(rs) - len(tps)
+        # AUDIT #23: say how many rounds were withheld. A median over the
+        # surviving rounds, printed without this, reads exactly like a median
+        # over all of them -- and "never the best one" is this repo's rule for a
+        # reason. A partial withholding must be visible in the table.
+        extra = f"   [{held}/{len(rs)} round(s) WITHHELD: box contended]" if held else ""
+        print(f"{a:9s} tok/s {'  '.join('%6.2f' % t for t in tps)}  median={statistics.median(tps):6.2f}{extra}")
     else:
-        print(f"{a:9s} (wall-time withheld: box contended)")
+        print(f"{a:9s} (wall-time withheld: box contended, {len(rs)}/{len(rs)} rounds)")
     print(f"{'':9s}   nk={g(nk):>6} nw={g(nw):>6} nr={g(nr):>6} kernel={f(kern)}ms submit={f(subm)}ms "
           f"wait={f(wait)}ms copy={f(copy)}ms rb={f(rb)}ms usmw={f(usm)}ms")
 if recs:

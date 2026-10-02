@@ -33,7 +33,27 @@ set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 set -u
 
-load1() { awk '{print $1}' /proc/loadavg; }
+# shellcheck source=scripts/_gate_loadlog.sh
+. "$SCRIPT_DIR/_gate_loadlog.sh"
+# Per-leg logs + load traces. AUDIT #23: the old loop piped every invocation into
+# `grep | head -3`, so nothing survived on disk and a tok/s could only be read off
+# the terminal. loadlog_arm also samples load1 CONTINUOUSLY and judges on the
+# MAXIMUM -- this gate only samples once, at the start, and then measures for
+# minutes (observed here: load1 1.94 -> 10.69 in under two minutes).
+loadlog_init "${INTFER_BUILD_DIR:-$ROOT/build}/bench_logs/quiet_ab_$(date -u +%Y%m%dT%H%M%SZ)" >/dev/null
+
+# One measured invocation: logged, continuously sampled, tok/s withheld unless
+# the arm stayed under the threshold for its whole duration.
+run_leg() { # $1 = label; the rest is the command
+  loadlog_arm "$1" "${@:2}" || true
+  local tps field
+  tps="$(grep -aoE '\([0-9.]+ tok/s\)' "$_LL_LOG" 2>/dev/null | head -1 | tr -d '() tok/s')"
+  field="$(loadlog_tps_field "${tps:-NA}")"
+  echo "  leg $1  max_load1=$_LL_MAX  TPS=$field  log=$_LL_LOG"
+  grep -aE "tokens in|@decode\]|@prefill\]" "$_LL_LOG" 2>/dev/null | head -3 | sed 's|^|      |' || true
+}
+
+load1() { loadlog_load1; }
 echo "== quiet gate: waiting for load1 < $QLOAD (max ${QWAIT}s) =="
  waited=0
 while [ "$waited" -lt "$QWAIT" ]; do
@@ -47,22 +67,22 @@ done
 L="$(load1)"
 echo "starting A/B at load1=$L"
 if ! awk -v l="$L" -v q="$QLOAD" 'BEGIN{exit !(l < q)}'; then
-  echo "WARN: box never quieted (load1=$L >= $QLOAD); results are variance, not signal."
+  echo "WARN: box never quieted (load1=$L >= $QLOAD). The run continues so the"
+  echo "  CONTENDERS still load and stream-identity still get checked, but every"
+  echo "  leg below that crosses the threshold has its TPS recorded as"
+  echo "  SKIPPED-CONTENDED, so no figure can be quoted from a busy box."
 fi
 
 P361="$(python3 -c "print('The history of artificial intelligence and machine learning. '*40)")"
 for r in $(seq 1 "$ROUNDS"); do
   for mode in WAVE NOWAVE; do
-    echo "===== round $r mode=$mode (load1=$(load1)) ====="
+    echo "===== round $r mode=$mode ====="
     if [ "$mode" = NOWAVE ]; then export INTFER_NO_WAVE=1; else unset INTFER_NO_WAVE; fi
-    echo "--- decode TP1 -n64 ---"
-    "$BIN" --gpu --tp 1 -m "$MODEL" -p "The capital of France is" -n 64 \
-      --no-stream $TOK 2>&1 | grep -aE "tokens in|@decode" | head -3
+    run_leg "r${r}_${mode}_decode" \
+      "$BIN" --gpu --tp 1 -m "$MODEL" -p "The capital of France is" -n 64 --no-stream $TOK
     for m in 128 361; do
-      echo "--- prefill chunk_M=$m ---"
-      INTFER_PREFILL_CHUNK=1 INTFER_PREFILL_CHUNK_M="$m" INTFER_BATCH_GEMM=1 \
-        "$BIN" --gpu --tp 1 -m "$MODEL" -p "$P361" -n 5 --no-stream $TOK 2>&1 \
-        | grep -aE "tokens in|@prefill" | head -3
+      run_leg "r${r}_${mode}_pf${m}" env INTFER_PREFILL_CHUNK=1 INTFER_PREFILL_CHUNK_M="$m" INTFER_BATCH_GEMM=1 \
+        "$BIN" --gpu --tp 1 -m "$MODEL" -p "$P361" -n 5 --no-stream $TOK
     done
   done
 done

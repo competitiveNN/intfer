@@ -35,7 +35,24 @@ set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 set -u
 
-load1() { awk '{print $1}' /proc/loadavg; }
+# shellcheck source=scripts/_gate_loadlog.sh
+. "$SCRIPT_DIR/_gate_loadlog.sh"
+# AUDIT #23: per-leg logs + CONTINUOUS load sampling. The old loop piped each
+# invocation into `grep | head -3`, so nothing survived on disk and a tok/s could
+# only be read off the terminal; and the quiet gate sampled load1 once, at the
+# start, then measured for minutes.
+loadlog_init "${INTFER_BUILD_DIR:-$ROOT/build}/bench_logs/quiet_l4_$(date -u +%Y%m%dT%H%M%SZ)" >/dev/null
+
+run_leg() { # $1 = label; the rest is the command
+  loadlog_arm "$1" "${@:2}" || true
+  local tps field
+  tps="$(grep -aoE '\([0-9.]+ tok/s\)' "$_LL_LOG" 2>/dev/null | head -1 | tr -d '() tok/s')"
+  field="$(loadlog_tps_field "${tps:-NA}")"
+  echo "  leg $1  max_load1=$_LL_MAX  TPS=$field  log=$_LL_LOG"
+  grep -aE "tokens in|@decode\]|@prefill\]" "$_LL_LOG" 2>/dev/null | head -3 | sed 's|^|      |' || true
+}
+
+load1() { loadlog_load1; }
 echo "== quiet gate: waiting for load1 < $QLOAD (max ${QWAIT}s) =="
 waited=0
 while [ "$waited" -lt "$QWAIT" ]; do
@@ -49,21 +66,21 @@ done
 L="$(load1)"
 echo "starting L4 A/B at load1=$L"
 if ! awk -v l="$L" -v q="$QLOAD" 'BEGIN{exit !(l < q)}'; then
-  echo "WARN: box never quieted (load1=$L >= $QLOAD); results are variance, not signal."
+  echo "WARN: box never quieted (load1=$L >= $QLOAD). The run continues so the"
+  echo "  contenders still load and stream-identity still get checked, but every"
+  echo "  leg below that crosses the threshold has its TPS recorded as"
+  echo "  SKIPPED-CONTENDED, so no figure can be quoted from a busy box."
 fi
 
 P361="$(python3 -c "print('The history of artificial intelligence and machine learning. '*40)")"
 for r in $(seq 1 "$ROUNDS"); do
   for mode in L4 BASE; do
-    echo "===== round $r mode=$mode (load1=$(load1)) ====="
+    echo "===== round $r mode=$mode ====="
     if [ "$mode" = L4 ]; then export INTFER_L4_FUSE=1; else unset INTFER_L4_FUSE; fi
-    echo "--- decode TP1 -n64 (L4 signal path) ---"
-    "$BIN" --gpu --tp 1 -m "$MODEL" -p "The capital of France is" -n 64 \
-      --no-stream $TOK 2>&1 | grep -aE "tokens in|@decode" | head -3
-    echo "--- prefill chunk361 (L4 no-op regression guard) ---"
-    INTFER_PREFILL_CHUNK=1 INTFER_PREFILL_CHUNK_M=361 INTFER_BATCH_GEMM=1 \
-      "$BIN" --gpu --tp 1 -m "$MODEL" -p "$P361" -n 5 --no-stream $TOK 2>&1 \
-      | grep -aE "tokens in|@prefill" | head -3
+    run_leg "r${r}_${mode}_decode" \
+      "$BIN" --gpu --tp 1 -m "$MODEL" -p "The capital of France is" -n 64 --no-stream $TOK
+    run_leg "r${r}_${mode}_pf361" env INTFER_PREFILL_CHUNK=1 INTFER_PREFILL_CHUNK_M=361 INTFER_BATCH_GEMM=1 \
+      "$BIN" --gpu --tp 1 -m "$MODEL" -p "$P361" -n 5 --no-stream $TOK
   done
 done
 unset INTFER_L4_FUSE

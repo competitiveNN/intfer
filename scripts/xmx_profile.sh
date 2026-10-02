@@ -60,6 +60,26 @@ fi
 
 OUT="$(mktemp --tmpdir="${TMPDIR:-/tmp}" xmxcap.XXXX.csv)"
 XMXLOG="$(mktemp --tmpdir="${TMPDIR:-/tmp}" xmxmon.XXXX.log)"
+
+# AUDIT #23: this harness publishes a tok/s line alongside the [GPU profile]
+# buckets, so it was the last member of the wall-time family with no load gate and
+# no log -- and the derived population in check_bench_load_gate.sh found it, which
+# is the argument for deriving that population instead of naming it. The XMX
+# counters themselves are load-INSENSITIVE and stay quotable on a busy box; only
+# the tok/s is withheld.
+# shellcheck source=scripts/_gate_loadlog.sh
+. "$SCRIPT_DIR/_gate_loadlog.sh"
+loadlog_init "${INTFER_BUILD_DIR:-$ROOT/build}/bench_logs/xmx_$(date -u +%Y%m%dT%H%M%SZ)" >/dev/null
+
+xmx_run_leg() { # $1 = label suffix
+  loadlog_arm "xmx_$1" "$BIN" --gpu --tp "$TP" "${ARGS[@]}" || true
+  local tps field
+  tps="$(grep -aoE '\([0-9.]+ tok/s\)' "$_LL_LOG" 2>/dev/null | head -1 | tr -d '() tok/s')"
+  field="$(loadlog_tps_field "${tps:-NA}")"
+  echo "  leg xmx_$1  max_load1=$_LL_MAX  TPS=$field  log=$_LL_LOG"
+  grep -aE "tokens in|GPU profile @|decode step|topology:" "$_LL_LOG" 2>/dev/null \
+    | sed 's|^|      |' || true
+}
 "$XMXMON" --device "$DEVICE" --group VectorEngineProfile \
   --period-ms "$PERIOD" --out "$OUT" >"$XMXLOG" 2>&1 &
 XMPID=$!
@@ -72,12 +92,12 @@ if ! kill -0 "$XMPID" 2>/dev/null; then
   echo "== internal buckets only =="
   rm -f "$XMXLOG"
   set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u
-  "$BIN" --gpu --tp "$TP" "${ARGS[@]}" 2>&1 | grep -aE "tokens in|GPU profile @|decode step|topology:"
+  xmx_run_leg buckets_only
   rm -f "$OUT"; exit 0
 fi
 echo "== xmxmon capturing on device $DEVICE (pid $XMPID) =="
 set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u
-"$BIN" --gpu --tp "$TP" "${ARGS[@]}" 2>&1 | grep -aE "tokens in|GPU profile @|decode step|topology:"
+xmx_run_leg captured
 kill -INT "$XMPID" 2>/dev/null; wait "$XMPID" 2>/dev/null
 echo "== XMX verdict =="
 SUMMARY_PY="$(dirname "$XMXMON")/xmx-summary.py"

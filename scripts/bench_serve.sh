@@ -38,24 +38,47 @@ for ((i = 0; i < N; i++)); do
   printf '{"id":%d,"prompt":"%s","max_new":%d}\n' "$((i + 1))" "$P" "$MAX_NEW" >>"$REQ"
 done
 
+# shellcheck source=scripts/_gate_loadlog.sh
+. "$SCRIPT_DIR/_gate_loadlog.sh"
+loadlog_init "${INTFER_BUILD_DIR:-$ROOT/build}/bench_logs/serve_$(date -u +%Y%m%dT%H%M%SZ)" >/dev/null
+
 T0=$(date +%s.%N)
-"$BIN" --no-gpu -m "$MODEL" --serve \
-  --tokenizer-py "$SCRIPT_DIR/bpe_tokenize.py" \
-  --detok-py "$SCRIPT_DIR/bpe_detokenize.py" <"$REQ" >"$OUT" 2>/dev/null
+# stdout is the SSE stream the token counts below are read from, so it must stay
+# in $OUT; stderr and everything else goes to the per-run artifact via loadlog.
+loadlog_arm "serve_n${N}" sh -c '"$1" --no-gpu -m "$2" --serve \
+  --tokenizer-py "$3" --detok-py "$4" <"$5"' _ \
+  "$BIN" "$MODEL" "$SCRIPT_DIR/bpe_tokenize.py" "$SCRIPT_DIR/bpe_detokenize.py" "$REQ" \
+  >"$OUT" 2>/dev/null
 RC=$?
 T1=$(date +%s.%N)
-[ "$RC" = "0" ] || { echo "BENCH FAIL: serve exited rc=$RC" >&2; exit 1; }
+MAXL="$_LL_MAX"
+[ "$RC" = "0" ] || { echo "BENCH FAIL: serve exited rc=$RC (log: $_LL_LOG)" >&2; exit 1; }
 
 WALL=$(echo "$T1 $T0" | awk '{printf "%.2f", $1 - $2}')
 TOKS=$(grep -a -c '"token"' "$OUT")
 IDS_DONE=$(grep -a -oE '"id":[0-9]+' "$OUT" | sort -u | wc -l)
 TPS=$(echo "$TOKS $WALL" | awk '{printf "%.2f", $1 / $2}')
+TPS_FIELD="$(loadlog_tps_field "$TPS")"
 PER_REQ_MS=$(echo "$WALL $N" | awk '{printf "%.0f", $1 * 1000 / $2}')
 
-echo "bench_serve: N=$N max_new=$MAX_NEW wall=${WALL}s tokens=$TOKS ids_done=$IDS_DONE tok/s=$TPS mean_lat/req=${PER_REQ_MS}ms"
+echo "bench_serve: N=$N max_new=$MAX_NEW wall=${WALL}s tokens=$TOKS ids_done=$IDS_DONE tok/s=$TPS_FIELD max_load1=${MAXL:-NA} mean_lat/req=${PER_REQ_MS}ms"
 [ "$IDS_DONE" = "$N" ] || { echo "BENCH FAIL: only $IDS_DONE/$N requests completed" >&2; exit 1; }
 EXP_TOKS=$((N * MAX_NEW))
 [ "$TOKS" = "$EXP_TOKS" ] || { echo "BENCH FAIL: $TOKS tokens != expected $EXP_TOKS" >&2; exit 1; }
+
+# AUDIT #23: a tok/s measured while the box is busy is run variance, and this
+# script's headline IS a tok/s. The serve call is now wrapped so the load is
+# sampled for its whole duration and judged on the MAXIMUM -- not sampled once
+# before a run that can take minutes. A contended run reports
+# SKIPPED-CONTENDED and the throughput floor is NOT applied to it, because the
+# floor is a stall guard and on a loaded box it can only produce a false alarm.
+if [ "$TPS_FIELD" = "SKIPPED-CONTENDED" ]; then
+  echo "BENCH: wall-time WITHHELD (load1 max ${MAXL:-NA} >= $INTFER_QUIET_LOAD)." >&2
+  echo "  The stall/token-count assertions above still ran and still mean something;" >&2
+  echo "  only the throughput figure is withheld. Re-run when the box is quiet." >&2
+  echo "SERVE-BENCH: PASS (counters only; no throughput figure)"
+  exit 0
+fi
 
 # Throughput floor: 0.8B CPU greedy must sustain >= 1 tok/s (far below the
 # ~3-8 tok/s single-stream rate; this guards against scheduler stalls,
