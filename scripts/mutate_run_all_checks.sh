@@ -668,6 +668,65 @@ patch_literal "$MUTANT" "$A_HEADMOVE" 'HEAD_MOVED=0  # detector removed; move no
 verify_patched N-K
 run_state "N-K" "mid-run HEAD-moved detector deleted" def_n_k "step_ok step_commit" "$ALL_CURRENT"
 
+# ---------------------------------------------------------------------------
+# N-P: SECTION 0c (every check_*/mutate_* is SCHEDULED) NEVER RUNS. *** THE STATE
+# THAT PROVES 0c IS A DETECTOR RATHER THAN AN ASSUMPTION. ***
+#
+# 0b only compares against dispatch(), and STEPS -- the list the run ITERATES -- was
+# hand-maintained beside it. Measured 2026-10-02: a checker and a matrix were added
+# with their arms, 0b reported "all dispatched", the matrix NEVER RAN, and step 3/3
+# reported its stamp STALE, which reads as "the evidence is older than the tree"
+# with "re-run the named matrix" as the remedy. Re-running changes nothing.
+#
+# *** IT NEEDS ITS OWN RUNNER, because run_rac always sets INTFER_RUN_ALL_STEPS --
+# which is exactly the variable that makes 0c SKIP. *** The state therefore drives
+# the mutant with INTFER_RUN_ALL_COVERAGE_ONLY=1 and NO steps override, so 0c runs
+# for real against the sandbox's scripts/ and the run stops after section 0c (no
+# step executes, and no stamp dir is needed). That seam is the reason 0c is
+# testable at all: proving it costs seconds instead of a 45-minute stack.
+run_rac_cov() { # $1 = case id, $2 = log suffix
+  INTFER_BUILD_DIR="$SYNTH/inner" INTFER_RUN_ALL_COVERAGE_ONLY=1 \
+    timeout 300 bash "$MUTANT" >"$WORK/$1$2.log" 2>&1
+}
+
+# The baseline is the CONVERSE half, and it is required: without it a state that
+# requires "0c printed FAIL" could be scored by a run that aborts before 0c. It
+# must show 0c's OK line, i.e. that 0c stays SILENT on a healthy tree.
+NBASE=$((NBASE + 1))
+reset_mutant
+run_rac_cov "N-P" ".baseline"; npb=$?
+if [ "$npb" -ne 0 ] \
+   || ! grep -q 'every check_\*/mutate_\* is in STEPS as well as dispatch()' \
+        "$WORK/N-P.baseline.log" \
+   || grep -q 'never scheduled' "$WORK/N-P.baseline.log"; then
+  echo "FAIL: baseline N-P rc=$npb -- 0c must be SILENT and green on a healthy" >&2
+  echo "  tree, or the state below cannot distinguish '0c fired' from 'the run" >&2
+  echo "  died'. ($WORK/N-P.baseline.log)" >&2; exit 1
+fi
+echo "  ok    baseline N-P: 0c is silent and rc=0 on a healthy tree"
+
+A_STEPS_ENTRY='mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh"'
+reset_mutant
+patch_literal "$MUTANT" "$A_STEPS_ENTRY" 'mutate_checker_matrix_coverage.sh"' || {
+  echo "N-P MISSED (fn) -- the STEPS anchor did not match" >&2; exit 1; }
+# The arm must SURVIVE, or this state would be N-J again (a missing arm) and
+# would prove nothing about scheduling. Assert it rather than assume it.
+grep -q '^    mutate_verdict_scope.sh)' "$MUTANT" \
+  || { echo "N-P MISSED (fn) -- the dispatch arm is gone; this is N-J, not 0c" >&2; exit 1; }
+grep -q 'N-P' "$MUTANT" || true
+TOTAL=$((TOTAL + 1))
+run_rac_cov "N-P" ""
+if [ "$?" -ne 0 ] && grep -q 'never scheduled, so this run will NOT execute: mutate_verdict_scope.sh' \
+     "$WORK/N-P.log"; then
+  CAUGHT=$((CAUGHT + 1))
+  printf '  ok    %-4s defect reproduced: a matrix with an ARM but no STEPS entry never runs\n' "N-P"
+else
+  printf '  MISSED %-4s defect NOT reproduced: 0c accepted an unscheduled matrix\n' "N-P"
+  printf '       %-4s (rc and marker are both required; see %s)\n' "N-P" "$WORK/N-P.log"
+fi
+printf '       %-4s sandbox mutant only; the real tracked tree is never written\n' "N-P"
+reset_mutant
+
 # N-M: a dispatch() arm given a STRAY ARGUMENT. This is the class the full
 # stack exposed on 2026-10-01: a STEPS-line edit that added a matrix name also
 # matched inside the mutate_gate_pop.sh dispatch arm, so it ran as
