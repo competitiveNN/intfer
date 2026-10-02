@@ -18,10 +18,18 @@
 #
 # USAGE
 #     . "$(dirname "$0")/_gate_loadlog.sh"
-#     loadlog_init build/bench_logs/run1
+#     loadlog_init "$LOGDIR/run1"
 #     loadlog_arm "r${r}_${arm}" env $e "$BIN" ...      # runs, logs, samples
 #     tps="$(loadlog_tps_field "$scraped")"             # '' -> SKIPPED-CONTENDED
 #     log="$_LL_LOG"; mx="$_LL_MAX"; usable="$_LL_USABLE"
+#
+# This helper owns NO build path. The CALLER chooses the directory and must
+# honour INTFER_BUILD_DIR itself -- that is what check_build_dir_consumers.sh
+# enforces. An earlier version of this comment showed `loadlog_init
+# build/bench_logs/run1`, which read as though the helper defaulted to the build
+# tree; the consumer classifier matched the comment (it does not strip comments)
+# and failed a script that consumes no artifact at all. The example is a variable
+# now because that is what the code actually does.
 #
 # SEAMS (both exist so a test can drive them; see _gate_precond.sh's INTFER_SYCL_LS
 # for the same rationale -- an assumption the harness cannot redirect is an
