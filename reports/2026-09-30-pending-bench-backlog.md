@@ -179,8 +179,9 @@ measurably disagrees with the host on ~10% of elements (AGENTS.md AUDIT #2/#3).
 
 ### MEASURED 2026-10-02 — 27B `--tp 2`, decode `-n64`, 3 interleaved rounds
 Run through `scripts/bench_reports_batch.sh E1 3` (per-arm continuous load
-sampling). **Every arm was `SKIPPED-CONTENDED`** (`max_load1` 3.60 / 4.44 / 6.54 /
-9.57 / 11.23 / 11.31 / 15.32 / 17.45), so **no tok/s is claimed and every
+sampling). **Every arm was `SKIPPED-CONTENDED`** (`max_load1` 3.60 / 4.44 / 6.06 /
+6.54 / 9.57 / 11.23 / 11.31 / 15.32 / 17.45 — all nine arm-runs, re-derivable with
+`grep -o 'LOAD1=[0-9.]*' build/bench_E1.log`), so **no tok/s is claimed and every
 `RESULT:` line stays blank.** Counters only; raw records in
 `build/bench_E1.log` and `build/bench_logs/E1_*/`.
 
