@@ -577,6 +577,18 @@ class of retracted wall-time claims in this repo came from doing exactly that.
 ```bash
 cd /var/home/fra/dev/intfer
 
+# *** THE ONEAPI ENVIRONMENT, OR EVERY RUN BELOW SILENTLY MEASURES NOTHING. ***
+# The first version of this block omitted these two lines, so SYCL could not
+# enumerate ANY GPU ("No devices matching filter 'Arc'") and every invocation
+# exited with no `decode:` line. Because each run is piped through
+# `grep -aE 'decode: |@decode\]'`, the failure was INVISIBLE: the block printed
+# its round headers, matched nothing, and exited 1 with no diagnostic anywhere.
+# Found by running the block and seeing an empty log while a manual invocation of
+# the same command worked -- the CLI's own error text was being filtered away.
+set +u; . /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u
+export LD_LIBRARY_PATH="/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}"
+sycl-ls | grep -q '[level_zero:gpu]' || { echo "ABORT: no GPU visible" >&2; exit 1; }
+
 # *** A QUIET BOX IS A HARD PRECONDITION, SO IT FAILS RATHER THAN WARNS. ***
 # The first version of this block used `until ...; do sleep 30; done` ONCE at the
 # top, and each round merely PRINTED its load1. That contradicts the note above
