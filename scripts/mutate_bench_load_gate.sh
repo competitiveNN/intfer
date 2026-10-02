@@ -197,6 +197,24 @@ PLANT
 run_state "B-G" 'B_G' 'bench_fake_latency' \
   "an ungated latency-only harness is INVISIBLE to the derivation"
 
+# B-H: the helper's fail-loud guard removed. Without it an unset verdict compared
+# unequal to "1" and loadlog_field returned SKIPPED-CONTENDED -- the SAFE
+# direction but a SILENT one, so a harness wired wrong withholds every figure
+# forever and never says why. Every other property still passes: the helper is
+# still sourced, still not redefined, still withholds a drifting arm correctly
+# (loadlog_arm sets the verdict, so the guard is never consulted there). Only the
+# no-arm probe can see this, which is why it is a separate state rather than
+# folded into B-E.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/_gate_loadlog.sh" \
+    '  _ll_need _LL_USABLE || return 1
+  if [ "$_LL_USABLE" = 1 ]; then' \
+    '  if [ "${_LL_USABLE-}" = 1 ]; then   # B_H guard removed'
+  grep -q 'B_H' "$SB/scripts/_gate_loadlog.sh"
+}
+run_state "B-H" 'B_H' 'did not fail loudly' \
+  "the helper silently withholds instead of refusing when no arm has run"
+
 restore
 echo
 echo "== residue + restore integrity =="

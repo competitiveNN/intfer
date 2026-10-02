@@ -202,6 +202,27 @@ else
     echo "        USABLE proves nothing and every real run would be discarded."
     bad=$((bad+1))
   fi
+  # The guard must be LOUD, not silently withholding. Proven by consuming a figure
+  # with no preceding loadlog_arm: before _ll_need existed, the empty verdict
+  # compared unequal to "1" and loadlog_field returned SKIPPED-CONTENDED -- the
+  # SAFE direction, but a SILENT one. A harness wired wrong would withhold every
+  # figure forever and never say why. State B-H removes the guard; this notices.
+  (
+    . "./$HELPER"
+    loadlog_init "$TDIR/noguard" >/dev/null
+    out="$(loadlog_field '2.83 tok/s' 2>&1)"; rc=$?
+    echo "NOGUARD_RC=$rc NOGUARD_OUT=$out"
+  ) > "$TDIR/noguard" 2>&1
+  if grep -q 'NOGUARD_RC=1' "$TDIR/noguard" \
+     && grep -q 'loadlog_arm must run' "$TDIR/noguard"; then
+    echo "  ok    behavioural: a figure consumed with no arm FAILS LOUDLY (rc=1)"
+  else
+    echo "  FAIL  consuming a figure with no preceding loadlog_arm did not fail loudly."
+    echo "        It must refuse and say why; silent withholding is how a harness"
+    echo "        wired wrong goes blank forever without a word. Got:"
+    sed 's/^/          /' "$TDIR/noguard"
+    bad=$((bad+1))
+  fi
 fi
 
 echo

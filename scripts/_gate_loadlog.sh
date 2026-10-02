@@ -86,11 +86,31 @@ loadlog_arm() { # $1 = label; the rest is the command (env comes from the caller
   return "$rc"
 }
 
+# Fail CLOSED and LOUDLY when a figure is consumed before loadlog_arm has run.
+# Without this the empty verdict compared unequal to "1" and loadlog_field
+# returned SKIPPED-CONTENDED -- the SAFE direction, but a silent one: a harness
+# wired wrong would withhold every figure forever and never say why. With it, the
+# wiring error is the message. This is the AUDIT #20 shape applied to a value: a
+# guard that cannot fail is not a guard, and neither is an empty verdict.
+_ll_need() { # $1 = variable name
+  if [ -z "${!1-}" ]; then
+    echo "loadlog: $1 is unset -- loadlog_arm must run (and succeed) before any" >&2
+    echo "loadlog:   figure is emitted. Refusing to guess: withholding a figure" >&2
+    echo "loadlog:   without saying why is how a harness goes quietly blank." >&2
+    return 1
+  fi
+}
+
+# The arm's verdict, or a loud failure. Harnesses may use this to gate a block of
+# figures (bench_chat.sh does), and it is the form that is safe under `set -u`.
+loadlog_usable() { _ll_need _LL_USABLE || return 1; [ "$_LL_USABLE" = 1 ]; }
+
 # THE primitive: a value a caller is about to publish, or the withheld token.
 # Every figure this repo quotes goes through here, whatever its unit -- a tok/s, a
 # TTFT in seconds, an aggregate rate. One primitive means one definition of
 # "withheld", so two harnesses cannot invent two spellings of it.
 loadlog_field() { # $1 = the value (may be empty)
+  _ll_need _LL_USABLE || return 1
   if [ "$_LL_USABLE" = 1 ]; then
     printf '%s' "$1"
   else

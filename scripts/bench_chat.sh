@@ -11,6 +11,7 @@
 #   Starts a server on P (default 18779) unless INTFER_HTTP_URL is set.
 # Env: INTFER_08B (model), INTFER_BUILD_DIR.
 set -o pipefail
+set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MODEL="${INTFER_08B:-$ROOT/test/models/Qwen3.5-0.8B.intifer}"
@@ -26,7 +27,15 @@ while [ $# -gt 0 ]; do
 done
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }
+# NOTE: setvars.sh is not `set -u`-clean; drop nounset across the source, exactly
+# as bench_gpu_ab.sh and every other `set -u` harness here does. bench_chat.sh was
+# the last harness without nounset, and it was the reason `$_LL_USABLE` was only
+# safe by ACCIDENT: an unset verdict compared unequal to "1" and silently
+# withheld. With nounset on, and _ll_need inside the helper, that wiring mistake
+# is now a message instead of a blank.
+set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+set -u
 mkdir -p /var/home/fra/build_tmp
 
 URL="${INTFER_HTTP_URL:-http://127.0.0.1:$PORT}"
@@ -112,7 +121,7 @@ echo "  leg chat_runs  max_load1=$_LL_MAX  log=$_LL_LOG"
 # threshold; otherwise name the withheld state and point at the log. Quoting a
 # TTFT measured on a box that swung past the threshold mid-run is the same defect
 # as quoting a contended tok/s, just in different units.
-if [ "$_LL_USABLE" = 1 ]; then
+if loadlog_usable; then
   grep -aE '^turn[0-9]+:' "$_LL_LOG" | sed 's/^/  /' || true
   echo "  FIGURES USABLE (max_load1=$_LL_MAX < $INTFER_QUIET_LOAD)"
 else
