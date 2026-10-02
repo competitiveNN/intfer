@@ -56,14 +56,41 @@ LOCK_DIR="$BUILD_DIR"
 LOCK="$LOCK_DIR/.run_all_checks.lock"
 mkdir -p "$BUILD_DIR" || exit 1
 
+# *** THE LOCK RECORDS ITS OWNER, AND SELF-HEALS ONLY IF THAT OWNER IS DEAD. ***
+# MEASURED HAZARD, and it was mine twice in this session: a run killed mid-stack
+# left the lock behind, and the operator's remedy was `rm -f $LOCK` -- a command
+# that will happily delete a LIVE run's lock and let a second stack restore
+# another run's mutations over its own. The message used to even instruct that. So
+# the lock now carries the owner's pid, and a stale lock is removed only after
+# `kill -0` proves the owner is gone, with a loud line naming the dead pid.
+#
+# FAIL-CLOSED ON RECYCLED PIDS, which is the right direction: if a new process has
+# inherited the dead run's pid, `kill -0` SUCCEEDS, the lock is treated as live, and
+# the run refuses -- annoying, never dangerous. States N-R and N-S in
+# mutate_run_all_checks.sh drive both directions (dead owner -> self-heal, live
+# owner -> refuse), because a self-heal that is not tested is an unconditional
+# delete with extra steps.
 if ! mkdir "$LOCK" 2>/dev/null; then
-  echo "FAIL: another run_all_checks.sh is running (or died holding $LOCK)." >&2
-  echo "  The mutation matrices edit tracked source, so a concurrent run would" >&2
-  echo "  restore another run's mutations over its own. If no run is active," >&2
-  echo "  remove $LOCK and re-run." >&2
-  exit 1
+  lock_owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
+  if [ -n "$lock_owner" ] && ! kill -0 "$lock_owner" 2>/dev/null; then
+    echo "STALE LOCK: $LOCK was held by pid $lock_owner, which is gone. Removing" >&2
+    echo "  it and continuing. (Recorded, because a silent takeover would hide a" >&2
+    echo "  killed run; check build/ for a truncated stack log if that matters.)" >&2
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || {
+      echo "FAIL: could not re-create $LOCK after removing a stale one." >&2; exit 1; }
+  else
+    echo "FAIL: another run_all_checks.sh holds $LOCK${lock_owner:+ (pid $lock_owner)}." >&2
+    echo "  The mutation matrices edit tracked source, so a concurrent run would" >&2
+    echo "  restore another run's mutations over its own." >&2
+    echo "  Do NOT delete the lock to get past this -- that is the one thing that" >&2
+    echo "  turns a refusal into a corrupted tree. Wait for it, or check whether" >&2
+    echo "  the holder is alive: kill -0 ${lock_owner:-<pid in $LOCK/pid>}." >&2
+    exit 1
+  fi
 fi
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+echo $$ > "$LOCK/pid" 2>/dev/null || true
+trap 'rm -rf "$LOCK" 2>/dev/null || true' EXIT INT TERM
 
 # --- fail closed on a dirty tracked tree ------------------------------------
 # The matrices restore with `git checkout --`, so ANY uncommitted tracked change
