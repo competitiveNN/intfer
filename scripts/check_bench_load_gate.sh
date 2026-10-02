@@ -225,6 +225,45 @@ else
   fi
 fi
 
+# ---- (6) the gate is consulted AFTER the arm, so _ll_need stays unreachable ---
+# _ll_need (the fail-loud guard on an unset verdict) is exercised ONLY by the
+# fixture above, never by a real run -- which is correct, and also worth stating
+# rather than leaving implied. It is unreachable precisely because every harness
+# consults the verdict after loadlog_arm has set it. Reverse that order and every
+# real figure would be REFUSED: a loud, total failure. So the invariant that keeps
+# the guard a wiring-error detector instead of a production outage is itself a
+# checked property, per derived harness, on comment-stripped source.
+#
+# *** The comment strip here was added because this check reproduced the bug it
+# exists to prevent. *** Its first version flagged bench_chat.sh GATE-BEFORE-ARM
+# on a COMMENT that merely mentions the verdict variable -- the same class as the
+# usage comment that turned the stack red twice. Caught on its first run, which is
+# the only reason a fresh script gets the benefit of the doubt.
+printf '\n%-4s %-34s %s\n' "" "harness" "gate consulted after the arm"
+for f in $POP; do
+  arm_line="$(strip_comments "$f" | grep -n 'loadlog_arm' | head -1 | cut -d: -f1)"
+  gate_line="$(strip_comments "$f" \
+    | grep -nE 'loadlog_usable|_LL_USABLE|loadlog_(tps_)?field' | head -1 | cut -d: -f1)"
+  if [ -z "$arm_line" ]; then
+    why="no loadlog_arm -- covered by property 1"
+  elif [ -z "$gate_line" ]; then
+    why="no gate consulted -- covered by property 2"
+  elif [ "$gate_line" -gt "$arm_line" ]; then
+    why="ok (arm@$arm_line, gate@$gate_line)"
+  else
+    why="GATE-BEFORE-ARM (arm@$arm_line, gate@$gate_line)"
+  fi
+  if pred_expect_absent "order:$(basename "$f")" \
+       "$(printf '%s' "$why" | grep -c 'GATE-BEFORE-ARM' || true)" '^[1-9]'; then
+    printf '  %-4s %-34s %s\n' "ok" "$(basename "$f")" "$why"
+  else
+    printf '  %-4s %-34s %s\n' "FAIL" "$(basename "$f")" "$why"
+    echo "        Every figure from this harness would be REFUSED at runtime by"
+    echo "        _ll_need. Reorder: run the arm, THEN consult the verdict."
+    bad=$((bad+1))
+  fi
+done
+
 echo
 if [ "$bad" -eq 0 ]; then
   echo "BENCH LOAD-GATE CHECK: PASS ($n_pop harness(es), one shared home, no bare"

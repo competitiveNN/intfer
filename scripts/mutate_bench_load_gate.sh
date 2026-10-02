@@ -229,6 +229,25 @@ MUTATE_FN() {
 run_state "B-H" 'B_H' 'did not fail loudly' \
   "the helper silently withholds instead of refusing when no arm has run"
 
+# B-I: the gate is consulted BEFORE the arm. Every figure from the harness would be
+# REFUSED at runtime by _ll_need -- a loud, total failure, which is why the
+# invariant is checked rather than trusted. _ll_need itself is fixture-only
+# coverage (no real run reaches it, which is the POINT of this property), so this
+# state is the only thing standing between that fact and a production outage.
+MUTATE_FN() {
+  patch_literal "$HC" 'if loadlog_usable; then' 'if loadlog_usable; then   # B_I queried too early' || return 1
+  # move the query above the arm: the verdict is unset at that point
+  patch_literal "$HC" 'loadlog_arm chat_runs python3 - <<'"'"'EOF'"'"'' \
+    'if loadlog_usable; then   # B_I queried BEFORE the arm
+loadlog_arm chat_runs python3 - <<'"'"'EOF'"'"'' || return 1
+  patch_literal "$HC" 'echo "  FIGURES USABLE (max_load1=$_LL_MAX < $INTFER_QUIET_LOAD)"
+else' \
+    'echo "  (gate moved above)"' || return 1
+  grep -q 'B_I' "$HC"
+}
+run_state "B-I" 'B_I' 'GATE-BEFORE-ARM' \
+  "the harness consults the load verdict before running its arm"
+
 restore
 echo
 echo "== residue + restore integrity =="
