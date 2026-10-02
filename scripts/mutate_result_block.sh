@@ -228,7 +228,7 @@ EOF
   patch_literal "$SB/reports/2026-09-30-pending-bench-backlog.md" "$a" "$b"
   grep -q 'R_I' "$SB/reports/2026-09-30-pending-bench-backlog.md"
 }
-run_state "R-I" 'R_I' 'unlogged, ungated' "an arm reverted to a bare pipe"
+run_state "R-I" 'R_I' 'unlogged and ungated' "an arm reverted to a bare pipe"
 
 restore
 echo
