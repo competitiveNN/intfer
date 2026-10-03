@@ -548,22 +548,29 @@ STUB
         timeout 300 bash "$SCRIPT_DIR/bench_reports_batch.sh" E2 1 \
         > "$TDIR/e2e.out" 2>&1
     }
-    # The signature is now PHASE-DERIVED: bench_reports_batch.sh harvests a
- # configurable phase (`PHASE_TAG`), so the dead-arm signature reads
-    # "no_<phase>_line_in_arm_output" -- "no_decode_..." at the default.
-    # It used to be the literal "no_@decode_line_in_arm_output". Renaming it
-    # broke THIS assertion, which is the recorded AUDIT #22 trap verbatim: a
-    # check that spells out another script's literal is graded by it. The
-    # rename was correct (the phase is genuinely configurable now); the
-    # expectation is what had to move with it.
-    # -- firing direction: no profile line, so every arm dies --
+    # The dead-arm signature is PHASE-DERIVED: bench_reports_batch.sh harvests a
+ # configurable phase (`PHASE_TAG`), so the signature reads
+ # "no_<phase>_line_in_arm_output" -- "no_decode_..." at the default phase.
+ #
+ # Match the SHAPE, not the phase name. Hard-coding the phase made this
+ # assertion a copy of the harness's default: adding E4 (which harvests
+ # `@prefill`) renamed the emitted signature and turned the assertion RED, which
+ # is the recorded AUDIT #22/#23 trap -- a check that spells out another
+ # script's literal is graded by it, so a rename silently un-scores the check.
+ # Commit 5364abe fixed that instance by moving the expectation with the rename;
+ # this is the durable fix. The property being asserted is "the refusal NAMES the
+ # dead arm's signature", and the phase is incidental to it, so the pattern
+ # `no_<anything>_line_in_arm_output` keeps the meaning while surviving the next
+ # phase the harness learns to harvest. It is still a positive assertion of a
+ # specific shape -- not a loosened `grep -q .`.
+ # -- firing direction: no profile line, so every arm dies --
     write_stub 0
     run_harness; e2e_dead_rc=$?
     if pred_expect_present "e2e-dead-stub-rc2" "$e2e_dead_rc" '^2$' \
        && pred_expect_present "e2e-dead-stub-says-not-a-result" \
             "$(grep -c 'THIS BATCH IS NOT A RESULT' "$TDIR/e2e.out" || true)" '^[1-9]' \
        && pred_expect_present "e2e-dead-stub-names-the-signature" \
-            "$(grep -c 'no_decode_line_in_arm_output' "$TDIR/e2e.out" || true)" '^[1-9]'; then
+            "$(grep -cE 'no_[A-Za-z0-9@_-]*_line_in_arm_output' "$TDIR/e2e.out" || true)" '^[1-9]'; then
       echo "  ok    e2e: the REAL harness refuses a batch whose arms all died (rc=2)"
     else
       echo "  FAIL  e2e-dead-stub: the harness did not refuse a batch in which"

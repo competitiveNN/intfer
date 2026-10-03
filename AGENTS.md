@@ -3569,6 +3569,18 @@ e.g. S3's contract column is 40 not 42).
    agreed BEFORE any code is written. Do not start it on the assumption it will
    be exact. Also note INTFER_DPAS_ROW is the cautionary precedent: re-partitioning
    one-WI-per-row without real cooperation measured ~460x SLOWER.
+   [SUPERSEDED 2026-10-03: E4 SHIPPED as `INTFER_DPAS48_TILED=1` (default OFF) —
+   bc0b008 implemented it, 59924ae benchmarked it at 27B `--tp 2` and recorded
+   KEEP: prefill device kernel -1851.9 ms (-9.95 %), 3/3 rounds same sign, nk
+   UNCHANGED. Report archived at
+   `reports/archive/2026-09-30-e4-dpas-2d-contract.md`. The paragraph above is the
+   record of why it was deferred, kept as written; read it for the reasoning, not
+   for the status. Two things it predicted that did NOT happen: the geometry IS
+   bit-exact, by construction rather than by tolerance -- each (row, tile) keeps
+   ONE accumulator and no FP32 add is reordered, so the contract's hazard (per-block
+   partial sums combined in a different order) has no counterpart here -- and it is
+   NOT a ~460x regression, because tile parallelism is preserved exactly (one tile
+   per WI; only the ROW COUNT per tile grows).]
 
    === AUDIT #10: AUDIT #8's OWN ENUMERATION WAS THE SAME NARROW PATTERN ===
    7efed06 fixed 5 harnesses and then claimed "All 17 artifact consumers now

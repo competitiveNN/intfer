@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -629,11 +630,31 @@ int main() {
         ++diff;
       }
     e4_dev_pairs = (std::uint64_t)M * N;
-    if (diff == 0)
+    // NON-TRIVIALITY. "256 outputs bit-identical" is ALSO what this arm would
+    // print if BOTH kernels wrote nothing, or wrote a constant field: two
+    // buffers of untouched shared memory compare equal forever. The comparison
+    // needs a subject before its verdict means anything -- AUDIT #20's rule
+    // ("found nothing to look at" and "found nothing wrong" are different
+    // claims), applied to a device readback. Count the distinct outputs of the
+    // R=1 side and require a real spread of values; the count is printed on the
+    // ok line so the evidence is on the record rather than asserted in prose.
+    std::vector<std::uint16_t> uniq(h1);
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    const std::size_t e4_distinct = uniq.size();
+    const bool e4_no_subject = (e4_distinct < 8);
+    if (e4_no_subject) {
+      std::printf("  FAIL  E4 readback has NO SUBJECT: only %zu distinct value(s) "
+                  "across %llu outputs, so 'bit-identical' is vacuous -- both "
+                  "kernels may have written a constant field\n",
+                  e4_distinct, (unsigned long long)e4_dev_pairs);
+      ok = false;
+    } else if (diff == 0) {
       std::printf("  ok    %llu outputs bit-identical between R=1 and R=2 "
-                  "(M=%u, N=%u, K=%u)\n",
-                  (unsigned long long)e4_dev_pairs, M, N, K);
-    else {
+                  "(M=%u, N=%u, K=%u, %zu distinct values -- the comparison HAS a "
+                  "subject)\n",
+                  (unsigned long long)e4_dev_pairs, M, N, K, e4_distinct);
+    } else {
       std::printf("  FAIL  E4 readback: %llu of %llu outputs differ -- the row "
                   "block changed the arithmetic\n",
                   (unsigned long long)diff, (unsigned long long)e4_dev_pairs);

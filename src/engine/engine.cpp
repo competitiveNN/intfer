@@ -961,10 +961,10 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
   // row-cooperative geometry (which has its own fold handling).
   const bool use_fold = dpas_fold_enabled();
 // E4: cooperative 2D row block. Requires M >= 2, which quant_gemm_dpas48_2d
-// ALSO enforces and DECLINES on -- the flag is checked here only so the
-// experiment is inert (and attributable) rather than attempted and declined on
-// every decode call.
-const bool use_tiled = dpas_tiled_enabled() && M >= 2 && !use_row;
+  // ALSO enforces and DECLINES on -- the flag is checked here only so the
+  // experiment is inert (and attributable) rather than attempted and declined on
+  // every decode call.
+  const bool use_tiled = dpas_tiled_enabled() && M >= 2 && !use_row;
 
   // 1) Activation quant into ws48_ (per row, per GA-slice max-abs scale).
   //    Device pre-pass first; on ANY decline fall through to the host loop,
@@ -1114,16 +1114,24 @@ const bool use_tiled = dpas_tiled_enabled() && M >= 2 && !use_row;
     sycl::event kernel_evt = use_row ? gemm::quant_gemm_dpas4_row(q, p, dep)
                           : use_tiled ? gemm::quant_gemm_dpas48_2d(q, p, dep)
                                       : gemm::quant_gemm_dpas48(q, p, dep);
-    // Decline detection. quant_gemm_dpas48_2d returns `dep` UNCHANGED when it
-    // declines (that is what makes a decline observable at all), so the old
-    // `== sycl::event{}` test would read a decline as SUCCESS whenever dep is
-    // non-empty -- silently skipping the GEMM instead of falling back. Test both
-    // shapes: with an empty prerequisite a decline surfaces as an empty event,
-    // with a real one it surfaces as identity with dep. A successful submit
-    // always returns a fresh event, so neither test can false-positive.
+    // Decline detection. BOTH callee conventions exist in this file and each
+    // declares which it uses, so this must accept BOTH:
+    //   quant_gemm_dpas48_2d returns `dep` UNCHANGED -- that is what makes its
+    //     decline observable at all, because a fresh `sycl::event{}` cannot be
+    //     told apart from a real return.
+    //   quant_gemm_dpas4_row returns a bare `sycl::event{}` (quant_gemm.cpp
+    //     "Declines (null event) unless bits==4 and weight group==64").
+    // Testing only the first, as an earlier revision of this function did, is
+    // strictly NARROWER than the pre-E4 `== sycl::event{}` test: a row-kernel
+    // decline under a non-empty `dep` would read as SUCCESS and silently skip
+    // the GEMM instead of falling back. Not reachable today -- use_row is gated
+    // on exactly the condition the row kernel declines on (engine.cpp:950) --
+    // but that is a coincidence of two sites agreeing, not a rule, and a rule
+    // fixed at one callee and not the other is the shape this repo keeps
+    // re-auditing. A successful submit always returns a FRESH event, so neither
+    // test can false-positive.
     const bool declined =
-        (dep == sycl::event{}) ? (kernel_evt == sycl::event{})
-                               : (kernel_evt == dep);
+        (kernel_evt == sycl::event{}) || (kernel_evt == dep);
     if (declined) kernel_evt = gemm::quant_gemm_dpas48(q, p, dep);
     kernel_events.push_back(kernel_evt);
 #ifdef INTFER_PROFILE_GPU

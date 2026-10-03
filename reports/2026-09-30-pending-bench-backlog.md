@@ -872,7 +872,7 @@ described as covered by them until they have actually run.
 | `test_gpu_optin.sh` | only its whole `tp 2` pass (~14 arms). The `tp 1` pass **does** run here | same condition, then `bash scripts/test_gpu_optin.sh` (expects rc=0 instead of rc=2) |
 | `test_tp2_27b.sh` | everything: 27B TP=2 greedy decode vs oracle, and the ~19GB-vs-~12GB VRAM headroom claim | same condition, then `bash scripts/test_tp2_27b.sh` |
 | E1 / E2 / E3 A/Bs | every tok/s number in those sections | needs both GPUs *and* a quiet window (load1 < 2) |
-| E4 | unimplemented by design; no flag exists | pre-registered only, see above |
+| E4 `INTFER_DPAS48_TILED=1` | **only the quiet-box tok/s.** BUILT, GATED and BENCHMARKED 2026-10-03: device-kernel A/B at 27B `--tp 2` is decided (KEEP), see `reports/archive/2026-09-30-e4-dpas-2d-contract.md` | needs a quiet window (load1 < 2), **not** a second GPU — the device-kernel leg is already settled |
 | E5 `INTFER_DEVICE_ARGMAX=1` | every tok/s number — the lever is **default-off and has never been benchmarked**, only correctness-gated | needs a quiet window (load1 < 2). Does **NOT** need a second GPU: the flag declines TP>1 (`:1913`), so it is TP=1-only by construction. But the 27B target is unreachable either way — TP=1-on-one-B580 OOMs on the lm_head tile (AUDIT #11) — so E5 is honestly a 0.8B measurement, not a 27B one. See `2026-10-01-device-argmax.md` |
 
 If a future session cannot get a second GPU, the correct statement is
@@ -891,11 +891,13 @@ moved, duplicated or vanished, or if a read site has stopped routing through
 
 ## Also not yet implemented (no flag to test — do not go looking)
 
-- rewritten **2D-tiled / cooperative** DPAS kernel (B operands loaded once per
-  block, not once per WI). Registered as **E4** above with its design and its
-  numerics blocker; it is no longer lumped in here because it now has a written
-  shape. The K-fold arithmetic half of that work SHIPPED as E3
-  (`INTFER_DPAS48_FOLD`, gated).
+- ~~rewritten **2D-tiled / cooperative** DPAS kernel (B operands loaded once per
+  block, not once per WI)~~ **SHIPPED 2026-10-03 as E4**
+  (`INTFER_DPAS48_TILED=1`, default OFF, gated, device-kernel A/B decided KEEP —
+  `reports/archive/2026-09-30-e4-dpas-2d-contract.md`). The arithmetic half of
+  that work shipped earlier as E3 (`INTFER_DPAS48_FOLD`, gated). What is still
+  unbuilt is the *subgroup-cooperative* form beyond a 2-row block; nothing in the
+  tree claims it.
 - batched multi-launch L0 command lists amortizing one sync over many kernels
   (single immediate append+sync was measured at the same floor as UR submit)
 
