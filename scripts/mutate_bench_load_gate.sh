@@ -431,6 +431,31 @@ echo "RESULT ($BATCH, $(basename "$MODEL") tp=$TP, devices=$NDEV) - NO wall-time
 run_state "B-O" 'B_O' 'e2e-dead-stub-rc2' \
   "the refusal prints but exits 0 -- invisible to every text property"
 
+# B-P: *** AN ARTIFACT-DEFECT STATE, WHICH IS THE ONLY FORM THAT WORKS HERE. ***
+# The e2e property asserts the refusal prints `<arm>/<round>: no_<phase>_line_...`,
+# so it can only be made to fail by DAMAGING THE HARNESS, not by weakening the
+# checker -- the checker is correct by construction, which is exactly the AUDIT #21
+# situation where checker-weakening is an unobservable no-op.
+#
+# The damage is the NARROWEST one available: the harness keeps printing the
+# signature, keeps printing it verbatim, and keeps exiting 2, but stops attributing
+# it to an arm. That is the shape a real regression would take (a refactor that
+# reformats FAILED_SIGS), and it is the one thing the new
+# `attributes-the-signature-to-an-arm` requirement exists to catch -- a reader who
+# cannot tell WHICH run produced nothing cannot act on the refusal at all.
+# Marked on the sandbox harness, which is unique to this state.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/bench_reports_batch.sh" \
+    '  FAILED_SIGS="$FAILED_SIGS
+  $1/$2: $ARM_SIG"' \
+    '  FAILED_SIGS="$FAILED_SIGS
+  B_P unattributed: $ARM_SIG"' || return 1
+  bash -n "$SB/scripts/bench_reports_batch.sh" || return 1
+  grep -q 'B_P' "$SB/scripts/bench_reports_batch.sh"
+}
+run_state "B-P" 'B_P' 'attributes-the-signature-to-an-arm' \
+  "the refusal still names the signature but no longer says WHICH arm died"
+
 restore
 echo
 echo "== residue + restore integrity =="

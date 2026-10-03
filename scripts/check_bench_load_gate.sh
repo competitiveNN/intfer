@@ -558,19 +558,26 @@ STUB
  # is the recorded AUDIT #22/#23 trap -- a check that spells out another
  # script's literal is graded by it, so a rename silently un-scores the check.
  # Commit 5364abe fixed that instance by moving the expectation with the rename;
- # this is the durable fix. The property being asserted is "the refusal NAMES the
- # dead arm's signature", and the phase is incidental to it, so the pattern
+ # this is the durable fix. The phase is incidental to what is being asserted, so
  # `no_<anything>_line_in_arm_output` keeps the meaning while surviving the next
- # phase the harness learns to harvest. It is still a positive assertion of a
- # specific shape -- not a loosened `grep -q .`.
+ # phase the harness learns to harvest.
+ #
+ # *** AND IT MUST BE ATTRIBUTED TO AN ARM. *** Requiring only the signature would
+ # accept a refusal that prints the string without saying WHICH arm died, which is
+ # the part an operator actually needs -- AUDIT #27's whole point is that a reader
+ # can tell which run produced nothing. bench_reports_batch.sh emits
+ # `RESULT:   <arm>/<round>: <signature>`, so the pattern below requires that
+ # attribution and nothing else does. Proven by mutation B-P: an artifact state
+ # that drops the `$1/$2:` prefix makes this assertion fail, so it is not a
+ # decoration on an already-passing check.
  # -- firing direction: no profile line, so every arm dies --
-    write_stub 0
-    run_harness; e2e_dead_rc=$?
-    if pred_expect_present "e2e-dead-stub-rc2" "$e2e_dead_rc" '^2$' \
+ write_stub 0
+ run_harness; e2e_dead_rc=$?
+ if pred_expect_present "e2e-dead-stub-rc2" "$e2e_dead_rc" '^2$' \
        && pred_expect_present "e2e-dead-stub-says-not-a-result" \
             "$(grep -c 'THIS BATCH IS NOT A RESULT' "$TDIR/e2e.out" || true)" '^[1-9]' \
-       && pred_expect_present "e2e-dead-stub-names-the-signature" \
-            "$(grep -cE 'no_[A-Za-z0-9@_-]*_line_in_arm_output' "$TDIR/e2e.out" || true)" '^[1-9]'; then
+       && pred_expect_present "e2e-dead-stub-attributes-the-signature-to-an-arm" \
+            "$(grep -cE '^[[:space:]]*RESULT:[[:space:]]+[A-Za-z0-9_]+/[A-Za-z0-9_-]+:[[:space:]]*no_[A-Za-z0-9@_-]*_line_in_arm_output' "$TDIR/e2e.out" || true)" '^[1-9]'; then
       echo "  ok    e2e: the REAL harness refuses a batch whose arms all died (rc=2)"
     else
       echo "  FAIL  e2e-dead-stub: the harness did not refuse a batch in which"
