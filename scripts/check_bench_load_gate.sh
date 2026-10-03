@@ -543,10 +543,17 @@ exit 0
 STUB
       chmod +x "$STUBDIR/intfer_cli"
     }
-    run_harness() { # $1 profile? -> writes $TDIR/e2e.out, returns the harness rc
-      INTFER_BUILD_DIR="$TDIR/stub" INTFER_08B="$TDIR/model.intifer" \
+    # $1 = PHASE_TAG (default @decode), $2 = output suffix. The phase is a parameter
+    # because the shape match below must be proven to work at a phase that is NOT
+    # the default -- otherwise "matches any phase" and "matches the default phase"
+    # are indistinguishable, and the wildcard could be a hardcoded literal that
+    # merely LOOKS general. That is the whole regression 5364abe was.
+    run_harness() { # $1 phase, $2 suffix -> writes $TDIR/e2e$2.out, returns rc
+      local ph="${1:-@decode}" suf="${2:-}"
+      INTFER_PHASE_TAG="$ph" INTFER_BUILD_DIR="$TDIR/stub" \
+        INTFER_08B="$TDIR/model.intifer" \
         timeout 300 bash "$SCRIPT_DIR/bench_reports_batch.sh" E2 1 \
-        > "$TDIR/e2e.out" 2>&1
+        > "$TDIR/e2e$suf.out" 2>&1
     }
     # The dead-arm signature is PHASE-DERIVED: bench_reports_batch.sh harvests a
  # configurable phase (`PHASE_TAG`), so the signature reads
@@ -605,6 +612,26 @@ STUB
       echo "        finish_batch exits 2 first, so a defect in the summary's exit"
       echo "        code is invisible without it. Got:"
       tail -12 "$TDIR/e2e.out" | sed 's/^/          /'
+      bad=$((bad + 1))
+    fi
+    # -- THE PHASE CONVERSE: the same firing direction at a NON-default phase. --
+    # A correctly-named refusal at `@prefill` must satisfy the same assertion. This
+    # is what makes the wildcard meaningful rather than decorative, and it is the
+    # ONLY thing that catches a checker which has quietly gone back to hardcoding
+    # `no_decode_...` -- state B-Q.
+    write_stub 0
+    run_harness "@prefill" ".prefill"; e2e_pf_rc=$?
+    if pred_expect_present "e2e-prefill-rc2" "$e2e_pf_rc" '^2$' \
+       && pred_expect_present "e2e-prefill-attributes-the-signature-to-an-arm" \
+            "$(grep -cE '^[[:space:]]*RESULT:[[:space:]]+[A-Za-z0-9_]+/[A-Za-z0-9_-]+:[[:space:]]*no_prefill_line_in_arm_output' "$TDIR/e2e.prefill.out" || true)" '^[1-9]'; then
+      echo "  ok    e2e-prefill: the SAME assertion holds at a NON-default phase"
+      echo "        (@prefill) -- so 'matches any phase' is real, not a hardcoded"
+      echo "        @decode that happens to work"
+    else
+      echo "  FAIL  e2e-prefill: rc=$e2e_pf_rc. A checker that only recognises the"
+      echo "        default phase would pass every other case in this section and"
+      echo "        then un-score the moment a second phase is harvested. Got:"
+      tail -12 "$TDIR/e2e.prefill.out" | sed 's/^/          /'
       bad=$((bad + 1))
     fi
     # -- converse: a profile line, so every arm measures --

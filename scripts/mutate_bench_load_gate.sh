@@ -456,6 +456,23 @@ MUTATE_FN() {
 run_state "B-P" 'B_P' 'attributes-the-signature-to-an-arm' \
   "the refusal still names the signature but no longer says WHICH arm died"
 
+# B-Q: *** THE PHASE WILDCARD, WHICH B-P DOES NOT TEST. *** B-P proves the refusal
+# must be ATTRIBUTED to an arm, but it damages the harness, not the checker, so it
+# says nothing about whether the checker still matches a phase other than the
+# default. This state reverts the checker's pattern to the hardcoded
+# `no_decode_...` literal -- i.e. it REPLAYS the 5364abe regression exactly, rather
+# than proxying for it -- and requires the @prefill case to reject it while every
+# other case keeps passing. Without this, "matches any phase" and "matches the
+# default phase" are indistinguishable and the wildcard is decoration.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/check_bench_load_gate.sh" \
+    "no_[A-Za-z0-9@_-]*_line_in_arm_output" "no_decode_line_in_arm_output" || return 1
+  bash -n "$SB/scripts/check_bench_load_gate.sh" || return 1
+  grep -q 'no_decode_line_in_arm_output' "$SB/scripts/check_bench_load_gate.sh"
+}
+run_state "B-Q" 'B_Q' 'e2e-prefill' \
+  "the phase wildcard reverted to a hardcoded @decode, so a @prefill refusal is missed"
+
 restore
 echo
 echo "== residue + restore integrity =="
