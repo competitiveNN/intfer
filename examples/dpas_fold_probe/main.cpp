@@ -570,6 +570,8 @@ int main() {
   std::printf("\n[dpas-fold-probe] E4 real-kernel readback "
               "(dpas48 R=1 vs dpas48_2d R=2, bit-exact expected):\n");
   std::uint64_t e4_dev_pairs = 0;
+  struct E4Sig { std::uint32_t bits, G; std::uint64_t sig; };
+  std::vector<E4Sig> e4_sigs;
   auto e4_readback = [&](std::uint32_t bits, std::uint32_t G) {
     // Counted HERE, not at the call site: the verdict line prints `devs` as
     // "device readback regimes", and a total written beside the calls is a
@@ -645,6 +647,22 @@ int main() {
         ++diff;
       }
     e4_dev_pairs += (std::uint64_t)M * N;
+    // SEPARABILITY. Four labelled readbacks are only four CHECKS if each really
+    // runs a different branch. If `bits`/`G` silently failed to reach the kernel,
+    // all four would compute the same thing and the section would be one check
+    // wearing four labels -- the AUDIT #20 shape, and the way a parameterised
+    // test stops being a coverage claim. So record a signature of the R=1 output
+    // per combo and require that they are NOT all identical. Deliberately NOT
+    // "all four must differ": two combos could coincide by arithmetic, and
+    // over-asserting that is how a correctness gate becomes a flaky one.
+    {
+      std::uint64_t sig = 1469598103934665603ull;
+      for (std::uint16_t v : h1) {
+        sig ^= (std::uint64_t)v;
+        sig *= 1099511628211ull;
+      }
+      e4_sigs.push_back({bits, G, sig});
+    }
     // NON-TRIVIALITY. "256 outputs bit-identical" is ALSO what this arm would
     // print if BOTH kernels wrote nothing, or wrote a constant field: two
     // buffers of untouched shared memory compare equal forever. The comparison
@@ -734,6 +752,27 @@ int main() {
   e4_readback(8u, 64u);
   e4_readback(2u, 64u);
   e4_readback(2u, 16u);
+  {
+    bool all_same = true;
+    for (std::size_t i = 1; i < e4_sigs.size(); ++i)
+      if (e4_sigs[i].sig != e4_sigs[0].sig) { all_same = false; break; }
+    if (e4_sigs.size() < 2) {
+      std::printf("  FAIL  E4 readback ran %zu combo(s); the separability check"
+                  " needs at least 2\n", e4_sigs.size());
+      ok = false;
+    } else if (all_same) {
+      std::printf("  FAIL  E4 readback produced BYTE-IDENTICAL output for all %zu"
+                  " combos, so they are one check wearing %zu labels -- `bits`/`G`"
+                  " are not reaching the kernel\n", e4_sigs.size(), e4_sigs.size());
+      ok = false;
+    } else {
+      std::printf("  ok    the %zu E4 readback combos are DISTINGUISHABLE (distinct"
+                  " output signatures:", e4_sigs.size());
+      for (const E4Sig& e : e4_sigs)
+        std::printf(" bits=%u/G=%u:%016llx", e.bits, e.G, (unsigned long long)e.sig);
+      std::printf(")\n");
+    }
+  }
   checked += e4_dev_pairs;
 
   // --- THE OTHER DECLINE CONVENTION, ASSERTED -------------------------------
