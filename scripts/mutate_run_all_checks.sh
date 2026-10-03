@@ -926,8 +926,8 @@ PYX
 }
 run_state_post() { # $1 id, $2 desc, $3 expected-RE
   local id="$1" desc="$2" expect="$3" o r
-PS_ID="N-R"   # named here so the DERIVED states= list is real, not N-?
-  TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} N-R"; reset_mutant
+  PS_ID="$id"   # run_state_post: each N-T/N-U records its OWN name
+  TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} $PS_ID"; reset_mutant
   if ! MUTATE_FN; then
     echo "  $id MISSED -- mutation fn failed (STATE fault)"; reset_mutant; reset_post_stack; return 1
   fi
@@ -969,10 +969,12 @@ PYX
 commit_mutant n-v
 conj_run "N-V.log"; nv=$?
 if [ "$nv" -ne 0 ] && grep -q 'declares POST-STACK \*and\* is in STEPS' "$WORK/N-V.log"; then
+  PS_ID="N-V"; STATES_SEEN="$STATES_SEEN $PS_ID"
   TOTAL=$((TOTAL + 1)); CAUGHT=$((CAUGHT + 1))
   echo "  N-V caught -- rc=$nv: an EXEMPT-AND-SCHEDULED file is refused"
   echo "N-V caught" >> "$WORK/summary.txt"
 else
+  PS_ID="N-V"; STATES_SEEN="$STATES_SEEN $PS_ID"
   TOTAL=$((TOTAL + 1))
   echo "  N-V MISSED -- rc=$nv; a file that is both exempt and scheduled was accepted"
   echo "N-V MISSED" >> "$WORK/summary.txt"
@@ -1000,8 +1002,8 @@ cov_run() { # $1 = log name  -> runs the mutant with COVERAGE_ONLY in a probe di
     timeout 300 bash "$MUTANT" >"$WORK/$1" 2>&1
 }
 
-PS_ID="N-S"   # named here so the DERIVED states= list is real, not N-?
-TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} N-S"; reset_mutant
+PS_ID="N-R"   # this block plants a DEAD pid -> the lock must self-heal
+TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} $PS_ID"; reset_mutant
 rm -rf "$SYNTH/lockprobe"; mkdir -p "$LOCKP"; echo 999999 > "$LOCKP/pid"
 cov_run "N-R.log"; nr_rc=$?
 if [ "$nr_rc" -eq 0 ] && grep -qF 'STALE LOCK' "$WORK/N-R.log"; then
@@ -1012,8 +1014,8 @@ else
     "N-R" "$nr_rc"
 fi
 
-PS_ID="N-V"   # named here so the DERIVED states= list is real, not N-?
-TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} N-V"; reset_mutant
+PS_ID="N-S"   # this block plants a LIVE pid -> the lock must be REFUSED
+TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} $PS_ID"; reset_mutant
 rm -rf "$SYNTH/lockprobe"; mkdir -p "$LOCKP"; echo $$ > "$LOCKP/pid"
 cov_run "N-S.log"; ns_rc=$?
 if [ "$ns_rc" -eq 1 ] && grep -qF 'another run_all_checks.sh holds' "$WORK/N-S.log" \
