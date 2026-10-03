@@ -287,10 +287,20 @@ commit_sandbox() { # $1 = message, $2 = path (default: the mutant)
 }
 # Every POST-STACK state also needs the SANDBOX's check_stack_cert.sh restored, or
 # one state's declaration edit survives into the next.
+# *** ORDER MATTERS, AND GETTING IT WRONG POISONS THE NEXT TWO STATES. *** The first
+# version copied the pristine file and THEN ran 'git checkout -- .', which
+# overwrote it with whatever the PREVIOUS state had committed -- so N-V ran against
+# an indented (non-declaring) check_stack_cert.sh and saw no POST-STACK file at all,
+# and N-R then inherited a dirty sandbox and failed on the mutant's start guard
+# instead of on its lock. Two states, two symptoms, one cause, and neither message
+# pointed at it. So: restore the sandbox's tracked state FIRST, copy the pristine
+# file over it, then COMMIT that copy so the mutant's dirty-tree guard stays armed.
 reset_post_stack() {
-  [ -e "$SCRIPT_DIR/check_stack_cert.sh" ] && \
-    cp "$SCRIPT_DIR/check_stack_cert.sh" "$SB/scripts/check_stack_cert.sh"
   git -C "$SB" -c user.email=m@x -c user.name=matrix checkout -q -- . 2>/dev/null
+  if [ -e "$SCRIPT_DIR/check_stack_cert.sh" ]; then
+    cp "$SCRIPT_DIR/check_stack_cert.sh" "$SB/scripts/check_stack_cert.sh"
+    commit_sandbox reset-post-stack "$SB/scripts/check_stack_cert.sh"
+  fi
 }
 reset_mutant() {
   cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"
