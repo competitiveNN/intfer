@@ -557,13 +557,28 @@ int main() {
   // property of the geometry, and this arm is what turns it from a claim into a
   // measurement -- in particular it would catch a future edit that hoisted a
   // partial sum out of the o loop.
+  //
+  // RUN OVER EVERY (bits, group) BRANCH, not just u4/G64. bc0b008 re-derived the
+  // u4/u8/u2 bodies inside the R template -- they were mechanically moved into a
+  // `for r` loop, which is exactly the "rule fixed at one site and re-derived at
+  // another" shape this repo keeps auditing. Only u4/G64 has a device identity
+  // readback here; the u8 body and the u2 body -- and especially the u2 **G16
+  // split** (two DPAS calls plus separate S0/Sf folds per op) -- would otherwise
+  // be untested branches inside a template that is on by default in the E4
+  // experiment. Each combo is a separate labelled line, so a failure names the
+  // branch instead of reporting one aggregate.
   std::printf("\n[dpas-fold-probe] E4 real-kernel readback "
               "(dpas48 R=1 vs dpas48_2d R=2, bit-exact expected):\n");
   std::uint64_t e4_dev_pairs = 0;
-  {
-    const std::uint32_t M = 4, N = 64, K = 512, G = 64, GA = 64;
+  auto e4_readback = [&](std::uint32_t bits, std::uint32_t G) {
+    // Counted HERE, not at the call site: the verdict line prints `devs` as
+    // "device readback regimes", and a total written beside the calls is a
+    // hand-count that goes stale the moment a combo is added -- which is the
+    // AUDIT #30 shape (a number in prose/behaviour that nothing re-derives).
+    ++devs;
+    const std::uint32_t M = 4, N = 64, K = 512, GA = 64;
     const std::uint32_t nOp = K / 32, nG = K / G, nGA = K / GA;
-    const std::uint32_t op_bytes = 32 * 16 * 4 / 8;
+    const std::uint32_t op_bytes = 32 * 16 * bits / 8;
     // The kernel indexes B[(t*nOp + o)*op_bytes] with t < nT = N/TN, so the buffer
     // is nT tiles wide. Sizing it by N over-allocates by TN (16x here).
     const std::uint32_t nT = N / 16;
@@ -572,8 +587,8 @@ int main() {
     std::uint32_t seed = 12345u;
     for (std::size_t i = 0; i < code_sz; ++i) {
       seed = seed * 1664525u + 1013904223u;
-      // Keep the code bytes inside the u4 range the DPAS path expects.
-      code[i] = (std::uint8_t)((seed >> 24) & 0x0F);
+      // Keep the code bytes inside the range the DPAS path expects for `bits`.
+      code[i] = (std::uint8_t)((seed >> 24) & ((1u << bits) - 1u));
     }
     std::vector<std::uint16_t> scale((std::size_t)N * nG);
     for (std::uint32_t i = 0; i < N * nG; ++i) {
@@ -611,7 +626,7 @@ int main() {
     intfer::gemm::Dpas48Params p;
     p.code_dpas = code_d; p.scale_usm = scale_d; p.act_int8 = act_d;
     p.act_scale = as_d; p.alpha = 1.0f / 64.0f; p.M = M; p.N = N; p.K = K;
-    p.group_size = G; p.act_group = GA; p.bits = 4;
+    p.group_size = G; p.act_group = GA; p.bits = bits;
     p.act_stride = K; p.as_stride = nGA;
     p.out_usm = o1;
     intfer::gemm::quant_gemm_dpas48(q, p).wait_and_throw();
@@ -625,11 +640,11 @@ int main() {
     for (std::size_t i = 0; i < h1.size(); ++i)
       if (h1[i] != h2[i]) {
         if (diff < 4)
-          std::printf("  FAIL  E4 readback differs at %zu: 0x%04x vs 0x%04x\n", i,
-                      h1[i], h2[i]);
+          std::printf("  FAIL  E4[bits=%u,G=%u] readback differs at %zu: 0x%04x vs "
+                      "0x%04x\n", bits, G, i, h1[i], h2[i]);
         ++diff;
       }
-    e4_dev_pairs = (std::uint64_t)M * N;
+    e4_dev_pairs += (std::uint64_t)M * N;
     // NON-TRIVIALITY. "256 outputs bit-identical" is ALSO what this arm would
     // print if BOTH kernels wrote nothing, or wrote a constant field: two
     // buffers of untouched shared memory compare equal forever. The comparison
@@ -643,31 +658,34 @@ int main() {
     uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
     const std::size_t e4_distinct = uniq.size();
     const bool e4_no_subject = (e4_distinct < 8);
+    const std::uint64_t pairs = (std::uint64_t)M * N;
     if (e4_no_subject) {
-      std::printf("  FAIL  E4 readback has NO SUBJECT: only %zu distinct value(s) "
-                  "across %llu outputs, so 'bit-identical' is vacuous -- both "
-                  "kernels may have written a constant field\n",
-                  e4_distinct, (unsigned long long)e4_dev_pairs);
+      std::printf("  FAIL  E4[bits=%u,G=%u] readback has NO SUBJECT: only %zu "
+                  "distinct value(s) across %llu outputs, so 'bit-identical' is "
+                  "vacuous -- both kernels may have written a constant field\n",
+                  bits, G, e4_distinct, (unsigned long long)pairs);
       ok = false;
     } else if (diff == 0) {
-      std::printf("  ok    %llu outputs bit-identical between R=1 and R=2 "
-                  "(M=%u, N=%u, K=%u, %zu distinct values -- the comparison HAS a "
-                  "subject)\n",
-                  (unsigned long long)e4_dev_pairs, M, N, K, e4_distinct);
+      std::printf("  ok    [bits=%u,G=%u] %llu outputs bit-identical between R=1 "
+                  "and R=2 (M=%u, N=%u, K=%u, %zu distinct values -- the "
+                  "comparison HAS a subject)\n",
+                  bits, G, (unsigned long long)pairs, M, N, K, e4_distinct);
     } else {
-      std::printf("  FAIL  E4 readback: %llu of %llu outputs differ -- the row "
-                  "block changed the arithmetic\n",
-                  (unsigned long long)diff, (unsigned long long)e4_dev_pairs);
+      std::printf("  FAIL  E4[bits=%u,G=%u] readback: %llu of %llu outputs differ "
+                  "-- the row block changed the arithmetic\n",
+                  bits, G, (unsigned long long)diff, (unsigned long long)pairs);
       ok = false;
     }
-    // The M<2 decline is a PRECONDITION, so ASSERT it rather than describe it:
+    // The M<2 decline is a PRECONDITION, so ASSERT it rather than describe it.
+    // ONCE, on the first combo -- it does not depend on bits or G, and repeating
+    // it four times would print four lines describing one fact.
     // a 1-row call must not submit, which is what makes E4 inert at decode and
     // therefore attributable. Declining is inert on the M=1 path (the kernel is
     // mathematically defined there -- it is just not a row BLOCK), so it cannot
     // be distinguished by its output; the sentinel prerequisite is the only
     // reliable signal, and the bare `sycl::event{}` comparison this first used
     // is exactly the trap the NEG cases above already record.
-    {
+    if (bits == 4 && G == 64) {
       const std::uint16_t kOutSentinel = 0xBEEF;
       std::vector<std::uint16_t> fill((std::size_t)M * N, kOutSentinel);
       std::memcpy(o1, fill.data(), fill.size() * 2);
@@ -698,9 +716,25 @@ int main() {
 
     sycl::free(code_d, q); sycl::free(scale_d, q); sycl::free(act_d, q);
     sycl::free(as_d, q); sycl::free(o1, q); sycl::free(o2, q);
-  }
+  };
+  // Every branch the template carries: u4/G64, u8/G64, u2/G64 (no split) and
+  // u2/G16 (the masked-A split with separate S0/Sf folds). Read in full off the
+  // kernel, not off this list: quant_gemm.cpp sets `need_split = (bits==2 &&
+  // G==16)` and picks the dpas_argument_type from `bits`. If a combo is added to
+  // the kernel and not here, it is untested -- say so rather than assume.
+  //
+  // SCOPE, stated rather than implied: R=1 and R=2 are the SAME template, so an
+  // edit applied symmetrically to both cancels in this comparison. What the arm
+  // proves is exactly what E4 can break: the per-ROW addressing (`m0 = mg*R`,
+  // `m = m0 + r`, the `As[r]`/`Aq[r]` reads and the store's row index) and the
+  // `m >= M` mask. It is NOT a correctness oracle for the arithmetic -- that is
+  // the shipped kernel's business, and mutating `need_split` (which changes both
+  // geometries identically) correctly leaves this arm green.
+  e4_readback(4u, 64u);
+  e4_readback(8u, 64u);
+  e4_readback(2u, 64u);
+  e4_readback(2u, 16u);
   checked += e4_dev_pairs;
-  devs += 1;
 
   // NOTE: the one-line verdict is printed at the END, after E4. Printing it
   // here would announce PASS and then let a later section flip it to FAIL, so

@@ -155,7 +155,8 @@ It also said *"when E4 exists, re-derive from the real kernel — do not inherit
 
 | what | measured |
 |---|---|
-| real-kernel readback, R=1 vs R=2 | **256/256 outputs BIT-IDENTICAL** |
+| real-kernel readback, R=1 vs R=2 | **4/4 template branches, 256/256 outputs BIT-IDENTICAL each** (u4/G64, u8/G64, u2/G64, and the u2/**G16 split**) |
+| readback **non-triviality** | 204 / 182 / 157 / 94 distinct output values per branch — the comparison has a subject, and the guard fails below 8 (proven by raising the threshold: rc 0 → 1) |
 | `backward_err` (contract's synthetic generator) | unchanged, 1.38e-5 at K=28672 |
 | M<2 **decline** asserted | sentinel prerequisite returned untouched, 0 slots written |
 
@@ -181,8 +182,10 @@ The tolerance numbers above are therefore **not inherited** — the real kernel 
 
 ## THE MEASUREMENT — 27B `--tp 2`, `devices=2`, `@prefill`, 3 interleaved rounds
 
-`scripts/bench_reports_batch.sh E4 3`. Stream identity verified first:
-`DPAS48 == FOLD == FOLDTILED` (`561 3712 314 19820 10903 321 5484 6618`).
+`scripts/bench_reports_batch.sh E4 3`. Stream identity verified first: the full
+361-token id stream is byte-identical across all nine arms (all three flags x
+three rounds; excerpt `561 3712 314 19820 10903 321 5484 6618`), i.e.
+`DPAS48 == FOLD == FOLDTILED`.
 
 **E4 is decode-inert by construction**, so this batch deliberately measures the
 **`@prefill`** bucket with a ~361-token single chunk. An E4 *decode* A/B could
@@ -252,7 +255,8 @@ RESULT (E4 built + gated + measured at 27B TP=2):
 RESULT: KEEP. Prefill device kernel 9.95 % cheaper (FOLD 18615.7 -> FOLDTILED
 RESULT: 16662.5 ms median, per-round d = -1981.5 / -1851.9 / -1766.9, 3/3 same
 RESULT: sign, CLEARS this run's 672.7 ms spread by ~2.8x), nk UNCHANGED at 5468,
-RESULT: nw/nr unchanged, bit-exact on device (256/256) and engine (TP=1+TP=2).
+RESULT: nw/nr unchanged, bit-exact on device (4/4 template branches, 256/256
+RESULT: each) and engine (TP=1+TP=2).
 RESULT: NO tok/s claimed -- all nine arms SKIPPED-CONTENDED (LOAD1 4.65-7.98).
 RESULT: Stays default-OFF: prefill-only (decode M=1 declines), and no quiet-box
 RESULT: wall-time yet. This retires the design-only status above.
