@@ -118,6 +118,61 @@ if [ "$CERT_SHA" = "$HEAD_SHA" ]; then
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# content_changed_paths < <(git diff --numstat A..B)
+# Prints the subset of changed paths whose CONTENT changed. A mode-only change
+# (chmod) reports `0<TAB>0` and is dropped; anything else is kept.
+#
+# The binary case is why this is NOT written as "non-zero": git prints `-` for
+# both columns of a binary file, so a "non-zero" test would read `-` as zero and
+# silently classify a changed binary as UNTOUCHED. The test is therefore
+# "NOT (0 and 0)". Getting this backwards is the classic vacuous-green shape --
+# a guard that reports nothing to fix while the thing it guards moved.
+# ---------------------------------------------------------------------------
+content_changed_paths() {
+  awk -F'\t' 'NF>=3 && !($1=="0" && $2=="0") {print $3}'
+}
+
+# *** BEHAVIOURAL SELF-CHECK, FIRST AND GATING. *** This weakens a guard (it now
+# ignores mode-only changes), and AUDIT #21's rule is that a weakening must be
+# PROVABLY total, not merely weaker -- E-D in this matrix is the precedent of a
+# "weaker" filter that was not weak enough to observe. The matrix cannot test
+# this one: it plants shas in the REAL repository's history, and manufacturing a
+# mode-only commit there would mean committing to the user's clone to test a
+# checker. So the classification itself is driven directly, in three cases, and
+# all three must pass before the verdict below is allowed to use it.
+_sc_bad=0
+_sc_case() { # $1 label, $2 expected-RE, $3 numstat text, $4 expected path or empty
+  local got
+  got="$(content_changed_paths <<<"$3")"
+  if [ -n "$4" ]; then
+    printf '%s' "$got" | grep -qxF -- "$4" || {
+      echo "  FAIL  self-check: $1 -- expected '$4', got [$(printf '%s' "$got" | tr '\n' ' ')]" >&2
+      _sc_bad=$((_sc_bad + 1)); return; }
+  else
+    [ -z "$got" ] || {
+      echo "  FAIL  self-check: $1 -- expected NO path, got [$(printf '%s' "$got" | tr '\n' ' ')]" >&2
+      _sc_bad=$((_sc_bad + 1)); return; }
+  fi
+  echo "  ok    self-check: $1"
+}
+_sc_case "a mode-only change is NOT content"        ''  "$(printf -- '0\t0\tscripts/_gate_precond.sh')" ''
+_sc_case "a real edit IS content (the converse)"    'scripts/_gate_precond.sh' "$(printf -- '3\t0\tscripts/_gate_precond.sh')" 'scripts/_gate_precond.sh'
+_sc_case "a deletion IS content"                    'src/gemm/quant_gemm.cpp'  "$(printf -- '0\t7\tsrc/gemm/quant_gemm.cpp')" 'src/gemm/quant_gemm.cpp'
+# The case that would be silently WRONG with a "non-zero" test: git prints `-`
+# for a binary's columns, and a changed binary is certainly a content change.
+# NOTE the `printf --`: a format string beginning with `-` is parsed as an OPTION
+# by bash's printf and silently yields nothing. Found by this very self-check --
+# the classifier was right and the FIXTURE was lying, which is the same shape as
+# the recorded "evidence about the tool, not the logic" traps (grep -E with an
+# unescaped `(`, `ls` hiding /dev/dri entries, `ps` reporting nothing for a live
+# job). The self-check earned its keep on its first run.
+_sc_case "a BINARY change is content, not mode-only" 'src/model.bin'          "$(printf -- '-\t-\tsrc/model.bin')" 'src/model.bin'
+if [ "$_sc_bad" -ne 0 ]; then
+  echo "RESULT: the mode-vs-content classifier is not trustworthy; refusing to grade"
+  exit 1
+fi
+
 # Older than HEAD. Does the difference touch anything a gate reads?
 #
 # The rc is checked EXPLICITLY rather than swallowed with `|| true`, because git's
@@ -141,8 +196,39 @@ if ! CHANGED="$(git diff --name-only "$CERT_SHA..HEAD" 2>/dev/null)"; then
   echo "RESULT: UNPROVEN -- the certification could not be compared to HEAD"
   exit 2
 fi
-TOUCHED="$(printf '%s\n' "$CHANGED" | grep -E '^(src/|examples/|include/|scripts/test_|scripts/_gate_precond\.sh|scripts/_gate_build\.sh|scripts/setvars\.sh)' || true)"
+# *** A MODE CHANGE IS NOT A CONTENT CHANGE, AND THE DIFFERENCE IS FREE. ***
+# Measured 2026-10-03: giving every scripts/*.sh the execute bit (closing the
+# exec-bit class) put scripts/_gate_build.sh and scripts/_gate_precond.sh into
+# `git diff --name-only`, so this checker declared a 10/10 ENGINE certification
+# STALE and demanded a 45-minute re-run -- for a change that cannot alter a
+# single byte of what those gates execute. This is the failure AGENTS.md names
+# explicitly: "a check that fires on every commit is a check people learn to
+# ignore". Left alone it would fire on every chmod, forever, and each firing
+# costs 45 minutes to discharge.
+#
+# `git diff --numstat` distinguishes them for free: a mode-only change reports
+# `0<TAB>0`, a content change reports non-zero. BINARY files report `-` for both
+# columns, so the test is "NOT (0 and 0)" rather than "non-zero" -- otherwise a
+# changed binary would be silently read as untouched. The rc of the numstat call
+# is checked explicitly, for the same silent-failure reason as the diff above.
+if ! CONTENT="$(git diff --numstat "$CERT_SHA..HEAD" 2>/dev/null)"; then
+  echo "  FAIL  git diff --numstat $CERT_SHORT..HEAD failed; whether any change is a"
+  echo "        CONTENT change is unknown. Refusing to certify."
+  echo "RESULT: UNPROVEN -- the certification could not be compared to HEAD"
+  exit 2
+fi
+CONTENT_PATHS="$(content_changed_paths <<<"$CONTENT")"
+CHANGED_CONTENT="$(printf '%s\n' "$CHANGED" | while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  if printf '%s\n' "$CONTENT_PATHS" | grep -qxF -- "$p"; then printf '%s\n' "$p"; fi
+done)"
+TOUCHED="$(printf '%s\n' "$CHANGED_CONTENT" \
+  | grep -E '^(src/|examples/|include/|scripts/test_|scripts/_gate_precond\.sh|scripts/_gate_build\.sh|scripts/setvars\.sh)' || true)"
 n_touched="$(printf '%s\n' "$TOUCHED" | grep -c . || true)"
+n_mode_only=$(( $(printf '%s\n' "$CHANGED" | grep -c . || true) - $(printf '%s\n' "$CHANGED_CONTENT" | grep -c . || true) ))
+[ "$n_mode_only" -gt 0 ] && \
+  echo "  ok    $n_mode_only path(s) changed MODE only (e.g. chmod); content is" \
+       "byte-identical, so no gate input moved"
 
 if [ "$n_touched" -eq 0 ]; then
   n_changed="$(printf '%s\n' "$CHANGED" | grep -c . || true)"
