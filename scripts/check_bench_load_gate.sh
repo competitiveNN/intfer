@@ -548,6 +548,14 @@ STUB
         timeout 300 bash "$SCRIPT_DIR/bench_reports_batch.sh" E2 1 \
         > "$TDIR/e2e.out" 2>&1
     }
+    # The signature is now PHASE-DERIVED: bench_reports_batch.sh harvests a
+ # configurable phase (`PHASE_TAG`), so the dead-arm signature reads
+    # "no_<phase>_line_in_arm_output" -- "no_decode_..." at the default.
+    # It used to be the literal "no_@decode_line_in_arm_output". Renaming it
+    # broke THIS assertion, which is the recorded AUDIT #22 trap verbatim: a
+    # check that spells out another script's literal is graded by it. The
+    # rename was correct (the phase is genuinely configurable now); the
+    # expectation is what had to move with it.
     # -- firing direction: no profile line, so every arm dies --
     write_stub 0
     run_harness; e2e_dead_rc=$?
@@ -555,7 +563,7 @@ STUB
        && pred_expect_present "e2e-dead-stub-says-not-a-result" \
             "$(grep -c 'THIS BATCH IS NOT A RESULT' "$TDIR/e2e.out" || true)" '^[1-9]' \
        && pred_expect_present "e2e-dead-stub-names-the-signature" \
-            "$(grep -c 'no_@decode_line_in_arm_output' "$TDIR/e2e.out" || true)" '^[1-9]'; then
+            "$(grep -c 'no_decode_line_in_arm_output' "$TDIR/e2e.out" || true)" '^[1-9]'; then
       echo "  ok    e2e: the REAL harness refuses a batch whose arms all died (rc=2)"
     else
       echo "  FAIL  e2e-dead-stub: the harness did not refuse a batch in which"
