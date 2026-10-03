@@ -120,6 +120,20 @@ restore() { local f
             CKB="$SB/check_gpu_recover.sh"; }
 run_check() { ( cd "$SB" && bash "$SB/check_gpu_recover.sh" 2>&1 ); }
 
+# *** THE NO-OP GUARD MUST WATCH EVERY MUTABLE FILE, NOT A LIST. ***
+# This guard was dead twice over. First it compared `cmp -s "$before" "$CHECKER"`
+# with $before holding CONTENT, so cmp saw a non-existent filename and returned 2
+# -- the branch was unreachable. Making it live immediately exposed the SECOND
+# defect: three states here (M-C, M-D, M-E) mutate the TOOL, not the checker, so a
+# checker-scoped guard reports them as no-ops even when they landed perfectly. It
+# scored 2/5 on first run and the three "misses" were the guard, not the states.
+#
+# The fix follows restore() above, which already snapshots the DIRECTORY because
+# "a state that damages a file nobody listed cannot leak into its successor". The
+# no-op guard has the same subject: the unit of mutation is the sandbox, so digest
+# every script in it. A hand list here would be the third copy of the bug.
+sb_digest() { cat "$SB"/*.sh 2>/dev/null | cksum; }
+
 echo "== baseline: clean checker must PASS, and must print the converse =="
 restore
 b="$(run_check)"; brc=$?
@@ -142,13 +156,13 @@ run_state() {
   local id="$1" marker="$2" expect="$3"
   total=$((total+1))
   restore
-  local before; before="$(cat "$SB/check_gpu_recover.sh")"
+  local before; before="$(sb_digest)"
   if ! MUTATE_FN; then
     echo "  $id MISSED -- mutation function failed"
     echo "$id MISSED (mutation fn)" >> "$LOG/summary.txt"; restore; return 1
   fi
-  if [ "$before" = "$(cat "$SB/check_gpu_recover.sh")" ]; then
-    echo "  $id MISSED -- mutation did not change the file"
+  if [ "$before" = "$(sb_digest)" ]; then
+    echo "  $id MISSED -- the mutation changed NO script in the sandbox"
     echo "$id MISSED (no-op)" >> "$LOG/summary.txt"; restore; return 1
   fi
   # The patch must have LANDED, or the state proves nothing (audit #17).
