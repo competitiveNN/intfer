@@ -187,6 +187,29 @@ matters for the next session reading this file:
   `[level_zero:gpu]` and E1/E2/E3 were each benchmarked at `--tp 2` on 27B. The
   two blocks above are the **record** of a condition that has since cleared.
 - **Quiet-box prerequisite: NOT met, and it is not this project's to fix.**
+  *** HOW MUCH OF THE LOAD IS OURS? MEASURED 2026-10-03, because the standing
+  explanation above had never been tested and it decides whether waiting is even
+  the right advice. *** A queued `scripts/bench_when_quiet.sh` on a box reading
+  `load1=0.59` produced **four** `[USABLE]` arms and then aborted at the round-3
+  gate on `load1=2.26` (artifact:
+  `build/bench_logs/when_quiet_20261003T202330Z_fc8b6e0_1648475.log`, and four of
+  the six arms it did run were withheld for crossing the line DURING the arm).
+  So the threshold is reachable in both directions, and the question is who owns
+  the load. A follow-up probe sampled `load1` and the CLI's own process-tree CPU
+  every second across one 27B `--tp 2` arm on a settled box (`load1=0.70` before):
+  **load1 median 0.62, max 2.82; the CLI's own tree mean 0.94 cores.** Read
+  honestly: the arm is NOT sustainably CPU-bound — its median load is *below* the
+  reading taken before it started — so the crossings come from **short bursts plus
+  whatever else is running**, and on this host that is the desktop (`zen-bin`) and
+  sibling `maki` sessions. Artifacts: `build/loadself2/samples`.
+  **Consequence, and it is the useful part:** "wait for a quiet box" IS the right
+  advice, and it is *nearly* enough — but it means a box with **no desktop
+  compositor and no sibling agent session**, not merely a low `load1` reading.
+  Do **NOT** respond by lowering `QLOAD`: the threshold is the only thing standing
+  between this repo and a fourth retracted tok/s. The two rejected measurement
+  paths (`/proc/stat`'s machine-wide idle delta, which went UP across an arm in
+  this container, and a naive "the harness caused it" inference) are recorded in
+  the probe script so neither is re-tried.
   `load1` is driven by **sibling agent sessions** on this host, not by a stale
   background job: a `julia` container was measured at 99.7 % CPU for 1d23h and is
   gone; what remains is bursty CPU from concurrent sessions. A wall-time A/B
