@@ -623,7 +623,7 @@ run_state() { # $1 id, $2 desc, $3 predicate, $4 steps, $5 stampdir, $6 dirty?
   local id="$1" desc="$2" pred="$3" steps="$4" sdir="$5" dirty="${6:-}"
   local residue="${7:-}" where="${8:-}" old2="${9:-}" new2="${10:-}"
   TOTAL=$((TOTAL + 1))
-  STATES_SEEN="${STATES_SEEN:-} # self-initialising: no ordering assumption $id"
+  STATES_SEEN="${STATES_SEEN:-} $id"
   [ "$dirty" = "dirty" ] && { printf 'probe\n' >"$PROBE"; git -C "$SB" add -- "$PROBE"; }
   run_rac "$id" "$steps" "$sdir" "$residue" "$where"
   [ "$dirty" = "dirty" ] && { git -C "$SB" reset -q -- "$PROBE"; rm -f "$PROBE"; }
@@ -796,7 +796,8 @@ patch_literal "$MUTANT" "$A_STEPS_ENTRY" 'mutate_checker_matrix_coverage.sh"' ||
 grep -q '^    mutate_verdict_scope.sh)' "$MUTANT" \
   || { echo "N-P MISSED (fn) -- the dispatch arm is gone; this is N-J, not 0c" >&2; exit 1; }
 grep -q 'N-P' "$MUTANT" || true
-TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} # self-initialising: no ordering assumption ${id:-N-?}"
+PS_ID="N-P"   # named here so the DERIVED states= list is real, not N-?
+TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} N-P"
 run_rac_cov "N-P" ""
 # *** THE PREDICATE GREPS FOR THE NAME, NOT FOR ITS POSITION IN THE LIST. *** The
 # first version matched the whole line including the name, and 0c prints the
@@ -855,7 +856,8 @@ cp "$MUTANT" "$EQ/run_all_checks.sh"; chmod +x "$EQ/run_all_checks.sh"
 for sib in _gate_enum.sh _gate_precond.sh; do
   [ -e "$SCRIPT_DIR/$sib" ] && cp "$SCRIPT_DIR/$sib" "$EQ/$sib"
 done
-TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} # self-initialising: no ordering assumption ${id:-N-?}"
+PS_ID="N-Q"   # named here so the DERIVED states= list is real, not N-?
+TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} N-Q"
 INTFER_BUILD_DIR="$SYNTH/inner3" INTFER_RUN_ALL_COVERAGE_ONLY=1 \
   timeout 300 bash "$EQ/run_all_checks.sh" >"$WORK/N-Q.log" 2>&1
 nq_rc=$?
@@ -924,7 +926,8 @@ PYX
 }
 run_state_post() { # $1 id, $2 desc, $3 expected-RE
   local id="$1" desc="$2" expect="$3" o r
-  TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} # self-initialising: no ordering assumption ${id:-N-?}"; reset_mutant
+PS_ID="N-R"   # named here so the DERIVED states= list is real, not N-?
+  TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} N-R"; reset_mutant
   if ! MUTATE_FN; then
     echo "  $id MISSED -- mutation fn failed (STATE fault)"; reset_mutant; reset_post_stack; return 1
   fi
@@ -997,7 +1000,8 @@ cov_run() { # $1 = log name  -> runs the mutant with COVERAGE_ONLY in a probe di
     timeout 300 bash "$MUTANT" >"$WORK/$1" 2>&1
 }
 
-TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} # self-initialising: no ordering assumption ${id:-N-?}"; reset_mutant
+PS_ID="N-S"   # named here so the DERIVED states= list is real, not N-?
+TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} N-S"; reset_mutant
 rm -rf "$SYNTH/lockprobe"; mkdir -p "$LOCKP"; echo 999999 > "$LOCKP/pid"
 cov_run "N-R.log"; nr_rc=$?
 if [ "$nr_rc" -eq 0 ] && grep -qF 'STALE LOCK' "$WORK/N-R.log"; then
@@ -1008,7 +1012,8 @@ else
     "N-R" "$nr_rc"
 fi
 
-TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} # self-initialising: no ordering assumption ${id:-N-?}"; reset_mutant
+PS_ID="N-V"   # named here so the DERIVED states= list is real, not N-?
+TOTAL=$((TOTAL + 1)); STATES_SEEN="${STATES_SEEN:-} N-V"; reset_mutant
 rm -rf "$SYNTH/lockprobe"; mkdir -p "$LOCKP"; echo $$ > "$LOCKP/pid"
 cov_run "N-S.log"; ns_rc=$?
 if [ "$ns_rc" -eq 1 ] && grep -qF 'another run_all_checks.sh holds' "$WORK/N-S.log" \
