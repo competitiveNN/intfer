@@ -254,6 +254,18 @@ matters for the next session reading this file:
   quoted from any of them yet**. The remaining blocker is unchanged and is NOT
   missing work: see the quiet-box note above.
 
+  **LIVE STATE: nothing is queued or in flight.** Verified, not assumed — the last
+  `bench_when_quiet.sh` process ended on its own abort and no `intfer_cli` process
+  is advancing an artifact, so there is no run to wait for. Nothing in this section
+  moves until a session starts one deliberately:
+  `setsid bash scripts/bench_when_quiet.sh --max-wait 21600 > build/bench_logs/wq_$(date -u +%Y%m%dT%H%M%SZ).$$.out 2>&1 &`
+  (the unique capture name is not optional — a fixed name silently overwrites the
+  previous launch, which is how this table already had to be reconstructed once).
+  **When a run does finish, THIS TABLE IS WRONG until it is re-derived from the new
+  artifact** — the five rows above are a snapshot of `build/bench_logs/`, not a
+  standing fact. Re-derive with the same `grep -cE '^ARM '` per run log and the same
+  per-round `awk`; do not add a row by hand.
+
   What this does and does not change: the correctness work stands, none of it needs
   repeating, and the load-insensitive counters are unaffected. It DOES mean the next
   session must not budget for "finishing" this — a fresh window with the box to
