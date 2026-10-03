@@ -530,7 +530,7 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_stack_cert.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
@@ -560,11 +560,25 @@ if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
 else
   echo "== 0c every check_*/mutate_* is SCHEDULED (an arm alone never runs) =="
   UNSCHEDULED=""
+  POST_STACK=""
   N_SCHEDULABLE=0
   for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
     [ -f "$f" ] || continue
     b="$(basename "$f")"
     N_SCHEDULABLE=$((N_SCHEDULABLE + 1))
+    # A checker that declares itself POST-STACK in its header is not required in
+    # STEPS: it grades the certificate the stack WRITES, so it must run AFTER the
+    # stack. Measured: wired in as a step it could only ever report STALE, so a PASS
+    # stack turned into FAIL. The declaration is read FROM THE FILE (no
+    # hand-maintained list) and printed, so the exemption is never quiet; requiring
+    # it in the first 40 lines stops a passing mention in the body from exempting
+    # anything. It is tested BEFORE the `case` because a case branch cannot hold a
+    # compound command -- the first attempt put the `if` inside one and bash blamed
+    # a token three lines later.
+    if head -40 "$f" | grep -q '^# POST-STACK:'; then
+      POST_STACK="$POST_STACK $b"
+      continue
+    fi
     case " $STEPS " in
       *" $b "*) ;;
       # run_ten_gates.sh is a COMPOSITE step, not a check_ or mutate_ file, so it
@@ -586,6 +600,13 @@ else
     FAILED=$((FAILED + 1))
   else
     echo "  ok    every check_*/mutate_* is in STEPS as well as dispatch()"
+  fi
+  if [ -n "$POST_STACK" ]; then
+    for b in $POST_STACK; do
+      echo "  ok    POST-STACK, exempt from STEPS (declared in its own header):$b"
+      echo "        it grades the certificate run_all_checks.sh WRITES, so it runs"
+      echo "        AFTER the stack -- as a step it could only ever report STALE."
+    done
   fi
   # *** 0c DOES NOT DETECT A DUPLICATE, AND THAT IS A RECORDED LIMITATION, NOT AN
   # OMISSION. *** It answers "is it scheduled", not "is it scheduled twice".

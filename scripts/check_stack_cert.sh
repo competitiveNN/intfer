@@ -44,6 +44,14 @@
 # be read as "the self-check passed". Same seam rationale as INTFER_SYCL_LS and
 # INTFER_BUILD_DIR: an assumption the harness cannot redirect is one it cannot test.
 #
+# POST-STACK: run this AFTER scripts/run_all_checks.sh, NEVER as one of its steps.
+# It grades "the certificate for the CURRENT commit", and a step of the stack runs
+# BEFORE that stack writes its certificate -- so as a step it could only ever report
+# STALE, and the stack would never be able to pass. Measured: wired in as a step, it
+# failed its own run with rc=1 (cert names the previous commit) and turned a PASS
+# stack into FAIL. Section 0c reads this declaration and exempts the file from the
+# STEPS requirement, printing the exemption so it is visible rather than silent.
+#
 # Usage: scripts/check_stack_cert.sh
 # Env:   INTFER_BUILD_DIR                    where the cert lives (the seam that
 #                                            lets the matrix redirect it -- without
