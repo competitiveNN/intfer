@@ -359,6 +359,9 @@ run_rac() { # $1 = case id, $2 = steps, $3 = stamp dir, $4 = leave residue?
 baseline() {
   local id="$1" steps="$2" sdir="$3" want="$4" marker="$5" residue="${6:-}" rc
   local where="${7:-}"   # litter site: "" = scripts/, "root" = sandbox repo root
+  # $9: an EXTRA predicate evaluated against the baseline log -- the converse half
+  # of a state whose observable is ABSENCE. A baseline that only checks the exit
+  # code cannot express "this must NOT appear", so it was impossible to state.
   local forbidden="${8:-}"
   NBASE=$((NBASE + 1))
   reset_mutant
@@ -366,6 +369,10 @@ baseline() {
   if [ "$rc" != "$want" ]; then
     echo "FAIL: baseline $id reached rc=$rc, want $want -- the CASE is broken, not" >&2
     echo "  the mutation. ($WORK/$id.baseline.log)" >&2; exit 1
+  fi
+  if [ -n "${9:-}" ] && ! eval "$9"; then
+    echo "FAIL: baseline $id violated its converse: $9" >&2
+    echo "  ($WORK/$id.baseline.log)" >&2; exit 1
   fi
   if [ -n "$marker" ] && ! grep -qF -- "$marker" "$WORK/$id.baseline.log"; then
     echo "FAIL: baseline $id did not show the CORRECT marker '$marker'." >&2
@@ -404,6 +411,12 @@ def_n_d() { [ -f "$SYNTH/step_sentinel.ran" ]; }                  # a step ran o
 # below, so this predicate cannot pass vacuously.
 def_n_e() { grep -q '1/2 checkers' "$WORK/N-E.log"; }
 def_n_f() { grep -q 'step(s) unproven' "$WORK/N-F.log" && ! grep -q '(re-run)' "$WORK/N-F.log"; }
+# N-W. BOTH halves are named, and the converse is the point: with the map present
+# the self-check prints no SELFCHECK line at all, so an always-green self-check
+# cannot score as caught.
+def_n_w() { grep -q 'SELFCHECK: sc_stale exited' "$WORK/N-W.log" \
+            && grep -q 'classifier self-check did not hold' "$WORK/N-W.log"; }
+def_n_w_converse() { ! grep -q 'SELFCHECK' "$WORK/N-W.baseline.log"; }
 # Anchored on the FAIL line specifically. A bare grep for 'untracked residue'
 # also matches the SUCCESS branch ("ok  no new untracked files ..."), so the
 # predicate was never true -- the first version of this state could not be caught.
@@ -452,6 +465,13 @@ A_RERUN='if [ -n "$UNPROVEN_LABELS" ]; then'
 A_FIND="find \"\$STAMP_DIR\" -name '*last_pass.stamp' -type f 2>/dev/null | sort"
 A_GUARD='if ! git diff --quiet || ! git diff --cached --quiet; then'
 A_SELFCHK='return $bad'
+# N-W: the per-step STALE map. Reverting it to the global mapping must make the
+# classifier SELF-CHECK fail -- and that is the only observable, because the
+# self-check runs before any step and exits, so the run never reaches a verdict
+# to disagree with. The predicate therefore reads the self-check's own message,
+# not the run's exit code: the self-check exits 1, which the runner also uses for
+# a real regression, so "rc != 0" would be satisfied by any unrelated abort.
+A_STALEMAP='  if [ "${2:-}" = "check_engine_cert.sh" ] && [ "$1" = "1" ]; then'
 A_DERIVE='UNPROVEN_LABELS="$UNPROVEN_LABELS $label"'
 # The WHOLE four-line block, not just its first line: the first attempt anchored
 # on line 1 alone, the patch replaced it with a one-liner, and the three
@@ -520,6 +540,11 @@ printf 'probe\n' >"$PROBE"; git -C "$SB" add -- "$PROBE"   # a genuinely TRACKED
 baseline "N-D" "step_sentinel" "$ALL_CURRENT" 1 "uncommitted changes"
 git -C "$SB" reset -q -- "$PROBE"; rm -f "$PROBE"
 baseline "N-E" "step_ok"     "$ALL_CURRENT" 0 ""                              # self-check passes
+# N-W baseline is the CONVERSE of its state: with the per-step map present the
+# classifier self-check must print NO SELFCHECK line. Without this, a harness whose
+# self-check always complains would satisfy def_n_w and the matrix would prove
+# only that a self-check can fail -- not that this map is what makes it quiet.
+baseline "N-W" "step_ok"     "$ALL_CURRENT" 0 "" def_n_w_converse
 baseline "N-F" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"       # re-run works
 baseline "N-G" "step_litter" "$ALL_CURRENT" 1 "untracked residue left behind" yes
 baseline "N-H" "step_escalate" "$ALL_CURRENT" 1 "REGRESSED rc=1"
@@ -686,6 +711,12 @@ patch_literal "$MUTANT" "$A_CLASSIFY" "2) printf 'fail\\n' ;;"
 patch_literal "$MUTANT" "$A_SELFCHK" "return 0  # MUTATION: self-check disarmed"
 verify_patched N-E
 run_state "N-E" "self-check disarmed while classify_rc is wrong" def_n_e "step_ok" "$ALL_CURRENT"
+
+reset_mutant
+patch_literal "$MUTANT" "$A_STALEMAP" '  if false; then  #MUTATION N-W'
+verify_patched N-W
+run_state "N-W" "a STALE engine cert classified as a failure; the self-check must catch it" \
+  def_n_w "step_ok" "$ALL_CURRENT"
 
 reset_mutant
 patch_literal "$MUTANT" "$A_DERIVE" 'UNPROVEN_LABELS=""'
