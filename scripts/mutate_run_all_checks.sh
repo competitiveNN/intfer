@@ -783,7 +783,14 @@ echo "        populated census (asserted as ABSENCE above, not just rc=0)"
 # anchor must fail in the first second, not masquerade as a weak state after thirteen
 # baselines). Re-pointed to the ENTRY with enough left context to be unique on the
 # real tree, NOT loosened: the check still demands exactly one occurrence.
-A_STEPS_ENTRY='mutate_engine_cert.sh mutate_checker_matrix_coverage.sh'
+# *** AND THE NAME HAS ONE HOME. *** The predicate below asserts that 0c names
+# THE step this state removed from STEPS. When the anchor was re-pointed, the entry
+# it removes changed, and the predicate still looked for the OLD name -- so the state
+# did exactly the right thing (0c refused and named the step) and was scored MISSED.
+# The name is now a variable used by BOTH the anchor and the predicate, so they
+# cannot drift apart again.
+N_P_REMOVED='mutate_checker_matrix_coverage.sh'
+A_STEPS_ENTRY="mutate_engine_cert.sh $N_P_REMOVED"
 check_anchor() { # $1 file, $2 anchor -- exactly once, not merely present
   local n
   n="$(python3 -c 'import sys;print(open(sys.argv[1]).read().count(sys.argv[2]))' "$1" "$2")"
@@ -816,7 +823,7 @@ run_rac_cov "N-P" ""
 # refused an unscheduled step, and the name proves it was THIS step.
 if [ "$?" -ne 0 ] \
    && grep -q 'never scheduled, so this run will NOT execute:' "$WORK/N-P.log" \
-   && grep -q 'mutate_verdict_scope.sh' "$WORK/N-P.log"; then
+   && grep -q "$N_P_REMOVED" "$WORK/N-P.log"; then
   CAUGHT=$((CAUGHT + 1))
   printf '  ok    %-4s defect reproduced: a matrix with an ARM but no STEPS entry never runs\n' "N-P"
 else
@@ -968,8 +975,8 @@ python3 - "$MUTANT" <<'PYX'
 import sys
 p = sys.argv[1]
 s = open(p).read()
-old = 'check_doc_counts.sh check_verdict_scope.sh"'
-new = 'check_doc_counts.sh check_verdict_scope.sh check_stack_cert.sh"'
+old = 'check_verdict_scope.sh check_dri_probe.sh"'
+new = 'check_verdict_scope.sh check_dri_probe.sh check_stack_cert.sh"'
 assert s.count(old) == 1, s.count(old)
 open(p, "w").write(s.replace(old, new))
 PYX
