@@ -2768,6 +2768,40 @@ e.g. S3's contract column is 40 not 42).
         it is **POST-STACK** by design, because it grades the certificate the stack
         *writes*, and `run_all_checks.sh` prints that pointer at the end of every
         verdict path.
+  - **THE BOX DROPPED TO ONE GPU MID-SESSION, AND IT TOOK A REAL FIX — NOT A
+    RE-DRIVE.** Measured 2026-10-03: `sycl-ls` 1 device, `xpu-smi` GPU 0 only,
+    `/dev/dri` at `card0`+`card2` (the minors moved again), and
+    `scripts/gpu_recover.sh diag` reporting `DEVICES=1`, `driverVersion=0x10396f6`,
+    one UUID whose group 4 is `0400` — **so 86:00.0 is absent from the compute
+    runtime again**. That is box state, and the runbook is unchanged
+    (`diag` → `sudo rebind` → `verify`). What made it expensive was not the drop:
+  - **`gate_inventory.sh` CALLED THE DOCUMENTS STALE, and the stack then said
+    "a real regression".** On a 1-GPU box it derives `7/2/1`, so every 2-GPU-era
+    tally (`10/0/0`) became `STALE` and the run ended
+    `FAIL (2 step(s) FAILED) -- a real regression`, naming a document that is a
+    **true record of the configuration this project is built for**. That is the
+    AUDIT #9/#11 shape at its worst: a red line that means *the box* is how people
+    learn to ignore red lines. **A box that cannot RUN the documented configuration
+    cannot falsify the document**, so that case is now reported `BOX` and the
+    checker exits **2 (UNPROVEN)**, never 1. The teeth are unchanged where they
+    matter: on a box that does support the documented configuration, a disagreeing
+    tally is still STALE and still fails, and the 0-GPU path still exits 2.
+  - **AND THE MATRIX'S BASELINE CALLED THAT CORRECT VERDICT A BROKEN CHECKER.**
+    `S0` demanded rc=0 and printed *"the checker does not pass on a clean tree, so
+    every state below would be scored against a broken baseline"* — the always-red
+    twin of the vacuous green. It now accepts **rc=0, or rc=2 carrying the
+    `GATE INVENTORY: UNPROVEN` diagnostic**, and a bare rc=2 with no explanation
+    still fails (the device-precond healthy column's rule: *a 2 must be
+    explained*). Over-asserting here is how a correctness gate becomes a flaky gate.
+    Matrix **9/9**.
+  - **THE SECOND FAILURE WAS TRANSIENT, and the way to know was to re-run it.**
+    `check_device_precond.sh` reported `test_device_argmax.sh … rc=1`, whose
+    section 4 runs `gpu-optin`. Run **directly**, `test_gpu_optin.sh` answers
+    **rc=2 PARTIAL PASS** ("tp=1 arms all green; tp=2 pass SKIPPED — need 2 GPUs,
+    1 visible"), and the whole matrix re-run is **rc=0 with all six device gates
+    green (the 2s explained)**. A contended shared box, not a regression: this
+    session changed no engine source. **Read the failing step's own log before
+    attributing anything.**
   - **A HAND-WRITTEN `states=` LIST IS HOW THAT BLOCK WENT WRONG, and deriving it
     exposed four defects of mine that the literal list had hidden**: an inline
     comment swallowing the assignment; five bespoke blocks with no local `id`
