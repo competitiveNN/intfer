@@ -776,7 +776,14 @@ echo "        populated census (asserted as ABSENCE above, not just rc=0)"
 # defect above, so N-P reported itself as a weak state instead of a stale anchor.
 # Re-point, never loosen -- and PRE-FLIGHT it, so a future drift is caught in the
 # first second instead of after thirteen baselines.
-A_STEPS_ENTRY='mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh"'
+# *** RE-POINTED 2026-10-03, and the OLD ANCHOR WAS THE WRONG SHAPE. *** It
+# anchored on the TAIL of the matrices STEPS line ("... mutate_stack_cert.sh\""),
+# which is appended to every time a matrix is added -- so adding mutate_dri_probe.sh
+# drifted it and the preflight refused, correctly and loudly (AUDIT #17: a drifted
+# anchor must fail in the first second, not masquerade as a weak state after thirteen
+# baselines). Re-pointed to the ENTRY with enough left context to be unique on the
+# real tree, NOT loosened: the check still demands exactly one occurrence.
+A_STEPS_ENTRY='mutate_engine_cert.sh mutate_checker_matrix_coverage.sh'
 check_anchor() { # $1 file, $2 anchor -- exactly once, not merely present
   local n
   n="$(python3 -c 'import sys;print(open(sys.argv[1]).read().count(sys.argv[2]))' "$1" "$2")"
@@ -789,7 +796,7 @@ check_anchor "$TARGET" "$A_STEPS_ENTRY" || {
   echo "PREFLIGHT FAIL -- no state was run and nothing was mutated." >&2; exit 1; }
 echo "  ok    anchor pre-flight: the N-P STEPS anchor occurs exactly once"
 reset_mutant
-patch_literal "$MUTANT" "$A_STEPS_ENTRY" 'mutate_checker_matrix_coverage.sh"' || {
+patch_literal "$MUTANT" "$A_STEPS_ENTRY" 'mutate_engine_cert.sh' || {
   echo "N-P MISSED (fn) -- the STEPS anchor did not match" >&2; exit 1; }
 # The arm must SURVIVE, or this state would be N-J again (a missing arm) and
 # would prove nothing about scheduling. Assert it rather than assume it.
