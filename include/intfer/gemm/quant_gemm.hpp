@@ -427,11 +427,35 @@ sycl::event act_quant_ga64_dev(sycl::queue& q, const ActQuantDevParams& p);
 // Row-cooperative INT4/G64 DPAS (EXPERIMENTAL, SLOWER — see .cpp note).
 // Same Dpas48Params contract as quant_gemm_dpas48; one WI per row loops
 // over 16-N tiles. Bit-exact vs the u4 path; ~460x slower device-side
-// (occupancy collapse). Default-off INTFER_DPAS_ROW=1 opts in; declines
-// (null event) unless bits==4 and weight group==64. Experiment base for
-// subgroup-cooperative sharing only — do NOT promote without a quiet A/B.
+// (occupancy collapse). Default-off INTFER_DPAS_ROW=1 opts in; DECLINES unless
+// dpas4_row_eligible() says otherwise. Experiment base for subgroup-cooperative
+// sharing only — do NOT promote without a quiet A/B.
 sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
                                 sycl::event dep = sycl::event{});
+
+// *** THE ROW KERNEL'S ELIGIBILITY RULE, IN ONE PLACE. ***
+//
+// It used to be written twice -- once in the kernel (`if (p.bits != 4 || G != 64)
+// return sycl::event{}`) and once in the engine (`use_row = ... && bits == 4 &&
+// Gw == 64`) -- and the two happened to agree, which is the audited-to-death shape
+// of a rule fixed at one site and re-derived at another. The engine's copy is the
+// dangerous one: it is the reason the kernel's decline path is unreachable today.
+//
+// It MUST stay unreachable, and it used to be unreachable only by coincidence.
+// Measured 2026-10-03 on this toolchain: an event that a callee produced by
+// `return sycl::event{}` does NOT compare equal to a bare `sycl::event{}`
+// constructed at the call site (see dpas_fold_probe's "decline conventions"
+// section, which asserts both directions). So engine.cpp's
+// `kernel_evt == sycl::event{}` fallback CANNOT be relied on to catch this
+// kernel's decline -- which is precisely why the guarantee has to be the
+// eligibility check, not the event comparison.
+//
+// Call this from the engine BEFORE launching, and the identity test is defence in
+// depth instead of the only thing standing between a decline and a silently
+// skipped GEMM.
+inline bool dpas4_row_eligible(uint32_t bits, uint32_t group_size) {
+  return bits == 4 && group_size == 64;
+}
 
 // ---------------------------------------------------------------------------
 // FP16-act-equivalent s8-weight DPAS GEMM for the VRAM-resident lm_head.

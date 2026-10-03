@@ -736,6 +736,132 @@ int main() {
   e4_readback(2u, 16u);
   checked += e4_dev_pairs;
 
+  // --- THE OTHER DECLINE CONVENTION, ASSERTED -------------------------------
+  // engine.cpp's decline test is `(kernel_evt == sycl::event{}) ||
+  // (kernel_evt == dep)`, and it has to be a UNION because the two callees in
+  // that ternary use DIFFERENT conventions:
+  //   quant_gemm_dpas48_2d  -> `return dep`        (proved above, sentinel test)
+  //   quant_gemm_dpas4_row  -> `return sycl::event{}`
+  // Until now only the first was a MEASURED fact and the second was a comment,
+  // which is the recorded "a rule that exists only in a document is not a check"
+  // shape. So measure it, both ways:
+  //   decline  -> returns an EMPTY event (and does NOT submit: the output buffer
+  //               keeps its sentinel), which is the shape the engine's first test
+  //               catches;
+  //   accepted -> returns a FRESH event that is neither `dep` nor empty, which is
+  //               what makes the union safe: a real submit can satisfy neither
+  //               side of it, so the fallback cannot fire spuriously.
+  // A one-sided version of this is worthless -- a test that only proves the
+  // kernel declines would also pass if it returned `dep`.
+  std::printf("\n[dpas-fold-probe] decline conventions (both, so the engine's union"
+              " test is a fact and not a comment):\n");
+  {
+    constexpr std::uint32_t M = 4, N = 64, K = 512;
+    const std::uint32_t nOp = K / 32, nG = K / 64, nGA = K / 64;
+    const std::uint32_t nT = N / 16, op_bytes = 32 * 16 * 4 / 8;
+    const std::size_t code_sz = (std::size_t)nT * nOp * op_bytes;
+    std::vector<std::uint8_t> code(code_sz);
+    std::vector<std::uint16_t> scale((std::size_t)N * nG);
+    std::vector<std::int8_t> act((std::size_t)M * K);
+    std::vector<float> as((std::size_t)M * nGA);
+    std::uint32_t seed = 987654321u;
+    for (std::size_t i = 0; i < code_sz; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      code[i] = (std::uint8_t)((seed >> 24) & 0x0F);
+    }
+    for (std::size_t i = 0; i < scale.size(); ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      scale[i] = (std::uint16_t)((seed >> 16) & 0xFFFF);
+    }
+    for (std::size_t i = 0; i < act.size(); ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      act[i] = (std::int8_t)((int)((seed >> 24) & 0xFF) - 128);
+    }
+    for (std::size_t i = 0; i < as.size(); ++i) as[i] = 0.02f;
+
+    auto *code_d = sycl::malloc_shared<std::uint8_t>(code_sz, q);
+    auto *scale_d = sycl::malloc_shared<std::uint16_t>(scale.size(), q);
+    auto *act_d = sycl::malloc_shared<std::int8_t>(act.size(), q);
+    auto *as_d = sycl::malloc_shared<float>(as.size(), q);
+    auto *o1 = sycl::malloc_shared<std::uint16_t>((std::size_t)M * N, q);
+    std::memcpy(code_d, code.data(), code_sz);
+    std::memcpy(scale_d, scale.data(), scale.size() * 2);
+    std::memcpy(act_d, act.data(), act.size());
+    std::memcpy(as_d, as.data(), as.size() * 4);
+
+    intfer::gemm::Dpas48Params p;
+    p.code_dpas = code_d; p.scale_usm = scale_d; p.act_int8 = act_d;
+    p.act_scale = as_d; p.alpha = 1.0f / 64.0f; p.M = M; p.N = N; p.K = K;
+    p.act_group = 64; p.act_stride = K; p.as_stride = nGA; p.out_usm = o1;
+
+    sycl::event dep = q.submit([&](sycl::handler& h) {
+      h.single_task<class dc_prereq_probe>([=]() {});
+    });
+
+    // (a) DECLINE: bits=8 is outside the row kernel's contract (it requires
+    // bits==4 and G==64), so it must return an empty event and write nothing.
+    const std::uint16_t kSent = 0xC0DE;
+    std::vector<std::uint16_t> fill((std::size_t)M * N, kSent);
+    std::memcpy(o1, fill.data(), fill.size() * 2);
+    p.bits = 8; p.group_size = 64;
+    sycl::event e_dec = intfer::gemm::quant_gemm_dpas4_row(q, p, dep);
+    e_dec.wait_and_throw();
+    std::uint32_t touched_dec = 0;
+    {
+      std::vector<std::uint16_t> chk((std::size_t)M * N);
+      std::memcpy(chk.data(), o1, chk.size() * 2);
+      for (std::uint16_t v : chk)
+        if (v != kSent) ++touched_dec;
+    }
+    // (b) ACCEPT: bits=4/G=64 is the row kernel's contract, so it must submit
+    // and return a FRESH event -- neither `dep` and not empty. This is the half
+    // that makes the union safe.
+    p.bits = 4; p.group_size = 64;
+    sycl::event e_ok = intfer::gemm::quant_gemm_dpas4_row(q, p, dep);
+    e_ok.wait_and_throw();
+
+    // The MEASURED, implementation-dependent fact, printed rather than asserted:
+    // whether an event a callee produced by `return sycl::event{}` compares equal
+    // to a bare one built HERE. It was written out of this section because the
+    // answer is NO on this toolchain, and a probe that quietly required "yes"
+    // would go red on the next compiler. The consequence is what matters and is
+    // asserted below: engine.cpp must not depend on it.
+    const bool null_cmp_works = (e_dec == sycl::event{});
+    std::printf("  ok    MEASURED: a callee's `return sycl::event{}` %s compare "
+                "equal to a bare sycl::event{} built here. engine.cpp therefore "
+                "may NOT rely on that test.\n",
+                null_cmp_works ? "DOES" : "does NOT");
+    // What IS asserted, both directions:
+    //   decline -> wrote nothing at all (the only reliable, side-effect-shaped
+    //              signal), and returned `dep` unchanged;
+    //   accept  -> returned an event that is neither `dep` nor empty, so the
+    //              engine's `== dep` test cannot fire on a real submit.
+    // And the rule itself is checked against OBSERVED behaviour in both
+    // directions, so the engine's eligibility predicate can never drift from the
+    // kernel without this going red -- that is the whole point of giving the
+    // predicate one home.
+    const bool dec_ok = (touched_dec == 0) && (e_dec == dep);
+    const bool acc_ok = (e_ok != dep) && (e_ok != sycl::event{});
+    const bool rule_ok = intfer::gemm::dpas4_row_eligible(8u, 64u) == false &&
+                         intfer::gemm::dpas4_row_eligible(4u, 64u) == true &&
+                         intfer::gemm::dpas4_row_eligible(4u, 32u) == false;
+    std::printf("  %s  quant_gemm_dpas4_row DECLINES (bits=8): wrote %u slot(s) and "
+                "returned `dep` UNCHANGED -- the shape engine.cpp's `== dep` "
+                "catches\n", dec_ok ? "ok   " : "FAIL ", touched_dec);
+    std::printf("  %s  quant_gemm_dpas4_row ACCEPTS  (bits=4/G=64): returned an "
+                "event that is neither `dep` nor empty, so the test cannot fire "
+                "spuriously\n", acc_ok ? "ok   " : "FAIL ");
+    std::printf("  %s  dpas4_row_eligible() agrees with OBSERVED behaviour in both "
+                "directions (8/64 declines, 4/64 accepts), so the engine's copy "
+                "cannot drift\n", rule_ok ? "ok   " : "FAIL ");
+    if (!dec_ok) ok = false;
+    if (!acc_ok) ok = false;
+    if (!rule_ok) ok = false;
+
+    sycl::free(code_d, q); sycl::free(scale_d, q); sycl::free(act_d, q);
+    sycl::free(as_d, q); sycl::free(o1, q);
+  }
+
   // NOTE: the one-line verdict is printed at the END, after E4. Printing it
   // here would announce PASS and then let a later section flip it to FAIL, so
   // the line a human reads would disagree with the exit code.

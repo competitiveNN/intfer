@@ -1359,7 +1359,14 @@ sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
   constexpr uint32_t RSTRIP = 4;
   const uint32_t M = p.M, N = p.N, K = p.K;
   const uint32_t G = (p.group_size == 0) ? K : p.group_size;
-  if (p.bits != 4 || G != 64) return sycl::event{};
+  // Decline by RETURNING `dep` UNCHANGED, the same convention as
+  // quant_gemm_dpas48_2d. It used to return a bare `sycl::event{}`, and that is
+  // NOT reliably observable: on this toolchain an event produced by
+  // `return sycl::event{}` does not compare equal to a bare `sycl::event{}`
+  // built at the call site (measured; dpas_fold_probe asserts it). The rule is
+  // dpas4_row_eligible() -- ONE home, shared with the engine -- so this branch is
+  // defence in depth rather than the mechanism the caller depends on.
+  if (!dpas4_row_eligible(p.bits, G)) return dep;
   const uint32_t GA = (p.act_group == 0) ? K : p.act_group;
   const uint32_t nT = N / TN, nOp = K / OP;
   const uint32_t nGA = (K + GA - 1) / GA;

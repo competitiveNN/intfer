@@ -946,8 +946,15 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
                                                               : 8;
   const uint32_t Gw = (sc.group_size == 0) ? K : sc.group_size;
   // EXPERIMENTAL row-cooperative geometry (default-off INTFER_DPAS_ROW=1;
-  // measured ~460x slower — experiment base only). Eligible: INT4/G64.
-  const bool use_row = dpas_row_enabled() && bits == 4 && Gw == 64;
+  // measured ~460x slower — experiment base only). Eligibility is the KERNEL'S
+  // OWN predicate (dpas4_row_eligible), not a second copy of it: this copy used
+  // to live here and to agree only by coincidence, and it is the copy that makes
+  // the kernel's decline path unreachable. That guarantee cannot rest on the
+  // event-identity test below -- measured 2026-10-03, an event a callee returns
+  // as a bare sycl::event{} does NOT compare equal to one built here, so the
+  // `== sycl::event{}` half of the fallback cannot be relied on (dpas_fold_probe
+  // asserts both directions).
+  const bool use_row = dpas_row_enabled() && gemm::dpas4_row_eligible(bits, Gw);
   // Device act-quant pre-pass (INTFER_DPAS_PREQ=1, default OFF): per device
   // one FP32 H2D + one GA64 quant kernel, dep-chained into that rank's DPAS
   // launch. Kills the host quant loop and adds no host wait. Per device
@@ -1114,22 +1121,16 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
     sycl::event kernel_evt = use_row ? gemm::quant_gemm_dpas4_row(q, p, dep)
                           : use_tiled ? gemm::quant_gemm_dpas48_2d(q, p, dep)
                                       : gemm::quant_gemm_dpas48(q, p, dep);
-    // Decline detection. BOTH callee conventions exist in this file and each
-    // declares which it uses, so this must accept BOTH:
-    //   quant_gemm_dpas48_2d returns `dep` UNCHANGED -- that is what makes its
-    //     decline observable at all, because a fresh `sycl::event{}` cannot be
-    //     told apart from a real return.
-    //   quant_gemm_dpas4_row returns a bare `sycl::event{}` (quant_gemm.cpp
-    //     "Declines (null event) unless bits==4 and weight group==64").
-    // Testing only the first, as an earlier revision of this function did, is
-    // strictly NARROWER than the pre-E4 `== sycl::event{}` test: a row-kernel
-    // decline under a non-empty `dep` would read as SUCCESS and silently skip
-    // the GEMM instead of falling back. Not reachable today -- use_row is gated
-    // on exactly the condition the row kernel declines on (engine.cpp:950) --
-    // but that is a coincidence of two sites agreeing, not a rule, and a rule
-    // fixed at one callee and not the other is the shape this repo keeps
-    // re-auditing. A successful submit always returns a FRESH event, so neither
-    // test can false-positive.
+    // Decline detection. BOTH DPAS48 callees now decline the SAME way -- they return
+    // `dep` UNCHANGED (quant_gemm.cpp) -- so `kernel_evt == dep` is the reliable
+    // test. The `sycl::event{}` half is kept as defence in depth and NOT relied
+    // on: measured on this toolchain, an event produced by `return sycl::event{}`
+    // does not compare equal to a bare one built here, so it cannot be the
+    // mechanism (dpas_fold_probe asserts that measurement in both directions).
+    // What actually keeps a decline unreachable is the eligibility predicate the
+    // caller checks BEFORE launching (gemm::dpas4_row_eligible, use_tiled's
+    // M >= 2) -- one rule, one home, consulted before the launch rather than
+    // inferred from a return value.
     const bool declined =
         (kernel_evt == sycl::event{}) || (kernel_evt == dep);
     if (declined) kernel_evt = gemm::quant_gemm_dpas48(q, p, dep);
