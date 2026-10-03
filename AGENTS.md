@@ -2977,6 +2977,93 @@ e.g. S3's contract column is 40 not 42).
     is the only durable fix; **(2)** if a sweep is still needed, delete only
     directories whose owning process is provably gone, or directories the current
     shell recorded at creation — never a time window over a shared `/tmp`.
+- **AUDIT #30 (2026-10-03): A TOOL NAMED A DEVICE THAT NO LONGER EXISTS, EIGHT
+  MUTATION GUARDS WERE DEAD CODE, AND THE REPLACEMENT RULE WAS VACUOUS TWICE.**
+  Audited the previous session by re-deriving its claims instead of re-running its
+  checks. No engine, quant or schedule code touched.
+  - **THE RECOVERY TOOL MISREPORTED THE FAULT IT EXISTS TO DIAGNOSE.**
+    `gpu_recover.sh diag` looped over the LITERAL minors `/dev/dri/renderD128` and
+    `/dev/dri/renderD129`. MEASURED on this box: the second B580 had renumbered to
+    **card2 / renderD130** (226:2), so diag printed
+    `/dev/dri/renderD129 MISSING` **on a healthy box**, while never opening the real
+    second node at all — two failures in one line, both silent: a false alarm naming
+    a device that merely got renamed, and the actual subject left unexamined. That is
+    the tool AGENTS.md's runbook tells the operator to use for exactly this fault.
+    The previous session fixed the UNBIND HINT to resolve by slot and generalised in
+    prose; it did not re-enumerate the other sites. **AUDIT #7/#8 shape.**
+    Now resolved via `/dev/dri/by-path/pci-<slot>-render`, which is named for the
+    slot and survives the rename, plus a sweep for **UNCLAIMED** render nodes so a
+    card the tool does not know by slot is reported rather than silently ignored.
+    `INTFER_DRI_ROOT` seam added — the only way to exercise a MISSING node is a
+    filesystem that is not `/dev/dri`, and *an assumption no harness can redirect is
+    an assumption no harness can test* (the `INTFER_SYCL_LS` rationale).
+    **`check_gpu_recover.sh` case (e)** with its CONVERSE: a renumbered second node
+    resolves by slot and emits no false MISSING; both-claimed emits no UNCLAIMED;
+    a genuine orphan IS reported. Its first draft had **two defects the harness
+    caught on first run** — a fixture splitting `0000:04:00.0:128` on the *first*
+    colon instead of the last, and an orphan case whose fixture contained nothing to
+    be unclaimed (a check that cannot fail).
+  - **EIGHT NO-OP GUARDS IN SIX MATRICES COULD NEVER FIRE.** They read
+    `before="$(cat "$f")"` then `if cmp -s "$before" "$f"`. **`cmp` compares two
+    PATHS**; `$before` is CONTENT, so cmp gets a non-existent filename and returns
+    **2 (error), never 0** — the "mutation did not change the file" branch is
+    unreachable. MEASURED: `cmp -s "$(cat f)" f` → rc 2. Affected
+    `mutate_checker_matrix_coverage` (×2), `mutate_e2_ctx`,
+    `mutate_fold_report_class`, `mutate_gate_enum` (×2), `mutate_gate_pop`,
+    `mutate_gpu_recover`. This is **precisely the guard that catches a stale anchor
+    degrading a mutation into a no-op** (the AUDIT #17 class that repeatedly bit
+    this repo) — load-bearing by name, absent in fact. The other 8 `cmp` sites
+    compare two real backup FILES and are correct: **enumerated, not assumed.**
+    Fixed to `[ "$before" = "$(cat "$f")" ]`.
+  - **MAKING IT LIVE EXPOSED A SECOND HALF: THE GUARD WATCHED THE WRONG FILE.**
+    `mutate_gpu_recover` immediately scored **2/5**, reporting M-C/M-D/M-E as
+    "mutation did not change the file". Those states mutate the **TOOL**; the guard
+    compared only the **CHECKER**. An artifact mutation that landed perfectly was
+    scored a no-op. Fixed to match `restore()` directly above it, which already
+    snapshots the whole sandbox **DIRECTORY** because *"a state that damages a file
+    nobody listed cannot leak into its successor"* — so the guard digests every
+    script in it (`sb_digest`). **A hand list here would have been the third copy of
+    the bug.** All six matrices then re-ran clean; no state in the other five turned
+    out to be a hidden no-op, so the conversion introduced no regression.
+  - **NOT REFACTORED INTO A SHARED HELPER**, per the recorded `patch_literal`
+    decision: these are passing, mutation-proven matrices, and a refactor that
+    breaks one is worse than the drift it removes.
+  - **THE FAMILY, CLOSED FROM SOURCE: `check_dri_probe.sh`.** Enumerating from
+    `scripts/` rather than from the fix found **6** scripts probing render nodes.
+    **7 name `renderD128` as a LIVENESS probe and are deliberately ALLOWED**:
+    failing there is **LOUD** (exit 2 SKIP through the shared device guard), not a
+    false report, and rewriting a helper six gates depend on is unmeasured churn.
+    The distinct defect is naming **2+ DISTINCT minors** = identifying a card.
+    `check_*/mutate_*` are excluded as **VERIFIERS** by prefix (a harness that
+    *plants* the defect must be able to name it), with the cost named and a trigger
+    recorded.
+  - **THE RULE WAS VACUOUS TWICE, AND BOTH TIMES A MUTATION CAUGHT IT.**
+    **v1** matched the literal `/dev/dri/renderD<minor>`, so a script hard-coding a
+    minor through the `INTFER_DRI_ROOT` seam — *the seam added one commit earlier to
+    make the probe testable* — scored PASS. **v2** excused any file mentioning
+    `by-path` **anywhere**, which is not the claim "the probe resolves by slot". **v3
+    has no by-path escape at all**: a compliant script names NO minors, so it needs
+    no exemption, and there is nothing to game. MEASURED: literal / seam /
+    by-path-nearby all **rc=1**, healthy tree **rc=0**.
+    **A fourth error was mine and in the OPPOSITE direction:** v1 demanded
+    `sites > 0`, i.e. **evidence of a violation from a healthy tree** — AUDIT #20
+    inverted. It now asserts the **SUBJECT** exists (some script probes render
+    nodes), never that a violation does, which is what a healthy tree must be
+    allowed to have.
+  - **`mutate_dri_probe.sh` 5/5.** D-A/D-B/D-C damage the **CORPUS** via
+    `INTFER_SCRIPTS_DIR`, never the checker — it is correct by construction, so
+    weakening it is unobservable (AUDIT #21). D-D: an empty census must be REFUSED.
+    **D-E is the CONVERSE, the state that gets forgotten**: a single-minor liveness
+    probe must stay CLEAN, without which a rule that flagged everything would
+    satisfy D-A..D-D and the matrix would prove only that a check cannot fail.
+    **Defect found by RUNNING it: D-D defined its mutation function and NEVER CALLED
+    IT**, so it ran against D-C's leftover corpus and "caught" the empty-census guard
+    for D-C's already-planted defect — rc=1 right, **reason** wrong. Surfaced only
+    because D-D asserts the guard's **MESSAGE** and not merely its exit code.
+  - **Wired into `dispatch()` AND `STEPS`** — an arm without a STEPS entry is the
+    AUDIT #18 defect, where a matrix never runs and its stamp reads STALE, a symptom
+    that looks like missing evidence with a remedy that cannot help. 0b reports
+    **35 scripts, all dispatched**; 0c confirms all scheduled.
 - **THE STALE LOCK WAS A HAZARD *IN THE TOOL'S OWN ADVICE*, not in my procedure.**
   I ran `rm -f build/.run_all_checks.lock` before two stack launches. The problem is
   that the script's refusal message **instructed exactly that**: *"If no run is
