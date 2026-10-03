@@ -366,6 +366,51 @@ Implement features for maximizing throughput for concurrent requests, starting f
 
 ## Performance targets (2x Arc Pro B580)
 
+### ALWAYS AIM FOR KERNEL FUSION to reduce CPU-GPU communication overhead
+
+**Standing directive.** When proposing or implementing a GPU optimization on this
+project, **kernel fusion is the DEFAULT direction to reach for**, not a fallback.
+Every host↔device round trip costs a submit, a wait and a transfer, and on Arc B580
+those dominate far more often than the arithmetic does.
+
+Apply these three questions to **any** new optimization before believing it will
+pay:
+
+1. **Which round trips does it remove** — submit / wait / D2H / H2D — **and what is
+   its launch delta?** An optimization with no round-trip removal and no launch
+   reduction is unlikely to pay on this box.
+2. **Prefer fusing the CONSUMER of a device buffer with the PRODUCER of it**, so the
+   intermediate never reaches the host. `run_mlp_fused` and `la_out_fused` are the
+   two shipped examples; the `run_linear_tp_devact` seam is the pattern they use.
+3. **A fusion that changes FP32 accumulation ORDER is NOT bit-exact** and needs a
+   tolerance-based numerics contract agreed **before** any code is written (this is
+   the recorded E4 blocker). Prefer fusions whose intermediate is an **exact**
+   integer fold (the FOLD hoist is bit-exact because integer addition is
+   associative) or a **bit-exact** converter (the RNE FP16 convert was verified
+   exhaustively).
+
+**Why, from this repo's own measurements** — do not re-derive these:
+
+- **The wall is submit, not math.** 0.8B TP=1 decode at ~27 tok/s ≈ 38.6 ms/token
+  splits kernel 9.6 / submit 11.7 / waitblock 9.5 / transfers 10.4 ms over ~194
+  launches. Fixing the arithmetic (the XMX question) does nothing about the rest.
+- **Fusion has already won twice, and both wins were round-trip removals, not flop
+  reductions.** Fused MLP down-projection was **+13 % decode** by cutting one host
+  wait + one D2H per MLP. By contrast the L5 LA-front chain **added** kernels and
+  ~8 submits per LA-layer and is a recorded dead end despite identical device work.
+  ***More device work in fewer host phases wins; more kernels lose.***
+- **The case where fusion does NOT win.** A fusion that ADDS launches can lose even
+  while removing waits: at M=3 under device saturation the L4 M-row save nets
+  ≈ −1.5 %, because submit savings land on an already-saturated queue.
+- **Prefill and decode want different fusions.** Prefill 4000 tok/s needs XMX on
+  the arithmetic (EU pipes are the whole story today); decode 40 tok/s needs
+  launch-count and transfer reduction, because at M=1 it is memory-bound and XMX
+  barely helps.
+
+Report fusion results in **load-insensitive buckets** (`kernel`/`submit`/
+`waitblock`/`copy`/`usm_write`/`readback`, `nk`/`nw`/`nr`) and never quote a tok/s
+that was not measured on a quiet box.
+
 > FOCUS (2026-09-24): our optimization target is the **27B model** — decode
 > and prefill work, benchmarks, and perf claims are scoped to 27B unless
 > explicitly stated otherwise. The 0.8B numbers below are legacy reference
