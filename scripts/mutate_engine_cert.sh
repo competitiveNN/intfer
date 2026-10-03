@@ -80,10 +80,12 @@ HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 # that shares the code it tests cannot catch that code being wrong -- the AUDIT #12
 # S4 blindness) and as a deliberate superset: it also counts scripts/_ec_mutant.sh,
 # which the checker does not, so a commit it picks carries under EITHER rule.
-derive_carries_anchor() {
-  git -C "$ROOT" rev-list --max-count=60 HEAD~1 2>/dev/null | while read -r sha; do
+derive_carries_anchor() { # ${1:-$ROOT} -- a repo root, so the SELF-CHECK below can
+                         # drive it on a synthetic history instead of only on this one
+  local r="${1:-$ROOT}"
+  git -C "$r" rev-list --max-count=60 HEAD~1 2>/dev/null | while read -r sha; do
     local files
-    files="$(git -C "$ROOT" diff --name-only "$sha..HEAD")"
+    files="$(git -C "$r" diff --name-only "$sha..HEAD")"
     [ -n "$files" ] || { echo "$sha"; return 0; }  # identical tree: carries
     if ! printf '%s\n' "$files" | grep -qE \
          '^(src/|examples/|include/|scripts/test_|scripts/setvars\.sh|scripts/_gate_|scripts/_ec_mutant\.sh)'; then
@@ -91,6 +93,55 @@ derive_carries_anchor() {
     fi
   done
 }
+# --- SELF-CHECK: both arms of the derivation, on a SYNTHETIC history ----------
+# The exclusion path (E-A not posable) is unreachable on a tree whose newest commit
+# happens to be tooling-only -- which is exactly when nobody notices it rotted, and
+# an unreachable branch is a branch nothing can break. So drive the derivation on a
+# throwaway repo where the newest commit IS an engine commit, and require it to
+# return nothing. Both directions are required: a derivation that always returns
+# nothing would also pass the first case and would exclude E-A forever, silently
+# deleting a state from every matrix run.
+echo "== self-check: the carrying-anchor derivation, both directions =="
+_sc_rc=0
+_scr="$(mktemp -d "$SB/sc.XXXXXX")"
+git -C "$_scr" init -q
+git -C "$_scr" -c user.email=m@x -c user.name=sc commit -q --allow-empty -m base
+SC_ENGINE="$(git -C "$_scr" rev-parse HEAD)"
+mkdir -p "$_scr/src/engine"; : >"$_scr/src/engine/a.cpp"
+git -C "$_scr" -c user.email=m@x -c user.name=sc add -A
+git -C "$_scr" -c user.email=m@x -c user.name=sc commit -q -m "engine input moves"
+: >"$_scr/docs.md"
+git -C "$_scr" -c user.email=m@x -c user.name=sc add -A
+git -C "$_scr" -c user.email=m@x -c user.name=sc commit -q -m "tooling only"
+SC_TOOL="$(git -C "$_scr" rev-parse HEAD)"
+got="$(derive_carries_anchor "$_scr" || true)"
+if [ "$got" != "$SC_TOOL" ]; then
+  echo "  SELFCHECK FAIL: newest commit is tooling-only, so the anchor must be" >&2
+  echo "    $SC_TOOL, got '${got:-<nothing>}' -- an always-empty derivation would" >&2
+  echo "    exclude E-A from every run and delete a state in plain sight." >&2
+  _sc_rc=1
+else
+  echo "  ok    tooling-only head  -> anchor is the commit before it"
+fi
+: >"$_scr/src/engine/b.cpp"
+git -C "$_scr" -c user.email=m@x -c user.name=sc add -A
+git -C "$_scr" -c user.email=m@x -c user.name=sc commit -q -m "engine input moves again"
+got2="$(derive_carries_anchor "$_scr" || true)"
+if [ -n "$got2" ]; then
+  echo "  SELFCHECK FAIL: the newest commit is now an ENGINE commit, so NO older" >&2
+  echo "    certification can carry and the derivation must return nothing; it" >&2
+  echo "    returned $got2 -- the exclusion path would be unreachable." >&2
+  _sc_rc=1
+else
+  echo "  ok    engine head       -> nothing carries, so E-A is EXCLUDED (loudly)"
+fi
+rm -rf "$_scr"
+if [ "$_sc_rc" -ne 0 ]; then
+  echo "ENGINE CERT MUTATE: FAIL -- self-check did not hold, so every state below" >&2
+  echo "  would be scored against a broken derivation." >&2
+  exit 1
+fi
+
 TOOLING_ONLY="$(derive_carries_anchor || true)"
 E_A_POSABLE=1
 if [ -z "$TOOLING_ONLY" ]; then
@@ -102,7 +153,15 @@ if [ -z "$TOOLING_ONLY" ]; then
   echo "  E-A NOT POSABLE -- the newest commits moved engine inputs, so no"
   echo "        older certification can legitimately 'carry'. Excluded, not"
   echo "        scored (AUDIT #21): the premise is false, which says nothing"
-  echo "        about the checker. Re-run it on a tooling-only commit."
+  echo "        about the checker."
+  echo "        HEAD=$(git -C "$ROOT" rev-parse --short HEAD) touched:"
+  git -C "$ROOT" diff-tree --no-commit-id --name-only -r HEAD \
+    | grep -E '^(src/|examples/|include/|scripts/test_|scripts/setvars\.sh|scripts/_gate_)' \
+    | sed 's/^/          /'
+  echo "        Re-run this matrix once HEAD is a tooling-only commit, or commit"
+  echo "        the engine work first -- otherwise E-A silently stops testing the"
+  echo "        converse of E-B, which is the state that stops the checker being"
+  echo "        so aggressive that people disable it."
 else
   echo "== E-A anchor =="
   echo "  ok    newest carrying ancestor: $(git -C "$ROOT" rev-parse --short "$TOOLING_ONLY")"
