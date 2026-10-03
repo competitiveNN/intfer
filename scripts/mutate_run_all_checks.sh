@@ -764,8 +764,17 @@ grep -q '^    mutate_verdict_scope.sh)' "$MUTANT" \
 grep -q 'N-P' "$MUTANT" || true
 TOTAL=$((TOTAL + 1))
 run_rac_cov "N-P" ""
-if [ "$?" -ne 0 ] && grep -q 'never scheduled, so this run will NOT execute: mutate_verdict_scope.sh' \
-     "$WORK/N-P.log"; then
+# *** THE PREDICATE GREPS FOR THE NAME, NOT FOR ITS POSITION IN THE LIST. *** The
+# first version matched the whole line including the name, and 0c prints the
+# unscheduled scripts in GLOB order, so the message reads
+# "...: mutate_stack_cert.sh mutate_verdict_scope.sh" -- the name is present but not
+# where the exact-match string expected. That is the AGENTS.md rule one level down
+# (write the predicate from what is ACTUALLY printed, not from what you expect),
+# and it is also why the two halves are asserted separately: the header proves 0c
+# refused an unscheduled step, and the name proves it was THIS step.
+if [ "$?" -ne 0 ] \
+   && grep -q 'never scheduled, so this run will NOT execute:' "$WORK/N-P.log" \
+   && grep -q 'mutate_verdict_scope.sh' "$WORK/N-P.log"; then
   CAUGHT=$((CAUGHT + 1))
   printf '  ok    %-4s defect reproduced: a matrix with an ARM but no STEPS entry never runs\n' "N-P"
 else
