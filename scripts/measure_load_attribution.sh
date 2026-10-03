@@ -70,8 +70,10 @@ set +u; . /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u
 export LD_LIBRARY_PATH="/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}"
 
 load1() { awk '{print $1}' "$LOADAVG"; }
-# CPU seconds consumed by a process AND its descendants, from /proc/<pid>/stat.
-# Sum over the whole tree, and sample the tree as it is at that instant.
+# CUMULATIVE CPU seconds consumed by a process AND its descendants, from
+# /proc/<pid>/stat. Summed over the whole tree as it stands at this instant -- this
+# is a monotone-ish total, NOT a rate. The caller differences it against the clock
+# to obtain cores.
 tree_cpu() { # $1 = root pid -> CPU seconds on stdout
   local pids="$1" front="$1" tot=0 p f pp next
   while [ -n "$front" ]; do
@@ -134,7 +136,11 @@ run_arm > "$SB/arm.log" 2>&1 &
 CLI=$!
 t0="$(date +%s)"
 while kill -0 "$CLI" 2>/dev/null; do
-  echo "$(load1) $(tree_cpu "$CLI")" >> "$SAMPLES"
+  # THREE fields: the timestamp is REQUIRED. `tree_cpu` returns CUMULATIVE CPU
+  # seconds, and labelling that "cores" is a unit error I made on the first run --
+  # it printed "30.89 cores" for an arm that used about one. Cores are a RATE, so
+  # they need the interval: (cpu[i]-cpu[i-1]) / (t[i]-t[i-1]).
+  echo "$(load1) $(tree_cpu "$CLI") $(date +%s)" >> "$SAMPLES"
   [ "$SECS" -gt 0 ] && [ $(( $(date +%s) - t0 )) -ge "$SECS" ] && break
   sleep 1
 done
@@ -149,13 +155,31 @@ if [ "$n" -lt 5 ]; then
 fi
 
 awk -v n="$n" -v q="$QLOAD" '
-  { l[NR]=$1; c[NR]=$2; if ($1>ml) ml=$1; if ($2>mc) mc=$2; sc+=$2 }
+  { l[NR]=$1; cu[NR]=$2; ts[NR]=$3
+    if ($1>ml) ml=$1 }
+  # CORES = d(cpu seconds)/d(seconds). Never print the cumulative number under the
+  # word "cores": the first version did, and it read 30.89 for an arm using ~1.
   END {
-    med_l = l[int(n/2)+1]; med_c = c[int(n/2)+1]; mean_c = sc/n
-    printf "samples                 : %d\n", n
+    for (i = 2; i <= n; i++) {
+      dt = ts[i] - ts[i-1]
+      if (dt <= 0) continue
+      r[i] = (cu[i] - cu[i-1]) / dt
+      if (r[i] < 0) r[i] = 0          # a process EXITED; its counter stops growing
+      k++; rr[k] = r[i]; sr += r[i]
+      if (r[i] > mr) mr = r[i]
+    }
+    med_l = l[int(n/2)+1]
+    mean_r = (k > 0) ? sr/k : 0
+    asort_r = 0
+    # median of the rate samples, via a simple insertion sort (n is small)
+    for (i = 2; i <= k; i++) { v = rr[i]; j = i-1
+      while (j >= 1 && rr[j] > v) { rr[j+1] = rr[j]; j-- }
+      rr[j+1] = v }
+    med_r = (k > 0) ? rr[int(k/2)+1] : 0
+    printf "samples                 : %d load readings, %d rate intervals\n", n, k
     printf "load1  median / max     : %.2f / %.2f   (threshold %.2f)\n", med_l, ml, q
-    printf "CLI tree CPU  median     : %.2f cores\n", med_c
-    printf "CLI tree CPU  mean / max : %.2f / %.2f cores\n", mean_c, mc
+    printf "CLI tree  median / mean : %.2f / %.2f cores\n", med_r, mean_r
+    printf "CLI tree  max rate     : %.2f cores\n", mr
     crosses = (ml >= q) ? "yes" : "no"
     printf "did load1 cross %-2s      : %s\n", q, crosses
     print ""
@@ -169,6 +193,10 @@ awk -v n="$n" -v q="$QLOAD" '
       print "         MEDIAN load is below it. Waiting for a quiet box IS the right"
       print "         advice; on this host it means no desktop compositor and no"
       print "         sibling session, not merely a low reading."
+      print ""
+      printf "         the arm itself uses ~%.1f cores (mean), so it cannot account\n", mean_r
+      print "         for a box sitting far above the threshold; the rest is"
+      print "         whatever else is running."
     } else {
       print "VERDICT: the arm itself holds load1 at or above the threshold, so"
       print "         \"wait for a quiet box\" is NECESSARY AND NOT SUFFICIENT."
