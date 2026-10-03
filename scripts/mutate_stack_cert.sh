@@ -182,6 +182,29 @@ MUTATE_FN() {
 run_state "S-C" "a mismatched census is accepted" 'the census is stale' \
   "the census comparison can no longer fail"
 
+# S-D: THE EXEC-BIT PROPERTY, damaged on the ARTIFACT (AUDIT #21). The new
+# executability check is correct by construction on a clean tree, so weakening
+# the CHECKER would be unobservable -- every script is 755, so deleting the
+# assertion changes nothing observable. The defect must therefore be planted in
+# the TREE: clear one script's execute bit and require the checker to reject it.
+# This is the exact shape of the 2026-10-03 defect (five shebanged scripts at
+# mode 644 that the stack never noticed), which is why it is the state that
+# makes the new property mean anything.
+#
+# NOTE the mode IS restored between states: git records the exec bit, so
+# `reset_tree` (git checkout -- .) puts it back. Verified by the residue check
+# below, which fails loudly if the sandbox repo is not clean -- a leaked 644
+# would otherwise be inherited by every state after this one, exactly the
+# incomplete-restore defect that hit mutate_bench_load_gate.sh twice.
+MUTATE_FN() {
+  chmod 644 "$REPO"/scripts/check_stack_cert.sh || return 1
+  [ -x "$REPO"/scripts/check_stack_cert.sh ] && return 1   # it must NOT be executable
+  return 0
+}
+run_state "S-D" "a non-executable entry point is accepted" \
+  'is not executable' \
+  "a shebang that cannot be run is invisible again"
+
 reset_tree
 echo
 echo "== residue + restore integrity =="
