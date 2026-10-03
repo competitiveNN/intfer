@@ -31,7 +31,7 @@ the run's own spread in 3 of 3 rounds.
 |---|---|---|---|
 | **E1** | `INTFER_DPAS_PREQ` (device act-quant pre-pass) | **DECISION: DO-NOT-PROMOTE** | `nk` **94208 → 124928 = +30720 launches** (+480/token), byte-identical in every round of both runs; `nw`/`nr` unchanged. **Kernel delta re-measured 2026-10-03 and now RESOLVES** (the 2026-10-02 run could not): `d = -15.1 -19.5 -22.9`, median **-19.5 ms** against a **4.7 ms** floor, signs **3/3 agree** — i.e. PREQ is a small device-kernel **WIN of 0.11 %**, not a cost. The decision therefore rests **only** on the exact launch count: a 0.11 % kernel win cannot pay for +480 launches/token. Stays default-OFF. |
 | **E2** | `INTFER_INT8_KV` / `INTFER_KV_Q8` (groupwise INT8 KV cache) | **DECISION: DO-NOT-PROMOTE** | `nk`/`nw`/`nr` = **63488 / 63488 / 16384 — byte-identical across BASE, KV and KVQ8**. The experiment changes **zero** device-side work at this shape, so there is no effect to measure and no reason to carry the flag. Stays default-OFF. |
-| **E3** | `INTFER_DPAS48_FOLD` (per-(row,op) activation-fold hoist) | **DECISION: KEEP — this is the one to keep** | `nk` **94208 → 116736 = +22528 launches** (+352/token); `nw`/`nr` unchanged. Kernel delta **CLEARS the spread**: `d = +343.9 +388.7 +410.8`, median **+388.7 ms**, floor **89.0 ms**, **3/3 rounds agree in sign**. FOLD is **2.05 % cheaper in device kernel** (388.7 / 18940.2) for one extra launch per DPAS GEMM. |
+| **E3** | `INTFER_DPAS48_FOLD` (per-(row,op) activation-fold hoist) | **DECISION: KEEP — this is the one to keep** | `nk` **94208 → 116736 = +22528 launches** (+352/token); `nw`/`nr` unchanged. Kernel delta **CLEARS the spread**: `d = -343.9 -388.7 -410.8`, median **-388.7 ms**, floor **89.0 ms**, **3/3 rounds agree in sign**. FOLD is **2.05 % cheaper in device kernel** (388.7 / 18940.2) for one extra launch per DPAS GEMM. |
 | **E3b** | `FOLD + PREQ` composed | **DECISION: DO-NOT-PROMOTE PREQ** | `FOLDPREQ` vs `FOLD`: `d = -46.3 -70.2 -146.9`, median **-70.2 ms** vs a **122.7 ms** floor → **INSIDE the spread**, not a result. PREQ adds **+30720** launches on top of FOLD and buys nothing resolvable. (FOLDPREQ vs DPAS48 *does* clear the spread at **+297.6 ms**, but that is inherited from FOLD, not from PREQ.) |
 
 **Bottom line for the archive step: keep E3 (`INTFER_DPAS48_FOLD`), drop E1
@@ -559,6 +559,52 @@ than dropping the arm — the cap behaviour is part of what you are testing.
   not retest on a loaded box hoping for more.
 - **KILL** — no decode gain at long ctx, or any stream divergence.
 
+### RE-RUN 2026-10-03 — the decision REPRODUCES, on three fresh rounds
+`scripts/bench_reports_batch.sh E2 3`, 27B `--tp 2`, `devices=2`,
+`INTFER_KV_CAP=8192` (the default 1024 aborts the long prompt). Stream identity
+re-verified first and held on all three arms:
+`BASE == KV == KVQ8` (`11751 13 198 760 6511 314 9338 369`).
+
+**Still no wall-time.** `max_load1` = 3.95 / 2.62 / 2.11 / 2.00 / 2.56 / 2.16 /
+1.99 / 2.64 / 1.85 (`grep -o 'LOAD1=[0-9.]*' build/bench_E2.log`), so eight of nine
+arms were withheld. Two arms (`r3 BASE` at 1.99, `r3 KVQ8` at 1.85) squeaked under
+and the summariser printed their tok/s **tagged `2/3 round(s) WITHHELD`** rather
+than as a figure — one usable round has no paired noise floor, the same rule it
+applies to kernel deltas. The `RESULT:` line stays blank; the batch ends
+"NO wall-time claimed".
+
+**The load-insensitive evidence is the whole story, and it is exact:**
+
+| arm | `nk` | `nw` | `nr` | kernel per round (ms) | median | spread |
+|---|---|---|---|---|---|---|
+| BASE | 63488 | 63488 | 16384 | 16406.0 / 16391.7 / 16382.3 | 16391.7 | 23.7 (0.1 %) |
+| **KV** | 63488 | 63488 | 16384 | 16401.2 / 16389.6 / 16374.8 | 16389.6 | 26.4 (0.2 %) |
+| **KVQ8** | 63488 | 63488 | 16384 | 16448.0 / 16395.6 / 16377.8 | 16395.6 | 70.2 (0.4 %) |
+
+Per-round kernel delta vs BASE, paired inside each round:
+
+| arm | r1 | r2 | r3 | median | verdict |
+|---|---|---|---|---|---|
+| KV | −4.8 | −2.1 | −7.5 | **−4.8 ms** | **INSIDE the spread** (\|4.8\| ≤ 26.4) — NOT a result; signs `---` |
+| KVQ8 | +42.0 | +3.9 | −4.5 | **+3.9 ms** | **INSIDE the spread** (\|3.9\| ≤ 70.2) — NOT a result; signs `++-` |
+
+**Verdict: DO-NOT-PROMOTE (confirmed, and now on three independent rounds).**
+The decisive evidence is not the delta at all — it is that **`nk`/`nw`/`nr` are
+byte-identical across BASE, KV and KVQ8 in every round.** These flags change
+**zero** device-side work at this shape: no extra launches, no extra waits, no
+extra readbacks, no extra copies (`copy` reads 11.4 / 11.8 / 11.4 ms in round 1,
+i.e. the same ~11 ms BASE has). An experiment that provably does no different
+device work has no effect to measure, which is why both deltas land inside their
+own spreads and one of them (`KVQ8`, signs `++-`) does not even agree in sign
+across rounds.
+
+This **reproduces** the 2026-10-02 conclusion exactly — same counters, same
+verdict, now on a second independent batch — so the decision is not resting on a
+single contended run. Note what it does *not* claim: that the KV cache is
+irrelevant at every context length. At this prompt length the quantized path is
+not exercised differently; a genuinely long-context run (where KV bytes dominate
+the decode read) is a separate experiment and is **not** covered by this result.
+
 RESULT (27B TP=2 long-ctx decode, 3 rounds, load1 at each round):
   <-- BLOCKED: do not fill until `sycl-ls | grep -c '[level_zero:gpu]'` prints 2 AND load1 < 2.
       A partially filled RESULT is worse than a blank one; see SINGLE NAMED PREREQUISITE.
@@ -771,11 +817,20 @@ Listed so nobody re-runs them; details and numbers in AGENTS.md.
 | OpenVINO | evaluated, not adopted |
 
 ### The queue is blocked on box state, not on missing experiments
-E1/E2/E3 are all `--tp 2`. As of this writing the box enumerates **one** GPU to
-the compute runtime, so **none of them can run** — see the PRECONDITION at the
+E1/E2/E3 are all `--tp 2`.
+
+> **SUPERSEDED 2026-10-03: both B580s enumerate again** (`devices=2`, L0 UUIDs
+> `…-0400-…` and `…-8600-…`), so this is no longer a blocker: **E1 and E2 were both
+> run today at 27B `--tp 2`** (see their `RE-RUN 2026-10-03` sections). What
+> actually withheld every figure is **box load, not GPU count** — `load1` crossed
+> the 2.0 threshold in 8 of 9 arms in both batches. The text below describes the
+> 1-GPU era and is kept as the record it is; do not read it as present-day state.
+
+E1/E2/E3 are all `--tp 2`. As of that writing the box enumerated **one** GPU to
+the compute runtime, so **none of them could run** — see the PRECONDITION at the
 top. That is a known box state (AGENTS.md AUDIT #9/#11), not an engine bug, and
-not something to re-investigate: when both GPUs enumerate, the queue is ready.
-Do not use a loaded or 1-GPU window and do not report a number from one.
+not something to re-investigate. Do not use a loaded or 1-GPU window and do not
+report a number from one.
 
 **The 2-GPU-dependent gate arms now SKIP instead of FAILing** — and, since audit
 #13, they skip **per arm** rather than per gate (`scripts/_gate_precond.sh`).
