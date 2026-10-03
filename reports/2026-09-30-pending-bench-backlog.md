@@ -32,6 +32,7 @@ the run's own spread in 3 of 3 rounds.
 | **E1** | `INTFER_DPAS_PREQ` (device act-quant pre-pass) | **DECISION: DO-NOT-PROMOTE** | `nk` **94208 → 124928 = +30720 launches** (+480/token), byte-identical in every round of both runs; `nw`/`nr` unchanged. **Kernel delta re-measured 2026-10-03 and now RESOLVES** (the 2026-10-02 run could not): `d = -15.1 -19.5 -22.9`, median **-19.5 ms** against a **4.7 ms** floor, signs **3/3 agree** — i.e. PREQ is a small device-kernel **WIN of 0.11 %**, not a cost. The decision therefore rests **only** on the exact launch count: a 0.11 % kernel win cannot pay for +480 launches/token. Stays default-OFF. |
 | **E2** | `INTFER_INT8_KV` / `INTFER_KV_Q8` (groupwise INT8 KV cache) | **DECISION: DO-NOT-PROMOTE** | `nk`/`nw`/`nr` = **63488 / 63488 / 16384 — byte-identical across BASE, KV and KVQ8**. The experiment changes **zero** device-side work at this shape, so there is no effect to measure and no reason to carry the flag. Stays default-OFF. |
 | **E3** | `INTFER_DPAS48_FOLD` (per-(row,op) activation-fold hoist) | **DECISION: KEEP — this is the one to keep** | `nk` **94208 → 116736 = +22528 launches** (+352/token); `nw`/`nr` unchanged. Kernel delta **CLEARS the spread**: `d = -343.9 -388.7 -410.8`, median **-388.7 ms**, floor **89.0 ms**, **3/3 rounds agree in sign**. FOLD is **2.05 % cheaper in device kernel** (388.7 / 18940.2) for one extra launch per DPAS GEMM. |
+| **E4** | `INTFER_DPAS48_TILED` (cooperative 2D row block) | **DECISION: KEEP — 2026-10-03, first measured** | Prefill device kernel **-1851.9 ms (-9.95 %)** vs FOLD: `d = -1981.5 -1851.9 -1766.9`, **CLEARS** this run's **672.7 ms** floor, **3/3 same sign**, at **ZERO added launches** (`nk` 5468 both arms, `nw`/`nr` unchanged). Bit-exact on device (256/256) and engine (TP=1+TP=2). Stays default-OFF: prefill-only (declines at M=1, so it cannot move decode) and no quiet-box tok/s yet. |
 | **E3b** | `FOLD + PREQ` composed | **DECISION: DO-NOT-PROMOTE PREQ** | `FOLDPREQ` vs `FOLD`: `d = -46.3 -70.2 -146.9`, median **-70.2 ms** vs a **122.7 ms** floor → **INSIDE the spread**, not a result. PREQ adds **+30720** launches on top of FOLD and buys nothing resolvable. (FOLDPREQ vs DPAS48 *does* clear the spread at **+297.6 ms**, but that is inherited from FOLD, not from PREQ.) |
 
 **Bottom line for the archive step: keep E3 (`INTFER_DPAS48_FOLD`), drop E1
@@ -739,12 +740,17 @@ second GPU (the flag declines TP>1 by construction, `:1913`), and it is
 tile. So the honest scope of E5 is a 0.8B measurement. Do not report an E5 number
 as a 27B result.
 
-## E4 — PROPOSED (not implemented): cooperative 2D-tiled DPAS block
+## E4 — **BUILT + MEASURED 2026-10-03: KEEP** — cooperative 2D-tiled DPAS block
 
-**Status: design only. There is no flag and no code yet — do not go looking for
-`INTFER_DPAS48_TILED` or similar; it does not exist.** Pre-registered here so
-the pending list stays honest about what the project still owes a
-measurement.
+**Status 2026-10-03: BUILT, GATED and MEASURED — DECISION KEEP.** The flag is
+`INTFER_DPAS48_TILED` (default OFF). Full design, contract and measurement:
+**`reports/archive/2026-09-30-e4-dpas-2d-contract.md`** (read that file — this
+section is the pointer). One line: prefill device kernel **9.95 % cheaper**
+than FOLD, 3/3 rounds agreeing in sign, clearing the run's own spread by ~2.8x,
+**with zero extra launches**, and bit-exact on device and engine.
+
+The "no flag and no code" text this replaces was true when written and is kept
+in the archived report as the record it is; do not read it as present state.
 
 **What is left.** E3 removed the *arithmetic* replication: the per-(row,op)
 activation fold no longer runs once per 16-N tile. It did not touch the *load*
@@ -782,7 +788,8 @@ wide N and M>1.
 accumulation ORDER of the FP32 `acc_tile`, so unlike E3 it is **not** a
 bit-exact hoist. It needs a tolerance-based gate, not `==`.
 
-**That contract is now WRITTEN DOWN: `reports/2026-09-30-e4-dpas-2d-contract.md`.**
+**That contract is now WRITTEN DOWN (and ARCHIVED, since E4 is now built and
+measured): `reports/archive/2026-09-30-e4-dpas-2d-contract.md`.**
 Key decision: gate **backward error** (`max |seq-blocked| / max |t_o|`), not
 result-relative error, because the kernel's `2*c - 15*S` zero-point correction
 makes the terms cancel and the result ~1000x smaller than the largest term — a

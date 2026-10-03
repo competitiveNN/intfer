@@ -67,10 +67,27 @@ case "$BATCH" in
       arm_env_FOLD="INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1"
       arm_env_FOLDPREQ="INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1 INTFER_DPAS_PREQ=1"
       REF_ARM="DPAS48" ;;  # FOLD/FOLDPREQ must equal DPAS48
+  # --- E4: INTFER_DPAS48_TILED (cooperative 2D row block) ---------------
+  # *** E4 IS DECODE-INERT BY CONSTRUCTION, so this batch measures PREFILL. ***
+  # quant_gemm_dpas48_2d declines when M < 2, and every decode step is M==1, so
+  # an E4 decode A/B could only ever read "no change" -- and reporting that as a
+  # result would be the same error as benching a declined flag. So E4 gets a long
+  # prompt, a small -n, and the @prefill bucket. This also retires the note below
+  # that said E4 "has no flag at all and is therefore not benchable" -- it has one.
+  E4) ARMS="DPAS48 FOLD FOLDTILED"
+      arm_env_DPAS48="INTFER_DPAS48=1"
+      arm_env_FOLD="INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1"
+      arm_env_FOLDTILED="INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1 INTFER_DPAS48_TILED=1"
+      REF_ARM="FOLD"   # FOLDTILED must equal FOLD (E4 is bit-exact)
+      PROMPT="$(python3 -c 'print("The history of artificial intelligence and machine learning. "*40)')"
+      NTOK=5; PHASE_TAG="@prefill" ;;
+  # E4 needs a wide prefill batch. NOTE: this also retires the stale claim in the
+  # Device-argmax comment below.
   # Device-argmax. NOT an E-batch: it is a separate lever with its own report
   # (reports/archive/2026-10-01-device-argmax.md), so it is named after the flag rather
   # than given an E-number -- E4 is already taken by the DPAS 2D numerics contract,
-  # which has no flag at all and is therefore not benchable.
+  # which HAD no flag at all and was therefore not benchable. E4 now HAS one
+  # (INTFER_DPAS48_TILED) and has its own case above -- so that is no longer true.
   #
   # *** TP>1 DECLINES THIS FLAG OUTRIGHT (main.cpp:1913) ***, so a --tp 2 A/B is a
   # silent NO-OP that would read as a wash. Refuse it here instead of quoting one:
@@ -91,7 +108,19 @@ case "$BATCH" in
   *) echo "FAIL: unknown batch '$BATCH'"; exit 1 ;;
 esac
 
-PROMPT="${INTFER_PROMPT:-The capital of France is}"
+# NOTE the :- nesting. These three are assigned AFTER the case, so a plain
+# "${VAR:-default}" CLOBBERS whatever a case set -- which is exactly what happened
+# to E4: its long prompt and @prefill phase were silently overwritten by these
+# defaults, and the batch measured DECODE, where E4 is inert by construction.
+# A run that measures the one phase the flag cannot affect is worse than no run:
+# it produces a confident "no change". The inner ${VAR:-} keeps an explicit env
+# override working; the outer one lets the case win.
+PROMPT="${PROMPT:-${INTFER_PROMPT:-The capital of France is}}"
+# Which profile phase an arm record is harvested from, and how many decode tokens.
+# Both DEFAULTED, so the E1/E2/E3 records are byte-identical to what they always
+# were; only the E4 case overrides them, because E4 cannot affect decode at all.
+PHASE_TAG="${PHASE_TAG:-${INTFER_PHASE_TAG:-@decode}}"
+NTOK="${NTOK:-${INTFER_NTOK:-64}}"
 # shellcheck source=scripts/_gate_loadlog.sh
 . "$SCRIPT_DIR/_gate_loadlog.sh"
 # Per-arm logs + load traces live beside $LOG, not in the build root, so a figure
@@ -236,13 +265,13 @@ FAILED_SIGS=""
 ARM_LINE=""
 ARM_SIG=""
 note_arm() { # $1=arm $2=round-label $3=raw arm output -> sets ARM_LINE / ARM_SIG
-  ARM_LINE="$(printf '%s\n' "$3" | grep -aoE '@decode\] .*' | head -1)"
+  ARM_LINE="$(printf '%s\n' "$3" | grep -aoE "${PHASE_TAG}\] .*" | head -1)"
   ARM_SIG=""
   [ -n "$ARM_LINE" ] && return 0
   ARM_SIG="$(printf '%s\n' "$3" \
     | grep -aoE 'UR_RESULT_ERROR_[A-Z_]+|terminate called|signal [0-9]+|out of memory|std::[a-z_]+_error' \
     | head -2 | tr ' \n' '__')"
-  [ -n "$ARM_SIG" ] || ARM_SIG="no_@decode_line_in_arm_output"
+  [ -n "$ARM_SIG" ] || ARM_SIG="no_${PHASE_TAG#@}_line_in_arm_output"
   ARM_FAILS=$((ARM_FAILS + 1))
   case " $FAILED_ARMS " in *" $1 "*) ;; *) FAILED_ARMS="$FAILED_ARMS $1" ;; esac
   FAILED_SIGS="$FAILED_SIGS
@@ -367,7 +396,7 @@ for r in $(seq 1 "$ROUNDS"); do
     # stayed under the threshold. This loop used to scrape tok/s unconditionally
     # and record it, so a figure measured on a busy box landed in $LOG as a
     # machine-readable record that a human then pasted into a report.
-    run_arm_capture "$arm" 64 "t${r}_${arm}"; out="$ARM_OUT"
+    run_arm_capture "$arm" "$NTOK" "t${r}_${arm}"; out="$ARM_OUT"
     tps="$(printf '%s\n' "$out" | grep -aoE '\([0-9.]+ tok/s\)' | head -1 | tr -d '() tok/s')"
     note_arm "$arm" "r$r" "$out"; line="$ARM_LINE"
     if [ -n "$ARM_SIG" ]; then
