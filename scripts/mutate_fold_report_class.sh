@@ -90,7 +90,7 @@ run_state() { # $1 id, $2 marker, $3 absent-RE
   if ! MUTATE_FN; then
     echo "  $id MISSED -- mutation fn failed"; echo "$id MISSED (fn)" >> "$LOG/summary.txt"; restore; return 1
   fi
-  cmp -s "$before" "$SB/scripts/check_fold_report_class.sh" && {
+  [ "$before" = "$(cat "$SB/scripts/check_fold_report_class.sh")" ] && {
     echo "  $id MISSED -- mutation did not change the file"
     echo "$id MISSED (no-op)" >> "$LOG/summary.txt"; restore; return 1; }
   grep -q -- "$marker" "$SB/scripts/check_fold_report_class.sh" || {

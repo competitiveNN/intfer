@@ -103,7 +103,7 @@ run_state() { # $1 id, $2 marker, $3 absent-RE, $4 why
   if ! MUTATE_FN; then
     echo "  $id MISSED -- mutation fn failed"; echo "$id MISSED (fn)" >> "$LOG/summary.txt"; restore; return 1
   fi
-  cmp -s "$before" "$TGT" && {
+  [ "$before" = "$(cat "$TGT")" ] && {
     echo "  $id MISSED -- no-op"; echo "$id MISSED (no-op)" >> "$LOG/summary.txt"; restore; return 1; }
   grep -q -- "$marker" "$TGT" || {
     echo "  $id MISSED -- marker absent (stale anchor)"
@@ -178,7 +178,7 @@ run_state_stub() {
   if ! MUTATE_FN; then
     echo "  $id MISSED -- mutation fn failed"; echo "$id MISSED (fn)" >> "$LOG/summary.txt"; restore; return 1
   fi
-  cmp -s "$before" "$TGT" && { echo "  $id MISSED -- no-op"; restore; return 1; }
+  [ "$before" = "$(cat "$TGT")" ] && { echo "  $id MISSED -- no-op"; restore; return 1; }
   grep -q -- 'M_D' "$TGT" || {
     echo "  $id MISSED -- marker absent (stale anchor)"; restore; return 1; }
   bash -n "$TGT" 2>/dev/null || {

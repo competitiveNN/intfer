@@ -90,7 +90,7 @@ run_state() {
     echo "$id MISSED (mutation fn)" >> "$LOG/summary.txt"
     restore; cp "$SB/_gate_enum.orig" "$HELPER"; return 1
   fi
-  if cmp -s "$before" "$file"; then
+  if [ "$before" = "$(cat "$file")" ]; then
     echo "  $id MISSED -- mutation did not change the file"
     echo "$id MISSED (no-op)" >> "$LOG/summary.txt"; cp "$SB/_gate_enum.orig" "$HELPER"; return 1
   fi
@@ -217,7 +217,7 @@ consumer_state() { # $1 id, $2 consumer-copy, $3 sed-on-consumer, $4 expect, $5 
   restore; cp "$SB/_gate_enum.orig" "$HELPER"
   local before; before="$(cat "$cons")"
   sed -i "$expr" "$cons"
-  if cmp -s "$before" "$cons"; then
+  if [ "$before" = "$(cat "$cons")" ]; then
     echo "  $id MISSED -- consumer mutation did not apply"
     echo "$id MISSED (no-op)" >> "$LOG/summary.txt"; restore; return 1
   fi

@@ -105,7 +105,7 @@ run_state() { # $1 id, $2 marker, $3 absent-RE
   if ! MUTATE_FN; then
     echo "  $id MISSED -- mutation fn failed"; echo "$id MISSED (fn)" >> "$LOG/summary.txt"; restore; return 1
   fi
-  cmp -s "$before" "$SB/check_gate_pop.sh" && {
+  [ "$before" = "$(cat "$SB/check_gate_pop.sh")" ] && {
     echo "  $id MISSED -- no-op"; echo "$id MISSED (no-op)" >> "$LOG/summary.txt"; restore; return 1; }
   grep -q -- "$marker" "$SB/check_gate_pop.sh" || {
     echo "  $id MISSED -- marker absent (stale anchor)"

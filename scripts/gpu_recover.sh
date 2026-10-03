@@ -38,6 +38,11 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MISSING_SLOT="${INTFER_MISSING_SLOT:-0000:86:00.0}"
 PRESENT_SLOT="${INTFER_PRESENT_SLOT:-0000:04:00.0}"
+# Seam, same rationale as INTFER_SYCL_LS / INTFER_BUILD_DIR: an assumption baked
+# into a probe that no harness can redirect is an assumption no harness can test.
+# Step 2's whole claim is "this slot's render node resolves and opens", and the only
+# way to exercise a MISSING one is a filesystem that is not /dev/dri.
+DRI_ROOT="${INTFER_DRI_ROOT:-/dev/dri}"
 
 is_root() { [ "$(id -u)" = "0" ]; }
 need_root() { is_root || { echo "ERROR: '$1' needs root (writes to /sys/bus/pci)."; exit 3; }; }
@@ -60,17 +65,49 @@ cmd_diag() {
   done
 
   echo
-  echo "-- 2. render nodes (both must exist AND open) --"
-  for n in /dev/dri/renderD128 /dev/dri/renderD129; do
-    if [ -e "$n" ]; then
-      if python3 -c "import os,sys;fd=os.open('$n',os.O_RDWR);os.close(fd)" 2>/dev/null; then
-        echo "  $n  present, opens O_RDWR"
-      else
-        echo "  $n  present, BUT open FAILED (permission?)"
-      fi
-    else
-      echo "  $n  MISSING"
+  # *** THE DRM MINOR IS NOT STABLE, AND A HARD-CODED LIST SILENTLY ROT. ***
+  # MEASURED 2026-10-03: the second card is card2 / renderD130 (226:2), because the
+  # second GPU re-enumerated mid-session and took the next free minor. A loop over
+  # literal /dev/dri/renderD128 /dev/dri/renderD129 therefore reported
+  #     /dev/dri/renderD129  MISSING
+  # on a box where nothing is missing -- it named a node that no longer exists under
+  # that name, and never opened the real one. Two failures in one line, both silent:
+  # a false alarm, and the actual second node unexamined.
+  #
+  # /dev/dri/by-path/ is named for the PCI SLOT, so it survives the renumber. Resolve
+  # every render node through it, then sweep for UNCLAIMED nodes so a slot that grew
+  # a node we do not know about is reported rather than ignored.
+  echo "-- 2. render nodes, resolved BY PCI SLOT (the DRM minor is not stable) --"
+  claimed=""
+  for s in "$PRESENT_SLOT" "$MISSING_SLOT"; do
+    link="$DRI_ROOT/by-path/pci-$s-render"
+    if [ ! -e "$link" ]; then
+      printf '  %s  NO render node (%s absent) -- the card has no DRM node at all\n' \
+        "$s" "$link"
+      continue
     fi
+    n="$(readlink -f "$link" 2>/dev/null)"
+    claimed="$claimed $n"
+    if [ -z "$n" ] || [ "$n" = "$link" ]; then
+      printf '  %s  %s  DANGLING by-path link (readlink -f did not resolve)\n' "$s" "$link"
+      continue
+    fi
+    if python3 -c "import os,sys;fd=os.open('$n',os.O_RDWR);os.close(fd)" 2>/dev/null; then
+      printf '  %s  %s  present, opens O_RDWR\n' "$s" "$n"
+    else
+      printf '  %s  %s  present, BUT open FAILED (permission?)\n' "$s" "$n"
+    fi
+  done
+  # An unclaimed render node means a card appeared that this tool does not know by
+  # slot. Reporting it is what keeps a rename from becoming invisible.
+  for n in "$DRI_ROOT"/renderD*; do
+    [ -e "$n" ] || continue
+    r="$(readlink -f "$n" 2>/dev/null)"
+    case " $claimed " in
+      *" $r "*) ;;
+      *) printf '  UNCLAIMED  %s  not owned by %s or %s -- inspect %s/by-path/\n' \
+            "$r" "$PRESENT_SLOT" "$MISSING_SLOT" "$DRI_ROOT" ;;
+    esac
   done
 
   echo
@@ -223,7 +260,8 @@ cmd_verify() {
   if [ "$erc" -eq 2 ]; then
     echo "RESULT: UNMEASURABLE -- the driver API could not be counted at all."
     echo "        This is NOT 'one device' and NOT a fix. Check that"
-    echo "        libze_intel_gpu is present and that /dev/dri/renderD128 opens."
+    echo "        libze_intel_gpu is present and that a render node opens -- name it"
+    echo "        by slot, not by minor: 'ls /dev/dri/by-path/pci-$PRESENT_SLOT-render'."
     exit 2
   fi
   if [ "$erc" -eq 0 ]; then

@@ -95,7 +95,7 @@ run_state() { # $1 id, $2 marker, $3 absent-RE
     echo "  $id MISSED -- mutation function failed"
     echo "$id MISSED (mutation fn)" >> "$LOG/summary.txt"; restore; return 1
   fi
-  cmp -s "$before" "$SB/scripts/check_e2_ctx.sh" && {
+  [ "$before" = "$(cat "$SB/scripts/check_e2_ctx.sh")" ] && {
     echo "  $id MISSED -- mutation did not change the file"
     echo "$id MISSED (no-op)" >> "$LOG/summary.txt"; restore; return 1; }
   if ! grep -q -- "$marker" "$SB/scripts/check_e2_ctx.sh"; then

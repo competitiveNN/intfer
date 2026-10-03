@@ -147,7 +147,7 @@ run_state() {
     echo "  $id MISSED -- mutation function failed"
     echo "$id MISSED (mutation fn)" >> "$LOG/summary.txt"; restore; return 1
   fi
-  if cmp -s "$before" "$SB/check_gpu_recover.sh"; then
+  if [ "$before" = "$(cat "$SB/check_gpu_recover.sh")" ]; then
     echo "  $id MISSED -- mutation did not change the file"
     echo "$id MISSED (no-op)" >> "$LOG/summary.txt"; restore; return 1
   fi
@@ -259,6 +259,26 @@ PYEOF
   verify_patched "$SB/gpu_recover.sh" 'MUT_D'
 }
 run_state "M-D" 'MUT_D' 'ok    diag refuses to certify a refutation it did not measure'
+
+# M-E: THE RENDER-NODE ENUMERATION GOES BACK TO A HARD-CODED MINOR. MEASURED
+# 2026-10-03: the second card renumbered to card2/renderD130, and the literal
+# /dev/dri/renderD129 probe printed "MISSING" on a healthy box while never opening
+# the real node. Case (e) of the checker exists for exactly this, so it must go red
+# when the fix is reverted. An ARTIFACT state (AUDIT #21): the tool is correct by
+# construction on a clean tree, so weakening the checker would be unobservable --
+# mutate the TOOL and require the checker to REJECT it.
+MUTATE_FN() {
+  python3 - "$SB/gpu_recover.sh" <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = '    link="$DRI_ROOT/by-path/pci-$s-render"'
+b = '    link="$DRI_ROOT/renderD129"  # MUT_E: the pre-fix hard-coded minor'
+assert s.count(a) == 1, "anchor count %d" % s.count(a)
+open(p, "w").write(s.replace(a, b, 1))
+PYEOF
+  verify_patched "$SB/gpu_recover.sh" 'MUT_E'
+}
+run_state "M-E" 'MUT_E' 'ok    a renumbered second node (renderD130) resolves by slot, no false MISSING'
 
 
 # ---- residue: the sandbox must not have joined the stamp population -------

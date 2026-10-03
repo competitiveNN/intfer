@@ -124,6 +124,61 @@ else
   fi
 fi
 
+# (e) THE RENDER-NODE ENUMERATION MUST BE BY PCI SLOT. MEASURED 2026-10-03: the
+#     second card had renumbered to card2/renderD130, and a loop over literal
+#     /dev/dri/renderD128 /dev/dri/renderD129 printed "renderD129 MISSING" on a
+#     healthy box -- a false alarm, and the real second node never opened. Driven
+#     through INTFER_DRI_ROOT because the ONLY way to exercise a MISSING node is a
+#     filesystem that is not /dev/dri (same rationale as INTFER_SYCL_LS).
+echo "-- (e) render nodes are resolved BY PCI SLOT, not by a hard-coded minor --"
+DRI="$(mktemp -d "$WORK/dri.XXXXXX")"
+mk_dri() { # $1 = "slot:minor" pairs, space separated
+  rm -rf "$DRI"; mkdir -p "$DRI/by-path"
+  for pair in $1; do
+    slot="${pair%:*}"; minor="${pair##*:}"
+    : >"$DRI/renderD$minor"
+    ln -s "../renderD$minor" "$DRI/by-path/pci-$slot-render"
+  done
+}
+sec2() { INTFER_DRI_ROOT="$DRI" "$SCRIPT_DIR/gpu_recover.sh" diag 2>&1 \
+           | sed -n '/-- 2\./,/-- 3\./p'; }
+mk_dri '0000:04:00.0:128 0000:86:00.0:130'
+o="$(sec2)"
+# The RENAMED minor is the whole point: 130, not 129. A literal-minor
+# implementation cannot resolve slot 86 at all.
+if printf '%s' "$o" | grep -q 'pci-0000:86:00.0-render absent' \
+   || printf '%s' "$o" | grep -qE '^  0000:86:00\.0 +NO render node'; then
+  echo "  FAIL  slot 86:00.0 was not resolved through by-path (renamed minor)"
+  bad=$((bad+1))
+elif printf '%s' "$o" | grep -q 'renderD129  MISSING'; then
+  echo "  FAIL  still emits the hard-coded 'renderD129 MISSING' false alarm"
+  bad=$((bad+1))
+else
+  echo "  ok    a renumbered second node (renderD130) resolves by slot, no false MISSING"
+fi
+# CONVERSE: both slots claimed -> nothing is unclaimed. Without this, an
+# implementation that printed UNCLAIMED unconditionally would pass (e).
+if printf '%s' "$o" | grep -q 'UNCLAIMED'; then
+  echo "  FAIL  both slots resolve, yet a node was called UNCLAIMED"
+  bad=$((bad+1))
+else
+  echo "  ok    converse: both slots claimed -> no UNCLAIMED false alarm"
+fi
+# And the sweep must FIRE when a node really is unaccounted for.
+mk_dri '0000:04:00.0:128'
+# A genuine orphan: a render node that EXISTS with no by-path link naming it.
+# (mk_dri only ever creates claimed nodes, so the orphan has to be added by hand --
+# an earlier version of this case asserted against a fixture with nothing to find,
+# which is a check that cannot fail.)
+: >"$DRI/renderD130"
+o="$(sec2)"
+if printf '%s' "$o" | grep -q 'UNCLAIMED'; then
+  echo "  ok    an orphan render node is reported UNCLAIMED, not silently ignored"
+else
+  echo "  FAIL  an orphan render node was ignored (the sweep cannot fail)"
+  bad=$((bad+1))
+fi
+
 echo
 if [ "$bad" -eq 0 ]; then
   echo "GPU RECOVER CHECK: PASS (all cases behaved as specified)"
