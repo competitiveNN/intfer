@@ -2754,6 +2754,28 @@ e.g. S3's contract column is 40 not 42).
 
 - **AUDIT #29 (2026-10-02): DEFECT #1 WAS A SHAPE, AND THE STACK HAD NO EXIT CODE
   ON DISK.** Two follow-ups, both from re-reading AUDIT #28's own output.
+  - *** READ THE LIVE FIGURES FROM THE ARTIFACTS. NO TOTAL IS QUOTED BELOW, ON
+    PURPOSE — the same rule this file already applies to the gate tally. *** A
+    paragraph cannot survive a session that adds a state, and this block has been
+    wrong that way twice (a `16/16` that was really fourteen, and a `3/3` quoted
+    from an earlier matrix than the one being described). Derive them:
+      * `build/stack_cert/cert` → `rc`, `verdict`, `scripts`, `checks`, `matrices`,
+        `stamps`, `stamp_dirs` (the census the stack itself recorded).
+      * `build/run_all_mutate/last_pass.stamp` → `caught=`, `baselines=`, `states=`
+        — and **`states=` is itself derived** now, from the states that actually ran.
+      * `build/stack_cert_mutate/last_pass.stamp` → the cert-checker matrix.
+      * `scripts/check_stack_cert.sh` re-derives all of it against the live tree;
+        it is **POST-STACK** by design, because it grades the certificate the stack
+        *writes*, and `run_all_checks.sh` prints that pointer at the end of every
+        verdict path.
+  - **A HAND-WRITTEN `states=` LIST IS HOW THAT BLOCK WENT WRONG, and deriving it
+    exposed four defects of mine that the literal list had hidden**: an inline
+    comment swallowing the assignment; five bespoke blocks with no local `id`
+    emitting the literal placeholder `N-?`; `run_state_post` (the runner for two
+    states) recording under a FIXED name, so both appeared as one; and one state
+    incrementing its counter only in the success branch, so a MISSED run would have
+    vanished from the list — **the exact defect the field exists to make visible**.
+    Each block now names itself; the list is asserted free of placeholders.
   - **THE FAMILY IS NOW CLOSED, NOT THE INSTANCE.** `scripts/check_verdict_scope.sh`
     **derives** the population of files that emit a spread-bounded verdict
     (`CLEARS the spread` / `INSIDE the spread` / `NO SPREAD ESTIMATE`), requires
