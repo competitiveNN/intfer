@@ -57,42 +57,58 @@ restore_check() { cp "$ORIG_C" "$MUT"; }
 OLD="$(git -C "$ROOT" rev-list --max-parents=0 HEAD | head -1)"
 HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 
-# DERIVED, NOT ASSUMED: the newest commit that touched NO engine input.
+# DERIVED, NOT ASSUMED: the newest ANCESTOR whose certification would legitimately
+# carry to HEAD, i.e. the newest C != HEAD with NO engine input in the CUMULATIVE
+# diff C..HEAD.
 #
-# E-A used to plant the artifact at `HEAD~1` and assert the checker says "carries",
-# which silently ASSUMES the most recent commit is tooling-only. It stopped being
-# true the moment a session ended on an engine commit -- measured 2026-10-03: HEAD
-# was the E4 probe-coverage commit, which edits examples/dpas_fold_probe/main.cpp,
-# so "carries" was the WRONG answer and E-A scored MISSED. The checker was right and
-# the state was mis-specified; that is the safe direction to fail in, but a state
-# whose PASS condition is an unstated property of whatever the last session happened
-# to commit is a flaky gate, which is how correctness gates get disabled.
+# E-A used to plant at `HEAD~1` and assert the verdict is "carries", whose premise
+# is that no engine input moved since. That premise was UNSTATED and stopped holding
+# the moment a session ended on an engine commit -- measured 2026-10-03, twice, and
+# both were the STATE's fault and not the checker's:
+#   * HEAD was the E4 probe-coverage commit (edits examples/dpas_fold_probe), so
+#     "carries" was the wrong answer and E-A scored MISSED on rc;
+#   * the first fix scanned history for a commit whose OWN diff was tooling-only,
+#     found HEAD itself, planted there, and got "certified at HEAD" instead. That is
+#     the recorded lesson applied one level down: I wrote the predicate I expected
+#     rather than the one the property needs -- it is the CUMULATIVE diff C..HEAD
+#     that decides the verdict, not C's own commit.
+# Both fail in the safe direction, but a state whose PASS condition is an unstated
+# property of whatever the last session happened to commit is a flaky gate, and
+# flaky gates are how correctness gates get switched off.
 #
-# The scan is written INDEPENDENTLY of check_engine_cert.sh's own filter (on
-# purpose -- a state that shares the code it tests cannot catch that code being
-# wrong; that is the AUDIT #12 S4 blindness). It is a superset: it treats
-# scripts/_ec_mutant.sh as an engine input too, which the checker does not, so a
-# commit this picks is provably tooling-only under EITHER rule.
-derive_last_tooling_only() {
-  git -C "$ROOT" rev-list --max-count=60 HEAD | while read -r sha; do
+# The scan is written INDEPENDENTLY of check_engine_cert.sh's own filter (a state
+# that shares the code it tests cannot catch that code being wrong -- the AUDIT #12
+# S4 blindness) and as a deliberate superset: it also counts scripts/_ec_mutant.sh,
+# which the checker does not, so a commit it picks carries under EITHER rule.
+derive_carries_anchor() {
+  git -C "$ROOT" rev-list --max-count=60 HEAD~1 2>/dev/null | while read -r sha; do
     local files
-    files="$(git -C "$ROOT" diff-tree --no-commit-id --name-only -r "$sha")"
-    [ -n "$files" ] || continue   # empty commit: identical tree, carries by definition
+    files="$(git -C "$ROOT" diff --name-only "$sha..HEAD")"
+    [ -n "$files" ] || { echo "$sha"; return 0; }  # identical tree: carries
     if ! printf '%s\n' "$files" | grep -qE \
          '^(src/|examples/|include/|scripts/test_|scripts/setvars\.sh|scripts/_gate_|scripts/_ec_mutant\.sh)'; then
       echo "$sha"; return 0
     fi
   done
 }
-TOOLING_ONLY="$(derive_last_tooling_only || true)"
+TOOLING_ONLY="$(derive_carries_anchor || true)"
+E_A_POSABLE=1
 if [ -z "$TOOLING_ONLY" ]; then
-  echo "FAIL: no tooling-only commit in the last 60 -- E-A cannot be posed"
-  echo "      (a state needs a commit where NO engine input moved)."
-  exit 2
+  # No older certification can legitimately carry, because the newest commits moved
+  # engine inputs. EXCLUDE the state with a reason rather than scoring it MISSED:
+  # an unobservable state is not a weak one (AUDIT #21).
+  E_A_POSABLE=0
+  echo "== E-A anchor =="
+  echo "  E-A NOT POSABLE -- the newest commits moved engine inputs, so no"
+  echo "        older certification can legitimately 'carry'. Excluded, not"
+  echo "        scored (AUDIT #21): the premise is false, which says nothing"
+  echo "        about the checker. Re-run it on a tooling-only commit."
+else
+  echo "== E-A anchor =="
+  echo "  ok    newest carrying ancestor: $(git -C "$ROOT" rev-parse --short "$TOOLING_ONLY")"
+  echo "        (derived from the CUMULATIVE diff to HEAD; HEAD~1 was assumed"
+  echo "         before, and was wrong on both of the commits measured)"
 fi
-echo "== E-A anchor =="
-echo "  ok    newest tooling-only commit: $(git -C "$ROOT" rev-parse --short "$TOOLING_ONLY")"
-echo "        (derived by scanning history; HEAD~1 would have been assumed)"
 
 echo "== stamp-population leak assertion (AS FOUND) =="
 pop_assert_no_leak "before" || exit 1
@@ -132,20 +148,25 @@ echo "== states =="
 # E-A: a TOOLING-only commit must NOT invalidate a 45-minute engine run. This is
 # the state that stops the check from being so aggressive that people disable it.
 #
-# Planted at a DERIVED tooling-only commit, not at HEAD~1 -- see derive_last_tooling_only
+# Planted at a DERIVED carrying ancestor, not at HEAD~1 -- see derive_carries_anchor
 # above for why assuming "the newest commit is tooling-only" is a flaky precondition.
-# The anchor is ASSERTED here too: if the derivation ever returns a commit that
-# actually moved an engine input, the state would silently become a second E-B and
-# report "the converse is broken" about a premise that is simply false.
-ea_files="$(git -C "$ROOT" diff-tree --no-commit-id --name-only -r "$TOOLING_ONLY")"
-if [ -n "$ea_files" ] && printf '%s\n' "$ea_files" | grep -qE \
-     '^(src/|examples/|include/|scripts/test_|scripts/setvars\.sh|scripts/_gate_|scripts/_ec_mutant\.sh)'; then
-  echo "  E-A MISSED -- ANCHOR FAULT: the derived commit moves an engine input"
-  printf '%s\n' "$ea_files" | sed 's/^/          /'
-  exit 1
+# The anchor is ASSERTED here too: if the derivation ever returns a commit whose
+# CUMULATIVE diff moves an engine input, the state would silently become a second
+# E-B and report "the converse is broken" about a premise that is simply false.
+if [ "$E_A_POSABLE" = "1" ]; then
+  ea_files="$(git -C "$ROOT" diff --name-only "$TOOLING_ONLY..HEAD")"
+  if [ -n "$ea_files" ] && printf '%s\n' "$ea_files" | grep -qE \
+       '^(src/|examples/|include/|scripts/test_|scripts/setvars\.sh|scripts/_gate_|scripts/_ec_mutant\.sh)'; then
+    echo "  E-A MISSED -- ANCHOR FAULT: the derived anchor moves an engine input"
+    printf '%s\n' "$ea_files" | sed 's/^/          /'
+    exit 1
+  fi
+  plant "$TOOLING_ONLY"
+  check_state "E-A" 0 'carries to HEAD' "a tooling-only commit must not invalidate the engine run"
+else
+  echo "  E-A excluded (not posable on this tree) -- not counted either way"
+  echo "E-A excluded (anchor not posable)" >> "$LOG/summary.txt"
 fi
-plant "$TOOLING_ONLY"
-check_state "E-A" 0 'carries to HEAD' "a tooling-only commit must not invalidate the engine run"
 
 # E-B: an ENGINE input moving must invalidate it. The load-bearing state.
 plant "$OLD"
@@ -259,9 +280,19 @@ pop_assert_no_leak "after" || exit 1
 echo
 echo "== summary =="
 sed 's/^/  /' "$LOG/summary.txt"
+EXCLUDED="$(grep -c 'excluded (anchor not posable)' "$LOG/summary.txt" 2>/dev/null || true)"
+[ -n "$EXCLUDED" ] || EXCLUDED=0
 if [ "$caught" -eq "$total" ]; then
   echo
-  echo "ENGINE CERT MUTATE: PASS ($caught/$total states behaved as characterized)"
+  # The excluded count rides in the VERDICT line, not only in the table above it:
+  # an exclusion shrinks the denominator, and a tally that shrinks silently is
+  # indistinguishable from a matrix that simply has fewer states (the AUDIT #29
+  # lesson -- a state that increments its counter only on success vanishes).
+  if [ "$EXCLUDED" -gt 0 ]; then
+    echo "ENGINE CERT MUTATE: PASS ($caught/$total states behaved as characterized, $EXCLUDED excluded -- NOT POSABLE on this tree)"
+  else
+    echo "ENGINE CERT MUTATE: PASS ($caught/$total states behaved as characterized)"
+  fi
   mkdir -p "$STAMP"
   { echo "stamp=engine_cert_mutate"
     echo "sha=$(git -C "$ROOT" rev-parse HEAD)"
