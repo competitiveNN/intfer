@@ -839,6 +839,109 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# N-T / N-U: THE POST-STACK EXEMPTION MUST NOT BE AVAILABLE BY ACCIDENT. *** A
+# MECHANISM THAT DECIDES WHO MAY BE UNSCHEDULED, WITH NOTHING TESTING IT. ***
+#
+# Section 0c exempts a script from the STEPS requirement when its own header
+# carries `# POST-STACK:` within the FIRST 40 LINES. That marker is a comment, so it
+# cannot be verified by running the checker on its normal fixtures -- and the whole
+# point of the window is to reject a mention that does not count. Two states:
+#
+#   N-T  the declaration is pushed PAST line 40 -> the exemption must NOT apply, so
+#         0c must demand the file be scheduled (rc=1).
+#   N-U  the declaration survives but is demoted to a BODY mention (indented, so the
+#         anchor `^# POST-STACK:` cannot match) -> the exemption must NOT apply
+#         either. This is the "a comment that merely mentions it" case, the same
+#         idea as check_bench_load_gate's case (7c) and check_verdict_scope's (d).
+#
+# *** AND THE CONVERSE IS N-P's baseline plus the assertion below: *** with the
+# declaration intact, 0c must print the exemption and stay green. Without it, N-T
+# and N-U would both be satisfied by a checker that exempts NOTHING and therefore
+# demands everything -- an always-red exemption is the mirror defect.
+CSC="$SB/scripts/check_stack_cert.sh"
+conj_run() { INTFER_BUILD_DIR="$SYNTH/inner" INTFER_RUN_ALL_COVERAGE_ONLY=1 \
+               timeout 300 bash "$MUTANT" >"$WORK/$1" 2>&1; }
+# The converse, asserted first: the declaration as shipped must be honoured.
+reset_mutant
+conj_run "N-T.converse.log"; cv=$?
+if [ "$cv" -eq 0 ] && grep -q 'POST-STACK, exempt from STEPS' "$WORK/N-T.converse.log" \
+   && ! grep -q 'never scheduled' "$WORK/N-T.converse.log"; then
+  echo "  ok    baseline N-T: a header declaration IS honoured, and 0c stays green"
+  nb_conv=1
+else
+  echo "FAIL: baseline N-T rc=$cv -- an in-window declaration must exempt the file." >&2
+  echo "  Without this, N-T and N-U are also satisfied by an exemption that never" >&2
+  echo "  fires (which would demand every file be scheduled). ($WORK/N-T.converse.log)" >&2
+  exit 1
+fi
+# A helper that moves the declaration below the window by padding above it.
+pad_above_decl() { # $1 = how many filler comment lines to insert
+  python3 - "$CSC" "$1" <<'PYX'
+import sys
+p, n = sys.argv[1], int(sys.argv[2])
+lines = open(p).read().split("\n")
+out = []
+for l in lines:
+    if l.startswith("# POST-STACK:") and not any(x.startswith("# POST-STACK:") for x in out):
+        out.extend(["# filler %d" % i for i in range(n)])
+    out.append(l)
+open(p, "w").write("\n".join(out))
+PYX
+}
+run_state_post() { # $1 id, $2 desc, $3 expected-RE
+  local id="$1" desc="$2" expect="$3" o r
+  TOTAL=$((TOTAL + 1)); reset_mutant
+  if ! MUTATE_FN; then
+    echo "  $id MISSED -- mutation fn failed (STATE fault)"; reset_mutant; return 1
+  fi
+  conj_run "$id.log"; r=$?
+  o="$(cat "$WORK/$id.log")"
+  if [ "$r" -eq 0 ]; then
+    echo "  $id MISSED -- 0c accepted a declaration it must not honour ($desc)"
+    echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; reset_mutant; return 1
+  fi
+  if ! printf '%s' "$o" | grep -qE "$expect"; then
+    echo "  $id MISSED -- failed for the wrong reason (unattributed)"; sed 's/^/        /' "$WORK/$id.log"
+    echo "$id MISSED (unattributed)" >> "$LOG/summary.txt"; reset_mutant; return 1
+  fi
+  echo "  $id caught -- rc=$r, marker matched: $desc"
+  echo "$id caught" >> "$LOG/summary.txt"; CAUGHT=$((CAUGHT + 1)); reset_mutant; return 0
+}
+# N-T: pushed past line 40.
+MUTATE_FN() { pad_above_decl 45; grep -q '^# POST-STACK:' "$CSC"; }
+run_state_post "N-T" "the declaration sits past the 40-line window" \
+  'never scheduled.*check_stack_cert|declares POST-STACK'
+# N-U: demoted to an indented body mention.
+MUTATE_FN() { sed -i 's|^# POST-STACK: run this AFTER|  # POST-STACK: run this AFTER|' "$CSC"; }
+run_state_post "N-U" "the declaration is an indented body mention" \
+  'never scheduled.*check_stack_cert|declares POST-STACK'
+
+# N-V: THE EXEMPTION IS SELF-POLICING -- a POST-STACK file must NOT also be in
+# STEPS, because that is the exact wiring that made the stack FAIL. The converse is
+# that adding it back to STEPS while keeping the declaration must be refused.
+reset_mutant
+python3 - "$MUTANT" <<'PYX'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = 'check_doc_counts.sh check_verdict_scope.sh"'
+new = 'check_doc_counts.sh check_verdict_scope.sh check_stack_cert.sh"'
+assert s.count(old) == 1, s.count(old)
+open(p, "w").write(s.replace(old, new))
+PYX
+conj_run "N-V.log"; nv=$?
+if [ "$nv" -ne 0 ] && grep -q 'declares POST-STACK \*and\* is in STEPS' "$WORK/N-V.log"; then
+  TOTAL=$((TOTAL + 1)); CAUGHT=$((CAUGHT + 1))
+  echo "  N-V caught -- rc=$nv: an EXEMPT-AND-SCHEDULED file is refused"
+  echo "N-V caught" >> "$LOG/summary.txt"
+else
+  TOTAL=$((TOTAL + 1))
+  echo "  N-V MISSED -- rc=$nv; a file that is both exempt and scheduled was accepted"
+  echo "N-V MISSED" >> "$LOG/summary.txt"
+fi
+reset_mutant
+
+# ---------------------------------------------------------------------------
 # N-R / N-S: THE STALE-LOCK SELF-HEAL, IN BOTH DIRECTIONS. *** AN UNTESTED
 # SELF-HEAL IS AN UNCONDITIONAL DELETE WITH EXTRA STEPS. ***
 #

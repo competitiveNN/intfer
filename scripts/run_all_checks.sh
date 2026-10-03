@@ -561,6 +561,7 @@ else
   echo "== 0c every check_*/mutate_* is SCHEDULED (an arm alone never runs) =="
   UNSCHEDULED=""
   POST_STACK=""
+  bad_post=""
   N_SCHEDULABLE=0
   for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
     [ -f "$f" ] || continue
@@ -576,6 +577,21 @@ else
     # compound command -- the first attempt put the `if` inside one and bash blamed
     # a token three lines later.
     if head -40 "$f" | grep -q '^# POST-STACK:'; then
+      # *** AND IT MUST NOT ALSO BE SCHEDULED. *** The exemption says "this grades
+      # the certificate the stack WRITES, so it runs after". A file that is both
+      # exempt and scheduled does the opposite: it grades the cert it is supposed to
+      # certify, BEFORE that cert is written, and can only ever report STALE --
+      # which is exactly how check_stack_cert.sh was first wired, and the stack went
+      # from PASS to FAIL. So the exemption is honest only while the two conditions
+      # are mutually exclusive, and that is asserted here rather than trusted.
+      case " $STEPS " in
+        *" $b "*)
+          echo "  FAIL  $b declares POST-STACK *and* is in STEPS." >&2
+          echo "         As a step it grades the certificate the stack has not" >&2
+          echo "         written yet, so it can only report STALE. Remove it from" >&2
+          echo "         STEPS -- do NOT remove the declaration." >&2
+          bad_post="$bad_post $b" ;;
+      esac
       POST_STACK="$POST_STACK $b"
       continue
     fi
@@ -601,6 +617,7 @@ else
   else
     echo "  ok    every check_*/mutate_* is in STEPS as well as dispatch()"
   fi
+  [ -z "$bad_post" ] || FAILED=$((FAILED + 1))
   if [ -n "$POST_STACK" ]; then
     for b in $POST_STACK; do
       echo "  ok    POST-STACK, exempt from STEPS (declared in its own header):$b"
@@ -861,6 +878,9 @@ if [ "$FAILED" -ne 0 ]; then
   echo "RUN ALL CHECKS: FAIL ($FAILED step(s) FAILED) -- a real regression." >&2
   [ "$UNPROVEN" -ne 0 ] && echo "  plus $UNPROVEN step(s) unproven (stale evidence)." >&2
   echo "  certified in $CERT (rc=1)" >&2
+  echo "  A REAL REGRESSION: see the FAIL lines above and the per-step logs in" >&2
+  echo "  $BUILD_DIR/run_all_*.log. Fix, re-run, then verify with" >&2
+  echo "  scripts/check_stack_cert.sh." >&2
   exit 1
 fi
 if [ "$STALE" -ne 0 ] || [ "$UNPROVEN" -ne 0 ]; then
@@ -870,6 +890,8 @@ if [ "$STALE" -ne 0 ] || [ "$UNPROVEN" -ne 0 ]; then
   echo "  wrong with the code; the proof is just older than the tree." >&2
   echo "  Re-run the named matrix (or all of them) so its stamp names $HEAD_SHORT." >&2
   echo "  certified in $CERT (rc=2)" >&2
+  echo "  STALE EVIDENCE, not a regression: scripts/check_stack_cert.sh gives the" >&2
+  echo "  same verdict this run gave; re-run the stack so the stamps name HEAD." >&2
   exit 2
 fi
 echo "RUN ALL CHECKS: PASS ($STAMP_COUNT stamp(s), all at $HEAD_SHORT)"
@@ -880,4 +902,16 @@ if [ "${INTFER_QUICK:-0}" = "1" ]; then
 fi
 write_cert 0 PASS
 echo "  certified in $CERT (rc=0)"
+# *** PRINT THE POINTER, so the next session is told BY THE TOOL. *** A
+# certification nobody re-derives is a transcript with a filename: for three
+# sessions running, each one hand-ran the same six probes before it could say the
+# stack passes. scripts/check_stack_cert.sh does that now, and it is POST-STACK BY
+# DESIGN (it grades the certificate this run writes), so it must be run after --
+# the one step a reader cannot infer from this output unless it is stated here.
+echo
+echo "  VERIFY IT NOW:  scripts/check_stack_cert.sh"
+echo "    rc=0 -> this certificate is evidence for THIS commit"
+echo "    rc=1 -> re-run the stack (the evidence is older than the tree)"
+echo "    rc=2 -> unproven, no certificate"
+echo "  Do not hand-check it: the checker re-derives the sha, the rc and the census."
 exit 0
