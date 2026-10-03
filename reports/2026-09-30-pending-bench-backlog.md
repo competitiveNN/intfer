@@ -29,7 +29,7 @@ the run's own spread in 3 of 3 rounds.
 
 | Exp | Change | Decision | Load-insensitive evidence (re-derived 2026-10-03) |
 |---|---|---|---|
-| **E1** | `INTFER_DPAS_PREQ` (device act-quant pre-pass) | **DECISION: DO-NOT-PROMOTE** | `nk` **94208 → 124928 = +30720 launches** (+480/token); `nw`/`nr` unchanged. Kernel delta **INSIDE the spread**: `d = -705.2 -1544.9 +58.5`, median **-705.2 ms** vs a **1539.6 ms** floor, signs **`--+`**. The device-kernel effect is **not resolvable**; what IS exact is that it costs 30720 extra launches. Stays default-OFF. |
+| **E1** | `INTFER_DPAS_PREQ` (device act-quant pre-pass) | **DECISION: DO-NOT-PROMOTE** | `nk` **94208 → 124928 = +30720 launches** (+480/token), byte-identical in every round of both runs; `nw`/`nr` unchanged. **Kernel delta re-measured 2026-10-03 and now RESOLVES** (the 2026-10-02 run could not): `d = -15.1 -19.5 -22.9`, median **-19.5 ms** against a **4.7 ms** floor, signs **3/3 agree** — i.e. PREQ is a small device-kernel **WIN of 0.11 %**, not a cost. The decision therefore rests **only** on the exact launch count: a 0.11 % kernel win cannot pay for +480 launches/token. Stays default-OFF. |
 | **E2** | `INTFER_INT8_KV` / `INTFER_KV_Q8` (groupwise INT8 KV cache) | **DECISION: DO-NOT-PROMOTE** | `nk`/`nw`/`nr` = **63488 / 63488 / 16384 — byte-identical across BASE, KV and KVQ8**. The experiment changes **zero** device-side work at this shape, so there is no effect to measure and no reason to carry the flag. Stays default-OFF. |
 | **E3** | `INTFER_DPAS48_FOLD` (per-(row,op) activation-fold hoist) | **DECISION: KEEP — this is the one to keep** | `nk` **94208 → 116736 = +22528 launches** (+352/token); `nw`/`nr` unchanged. Kernel delta **CLEARS the spread**: `d = +343.9 +388.7 +410.8`, median **+388.7 ms**, floor **89.0 ms**, **3/3 rounds agree in sign**. FOLD is **2.05 % cheaper in device kernel** (388.7 / 18940.2) for one extra launch per DPAS GEMM. |
 | **E3b** | `FOLD + PREQ` composed | **DECISION: DO-NOT-PROMOTE PREQ** | `FOLDPREQ` vs `FOLD`: `d = -46.3 -70.2 -146.9`, median **-70.2 ms** vs a **122.7 ms** floor → **INSIDE the spread**, not a result. PREQ adds **+30720** launches on top of FOLD and buys nothing resolvable. (FOLDPREQ vs DPAS48 *does* clear the spread at **+297.6 ms**, but that is inherited from FOLD, not from PREQ.) |
@@ -267,6 +267,55 @@ an 18.2 s kernel total and 10 s each of host `submit`/`waitblock` cannot reach t
 ≥2 % rule. See the E1 row of
 `reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md`, whose single-shot
 `−16.8 ms` kernel figure sits inside this run's noise band and is reconciled there.
+
+### RE-RUN 2026-10-03 — kernel delta now RESOLVES (and reverses sign); decision unchanged
+`scripts/bench_reports_batch.sh E1 3`, 27B `--tp 2`, `devices=2`, stream identity
+re-verified first: `BASE == DPAS48 == PREQ` (`11751 13 198 760 6511 314 9338 369`).
+**Still no wall-time.** Per-arm `max_load1` = 2.31 / 2.23 / 5.74 / 9.58 / 9.58 /
+2.53 / 2.12 / 2.51 / 1.80 (`grep -o 'LOAD1=[0-9.]*' build/bench_E1.log`), so eight of
+nine arms were withheld. The one USABLE arm is `r3 PREQ` (1.80), and the summariser
+**declined to publish its 0.6 tok/s** — a single round has no paired noise floor, which
+is the same rule `scripts/_bench_summary.py` applies to kernel deltas. Every
+`RESULT:` line therefore stays blank, and the batch ends "NO wall-time claimed".
+
+**Device-side kernel time IS load-insensitive, and it is much better resolved here
+than in the 2026-10-02 run:**
+
+| round | BASE kernel | DPAS48 kernel | PREQ kernel | BASE copy | DPAS48 copy | PREQ copy |
+|---|---|---|---|---|---|---|
+| 1 | 16385.4 | 18219.1 | 18204.0 | 11.8 | 2536.3 | 2620.9 |
+| 2 | 16375.0 | 18223.5 | 18204.0 | 11.7 | 2622.2 | 2659.9 |
+| 3 | 16394.2 | 18223.8 | 18200.9 | 11.8 | 2477.7 | 2646.4 |
+
+Spreads (the only noise estimate available, and a property of **this run**, not of
+the arm): BASE **19.2 ms (0.1 %)**, DPAS48 **4.7 ms**, PREQ **3.1 ms**.
+
+- **BASE → DPAS48**: `d = -1833.7 / -1848.5 / -1829.6`, median **-1833.7 ms**,
+  **CLEARS** a 19.2 ms floor, 3/3 same sign → DPAS48's host GA64 act-quant costs
+  **+1833.7 ms of device kernel (+10.06 %)**. This is the price of the whole
+  DPAS48 family at 27B, and it is consistent with `copy` going 11.8 ms → ~2.5 s.
+- **DPAS48 → PREQ**: `d = -15.1 / -19.5 / -22.9`, median **-19.5 ms**, **CLEARS** a
+  4.7 ms floor, 3/3 same sign → PREQ **saves 19.5 ms of kernel (0.11 %)**.
+
+> **The 2026-10-02 statement above ("the kernel column does NOT resolve PREQ's cost")
+> is SUPERSEDED, not contradicted.** That run's floor was 1539.6 ms against deltas of
+> the same order; this run's floor is 4.7 ms, an order of magnitude tighter, while the
+> deltas are three orders of magnitude smaller. Both statements are true of their own
+> run, and the honest reading is that the earlier one was **under-powered**, not wrong.
+> Note the caution the summariser itself prints: BASE spread was 1875.5 ms on 10-02 and
+> 19.2 ms here, so "clears the spread" always means *clears the noise actually
+> observed in this run*.
+
+**Verdict: DO NOT PROMOTE (unchanged), on a corrected rationale.** PREQ's kernel
+effect is now measured rather than unresolved, and it points the *other* way — a
+0.11 % win. It still does not promote, because the thing that is exact is the
+**+30720 launches (+480/token)**, reproduced byte-identically here and on 10-02, and
+0.11 % of an 18.2 s kernel cannot pay for 480 extra submissions per token. What is
+NOT evidence either way is `copy`: PREQ does **not** recover the host act-quant
+(2659.9 median against DPAS48's 2622.2 — slightly worse), and every host bucket here
+is box-shaped (`submit` reads 3378 ms for PREQ against 7257 ms for DPAS48, a 2× swing
+that is load, not PREQ). Do not read the host columns; that mistake produced the
+retracted "−53 % submit saving" in AUDIT #26.
 
 ### Expected direction
 It removes part of the host `copy` bucket but **keeps** the O(M*K) host
