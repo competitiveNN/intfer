@@ -418,15 +418,23 @@ step() { # $1 = label
       # code. Counted separately so the run still ends non-zero (the evidence is
       # genuinely absent) -- the same rc=2 rule UNPROVEN follows.
       printf 'STALE rc=%s (evidence older than HEAD, NOT a regression -- re-run scripts/run_ten_gates.sh; %s)\n' "$rc" "$log"
-      UNPROVEN=$((UNPROVEN + 1))
-      UNPROVEN_LABELS="$UNPROVEN_LABELS $label" ;;
+      UNPROVEN=$((UNPROVEN + 1)) ;;
     unproven)
       printf 'UNPROVEN rc=%s (stale evidence, not a regression -- %s)\n' "$rc" "$log"
-      UNPROVEN=$((UNPROVEN + 1))
-      UNPROVEN_LABELS="$UNPROVEN_LABELS $label" ;;
+      UNPROVEN=$((UNPROVEN + 1)) ;;
     fail)
       printf 'FAIL rc=%s (see %s)\n' "$rc" "$log"
       FAILED=$((FAILED + 1)) ;;
+  esac
+  # ONE accumulation for BOTH evidence verdicts, in one place. The first version
+  # duplicated `UNPROVEN_LABELS=...` across the two branches, and the very next
+  # matrix run refused to score: its anchor pre-flight found the line twice and
+  # said "want 1" -- correct, because an anchor that matches two sites cannot say
+  # which one a patch rewrites. Fixing the ANCHOR would have been the wrong move
+  # (the standing rule is re-point, never loosen); the duplication was the defect,
+  # so the duplication is what went.
+  case "$verdict" in
+    stale|unproven) UNPROVEN_LABELS="$UNPROVEN_LABELS $label" ;;
   esac
   RC_SUMMARY="$RC_SUMMARY$(printf '%-34s %s\n' "$label" "rc=$rc")\n"
   return 0
