@@ -148,7 +148,28 @@ UNPROVEN_LABELS=""
 # self-check below. A classification that exists twice is one that can disagree
 # with itself, and the self-check would then be testing a copy rather than the
 # code that actually runs.
-classify_rc() { # $1 = rc -> prints ok | unproven | fail
+#
+# *** ONE STEP'S rc=1 MEANS "EVIDENCE IS OLDER THAN THE TREE", NOT "THE CODE IS
+# BROKEN". *** check_engine_cert.sh documents its own rc=1 as `stale`: an engine
+# input moved since the 45-minute gate run, so the certification no longer
+# describes HEAD. Measured 2026-10-03: an audit that legitimately touched
+# src/engine/engine.cpp made this step answer rc=1, and the stack printed
+# "RUN ALL CHECKS: FAIL -- a real regression" with the remedy "Fix, re-run".
+# Those are two OPPOSITE actions -- one of them is "change nothing and re-run
+# scripts/run_ten_gates.sh" -- and conflating them is exactly the recorded
+# AUDIT #18 defect (a red line that means the evidence, rather than the code, is
+# how people learn to ignore red lines). AUDIT #29 hit the identical shape when
+# gate_inventory called the documents stale on a 1-GPU box; that one got a BOX
+# category, this one needs the same treatment.
+#
+# Per-STEP, derived where the step is named, not a global reinterpretation of 1:
+# for every other step rc=1 still means a real failure, and it must keep doing
+# so. check_engine_cert.sh is the only checker in the tree whose rc=1 is a
+# statement about evidence rather than about code.
+classify_rc() { # $1 = rc [$2 = step label] -> prints ok | stale | unproven | fail
+  if [ "${2:-}" = "check_engine_cert.sh" ] && [ "$1" = "1" ]; then
+    printf 'stale\n'; return 0
+  fi
   case "$1" in
     0) printf 'ok\n' ;;
     2) printf 'unproven\n' ;;
@@ -387,9 +408,18 @@ step() { # $1 = label
   printf '  %-34s ' "$label"
   dispatch "$label" >"$log" 2>&1
   rc=$?
-  verdict="$(classify_rc "$rc")"
+  verdict="$(classify_rc "$rc" "$label")"
   case "$verdict" in
     ok) printf 'ok\n' ;;
+    stale)
+      # NOT counted as a failure: nothing is wrong with the code, the EVIDENCE
+      # describes an older tree. The remedy is a re-run of the engine gates, and
+      # saying "real regression" here would tell the reader to go and edit working
+      # code. Counted separately so the run still ends non-zero (the evidence is
+      # genuinely absent) -- the same rc=2 rule UNPROVEN follows.
+      printf 'STALE rc=%s (evidence older than HEAD, NOT a regression -- re-run scripts/run_ten_gates.sh; %s)\n' "$rc" "$log"
+      UNPROVEN=$((UNPROVEN + 1))
+      UNPROVEN_LABELS="$UNPROVEN_LABELS $label" ;;
     unproven)
       printf 'UNPROVEN rc=%s (stale evidence, not a regression -- %s)\n' "$rc" "$log"
       UNPROVEN=$((UNPROVEN + 1))
@@ -413,17 +443,25 @@ step() { # $1 = label
 # missing evidence (rc 2). Each writes a sentinel, so "the step never ran" is
 # distinguishable from "the step ran and was classified".
 selfcheck() {
-  local d bad=0 g rc verdict want sent label code
+  local d bad=0 g rc verdict want sent label code rest step_name
   d="$(mktemp -d "$BUILD_DIR/.selfcheck.XXXXXX")" || return 1
   # Fields are split ONCE into three named variables. The first version used
   # "${spec#*:}" on "sc_ok:0:ok", which yields "0:ok" and wrote `exit 0:ok` --
   # an invalid exit argument, so ALL THREE steps returned bash's exit-error
   # status 2 and the self-check reported every case wrong. The self-check caught
   # a bug in itself, which is the only reason to trust it.
-  for spec in "sc_ok:0:ok" "sc_unproven:2:unproven" "sc_fail:1:fail"; do
+  # The engine-cert case is the CONVERSE of the map above and both halves are
+  # required: rc=1 must be `stale` for THAT step and must stay `fail` for every
+  # other one. A per-step map that swallowed 1 globally would satisfy the first
+  # case and silently disarm the whole stack.
+  for spec in "sc_ok:0:ok::" "sc_unproven:2:unproven::" "sc_fail:1:fail::" \
+              "sc_stale:1:stale:check_engine_cert.sh" \
+              "sc_stale_converse:1:fail::"; do
     label="${spec%%:*}"
-    code="${spec#*:}"; code="${code%%:*}"
-    want="${spec##*:}"
+    rest="${spec#*:}"
+    code="${rest%%:*}"; rest="${rest#*:}"
+    want="${rest%%:*}"; rest="${rest#*:}"
+    step_name="${rest%%:*}"
     g="$d/$label"
     sent="$d/$label.ran"
     printf '#!/usr/bin/env bash\n: > %q\nexit %s\n' "$sent" "$code" >"$g"
@@ -431,7 +469,7 @@ selfcheck() {
     rm -f "$sent"
     "$g" >/dev/null 2>&1
     rc=$?
-    verdict="$(classify_rc "$rc")"
+    verdict="$(classify_rc "$rc" "$step_name")"
     if [ ! -f "$sent" ]; then
       echo "  SELFCHECK: $label never ran (no sentinel) -- the check is vacuous" >&2
       bad=1; continue
@@ -451,7 +489,7 @@ if ! selfcheck; then
   echo "  verdict below is meaningless. A checker that cannot fail proves nothing." >&2
   exit 1
 fi
-echo "  ok    sc_ok->ok, sc_unproven->unproven, sc_fail->fail"
+echo "  ok    sc_ok->ok, sc_unproven->unproven, sc_fail->fail, sc_stale->stale"
 
 # --- 0b dispatch coverage, derived by ENUMERATION ----------------------------
 # dispatch() and STEPS are hand-written lists. So a new check_*.sh or
@@ -700,12 +738,21 @@ if [ "${INTFER_QUICK:-0}" != "1" ]; then
       log="$BUILD_DIR/run_all_$(printf '%s' "$label" | tr -c 'a-zA-Z0-9' '_')_rerun.log"
       dispatch "$label" >"$log" 2>&1
       rc=$?
-      case "$(classify_rc "$rc")" in
+      case "$(classify_rc "$rc" "$label")" in
         ok)
           printf 'ok (evidence now current)\n'
           UNPROVEN=$((UNPROVEN - 1)) ;;
         unproven)
           printf 'still rc=%s (%s)\n' "$rc" "$log" ;;
+        stale)
+          # The one rc that must NOT be escalated here. check_engine_cert.sh is
+          # stale because an ENGINE input moved, and steps 1-2 mutate only
+          # scripts/ -- so it will still be stale after the matrices, and the
+          # remedy is a human re-running the 45-minute engine gates. Calling that
+          # "REGRESSED ... is now a real failure" would be false on every run
+          # where an engine commit landed, and would move UNPROVEN -> FAILED,
+          # turning "the evidence is old" into "the code is broken".
+          printf 'still STALE rc=%s (evidence older than HEAD -- re-run scripts/run_ten_gates.sh; %s)\n' "$rc" "$log" ;;
         fail)
           # A re-run that turns STALE EVIDENCE into a REAL FAILURE is a
           # regression, not missing evidence. The first version only branched on
