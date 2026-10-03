@@ -273,6 +273,25 @@ commit_mutant() { # $1 = message
   git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$MUTANT" >/dev/null 2>&1
   git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "$1" -- "$MUTANT" >/dev/null 2>&1 || true
 }
+# *** AND FOR A SIBLING FILE, WHICH commit_mutant DOES NOT STAGE. *** The POST-STACK
+# states edit the SANDBOX's check_stack_cert.sh, not the mutant. The mutant's own
+# start-of-run guard refuses a dirty TRACKED tree, so an uncommitted sibling edit
+# aborts the run before 0c exists -- and N-T scored MISSED (unattributed) for
+# exactly that reason on its first run. This is the same masking as the N-Q fix, in
+# a third place: a sandbox mutation that is not committed stops the CASE, not the
+# MUTANT, from being exercised.
+commit_sandbox() { # $1 = message, $2 = path (default: the mutant)
+  local msg="$1" path="${2:-$MUTANT}"
+  git -C "$SB" -c user.email=m@x -c user.name=matrix add -- "$path" >/dev/null 2>&1
+  git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m "$msg" -- "$path" >/dev/null 2>&1 || true
+}
+# Every POST-STACK state also needs the SANDBOX's check_stack_cert.sh restored, or
+# one state's declaration edit survives into the next.
+reset_post_stack() {
+  [ -e "$SCRIPT_DIR/check_stack_cert.sh" ] && \
+    cp "$SCRIPT_DIR/check_stack_cert.sh" "$SB/scripts/check_stack_cert.sh"
+  git -C "$SB" -c user.email=m@x -c user.name=matrix checkout -q -- . 2>/dev/null
+}
 reset_mutant() {
   cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"
   # The mutant SOURCES scripts/_gate_enum.sh (grep rc-classification +
@@ -892,27 +911,27 @@ run_state_post() { # $1 id, $2 desc, $3 expected-RE
   local id="$1" desc="$2" expect="$3" o r
   TOTAL=$((TOTAL + 1)); reset_mutant
   if ! MUTATE_FN; then
-    echo "  $id MISSED -- mutation fn failed (STATE fault)"; reset_mutant; return 1
+    echo "  $id MISSED -- mutation fn failed (STATE fault)"; reset_mutant; reset_post_stack; return 1
   fi
   conj_run "$id.log"; r=$?
   o="$(cat "$WORK/$id.log")"
   if [ "$r" -eq 0 ]; then
     echo "  $id MISSED -- 0c accepted a declaration it must not honour ($desc)"
-    echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; reset_mutant; return 1
+    echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; reset_mutant; reset_post_stack; return 1
   fi
   if ! printf '%s' "$o" | grep -qE "$expect"; then
     echo "  $id MISSED -- failed for the wrong reason (unattributed)"; sed 's/^/        /' "$WORK/$id.log"
-    echo "$id MISSED (unattributed)" >> "$LOG/summary.txt"; reset_mutant; return 1
+    echo "$id MISSED (unattributed)" >> "$LOG/summary.txt"; reset_mutant; reset_post_stack; return 1
   fi
   echo "  $id caught -- rc=$r, marker matched: $desc"
-  echo "$id caught" >> "$LOG/summary.txt"; CAUGHT=$((CAUGHT + 1)); reset_mutant; return 0
+  echo "$id caught" >> "$LOG/summary.txt"; CAUGHT=$((CAUGHT + 1)); reset_mutant; reset_post_stack; return 0
 }
 # N-T: pushed past line 40.
-MUTATE_FN() { pad_above_decl 45; grep -q '^# POST-STACK:' "$CSC"; }
+MUTATE_FN() { pad_above_decl 45; grep -q '^# POST-STACK:' "$CSC" || return 1; commit_sandbox post-stack "$CSC"; }
 run_state_post "N-T" "the declaration sits past the 40-line window" \
   'never scheduled.*check_stack_cert|declares POST-STACK'
 # N-U: demoted to an indented body mention.
-MUTATE_FN() { sed -i 's|^# POST-STACK: run this AFTER|  # POST-STACK: run this AFTER|' "$CSC"; }
+MUTATE_FN() { sed -i 's|^# POST-STACK: run this AFTER|  # POST-STACK: run this AFTER|' "$CSC" || return 1; commit_sandbox post-stack "$CSC"; }
 run_state_post "N-U" "the declaration is an indented body mention" \
   'never scheduled.*check_stack_cert|declares POST-STACK'
 
@@ -929,6 +948,7 @@ new = 'check_doc_counts.sh check_verdict_scope.sh check_stack_cert.sh"'
 assert s.count(old) == 1, s.count(old)
 open(p, "w").write(s.replace(old, new))
 PYX
+commit_mutant n-v
 conj_run "N-V.log"; nv=$?
 if [ "$nv" -ne 0 ] && grep -q 'declares POST-STACK \*and\* is in STEPS' "$WORK/N-V.log"; then
   TOTAL=$((TOTAL + 1)); CAUGHT=$((CAUGHT + 1))
