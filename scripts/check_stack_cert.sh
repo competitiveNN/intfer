@@ -104,9 +104,32 @@ echo "   census (re-derived): $n_scripts scripts = $n_checks checkers + $n_matri
 echo "                        $n_stamps stamp FILES across $n_dirs directories"
 
 # ============================ SELF-CHECK, FIRST AND GATING ===================
+#
+# *** AND IT IS NOT EVALUABLE ON A DIRTY TREE -- SAY SO, DO NOT SCORE IT. ***
+# sc_run below redirects INTFER_BUILD_DIR but not INTFER_STACK_CERT_ROOT, so each
+# nested run grades the REAL checkout -- including its dirty state. Case (i) is
+# "a matching rc=0 cert is ACCEPTED", and on a dirty tree the nested run correctly
+# refuses with DIRTY, so the case reported a failure and the aggregate verdict
+# read "FAIL (1 self-check failure(s)) -- the checker cannot classify". The
+# checker was fine; the TREE was dirty. Measured 2026-10-03 while editing this
+# file, which is exactly when the self-check is wanted.
+#
+# The consequence of scoring it anyway is the AUDIT #22 family: a correct refusal
+# wearing a wrong label, i.e. a red line that means "my working tree" reading as
+# "this checker is broken". So the honest answer is to SKIP the self-check LOUDLY
+# and fall through to the live verdict, which reports the dirty tree with its own
+# message and its own rc. Exit code semantics are deliberately UNCHANGED -- a
+# dirty tree is still a failure (rc=1) below, because the cert really does
+# describe a different tree; only the self-check's contribution is withdrawn.
 if [ "${INTFER_STACK_CERT_NO_SELFCHECK:-0}" = "1" ]; then
   echo "   self-tests SKIPPED (INTFER_STACK_CERT_NO_SELFCHECK=1) -- grading the"
   echo "   artifact only; THIS RUN CERTIFIES NO NON-VACUITY."
+elif ! git diff --quiet -- scripts/ 2>/dev/null || ! git diff --cached --quiet -- scripts/ 2>/dev/null; then
+  echo "   self-tests NOT RUN: scripts/ is dirty, and the self-check's nested runs"
+  echo "   grade the real checkout -- a dirty tree makes case (i) refuse for a"
+  echo "   reason that has nothing to do with classification. Grading the artifact"
+  echo "   only; the dirty tree is reported by the live verdict below, with rc=1."
+  SELF_SKIPPED_DIRTY=1
 else
 SELF="$BD/.stack_cert_selfcheck"
 rm -rf "$SELF"; mkdir -p "$SELF/stack_cert"
@@ -346,4 +369,14 @@ echo "STACK CERT CHECK: PASS (cert $HEAD_SHORT rc=0, census identical, tree clea
 echo "RESULT: the stack certification on disk is evidence for THIS commit"
 echo "RESULT: census: $n_scripts scripts = $n_checks checkers + $n_matrices matrices;"
 echo "RESULT: $n_stamps stamp FILES across $n_dirs directories"
+# *** A PASS MUST NOT CLAIM A CHECK THAT DID NOT RUN (the ddea91d defect). *** The
+# tree-clean line above can only be reached on a clean tree, so the dirty-skip is
+# unreachable HERE -- but the disclosure is kept because the invariant is the
+# point, and because SELF_SKIPPED_DIRTY is the only witness that the self-check
+# is conditional at all. If this ever prints on a skipped run, the omission below
+# is the bug it is guarding.
+if [ "${SELF_SKIPPED_DIRTY:-0}" = "1" ]; then
+  echo "RESULT: SELF-CHECK NOT RUN (scripts/ was dirty) -- this verdict certifies the"
+  echo "        ARTIFACT only and asserts NOTHING about the checker's classification"
+fi
 exit 0
