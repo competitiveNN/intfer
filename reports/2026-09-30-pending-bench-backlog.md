@@ -17,6 +17,38 @@ from me; every `RESULT:` line is deliberately blank and is yours to fill.
 > command (*400) aborts with `FATAL: pos 1151 >= KV capacity 1024` unless the cap
 > is raised explicitly.
 
+## DECISIONS — settled 2026-10-03 on LOAD-INSENSITIVE evidence (no quiet box needed)
+
+**These are the pick/keep/drop decisions for E1, E2 and E3. They do not require a
+tok/s and they are not provisional.** Each was re-derived today by running
+`scripts/_bench_summary.py` against the raw `ARM=` records in
+`build/bench_E1.log` / `bench_E2.log` / `bench_E3.log`, not read off this prose.
+A **wall-time figure can still refine a tok/s; it cannot overturn these**, because
+each one rests either on an *exact* launch counter or on a kernel delta that clears
+the run's own spread in 3 of 3 rounds.
+
+| Exp | Change | Decision | Load-insensitive evidence (re-derived 2026-10-03) |
+|---|---|---|---|
+| **E1** | `INTFER_DPAS_PREQ` (device act-quant pre-pass) | **DECISION: DO-NOT-PROMOTE** | `nk` **94208 → 124928 = +30720 launches** (+480/token); `nw`/`nr` unchanged. Kernel delta **INSIDE the spread**: `d = -705.2 -1544.9 +58.5`, median **-705.2 ms** vs a **1539.6 ms** floor, signs **`--+`**. The device-kernel effect is **not resolvable**; what IS exact is that it costs 30720 extra launches. Stays default-OFF. |
+| **E2** | `INTFER_INT8_KV` / `INTFER_KV_Q8` (groupwise INT8 KV cache) | **DECISION: DO-NOT-PROMOTE** | `nk`/`nw`/`nr` = **63488 / 63488 / 16384 — byte-identical across BASE, KV and KVQ8**. The experiment changes **zero** device-side work at this shape, so there is no effect to measure and no reason to carry the flag. Stays default-OFF. |
+| **E3** | `INTFER_DPAS48_FOLD` (per-(row,op) activation-fold hoist) | **DECISION: KEEP — this is the one to keep** | `nk` **94208 → 116736 = +22528 launches** (+352/token); `nw`/`nr` unchanged. Kernel delta **CLEARS the spread**: `d = +343.9 +388.7 +410.8`, median **+388.7 ms**, floor **89.0 ms**, **3/3 rounds agree in sign**. FOLD is **2.05 % cheaper in device kernel** (388.7 / 18940.2) for one extra launch per DPAS GEMM. |
+| **E3b** | `FOLD + PREQ` composed | **DECISION: DO-NOT-PROMOTE PREQ** | `FOLDPREQ` vs `FOLD`: `d = -46.3 -70.2 -146.9`, median **-70.2 ms** vs a **122.7 ms** floor → **INSIDE the spread**, not a result. PREQ adds **+30720** launches on top of FOLD and buys nothing resolvable. (FOLDPREQ vs DPAS48 *does* clear the spread at **+297.6 ms**, but that is inherited from FOLD, not from PREQ.) |
+
+**Bottom line for the archive step: keep E3 (`INTFER_DPAS48_FOLD`), drop E1
+(`INTFER_DPAS_PREQ`), E2 (`INTFER_INT8_KV`/`INTFER_KV_Q8`) and the E3b PREQ
+composition.** All three losers stay **default-OFF** in the CLI, which is already
+their shipped state, so no code change is implied by any of these decisions.
+
+**What is still open and why it is not a decision:** every `RESULT:` line below is
+blank because a tok/s needs a **quiet box** (`load1 < 2`). On 2026-10-03 the 27B
+`--tp 2` benchmark was launched with both GPUs enumerating
+(`GPU backend: 2 device(s) (TP=sharded)`) and **every arm came back
+`CONTENDED max_load1=2.96…3.99 >= 2`**, and the cause was measured as **not ours**:
+`zen-bin` 49.5 %, three chromium `Isolated Web Content`, `kwin_wayland`, `maki` —
+sibling sessions and desktop, which must not be killed. The quiet threshold was
+**not** lowered to make arms read USABLE; that would manufacture the exact class of
+figure this repo retracted three times.
+
 Scope note (AGENTS.md): the optimization target is the **27B** model
 (`Qwen3.8-27B-int2.intifer`, 19 GB, INT2/G16+G32 + INT4/G64 + INT8/G32).
 The 0.8B numbers elsewhere in AGENTS.md are legacy reference only. On 27B,
@@ -489,7 +521,7 @@ RESULT (27B TP=2 long-ctx decode, 3 rounds, load1 at each round):
 Implemented and gated; awaiting quiet-box numbers. Full report (with the
 measured device-side counters, the mutation proof, and the row-stride bug the
 probe caught during development) is in
-**`reports/2026-09-30-dpas48-fold.md`** — read that file for the command.
+**`reports/archive/2026-09-30-dpas48-fold.md`** — read that file for the command.
 Run its pre-flight before spending a quiet window on it:
 `./scripts/test_dpas_fold.sh` (builds its own target first, so it cannot
 report PASS for a stale binary).
@@ -573,7 +605,7 @@ adding PREQ, though PREQ adds +30720 more launches for less benefit (see E1).
 > result, not an absence of one.
 
 ### Its 0.8B table above is single-shot — flag it as such
-The §4 numbers in `reports/2026-09-30-dpas48-fold.md` (`−1.6 %` decode, `−1.7 %`
+The §4 numbers in `reports/archive/2026-09-30-dpas48-fold.md` (`−1.6 %` decode, `−1.7 %`
 prefill) are **one measurement each, with no spread measured**, so they carry no
 noise estimate at all. They are consistent in sign and magnitude with the 27B
 three-round result above; that agreement is why they were worth trusting, but it

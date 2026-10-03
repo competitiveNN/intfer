@@ -644,7 +644,7 @@ cannot detect a gate that is green-numbered but red."*
 3. Then run these three batches for real with `--tp 2` on 27B, interleaved,
    3+ rounds, and fill the `RESULT:` lines in
    `reports/2026-09-30-pending-bench-backlog.md` and
-   `reports/2026-09-30-dpas48-fold.md`.
+   `reports/archive/2026-09-30-dpas48-fold.md`.
 4. E2's long-ctx command needs `INTFER_KV_CAP` raised above the prompt length.
 
 ---

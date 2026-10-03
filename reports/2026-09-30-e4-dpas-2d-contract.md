@@ -4,7 +4,7 @@ Date: 2026-09-30. Author: maki (agent). **Decision record, not code.** No E4
 kernel exists and no E4 flag exists. This file exists so the next session does
 NOT start E4 by guessing a tolerance.
 
-Related: `reports/2026-09-30-dpas48-fold.md` (E3, the bit-exact fold hoist),
+Related: `reports/archive/2026-09-30-dpas48-fold.md` (E3, the bit-exact fold hoist),
 `reports/2026-09-30-pending-bench-backlog.md` (E4 entry + queue state).
 
 ## Why E4 needs a contract at all, and why E3 did not

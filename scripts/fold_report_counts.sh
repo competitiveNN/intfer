@@ -2,7 +2,7 @@
 # Print the fold mutation-matrix report table CELLS, derived from the per-state
 # logs, instead of leaving them as hand-transcribed prose.
 #
-# WHY. The report (reports/2026-09-30-dpas48-fold.md) carries a 7-row table whose
+# WHY. The report (reports/archive/2026-09-30-dpas48-fold.md) carries a 7-row table whose
 # numeric cells drifted twice, both times silently:
 #   * S3's contract cell read "42 viol." -- that is the probe's AGGREGATE
 #     (contract + index + readback). The contract column is 40.

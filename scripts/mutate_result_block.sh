@@ -46,12 +46,17 @@ for f in "$SCRIPT_DIR"/*.sh; do ln -sf "$f" "$SB/scripts/$(basename "$f")"; done
 ln -sfn "$ROOT/src" "$SB/src"
 ln -sfn "$ROOT/examples" "$SB/examples"
 rm -f "$TGT"; cp "$CHECK" "$TGT"
-for r in 2026-09-30-pending-bench-backlog.md 2026-09-30-dpas48-fold.md; do
-  cp "$ROOT/reports/$r" "$SB/reports/$r"
-done
+# *** THE ARCHIVED REPORT NEEDS ITS SUBDIR IN THE SANDBOX TOO. *** E3 was
+# archived on 2026-10-03 (verdict decided on load-insensitive evidence), so the
+# checker now reads reports/archive/.... A flat copy would leave the checker
+# reading a path the sandbox does not have -- the missing-sibling class, which
+# has now bitten this repo four times and fails for an ARTEFACT reason.
+cp "$ROOT/reports/2026-09-30-pending-bench-backlog.md" "$SB/reports/"
+mkdir -p "$SB/reports/archive"
+cp "$ROOT/reports/archive/2026-09-30-dpas48-fold.md" "$SB/reports/archive/"
 ORIG_B="$SB/.orig_b"; ORIG_F="$SB/.orig_f"; ORIG_C="$SB/.orig_c"
 cp "$SB/reports/2026-09-30-pending-bench-backlog.md" "$ORIG_B"
-cp "$SB/reports/2026-09-30-dpas48-fold.md" "$ORIG_F"
+cp "$SB/reports/archive/2026-09-30-dpas48-fold.md" "$ORIG_F"
 cp "$TGT" "$ORIG_C"
 # *** RESTORE THE DIRECTORIES, NOT A LIST OF FILES. ***
 # This had a 3-file restore list (two reports + the checker) while carrying NINE
@@ -141,21 +146,21 @@ run_state "R-B" 'R_B' 'a numeric tok/s appears inside the block' "a fabricated t
 
 # R-C: the fold report's cross-reference removed, orphaning its two blank lines.
 MUTATE_FN() {
-  patch_literal "$SB/reports/2026-09-30-dpas48-fold.md" \
+  patch_literal "$SB/reports/archive/2026-09-30-dpas48-fold.md" \
     '> `reports/2026-09-30-pending-bench-backlog.md`, section
 > "ONE COMMAND FILLS EVERY `RESULT:` LINE ABOVE". Interleaved, 3 rounds, each
 > round gated on `load1 < 2` and the load printed above it.' \
     '> (cross-reference removed)  # R_C'
-  grep -q 'R_C' "$SB/reports/2026-09-30-dpas48-fold.md"
+  grep -q 'R_C' "$SB/reports/archive/2026-09-30-dpas48-fold.md"
 }
 run_state "R-C" 'R_C' 'does not point at the block' "the fold report's pointer to the block deleted"
 
 # R-D: a RESULT line removed, so part of the batch is no longer reachable.
 MUTATE_FN() {
-  patch_literal "$SB/reports/2026-09-30-dpas48-fold.md" \
+  patch_literal "$SB/reports/archive/2026-09-30-dpas48-fold.md" \
     'RESULT (27B TP=2 prefill, chunk361):' \
     'FILLED (27B TP=2 prefill, chunk361): -- removed  # R_D'
-  grep -q 'R_D' "$SB/reports/2026-09-30-dpas48-fold.md"
+  grep -q 'R_D' "$SB/reports/archive/2026-09-30-dpas48-fold.md"
 }
 run_state "R-D" 'R_D' 'RESULT lines across both reports' "a RESULT line deleted (5 left, min is 6)"
 

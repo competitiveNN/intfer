@@ -579,7 +579,7 @@ for path in docs:
                 continue
             # A QUOTED claim is one the doc REFUTES, not makes. Without this the
             # single live hit was '"4 gates is enough"' -- argued against in
-            # reports/2026-09-30-dpas48-fold.md -- so flagging it is a false
+            # reports/archive/2026-09-30-dpas48-fold.md -- so flagging it is a false
             # positive. Quoted spans are excluded explicitly rather than by
             # loosening the pattern.
             q = re.compile(r'["\u201c\u201d][^"\u201c\u201d]*' + re.escape(m.group(0)))

@@ -244,7 +244,7 @@ matrix, and the shared patch helper — all dispatched steps of
      the ONLY gate that can certify TP=2 coverage at all right now.
   3. Then, and only then, fill the `RESULT:` lines in
      `reports/2026-09-30-pending-bench-backlog.md` and
-     `reports/2026-09-30-dpas48-fold.md`, and re-decide the E1/E2/E3 verdicts at
+     `reports/archive/2026-09-30-dpas48-fold.md`, and re-decide the E1/E2/E3 verdicts at
      27B — they currently rest on 0.8B counters alone.
   Also negative, so they are not retried: ONEAPI_DEVICE_SELECTOR in
   {level_zero:gpu, level_zero:*, *:gpu, level_zero:0, *} and SYCL_DEVICE_FILTER
@@ -3555,7 +3555,7 @@ e.g. S3's contract column is 40 not 42).
    the weak case (small N => few tiles to amortize against). 27B wide-N is where
    it should pay and CANNOT be measured here (1 GPU; 27B needs --tp 2). No
    tok/s claim. Handover report with blank RESULT lines:
-   `reports/2026-09-30-dpas48-fold.md` (E3), cross-referenced from
+   `reports/archive/2026-09-30-dpas48-fold.md` (E3), cross-referenced from
    `reports/2026-09-30-pending-bench-backlog.md`, which now also states plainly
    that the queue is blocked on 2-GPU box state, not on missing experiments.
    STILL NOT DONE, deliberately: the remaining 2D-tiled geometry work proper

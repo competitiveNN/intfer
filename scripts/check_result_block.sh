@@ -30,7 +30,7 @@ cd "$ROOT" || exit 2
 enum_reset
 
 BACKLOG="reports/2026-09-30-pending-bench-backlog.md"
-FOLD="reports/2026-09-30-dpas48-fold.md"
+FOLD="reports/archive/2026-09-30-dpas48-fold.md"
 SRC_DIRS="src examples/intfer_cli scripts"
 
 echo "== RESULT-BLOCK CHECK =="
