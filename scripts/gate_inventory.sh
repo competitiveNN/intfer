@@ -276,6 +276,10 @@ printf '%-26s %-9s %-22s %-11s %-12s %s\n' GATE BUILD-GUARD PRECONDITION GRANULA
 printf '%s\n' "-----------------------------------------------------------------------------------------------------"
 
 VIOLATIONS=0
+# Set when the doc tally could not be reconciled because THIS BOX cannot run the
+# configuration the docs describe (see the BOX branch in the tally loop). It is not
+# a violation; it is the absence of a measurement, and the exit code must say so.
+TALLY_UNPROVEN=0
 for f in $GATES; do
   name="$(basename "$f")"
   code="$(strip_comments "$f")"
@@ -422,7 +426,11 @@ else
   #   (2) A tally WRAPPED across two markdown lines ("7 PASS, 2 PARTIAL," then
   #       "1 SKIPPED**"), which parses as SKIPPED=0. The next line is consulted
   #       when PARTIAL is present but SKIPPED is not.
-  bad_tally=0; sites_found=0; excluded=0
+  bad_tally=0; sites_found=0; excluded=0; box_short=0
+  # Total gates, and the "this box cannot support the documented configuration" flag.
+  EXP_PASS_TOTAL="$((N_PASS + N_PARTIAL + N_SKIP))"
+  BOX_SHORT=0
+  [ "${NDEV:-0}" -lt 2 ] && BOX_SHORT=1
   for d in $DOCS; do
     [ -f "$d" ] || continue
     # ALL lines, so the wrap look-up below can reach a continuation line that
@@ -452,6 +460,26 @@ else
       sites_found=$((sites_found + 1))
       if [ "$p" = "$EXP_PASS" ] && [ "$pa" = "$EXP_PARTIAL" ] && [ "$sk" = "$EXP_SKIP" ]; then
         printf '           ok    %s:%s  %s\n' "$d" "$ln" "$(printf '%s' "$txt" | cut -c1-66)"
+      elif [ "$BOX_SHORT" = 1 ] && [ "$p" = "$EXP_PASS_TOTAL" ] \
+           && [ "$pa" = 0 ] && [ "$sk" = 0 ]; then
+        # *** BOX STATE, NOT A STALE DOCUMENT. *** MEASURED 2026-10-03: the box
+        # dropped to ONE enumerated GPU, so this checker derived 7/2/1 and called
+        # every 2-GPU-era tally STALE -- and the stack then printed "FAIL (2 step(s)
+        # FAILED) -- a real regression", naming a doc that is a TRUE RECORD of the
+        # configuration this project is built for. That is the AUDIT #9/#11 shape
+        # at its worst: a red line that means "the box", teaching everyone to
+        # ignore red lines.
+        #
+        # The docs cannot be falsified from a box that cannot run the configuration
+        # they describe. So this is UNPROVEN (2), never STALE (1) -- the same
+        # distinction the load gate makes when it withholds a figure it does not
+        # have. A doc that disagrees on a box which DOES support the configuration
+        # is still a STALE doc, and still fails.
+        printf '           BOX   %s:%s  says %s/%s/%s, box shows %s GPU(s) so the' \
+          "$d" "$ln" "$p" "$pa" "$sk" "$NDEV"
+        printf '                 %s-configuration cannot be re-derived. UNPROVEN.\n' \
+          "$((p + pa + sk))"
+        box_short=$((box_short + 1))
       else
         printf '           STALE %s:%s  says %s/%s/%s, source implies %s/%s/%s\n' \
           "$d" "$ln" "$p" "$pa" "$sk" "$EXP_PASS" "$EXP_PARTIAL" "$EXP_SKIP"
@@ -459,7 +487,11 @@ else
       fi
     done < <(grep -nE '[0-9]+ PASS, [0-9]+ PARTIAL|[0-9]+ PASS[^*]*$' "$d")
   done
-  echo "           sites_found=$sites_found excluded_history=$excluded stale_tally_sites=$bad_tally"
+  echo "           sites_found=$sites_found excluded_history=$excluded stale_tally_sites=$bad_tally box_shortfall_sites=$box_short"
+  # *** A BOX SHORTFALL IS NOT A VIOLATION. *** It sets TALLY_UNPROVEN, which makes
+  # the whole checker exit 2 rather than 1 -- UNPROVEN, never green. The 0-GPU path
+  # above already exits 2 for the same reason one notch louder.
+  [ "$box_short" -eq 0 ] || TALLY_UNPROVEN=1
   VIOLATIONS=$((VIOLATIONS + bad_tally))
   # Routed through the SHARED vacuity guard (scripts/_gate_enum.sh) rather than
   # a second hand-rolled copy of the same rule -- the audit #7/#8 "rule fixed at
@@ -596,6 +628,14 @@ if [ "$VIOLATIONS" = "0" ]; then
   if [ "${TALLY_RAN:-0}" != "1" ]; then
     echo "GATE INVENTORY: BUG -- reached the OK line with the tally unrun" >&2
     exit 1
+  fi
+  if [ "${TALLY_UNPROVEN:-0}" = "1" ]; then
+    echo "GATE INVENTORY: UNPROVEN (doc tally could not be reconciled: this box" >&2
+    echo "  enumerates fewer GPUs than the documented configuration, so a doc that" >&2
+    echo "  disagrees cannot be distinguished from one the box simply cannot check)." >&2
+    echo "  NOT a regression and NOT a stale doc -- see the BOX lines above. Restore" >&2
+    echo "  the second device (scripts/gpu_recover.sh diag, then rebind) and re-run." >&2
+    exit 2
   fi
   echo "GATE INVENTORY: OK (every gate builds its own target; no whole-gate skip strands 1-GPU arms; doc tallies reconcile)"
   echo "  NOTE what 'reconcile' means: the doc NUMBERS agree with what the source"
