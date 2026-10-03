@@ -465,10 +465,14 @@ run_state "B-P" 'B_P' 'attributes-the-signature-to-an-arm' \
 # other case keeps passing. Without this, "matches any phase" and "matches the
 # default phase" are indistinguishable and the wildcard is decoration.
 MUTATE_FN() {
+  # ONE occurrence only, because the checker now holds the wildcard in ONE variable
+  # (SIG_RE) shared by both phase directions -- which is what makes this state
+  # observable at all.
   patch_literal "$SB/scripts/check_bench_load_gate.sh" \
-    "no_[A-Za-z0-9@_-]*_line_in_arm_output" "no_decode_line_in_arm_output" || return 1
+    "SIG_RE='no_[A-Za-z0-9@_-]*_line_in_arm_output'" \
+    "SIG_RE='no_decode_line_in_arm_output'  #B_Q the phase wildcard, gone" || return 1
   bash -n "$SB/scripts/check_bench_load_gate.sh" || return 1
-  grep -q 'no_decode_line_in_arm_output' "$SB/scripts/check_bench_load_gate.sh"
+  grep -q 'B_Q the phase wildcard' "$SB/scripts/check_bench_load_gate.sh"
 }
 run_state "B-Q" 'B_Q' 'e2e-prefill' \
   "the phase wildcard reverted to a hardcoded @decode, so a @prefill refusal is missed"

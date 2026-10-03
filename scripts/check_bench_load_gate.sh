@@ -577,6 +577,16 @@ STUB
  # attribution and nothing else does. Proven by mutation B-P: an artifact state
  # that drops the `$1/$2:` prefix makes this assertion fail, so it is not a
  # decoration on an already-passing check.
+    # *** ONE PATTERN, TWO PHASES. *** Both firing directions below MUST read the
+    # same wildcard. When the @prefill case spelled its signature out literally,
+    # "matches any phase" and "matches the default phase" were indistinguishable:
+    # state B-Q reverted the wildcard to a hardcoded `no_decode_...` and the
+    # checker stayed GREEN, because the prefill case never consulted it. A
+    # converse has to share the mechanism it is a converse of, or it is a second
+    # independent check wearing the same name. That is the AUDIT #21 lesson -- the
+    # converse was a real case, just not of the thing it claimed.
+    SIG_RE='no_[A-Za-z0-9@_-]*_line_in_arm_output'
+    ATTR_RE="^[[:space:]]*RESULT:[[:space:]]+[A-Za-z0-9_]+/[A-Za-z0-9_-]+:[[:space:]]*$SIG_RE"
  # -- firing direction: no profile line, so every arm dies --
  write_stub 0
  run_harness; e2e_dead_rc=$?
@@ -584,7 +594,7 @@ STUB
        && pred_expect_present "e2e-dead-stub-says-not-a-result" \
             "$(grep -c 'THIS BATCH IS NOT A RESULT' "$TDIR/e2e.out" || true)" '^[1-9]' \
        && pred_expect_present "e2e-dead-stub-attributes-the-signature-to-an-arm" \
-            "$(grep -cE '^[[:space:]]*RESULT:[[:space:]]+[A-Za-z0-9_]+/[A-Za-z0-9_-]+:[[:space:]]*no_[A-Za-z0-9@_-]*_line_in_arm_output' "$TDIR/e2e.out" || true)" '^[1-9]'; then
+            "$(grep -cE "$ATTR_RE" "$TDIR/e2e.out" || true)" '^[1-9]'; then
       echo "  ok    e2e: the REAL harness refuses a batch whose arms all died (rc=2)"
     else
       echo "  FAIL  e2e-dead-stub: the harness did not refuse a batch in which"
@@ -623,7 +633,9 @@ STUB
     run_harness "@prefill" ".prefill"; e2e_pf_rc=$?
     if pred_expect_present "e2e-prefill-rc2" "$e2e_pf_rc" '^2$' \
        && pred_expect_present "e2e-prefill-attributes-the-signature-to-an-arm" \
-            "$(grep -cE '^[[:space:]]*RESULT:[[:space:]]+[A-Za-z0-9_]+/[A-Za-z0-9_-]+:[[:space:]]*no_prefill_line_in_arm_output' "$TDIR/e2e.prefill.out" || true)" '^[1-9]'; then
+            "$(grep -cE "$ATTR_RE" "$TDIR/e2e.prefill.out" || true)" '^[1-9]' \
+       && pred_expect_present "e2e-prefill-really-harvested-the-prefill-phase" \
+            "$(grep -c 'no_prefill_line_in_arm_output' "$TDIR/e2e.prefill.out" || true)" '^[1-9]'; then
       echo "  ok    e2e-prefill: the SAME assertion holds at a NON-default phase"
       echo "        (@prefill) -- so 'matches any phase' is real, not a hardcoded"
       echo "        @decode that happens to work"
