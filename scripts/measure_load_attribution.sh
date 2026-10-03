@@ -104,12 +104,25 @@ echo
 echo "load1 before the arm: $(load1)"
 echo "settling so the reading means something (the loadavg is a 1-minute average,"
 echo "so a reading taken straight after another run describes THAT run) ..."
+settled=0
 for _ in $(seq 1 40); do
   l="$(load1)"
-  awk -v l="$l" 'BEGIN{exit !(l < 1.0)}' && break
+  if awk -v l="$l" 'BEGIN{exit !(l < 1.0)}'; then settled=1; break; fi
   sleep 15
 done
 sleep 15
+if [ "$settled" != "1" ]; then
+  # *** REFUSE, do not measure anyway. *** The first version printed "settled at"
+  # regardless and ran the arm on a busy box, which is the whole discipline this
+  # repo exists to enforce applied to my own new script -- and the number it would
+  # have produced would have been about a box in the middle of something else.
+  # Found by running it: the loop timed out and the label still said "settled".
+  echo "FAIL: the box never settled to load1 < 1.0 within 600s (now $(load1))."
+  echo "  Attribution measured on a box that is already busy answers a different"
+  echo "  question, and this repo has retracted figures for exactly that. Nothing"
+  echo "  was measured. Re-run when the box is free."
+  exit 1
+fi
 echo "load1 settled at    : $(load1)"
 echo
 
@@ -146,15 +159,21 @@ awk -v n="$n" -v q="$QLOAD" '
     crosses = (ml >= q) ? "yes" : "no"
     printf "did load1 cross %-2s      : %s\n", q, crosses
     print ""
-    if (med_l < q)
+    # NOTE THE BRACED `} else {`. The first version wrote the branches as bare
+    # multi-line `print` sequences under a newline-separated `else`, which awk
+    # parses as a statement ending at the newline -- it died with a syntax error at
+    # the word `else`. Found by RUNNING the script, not by reading it, which is the
+    # only reason this is fixed rather than shipped.
+    if (med_l < q) {
       print "VERDICT: the arm is NOT what keeps the box over the threshold -- its"
       print "         MEDIAN load is below it. Waiting for a quiet box IS the right"
       print "         advice; on this host it means no desktop compositor and no"
       print "         sibling session, not merely a low reading."
-    else
+    } else {
       print "VERDICT: the arm itself holds load1 at or above the threshold, so"
       print "         \"wait for a quiet box\" is NECESSARY AND NOT SUFFICIENT."
       print "         Do NOT respond by lowering the threshold."
+    }
   }' "$SAMPLES"
 
 echo
