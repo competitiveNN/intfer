@@ -438,13 +438,29 @@ echo "tree must be clean; logs -> $LOG_DIR"
 
 # S0: baseline. The checker must PASS on the unmutated tree, or the matrix would
 # be scoring states against a checker that is already broken.
-echo "--- S0 baseline (must be rc=0) ---"
+# *** S0 ACCEPTS rc=2, AND *REQUIRES* IT TO BE EXPLAINED. *** Measured 2026-10-03:
+# the box dropped to ONE enumerated GPU, and the checker correctly answered
+# UNPROVEN (exit 2) because the doc tally describes a two-GPU configuration this
+# box cannot run. The baseline demanded rc=0 and therefore reported "the checker
+# does not pass on a clean tree" -- i.e. it called a CORRECT verdict a broken
+# checker, which is the always-red twin of the vacuous green.
+#
+# So the healthy baseline is "rc 0, or rc 2 WITH the UNPROVEN diagnostic". A bare
+# rc=2 with no explanation is still a failure, exactly as the device-precond healthy
+# column requires ("a 2 must be explained"). Over-asserting here is how a
+# correctness gate becomes a flaky gate.
+echo "--- S0 baseline (rc=0, or rc=2 WITH its UNPROVEN diagnostic) ---"
 bash "$TGT" >"$LOG_DIR/S0_clean.log" 2>&1
-if [ $? -eq 0 ]; then
-  echo "  S0   rc=0  AS EXPECTED (clean tree)" | tee -a "$SUMMARY"
+s0_rc=$?
+if [ "$s0_rc" -eq 0 ]; then
+  echo "  S0   rc=0  AS EXPECTED (clean tree, 2-GPU box)" | tee -a "$SUMMARY"
+elif [ "$s0_rc" -eq 2 ] && grep -q 'GATE INVENTORY: UNPROVEN' "$LOG_DIR/S0_clean.log"; then
+  echo "  S0   rc=2  AS EXPECTED (box cannot run the documented configuration;" | tee -a "$SUMMARY"
+  echo "        the UNPROVEN diagnostic is present, so this is a BOX verdict)" | tee -a "$SUMMARY"
 else
-  echo "  S0   FAILED -- the checker does not pass on a clean tree, so every" | tee -a "$SUMMARY"
-  echo "    state below would be scored against a broken baseline" | tee -a "$SUMMARY"
+  echo "  S0   FAILED -- rc=$s0_rc on a clean tree. rc=0 is healthy and rc=2 WITH" | tee -a "$SUMMARY"
+  echo "    the UNPROVEN diagnostic is healthy; anything else means the checker" | tee -a "$SUMMARY"
+  echo "    is broken, and every state below would be scored against it." | tee -a "$SUMMARY"
   FAILED=$((FAILED + 1))
 fi
 
