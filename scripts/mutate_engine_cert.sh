@@ -56,7 +56,43 @@ restore_check() { cp "$ORIG_C" "$MUT"; }
 
 OLD="$(git -C "$ROOT" rev-list --max-parents=0 HEAD | head -1)"
 HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD)"
-HEAD_PARENT="$(git -C "$ROOT" rev-parse HEAD~1)"
+
+# DERIVED, NOT ASSUMED: the newest commit that touched NO engine input.
+#
+# E-A used to plant the artifact at `HEAD~1` and assert the checker says "carries",
+# which silently ASSUMES the most recent commit is tooling-only. It stopped being
+# true the moment a session ended on an engine commit -- measured 2026-10-03: HEAD
+# was the E4 probe-coverage commit, which edits examples/dpas_fold_probe/main.cpp,
+# so "carries" was the WRONG answer and E-A scored MISSED. The checker was right and
+# the state was mis-specified; that is the safe direction to fail in, but a state
+# whose PASS condition is an unstated property of whatever the last session happened
+# to commit is a flaky gate, which is how correctness gates get disabled.
+#
+# The scan is written INDEPENDENTLY of check_engine_cert.sh's own filter (on
+# purpose -- a state that shares the code it tests cannot catch that code being
+# wrong; that is the AUDIT #12 S4 blindness). It is a superset: it treats
+# scripts/_ec_mutant.sh as an engine input too, which the checker does not, so a
+# commit this picks is provably tooling-only under EITHER rule.
+derive_last_tooling_only() {
+  git -C "$ROOT" rev-list --max-count=60 HEAD | while read -r sha; do
+    local files
+    files="$(git -C "$ROOT" diff-tree --no-commit-id --name-only -r "$sha")"
+    [ -n "$files" ] || continue   # empty commit: identical tree, carries by definition
+    if ! printf '%s\n' "$files" | grep -qE \
+         '^(src/|examples/|include/|scripts/test_|scripts/setvars\.sh|scripts/_gate_|scripts/_ec_mutant\.sh)'; then
+      echo "$sha"; return 0
+    fi
+  done
+}
+TOOLING_ONLY="$(derive_last_tooling_only || true)"
+if [ -z "$TOOLING_ONLY" ]; then
+  echo "FAIL: no tooling-only commit in the last 60 -- E-A cannot be posed"
+  echo "      (a state needs a commit where NO engine input moved)."
+  exit 2
+fi
+echo "== E-A anchor =="
+echo "  ok    newest tooling-only commit: $(git -C "$ROOT" rev-parse --short "$TOOLING_ONLY")"
+echo "        (derived by scanning history; HEAD~1 would have been assumed)"
 
 echo "== stamp-population leak assertion (AS FOUND) =="
 pop_assert_no_leak "before" || exit 1
@@ -95,7 +131,20 @@ echo "== states =="
 
 # E-A: a TOOLING-only commit must NOT invalidate a 45-minute engine run. This is
 # the state that stops the check from being so aggressive that people disable it.
-plant "$HEAD_PARENT"
+#
+# Planted at a DERIVED tooling-only commit, not at HEAD~1 -- see derive_last_tooling_only
+# above for why assuming "the newest commit is tooling-only" is a flaky precondition.
+# The anchor is ASSERTED here too: if the derivation ever returns a commit that
+# actually moved an engine input, the state would silently become a second E-B and
+# report "the converse is broken" about a premise that is simply false.
+ea_files="$(git -C "$ROOT" diff-tree --no-commit-id --name-only -r "$TOOLING_ONLY")"
+if [ -n "$ea_files" ] && printf '%s\n' "$ea_files" | grep -qE \
+     '^(src/|examples/|include/|scripts/test_|scripts/setvars\.sh|scripts/_gate_|scripts/_ec_mutant\.sh)'; then
+  echo "  E-A MISSED -- ANCHOR FAULT: the derived commit moves an engine input"
+  printf '%s\n' "$ea_files" | sed 's/^/          /'
+  exit 1
+fi
+plant "$TOOLING_ONLY"
 check_state "E-A" 0 'carries to HEAD' "a tooling-only commit must not invalidate the engine run"
 
 # E-B: an ENGINE input moving must invalidate it. The load-bearing state.
