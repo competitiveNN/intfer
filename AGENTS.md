@@ -2947,15 +2947,88 @@ e.g. S3's contract column is 40 not 42).
 - **TWO STATE FAILURES WORTH RECORDING, because both were the harness's own guards
   firing for the wrong reason — and the predicate caught it.**
   - N-Q first scored rc=1 with **neither** guard message: the empty sandbox was not
-    a git work tree, so the dirty-tree guard died at its own `git diff --quiet`
-    before 0b or 0c ran. `ROOT` is `dirname(SCRIPT_DIR)`, so that directory has to
-    be a *checkout*; it now lives inside the sandbox repo, where untracked files
-    are fine. A state that fails for an unrelated cause is worse than a MISSED one.
+  a git work tree, so the dirty-tree guard died at its own `git diff --quiet`
+  before 0b or 0c ran. `ROOT` is `dirname(SCRIPT_DIR)`, so that directory has to
+  be a *checkout*; it now lives inside the sandbox repo, where untracked files
+  are fine. A state that fails for an unrelated cause is worse than a MISSED one.
   - The 12/13 `MISSED N-P` result in the record is **resolved**: the sandbox
-    population fix landed in `edfa21b`, after which the matrix reported
-    `caught=13/13 baselines=13/13`, and it now reports **16/16** (N-P, N-Q, N-R,
-    N-S added). Read the live figures from `build/run_all_mutate/last_pass.stamp`,
-    never from a paragraph like this one.
+  population fix landed in `edfa21b`, after which the matrix reported
+  `caught=13/13 baselines=13/13`, and it now reports **16/16** (N-P, N-Q, N-R,
+  N-S added). Read the live figures from `build/run_all_mutate/last_pass.stamp`,
+  never from a paragraph like this one.
+- **`scripts/check_stack_cert.sh` — THE CERT IS NOW A CHECK, NOT A CLAIM.** For
+  three sessions running, every session hand-ran the same six probes (cert sha vs
+  HEAD, rc, stale/unproven, tree clean, lock absent, census) before it could say
+  "the stack passes" — and one of them mis-quoted a mid-sequence failure as the
+  final state. That is **AUDIT #22's shape applied to the harness that certifies
+  everything else**, so it is now mechanised, as the sibling `check_engine_cert.sh`
+  mechanises the ten_gates certificate. The difference is the design, not an
+  oversight: `check_engine_cert.sh` has a **carries** case (a tooling-only commit
+  must not invalidate a 45-minute *engine* certification), while this has **none**,
+  because the stack's rule is that every stamp names HEAD — any commit makes the
+  evidence older than the tree, so the only honest answers are CERTIFIED (rc=0) or
+  RE-RUN (rc=1). Softening it to "carries" would reopen the gap.
+  - **It CANNOT BE A STEP OF THE STACK, and that is now a declaration, not a
+  accident** (`# POST-STACK:` in its own header, honoured by 0c). Measured: wired
+  in as a step it could only ever report STALE — a step runs *before* the stack
+  writes its certificate — so a PASS stack became FAIL, naming the previous
+  commit. The declaration is read **from the file** (no hand-maintained list),
+  must be in the first **40 lines** so a body mention cannot exempt anything, and
+  the exemption is **printed**, so it can never be quiet.
+  - **Its census cross-check paid on the first run**: adding the file moved the tree
+  to 32/15 while the cert said 31/14, and the checker said STALE. The four counts
+  (`scripts`/`checks`/`matrices`/`stamps`+`stamp_dirs`) are re-derived from the
+  filesystem every time, because quoting them in prose is what produced the
+  "14 checkers, 18 matrices" confusion in the first place.
+  - **Seven self-check cases, and they caught three defects of mine**: a **numeric**
+  emptiness test pointed at a hex sha (`enum_require_nonempty` tests `-gt 0`, so
+  every cert read as having no sha); a **hard-coded census** in the RESULT footer —
+  the exact hand-counted citation the file exists to refuse, printed by the very
+  checker that refuses it; and a fixture that baked the **live** census into a
+  nested run whose redirected build dir had none. The self-check is **first and
+  gating**, and nested runs skip it via `INTFER_STACK_CERT_NO_SELFCHECK=1` **and
+  say so** — the first version had no recursion guard and the call *timed out*,
+  which is worse than failing.
+  - **Two seams, both required**: `INTFER_BUILD_DIR` (the artifact) and
+  `INTFER_STACK_CERT_ROOT` (the **checkout**). Without the second, the
+  dirty-tree branch judged the real tree and could not be exercised at all.
+  - **`mutate_stack_cert.sh`: 3/3**, aimed at what the self-check structurally
+  **cannot** see, because every fixture derives its census from the same
+  expression the verdict uses (the AUDIT #12 S4 shape). S-A breaks the census
+  derivation, S-C widens the comparison. **S-B could not use the shared `rc != 0`
+  predicate**: neutering the dirty-tree guard turns rc 1 into **rc 0**, so the
+  mutation makes the checker exit *zero* where it must exit non-zero, and the
+  first run reported it MISSED for a state whose defect had reproduced perfectly.
+  Both halves are asserted explicitly, starting with the case's real proof — the
+  unmutated checker must refuse a dirty tree at all.
+- **THE `patch_literal` DUPLICATION TRIGGER FIRED FOR REAL — AND IT WAS WORSE THAN
+  A DRIFT.** `mutate_run_all_checks.sh` carries its own copy (it must commit after
+  patching; the shared helper does not), and that copy ended with `commit_mutant` —
+  so the **function returned COMMIT's status and python's non-zero exit was
+  discarded**. Measured consequence: N-P's anchor drifted, `patch_literal` refused
+  correctly (`anchor found 0 times, want 1`), and the `|| fail` guard **never
+  fired**: the run continued and the state reported *"defect NOT reproduced"*, which
+  reads as "this state is weak" and is entirely wrong — **nothing had been
+  mutated**. **Every state in that matrix shared the hole**, so a silent patch
+  failure anywhere was being reported as an un-reproduced defect. The copy now
+  fails closed. The recorded reason to keep the copies was that each is exercised
+  whenever its matrix runs — which presumes they behave like the shared helper.
+  - N-P's anchor is **re-pointed** (never loosened) and **pre-flighted**, and the
+  matrix prints `anchor pre-flight: ok (10/10 targets located exactly once)`.
+  The same treatment `mutate_bench_load_gate.sh` got in AUDIT #28 for the
+  identical class: a drifted anchor must fail in the first second, not masquerade
+  as a weak state after thirteen baselines.
+  - **N-P's predicate also matched a name's POSITION**: 0c prints unscheduled
+  scripts in **glob order**, so the message read `…: mutate_stack_cert.sh
+  mutate_verdict_scope.sh` and the exact-match string missed a name that was
+  present. Now two facts are asserted — 0c **refused** an unscheduled step, and it
+  **named this step** — the AGENTS.md "write the predicate from what is actually
+  printed" rule, one level down.
+- **TWO MORE OF MY OWN, FOR THE RECORD.** A `python3 - <<'PY'` heredoc inside
+  another heredoc terminated the outer one (use distinct delimiters). And a commit
+  message containing **backticks** made `git -m` run `if` as a command
+  substitution — the commit succeeded, the message did not survive. **No backticks
+  in commit messages.**
 
 - **THE STANDING BLOCKER ON 27B WALL-TIME — *SUPERSEDED 2026-10-02, READ THE ENTRY
       BELOW; THIS TEXT IS THE RECORD OF A PROCESS THAT NO LONGER EXISTS*.**
