@@ -417,6 +417,14 @@ def_n_f() { grep -q 'step(s) unproven' "$WORK/N-F.log" && ! grep -q '(re-run)' "
 def_n_w() { grep -q 'SELFCHECK: sc_stale exited' "$WORK/N-W.log" \
             && grep -q 'classifier self-check did not hold' "$WORK/N-W.log"; }
 def_n_w_converse() { ! grep -q 'SELFCHECK' "$WORK/N-W.baseline.log"; }
+# N-X: the CONVERSE of N-W, and the half that gets forgotten. N-W proves the map
+# can fire; N-X makes it GLOBAL -- every rc=1 becomes `stale` -- so if the
+# self-check has no converse case the whole stack's verdict vocabulary silently
+# degrades to "nothing is ever a failure" and every run would exit 0. This state
+# is therefore not a nicety: it is the only thing standing between a broken
+# classifier and a permanently green stack.
+def_n_x() { grep -q 'SELFCHECK: sc_stale_converse exited' "$WORK/N-X.log" \
+            && grep -q 'classifier self-check did not hold' "$WORK/N-X.log"; }
 # Anchored on the FAIL line specifically. A bare grep for 'untracked residue'
 # also matches the SUCCESS branch ("ok  no new untracked files ..."), so the
 # predicate was never true -- the first version of this state could not be caught.
@@ -472,6 +480,11 @@ A_SELFCHK='return $bad'
 # not the run's exit code: the self-check exits 1, which the runner also uses for
 # a real regression, so "rc != 0" would be satisfied by any unrelated abort.
 A_STALEMAP='  if [ "${2:-}" = "check_engine_cert.sh" ] && [ "$1" = "1" ]; then'
+# N-X uses the SAME anchor line as N-W, and that is sound: each state resets the
+# sandbox to pristine before patching, so neither can see the other's damage.
+# They must be told apart by their PREDICATE, not by their anchor -- the same
+# reason B-F is marked on a harness name rather than a shared marker.
+A_STALEMAP_GLOBAL='  if [ "$1" = "1" ]; then  #MUTATION N-X'
 A_DERIVE='UNPROVEN_LABELS="$UNPROVEN_LABELS $label"'
 # The WHOLE four-line block, not just its first line: the first attempt anchored
 # on line 1 alone, the patch replaced it with a one-liner, and the three
@@ -545,6 +558,7 @@ baseline "N-E" "step_ok"     "$ALL_CURRENT" 0 ""                              # 
 # self-check always complains would satisfy def_n_w and the matrix would prove
 # only that a self-check can fail -- not that this map is what makes it quiet.
 baseline "N-W" "step_ok"     "$ALL_CURRENT" 0 "" def_n_w_converse
+baseline "N-X" "step_ok"     "$ALL_CURRENT" 0 "" def_n_w_converse
 baseline "N-F" "step_flaky2" "$ALL_CURRENT" 0 "ok (evidence now current)"       # re-run works
 baseline "N-G" "step_litter" "$ALL_CURRENT" 1 "untracked residue left behind" yes
 baseline "N-H" "step_escalate" "$ALL_CURRENT" 1 "REGRESSED rc=1"
@@ -717,6 +731,12 @@ patch_literal "$MUTANT" "$A_STALEMAP" '  if false; then  #MUTATION N-W'
 verify_patched N-W
 run_state "N-W" "a STALE engine cert classified as a failure; the self-check must catch it" \
   def_n_w "step_ok" "$ALL_CURRENT"
+
+reset_mutant
+patch_literal "$MUTANT" "$A_STALEMAP" "$A_STALEMAP_GLOBAL"
+verify_patched N-X
+run_state "N-X" "the STALE map made GLOBAL: rc=1 is stale everywhere, so the converse case must catch it" \
+  def_n_x "step_ok" "$ALL_CURRENT"
 
 reset_mutant
 patch_literal "$MUTANT" "$A_DERIVE" 'UNPROVEN_LABELS=""'
