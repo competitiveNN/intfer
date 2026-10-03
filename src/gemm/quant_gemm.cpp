@@ -1045,8 +1045,50 @@ sycl::event quant_gemm_dpas48_rowfold(sycl::queue& q,
   });
 }
 
-sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
-                              sycl::event dep) {
+// ---------------------------------------------------------------------------
+// DPAS48 with a COOPERATIVE 2D WORK-ITEM BLOCK (E4, default OFF).
+//
+// R == 1 is the shipped geometry: one WI per (row m, 16-N tile t). R > 1 gives
+// one WI a 2D block of R rows x ONE tile, so the B op-tile is fetched once per
+// op and reused across R rows, instead of being re-fetched by every row's WI.
+// This is exactly the load-replication half that E3 (INTFER_DPAS48_FOLD)
+// deliberately left alone: E3 removed the ARITHMETIC replication, this removes
+// the LOAD.
+//
+// WHY IT IS BIT-EXACT, and why that is a design property rather than luck:
+// every row still accumulates acc_tile[r][nl] over ops o = 0..nOp-1 in the same
+// order, with the same expression and the same operands. Sharing vb across rows
+// reorders no FP32 add at all. The hazard E4's numerics contract was written
+// for -- per-block partial sums combined in a different order -- DOES NOT ARISE
+// in this geometry, because there are no partial sums: there is one
+// accumulator per (row, tile), exactly as before.
+//
+// Per that contract, identity must still be CHECKED and REPORTED, never turned
+// into the gate; the tolerance gate (backward_err / ULP / fraction-changed) stays
+// the gate. That contract also warned that a real kernel "may need a different
+// bound" because its numbers came from a SYNTHETIC term generator. Measured
+// against the real kernel, this geometry is exactly identical, so the question
+// is answered rather than assumed -- see the E4 readback arms in
+// scripts/test_dpas_fold.sh.
+//
+// NOT the same experiment as INTFER_DPAS_ROW (quant_gemm_dpas4_row), which put
+// the whole TILE LOOP inside one WI and measured ~460x SLOWER because it
+// collapsed occupancy. Here tile parallelism is preserved exactly -- one 16-N
+// tile per WI, WI-per-tile parallelism kept -- and only the ROW count per tile
+// grows. That is what the "real cooperation" warning in that experiment's
+// comment asks for, and it is why this design does not repeat its failure.
+// ---------------------------------------------------------------------------
+// A SYCL kernel NAME is a type, and a templated kernel name therefore has to
+// exist as a declared (never defined, never instantiated) class template before
+// it can be named in parallel_for<...>. Instantiating it for R==1 and R==2 is
+// what gives the two geometries distinct kernel identities.
+template <uint32_t R>
+class gemm_dpas48_tiled_kernel;
+
+namespace {
+template <uint32_t R>
+sycl::event dpas48_tiled(sycl::queue& q, const Dpas48Params& p,
+                         sycl::event dep) {
 #ifdef INTFER_PROFILE_GPU
   profile_note_launch();
 #endif
@@ -1065,7 +1107,7 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
   const uint8_t* B = static_cast<const uint8_t*>(p.code_dpas);
   const auto BPrec = (p.bits == 4) ? dpas_argument_type::u4
                      : (p.bits == 2) ? dpas_argument_type::u2
-                                     : dpas_argument_type::u8;
+                                      : dpas_argument_type::u8;
   // INT2/G16 needs a masked-A second DPAS per op (linearity split);
   // every other (bits, G) combo is 1 DPAS/op.
   const bool need_split = (p.bits == 2 && G == 16);
@@ -1075,146 +1117,217 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
   // INTFER_DPAS48_FOLD: when the caller ran quant_gemm_dpas48_rowfold, the
   // per-(row,op) sums are precomputed and every tile WI just reads them,
   // instead of redoing the identical O(K) integer fold once per 16-N tile.
-  // Exact int32 values, so this is a pure work hoist — not a numeric change.
+  // Exact int32 values, so this is a pure work hoist -- not a numeric change.
   // One shared layout rule with the writer (fold_readable): a fold buffer
   // whose stride does not clear 2*nOp is IGNORED and the kernel falls back to
   // the inline fold, rather than reading Sfull out of the wrong row's S0.
   const uint32_t fold_stride = fold_row_stride(p.fold_stride, nOp);
   const std::int32_t* Fold = fold_readable(p.fold_usm, p.fold_stride, nOp);
 
-  // One WI per (row m, 16-N tile t). B op-tiles reload per WI (L1-resident
-  // across the M rows of a tile); A is per-row. Same fold math as the M=1
-  // probe (probe_dpas_fold.cpp T5/T6, 1e-16 exact).
+  // One WI per (row-group of R, 16-N tile t). B op-tiles reload per WI (L1-
+  // resident across the M rows of a tile); A is per-row. Same fold math as the
+  // M=1 probe (probe_dpas_fold.cpp T5/T6, 1e-16 exact).
   const uint32_t nWG = 16;
-  const uint32_t n_blocks = M * nT;
+  const uint32_t nMG = (M + R - 1) / R;
+  const uint32_t n_blocks = nMG * nT;
   const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
 
   return q.submit([&](sycl::handler& h) {
     if (dep != sycl::event{}) h.depends_on(dep);
-    h.parallel_for<class gemm_dpas48_m1_kernel>(
+    h.parallel_for<class gemm_dpas48_tiled_kernel<R>>(
         sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
         [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
           const uint32_t block = it.get_global_id(0);
           if (block >= n_blocks) return;
-          const uint32_t m = block / nT;
+          // NOTE the decode is (t = block % nT) FIRST, then the row group. At
+          // R==1 that is bit-for-bit the shipped mapping (m = block / nT,
+          // t = block % nT), so the default path is unchanged -- which is why
+          // this can be one template instead of a second copy of the math.
           const uint32_t t = block % nT;
-          const std::int8_t* Aq = p.act_int8 + (size_t)m * act_stride;
-          const float* As = p.act_scale + (size_t)m * as_stride;
-          float acc_tile[TN];
-          for (uint32_t nl = 0; nl < TN; ++nl) acc_tile[nl] = 0.0f;
+          const uint32_t mg = block / nT;
+          const uint32_t m0 = mg * R;
+          const std::int8_t* Aq[R];
+          const float* As[R];
+          float acc_tile[R][TN];
+#pragma unroll
+          for (uint32_t r = 0; r < R; ++r) {
+            const uint32_t m = m0 + r;
+            Aq[r] = p.act_int8 + (size_t)m * act_stride;
+            As[r] = p.act_scale + (size_t)m * as_stride;
+#pragma unroll
+            for (uint32_t nl = 0; nl < TN; ++nl) acc_tile[r][nl] = 0.0f;
+          }
           for (uint32_t o = 0; o < nOp; ++o) {
             const uint32_t k0 = o * OP;
-            simd<std::int8_t, OP> va;
-            va.copy_from(Aq + k0);
-            const float as = As[k0 / GA];
+            const uint32_t g = k0 / G;
             if (BPrec == dpas_argument_type::u4) {
               simd<uint8_t, 256> vb;  // op_bytes(u4) = 32*16*4/8
               vb.copy_from(B + ((size_t)t * nOp + o) * op_bytes);
-              simd<int, TN> c;
-              c = dpas<8, 1, int, uint8_t, std::int8_t,
-                       dpas_argument_type::u4, dpas_argument_type::s8>(vb, va);
-              int S;
-              if (Fold) S = Fold[fold_index_sfull(m, fold_stride, nOp, o)];
-              else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }
-              const uint32_t g = k0 / G;
-              for (uint32_t nl = 0; nl < TN; ++nl) {
-                const uint32_t n = t * TN + nl;
-                const float ws = static_cast<float>(
-                    sycl::bit_cast<sycl::half>(
-                        p.scale_usm[(size_t)n * nG + g]));
-                acc_tile[nl] += as * ws * alpha *
-                                (2.0f * (float)c[nl] - 15.0f * (float)S) *
-                                Cinv;
+#pragma unroll
+              for (uint32_t r = 0; r < R; ++r) {
+                const uint32_t m = m0 + r;
+                if (m >= M) continue;
+                simd<std::int8_t, OP> va;
+                va.copy_from(Aq[r] + k0);
+                const float as = As[r][k0 / GA];
+                simd<int, TN> c;
+                c = dpas<8, 1, int, uint8_t, std::int8_t,
+                         dpas_argument_type::u4, dpas_argument_type::s8>(vb, va);
+                int S;
+                if (Fold) S = Fold[fold_index_sfull(m, fold_stride, nOp, o)];
+                else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }
+#pragma unroll
+                for (uint32_t nl = 0; nl < TN; ++nl) {
+                  const uint32_t n = t * TN + nl;
+                  const float ws = static_cast<float>(
+                      sycl::bit_cast<sycl::half>(
+                          p.scale_usm[(size_t)n * nG + g]));
+                  acc_tile[r][nl] += as * ws * alpha *
+                                  (2.0f * (float)c[nl] - 15.0f * (float)S) *
+                                  Cinv;
+                }
               }
             } else if (BPrec == dpas_argument_type::u8) {
               simd<uint8_t, 512> vb;  // op_bytes(u8) = 32*16*8/8
               vb.copy_from(B + ((size_t)t * nOp + o) * op_bytes);
-              simd<int, TN> c;
-              c = dpas<8, 1, int, uint8_t, std::int8_t,
-                       dpas_argument_type::u8, dpas_argument_type::s8>(vb, va);
-              int S;
-              if (Fold) S = Fold[fold_index_sfull(m, fold_stride, nOp, o)];
-              else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }
-              const uint32_t g = k0 / G;
-              for (uint32_t nl = 0; nl < TN; ++nl) {
-                const uint32_t n = t * TN + nl;
-                const float ws = static_cast<float>(
-                    sycl::bit_cast<sycl::half>(
-                        p.scale_usm[(size_t)n * nG + g]));
-                acc_tile[nl] += as * ws * alpha *
-                                (2.0f * (float)c[nl] - 255.0f * (float)S) *
-                                Cinv;
+#pragma unroll
+              for (uint32_t r = 0; r < R; ++r) {
+                const uint32_t m = m0 + r;
+                if (m >= M) continue;
+                simd<std::int8_t, OP> va;
+                va.copy_from(Aq[r] + k0);
+                const float as = As[r][k0 / GA];
+                simd<int, TN> c;
+                c = dpas<8, 1, int, uint8_t, std::int8_t,
+                         dpas_argument_type::u8, dpas_argument_type::s8>(vb, va);
+                int S;
+                if (Fold) S = Fold[fold_index_sfull(m, fold_stride, nOp, o)];
+                else { S = 0; for (uint32_t k = 0; k < OP; ++k) S += va[k]; }
+#pragma unroll
+                for (uint32_t nl = 0; nl < TN; ++nl) {
+                  const uint32_t n = t * TN + nl;
+                  const float ws = static_cast<float>(
+                      sycl::bit_cast<sycl::half>(
+                          p.scale_usm[(size_t)n * nG + g]));
+                  acc_tile[r][nl] += as * ws * alpha *
+                                  (2.0f * (float)c[nl] - 255.0f * (float)S) *
+                                  Cinv;
+                }
               }
             } else {
               // u2: K=32 op, E=16 rows/dword, 32*16*2/8 = 128B.
               simd<uint8_t, 128> vb;
               vb.copy_from(B + ((size_t)t * nOp + o) * op_bytes);
               if (!need_split) {
-                simd<int, TN> c;
-                c = dpas<8, 1, int, uint8_t, std::int8_t,
-                         dpas_argument_type::u2, dpas_argument_type::s8>(vb, va);
-                int S = 0;
-                for (uint32_t k = 0; k < OP; ++k) S += va[k];
-                const uint32_t g = k0 / G;
-                for (uint32_t nl = 0; nl < TN; ++nl) {
-                  const uint32_t n = t * TN + nl;
-                  const float ws = static_cast<float>(
-                      sycl::bit_cast<sycl::half>(
-                          p.scale_usm[(size_t)n * nG + g]));
-                  acc_tile[nl] += as * ws * alpha *
-                                  (2.0f * (float)c[nl] - 3.0f * (float)S) *
-                                  Cinv;
+#pragma unroll
+                for (uint32_t r = 0; r < R; ++r) {
+                  const uint32_t m = m0 + r;
+                  if (m >= M) continue;
+                  simd<std::int8_t, OP> va;
+                  va.copy_from(Aq[r] + k0);
+                  const float as = As[r][k0 / GA];
+                  simd<int, TN> c;
+                  c = dpas<8, 1, int, uint8_t, std::int8_t,
+                           dpas_argument_type::u2, dpas_argument_type::s8>(vb, va);
+                  int S = 0;
+                  for (uint32_t k = 0; k < OP; ++k) S += va[k];
+#pragma unroll
+                  for (uint32_t nl = 0; nl < TN; ++nl) {
+                    const uint32_t n = t * TN + nl;
+                    const float ws = static_cast<float>(
+                        sycl::bit_cast<sycl::half>(
+                            p.scale_usm[(size_t)n * nG + g]));
+                    acc_tile[r][nl] += as * ws * alpha *
+                                    (2.0f * (float)c[nl] - 3.0f * (float)S) *
+                                    Cinv;
+                  }
                 }
               } else {
                 // G16 split: T_full on va, T_0 on va masked to first 16.
-                simd<int, TN> cf, c0;
-                cf = dpas<8, 1, int, uint8_t, std::int8_t,
-                          dpas_argument_type::u2, dpas_argument_type::s8>(vb, va);
-                simd<std::int8_t, OP> va0(0);
-                int S0, Sf;
-                if (Fold) {
-                  S0 = Fold[fold_index_s0(m, fold_stride, o)];
-                  Sf = Fold[fold_index_sfull(m, fold_stride, nOp, o)];
-                  for (uint32_t k = 0; k < 16; ++k) va0[k] = va[k];
-                } else {
-                  S0 = 0;
-                  for (uint32_t k = 0; k < 16; ++k) {
-                    va0[k] = va[k];
-                    S0 += va[k];
+#pragma unroll
+                for (uint32_t r = 0; r < R; ++r) {
+                  const uint32_t m = m0 + r;
+                  if (m >= M) continue;
+                  simd<std::int8_t, OP> va;
+                  va.copy_from(Aq[r] + k0);
+                  const float as = As[r][k0 / GA];
+                  simd<int, TN> cf, c0;
+                  cf = dpas<8, 1, int, uint8_t, std::int8_t,
+                            dpas_argument_type::u2, dpas_argument_type::s8>(vb, va);
+                  simd<std::int8_t, OP> va0(0);
+                  int S0, Sf;
+                  if (Fold) {
+                    S0 = Fold[fold_index_s0(m, fold_stride, o)];
+                    Sf = Fold[fold_index_sfull(m, fold_stride, nOp, o)];
+                  } else {
+                    S0 = 0;
+                    for (uint32_t k = 0; k < 16; ++k) {
+                      va0[k] = va[k];
+                      S0 += va[k];
+                    }
+                    Sf = S0;
+                    for (uint32_t k = 16; k < OP; ++k) Sf += va[k];
                   }
-                  Sf = S0;
-                  for (uint32_t k = 16; k < OP; ++k) Sf += va[k];
-                }
-                c0 = dpas<8, 1, int, uint8_t, std::int8_t,
-                          dpas_argument_type::u2, dpas_argument_type::s8>(vb, va0);
-                const uint32_t g0 = k0 / G, g1 = g0 + 1;
-                for (uint32_t nl = 0; nl < TN; ++nl) {
-                  const uint32_t n = t * TN + nl;
-                  const float ws0 = static_cast<float>(
-                      sycl::bit_cast<sycl::half>(
-                          p.scale_usm[(size_t)n * nG + g0]));
-                  const float ws1 = static_cast<float>(
-                      sycl::bit_cast<sycl::half>(
-                          p.scale_usm[(size_t)n * nG + g1]));
-                  const float T0 = (float)c0[nl], Tf = (float)cf[nl];
-                  const float T1 = Tf - T0;
-                  const float S1 = (float)(Sf - S0);
-                  acc_tile[nl] += as * alpha *
-                                  ((2.0f * T0 - 3.0f * (float)S0) * ws0 +
-                                   (2.0f * T1 - 3.0f * S1) * ws1) *
-                                  Cinv;
+                  c0 = dpas<8, 1, int, uint8_t, std::int8_t,
+                            dpas_argument_type::u2, dpas_argument_type::s8>(vb, va0);
+                  const uint32_t g0 = k0 / G, g1 = g0 + 1;
+#pragma unroll
+                  for (uint32_t nl = 0; nl < TN; ++nl) {
+                    const uint32_t n = t * TN + nl;
+                    const float ws0 = static_cast<float>(
+                        sycl::bit_cast<sycl::half>(
+                            p.scale_usm[(size_t)n * nG + g0]));
+                    const float ws1 = static_cast<float>(
+                        sycl::bit_cast<sycl::half>(
+                            p.scale_usm[(size_t)n * nG + g1]));
+                    const float T0 = (float)c0[nl], Tf = (float)cf[nl];
+                    const float T1 = Tf - T0;
+                    const float S1 = (float)(Sf - S0);
+                    acc_tile[r][nl] += as * alpha *
+                                    ((2.0f * T0 - 3.0f * (float)S0) * ws0 +
+                                     (2.0f * T1 - 3.0f * S1) * ws1) *
+                                    Cinv;
+                  }
                 }
               }
             }
           }
-          std::uint16_t oh[TN];
-          for (uint32_t nl = 0; nl < TN; ++nl)
-            oh[nl] = to_half_bits(acc_tile[nl]);
-          simd<std::uint16_t, TN> oc;
-          oc.copy_from(oh);
-          oc.copy_to(p.out_usm + (size_t)m * N + (size_t)t * TN);
+#pragma unroll
+          for (uint32_t r = 0; r < R; ++r) {
+            const uint32_t m = m0 + r;
+            if (m >= M) continue;
+            std::uint16_t oh[TN];
+            for (uint32_t nl = 0; nl < TN; ++nl)
+              oh[nl] = to_half_bits(acc_tile[r][nl]);
+            simd<std::uint16_t, TN> oc;
+            oc.copy_from(oh);
+            oc.copy_to(p.out_usm + (size_t)m * N + (size_t)t * TN);
+          }
         });
   });
+}
+}  // namespace
+
+sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
+                              sycl::event dep) {
+  return dpas48_tiled<1>(q, p, dep);
+}
+
+// E4 entry point. DECLINES below the block size rather than running a 2-row
+// block over a 1-row call: a decline is observable (the caller keeps the
+// shipped kernel and the stream is unchanged), whereas a "works at any M"
+// variant would hide a real precondition and make the flag's effect
+// unattributable. At M==1 -- i.e. all of decode -- E4 is inert BY CONSTRUCTION,
+// which is exactly what the gate asserts.
+sycl::event quant_gemm_dpas48_2d(sycl::queue& q, const Dpas48Params& p,
+                                 sycl::event dep) {
+  // Decline by RETURNING `dep` UNCHANGED, not a fresh event. That is what makes
+  // a decline observable at all: the caller passes a sentinel prerequisite and
+  // tests `e == dep`, because comparing against a bare sycl::event{} is NOT
+  // reliable across implementations (recorded in this probe's own NEG cases).
+  // Returning {} here instead would be undetectable whenever dep is non-empty.
+  if (p.M < 2) return dep;
+  return dpas48_tiled<2>(q, p, dep);
 }
 
 // ---------------------------------------------------------------------------

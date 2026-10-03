@@ -212,6 +212,43 @@ for tp in $TPS; do
   FOLDA="$(N=24 ids_of "$tp" INTFER_DPAS48_FOLD=1)"
   echo "TP=$tp [INTFER_DPAS48_FOLD=1 alone]: '$FOLDA'"
   [ "$FOLDA" = "$B24" ] || fail "TP=$tp [INTFER_DPAS48_FOLD=1 alone] '$FOLDA' != base '$B24'"
+
+  # --- INTFER_DPAS48_TILED arms (E4: cooperative 2D row block) ------------
+  # E4 gives each work-item 2 ROWS of ONE 16-N tile, so the B op-tile is fetched
+  # once per op and reused across both rows. It is BIT-EXACT with plain DPAS48 --
+  # each (row, tile) keeps one accumulator and still sums ops in the same order,
+  # so no FP32 add is reordered. That is why these are hard `==` assertions and
+  # not the E4 tolerance gate: the tolerance gate (backward_err / ULP / fraction)
+  # lives in examples/dpas_fold_probe and covers the GEOMETRY question, while
+  # this covers the ENGINE wiring, which a device-level probe cannot see.
+  #
+  # These arms exist because of a recorded failure mode: every flag nested inside
+  # DPAS48 was once vacuously green because the inner path never ran. E4 DECLINES
+  # at M<2, so the short-prompt arm below is the INERTNESS check (M=1 decode) and
+  # the WIDE arm is the one where the block actually fires -- one without the
+  # other proves nothing.
+  TILED="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS48_TILED=1)"
+  echo "TP=$tp [DPAS48+TILED n=24]: '$TILED'"
+  [ -n "$TILED" ] || fail "TP=$tp DPAS48+TILED stream empty (broken run)"
+  [ "$TILED" = "$D48" ] || fail "TP=$tp [DPAS48+TILED] '$TILED' != DPAS48 '$D48'"
+
+  WTILED="$(wide_ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS48_TILED=1)"
+  echo "TP=$tp [wide DPAS48+TILED]: '$WTILED'"
+  [ -n "$WTILED" ] || fail "TP=$tp wide DPAS48+TILED stream empty (broken run)"
+  [ "$WTILED" = "$WD48" ] || fail "TP=$tp [wide DPAS48+TILED] '$WTILED' != wide DPAS48 '$WD48'"
+
+  # Composes with the E3 hoist and the PREQ pre-pass (E4 reads the same fold
+  # buffer, indexed per row -- a mis-strided read here would corrupt row 1+).
+  TILDF="$(wide_ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS48_FOLD=1 INTFER_DPAS48_TILED=1)"
+  echo "TP=$tp [wide DPAS48+FOLD+TILED]: '$TILDF'"
+  [ "$TILDF" = "$WD48" ] || fail "TP=$tp [wide DPAS48+FOLD+TILED] '$TILDF' != wide DPAS48 '$WD48'"
+
+  # TILED without DPAS48 must be inert (nested-flag guard, same shape as
+  # PREQ/FOLD). Without this, a bug that made E4 reachable without DPAS48 would
+  # change the base FP16-act stream and this arm would catch it.
+  TILDA="$(N=24 ids_of "$tp" INTFER_DPAS48_TILED=1)"
+  echo "TP=$tp [INTFER_DPAS48_TILED=1 alone]: '$TILDA'"
+  [ "$TILDA" = "$B24" ] || fail "TP=$tp [INTFER_DPAS48_TILED=1 alone] '$TILDA' != base '$B24'"
 done
 
 if [ "$PASS" != 1 ]; then

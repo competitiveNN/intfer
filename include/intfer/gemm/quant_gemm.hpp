@@ -363,6 +363,28 @@ bool repack_dpas412(const std::uint8_t* row_codes, uint32_t N, uint32_t K,
 sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
                               sycl::event dep = sycl::event{});
 
+// E4 (INTFER_DPAS48_TILED=1, default OFF): the SAME kernel and the SAME math as
+// quant_gemm_dpas48 -- literally the same template instantiated with 2 rows per
+// work-item instead of 1 -- but each WI owns a 2D block of 2 rows x ONE 16-N
+// tile, so the B op-tile is fetched once per op and reused across both rows.
+//
+// This is the load-replication half that E3/INTFER_DPAS48_FOLD left alone: E3
+// hoisted the per-(row,op) ARITHMETIC replication, this hoists the LOAD.
+//
+// BIT-EXACT by construction, and that is a property of the geometry rather than
+// a lucky tolerance: each (row, tile) keeps ONE accumulator and still sums over
+// ops o = 0..nOp-1 in the same order with the same operands, so no FP32 add is
+// reordered. E4's numerics contract (reports/archive/) was written for a design
+// that combines per-block partial sums in a different order; this geometry has
+// no partial sums, so it does not have that hazard. Per the contract, identity
+// is REPORTED, never used as the gate.
+//
+// DECLINES (returns a null event) when M < 2, so the caller keeps the shipped
+// kernel. E4 is therefore inert at M==1 -- i.e. across all of decode -- which is
+// what the gate asserts rather than assumes.
+sycl::event quant_gemm_dpas48_2d(sycl::queue& q, const Dpas48Params& p,
+                                 sycl::event dep = sycl::event{});
+
 // Device-side GA64 activation quant pre-pass (INTFER_DPAS_PREQ=1).
 // Mirrors dashq::act_quant_ga64_batch(HalfAway) bit-exactly: per-64-slice
 // max-abs (floor 1e-6), s=mx/127, clamp(x*inv, +-127), half-away-from-zero.

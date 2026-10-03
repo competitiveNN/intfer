@@ -544,6 +544,143 @@ int main() {
   checked += rc_pairs;
   devs += rc_devs;
 
+  // --- E4 REAL-KERNEL READBACK: quant_gemm_dpas48 vs _2d ------------------
+  // The section above measures the contract's tolerance from a SYNTHETIC term
+  // generator, and the contract itself says: "When E4 exists, re-derive from the
+  // real kernel. Do NOT inherit 4.0e-5 by copy." This is that re-derivation --
+  // the two geometries are the SAME template, so any difference is a real
+  // difference in the kernel and nothing else.
+  //
+  // EXPECTED: bit-identical. Each (row, tile) keeps one accumulator and still
+  // sums over ops in the same order, so there is nothing to reorder. That is a
+  // property of the geometry, and this arm is what turns it from a claim into a
+  // measurement -- in particular it would catch a future edit that hoisted a
+  // partial sum out of the o loop.
+  std::printf("\n[dpas-fold-probe] E4 real-kernel readback "
+              "(dpas48 R=1 vs dpas48_2d R=2, bit-exact expected):\n");
+  std::uint64_t e4_dev_pairs = 0;
+  {
+    const std::uint32_t M = 4, N = 64, K = 512, G = 64, GA = 64;
+    const std::uint32_t nOp = K / 32, nG = K / G, nGA = K / GA;
+    const std::uint32_t op_bytes = 32 * 16 * 4 / 8;
+    // The kernel indexes B[(t*nOp + o)*op_bytes] with t < nT = N/TN, so the buffer
+    // is nT tiles wide. Sizing it by N over-allocates by TN (16x here).
+    const std::uint32_t nT = N / 16;
+    const std::size_t code_sz = (std::size_t)nT * nOp * op_bytes;
+    std::vector<std::uint8_t> code(code_sz);
+    std::uint32_t seed = 12345u;
+    for (std::size_t i = 0; i < code_sz; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      // Keep the code bytes inside the u4 range the DPAS path expects.
+      code[i] = (std::uint8_t)((seed >> 24) & 0x0F);
+    }
+    std::vector<std::uint16_t> scale((std::size_t)N * nG);
+    for (std::uint32_t i = 0; i < N * nG; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      scale[i] = (std::uint16_t)((seed >> 16) & 0xFFFF);
+    }
+    std::vector<std::int8_t> act((std::size_t)M * K);
+    for (std::uint32_t m = 0; m < M; ++m)
+      for (std::uint32_t k = 0; k < K; ++k) {
+        seed = seed * 1664525u + 1013904223u;
+        act[(std::size_t)m * K + k] =
+            (std::int8_t)((int)((seed >> 24) & 0xFF) - 128);
+      }
+    std::vector<float> as((std::size_t)M * nGA);
+    for (std::uint32_t i = 0; i < M * nGA; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      as[i] = 0.01f + 0.0005f * (float)((seed >> 16) & 0x3FF);
+    }
+
+    // malloc_SHARED, not malloc_device: every other buffer in this probe is
+    // shared, and on this Level Zero driver device-only USM is not host-
+    // accessible -- memcpy() into it segfaults. Measured, not guessed: the
+    // first run of this arm died exactly at the code memcpy.
+    auto *code_d = sycl::malloc_shared<std::uint8_t>(code_sz, q);
+    auto *scale_d = sycl::malloc_shared<std::uint16_t>(scale.size(), q);
+    auto *act_d = sycl::malloc_shared<std::int8_t>(act.size(), q);
+    auto *as_d = sycl::malloc_shared<float>(as.size(), q);
+    auto *o1 = sycl::malloc_shared<std::uint16_t>((std::size_t)M * N, q);
+    auto *o2 = sycl::malloc_shared<std::uint16_t>((std::size_t)M * N, q);
+    std::memcpy(code_d, code.data(), code_sz);
+    std::memcpy(scale_d, scale.data(), scale.size() * 2);
+    std::memcpy(act_d, act.data(), act.size());
+    std::memcpy(as_d, as.data(), as.size() * 4);
+
+    intfer::gemm::Dpas48Params p;
+    p.code_dpas = code_d; p.scale_usm = scale_d; p.act_int8 = act_d;
+    p.act_scale = as_d; p.alpha = 1.0f / 64.0f; p.M = M; p.N = N; p.K = K;
+    p.group_size = G; p.act_group = GA; p.bits = 4;
+    p.act_stride = K; p.as_stride = nGA;
+    p.out_usm = o1;
+    intfer::gemm::quant_gemm_dpas48(q, p).wait_and_throw();
+    p.out_usm = o2;
+    intfer::gemm::quant_gemm_dpas48_2d(q, p).wait_and_throw();
+
+    std::vector<std::uint16_t> h1((std::size_t)M * N), h2((std::size_t)M * N);
+    std::memcpy(h1.data(), o1, h1.size() * 2);
+    std::memcpy(h2.data(), o2, h2.size() * 2);
+    std::uint64_t diff = 0;
+    for (std::size_t i = 0; i < h1.size(); ++i)
+      if (h1[i] != h2[i]) {
+        if (diff < 4)
+          std::printf("  FAIL  E4 readback differs at %zu: 0x%04x vs 0x%04x\n", i,
+                      h1[i], h2[i]);
+        ++diff;
+      }
+    e4_dev_pairs = (std::uint64_t)M * N;
+    if (diff == 0)
+      std::printf("  ok    %llu outputs bit-identical between R=1 and R=2 "
+                  "(M=%u, N=%u, K=%u)\n",
+                  (unsigned long long)e4_dev_pairs, M, N, K);
+    else {
+      std::printf("  FAIL  E4 readback: %llu of %llu outputs differ -- the row "
+                  "block changed the arithmetic\n",
+                  (unsigned long long)diff, (unsigned long long)e4_dev_pairs);
+      ok = false;
+    }
+    // The M<2 decline is a PRECONDITION, so ASSERT it rather than describe it:
+    // a 1-row call must not submit, which is what makes E4 inert at decode and
+    // therefore attributable. Declining is inert on the M=1 path (the kernel is
+    // mathematically defined there -- it is just not a row BLOCK), so it cannot
+    // be distinguished by its output; the sentinel prerequisite is the only
+    // reliable signal, and the bare `sycl::event{}` comparison this first used
+    // is exactly the trap the NEG cases above already record.
+    {
+      const std::uint16_t kOutSentinel = 0xBEEF;
+      std::vector<std::uint16_t> fill((std::size_t)M * N, kOutSentinel);
+      std::memcpy(o1, fill.data(), fill.size() * 2);
+      sycl::event prereq = q.submit([&](sycl::handler& h) {
+        h.single_task<class e4_prereq_probe>([=]() {});
+      });
+      p.M = 1; p.out_usm = o1;
+      sycl::event e1 = intfer::gemm::quant_gemm_dpas48_2d(q, p, prereq);
+      e1.wait_and_throw();
+      std::vector<std::uint16_t> chk((std::size_t)M * N);
+      std::memcpy(chk.data(), o1, chk.size() * 2);
+      std::uint32_t touched = 0;
+      for (std::uint16_t v : chk)
+        if (v != kOutSentinel) ++touched;
+      if (e1 != prereq) {
+        std::printf("  FAIL  E4 did not DECLINE at M=1 (it submitted anyway); it must"
+                    " be inert across all of decode\n");
+        ok = false;
+      } else if (touched != 0) {
+        std::printf("  FAIL  E4 declined at M=1 but wrote %u slots; a decline must"
+                    " write nothing\n", touched);
+        ok = false;
+      } else {
+        std::printf("  ok    DECLINES at M=1 (sentinel prerequisite returned"
+                    " untouched, 0 slots written) -- inert across all of decode\n");
+      }
+    }
+
+    sycl::free(code_d, q); sycl::free(scale_d, q); sycl::free(act_d, q);
+    sycl::free(as_d, q); sycl::free(o1, q); sycl::free(o2, q);
+  }
+  checked += e4_dev_pairs;
+  devs += 1;
+
   // NOTE: the one-line verdict is printed at the END, after E4. Printing it
   // here would announce PASS and then let a later section flip it to FAIL, so
   // the line a human reads would disagree with the exit code.

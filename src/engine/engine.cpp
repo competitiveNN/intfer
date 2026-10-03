@@ -179,6 +179,20 @@ bool dpas_row_enabled() {
   return enabled;
 }
 
+// E4: cooperative 2D row-block DPAS (default OFF). Same getenv/static rule.
+//
+// Deliberately MUTUALLY EXCLUSIVE with INTFER_DPAS_ROW: that experiment already
+// owns the "one WI owns many tiles" geometry and measured ~460x slower by
+// collapsing occupancy. Letting both flags be set would leave it undecidable
+// which geometry ran, which is the "unattributable experiment" failure the
+// report warns about. Declining the combination is loud in the sense that
+// dpas_row wins and E4 does not fire.
+bool dpas_tiled_enabled() {
+  const char* env = std::getenv("INTFER_DPAS48_TILED");
+  static const bool enabled = (env && env[0] == '1' && env[1] == '\0');
+  return enabled && !dpas_row_enabled();
+}
+
 // Device act-quant pre-pass opt-in (default OFF). Host-side read, same
 // getenv/static rule as dpas_row_enabled(). The pre-pass is bit-exact (same
 // GA64 HalfAway contract as dashq::act_quant_ga64_batch) — it moves the
@@ -946,6 +960,11 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
   // Composes with the pre-pass above (the fold dep-chains on it) and with the
   // row-cooperative geometry (which has its own fold handling).
   const bool use_fold = dpas_fold_enabled();
+// E4: cooperative 2D row block. Requires M >= 2, which quant_gemm_dpas48_2d
+// ALSO enforces and DECLINES on -- the flag is checked here only so the
+// experiment is inert (and attributable) rather than attempted and declined on
+// every decode call.
+const bool use_tiled = dpas_tiled_enabled() && M >= 2 && !use_row;
 
   // 1) Activation quant into ws48_ (per row, per GA-slice max-abs scale).
   //    Device pre-pass first; on ANY decline fall through to the host loop,
@@ -1093,9 +1112,19 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
     auto t_s0 = std::chrono::high_resolution_clock::now();
 #endif
     sycl::event kernel_evt = use_row ? gemm::quant_gemm_dpas4_row(q, p, dep)
-                                     : gemm::quant_gemm_dpas48(q, p, dep);
-    if (kernel_evt == sycl::event{})
-      kernel_evt = gemm::quant_gemm_dpas48(q, p, dep);
+                          : use_tiled ? gemm::quant_gemm_dpas48_2d(q, p, dep)
+                                      : gemm::quant_gemm_dpas48(q, p, dep);
+    // Decline detection. quant_gemm_dpas48_2d returns `dep` UNCHANGED when it
+    // declines (that is what makes a decline observable at all), so the old
+    // `== sycl::event{}` test would read a decline as SUCCESS whenever dep is
+    // non-empty -- silently skipping the GEMM instead of falling back. Test both
+    // shapes: with an empty prerequisite a decline surfaces as an empty event,
+    // with a real one it surfaces as identity with dep. A successful submit
+    // always returns a fresh event, so neither test can false-positive.
+    const bool declined =
+        (dep == sycl::event{}) ? (kernel_evt == sycl::event{})
+                               : (kernel_evt == dep);
+    if (declined) kernel_evt = gemm::quant_gemm_dpas48(q, p, dep);
     kernel_events.push_back(kernel_evt);
 #ifdef INTFER_PROFILE_GPU
     {
