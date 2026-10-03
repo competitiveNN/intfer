@@ -201,7 +201,13 @@ matters for the next session reading this file:
   honestly: the arm is NOT sustainably CPU-bound — its median load is *below* the
   reading taken before it started — so the crossings come from **short bursts plus
   whatever else is running**, and on this host that is the desktop (`zen-bin`) and
-  sibling `maki` sessions. Artifacts: `build/loadself2/samples`.
+  sibling `maki` sessions. Artifacts: `build/load_attribution/samples.txt`. **The measurement is a committed script now,
+  not a throwaway** — `scripts/measure_load_attribution.sh`, re-runnable with
+  `LOADAVG` / `INTFER_QUIET_LOAD` / `INTFER_BUILD_DIR` seams, so re-run it before
+  re-deciding anything about this box rather than trusting this paragraph. On its
+  first run it printed "30.89 cores" for an arm using about one, because `tree_cpu`
+  returns a CUMULATIVE total and cores are a RATE; it now differences over the sample
+  interval and reads ~0.8.
   **Consequence, and it is the useful part:** "wait for a quiet box" IS the right
   advice, and it is *nearly* enough — but it means a box with **no desktop
   compositor and no sibling agent session**, not merely a low `load1` reading.
@@ -214,6 +220,28 @@ matters for the next session reading this file:
   background job: a `julia` container was measured at 99.7 % CPU for 1d23h and is
   gone; what remains is bursty CPU from concurrent sessions. A wall-time A/B
   needs the box to itself.
+- *** A PARTIAL RUN EXISTS FROM 2026-10-03. IT IS NOT A RESULT AND NOT A HALF
+  RESULT — read this before re-running, and do not mistake it for either. *** Four
+  launches of `scripts/bench_when_quiet.sh` were attempted across the session and
+  **none completed the protocol**, which needs 3 interleaved rounds with all three
+  arms of each round usable. Inventory DERIVED from the artifacts (`grep -c '^ARM '`
+  per run log), not counted by eye:
+
+  | artifact | arms | `[USABLE]` | `[CONTENDED]` | how it ended |
+  |---|---|---|---|---|
+  | `when_quiet_20261003T202330Z_fc8b6e0_1648475.log` | 6 | 4 | 2 | **aborted at the round-3 gate**, `load1=2.26` |
+  | `when_quiet_20261003T213817Z_1444648_1947753.log` | 9 | 3 | 6 | stopped deliberately so the script itself could be edited |
+  | `when_quiet_20261003T220122Z_878f36a_2115666.log` | 1 | 1 | 0 | an accidental launch while testing the collision guard |
+  | `when_quiet_20261003T200901Z_fc8b6e0_1634032.log` | 1 | 0 | 1 | killed by the calling tool's timeout, before the detach fix |
+
+  All four are under `build/bench_logs/`. **What this changes and what it does not.**
+  It does not reduce what must be re-run: the correctness work stands, none of it
+  needs repeating, and the load-insensitive counters are unaffected. It DOES mean the
+  next session must not budget for "finishing" this run — a fresh quiet window is
+  needed, and the 8 usable arms are scattered across four artifacts in no interleaved
+  set (per arm: BASE 5 usable / 2 contended, DPAS48 1/4, PREQ 2/3), so **no per-arm
+  tok/s may be compared across them**. Nothing was published: every arm above was
+  withheld by the harness itself, and every `RESULT:` line here is still blank.
 - **Therefore: do not start a wall-time run on a busy box, and do not treat the
   blank `RESULT:` lines as an oversight.** Every arm already reports
   `TPS=SKIPPED-CONTENDED` when its own maximum load crosses the threshold, so a
