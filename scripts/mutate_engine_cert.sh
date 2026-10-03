@@ -115,13 +115,29 @@ git -C "$_scr" -c user.email=m@x -c user.name=sc add -A
 git -C "$_scr" -c user.email=m@x -c user.name=sc commit -q -m "tooling only"
 SC_TOOL="$(git -C "$_scr" rev-parse HEAD)"
 got="$(derive_carries_anchor "$_scr" || true)"
-if [ "$got" != "$SC_TOOL" ]; then
-  echo "  SELFCHECK FAIL: newest commit is tooling-only, so the anchor must be" >&2
-  echo "    $SC_TOOL, got '${got:-<nothing>}' -- an always-empty derivation would" >&2
-  echo "    exclude E-A from every run and delete a state in plain sight." >&2
+# ASSERT THE PROPERTY, NOT A SHA. My first version of this self-check expected the
+# anchor to be HEAD -- and `rev-list HEAD~1` EXCLUDES HEAD, so the answer is the
+# newest ANCESTOR whose cumulative diff is engine-free, which here is the engine
+# commit itself (docs.md landed after it). A sha comparison would have "found" that
+# defect in the function when the defect was in my expectation -- the recorded
+# lesson, verbatim: expect the predicate you measured, not the one you expected.
+got_files=""
+[ -n "$got" ] && got_files="$(git -C "$_scr" diff --name-only "$got..HEAD")"
+if [ -z "$got" ]; then
+  echo "  SELFCHECK FAIL: the newest commit is tooling-only, so SOME ancestor" >&2
+  echo "    carries -- the derivation returned nothing. An always-empty" >&2
+  echo "    derivation would exclude E-A from every run and delete a state in" >&2
+  echo "    plain sight." >&2
+  _sc_rc=1
+elif printf '%s\n' "$got_files" | grep -qE \
+       '^(src/|examples/|include/|scripts/test_|scripts/setvars\.sh|scripts/_gate_|scripts/_ec_mutant\.sh)'; then
+  echo "  SELFCHECK FAIL: the returned anchor $got moves an engine input" >&2
+  printf '%s\n' "$got_files" | sed 's/^/          /' >&2
+  echo "    -- so E-A would silently become a second E-B and report the converse" >&2
+  echo "    broken about a premise that is simply false." >&2
   _sc_rc=1
 else
-  echo "  ok    tooling-only head  -> anchor is the commit before it"
+  echo "  ok    tooling-only head  -> a carrying ancestor exists, engine-free"
 fi
 : >"$_scr/src/engine/b.cpp"
 git -C "$_scr" -c user.email=m@x -c user.name=sc add -A
