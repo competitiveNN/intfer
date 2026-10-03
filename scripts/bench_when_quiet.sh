@@ -20,8 +20,19 @@ BACKLOG="reports/2026-09-30-pending-bench-backlog.md"
 LIMIT="${INTFER_QUIET_WAIT:-3600}"
 [ "${1:-}" = "--max-wait" ] && LIMIT="${2:-3600}"
 
+# SEAMS, for the same reason scripts/_gate_precond.sh honours INTFER_SYCL_LS and
+# scripts/measure_load_attribution.sh honours $LOADAVG: an assumption a harness
+# cannot redirect is one it cannot be tested against. Without $LOADAVG the
+# collision guard below is UNREACHABLE on a busy box -- the wait loop would give up
+# first and exit 2 for a completely different reason, so the guard could never be
+# observed failing. Measured: that is exactly what happened the first time it was
+# checked, and the "proof" that came back was the give-up path, not the guard.
+#   $LOADAVG          loadavg source (default /proc/loadavg)
+#   INTFER_QUIET_LOAD threshold (default 2)
 QLOAD="${INTFER_QUIET_LOAD:-2}"
-load1() { awk '{print $1}' /proc/loadavg; }
+LOADAVG="${LOADAVG:-/proc/loadavg}"
+[ -r "$LOADAVG" ] || { echo "FAIL: cannot read \$LOADAVG=$LOADAVG" >&2; exit 2; }
+load1() { awk '{print $1}' "$LOADAVG"; }
 quiet() { awk -v l="$(load1)" -v q="$QLOAD" 'BEGIN{exit !(l < q)}'; }
 
 echo "waiting for load1 < $QLOAD (max ${LIMIT}s) -- Ctrl-C to stop"

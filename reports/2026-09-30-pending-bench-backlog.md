@@ -229,20 +229,37 @@ matters for the next session reading this file:
 
   | artifact | arms | `[USABLE]` | `[CONTENDED]` | how it ended |
   |---|---|---|---|---|
-  | `when_quiet_20261003T202330Z_fc8b6e0_1648475.log` | 6 | 4 | 2 | **aborted at the round-3 gate**, `load1=2.26` |
+  | `when_quiet_20261003T225024Z_5466335_2519230.log` | 11 | 7 | 4 | **aborted at the prefill-legs gate**, `load1=2.08` |
   | `when_quiet_20261003T213817Z_1444648_1947753.log` | 9 | 3 | 6 | stopped deliberately so the script itself could be edited |
+  | `when_quiet_20261003T202330Z_fc8b6e0_1648475.log` | 6 | 4 | 2 | aborted at the round-3 gate, `load1=2.26` |
   | `when_quiet_20261003T220122Z_878f36a_2115666.log` | 1 | 1 | 0 | an accidental launch while testing the collision guard |
   | `when_quiet_20261003T200901Z_fc8b6e0_1634032.log` | 1 | 0 | 1 | killed by the calling tool's timeout, before the detach fix |
 
-  All four are under `build/bench_logs/`. **What this changes and what it does not.**
-  It does not reduce what must be re-run: the correctness work stands, none of it
-  needs repeating, and the load-insensitive counters are unaffected. It DOES mean the
-  next session must not budget for "finishing" this run — a fresh quiet window is
-  needed, and the 8 usable arms are scattered across four artifacts in no interleaved
-  set (per arm: BASE 5 usable / 2 contended, DPAS48 1/4, PREQ 2/3), so **no per-arm
-  tok/s may be compared across them**. Nothing was published: every arm above was
-  withheld by the harness itself, and every `RESULT:` line here is still blank.
-- **Therefore: do not start a wall-time run on a busy box, and do not treat the
+  All five are under `build/bench_logs/`. **The number that decides it is per ROUND,
+  not per arm — and the earlier version of this note counted across artifacts,
+  which is the wrong basis.** The protocol needs **3** rounds in which all three
+  arms were `[USABLE]`. Per artifact (`awk` over each run log's own `ARM` lines):
+
+  | artifact | complete rounds (all 3 arms `[USABLE]`) |
+  |---|---|
+  | `…225024Z_5466335…` | **1** (E1 r3) — r1 had 2/3, r2 had 1/3 |
+  | `…213817Z_1444648…` | 0 (r1, r2, r3 each had 1/3) |
+  | `…202330Z_fc8b6e0…` | **1** (E1 r1) — r2 had 1/3 |
+  | `…220122Z_878f36a…` | 0 (single arm only) |
+  | `…200901Z_fc8b6e0…` | 0 (single arm only) |
+
+  **So: 2 complete rounds exist across 5 artifacts, and 3 are required.** Rounds
+  from different runs are NOT the same round — they were taken minutes apart under
+  different load — so they cannot be stitched into a set, and **no tok/s may be
+  quoted from any of them yet**. The remaining blocker is unchanged and is NOT
+  missing work: see the quiet-box note above.
+
+  What this does and does not change: the correctness work stands, none of it needs
+  repeating, and the load-insensitive counters are unaffected. It DOES mean the next
+  session must not budget for "finishing" this — a fresh window with the box to
+  itself is needed, and the next run should go straight to the rounds it needs
+  rather than re-walking the whole block. Nothing was published: every arm above was
+  withheld by the harness itself, and every `RESULT:` line here is still blank.- **Therefore: do not start a wall-time run on a busy box, and do not treat the
   blank `RESULT:` lines as an oversight.** Every arm already reports
   `TPS=SKIPPED-CONTENDED` when its own maximum load crosses the threshold, so a
   contended run cannot produce a quotable number even if one is started. When you
