@@ -536,8 +536,32 @@ echo "sandbox hygiene: ok (clean after $NBASE baselines)"
 # Exact literal replacement -- no delimiter that can occur inside the pattern
 # (audit #17b: a sed delimiter inside an ERE alternation killed a state, and a
 # state that silently does nothing is reported as "defect not reproduced").
-patch_literal() { # $1 = file, $2 = old, $3 = new
-  python3 - "$1" "$2" "$3" <<'PY'
+patch_literal() { # $1 = file, $2 = old, $3 = new -- delegates, then commits
+  patch_literal_rc "$1" "$2" "$3" || return 1
+  # Commit the patch. In the sandbox the mutant is a TRACKED file, so patching it
+  # leaves the tree dirty -- and the mutant's own start-of-run guard would then
+  # abort every case before the defect could appear. That is precisely the masking
+  # that broke the FIRST version of this matrix, reappearing one level down; the
+  # sandbox removes it only if each patched state is committed.
+  commit_mutant patched
+}
+# *** AND THE FUNCTION NOW FAILS CLOSED. *** Its last command was commit_mutant, so
+# it exited with COMMIT's status and python's non-zero exit was discarded.
+# MEASURED consequence: state N-P's anchor drifted (a later STEPS edit appended
+# another matrix name), patch_literal refused correctly -- "anchor found 0 times,
+# want 1" -- and the `|| fail` guard NEVER FIRED. The run continued and N-P reported
+# "defect NOT reproduced", which reads as "this state is weak" and is completely
+# wrong: nothing had been mutated at all.
+#
+# *** THAT AFFECTED EVERY STATE IN THIS MATRIX, not just N-P: *** a silent patch
+# failure anywhere here was reported as an un-reproduced defect. This is the
+# AGENTS.md patch_literal-duplication divergence TRIGGER firing for real -- the
+# recorded reason to keep the copies was that each is exercised whenever its matrix
+# runs, which presumes they behave like the shared helper. This one did not. It
+# keeps its own copy (it must commit after patching, which the shared helper does
+# not) and now fails closed like the shared one.
+patch_literal_rc() { # $1 = file, $2 = old, $3 = new -- NO commit, honest rc
+  python3 - "$1" "$2" "$3" <<'PYX'
 import sys
 path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
 src = open(path).read()
@@ -545,13 +569,7 @@ n = src.count(old)
 if n != 1:
     sys.exit("patch_literal: anchor found %d times, want 1" % n)
 open(path, "w").write(src.replace(old, new))
-PY
-  # Commit the patch. In the sandbox the mutant is a TRACKED file, so patching it
-  # leaves the tree dirty -- and the mutant's own start-of-run guard would then
-  # abort every case before the defect could appear. That is precisely the masking
-  # that broke the FIRST version of this matrix, reappearing one level down; the
-  # sandbox removes it only if each patched state is committed.
-  commit_mutant patched
+PYX
 }
 verify_patched() { # $1 = state id -- the MUTANT copy must differ from the target
   if cmp -s "$MUTANT" "$TARGET"; then
@@ -718,7 +736,24 @@ echo "  ok    baseline N-P: 0c is silent and rc=0 on a healthy tree"
 echo "  ok    CONVERSE for N-Q: the EMPTY-CENSUS guards stayed quiet on a"
 echo "        populated census (asserted as ABSENCE above, not just rc=0)"
 
-A_STEPS_ENTRY='mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh"'
+# RE-POINTED (AUDIT #29 round 4): this anchor ENDED the STEPS matrices line, and
+# appending mutate_stack_cert.sh moved the end. The refusal was CORRECT -- and the
+# guard that should have surfaced it was masked by the patch_literal return-value
+# defect above, so N-P reported itself as a weak state instead of a stale anchor.
+# Re-point, never loosen -- and PRE-FLIGHT it, so a future drift is caught in the
+# first second instead of after thirteen baselines.
+A_STEPS_ENTRY='mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh"'
+check_anchor() { # $1 file, $2 anchor -- exactly once, not merely present
+  local n
+  n="$(python3 -c 'import sys;print(open(sys.argv[1]).read().count(sys.argv[2]))' "$1" "$2")"
+  [ "$n" = "1" ] && return 0
+  echo "ANCHOR STALE in $(basename "$1"): found $n occurrence(s), want 1." >&2
+  echo "  Re-point the state; do NOT loosen the check." >&2
+  return 1
+}
+check_anchor "$TARGET" "$A_STEPS_ENTRY" || {
+  echo "PREFLIGHT FAIL -- no state was run and nothing was mutated." >&2; exit 1; }
+echo "  ok    anchor pre-flight: the N-P STEPS anchor occurs exactly once"
 reset_mutant
 patch_literal "$MUTANT" "$A_STEPS_ENTRY" 'mutate_checker_matrix_coverage.sh"' || {
   echo "N-P MISSED (fn) -- the STEPS anchor did not match" >&2; exit 1; }
