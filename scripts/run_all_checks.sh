@@ -211,6 +211,13 @@ dispatch() { # $1 = label -> runs it
       # hold IN COMMON. Read-only, no GPU, no build; plants its own counter-
       # examples in a temp tree.
       timeout 600 bash "$SCRIPT_DIR/check_verdict_scope.sh"; return $? ;;
+    check_dri_probe.sh)
+      # Closes the /dev/dri family: no script may identify a GPU card by its DRM
+      # minor, which is not stable (the 2nd B580 became card2/renderD130). The
+      # rule is derived from scripts/, and a four-case planted self-check gates the
+      # verdict -- two earlier versions of the rule passed while a defect was
+      # planted. Read-only, no GPU, no build.
+      timeout 600 bash "$SCRIPT_DIR/check_dri_probe.sh"; return $? ;;
     check_stack_cert.sh)
       # AUDIT #29. Re-derives build/stack_cert/cert against THIS tree: sha, rc,
       # the census, and a clean tree. A seven-case behavioural self-check runs
@@ -297,6 +304,13 @@ dispatch() { # $1 = label -> runs it
       # mutation: it empties the harvest with the self-tests disabled so the
       # enumeration guard is the only thing that can fire.
       timeout 900 bash "$SCRIPT_DIR/mutate_verdict_scope.sh"; return $? ;;
+    mutate_dri_probe.sh)
+      # Every state damages the CORPUS the rule grades, handed over through
+      # INTFER_SCRIPTS_DIR; the checker that runs is the real one reading that
+      # corpus -- weakening the CHECKER would be unobservable (AUDIT #21). D-E is
+      # the CONVERSE: a single-minor liveness probe must stay clean, without which
+      # a rule that flagged everything would satisfy D-A..D-D.
+      timeout 900 bash "$SCRIPT_DIR/mutate_dri_probe.sh"; return $? ;;
     mutate_stack_cert.sh)
       # AUDIT #29. Breaks the census DERIVATION and the dirty-tree test, both of
       # which the self-check cannot see because every fixture derives its census
@@ -530,12 +544,12 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
