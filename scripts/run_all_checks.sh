@@ -211,6 +211,12 @@ dispatch() { # $1 = label -> runs it
       # hold IN COMMON. Read-only, no GPU, no build; plants its own counter-
       # examples in a temp tree.
       timeout 600 bash "$SCRIPT_DIR/check_verdict_scope.sh"; return $? ;;
+    check_stack_cert.sh)
+      # AUDIT #29. Re-derives build/stack_cert/cert against THIS tree: sha, rc,
+      # the census, and a clean tree. A seven-case behavioural self-check runs
+      # FIRST and gates the verdict; a nested run (the self-check itself) skips it
+      # and SAYS SO. Read-only, no GPU, no build.
+      timeout 600 bash "$SCRIPT_DIR/check_stack_cert.sh"; return $? ;;
     check_engine_cert.sh)
       # AUDIT #24. run_all_checks certifies the TOOLING; scripts/run_ten_gates.sh
       # certifies the ENGINE. This is what stops the two being reconciled by
@@ -291,6 +297,13 @@ dispatch() { # $1 = label -> runs it
       # mutation: it empties the harvest with the self-tests disabled so the
       # enumeration guard is the only thing that can fire.
       timeout 900 bash "$SCRIPT_DIR/mutate_verdict_scope.sh"; return $? ;;
+    mutate_stack_cert.sh)
+      # AUDIT #29. Breaks the census DERIVATION and the dirty-tree test, both of
+      # which the self-check cannot see because every fixture derives its census
+      # from the same expression the verdict uses (the AUDIT #12 S4 shape). S-B
+      # cannot use the shared `rc != 0` predicate -- neutering the guard turns
+      # rc 1 into rc 0 -- so both halves are asserted there explicitly.
+      timeout 900 bash "$SCRIPT_DIR/mutate_stack_cert.sh"; return $? ;;
     mutate_engine_cert.sh)
       # AUDIT #24. Plants ten_gates/HEAD into a SANDBOX build dir (via
       # INTFER_BUILD_DIR) so the real certification is never touched, and drives
@@ -517,12 +530,12 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_stack_cert.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
