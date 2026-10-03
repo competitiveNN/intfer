@@ -276,6 +276,45 @@ for pair in "scripts:$n_scripts" "checks:$n_checks" "matrices:$n_matrices" \
 done
 [ "$bad" -eq 0 ] && echo "  ok    census re-derived and identical to the cert"
 
+# ============= ENTRY-POINT EXECUTABILITY: a shebang that cannot be run =======
+# MEASURED defect 2026-10-03: five shebanged scripts/ entries were mode 644
+# (check_engine_cert.sh, check_bench_load_gate.sh, mutate_engine_cert.sh,
+# mutate_bench_load_gate.sh, merge_27b_batched.sh). The stack never noticed,
+# because every step is dispatched as `bash "$SCRIPT_DIR/<name>.sh"`, which
+# ignores the mode -- so the WHOLE certification stayed green over a tree whose
+# documented entry points could not be run. That is this repo's own rule
+# inverted: a checker that cannot SEE a defect cannot report it, and the census
+# above re-derives every number except the one bit that decides whether the
+# scripts are runnable at all. It is user-facing rather than internal --
+# AGENTS.md tells the next session to run these directly, and
+# `scripts/check_engine_cert.sh` exited "Permission denied". Found by trying to
+# use it, which is the only way this defect is reachable.
+#
+# The rule is UNIFORM (every scripts/*.sh is executable) rather than
+# "executable unless something sources it". A sourced library has no legal
+# reason to be non-executable, the other 75 scripts already were, and an
+# exemption would be a hand-maintained list -- the copy-drift family (audit
+# #3/#12) with a brand-new population to rot.
+n_sh=0; n_x=0
+for f in "$REPO"/scripts/*.sh; do
+  [ -f "$f" ] || continue
+  n_sh=$((n_sh + 1))
+  if [ -x "$f" ]; then
+    n_x=$((n_x + 1))
+  else
+    printf '  FAIL   scripts/%s is not executable; a documented entry point cannot\n' \
+      "$(basename "$f")"
+    echo "         be run directly (it carries a shebang and is invoked as"
+    echo "         scripts/<name> in AGENTS.md and in the reports)."
+    bad=$((bad + 1))
+  fi
+done
+# Anti-vacuity, the shared guard (AUDIT #20): "0 scripts harvested" and "0
+# scripts are broken" are different claims, and a green verdict over an empty
+# census is the defect this whole checker exists to prevent -- one level down.
+enum_require_min "exec-bit-population" "$n_sh" 5 || exit 1
+[ "$bad" -eq 0 ] && echo "  ok    all $n_x script(s) are directly runnable"
+
 if git diff --quiet && git diff --cached --quiet; then
   echo "  ok    tracked tree clean (a dirty tree is not what the cert measured)"
 else
