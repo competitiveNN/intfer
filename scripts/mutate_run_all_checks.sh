@@ -917,14 +917,14 @@ run_state_post() { # $1 id, $2 desc, $3 expected-RE
   o="$(cat "$WORK/$id.log")"
   if [ "$r" -eq 0 ]; then
     echo "  $id MISSED -- 0c accepted a declaration it must not honour ($desc)"
-    echo "$id MISSED (rc=0)" >> "$LOG/summary.txt"; reset_mutant; reset_post_stack; return 1
+    echo "$id MISSED (rc=0)" >> "$WORK/summary.txt"; reset_mutant; reset_post_stack; return 1
   fi
   if ! printf '%s' "$o" | grep -qE "$expect"; then
     echo "  $id MISSED -- failed for the wrong reason (unattributed)"; sed 's/^/        /' "$WORK/$id.log"
-    echo "$id MISSED (unattributed)" >> "$LOG/summary.txt"; reset_mutant; reset_post_stack; return 1
+    echo "$id MISSED (unattributed)" >> "$WORK/summary.txt"; reset_mutant; reset_post_stack; return 1
   fi
   echo "  $id caught -- rc=$r, marker matched: $desc"
-  echo "$id caught" >> "$LOG/summary.txt"; CAUGHT=$((CAUGHT + 1)); reset_mutant; reset_post_stack; return 0
+  echo "$id caught" >> "$WORK/summary.txt"; CAUGHT=$((CAUGHT + 1)); reset_mutant; reset_post_stack; return 0
 }
 # N-T: pushed past line 40.
 MUTATE_FN() { pad_above_decl 45; grep -q '^# POST-STACK:' "$CSC" || return 1; commit_sandbox post-stack "$CSC"; }
@@ -953,11 +953,11 @@ conj_run "N-V.log"; nv=$?
 if [ "$nv" -ne 0 ] && grep -q 'declares POST-STACK \*and\* is in STEPS' "$WORK/N-V.log"; then
   TOTAL=$((TOTAL + 1)); CAUGHT=$((CAUGHT + 1))
   echo "  N-V caught -- rc=$nv: an EXEMPT-AND-SCHEDULED file is refused"
-  echo "N-V caught" >> "$LOG/summary.txt"
+  echo "N-V caught" >> "$WORK/summary.txt"
 else
   TOTAL=$((TOTAL + 1))
   echo "  N-V MISSED -- rc=$nv; a file that is both exempt and scheduled was accepted"
-  echo "N-V MISSED" >> "$LOG/summary.txt"
+  echo "N-V MISSED" >> "$WORK/summary.txt"
 fi
 reset_mutant
 
