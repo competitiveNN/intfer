@@ -3064,6 +3064,44 @@ e.g. S3's contract column is 40 not 42).
     AUDIT #18 defect, where a matrix never runs and its stamp reads STALE, a symptom
     that looks like missing evidence with a remedy that cannot help. 0b reports
     **35 scripts, all dispatched**; 0c confirms all scheduled.
+- **2026-10-03: THE SECOND GPU CAME BACK, AND THE ONE GATE THAT HAD NEVER RUN
+  NOW PASSES.** Verified at the **driver API**, not `sycl-ls` alone:
+  `scripts/l0_enumerate.sh` → `zeDeviceGet rc=0 DEVICES=2`, UUIDs `…-0400-…`
+  (04:00.0) and `…-8600-…` (86:00.0), both `0xe20b`. It returned **without any change
+  in this repo** — no rebind was run here — so this is the host/driver-side state
+  of AUDIT #11 holding for a fourth time. Note the DRM minor **flipped back** to
+  `renderD129` (it had been `renderD130` hours earlier): **derive a card from
+  `/dev/dri/by-path/pci-<slot>-render`, never from `/dev/dri/renderD<n>`** — that is
+  now enforced by `scripts/check_dri_probe.sh`, see AUDIT #30.
+  ==> **`scripts/test_tp2_27b.sh`: PASS — `GPU backend: 2 device(s) (TP=sharded)`.**
+  This is the gate whose *sole* arm is `--tp 2` on 27B, and it had been unrunnable
+  for the entire 1-GPU era (rc=2 SKIPPED). It is the only thing that could certify
+  TP=2 coverage at 27B, so this closes the last unverified coverage item. Kernel
+  70.2 % of decode; `waitblock` 520.6 ms vs `kernel` 1031.7 ms — the device
+  saturates before the host does, which is the same wall every prior decode
+  measurement found.
+  ==> **STREAM IDENTITY AT 27B `--tp 2`, measured (load-insensitive):**
+  `BASE == DPAS48 == PREQ`, token-identical over 64 decode steps
+  (`11751 13 198 760 6511 314 9338 369 …`). Recorded because the protocol requires
+  identity to be checked BEFORE any wall-time figure, and identity does not need a
+  quiet box — so it is obtainable on a busy one, and tok/s is not.
+- **THE 27B BENCHMARK RAN AND CORRECTLY PUBLISHED NOTHING — BOX IS SHARED.** With
+  both GPUs back I launched the backlog's `ONE COMMAND` block
+  (extracted to `build/bench_fill_results.sh`). Every arm came back
+  `CONTENDED max_load1=2.96…3.99 >= 2`, and round 2's `require_quiet` saw
+  `load1=2.95` and **ABORTED**, which is the gate doing its job.
+  **The load is NOT ours.** Measured immediately after the abort: `load1=2.42` with
+  the top consumers being `zen-bin` 49.5 %, three `Isolated Web Co` (chromium)
+  13.3/9.6/3.9 %, `kwin_wayland` 12.8 %, `maki` 3.5 % — desktop and sibling agent
+  sessions. Per the standing rule **do not kill them**. So `load1 < 2` is
+  unreachable while they run and the six `RESULT:` lines **stay blank**, which is
+  the correct state, not an oversight.
+  *** AND THE THRESHOLD WAS NOT TOUCHED. *** Lowering `QLOAD` until arms read
+  USABLE would manufacture exactly the class of figure this repo retracted three
+  times; the honest options are to wait for a window or to accept the counters.
+  **The benchmarks CANNOT be closed out today**, so no report was moved to
+  `reports/archive/` — that is gated on a wall-time verdict, and archiving an
+  undecided batch would destroy the queue.
 - **THE STALE LOCK WAS A HAZARD *IN THE TOOL'S OWN ADVICE*, not in my procedure.**
   I ran `rm -f build/.run_all_checks.lock` before two stack launches. The problem is
   that the script's refusal message **instructed exactly that**: *"If no run is
