@@ -396,7 +396,17 @@ echo
 # (audit #14). A 0 here must not be silently indistinguishable from a failure to
 # measure.
 NDEV="$(gate_gpu_count)" || NDEV=0
-DOCS="AGENTS.md $(ls reports/*.md 2>/dev/null)"
+# The doc corpus. `docs/*.md` was added 2026-10-04 when the AGENTS.md cleanup
+# moved AUDIT #7..#31 verbatim into docs/audit-log-tooling.md: the corpus MOVED,
+# and an enumeration that did not follow would have left this checker able to
+# certify a corpus it can no longer see -- which is the audit #20 vacuous-green
+# class arriving through a MOVE rather than through a deletion. Measured before
+# the fix: 22 hand-counted sites in the archive, 0 reachable, so the shared
+# `enum_require_nonempty` guard fired and correctly refused to certify anything.
+# Two sites here, not one: the shell tally loop and the python handcounted
+# harvest below are SEPARATE enumerations of the same corpus (the audit #3 shape
+# -- a rule fixed at one site and merely assumed at the next).
+DOCS="AGENTS.md $(ls reports/*.md docs/*.md 2>/dev/null)"
 
 if [ "${NDEV:-0}" -lt 1 ]; then
   echo "doc-tally: SKIPPED (${NDEV} level_zero GPU(s) visible -- cannot derive the expected rc classes)."
@@ -543,6 +553,12 @@ docs = [os.path.join(ROOT, "AGENTS.md")]
 rd = os.path.join(ROOT, "reports")
 if os.path.isdir(rd):
     docs += [os.path.join(rd, f) for f in sorted(os.listdir(rd)) if f.endswith(".md")]
+# Same corpus as the shell DOCS list above -- see the note there. Two
+# enumerations of one corpus is the audit #3 shape, so both were widened in the
+# same commit rather than leaving the second to be found later.
+dd = os.path.join(ROOT, "docs")
+if os.path.isdir(dd):
+    docs += [os.path.join(dd, f) for f in sorted(os.listdir(dd)) if f.endswith(".md")]
 
 # The phrase is ONE token: number, optional /denominator, then the noun.
 PAT = re.compile(r'\b\d+(?:/\d+)?\s+(?:scripts\b|baselines?\b|artifact consumers\b|gates\b)')
