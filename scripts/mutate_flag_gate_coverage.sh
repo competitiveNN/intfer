@@ -125,9 +125,15 @@ fg2() { patch_checker "INTFER_[A-Z0-9_]+' -- 'scripts/test_" "Zzz_never' -- 'scr
 # residue independently, so deleting only the census floor still goes red -- which
 # is FG-3 catching itself, and is why the first version of this state failed as
 # a FALSE POSITIVE rather than as a missing observation.
+# ALL THREE floors must go, not two. A third harvest (the '=0 disables' class)
+# gained its own floor, and with only the first two removed that third fired on
+# the emptied residue -- so FG-3 went red for a reason unrelated to what it tests.
+# That is the always-red twin working in REVERSE: the false positive arrived from
+# ADDING a guard rather than removing one.
 fg3() { fg1
         patch_checker 'if [ "$n_src" -lt 10 ]; then'  'if false; then  #FG3 census floor gone'
-        patch_checker 'if [ "$n_opt" -lt 1 ]; then'   'if false; then  #FG3 opt-in floor gone'; }
+        patch_checker 'if [ "$n_opt" -lt 1 ]; then'   'if false; then  #FG3 opt-in floor gone'
+        patch_checker 'if [ "$n_dis" -lt 1 ]; then'   'if false; then  #FG3 disabler floor gone'; }
 
 # FG-4: reclassify a genuine opt-in flag as a diagnostic, which SHORTENS the
 # opt-in residue. A checker that can only report "more" fails here.
@@ -147,7 +153,7 @@ fg4() { patch_checker 'is_diag() { grep -qE' 'is_diag() { true; }; is_diag_orig(
 fg1; run_state FG-1 'census query harvested only|could not be trusted' 1
 fg2; run_state FG-2 'gate-side query is broken|could not be trusted' 1
 fg3; run_state FG-3 '' 0
-fg4; run_state FG-4 'opt-in residue is EMPTY|could not be trusted' 1
+fg4; run_state FG-4 'class is EMPTY|residue is EMPTY|could not be trusted' 1
 
 for r in "${RESULTS[@]}"; do printf '  %s\n' "$r"; done
 

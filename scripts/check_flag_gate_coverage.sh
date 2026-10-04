@@ -95,7 +95,28 @@ git grep -hoE '"INTFER_[A-Z0-9_]+"' -- src examples include \
 # or the pattern to be absent from the source entirely.
 python3 -c '
 import os, re
-pat = re.compile(r"getenv\(\s*\"(INTFER_[A-Z0-9_]+)\"\s*\)\s*!=\s*nullptr[^;]*?==\s*\"0\"", re.S)
+# A "disabler" is a flag whose OWN VALUE is compared to 0: read it, then read it
+# again and check whether that is 0. A BACKREFERENCE on the flag name is what
+# makes this exact -- without it, any flag sitting near any `== 0` would match.
+#
+# MEASURED, AND THE ORIGINAL FOUND 2 OF 4. It was written for one spelling:
+#     std::string(std::getenv("INTFER_HOST_AVX2")) == "0"     matched
+#     std::getenv("INTFER_LMHEAD_BATCH")[0]      == '0'       NOT matched
+# Two spellings of zero (string vs char literal) AND two ways of joining the two
+# reads (!= nullptr && vs a bare &&). The failure shape is the one this repo keeps
+# auditing: the class came out two members SHORT, which reads as correct unless
+# you already know the answer. Only a query that finds nothing announces itself.
+#
+# QUOTING IS LOAD-BEARING HERE, and it cost a round trip: this python runs inside
+# a shell SINGLE-quoted -c '...', so an r'...' literal TERMINATES the shell string
+# and the harvest writes an EMPTY file. An empty class is the worst shape a query
+# failure can take -- it reads as an absence in the world rather than as a broken
+# question -- so the floor below exists and every literal is double-quoted.
+D0 = chr(34) + "0" + chr(34)
+D1 = chr(39) + "0" + chr(39)
+pat = re.compile(
+    "getenv\\(\\s*\"(INTFER_[A-Z0-9_]+)\"\\s*\\)[^;]*?getenv\\(\\s*\"\\1\"\\s*\\)"
+    "[^;]*?==\\s*(?:" + re.escape(D0) + "|" + re.escape(D1) + ")", re.S)
 found = set()
 for base in ("src", "examples", "include"):
     for root, _, files in os.walk(base):
@@ -212,6 +233,24 @@ echo "   comparison cannot decide it -- see the header)"
 # classification below is what this script certifies, and it is correct.
 
 n_opt="$(wc -w <<<"$optin_res" | tr -d ' ')"
+n_dis="$(wc -w <<<"$dis_res" | tr -d ' ')"
+
+# *** FLOOR ON THE DISABLER CLASS, added because it silently went EMPTY. *** The
+# harvest is a python -c inside a shell single-quoted string; an r'...' literal
+# inside it terminated the shell string, the file came out empty, and the checker
+# printed "<none>" under a class with four members in this tree. That moved four
+# flags into the opt-in gap without failing anything -- an empty class reads as an
+# absence in the world, not as a broken question.
+#
+# If this ever fires legitimately -- every '=0 disables' flag renamed away -- the
+# fix is to delete the class AND its floor together, not to relax the floor.
+if [ "$n_dis" -lt 1 ]; then
+  echo "  FAIL  the disabler class is EMPTY. This tree HAS '=0 disables' flags" >&2
+  echo "        (INTFER_HOST_AVX2, INTFER_PREFILL_RR and others), so an empty" >&2
+  echo "        harvest is a broken query, not an absence. Check the QUOTING of" >&2
+  echo "        the python -c block above before anything else." >&2
+  exit 1
+fi
 
 # *** FLOOR ON THE OPT-IN CLASS, ADDED BECAUSE FG-4 MISSED. *** FG-4
 # reclassified a genuine opt-in flag as a diagnostic, which shortened the
@@ -238,8 +277,7 @@ if [ "$bad" -eq 0 ]; then
   echo "NOTE: only the OPT-IN class is a certification gap. A kill switch or a"
   echo "  diagnostic in the residue says nothing about whether the DEFAULT path"
   echo "  is certified -- the gates already exercise that."
-  n_dis="$(wc -w <<<"$dis_res" | tr -d ' ')"
-echo "RESULT: flag/gate coverage classified by polarity; $n_opt opt-in flag(s) ungated"
+  echo "RESULT: flag/gate coverage classified by polarity; $n_opt opt-in flag(s) ungated"
 echo "        ($n_dis more are '=0 disables' kill switches that do not use the NO_ prefix)"
   exit 0
 fi

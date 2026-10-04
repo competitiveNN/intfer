@@ -275,12 +275,29 @@ operational   PRELOAD*/SCHED/SERVE_MAX/PCACHE*/KV_CAP/...: runtime knobs
 ```
 
 **There are three spellings of "this flag changes behaviour", and only one of
-them is a certification gap.** The `X=0` form was the one initially missed, which
-overstated the gap by two: a disabler's DEFAULT is what the gates already test.
-Its signal is derivable — the source compares the value to `"0"` — but only across
-a line break, so a single-line grep finds nothing and prints an empty class that
-looks like "no such flags". That is a vacuous answer, not a wrong one, and is
-much harder to notice.
+them is a certification gap.** The `X=0` disabler form was the one initially
+missed. Its signal is derivable — the flag's OWN value is compared to `0` — but
+two things bite, and both failed silently:
+
+* **two spellings of zero** (`== "0"` and `== '0'`) and **two ways of joining the
+  two reads** (`!= nullptr &&` vs a bare `&&`). A pattern written for one form
+  found 2 of 4, and the class simply came out short — which reads as *correct*
+  unless you already know the answer. Only a query that finds nothing announces
+  itself.
+* **the harvest is a `python3 -c` inside a shell single-quoted string**, so an
+  `r'...'` literal inside it terminates the shell string and writes an EMPTY file.
+  That is the worst shape a query failure can take here: an empty class reads as
+  an absence in the world rather than as a broken question. Every class expected
+  to be populated is floored.
+
+The signal is now matched with a backreference on the flag name, so no flag can be
+captured by another flag's `== 0`.
+
+**One residual is NOT derivable and needs reading:** `INTFER_STREAM_F16` is named
+like an opt-in but its effect is "restore the old evict-everything behaviour" — a
+kill switch with no `NO_` prefix and no `=0`. No mechanical rule separates it from
+a genuine opt-in; only reading the code does. That is the honest limit of the
+classifier, stated rather than implied away.
 
 A kill switch in the residue says **nothing** about whether the default is
 certified: the gates already exercise the default path. Only the opt-in class is
@@ -581,14 +598,26 @@ narrative with the measurements is in `docs/audit-log-tooling.md`):
 ## Flag certification status
 
 Every optimization ships behind a flag, and **a flag is only certified once a gate
-NAMES it.** Currently uncategorised-but-live, and honest about it:
+NAMES it.**
 
-* `INTFER_L4_FUSE`, `INTFER_L5_FRONT`, `INTFER_HOST_AVX2`, `INTFER_NO_WAVE`,
-  `INTFER_LMHEAD_FP16`, `INTFER_PREFILL_RR`, `INTFER_STREAM_F16` — recorded
-  certifications are **transcripts in commit messages**, not re-runnable artifacts.
-  State: **UNCERTIFIED.** Closing them is scoped work, not copy-paste: read each
-  flag's semantics, decide whether identity is claimed or disclaimed, and pick the
-  gate whose model can actually reach the branch.
+**Do not read a flag list off this file — derive it.** This section used to carry
+a hand-written list of seven "UNCERTIFIED" flags, and measured against the derived
+census it was wrong in BOTH directions: it named three that are kill switches
+(`INTFER_HOST_AVX2`, `INTFER_PREFILL_RR`, `INTFER_NO_WAVE` — the gates already
+test their defaults) and omitted five that are genuine opt-in gaps. A hand-kept
+list is a citation that decays into a guess:
+
+```
+scripts/check_flag_gate_coverage.sh     # classifies and prints every class
+```
+
+**`INTFER_LMHEAD_FP16` is UNCERTIFIED-BY-DISCLAIM** — see the census section above
+for why no arm is warranted. That is a *decision record*, not a census entry, which
+is precisely why it lives in prose while the census does not.
+
+Closing the remaining opt-in gaps is scoped work, not copy-paste: read each flag's
+semantics, decide whether identity is *claimed or disclaimed*, and pick the gate
+whose model can actually reach the branch.
 
 ## PLAN.md status (triaged 2026-10-04 against the tree, not from memory)
 
