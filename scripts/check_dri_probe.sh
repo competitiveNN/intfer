@@ -82,7 +82,9 @@ self_is() { [ "$1" = "$0" ]; }
 # *** BEHAVIOURAL SELF-CHECK FIRST, and it GATES the run. *** A rule that cannot
 # fail proves nothing; one that fires on everything is the mirror defect.
 TMP="$(mktemp -d "${TMPDIR:-/dev/shm}/dri_probe.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT INT TERM
+trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"; exit 130' INT
+trap 'rm -rf "$TMP"; exit 143' TERM
 self_bad=0
 dri="$(printf '/dev/dri/%s' x)"; dri="${dri%x}"   # built at runtime, see note
 ra="$(printf '%s/render%s' "$dri" D128)"

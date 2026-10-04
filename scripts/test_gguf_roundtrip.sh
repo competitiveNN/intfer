@@ -29,6 +29,8 @@ gate_require_build intfer_gguf || exit 1
 export TMPDIR="${TMPDIR:-/tmp}"
 GGUF="$(mktemp --tmpdir="$TMPDIR" model.XXXX.gguf)"
 trap 'rm -f "$GGUF"' EXIT
+trap 'rm -f "$GGUF"; exit 130' INT
+trap 'rm -f "$GGUF"; exit 143' TERM
 
 OUT="$("$BIN" "$MODEL" "$GGUF" 2>&1)"; RC=$?
 echo "$OUT"

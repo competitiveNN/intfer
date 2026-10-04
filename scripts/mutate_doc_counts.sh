@@ -38,6 +38,8 @@ git -C "$ROOT" diff --quiet -- "$TARGET" 2>/dev/null || {
 CB="$(mktemp "${TMPDIR:-/tmp}/cdc.XXXXXX")"
 cp "$TARGET" "$CB"
 trap 'cp "$CB" "$TARGET"; rm -rf "$WORK" "$CB"' EXIT
+trap 'cp "$CB" "$TARGET"; rm -rf "$WORK" "$CB"; exit 130' INT
+trap 'cp "$CB" "$TARGET"; rm -rf "$WORK" "$CB"; exit 143' TERM
 restore() { cp "$CB" "$TARGET"; }
 
 echo "== baseline: clean tree must PASS =="

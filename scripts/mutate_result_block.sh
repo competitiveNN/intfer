@@ -37,7 +37,9 @@ SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_rbm.XXXXXX")"
 TGT="$SB/scripts/check_result_block.sh"
 mkdir -p "$SB/scripts" "$SB/reports" "$LOG"
 : > "$LOG/summary.txt"
-trap 'rm -rf "$SB"' EXIT INT TERM
+trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf "$SB"; exit 130' INT
+trap 'rm -rf "$SB"; exit 143' TERM
 for f in "$SCRIPT_DIR"/*.sh; do ln -sf "$f" "$SB/scripts/$(basename "$f")"; done
 # The checker resolves the flag lookup against ROOT/src and ROOT/examples, so
 # those trees must be reachable from the sandbox too. Without them EVERY flag

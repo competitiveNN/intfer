@@ -19,7 +19,9 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/intfer_foldclass.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; exit 130' INT
+trap 'rm -rf "$WORK"; exit 143' TERM
 STAMP_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/fold_matrix"
 HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 CLEAN_SHA="0000000000000000000000000000000000000000"

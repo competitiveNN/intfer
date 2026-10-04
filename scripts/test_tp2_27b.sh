@@ -69,6 +69,8 @@ LOG="$(mktemp --tmpdir="$TMPDIR" tp2_27b.XXXX.log)"
 # <wrapper>.out / <wrapper>.err hold the CLI stdout/stderr on gate failure.
 CLI_OUT="$LOG.out"; CLI_ERR="$LOG.err"
 trap 'rc=$?; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR"; fi' EXIT
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR"; fi; exit 130' INT
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR"; fi; exit 143' TERM
 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
   -p "$PROMPT" -n "$N" >"$CLI_OUT" 2>"$CLI_ERR"; RC=$?
 cat "$CLI_OUT"

@@ -29,7 +29,9 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/intfer_l0trace.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; exit 130' INT
+trap 'rm -rf "$WORK"; exit 143' TERM
 
 # ---- locate the driver we are going to interrogate -------------------------
 DRV_DIR="${INTFER_L0_DRIVER_LIB:-/usr/lib64}"

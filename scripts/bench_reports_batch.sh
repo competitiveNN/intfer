@@ -184,6 +184,8 @@ fi
 
 TMPOUT="$(mktemp "${TMPDIR:-/tmp}/brb.XXXXXX")"
 trap 'rm -f "$TMPOUT"' EXIT
+trap 'rm -f "$TMPOUT"; exit 130' INT
+trap 'rm -f "$TMPOUT"; exit 143' TERM
 
 # *** run_arm MUST NOT BE CALLED INSIDE $( ). *** loadlog_arm records its verdict in
 # the globals _LL_USABLE / _LL_MAX / _LL_LOG, and a command substitution is a

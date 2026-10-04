@@ -271,7 +271,9 @@ restore() {
     git checkout -- "$TGT" "$TGT2"
   fi
 }
-trap restore EXIT INT TERM
+trap 'restore' EXIT
+trap 'restore; exit 130' INT
+trap 'restore; exit 143' TERM
 
 # Replace `old` with `new` in $1, from the patch file $2. Hard-fails unless every
 # `old` occurs exactly once AT THE TIME IT IS APPLIED -- a zero-match or

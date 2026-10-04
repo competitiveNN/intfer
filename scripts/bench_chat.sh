@@ -54,6 +54,8 @@ if ! curl -s -m 3 "$URL/health" >/dev/null 2>&1; then
 fi
 cleanup() { [ "$STARTED" = 1 ] && kill "$SRV_PID" 2>/dev/null; }
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 echo "box loadavg: $(cat /proc/loadavg)"
 xpu-smi discovery 2>/dev/null | grep -E "Device Name" | head -2 || true

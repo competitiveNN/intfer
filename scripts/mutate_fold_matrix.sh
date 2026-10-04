@@ -225,7 +225,9 @@ restore() {
     git checkout -- "$HDR" "$SRC"
   fi
 }
-trap restore EXIT INT TERM
+trap 'restore' EXIT
+trap 'restore; exit 130' INT
+trap 'restore; exit 143' TERM
 
 rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR" || exit 1

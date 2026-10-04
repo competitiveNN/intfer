@@ -59,7 +59,9 @@ HZ="$(getconf CLK_TCK 2>/dev/null || echo 100)"
 SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_loadattr.XXXXXX")"
 # EXIT alone does not fire on an untrapped signal, and this script gets wrapped in
 # `timeout` by callers -- the recorded /tmp rule, which cost 430 MB once.
-trap 'rm -rf "$SB"' EXIT INT TERM
+trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf "$SB"; exit 130' INT
+trap 'rm -rf "$SB"; exit 143' TERM
 
 [ -x "$BIN" ]  || { echo "SKIP: no intfer_cli at $BIN (build it, or set INTFER_BIN)"; exit 2; }
 [ -f "$MODEL" ] || { echo "SKIP: no model at $MODEL (set INTFER_MODEL)"; exit 2; }

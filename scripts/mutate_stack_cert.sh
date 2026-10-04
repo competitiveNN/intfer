@@ -41,6 +41,8 @@ mkdir -p "$LOG"
 
 SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_scmut.XXXXXX")"
 trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf "$SB"; exit 130' INT
+trap 'rm -rf "$SB"; exit 143' TERM
 REPO="$SB/repo"
 BD="$SB/build"
 mkdir -p "$REPO/scripts" "$BD/stack_cert"

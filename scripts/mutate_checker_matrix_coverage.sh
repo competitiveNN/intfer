@@ -52,7 +52,9 @@ SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_mcov.XXXXXX")"
 TGT="$SB/scripts/check_checker_matrix_coverage.sh"
 mkdir -p "$SB/scripts" "$LOG"
 : > "$LOG/summary.txt"
-trap 'rm -rf "$SB"' EXIT INT TERM
+trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf "$SB"; exit 130' INT
+trap 'rm -rf "$SB"; exit 143' TERM
 for f in "$SCRIPT_DIR"/*.sh; do ln -sf "$f" "$SB/scripts/$(basename "$f")"; done
 rm -f "$TGT"
 cp "$SCRIPT_DIR/check_checker_matrix_coverage.sh" "$TGT"

@@ -84,7 +84,9 @@ if ! mkdir "$WQ_LOCK" 2>/dev/null; then
   fi
 fi
 echo $$ > "$WQ_LOCK/pid" 2>/dev/null || true
-trap 'rm -rf "$WQ_LOCK" 2>/dev/null || true' EXIT INT TERM
+trap 'rm -rf "$WQ_LOCK" 2>/dev/null || true' EXIT
+trap 'rm -rf "$WQ_LOCK" 2>/dev/null || true; exit 130' INT
+trap 'rm -rf "$WQ_LOCK" 2>/dev/null || true; exit 143' TERM
 
 # *** THE ARTIFACT PATH AND ITS COLLISION GUARD ARE SETUP, NOT A WAIT RESULT. ***
 # Both used to sit AFTER the quiet-wait loop, which made the guard unreachable on a
@@ -148,6 +150,15 @@ case "${1:-}" in
 esac
 
 echo "waiting for load1 < $QLOAD (max ${LIMIT}s) -- Ctrl-C to stop"
+# *** THE SLEEP MUST BE INTERRUPTIBLE, OR THE TRAP IS DEFERRED AND NEVER RUNS. ***
+# A trap for a signal arriving while a FOREGROUND command runs does not execute
+# until that command returns -- so a plain `sleep 30` here meant SIGTERM sat
+# unhandled for up to 30 seconds. Measured: 10s after SIGTERM the lock was still
+# present and the process still alive, so `timeout` could not stop it at all; and
+# since GNU timeout WAITS for the child, a step that ignored its signal would hang
+# the whole stack rather than fail it. `wait` IS interruptible, so the sleep is
+# backgrounded and waited on: the trap fires at once, releases the lock and exits
+# 143. The orphaned `sleep` then ends by itself within 30s and touches nothing.
 waited=0
 while [ "$waited" -lt "$LIMIT" ]; do
   if quiet; then
@@ -155,7 +166,11 @@ while [ "$waited" -lt "$LIMIT" ]; do
     break
   fi
   [ $((waited % 300)) -eq 0 ] && echo "  ...load1=$(load1) after ${waited}s"
-  sleep 30; waited=$((waited+30))
+  sleep 30 &
+  _wq_sleep=$!
+  wait "$_wq_sleep" 2>/dev/null || true
+  kill "$_wq_sleep" 2>/dev/null || true
+  waited=$((waited+30))
 done
 
 if ! quiet; then

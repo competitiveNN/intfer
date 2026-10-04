@@ -43,6 +43,8 @@ cleanup() { cp "$SB_SUM" "$STAMP_DIR/summary.txt" 2>/dev/null
             cp "$SB_STAMP" "$STAMP_DIR/last_pass.stamp" 2>/dev/null
             rm -rf "$SB" "$SB_SUM" "$SB_STAMP"; }
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 [ -f "$CHECK" ] || { echo "SKIP: $CHECK missing"; exit 2; }
 [ -d "$STAMP_DIR" ] || { echo "SKIP: $STAMP_DIR absent; run mutate_fold_matrix.sh first"; exit 2; }

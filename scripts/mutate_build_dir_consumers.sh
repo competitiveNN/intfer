@@ -38,6 +38,8 @@ git -C "$ROOT" diff --quiet -- "$TARGET" 2>/dev/null || {
 BAK="$(mktemp "${TMPDIR:-/tmp}/brb.XXXXXX")"
 cp "$ROOT/$TARGET" "$BAK"
 trap 'cp "$BAK" "$ROOT/$TARGET"; rm -f "$BAK"' EXIT
+trap 'cp "$BAK" "$ROOT/$TARGET"; rm -f "$BAK"; exit 130' INT
+trap 'cp "$BAK" "$ROOT/$TARGET"; rm -f "$BAK"; exit 143' TERM
 
 restore() { cp "$BAK" "$ROOT/$TARGET"; }
 

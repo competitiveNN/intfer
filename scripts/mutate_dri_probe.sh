@@ -31,7 +31,9 @@ STAMP="$BUILD_DIR/dri_probe_mutate"
 LOG="$BUILD_DIR/dri_probe_mutate"
 SB="$(mktemp -d "${TMPDIR:-/dev/shm}/dri_mut.XXXXXX")"
 mkdir -p "$STAMP" "$LOG"
-trap 'rm -rf "$SB"' EXIT INT TERM
+trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf "$SB"; exit 130' INT
+trap 'rm -rf "$SB"; exit 143' TERM
 
 # Sourced shared helpers, so this matrix does not carry a second copy.
 . "$SCRIPT_DIR/_gate_pred.sh"

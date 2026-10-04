@@ -49,6 +49,8 @@ MUT="$SCRIPT_DIR/_ec_mutant.sh"
 ORIG_C="$SB/.orig_check"; cp "$CHECK" "$ORIG_C"
 cp "$CHECK" "$MUT"
 trap 'rm -f "$MUT"; rm -rf "$SB"' EXIT
+trap 'rm -f "$MUT"; rm -rf "$SB"; exit 130' INT
+trap 'rm -f "$MUT"; rm -rf "$SB"; exit 143' TERM
 
 run_check() { INTFER_BUILD_DIR="$SB" bash "$MUT" 2>&1; }
 plant() { printf 'HEAD=%s\npass=10 partial=0 skip=0 fail=0\n' "$1" > "$SB/ten_gates/HEAD"; }

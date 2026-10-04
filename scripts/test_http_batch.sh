@@ -63,6 +63,8 @@ fi
 
 cleanup() { [ "$STARTED" = 1 ] && kill "$SRV_PID" 2>/dev/null; }
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 export INTFER_HTTP_URL="$URL"
 python3 - "$@" <<'EOF'

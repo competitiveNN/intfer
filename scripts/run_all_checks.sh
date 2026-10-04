@@ -90,7 +90,9 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   fi
 fi
 echo $$ > "$LOCK/pid" 2>/dev/null || true
-trap 'rm -rf "$LOCK" 2>/dev/null || true' EXIT INT TERM
+trap 'rm -rf "$LOCK" 2>/dev/null || true' EXIT
+trap 'rm -rf "$LOCK" 2>/dev/null || true; exit 130' INT
+trap 'rm -rf "$LOCK" 2>/dev/null || true; exit 143' TERM
 
 # --- fail closed on a dirty tracked tree ------------------------------------
 # The matrices restore with `git checkout --`, so ANY uncommitted tracked change
@@ -183,68 +185,68 @@ classify_rc() { # $1 = rc [$2 = step label] -> prints ok | stale | unproven | fa
 dispatch() { # $1 = label -> runs it
   case "$1" in
     gate_inventory.sh)
-      timeout 1800 bash "$SCRIPT_DIR/gate_inventory.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/gate_inventory.sh"; return $? ;;
     fold_report_counts.sh)
-      timeout 1800 bash "$SCRIPT_DIR/fold_report_counts.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/fold_report_counts.sh"; return $? ;;
     check_device_precond.sh)
       if [ "${INTFER_SKIP_HEALTHY:-0}" = "1" ]; then
-        INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1 timeout 1800 bash "$SCRIPT_DIR/check_device_precond.sh"
+        INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1 timeout -k 30 1800 bash "$SCRIPT_DIR/check_device_precond.sh"
       else
-        timeout 3600 bash "$SCRIPT_DIR/check_device_precond.sh"
+        timeout -k 30 3600 bash "$SCRIPT_DIR/check_device_precond.sh"
       fi
       return $? ;;
     check_e2_ctx.sh)
-      timeout 3600 bash "$SCRIPT_DIR/check_e2_ctx.sh"; return $? ;;
+      timeout -k 30 3600 bash "$SCRIPT_DIR/check_e2_ctx.sh"; return $? ;;
     check_l0_cite.sh)
       # Needs network on first run (clones compute-runtime sparse, ~1 min) and
       # exits 2 if the pin cannot be resolved, which reads as UNPROVEN rather
       # than as a pass.
-      timeout 1800 bash "$SCRIPT_DIR/check_l0_cite.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/check_l0_cite.sh"; return $? ;;
     check_fold_report_class.sh)
       # Asserts that fold_report_counts keeps rc=1 (real regression) apart from
       # rc=2 (stale evidence) in BOTH directions. It WAS misclassified: the stale
       # branch was reachable only with a clean summary, so logs damaged by a
       # previous failed run reported a regression and printed the wrong remedy.
       # Runs FIRST so its sandbox restore precedes the real matrix's re-run.
-      timeout 900 bash "$SCRIPT_DIR/check_fold_report_class.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/check_fold_report_class.sh"; return $? ;;
     check_gate_pop.sh)
       # Self-check for the SHARED stamp-population helper. Synthetic tree, no
       # build state touched. Gated on the two defects the helper actually
       # produced during conversion (false LEAK, vacuous assertion) plus the
       # fail-closed case its own check then found.
-      timeout 300 bash "$SCRIPT_DIR/check_gate_pop.sh"; return $? ;;
+      timeout -k 30 300 bash "$SCRIPT_DIR/check_gate_pop.sh"; return $? ;;
     check_result_block.sh)
       # Asserts the RESULT-filling benchmark block still names only flags that
       # exist in source, still anchors every blank RESULT line, and still
       # contains NO numeric tok/s. Read-only, no GPU, no build.
-      timeout 600 bash "$SCRIPT_DIR/check_result_block.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_result_block.sh"; return $? ;;
     check_bench_load_gate.sh)
       # AUDIT #23. Derives the wall-time harness population from scripts/ (a
       # non-gate script that scrapes a timing figure, comments stripped) and
       # requires each to route its figure through scripts/_gate_loadlog.sh, with
       # the maximum-over-arm criterion proven BEHAVIOURALLY in both directions.
       # Read-only, no GPU, no build.
-      timeout 600 bash "$SCRIPT_DIR/check_bench_load_gate.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_bench_load_gate.sh"; return $? ;;
     check_verdict_scope.sh)
       # AUDIT #29. Closes AUDIT #28 defect #1 as a FAMILY: every non-verifier in
       # scripts/ that emits a spread-bounded verdict must be the one owner or a
       # declared site, and the owner's gate must be over the rounds the two arms
       # hold IN COMMON. Read-only, no GPU, no build; plants its own counter-
       # examples in a temp tree.
-      timeout 600 bash "$SCRIPT_DIR/check_verdict_scope.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_verdict_scope.sh"; return $? ;;
     check_dri_probe.sh)
       # Closes the /dev/dri family: no script may identify a GPU card by its DRM
       # minor, which is not stable (the 2nd B580 became card2/renderD130). The
       # rule is derived from scripts/, and a four-case planted self-check gates the
       # verdict -- two earlier versions of the rule passed while a defect was
       # planted. Read-only, no GPU, no build.
-      timeout 600 bash "$SCRIPT_DIR/check_dri_probe.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_dri_probe.sh"; return $? ;;
     check_stack_cert.sh)
       # AUDIT #29. Re-derives build/stack_cert/cert against THIS tree: sha, rc,
       # the census, and a clean tree. A seven-case behavioural self-check runs
       # FIRST and gates the verdict; a nested run (the self-check itself) skips it
       # and SAYS SO. Read-only, no GPU, no build.
-      timeout 600 bash "$SCRIPT_DIR/check_stack_cert.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_stack_cert.sh"; return $? ;;
     check_engine_cert.sh)
       # AUDIT #24. run_all_checks certifies the TOOLING; scripts/run_ten_gates.sh
       # certifies the ENGINE. This is what stops the two being reconciled by
@@ -253,7 +255,7 @@ dispatch() { # $1 = label -> runs it
       # engine edit, nor needlessly invalidated by a docs-only one.
       # Read-only, no GPU, no build. rc=2 (no artifact) is UNPROVEN, not a
       # regression, and the 2b re-run path handles it.
-      timeout 300 bash "$SCRIPT_DIR/check_engine_cert.sh"; return $? ;;
+      timeout -k 30 300 bash "$SCRIPT_DIR/check_engine_cert.sh"; return $? ;;
     run_ten_gates.sh)
       # AUDIT #24 -- SELF-CHECK ONLY, never the gates themselves. run_ten_gates.sh
       # runs the engine on both GPUs for tens of minutes and is deliberately NOT a
@@ -262,61 +264,61 @@ dispatch() { # $1 = label -> runs it
       # stubs and is what the stack enforces -- otherwise the one runner in the tree
       # whose failure path nobody has ever watched execute is exactly the always-green
       # harness the AUDIT #14 vacuity class describes.
-      timeout 300 bash "$SCRIPT_DIR/run_ten_gates.sh" --self-check; return $? ;;
+      timeout -k 30 300 bash "$SCRIPT_DIR/run_ten_gates.sh" --self-check; return $? ;;
     check_checker_matrix_coverage.sh)
       # Derives "every checker has a dispatched matrix" from scripts/ rather than
       # trusting a hand-written total. Wired, and its own matrix is
       # mutate_checker_matrix_coverage.sh -- otherwise this checker would be the
       # very drift it reports.
-      timeout 600 bash "$SCRIPT_DIR/check_checker_matrix_coverage.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_checker_matrix_coverage.sh"; return $? ;;
     check_gpu_recover.sh)
       # Stubbed probe; nothing real is modified. Pins the RECOVERY TOOL's exit
       # codes, especially 2=unmeasurable vs 1=still-broken -- the distinction
       # that keeps "the probe could not count" from being read as a device
       # count. Needs no GPU.
-      timeout 600 bash "$SCRIPT_DIR/check_gpu_recover.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_gpu_recover.sh"; return $? ;;
     check_gate_enum.sh)
       # Behavioural self-check for the SHARED vacuity guard. Four cases plus a
       # converse: must reject 0/empty/non-numeric/below-minimum, and must
       # ACCEPT well-formed input SILENTLY -- without that, a helper that
       # rejects everything would score 3/3 and prove nothing.
-      timeout 300 bash "$SCRIPT_DIR/check_gate_enum.sh"; return $? ;;
+      timeout -k 30 300 bash "$SCRIPT_DIR/check_gate_enum.sh"; return $? ;;
     check_build_dir_consumers.sh)
       # Static: derives the artifact-consumer population from the CMake
       # add_executable list plus every script touching a build tree, then fails
       # on any that hardcodes one. No GPU, no build, seconds.
-      timeout 900 bash "$SCRIPT_DIR/check_build_dir_consumers.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/check_build_dir_consumers.sh"; return $? ;;
     check_doc_counts.sh)
       # Re-derives the report's commit count with git and fails if the stated
       # number disagrees, or if the gate tally / TP=2 UNVERIFIED wording moved.
-      timeout 900 bash "$SCRIPT_DIR/check_doc_counts.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/check_doc_counts.sh"; return $? ;;
     mutate_e2_ctx.sh)
       # Proves check_e2_ctx.sh's SELF-CHECK half. The real-run half is not
       # mutation-testable (its artifact is correct by construction) and one
       # state is excluded as unobservable -- see the matrix's SCOPE block.
-      timeout 1800 bash "$SCRIPT_DIR/mutate_e2_ctx.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_e2_ctx.sh"; return $? ;;
     mutate_gpu_recover.sh)
       # Fixtures live in a mktemp sandbox OUTSIDE $BUILD_DIR, and the matrix
       # asserts the enumerated stamp-DIRECTORY set is unchanged, so its own
       # artefacts cannot join the population step 3/3 compares.
-      timeout 1800 bash "$SCRIPT_DIR/mutate_gpu_recover.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_gpu_recover.sh"; return $? ;;
     mutate_fold_report_class.sh)
       # Removes one EXPECTED DIRECTION from the classifier check. Per AUDIT #21
       # the states cannot weaken the CHECKER here -- every artifact it drives is
       # correct by construction, so that would score MISSED for free. They break
       # the expectation instead, so a direction the checker quietly stopped
       # testing must show up as a missing ok line.
-      timeout 1800 bash "$SCRIPT_DIR/mutate_fold_report_class.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_fold_report_class.sh"; return $? ;;
     mutate_result_block.sh)
       # Damages the REPORTS in a sandbox, never the checker (AUDIT #21: the
       # reports are correct, so weakening the checker is unobservable).
-      timeout 1800 bash "$SCRIPT_DIR/mutate_result_block.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_result_block.sh"; return $? ;;
     mutate_bench_load_gate.sh)
       # AUDIT #23. Damages a HARNESS in a fully-copied sandbox (never the
       # checker, and never through a symlink into the real tree). B-E is the
       # sharp state: the helper stops withholding while every text property
       # still passes, so only the behavioural probe can see it.
-      timeout 1800 bash "$SCRIPT_DIR/mutate_bench_load_gate.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_bench_load_gate.sh"; return $? ;;
     mutate_verdict_scope.sh)
       # AUDIT #29. Every state damages the TREE the checker grades, in a copy of
       # scripts/, and the checker that runs is the sandbox's OWN copy -- the
@@ -324,63 +326,63 @@ dispatch() { # $1 = label -> runs it
       # states unobservable by construction. V-F is an isolation case, not a
       # mutation: it empties the harvest with the self-tests disabled so the
       # enumeration guard is the only thing that can fire.
-      timeout 900 bash "$SCRIPT_DIR/mutate_verdict_scope.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_verdict_scope.sh"; return $? ;;
     mutate_dri_probe.sh)
       # Every state damages the CORPUS the rule grades, handed over through
       # INTFER_SCRIPTS_DIR; the checker that runs is the real one reading that
       # corpus -- weakening the CHECKER would be unobservable (AUDIT #21). D-E is
       # the CONVERSE: a single-minor liveness probe must stay clean, without which
       # a rule that flagged everything would satisfy D-A..D-D.
-      timeout 900 bash "$SCRIPT_DIR/mutate_dri_probe.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_dri_probe.sh"; return $? ;;
     mutate_stack_cert.sh)
       # AUDIT #29. Breaks the census DERIVATION and the dirty-tree test, both of
       # which the self-check cannot see because every fixture derives its census
       # from the same expression the verdict uses (the AUDIT #12 S4 shape). S-B
       # cannot use the shared `rc != 0` predicate -- neutering the guard turns
       # rc 1 into rc 0 -- so both halves are asserted there explicitly.
-      timeout 900 bash "$SCRIPT_DIR/mutate_stack_cert.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_stack_cert.sh"; return $? ;;
     mutate_engine_cert.sh)
       # AUDIT #24. Plants ten_gates/HEAD into a SANDBOX build dir (via
       # INTFER_BUILD_DIR) so the real certification is never touched, and drives
       # the four verdict paths. Its own E-D state weakens the input filter while
       # the artifact is deliberately stale -- legitimate only because the planted
       # artifact is itself defective (the AUDIT #21 rule).
-      timeout 900 bash "$SCRIPT_DIR/mutate_engine_cert.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_engine_cert.sh"; return $? ;;
     mutate_checker_matrix_coverage.sh)
       # Each state BOTH poisons the tree with an unmated checker AND removes the
       # requirement that would catch it -- weakening alone is unobservable while
       # the real tree has full coverage (AUDIT #21).
-      timeout 1800 bash "$SCRIPT_DIR/mutate_checker_matrix_coverage.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_checker_matrix_coverage.sh"; return $? ;;
     mutate_gate_pop.sh)
       # Removes ONE case (its echo AND its own counter) from check_gate_pop.sh.
       # patch_literal is called with THREE arguments -- file, exact-old,
       # exact-new -- and old/new each span a literal newline. Passing one quoted
       # string per LINE was the original bug: five states, all "PATCH VERIFY
       # FAIL", found with bash -x rather than by guessing.
-      timeout 1800 bash "$SCRIPT_DIR/mutate_gate_pop.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_gate_pop.sh"; return $? ;;
     mutate_gate_enum.sh)
       # Patches SANDBOX COPIES under the build tree, never scripts/, so a
       # mutated helper cannot leak into a later glob of that directory.
-      timeout 1800 bash "$SCRIPT_DIR/mutate_gate_enum.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_gate_enum.sh"; return $? ;;
     mutate_doc_counts.sh)
       # Poisons a COPY of the batch report, then restores it. Refuses to start
       # if the report is dirty, and verifies every poison actually landed.
-      timeout 1800 bash "$SCRIPT_DIR/mutate_doc_counts.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_doc_counts.sh"; return $? ;;
     mutate_l0_cite.sh)
       # Mutates a COPY of the pinned upstream tree under build/, never tracked
       # source, so this matrix is safe to run alongside the rest of the stack.
-      timeout 3600 bash "$SCRIPT_DIR/mutate_l0_cite.sh"; return $? ;;
+      timeout -k 30 3600 bash "$SCRIPT_DIR/mutate_l0_cite.sh"; return $? ;;
     mutate_build_dir_consumers.sh)
       # Edits scripts/bench_reports_batch.sh and restores it from a backup.
-      timeout 1800 bash "$SCRIPT_DIR/mutate_build_dir_consumers.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_build_dir_consumers.sh"; return $? ;;
     mutate_fold_matrix.sh)
-      timeout 7200 bash "$SCRIPT_DIR/mutate_fold_matrix.sh"; return $? ;;
+      timeout -k 30 7200 bash "$SCRIPT_DIR/mutate_fold_matrix.sh"; return $? ;;
     mutate_gate_inventory.sh)
-      timeout 7200 bash "$SCRIPT_DIR/mutate_gate_inventory.sh"; return $? ;;
+      timeout -k 30 7200 bash "$SCRIPT_DIR/mutate_gate_inventory.sh"; return $? ;;
     mutate_device_precond.sh)
-      timeout 7200 bash "$SCRIPT_DIR/mutate_device_precond.sh"; return $? ;;
+      timeout -k 30 7200 bash "$SCRIPT_DIR/mutate_device_precond.sh"; return $? ;;
     mutate_run_all_checks.sh)
-      timeout 3600 bash "$SCRIPT_DIR/mutate_run_all_checks.sh"; return $? ;;
+      timeout -k 30 3600 bash "$SCRIPT_DIR/mutate_run_all_checks.sh"; return $? ;;
     *)
       # Seam: an external step directory. It exists because this script is the
       # ENTRY POINT for a ~45 minute stack, so a mutation matrix that invoked it

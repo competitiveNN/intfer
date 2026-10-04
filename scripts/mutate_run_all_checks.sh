@@ -200,6 +200,8 @@ cleanup() {
   rm -rf "$SYNTH"
 }
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 [ -e "$TARGET" ] || { echo "FAIL: $TARGET missing" >&2; exit 1; }
 if ! git diff --quiet || ! git diff --cached --quiet; then

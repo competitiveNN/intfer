@@ -35,7 +35,9 @@ git -C "$ROOT" diff --quiet -- scripts/ 2>/dev/null || {
   echo "FAIL: scripts/ is dirty; this matrix edits a sandbox copy."; exit 2; }
 
 SB="$(mktemp -d "${TMPDIR:-/tmp}/intfer_blg.XXXXXX")"
-trap 'rm -rf "$SB"' EXIT INT TERM
+trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf "$SB"; exit 130' INT
+trap 'rm -rf "$SB"; exit 143' TERM
 mkdir -p "$SB/scripts" "$LOG"
 # Reset the summary. Without this it ACCUMULATES across runs and the printed
 # block contradicts its own verdict -- it listed "B-A MISSED (fn)" from the
@@ -541,6 +543,44 @@ MUTATE_FN() {
 }
 run_state "B-T" 'B_T' 'lock-self-heals-a-dead-owner' \
   "the self-heal deleted, so a dead owner's lock blocks forever and the queued benchmark can never be started again"
+
+# B-U: the TERM trap CLEANING UP BUT NOT EXITING. This is the exact idiom that was
+# shipped and believed safe -- `trap 'rm -rf ...' EXIT INT TERM`, the AUDIT #29 remedy
+# applied mechanically without noticing that a trap which does not exit lets the
+# process SURVIVE the signal. Every dispatch arm wraps its target in `timeout`, which
+# sends SIGTERM and then WAITS for the child, so a step that ignored its signal hangs
+# the whole stack instead of failing it. None of the four DECISION cells can see this:
+# they assert rc, the message, the pid and the live holder's lock, all of which are
+# unchanged -- which is why the earlier version of this matrix passed with the defect
+# present and every cell green.
+#
+# B-V is a DIFFERENT defect, and the converse of the other assertion: the TERM trap
+# exits but does NOT clean up. "It terminated" and "it released the lock" are two
+# independent claims, so each needs its own state. Without B-V, B-U would also be
+# caught by an assertion that only ever looked at the exit status.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/bench_when_quiet.sh" \
+    "trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true; exit 143' TERM" \
+    "trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true' TERM  #B_U cleans up but does NOT exit" || return 1
+  bash -n "$SB/scripts/bench_when_quiet.sh" || return 1
+  grep -q 'B_U cleans up but does NOT exit' "$SB/scripts/bench_when_quiet.sh"
+}
+run_state "B-U" 'B_U' 'SIGTERM-exits-the-process' \
+  "the TERM trap cleans up but does not exit, so the process survives the signal and timeout can never stop it"
+
+MUTATE_FN() {
+  patch_literal "$SB/scripts/bench_when_quiet.sh" \
+    "trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true' EXIT
+trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true; exit 130' INT
+trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true; exit 143' TERM" \
+    "trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true' EXIT
+trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true; exit 130' INT
+trap 'exit 143' TERM  #B_V terminates but leaks the lock" || return 1
+  bash -n "$SB/scripts/bench_when_quiet.sh" || return 1
+  grep -q 'B_V terminates but leaks the lock' "$SB/scripts/bench_when_quiet.sh"
+}
+run_state "B-V" 'B_V' 'SIGTERM-releases-the-lock' \
+  "the TERM trap terminates but leaks the lock, so the next run is refused by a lock nobody is holding"
 
 restore
 echo

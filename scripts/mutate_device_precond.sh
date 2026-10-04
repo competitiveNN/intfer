@@ -87,6 +87,8 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   exit 1
 fi
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 130' INT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 143' TERM
 
 TGT_A="scripts/test_dpas_fold.sh"
 TGT_C="scripts/test_http_batch.sh"

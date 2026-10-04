@@ -21,6 +21,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${INTFER_L0_OUT:-${TMPDIR:-/tmp}/intfer_l0_enumerate.$$}"
 trap 'rm -f "$OUT" "$OUT.bin"' EXIT
+trap 'rm -f "$OUT" "$OUT.bin"; exit 130' INT
+trap 'rm -f "$OUT" "$OUT.bin"; exit 143' TERM
 
 # Locate the compiler the same way scripts/build.sh does (avoids sourcing
 # setvars.sh, which calls exit and would kill this script).

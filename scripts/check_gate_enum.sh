@@ -36,6 +36,8 @@ echo "== GATE ENUM SELF-CHECK (_gate_enum.sh) =="
 bad=0
 SELFCHECK_OUT="$(mktemp "${TMPDIR:-/tmp}/intfer_enum_sc.XXXXXX")"
 trap 'rm -f "$SELFCHECK_OUT"' EXIT
+trap 'rm -f "$SELFCHECK_OUT"; exit 130' INT
+trap 'rm -f "$SELFCHECK_OUT"; exit 143' TERM
 
 must_reject() { # $1 label, then: func + that func's own arguments, forwarded WHOLE
   local label="$1"; shift

@@ -167,7 +167,9 @@ done
 # is the exact defect. Both directions are required: a gate that can only say
 # USABLE is the bug, and one that can only say CONTENDED is useless.
 TDIR="$(mktemp -d "${TMPDIR:-/tmp}/blg.XXXXXX")"
-trap 'rm -rf "$TDIR"' EXIT INT TERM
+trap 'rm -rf "$TDIR"' EXIT
+trap 'rm -rf "$TDIR"; exit 130' INT
+trap 'rm -rf "$TDIR"; exit 143' TERM
 if [ ! -f "$HELPER" ]; then
   echo "  FAIL  $HELPER is missing -- the shared home does not exist"
   bad=$((bad+1))
@@ -782,6 +784,67 @@ STUB
     echo "        Got:"
     sed 's/^/          [live] /' "$GD/lock_live.out" | tail -4
     sed 's/^/          [dead] /' "$GD/lock_dead.out" | tail -4
+    bad=$((bad + 1))
+  fi
+
+  # -- AND THE LOCK IS ACTUALLY RELEASED. BOTH PATHS, and both were unasserted ----
+  # The four cells above assert the DECISIONS (rc, the message, the pid, and that a
+  # live holder's lock survives). None of them asserts that the lock is GONE once
+  # the run ends -- which is the whole point of taking it, and the half that has
+  # been silently broken twice in this repo's history:
+  #   * AUDIT #29: an EXIT-only trap does not run on SIGTERM, so every sandbox leaked
+  #   * and the "fix" for that wrote `rm -rf \"$SB\"`, so nothing was EVER removed,
+  #     while `bash -n` stayed green because the file was syntactically fine
+  #
+  # TWO SEPARATE DEFECTS were live here, and fixing the first exposed the second:
+  #   (1) `trap 'rm -rf "$WQ_LOCK"' EXIT INT TERM` cleans up but does NOT exit, so
+  #       the process SURVIVES the signal. Every dispatch arm wraps its target in
+  #       `timeout`, which sends SIGTERM and then WAITS for the child -- so a step
+  #       that ignored its signal would hang the whole stack instead of failing it.
+  #   (2) bash DEFERS a trap while a FOREGROUND command runs, so the plain
+  #       `sleep 30` in the wait loop meant the handler did not run for up to 30s.
+  #       Measured: 10s after SIGTERM the lock was still there and the process still
+  #       alive. Backgrounding the sleep and `wait`ing on it puts the interruptible
+  #       `wait`, not the uninterruptible `sleep`, in the signal path.
+  # The exit status is asserted too (143 = 128+SIGTERM), because "released the lock"
+  # and "actually terminated" are different claims, and only the second is what makes
+  # the `timeout -k 30` in dispatch() a guarantee rather than a hope.
+  #
+  # (a) NORMAL EXIT: the dead-owner cell above returned 0, so its lock must be gone.
+  #     Zero extra cost, and it is the half that catches a trap body which silently
+  #     stopped removing anything.
+  # (b) SIGTERM MID-WAIT: launched for real and terminated for real. A watchdog backs
+  #     the `wait` off with SIGKILL so this cell can never be the thing that hangs.
+  printf '9.00 9.00 9.00\n' > "$GD/load_hi"
+  sig_rc=""
+  LOADAVG="$GD/load_hi" INTFER_RUNLOG="$GD/sig.log" INTFER_WQ_LOCK="$GD/SL" \
+    bash "$SCRIPT_DIR/bench_when_quiet.sh" --max-wait 600 >"$GD/sig.out" 2>&1 &
+  sig_pid=$!
+  ( sleep 20; kill -KILL "$sig_pid" 2>/dev/null ) >/dev/null 2>&1 &
+  sig_watch=$!
+  sig_took=""
+  for _i in $(seq 1 80); do [ -e "$GD/SL/pid" ] && { sig_took=yes; break; }; sleep 0.25; done
+  kill -TERM "$sig_pid" 2>/dev/null
+  wait "$sig_pid" 2>/dev/null; sig_rc=$?
+  kill "$sig_watch" 2>/dev/null
+  if pred_expect_present "normal-EXIT-releases-the-lock" \
+          "$([ -e "$GD/dead" ] && echo present || echo gone)" '^gone$' \
+     && pred_expect_present "the-wait-loop-is-reachable-to-a-signal" "${sig_took:-no}" '^yes$' \
+     && pred_expect_present "SIGTERM-exits-the-process" "$sig_rc" '^143$' \
+     && pred_expect_present "SIGTERM-releases-the-lock" \
+          "$([ -e "$GD/SL" ] && echo present || echo gone)" '^gone$' \
+     && pred_expect_present "SIGTERM-actually-reached-the-wait-loop" \
+          "$(grep -c 'waiting for load1' "$GD/sig.out" || true)" '^[1-9]'; then
+    echo "  ok    lock RELEASE: gone after a normal EXIT, and after a real SIGTERM"
+    echo "        mid-wait the process EXITS 143 with the lock gone -- so the"
+    echo "        timeout -k 30 in dispatch() is a guarantee, not a hope"
+  else
+    echo "  FAIL  lock-RELEASE: normal EXIT left $([ -e "$GD/dead" ] && echo the || echo no) lock;"
+    echo "        SIGTERM rc='${sig_rc}' (want 143), lock $([ -e "$GD/SL" ] && echo PRESENT || echo gone),"
+    echo "        reached the wait loop: ${sig_took:-no}. A trap that cleans up but does not"
+    echo "        exit lets the process SURVIVE, and timeout waits for the child, so one"
+    echo "        stubborn step would hang the stack rather than fail it. Got:"
+    tail -4 "$GD/sig.out" | sed 's/^/          [sig ] /'
     bad=$((bad + 1))
   fi
   fi

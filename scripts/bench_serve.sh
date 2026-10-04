@@ -31,6 +31,8 @@ export TMPDIR="${TMPDIR:-/tmp}"
 REQ="$(mktemp --tmpdir="$TMPDIR" bench_req.XXXX.jsonl)"
 OUT="$(mktemp --tmpdir="$TMPDIR" bench_out.XXXX.jsonl)"
 trap 'rm -f "$REQ" "$OUT"' EXIT
+trap 'rm -f "$REQ" "$OUT"; exit 130' INT
+trap 'rm -f "$REQ" "$OUT"; exit 143' TERM
 
 PROMPTS=("The capital of France is" "The quick brown fox jumps over the lazy dog." "Hi" "Hello world")
 for ((i = 0; i < N; i++)); do

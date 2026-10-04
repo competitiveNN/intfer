@@ -263,6 +263,13 @@ serve_cleanup() {
   SERVE_PID=""
 }
 trap serve_cleanup EXIT
+# INT/TERM must clean up AND exit: a trap that cleans up but does not exit lets
+# the process SURVIVE the signal, and every dispatch arm wraps its target in
+# `timeout`, which sends SIGTERM and then waits for the child -- so a step that
+# ignored it would hang the stack forever instead of failing. See
+# scripts/check_trap_release.sh, which derives and enforces this across scripts/.
+trap 'serve_cleanup; exit 130' INT
+trap 'serve_cleanup; exit 143' TERM
 setsid nohup env INTFER_DEVICE_ARGMAX=1 "$BIN" -m "$MODEL" --gpu --tp 1 \
   --serve-http --port "$SERVE_PORT" --host 127.0.0.1 >"$SERVE_LOG" 2>&1 < /dev/null &
 SERVE_PID=$!
@@ -310,7 +317,7 @@ else
     while read -r line; do fail "server log fatal: $line"; done
 fi
 serve_cleanup
-trap - EXIT
+trap - EXIT INT TERM
 
 if [ "$PASS" != 1 ]; then
   echo "DEVICE-ARGMAX TEST: FAIL" >&2
