@@ -396,6 +396,141 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // (bisection). Host-side read; getenv/static are illegal in device.
       const bool use_int2_tab =
           (std::getenv("INTFER_NO_INT2_TAB") == nullptr);
+      // INTFER_DECODE1_MR=1 (EXPERIMENTAL, default OFF): process MR output
+      // elements per work-item instead of one. Kill switch
+      // INTFER_NO_DECODE1_MR=1 additionally forces it off.
+      //
+      // *** MEASURED 2026-10-04, 27B --tp 2, decode M=1, n=8: 2.3x SLOWER. ***
+      // kernel 2055.1 ms -> 4698.7 ms, waitblock 1037.7 -> 2362.5 ms.
+      // DEFAULT OFF, and the reason is the most useful thing this experiment
+      // produced, so it is recorded here rather than only in a report:
+      //
+      // At M=1 the total work-item count of this kernel is EXACTLY N -- one
+      // output element per work-item -- and that is invariant to the work-group
+      // shape. So MR=4 did not add memory parallelism, it DIVIDED an already
+      // starved parallelism budget by four. At 27B TP=2 a layer GEMM has
+      // N~2048 per rank over 512 Xe cores = ~4 threads/EU, and kThr=16 cannot
+      // even fill one SIMD. The kernel is PARALLELISM-bound, not bandwidth-
+      // bound, and not issue/MLP-bound.
+      //
+      // That reframes the whole M=1 decode target: the only ways to raise
+      // parallelism are (a) split K across work-items, which reassociates the
+      // FP32 sum and is therefore NOT bit-exact, or (b) fuse INDEPENDENT GEMMs
+      // into one nd_range so one launch carries several N's worth of
+      // work-items, which IS bit-exact because each output keeps its own
+      // work-item and its own K order. (b) is the live direction.
+      const bool use_mr = (std::getenv("INTFER_DECODE1_MR") != nullptr) &&
+                          (std::getenv("INTFER_NO_DECODE1_MR") == nullptr);
+
+      // --- WHY (measured 2026-10-04, 27B --tp 2, decode M=1) ---------------
+      // The one-output-per-work-item kernel gives lane i the row
+      // `code_u8 + i*K`, so at any instant the subgroup's lanes sit K bytes
+      // apart: a stride-K gather, not a coalesced stream. Worse, EVERY work-item
+      // re-loads the ENTIRE activation row (`a16.load` inside the K loop), so
+      // one GEMM re-reads K halves N times.
+      // Measured effect at 27B: decode reads 9.16 GiB of weights per device per
+      // token in 257.7 ms of kernel = 35.5 GiB/s, which is ~21 % of the B580's
+      // ~179 GB/s. So the kernel is issue/MLP-bound, not bandwidth-bound.
+      //
+      // MR attacks BOTH causes without touching the arithmetic:
+      //   * MR independent weight streams per lane => more memory-level
+      //     parallelism to cover the same latency;
+      //   * the activation chunk is loaded ONCE per K step and reused across all
+      //     MR outputs => MR-fold fewer activation loads.
+      //
+      // BIT-EXACT, and that is the whole reason this shape was chosen over the
+      // obvious alternative. Each output still accumulates its own K in ascending
+      // kg, ascending j, into its own register. The tempting fix -- split K
+      // across lanes and tree-reduce -- would make the weight loads coalesced
+      // too, but it reassociates the FP32 sum and is therefore NOT bit-exact.
+      // This changes only WHICH work-item computes an output and how many loads
+      // it shares, never the order of any accumulation.
+      if (use_mr && bits == 2 && use_int2_tab && num_groups > 0) {
+        constexpr int MR = 4;
+        const int per_group = nWG * MR;
+        const int nB = (N + per_group - 1) / per_group;
+        const int global_mr = nB * nWG;
+        return q.submit([&](sycl::handler& h) {
+          h.depends_on(copy_dep);
+          h.parallel_for<class gemm_usm_decode1_vec_mr>(
+              sycl::nd_range<1>(sycl::range<1>(global_mr), sycl::range<1>(nWG)),
+              [=](sycl::nd_item<1> it) {
+                const int ng0 = static_cast<int>(it.get_global_id(0)) * MR;
+                if (ng0 >= N) return;
+                const int nvalid =
+                    (N - ng0) < MR ? (N - ng0) : MR;
+
+                float acc[MR];
+                const std::uint16_t* sptr[MR];
+                const std::uint8_t* wrow[MR];
+                for (int r = 0; r < MR; ++r) {
+                  acc[r] = 0.0f;
+                  sptr[r] = scale_usm + (ng0 + r) * num_groups_w;
+                  wrow[r] = code_u8 + static_cast<std::size_t>(ng0 + r) * K;
+                }
+                sycl::multi_ptr<const std::uint16_t,
+                    sycl::access::address_space::global_space> act_mp(act_usm);
+
+                const float alpha_f = alpha;
+                const std::size_t pack_sz = 4;  // 8 codes / 4 bytes at INT2
+
+                for (int g = 0; g < num_groups; ++g) {
+                  const int kg0 = g * Gw;
+                  int kg1 = kg0 + Gw;
+                  if (kg1 > static_cast<int>(K)) kg1 = (int)K;
+                  // Per-output group scale folded into a 4-entry register table
+                  // (identical algebra and identical op order to the 1-output
+                  // path's wtab -- see the note there).
+                  float wtab[MR][4];
+                  for (int r = 0; r < nvalid; ++r) {
+                    const float sc = from_half_bits(sptr[r][g]) * alpha_f;
+                    wtab[r][0] = sc * -1.0f;
+                    wtab[r][1] = sc * (-1.0f / 3.0f);
+                    wtab[r][2] = sc * (1.0f / 3.0f);
+                    wtab[r][3] = sc * 1.0f;
+                  }
+                  int kg = kg0;
+                  std::size_t b0[MR];
+                  for (int r = 0; r < nvalid; ++r)
+                    b0[r] = (static_cast<std::size_t>(ng0 + r) * K +
+                             static_cast<std::size_t>(kg)) / pack_sz;
+                  for (; kg + 8 <= kg1; kg += 8) {
+                    // ONE activation load, reused by every output.
+                    sycl::vec<std::uint16_t, 8> a16;
+                    a16.load(0, act_mp + kg);
+                    for (int r = 0; r < nvalid; ++r) {
+                      const std::uint8_t b0v = code_u8[b0[r]];
+                      const std::uint8_t b1v = code_u8[b0[r] + 1];
+                      b0[r] += 2;
+                      for (int j = 0; j < 8; ++j) {
+                        const float av = static_cast<float>(
+                            sycl::bit_cast<sycl::half>(a16[j]));
+                        const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                        const int code = (bv >> ((j & 3) * 2)) & 3;
+                        acc[r] += av * wtab[r][code];
+                      }
+                    }
+                  }
+                  // Scalar tail: same order, same table, same products.
+                  for (; kg < kg1; ++kg) {
+                    const float av = from_half_bits(act_usm[kg]);
+                    for (int r = 0; r < nvalid; ++r) {
+                      const std::size_t idx =
+                          static_cast<std::size_t>(ng0 + r) * K +
+                          static_cast<std::size_t>(kg);
+                      const std::uint8_t byte = code_u8[idx / pack_sz];
+                      const int within = (int)(idx % pack_sz);
+                      const int code = (byte >> (within * 2)) & 3;
+                      acc[r] += av * wtab[r][code];
+                    }
+                  }
+                }
+                for (int r = 0; r < nvalid; ++r)
+                  out_usm[ng0 + r] = to_half_bits(acc[r]);
+              });
+        });
+      }
+
       return q.submit([&](sycl::handler& h) {
         h.depends_on(copy_dep);
         h.parallel_for<class gemm_usm_decode1_vec>(

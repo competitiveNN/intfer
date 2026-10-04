@@ -364,7 +364,59 @@ SYCL Command Graphs: Replace CUDA Graphs with sycl::ext::oneapi::experimental::c
 Stage 3.
 Implement features for maximizing throughput for concurrent requests, starting from continuous batching.
 
-## ==> PARAMOUNT DIRECTIVE (2026-10-04): OPTIMIZE FIRST. WALL-TIME BENCHMARKING IS RETIREED. <==
+### ==> 27B DECODE IS **PARALLELISM-BOUND**, NOT BANDWIDTH-BOUND (measured 2026-10-04) <==
+
+The most important thing measured since the directive below, and it **overturns**
+the natural first guess. Read it before optimizing decode.
+
+Measured on 27B `--tp 2`, decode M=1, load1 0.96-1.58 (counters only):
+`kernel` 44 %, `waitblock` 22 %, `submit` 17 %, `usm_write` 9 %, `readback` 8 %.
+Decode reads **9.16 GiB of weights per device per token** in **257.7 ms** of
+kernel = **35.5 GiB/s, about 21 % of the B580's ~179 GB/s**. The obvious reading
+is "the GEMV kernel is not saturating bandwidth". That reading is **wrong**.
+
+**Proof by measurement, not argument.** `INTFER_DECODE1_MR=1` processes MR=4
+outputs per work-item, chosen because it raises memory-level parallelism *and*
+shares one activation load across 4 outputs, and chosen to be **bit-exact** (each
+output keeps its own K order -- ascending `kg`, then ascending `j` -- in its own
+register; nothing is reassociated). It came out **2.3x SLOWER**:
+
+| arm | kernel | waitblock |
+|---|---|---|
+| `INTFER_DECODE1_MR` off | 2055.1 ms | 1037.7 ms |
+| `INTFER_DECODE1_MR` on | **4698.7 ms** | 2362.5 ms |
+
+`nk`/`nw`/`nr` identical (7936/7936/2048), so this is device work, not plumbing.
+
+**Why -- and this is the finding.** At M=1 this kernel's total work-item count is
+**exactly `N`** (one output element per work-item), and that is **invariant to the
+work-group shape**. So MR did not add parallelism; it **divided an already-starved
+budget by four**. At 27B TP=2 a layer GEMM has N about 2048 per rank over **512 Xe
+cores, about 4 threads/EU**, and `kThr=16` (`quant_gemm.cpp:63`) cannot even fill
+one SIMD. More outputs per work-item is *anti*-parallel at M=1.
+
+**So the target is EU occupancy, and the 21 % bandwidth figure is a symptom, not
+the cause.** Exactly two ways to raise it:
+
+* **(a) split K across work-items.** Raises parallelism *and* coalesces the weight
+  loads. **NOT bit-exact** -- it reassociates the FP32 sum, so it needs a numerics
+  contract agreed *before* code (the recorded E4-style precondition).
+* **(b) fuse INDEPENDENT GEMMs into ONE `nd_range`,** so a single launch carries
+  several N's worth of work-items. **BIT-EXACT** -- each output still has its own
+  work-item and its own K order; only the launch boundary moves. **This is the
+  live direction**, and it is also the standing fusion directive, so the two agree.
+
+Concretely for (b): q/k/v are three independent GEMMs and gate/up are two, all
+submitted back-to-back, each currently launching its own `N`-wide kernel. One
+launch of `3N`/`2N` work-items occupies 3-5x the EUs for identical arithmetic.
+The existing "wave" work already groups the *submits* and already proved the
+direction is safe (`INTFER_NO_WAVE=1` restores sequential). What is missing is
+grouping them into a **single kernel launch**, not merely a single host phase.
+
+Do **not** re-attempt per-work-item output tiling at M=1. It is measured, and the
+mechanism is structural rather than a tuning miss.
+
+## ==> PARAMOUNT DIRECTIVE (2026-10-04): OPTIMIZE FIRST. WALL-TIME BENCHMARKING IS RETIRED. <==
 
 **The single objective of this project right now is to make 27B (`--tp 2`)
 prefill and inference as fast as possible.** Everything else is subordinate. This
