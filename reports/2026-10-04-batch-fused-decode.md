@@ -224,22 +224,33 @@ spread if you take more than one round, and state the counting basis.
 
 ## Status and provenance (read before trusting any of the above)
 
-**Verified, without running the model:** `intfer_gemm`, `intfer_engine` and
-`intfer_cli` compile clean; `bash -n` clean on `test_gpu_optin.sh`,
-`mutate_fused_decode.sh`, `run_all_checks.sh`; the wide arms appear **exactly
-once** and **inside** the `for tp` loop, with their base (`WB`) assigned before
-use; **zero** references to an undefined base variable; all four mutation anchors
-located exactly once, proven stale-refusing and ambiguity-refusing as above; and
-`INTFER_RUN_ALL_COVERAGE_ONLY=1 run_all_checks.sh` → **40 check_*/mutate_* scripts,
-all dispatched (0b) and all scheduled (0c)**, rc=0.
+**Verified without running the model, re-checked against the COMMITTED bytes:**
+`intfer_gemm`, `intfer_engine` and `intfer_cli` compile clean; `bash -n` clean on
+`test_gpu_optin.sh`, `mutate_fused_decode.sh`, `run_all_checks.sh`; the wide arms
+appear **exactly once** each and **inside** the `for tp` loop, with their base
+(`WB`) assigned before both of its uses; **zero** occurrences of an undefined
+base variable in that file -- in the working tree *and* in `HEAD`; all four
+mutation anchors located exactly once, with the pre-flight refusing both a
+drifted (0) and an ambiguous (2) anchor, per the table above; and the coverage
+sections green. Re-derive that last one rather than take it from here:
+
+```bash
+INTFER_RUN_ALL_COVERAGE_ONLY=1 bash scripts/run_all_checks.sh
+```
+
+It prints its own census and asserts every `check_*`/`mutate_*` is both
+**dispatched** (0b) and **scheduled** (0c). **No count is quoted in this file on
+purpose** -- a hand-counted total in prose is a citation, not a count, and it goes
+stale the moment a script is added.
 
 **NOT verified, and it needs the model:** the four mutation states and the
 stream-identity arms themselves. Those are the certification of bit-exactness and
 they have not been executed. `RESULT:` lines stay blank until they are.
 
-**Commits for this batch** (5, each bisectable): `40219bf` (the measured
-negative result that motivates it) → `0961035` (the two flags) → `db0ce37`
-(gating) → `030e0a6` (this report) → `62694ea` (the pre-flight verdict fix).
+**Commits for this batch**, each bisectable: `40219bf` (the measured negative
+result that motivates it) -> `0961035` (the two flags) -> `db0ce37` (gating) ->
+`030e0a6` (this report) -> `62694ea` (the pre-flight verdict fix) -> `af1d43b`
+(provenance reconciliation).
 
 ---
 

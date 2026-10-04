@@ -472,6 +472,28 @@ identical *and* the fused path proven **reachable** by launch-counter movement,
 because a kernel that always declines would satisfy every other state without
 ever running. Wired into BOTH `dispatch()` and `STEPS`.
 
+*** ITS ANCHOR PRE-FLIGHT, AND THE VERDICT IS COUNTED -- read this before copying
+the pattern. *** Every anchor is located up front by substring occurrence count
+**in python**, the same method `patch_literal` uses, so the guard and the thing it
+guards agree about what "exactly once" means (a multi-line anchor is one line to
+`grep -c` and many occurrences to python). It refuses **drifted** (0) *and*
+**ambiguous** (2) anchors; the second matters because it is the state where a
+patch would rewrite whichever comes first -- a DIFFERENT mutation than the state
+describes. `--anchors-only` runs it with no build, no model and no mutation.
+
+The first version printed `ANCHOR STALE ... found 0 occurrences` **and exited 0**
+-- python's non-zero status discarded by a script that is not `set -e`, so it went
+on to print `anchor pre-flight: ok (4/4)` and certify a stale anchor. **A loud
+message followed by a green summary is worse than no pre-flight at all.** The
+failure is now accumulated in `ANCHOR_BAD` and BOTH the summary line and the exit
+code derive from that count. Measured in all four directions: healthy `ok`/rc=0;
+drifted `FAIL (1 of 4)`/rc=1; duplicated `FAIL (1 of 4)`/rc=1; restored `ok`/rc=0.
+
+Also: `--anchors-only` originally sat **behind** the dirty-tree guard, so it could
+not run on a dirty tree -- which is exactly the tree you are on when you want it.
+It mutates nothing, so it belongs above the guard. A diagnostic you cannot run is
+not a diagnostic.
+
 **What is still NOT done, and is the next thing to attempt:** splitting K across
 work-items. It raises parallelism *and* coalesces the weight loads, and it is the
 only remaining lever on the M=1 budget — but it **reassociates the FP32 sum**, so
