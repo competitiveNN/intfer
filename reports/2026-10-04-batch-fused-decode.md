@@ -130,6 +130,27 @@ mean the fused launch serialised something it should have overlapped.
   healthy streams identical *and* the fused path proven **reachable** by
   launch-counter movement. Without the reachability half a kernel that always
   declines would satisfy every other state without ever running.
+* **Anchor pre-flight, and the verdict is COUNTED, not inherited.** Every anchor
+  is located up front by *substring occurrence count in python* — the same
+  counting method `patch_literal` uses, so the guard and the thing it guards
+  agree about what "exactly once" means (a multi-line anchor is one line to
+  `grep -c` and many occurrences to python). It refuses **drifted** (0
+  occurrences) *and* **ambiguous** (2 occurrences) anchors; the second matters
+  because it is the state where a patch would rewrite whichever comes first,
+  which is a different mutation than the state describes.
+  `scripts/mutate_fused_decode.sh --anchors-only` runs it with no build, no
+  model and no mutation.
+
+  *Verified in both directions without a model run* (measured, not asserted):
+  healthy tree → `ok (4/4)`, rc=0; G-C reindented → `FAIL (1 of 4 stale)`, rc=1,
+  refuses to start; G-D's anchor duplicated → `FAIL (1 of 4 stale)`, rc=1;
+  restored → `ok (4/4)`, rc=0.
+
+  The first version printed `ANCHOR STALE` and then exited **0** — python's
+  non-zero status discarded by a script that is not `set -e`. A loud message
+  followed by a green summary is worse than no pre-flight, so the failure is now
+  accumulated in `ANCHOR_BAD` and both the summary line and the exit code derive
+  from that count.
 
 RESULT (TP=1): ______________________
 RESULT (TP=2): ______________________
@@ -198,6 +219,27 @@ done
 
 Read the counters, not tok/s. Report the **per-round** `kernel` values with their
 spread if you take more than one round, and state the counting basis.
+
+---
+
+## Status and provenance (read before trusting any of the above)
+
+**Verified, without running the model:** `intfer_gemm`, `intfer_engine` and
+`intfer_cli` compile clean; `bash -n` clean on `test_gpu_optin.sh`,
+`mutate_fused_decode.sh`, `run_all_checks.sh`; the wide arms appear **exactly
+once** and **inside** the `for tp` loop, with their base (`WB`) assigned before
+use; **zero** references to an undefined base variable; all four mutation anchors
+located exactly once, proven stale-refusing and ambiguity-refusing as above; and
+`INTFER_RUN_ALL_COVERAGE_ONLY=1 run_all_checks.sh` → **40 check_*/mutate_* scripts,
+all dispatched (0b) and all scheduled (0c)**, rc=0.
+
+**NOT verified, and it needs the model:** the four mutation states and the
+stream-identity arms themselves. Those are the certification of bit-exactness and
+they have not been executed. `RESULT:` lines stay blank until they are.
+
+**Commits for this batch** (5, each bisectable): `40219bf` (the measured
+negative result that motivates it) → `0961035` (the two flags) → `db0ce37`
+(gating) → `030e0a6` (this report) → `62694ea` (the pre-flight verdict fix).
 
 ---
 
