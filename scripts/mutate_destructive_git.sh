@@ -53,20 +53,34 @@ if ! git diff --quiet -- $DIRTY || ! git diff --cached --quiet -- $DIRTY; then
   echo "  This script edits and restores them; commit or stash first." >&2
   exit 1
 fi
-PRISTINE_ART="$SB/pristine.art"
-PRISTINE_DOC="$SB/pristine.doc"
-cp "$ART" "$PRISTINE_ART"
-cp "$DOC" "$PRISTINE_DOC"
+# Snapshot EVERY file any state may touch, and DERIVE the list. The first version
+# kept two copies while states edited four scripts, so it reported "residue ok" on
+# the two it checked and left the other two patched in the tree -- a residue check
+# lying by omission. Derived rather than named, because a hardcoded list went stale
+# the moment a fifth destructive script appeared (audit #7, applied to my states).
+TOUCHED="$(ls scripts/*.sh) $DOC"
+PRISTINE_DIR="$SB/pristine"
+rm -rf "$PRISTINE_DIR"; mkdir -p "$PRISTINE_DIR"
+for f in $TOUCHED; do cp "$f" "$PRISTINE_DIR/$(echo "$f" | tr / _)"; done
+restore_all() { local f; for f in $TOUCHED; do cp "$PRISTINE_DIR/$(echo "$f" | tr / _)" "$f"; done; }
 
-patch() { python3 - "$1" "$2" "$3" <<'PY'
+patch1() { python3 - "$1" "$2" "$3" <<'PYQ'
+import sys
+p, o, n = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p).read(); c = s.count(o)
+if c != 1:
+    print("anchor found %d times (want 1) in %s" % (c, p), file=sys.stderr); sys.exit(1)
+open(p, 'w').write(s.replace(o, n, 1))
+PYQ
+}
+patchN() { python3 - "$1" "$2" "$3" <<'PYQ'
 import sys
 p, o, n = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(p).read()
 if s.count(o) < 1:
-    print("anchor not found in %s: %r" % (p, o), file=sys.stderr)
-    sys.exit(1)
+    print("anchor absent in %s" % p, file=sys.stderr); sys.exit(1)
 open(p, 'w').write(s.replace(o, n))
-PY
+PYQ
 }
 
 baseline() {
@@ -82,7 +96,7 @@ run_state() {
   total=$((total + 1))
   out="$(bash "$CHECK" 2>&1)"; rc=$?
   printf '%s\n' "$out" >"$SB/$id.log"
-  cp "$PRISTINE_ART" "$ART"; cp "$PRISTINE_DOC" "$DOC"
+  restore_all
   if [ "$want" = 1 ]; then
     if [ "$rc" -eq 0 ]; then RESULTS+=("$id MISSED '(still PASS)'")
     elif ! printf '%s' "$out" | grep -qE -- "$expect"; then RESULTS+=("$id MISSED '(wrong reason)'")
@@ -93,34 +107,30 @@ run_state() {
   fi
 }
 
-if [ "${1:-}" = "--list" ]; then
-  echo "states:"
-  echo "  DG-1  a real destructive script loses its dirty-tree guard  [must REJECT]"
-  echo "  DG-2  comment-stripping removed from the harvest           [must REJECT]"
-  echo "  DG-3  the AGENTS.md standing rule deleted                  [must REJECT]"
-  echo "  DG-4  every destructive op commented out (empty corpus)    [must REJECT]"
-  exit 0
-fi
+# DG-1 EVERY occurrence: mutate_device_precond.sh carries five dirty-tree queries,
+# so replacing one left four and the state scored MISSED while the checker was,
+# correctly, still seeing a guard. A state removes the MECHANISM, not a token.
+dg1() { patchN scripts/mutate_device_precond.sh 'git diff --quiet' '# DG1 removed'; }
 
-echo "== baseline =="
-baseline || exit 1
-echo "== states =="
+# DG-2 remove the comment-strip. mutate_tp2_selfcheck.sh mentions
+# `git checkout --` exactly once, inside a comment saying it deliberately needs no
+# guard -- so with comments included a CORRECT script gets flagged. The strip is
+# the only reason it does not, which makes it load-bearing.
+dg2() { patch1 "$CHECK" 'strip_comments() { sed -e' 'strip_comments() { cat "$1"; } #DG2'; }
 
-# DG-1: remove the guard from a script that really does restore with checkout.
-dg1() { patch "$ART" 'DIRTY="$TGT_A $TGT_C $TGT_B $TGT_H $TGT_P"' 'DIRTY=""  #DG1 guard removed'; }
+# DG-3 the checker regex accepts EITHER "commit...before...destructive" OR
+# "reset --hard...uncommitted", and rule 16 satisfies BOTH -- so deleting only the
+# heading left the rule matching on its own body and the state scored MISSED.
+dg3() { patchN "$DOC" 'COMMIT BEFORE ANY DESTRUCTIVE GIT' '[DELETED BY DG-3]'
+        patchN "$DOC" 'reset --hard' 'a destructive command'; }
 
-# DG-2: make the harvest read comments too, so the mutate_tp2_selfcheck.sh
-# DECOY is flagged. Must stay GREEN: more permissive, not less.
-dg2() { patch "$CHECK" "sed -e 's/[[:space:]]#.*\$//' -e 's/^[[:space:]]*#.*\$//' \"\$1\"" 'cat "$1"'; }
-
-# DG-3: delete the standing rule.
-dg3() { patch "$DOC" '16. **COMMIT BEFORE ANY DESTRUCTIVE GIT' '16. **[DELETED BY DG-3]** old text' ; }
-
-# DG-4: empty the corpus.
-dg4() { for f in scripts/mutate_device_precond.sh scripts/mutate_fold_matrix.sh \
-               scripts/mutate_gate_inventory.sh scripts/run_all_checks.sh; do
-           patch "$f" 'git checkout --' '# git checkout -- (commented out)'
-       done; }
+# DG-4 neuter the harvest REGEX -- the direct anti-vacuity test. The first attempt
+# commented out every `git checkout --` across scripts/, ambiguous twice: the
+# checker's pattern is WIDER (reset --hard, clean -f) AND this file's own mutation
+# strings are executable occurrences of it, so the state could not tell whether it
+# had emptied the corpus. Neuter the query instead -- that is what "finds nothing"
+# actually looks like (the FG-1 move).
+dg4() { patch1 "$CHECK" "checkout[[:space:]]+--)'" "zzz_never)'"; }
 
 dg1; run_state DG-1 'NO dirty-tree guard|destroy uncommitted work|FAIL' 1
 dg2; run_state DG-2 'NO dirty-tree guard|destroy uncommitted work|FAIL' 1
@@ -129,11 +139,18 @@ dg4; run_state DG-4 'harvest is|broken' 1
 
 for r in "${RESULTS[@]}"; do printf '  %s\n' "$r"; done
 
-if ! cmp -s "$ART" "$PRISTINE_ART" || ! cmp -s "$DOC" "$PRISTINE_DOC"; then
-  echo "  FAIL residue: an artifact differs from its pre-matrix state" >&2
+# Residue over EVERY touched file, not the two the first version checked -- a
+# residue check that counts only what it happens to look at is the same shape as
+# a checker that certifies only the corpus it enumerated.
+leftover=""
+for f in $TOUCHED; do
+  cmp -s "$f" "$PRISTINE_DIR/$(echo "$f" | tr / _)" || leftover="$leftover $f"
+done
+if [ -n "$leftover" ]; then
+  echo "  FAIL residue: these differ from their pre-matrix state:$leftover" >&2
   exit 1
 fi
-echo "  ok residue: both artifacts byte-identical to their pre-matrix state"
+echo "  ok residue: all $(printf '%s\n' $TOUCHED | grep -c .) touched files byte-identical to their pre-matrix state"
 
 echo
 if [ "$caught" -eq "$total" ]; then

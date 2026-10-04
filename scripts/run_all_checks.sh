@@ -234,6 +234,15 @@ dispatch() { # $1 = label -> runs it
       # hold IN COMMON. Read-only, no GPU, no build; plants its own counter-
       # examples in a temp tree.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_verdict_scope.sh"; return $? ;;
+    check_destructive_git.sh)
+      # No script may destroy uncommitted work: any script performing
+      # `git reset --hard` / `git clean -f` / `git checkout --` must refuse to run
+      # on a dirty tree. The harvest strips COMMENTS first, because
+      # mutate_tp2_selfcheck.sh mentions `git checkout --` exactly once inside a
+      # comment explaining that it deliberately needs no guard. Also asserts the
+      # AGENTS.md standing rule exists, which is the only cover for the case that
+      # actually destroyed work: a destructive command typed at a prompt.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_destructive_git.sh"; return $? ;;
     check_env_not_box_state.sh)
       # The device preconditions must name an unprepared shell as an ENVIRONMENT
       # problem, never as box state. This session misattributed a missing
@@ -242,7 +251,7 @@ dispatch() { # $1 = label -> runs it
       # a timeout. Its final assertion is a LIVE probe -- it runs the helper with
       # a PATH that has no sycl-ls -- so the banner is proved to print rather than
       # merely to exist.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_env_not_box_state.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_env_not_box_state.sh check_destructive_git.sh"; return $? ;;
     check_flag_gate_coverage.sh)
       # Classifies the ungated-flag residue: only the OPT-IN class is a
       # certification gap. No GPU, no model, no build. Exists because AGENTS.md's
@@ -405,11 +414,17 @@ dispatch() { # $1 = label -> runs it
       # the artifact is deliberately stale -- legitimate only because the planted
       # artifact is itself defective (the AUDIT #21 rule).
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_engine_cert.sh"; return $? ;;
+    mutate_destructive_git.sh)
+      # DG-2 is the state that makes the comment-strip load-bearing: without it
+      # the mutate_tp2_selfcheck.sh DECOY is flagged. DG-4 is the anti-vacuity
+      # test -- a harvest matching nothing must be refused, not read as "all
+      # guarded, nothing to check".
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_destructive_git.sh"; return $? ;;
     mutate_env_not_box_state.sh)
       # Mutates scripts/_gate_precond.sh. EN-2 is the state that keeps EN-1
       # honest: delete the banner TEXT while every call site survives, so a
       # call-site count alone cannot pass.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_env_not_box_state.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_env_not_box_state.sh mutate_destructive_git.sh"; return $? ;;
     mutate_flag_gate_coverage.sh)
       # FG-1/FG-4 are the two states that FOUND real holes in the checker: a
       # census query with no floor of its own, and an opt-in class with no
