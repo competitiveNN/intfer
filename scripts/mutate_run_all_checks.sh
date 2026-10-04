@@ -1042,15 +1042,18 @@ python3 - "$MUTANT" <<'PYX' || { echo "N-V ANCHOR STALE: the STEPS tail moved --
 import sys
 p = sys.argv[1]
 s = open(p).read()
-# RE-POINTED 2026-10-04: adding check_decode1_copies /
-# check_flag_gate_coverage / check_env_not_box_state to STEPS moved this tail.
+# RE-POINTED TWICE on 2026-10-04: adding check_decode1_copies /
+# check_flag_gate_coverage / check_env_not_box_state moved this tail, and adding
+# check_destructive_git moved it AGAIN. That is the EXPECTED cost of a state anchored
+# to a moving list; the `|| exit 1` below is what keeps the drift loud instead of
+# scoring the state against an unmutated copy and reporting a false result.
 # The state's intent is unchanged -- schedule check_stack_cert.sh, which is
 # POST-STACK and must therefore be refused -- so only the tail is re-pointed, and
 # only as far as the list now extends. Loosening it to "whatever the last entry
 # is" would make the state test nothing in particular, which is the failure mode
 # the `|| exit 1` below exists to prevent.
-old = 'check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh"'
-new = 'check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh check_stack_cert.sh"'
+old = 'check_env_not_box_state.sh check_destructive_git.sh"'
+new = 'check_env_not_box_state.sh check_destructive_git.sh check_stack_cert.sh"'
 assert s.count(old) == 1, s.count(old)
 open(p, "w").write(s.replace(old, new))
 PYX
