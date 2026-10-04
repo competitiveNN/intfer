@@ -62,8 +62,14 @@ for f in scripts/*.sh; do
   [ "$ops" -gt 0 ] || continue
   n_found=$((n_found + 1))
   if strip_comments "$f" \
-     | grep -qE 'git diff --quiet|git_guard_clean|uncommitted changes|DIRTY'; then
+     | grep -qE 'git diff --quiet|git status --porcelain|git_guard_clean'; then
     n_guarded=$((n_guarded + 1))
+    # TIGHTENED, and the mutation matrix is what found it. The first version also
+    # accepted the bare words DIRTY and "uncommitted changes", so a script whose
+    # guard had been REPLACED BY `if false` still matched on the variable
+    # assignment it left behind -- the checker reported "guarded" from a WORD. A
+    # guard is a test, so only a test counts: a dirty-tree query or the shared
+    # helper. The prose around the mechanism is not the mechanism.
     printf '  ok    %-38s %s destructive op(s), dirty-tree guard present\n' \
       "$(basename "$f")" "$ops"
   else

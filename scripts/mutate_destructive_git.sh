@@ -37,6 +37,22 @@ ART="scripts/mutate_device_precond.sh"   # a real destructive script
 
 mkdir -p "$SB" || exit 2
 rm -rf "$SB"; mkdir -p "$SB"
+
+# DIRTY-TREE GUARD. This matrix writes tracked files (AGENTS.md, several
+# scripts/) and restores them from its own pristine copies. Restoring from a copy
+# is safer than `git checkout --` -- it cannot reach a path this matrix did not
+# snapshot -- but the guard is still required, and check_destructive_git.sh
+# flagged this file for its absence the moment its guard detection was tightened
+# from "any of these words" to "an actual test". The finding is correct: a matrix
+# that snapshots a tree someone else had already modified is measuring something
+# other than what it thinks.
+DIRTY="$CHECK $DOC scripts/mutate_device_precond.sh scripts/mutate_fold_matrix.sh
+scripts/mutate_gate_inventory.sh scripts/run_all_checks.sh"
+if ! git diff --quiet -- $DIRTY || ! git diff --cached --quiet -- $DIRTY; then
+  echo "FAIL: uncommitted changes in: $DIRTY" >&2
+  echo "  This script edits and restores them; commit or stash first." >&2
+  exit 1
+fi
 PRISTINE_ART="$SB/pristine.art"
 PRISTINE_DOC="$SB/pristine.doc"
 cp "$ART" "$PRISTINE_ART"
