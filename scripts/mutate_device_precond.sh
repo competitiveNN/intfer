@@ -392,8 +392,17 @@ assert_clean "$TGT_G" M-G || exit 1
 printf '#!/bin/sh\nexit 2\n' >"$TGT_G"          # an early exit: NO table at all
 chmod +x "$TGT_G"
 verify_patched "$TGT_G" M-G
+# The must-be-absent pattern is ANCHORED on the verdict line (`FAIL  <spaces>
+# classification drift:`), and that precision was bought by reading the log rather
+# than by reasoning about it. A bare `classification drift` matched the REFUSAL's
+# own sentence -- "That is not classification drift, so do not debug the gates" --
+# so M-G scored MISSED against a checker that had behaved exactly right. The
+# anchored form still matches the genuine drift verdict (M-D's log) and still does
+# not match the refusal. Same rule as everywhere else here: write the predicate
+# from what is ACTUALLY PRINTED, not from what you expect.
+A_DRIFT_VERDICT='^ *FAIL +classification drift:'
 run_state "M-G" "gate_inventory returns NO table (early exit)" "$TGT_G" \
-  "NO TABLE to cross-check" "classification drift"
+  "NO TABLE to cross-check" "$A_DRIFT_VERDICT"
 assert_clean "$TGT_G" M-G || exit 1
 
 assert_clean "$TGT_G" M-H || exit 1
@@ -409,7 +418,7 @@ EOS
 chmod +x "$TGT_G"
 verify_patched "$TGT_G" M-H
 run_state "M-H" "gate_inventory's table classifies NO device gate" "$TGT_G" \
-  "classifies NO gate as needing" "classification drift"
+  "classifies NO gate as needing" "$A_DRIFT_VERDICT"
 
 echo
 if [ "$CAUGHT" -eq "$TOTAL" ]; then
