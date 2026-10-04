@@ -254,14 +254,17 @@ matters for the next session reading this file:
   quoted from any of them yet**. The remaining blocker is unchanged and is NOT
   missing work: see the quiet-box note above.
 
-  *** NAMED LIMITATION OF THIS QUEUE PATH — read before trusting it. *** Three
-  things are now MECHANISED and one is not, and the difference matters:
+  *** NAMED LIMITATION OF THIS QUEUE PATH — read before trusting it. *** Six rows
+  below are now MECHANISED and one is not, and the difference matters:
 
   | what | how it is proved |
   |---|---|
   | the artifact collision guard refuses an existing path | staged, both directions, no GPU (`--guard-only`), via `check_bench_load_gate.sh` |
   | the same guard stays quiet on a NEW path | staged — it used to be **observed only**, because proving it for real ran the whole 27B block |
   | the guard can actually fail | state **B-R** removes it from a sandbox copy and the checker must reject |
+  | a CONCURRENT run is refused, and the live holder's lock SURVIVES | staged, all four cells (`--guard-only` + `INTFER_WQ_LOCK`) |
+  | a DEAD holder's lock self-heals, loudly, naming the pid | staged — and state **B-T** deletes the self-heal, so it must be caught |
+  | the concurrency guard can actually fail | state **B-S** drops the `kill -0` liveness proof, so the self-heal becomes a takeover |
   | **the block completes a 3-round interleaved set on the real model** | *** NEVER GATED — only ever OBSERVED, in the five artifacts above *** |
 
   Every `bench_reports_batch.sh` case in the checker drives a **stub CLI**, so the
@@ -273,10 +276,26 @@ matters for the next session reading this file:
   it" family, and it is the honest reason this section is still open — **not** a
   missing experiment. Closing it needs a quiet window, not a new checker.
 
-  **LIVE STATE: nothing is queued or in flight.** Verified, not assumed — the last
-  `bench_when_quiet.sh` process ended on its own abort and no `intfer_cli` process
-  is advancing an artifact, so there is no run to wait for. Nothing in this section
-  moves until a session starts one deliberately:
+  **IS A RUN IN FLIGHT? ASK THE LOCK, NOT THIS PARAGRAPH.** An earlier version of
+  this note read “LIVE STATE: nothing is queued or in flight. Verified, not
+  assumed” — a transient claim about the box that cannot be re-derived from
+  anything, and it was the FIRST line a next session read to decide whether to
+  launch. It is now answered by a mechanism instead:
+  `build/bench_logs/.bench_when_quiet.lock` holds the pid of the running launch.
+  Absent, or holding a pid that is gone (`kill -0 <pid>` fails), means nothing is
+  in flight; present with a live pid means a run IS running. The path is derived
+  and `INTFER_WQ_LOCK` overrides it. The script now also **refuses a second
+  concurrent launch**, so the question cannot be got wrong by launching twice.
+  Why mechanise rather than re-word it: the artifact collision guard refuses an
+  existing ARTIFACT PATH, and the artifact name carries `$$` — so two live runs get
+  DIFFERENT names and neither sees the other. These are 27B `--tp 2` batches, so a
+  second one loads the same CPU and GPU and **both** runs' arms cross the load
+  threshold and **both** artifacts withhold every figure, while both artifacts
+  stay perfectly clean. Two runs cannot each obtain the quiet window they are both
+  waiting for. A lock was the only thing that could see it, and both directions
+  are staged in `check_bench_load_gate.sh` — including that a refused run must NOT
+  delete the live holder's lock, which is the whole safety argument.
+  Nothing in this section moves until a session starts one deliberately:
   `setsid bash scripts/bench_when_quiet.sh --max-wait 21600 > build/bench_logs/wq_$(date -u +%Y%m%dT%H%M%SZ).$$.out 2>&1 &`
   (the unique capture name is not optional — a fixed name silently overwrites the
   previous launch, which is how this table already had to be reconstructed once).
