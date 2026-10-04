@@ -190,8 +190,14 @@ cause.** Two ways to raise it:
   one that coalesces — contiguous chunks were measured and stay strided.
   Measured margin consumed: **0 FP16 ulp** on random / act-outliers / full
   cancellation, **2 ulp** on an adversarial escalating dataset. So the claim is
-  "stream-identical on the gate models", never "bit-exact". Gated in
-  `test_tp2_27b.sh`. **Unbenchmarked — the verdict is pending the box.**
+  "stream-identical on the gate models", never "bit-exact" — and on 27B that is
+  exactly what happened: identical stream. **But it is a measured LOSS on
+  kernel** (267 -> 384 ms, +43.8%, 3/3 same sign, clears the spread floor), so
+  (a) is closed as a PERFORMANCE direction: raising parallelism and coalescing
+  both worked and the kernel still got 43.8% slower, which points at the
+  per-work-group `local_accessor` + local barrier on the critical path of every
+  output. Flag stays default OFF, kept as the worked example of a numerics
+  contract passing while the performance hypothesis failed.
 * **(b) fuse INDEPENDENT GEMMs into ONE `nd_range`** — bit-exact (each output keeps
   its own work-item and its own K order; only the launch boundary moves). **This
   is the live direction**, and it is also the standing fusion directive, so the two
@@ -247,17 +253,53 @@ git grep -hoE 'INTFER_[A-Z0-9_]+' -- 'scripts/test_*.sh' | sort -u > /tmp/f_gate
 comm -23 /tmp/f_src /tmp/f_gate      # read by the engine, named by NO gate
 ```
 
-The residue is dominated by diagnostics (`_DBG`/`_TRACE`/`_WHY`/`_TIME`, derivable
-by suffix) and operational knobs (`PRELOAD*`/`SCHED`/`SERVE_MAX`), which are
-legitimately not gate subjects. The interesting middle is opt-in and kill-switch
-flags that change arithmetic or control flow that no gate sets — `INTFER_L4_FUSE`,
-`INTFER_L5_FRONT`, `INTFER_HOST_AVX2`, `INTFER_NO_WAVE`, `INTFER_LMHEAD_FP16`,
-`INTFER_PREFILL_RR`, `INTFER_STREAM_F16`. Their recorded certifications came from
-a commit message, i.e. a transcript. **Honest state: UNCERTIFIED, not "probably
-fine".** Adding arms is NOT copy-paste: read each flag's semantics first, because
-some are *deliberately approximate* (`INTFER_PREFILL_RR` rounds in a different
-order by design) and asserting identity for those ships a gate that fails for a
-legitimate reason.
+**Do not read the residue as one class — it is four, and only one is a gap.**
+`scripts/check_flag_gate_coverage.sh` derives the classification and prints it:
+
+```
+opt-in        default OFF, changes arithmetic, no gate names it -> A REAL GAP
+kill switch   the feature is ON by default and the env var turns it OFF
+diagnostic    _DBG/_TRACE/_WHY/_TIME/_SNAP/_CHECK: print paths, not arithmetic
+operational   PRELOAD*/SCHED/SERVE_MAX/PCACHE*/KV_CAP/...: runtime knobs
+```
+
+A kill switch in the residue says **nothing** about whether the default is
+certified: the gates already exercise the default path. Only the opt-in class is
+a certification gap. Quoting the whole residue as "UNCERTIFIED" overstates it,
+and someone will eventually write a stream-identity arm for a flag whose default
+is already tested.
+
+**A measured trap in deriving the class from source:** the getenv comparison
+operator does **not** determine feature polarity. `INTFER_NO_WAVE` is read as
+`getenv("INTFER_NO_WAVE") != nullptr`, which looks like presence-enables/opt-in,
+but `no_wave` *disables* the wave submit grouping. The getenv test says what the
+PROCESS reads, not what the FEATURE does. The class above therefore rests on the
+`INTFER_NO_*` naming convention plus suffix rules, and only reading the code
+settles an individual flag.
+
+Adding arms is NOT copy-paste: read each flag's semantics first. Some are
+deliberately approximate and asserting identity would ship a gate that fails for
+a legitimate reason. `INTFER_PREFILL_RR` is a good example of why reading
+matters — it is a *scheduling* knob (round-robin vs head-of-line), not a
+rounding-order flag, so an arm would be testing the wrong thing entirely.
+
+**`INTFER_DECODE1_SPLITK` is the worked example of doing this right**, and the
+opposite of MR — including how a kernel is caught. It shipped with
+`(bv >> (j * 2)) & 3` instead of `(bv >> ((j & 3) * 2)) & 3`; INT2 packs four
+codes per byte, so `j=4..7` must re-read bit 0 of the second byte, and a
+`uint8_t` shifted by 8..14 promotes to 0. It was localised by three facts
+together: the stream diverged, the kill switch stayed clean, and the contract
+said the order was safe — which pointed at the implementation, not the
+arithmetic. `scripts/check_decode1_copies.sh` now pins the two inline copies
+against each other (mutual agreement, NOT against remembered literals — the
+first version failed its own "both copies changed together" state for exactly
+that reason), with `mutate_decode1_copies.sh` mutating the ARTIFACT.
+
+Also recorded, because it is the shape of mistake this repo keeps auditing: an
+earlier revision of that work attributed a "no GPU visible" report to the
+container/host driver mismatch. **It was a missing `setvars.sh` in my own shell.**
+`gate_gpu_count` had printed `SKIP: sycl-ls not available` and I read that as box
+state. Attribute a measurement to the thing measured, or re-derive it.
 
 **`INTFER_DECODE1_SPLITK` is the worked example of doing this right**, and the
 opposite of MR: the numerics contract was measured *before* the kernel existed
@@ -364,7 +406,7 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_DPAS_PREQ` | device-side GA64 act-quant pre-pass | recovers 52.7 ms of 2559.2 ms host act-quant but pays +30720 launches. **DO NOT PROMOTE** |
 | `INTFER_DPAS_ROW` | one WI owns many tiles | ~460x slower. Historical dead end, mutually exclusive with E4 |
 | `INTFER_DECODE1_MR` | 4 outputs per WI at M=1 INT2 | **2.3x slower.** Do not use |
-| `INTFER_DECODE1_SPLITK` | split-K block-cyclic M=1 INT2 decode: `N*S` work-items + coalesced weight loads. Exactly `=1`; kill switch `INTFER_NO_DECODE1_SPLITK` | **NOT YET BENCHMARKED.** Numerics contracted (0 FP16 ulp on realistic data) and gated in `test_tp2_27b.sh`, but no 27B run yet — see `reports/2026-10-04-ksplit-decode1.md` |
+| `INTFER_DECODE1_SPLITK` | split-K block-cyclic M=1 INT2 decode: `N*S` work-items + coalesced weight loads. Exactly `=1`; kill switch `INTFER_NO_DECODE1_SPLITK` | **MEASURED LOSS.** Stream-identical to base on 27B (so the numerics contract held), but kernel 267 -> 384 ms (+43.8%, 3/3 same sign, clears the 6 ms spread floor; `nk/nw/nr` identical). Both halves of the hypothesis delivered and it still lost. **Do not promote.** `reports/2026-10-04-ksplit-decode1.md` |
 | `INTFER_L4_FUSE` | fused ssm+norm+FP16 -> la_out GEMM (TP=1) | stream-identical, but M>1 nets ~-1.5% and scalar A/B was a variance wash |
 | `INTFER_L5_FRONT` | device-resident whole LA input path | **dead end as built**: +144 launches/token, waitblock 5x. More kernels lose |
 | `INTFER_SSM_GPU` | device SSM recurrence | declines under `INTFER_DPAS48=1` (its ~1ulp drift flips a GA64 code at a tie) |

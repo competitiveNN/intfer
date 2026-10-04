@@ -234,6 +234,22 @@ dispatch() { # $1 = label -> runs it
       # hold IN COMMON. Read-only, no GPU, no build; plants its own counter-
       # examples in a temp tree.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_verdict_scope.sh"; return $? ;;
+    check_flag_gate_coverage.sh)
+      # Classifies the ungated-flag residue: only the OPT-IN class is a
+      # certification gap. No GPU, no model, no build. Exists because AGENTS.md's
+      # "UNCERTIFIED" claim was undifferentiated and so read as a stronger claim
+      # than it supported -- the residue also holds kill switches, diagnostics and
+      # operational knobs, and a gate arm for one of those certifies the DEFAULT
+      # path, which the gates already test.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_flag_gate_coverage.sh"; return $? ;;
+    check_decode1_copies.sh)
+      # The two inline copies of the M=1 decode arithmetic must AGREE. No GPU,
+      # no model, no build: it reads src/gemm/quant_gemm.cpp and compares
+      # arithmetic atoms, so it is an ordinary step. It is here because the
+      # duplication is deliberate (quant_gemm_fused_decode1 measured that the
+      # shared-device-function alternative cost 231 114 ms) and deliberate
+      # duplication is only acceptable while it is pinned.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_decode1_copies.sh"; return $? ;;
     check_dri_probe.sh)
       # Closes the /dev/dri family: no script may identify a GPU card by its DRM
       # minor, which is not stable (the 2nd B580 became card2/renderD130). The
@@ -380,6 +396,20 @@ dispatch() { # $1 = label -> runs it
       # the artifact is deliberately stale -- legitimate only because the planted
       # artifact is itself defective (the AUDIT #21 rule).
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_engine_cert.sh"; return $? ;;
+    mutate_flag_gate_coverage.sh)
+      # FG-1/FG-4 are the two states that FOUND real holes in the checker: a
+      # census query with no floor of its own, and an opt-in class with no
+      # non-empty floor. FG-3 is the inverse that proves the floors are what does
+      # the catching rather than the state passing for an unrelated reason.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_flag_gate_coverage.sh"; return $? ;;
+    mutate_decode1_copies.sh)
+      # AUDIT #11 direction: these states mutate the ARTIFACT (quant_gemm.cpp),
+      # not the checker, because an artifact that is correct by construction
+      # makes any weakening of the checker unobservable. DC-6 is the always-red
+      # twin -- both copies drifting together must stay GREEN. Mutates a TEMP
+      # COPY only and restores from a pre-matrix snapshot, never from git, so it
+      # is safe on a legitimately dirty tree.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_decode1_copies.sh"; return $? ;;
     mutate_tp2_selfcheck.sh)
       # AUDIT #31. The DECODE1_MR arm's --self-check in test_tp2_27b.sh. It runs
       # ONLY the stubbed --self-check half on temp copies -- NO GPU, NO MODEL, NO
@@ -632,12 +662,12 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------

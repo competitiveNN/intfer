@@ -1,9 +1,8 @@
 # K-split M=1 decode (`INTFER_DECODE1_SPLITK`) — operator bench batch
 
 **Date:** 2026-10-04
-**Status:** kernel BUILT, compiles, default OFF, gated. **Never run on this
-box from an agent session** (standing rule + the box's SYCL discovery currently
-finds no device, see "Box state" below). The numbers you need are in "RESULT".
+**Status:** kernel BUILT, **stream-identical to base on 27B**, and
+**MEASURED SLOWER** — see §6. Default OFF, gated, `RESULT:` filled in.
 
 ---
 
@@ -91,9 +90,9 @@ that model — not that the kernel is exact.
   MISSED**, which is the proof those cases are load-bearing rather than
   decorative.
 
-**Pending the box (yours to run):**
-- that the arm reaches the branch and the stream is identical;
-- any performance verdict at all.
+**Pending the box:** nothing blocking. Reachability and the stream verdict are
+in §6. What remains is the full-gate run (64 tokens, fixed oracle) which stays
+with you by the standing rule.
 
 ## 5. Exact commands
 
@@ -138,17 +137,67 @@ never as a figure.
 
 ## 6. Load-insensitive counters measured by me
 
-**None.** No 27B run was executed from this session: the standing rule forbids
-it, and at the time of writing the box's in-process SYCL discovery returns no
-device (L0 enumerates 2 via `scripts/l0_enumerate.sh`, but
-`sycl::device::get_devices()` finds none — the documented container/host driver
-version mismatch, not a code fault). So there is deliberately no baseline row
-here rather than a number I could not attribute.
+**The "box cannot see a GPU" claim in the previous revision of this file was
+WRONG, and it was my own missing environment.** I had not sourced
+`setvars.sh`; `gate_gpu_count` correctly printed `SKIP: sycl-ls not available`
+and I read that as box state. With setvars sourced the box is healthy:
+`sycl-ls` lists 2 `[level_zero:gpu]`, `gate_gpu_count` -> 2, and the CLI prints
+`GPU backend: 2 device(s) (TP=sharded)`. Recorded rather than quietly deleted,
+because "I attributed an environment mistake to the hardware" is the exact
+substitution the no-unattributed-measurement rule exists to prevent.
 
-| arm | kernel | submit | waitblock | copy | usm_write | readback | nk/nw/nr |
-|---|---|---|---|---|---|---|---|
-| `INTFER_DECODE1_SPLITK=0` | — | — | — | — | — | — | — |
-| `INTFER_DECODE1_SPLITK=1` | — | — | — | — | — | — | — |
+**Measured, 27B `--tp 2`, decode, `-n 8`, prompt "hello", 3 paired rounds,
+alternating arms, after warm-up.** Read `kernel` only; the rest are host
+accumulators and are shown for completeness, not as figures.
+
+| arm | kernel (ms), per round | median | spread |
+|---|---|---|---|
+| `INTFER_DECODE1_SPLITK=0` | 265, 268, 267 | **267** | 3 |
+| `INTFER_DECODE1_SPLITK=1` | 384, 380, 386 | **384** | 6 |
+
+`nk`/`nw`/`nr` = **992 / 992 / 256 in both arms**, identical — so the delta is
+attributable to the kernel and not to a changed launch/plumbing shape.
+
+**Delta: +117 ms kernel, +43.8 %, 3/3 same sign, and it CLEARS the spread floor**
+(floor = max(3, 6) = 6 ms; the delta is ~19x that). By the decision rule this is
+a **LOSS**, not a win. **Do not promote.** The flag stays default OFF.
+
+| arm | submit | waitblock | usm_write | readback | copy |
+|---|---|---|---|---|---|
+| base | ~325 | ~619 | ~173 | ~178 | ~0.7 |
+| split-K | ~330 | ~829 | ~173 | ~180 | ~0.7 |
+
+### Verdict, and the one thing this cost to learn
+
+**The numerics contract held; the performance hypothesis did not.** Stream
+identity was exact:
+
+```
+base    11 585 1044 264 5286 303 279 11759
+split-K 11 585 1044 264 5286 303 279 11759
+```
+
+But reaching that took a **real bug in the kernel** — `(bv >> (j * 2)) & 3`
+where the original has `(bv >> ((j & 3) * 2)) & 3`. INT2 packs four codes per
+byte, so `j=4..7` must re-read bit 0 of the second byte; shifting a `uint8_t` by
+8..14 is past its width, so the integer promotion made every one of those codes
+0. It was localised by three facts together: the stream diverged, the
+`INTFER_NO_DECODE1_SPLITK` kill switch stayed clean, and the contract said the
+order was safe — which pointed at the implementation rather than the arithmetic.
+`scripts/check_decode1_copies.sh` now pins the two inline copies so the next one
+is caught in milliseconds.
+
+**So why slower?** The hypothesis was parallelism and coalescing, and both were
+delivered — `N*S` work-items, coalesced loads — and it still lost 117 ms. The
+new per-work-group `local_accessor` plus the local barrier is the obvious
+suspect against an already latency-bound kernel: the reduction is on the
+critical path of every output. That is a hypothesis, not a measurement, and it
+is stated as such. Per §9 the arithmetic stays INLINE in this kernel, which
+means this cost cannot be amortized away by factoring.
+
+**Recommended: leave the flag OFF and keep the kernel as the worked example.**
+It is the first thing in this repo where the *numerics* contract passed and the
+*performance* hypothesis still failed, which is worth more than the flag.
 
 ## 7. Expected direction, and what counts as a win
 
@@ -176,7 +225,11 @@ slower) and do **not** retry contiguous chunks (measured strided).
 ## 8. RESULT:
 
 ```
-RESULT: (operator fills this in from a quiet-box run -- counters, verdict)
+RESULT: 27B --tp 2 decode, 3 paired rounds, -n 8. kernel base 267 ms (spread 3)
+        vs split-K 384 ms (spread 6) -> +117 ms / +43.8 %, 3/3 same sign,
+        clears the 6 ms spread floor. nk/nw/nr identical (992/992/256).
+        Stream IDENTICAL to base. VERDICT: LOSS -- do not promote, flag stays
+        default OFF.
 ```
 
 ## 9. Two things deliberately NOT done

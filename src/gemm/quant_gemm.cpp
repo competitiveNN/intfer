@@ -698,7 +698,17 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                           const float av = static_cast<float>(
                               sycl::bit_cast<sycl::half>(a16[j]));
                           const std::uint8_t bv = (j < 4) ? b0v : b1v;
-                          const int code = (bv >> (j * 2)) & 3;
+                          // (j & 3), NOT j. INT2 packs FOUR codes per byte, so
+                          // j=4..7 must re-read bit 0 of b1v. Shifting by
+                          // j*2 gives shifts of 8..14, which on a uint8_t are
+                          // >= the width: the integer promotion makes every one
+                          // of those codes 0. That bug shipped in the first
+                          // version of this kernel and was caught by the 27B
+                          // reachability probe -- stream diverged at step 0
+                          // while the kill switch stayed clean, which is what
+                          // localised it to this expression rather than to the
+                          // guard, the reduction, or the phase arithmetic.
+                          const int code = (bv >> ((j & 3) * 2)) & 3;
                           acc += av * wtab[code];
                         }
                       }
