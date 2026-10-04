@@ -462,7 +462,21 @@ else
       fi
       pa="${pa:-0}"; sk="${sk:-0}"
       # (1) explicit, narrow exclusion for quoted/history text.
-      if printf '%s' "$txt" | grep -qE 'audit-#|COUNTING TRAP'; then
+      #
+      # The vocabulary is the SAME one the python handcounted harvest uses below
+      # (HIST/CITED at ~line 566). They were NOT the same until 2026-10-04: the
+      # shell half knew only `audit-#|COUNTING TRAP` while the python half
+      # already accepted HISTORICAL/CITATION/superseded/re-derive. So a
+      # supersede annotation was enough for one check and not the other, and
+      # adding an 11th gate made nine historical sites read as STALE here while
+      # the same lines were correctly classified as citations one screen down.
+      # One corpus, two exclusion vocabularies -- the audit #3 shape, live
+      # inside the checker that exists to catch drift.
+      #
+      # Widening is safe in the direction that matters because the fallback is
+      # STILL a failure: an unmarked stale tally is STALE and rc=1, exactly as
+      # before. A line has to SAY it is historical; silence is not consent.
+      if printf '%s' "$txt" | grep -qiE 'audit-#|COUNTING TRAP|HISTORICAL|CITATION|at the time|superseded|re-derive'; then
         excluded=$((excluded + 1))
         printf '           excl  %s:%s  %s\n' "$d" "$ln" "$(printf '%s' "$txt" | cut -c1-66)"
         continue

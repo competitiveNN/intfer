@@ -47,30 +47,45 @@ It is HOST-SIDE driver enumeration state, not a code fault. Three consequences:
     stable liveness probe; two or more distinct minors in one script is the defect
     `scripts/check_dri_probe.sh` refuses.
 
-### Gates: 10 PASS, 0 PARTIAL, 0 SKIPPED (rc=0 for all ten)
+### Gates: all PASS, nothing PARTIAL, nothing SKIPPED
 
-The ten gates: `cpu_parity`, `device_argmax`, `dpas_fold`, `ga64_recip`,
-`gguf_roundtrip`, `gpu_optin`, `http_batch`, `oracle_equiv`, `serve_load`,
-`tp2_27b`. **This is derived, not hand-counted:** `scripts/gate_inventory.sh`
-reads each gate's own precondition plus the visible device count. With 2 GPUs
-every precondition is met, so nothing is PARTIAL and nothing is SKIPPED.
+**Do not read a gate count off this file.** `scripts/gate_inventory.sh` derives
+the population from `scripts/test_*.sh` and reconciles any tally it finds
+against that derivation, so adding a gate makes every hand-written count stale
+*by design* — that is the mechanism working, not a defect to silence. Run it:
 
-`test_tp2_27b` runs for real (**TP2-27B TEST: PASS**, `GPU backend: 2 device(s)
-(TP=sharded)`), and `test_gpu_optin` / `test_device_argmax` execute their `--tp 2`
-arms instead of skipping them. TP=2 coverage is live.
+```
+scripts/gate_inventory.sh        # population, preconditions, and doc tally
+```
 
-* **NEVER quote a tally from this file.** `gate_inventory.sh` fails the build if
-  any tally in this file or `reports/*.md` disagrees with what the source
-  classification predicts for the box's GPU count — so "the docs said 8 instead
-  of 7" is a refusal, not something a reviewer has to notice.
-* Lines in `reports/` and `docs/audit-log-tooling.md` that record the **1-GPU
-  era** tally are **records of that era**. Do not "correct" them — rewriting a
-  true historical record to match today's box is the same laundering failure in
-  the other direction. (They are quoted here without their numbers on purpose:
-  a copied tally is a site `gate_inventory.sh` must reconcile against the box,
-  and this file has no business asserting an old one.)
-* Correct present-tense sentence: *"10 PASS, 0 PARTIAL, 0 SKIPPED; both B580s
-  enumerate and TP=2 coverage is live."*
+Every gate's precondition is met with both B580s enumerating, so nothing is
+PARTIAL and nothing is SKIPPED. `test_tp2_27b` runs for real (**TP2-27B TEST:
+PASS**, `GPU backend: 2 device(s) (TP=sharded)`), and `test_gpu_optin` /
+`test_device_argmax` execute their `--tp 2` arms instead of skipping them.
+TP=2 coverage is live.
+
+The line below is the ONE live tally in this file, kept so `gate_inventory.sh`
+has a non-historical site to reconcile against -- its own `sites_found=0`
+vacuity guard refuses to certify a corpus with no live site, which is the
+correct behaviour and not something to work around. Rewrite it when the gate
+population changes; the checker fails if you do not:
+
+```
+gate tally: 11 PASS, 0 PARTIAL, 0 SKIPPED
+```
+
+* Historical lines recording the 1-GPU-era tally are **records of that era**. Do
+  not "correct" them — rewriting a true historical record to match today's box is
+  the same laundering failure in the other direction. They carry an explicit
+  `[SUPERSEDED ...]` annotation instead, which records the supersession rather
+  than erasing the claim.
+* Present tense: *"all gates PASS; both B580s enumerate and TP=2 coverage is
+  live."*
+
+`gate_inventory.sh` also fails the build if any tally it finds in `AGENTS.md`,
+`docs/*.md` or `reports/*.md` disagrees with what the source classification
+predicts for the box's GPU count — so "the docs said 8 instead of 7" is a
+refusal, not something a reviewer has to notice.
 
 ### Two standing rules from the operator
 

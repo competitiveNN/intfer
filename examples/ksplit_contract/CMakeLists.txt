@@ -1,0 +1,2 @@
+add_executable(ksplit_contract main.cpp)
+target_link_libraries(ksplit_contract PRIVATE intfer_common)

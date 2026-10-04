@@ -15,7 +15,7 @@ Load-insensitive work (stream-identity + code) can proceed now.
   2.63->2.78 (+5.7%), 2.67->2.83 (+6.0%), 2.68->2.82 (+5.2%) tok/s;
   kernel bucket (load-immune) 18856->16444ms (-12.8% R1); submit/transfer
   buckets unchanged; nk/nw/nr identical; streams identical TP1/TP2 +
-  opt-out; cpu parity + http batch + gpu-optin 10/10 PASS.
+  opt-out; cpu parity + http batch + gpu-optin 10/10 PASS. [SUPERSEDED 2026-10-04: an 11th gate, test_ksplit_contract, was added; re-derive with scripts/gate_inventory.sh]
   New 27B TP=2 decode ceiling: ~2.8 tok/s (was ~2.6).
 - This session, contended box TP1 -n8: 29.79 tok/s => 33.6 ms/token.
   Per-token buckets: submit 9.6 / kernel 9.0 / waitblock 8.8 /

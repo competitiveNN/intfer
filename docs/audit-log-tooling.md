@@ -374,7 +374,7 @@ e.g. S3's contract column is 40 not 42).
      added in AUDIT #12 is its sole gate. Matrix is now 7/7 (S0..S6) and the
      claim is "all FOUR checks are load-bearing", each invisible to the others.
 
-   === FULL 10-GATE SUITE ON THIS TREE — 7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED] ===
+   === FULL 10-GATE SUITE ON THIS TREE — 7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED] === [SUPERSEDED 2026-10-04: an 11th gate, test_ksplit_contract, was added; re-derive with scripts/gate_inventory.sh]
    Re-run after test_dpas_fold.sh was added. PASS: cpu_parity, dpas_fold,
    ga64_recip, gguf_roundtrip, http_batch, oracle_equiv, serve_load.
    PARTIAL (exit 2, not FAIL): device_argmax and gpu_optin — every arm that
@@ -446,7 +446,7 @@ e.g. S3's contract column is 40 not 42).
    (882a0c2). A number in prose is a citation.
    They are blocked on a second GPU, not on missing work. Do not let any
    future summary fold "skipped" into "covered" — the correct phrasing is
-   "7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED], E1-E5 unmeasured". Itemized table of exactly
+   "7 PASS, 2 PARTIAL, 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED], E1-E5 unmeasured". Itemized table of exactly [SUPERSEDED 2026-10-04: an 11th gate, test_ksplit_contract, was added; re-derive with scripts/gate_inventory.sh]
    what is
    unverified and how to close it: reports/2026-09-30-pending-bench-backlog.md,
    "OUTSTANDING — blocked on the second GPU".
@@ -599,7 +599,7 @@ e.g. S3's contract column is 40 not 42).
    gpu_guard_state() and adding a self-check case that seeds an unguarded GPU
    gate. That is the audit-#14 equivalent-mutation lesson recurring one level
    down, and it was caught by the harness rather than argued about.
-   The doc tally is deliberately UNCHANGED at 7 PASS / 2 PARTIAL / 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED].
+   The doc tally is deliberately UNCHANGED at 7 PASS / 2 PARTIAL / 1 SKIPPED [SUPERSEDED 2026-10-01: now 10 PASS, 0 PARTIAL, 0 SKIPPED]. [SUPERSEDED 2026-10-04: an 11th gate, test_ksplit_contract, was added; re-derive with scripts/gate_inventory.sh]
    The render-node guard exits 2 only on a box with no device, so on a 1-GPU box
    these three are the same rc=0 they always were: the guard is protective, not a
    behaviour change. A tally that moved because a no-op guard was added would be
@@ -1717,7 +1717,7 @@ e.g. S3's contract column is 40 not 42).
           invites converting matrices that cannot leak. Fixed by delimiting on the
           closing brace and counting DISTINCT destinations.
 - **THE TEN CORRECTNESS GATES ARE NOW AN ARTIFACT, NOT A DIFF ARGUMENT.**
-          A session reported "10 PASS / 0 PARTIAL / 0 SKIPPED" justified by "the
+          A session reported "10 PASS / 0 PARTIAL / 0 SKIPPED" justified by "the [SUPERSEDED 2026-10-04: an 11th gate, test_ksplit_contract, was added; re-derive with scripts/gate_inventory.sh]
           files that changed since the gates ran are not engine inputs". That is
           sound reasoning and it is NOT evidence — it is AUDIT #22's shape exactly:
           a number whose backing is an argument about the tree rather than a file
@@ -1748,7 +1748,7 @@ e.g. S3's contract column is 40 not 42).
 
 - **AUDIT #24 (2026-10-02): THE ENGINE CERTIFICATION IS NOW A CHECKED ARTIFACT,
       NOT A HAND-MADE ARGUMENT.** The previous round's last weak point was that
-      "10 PASS / 0 PARTIAL / 0 SKIPPED" was reconciled with the tooling stamps by
+      "10 PASS / 0 PARTIAL / 0 SKIPPED" was reconciled with the tooling stamps by [SUPERSEDED 2026-10-04: an 11th gate, test_ksplit_contract, was added; re-derive with scripts/gate_inventory.sh]
       ME, by hand, with a diff argument. Sound reasoning; still not evidence.
     - **`scripts/check_engine_cert.sh` mechanises exactly that argument**, so it
       cannot be skipped or forgotten. Four verdicts, all exercised:
