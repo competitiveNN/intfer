@@ -155,6 +155,11 @@ A_GUARD='gate_require_device || exit 2'
 A_EXEC='exec /usr/bin/python3'
 A_TOKENS='(--gpu|sycl-ls|level_zero|xpu-smi|dpas_fold_probe)'
 A_NOTAVAIL='echo "SKIP: $sycl_ls not available; cannot count GPUs" >&2'
+# The gate_env_diagnose call inside that branch. SINGLE-quoted for the same reason
+# as A_NOTAVAIL: it contains $sycl_ls, and every double-quoted interpolation of
+# it tried so far silently mangled the dollar. Declared here (before the
+# check_anchor pre-flight) and consumed at the M-E state below.
+A_DIAG='    gate_env_diagnose "'"'"'$sycl_ls'"'"' is not executable on PATH."'
 A_CASEC='echo "SKIPPED: render node opens but Level Zero enumerates 0 device(s)."'
 check_anchor "$TGT_A" "$A_GUARD" "M-A: the whole-gate device guard to strip"
 check_anchor "$TGT_C" "$A_GUARD" "M-C: the guard line to weaken to render_node-only"
@@ -363,7 +368,29 @@ run_state "M-D" "checker's own GPU-token regex narrowed (list drifts)" "$TGT_H" 
 # precedes gate_require_device's message, so the two diagnostics still differed.
 # A rotted seam that stays self-describing is not rotted. Both lines go.
 assert_clean "$TGT_P" M-E || exit 1
+# *** THE ANCHOR HAD TO BE RE-POINTED, AND THAT IS THE POINT OF THIS STATE. ***
+# It used to be the two-line literal <SKIP echo> + <return 1>. Adding
+# gate_env_diagnose between those two lines -- which is exactly what the
+# ENVIRONMENT-vs-BOX-STATE fix did -- left the two-line adjacency GONE, so
+# patch_literal found 0 and ABORTED. That abort is the tooling working: the fault
+# was in the STATE, and the instruction it prints is "fix the patch, not the
+# checker". Widening the checker to match stale code would have inverted that.
+# So the anchor is re-pointed at the CURRENT three-line shape -- echo,
+# diagnostic, return -- and the state still rots the seam exactly as intended:
+# all three go, and gate_gpu_count again reports 0 devices as if it had counted.
+# *** PUT THE DIAGNOSTIC LINE IN ITS OWN SINGLE-QUOTED VARIABLE. *** Three
+# attempts at inlining it failed, and the third is the instructive one: inside a
+# DOUBLE-quoted argument the obvious `\$sycl_ls` escape did not survive --
+# bash carried a literal backslash through, so the anchor read
+# `gate_env_diagnose \$sycl_ls' is not executable on $'PATH.` and matched
+# nothing. The symptom is IDENTICAL to a stale anchor ("0 occurrences"), so it is
+# indistinguishable from the thing it is imitating, which is what made it
+# expensive. A_NOTAVAIL survives this because it is SINGLE-quoted at its
+# definition; the fix is to give the new line the same treatment rather than to
+# out-quote the interpolation.
+check_anchor "$TGT_P" "$A_DIAG" "M-E: the environment diagnostic line"
 patch_literal "$TGT_P" "$A_NOTAVAIL
+$A_DIAG
     return 1" "printf '0\\n'
     return 0"
 verify_patched "$TGT_P" M-E
