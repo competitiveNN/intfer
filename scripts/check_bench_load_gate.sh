@@ -719,6 +719,72 @@ STUB
     sed 's/^/          [miss] /' "$GD/miss.out" | tail -4
     bad=$((bad + 1))
   fi
+
+  # -- CONCURRENCY LOCK: ALL FOUR CELLS, in seconds, no GPU --------------------
+  # The collision guard above refuses an EXISTING ARTIFACT PATH, and the artifact
+  # name carries $$ -- so two LIVE runs get DIFFERENT names and neither sees the
+  # other. These are 27B --tp 2 batches: a second one loads the same CPU and GPU,
+  # so BOTH runs' arms cross the load threshold and BOTH artifacts withhold every
+  # figure, while both artifacts stay perfectly CLEAN. Two runs cannot each obtain
+  # the quiet window they are both waiting for. So a pid-owning lock is the only
+  # thing that can see a concurrent run, and this section drives it in all four
+  # cells -- including the two that matter most and are easy to get wrong:
+  #   (iii) a LIVE owner is refused AND ITS LOCK SURVIVES (a refused run must not
+  #         steal or remove the holder's lock -- that is the whole safety argument)
+  #   (iv)  a DEAD owner self-heals, announced loudly rather than silently, so a run
+  #         that died mid-flight does not leave a truncated artifact that looks
+  #         complete.
+  # A self-heal that is untested is an unconditional delete with extra steps, so
+  # (iv) is not optional next to (iii). Both directions, both guards.
+  #
+  # $wq_dead_pid is DERIVED, never hardcoded: a "dead pid" that happens to be alive
+  # makes cell (iv) assert the FAILURE path, so the state would pass for the wrong
+  # reason. Scan down from our own pid for one that is genuinely free.
+  wq_dead_pid=""
+  wq_cand=$$
+  while [ -z "$wq_dead_pid" ] && [ "$wq_cand" -gt 1 ]; do
+    kill -0 "$wq_cand" 2>/dev/null || wq_dead_pid="$wq_cand"
+    wq_cand=$((wq_cand - 1))
+  done
+  if [ -z "$wq_dead_pid" ]; then
+    echo "  FAIL  concurrency-lock: could not find a dead pid to test self-heal with."
+    bad=$((bad + 1))
+  else
+  mkdir -p "$GD/live"; echo $$ > "$GD/live/pid"
+  mkdir -p "$GD/dead"; echo "$wq_dead_pid" > "$GD/dead/pid"
+  LOADAVG="$GD/load" INTFER_RUNLOG="$GD/new.log" INTFER_WQ_LOCK="$GD/live" \
+    timeout 60 bash "$SCRIPT_DIR/bench_when_quiet.sh" --guard-only >"$GD/lock_live.out" 2>&1
+  w_live_rc=$?
+  LOADAVG="$GD/load" INTFER_RUNLOG="$GD/new.log" INTFER_WQ_LOCK="$GD/dead" \
+    timeout 60 bash "$SCRIPT_DIR/bench_when_quiet.sh" --guard-only >"$GD/lock_dead.out" 2>&1
+  w_dead_rc=$?
+  if pred_expect_present "lock-refuses-a-live-owner" "$w_live_rc" '^2$' \
+     && pred_expect_present "lock-refusal-names-the-owner" \
+          "$(grep -c 'another bench_when_quiet.sh holds' "$GD/lock_live.out" || true)" '^[1-9]' \
+     && pred_expect_present "lock-refusal-refuses-deletion" \
+          "$(grep -c 'Do NOT delete the lock' "$GD/lock_live.out" || true)" '^[1-9]' \
+     && pred_expect_present "lock-LEFT-the-live-owners-lock-alone" \
+          "$([ -e "$GD/live/pid" ] && echo survived || echo destroyed)" '^survived$' \
+     && pred_expect_present "lock-self-heals-a-dead-owner" "$w_dead_rc" '^0$' \
+     && pred_expect_present "lock-self-heal-is-ANNOUNCED" \
+          "$(grep -c 'STALE LOCK' "$GD/lock_dead.out" || true)" '^[1-9]' \
+     && pred_expect_present "lock-self-heal-reports-the-dead-pid" \
+          "$(grep -c "$wq_dead_pid" "$GD/lock_dead.out" || true)" '^[1-9]'; then
+    echo "  ok    concurrency lock: a LIVE owner is refused (rc=2) and ITS LOCK SURVIVES;"
+    echo "        a DEAD owner self-heals (rc=0) with a loud line naming the pid -- all"
+    echo "        four cells, no GPU, and the artifact path is untouched in both"
+  else
+    echo "  FAIL  concurrency-lock: live-owner rc=$w_live_rc, dead-owner rc=$w_dead_rc."
+    echo "        Two concurrent 27B runs load the same CPU and GPU, so BOTH runs' arms"
+    echo "        cross the load threshold and BOTH artifacts withhold every figure --"
+    echo "        while the collision guard sees neither, because the pid differs. A lock"
+    echo "        that removes a LIVE holder's lock turns a refusal into a corrupted run."
+    echo "        Got:"
+    sed 's/^/          [live] /' "$GD/lock_live.out" | tail -4
+    sed 's/^/          [dead] /' "$GD/lock_dead.out" | tail -4
+    bad=$((bad + 1))
+  fi
+  fi
   rm -rf "$GD"
 
   # (7d) *** THE HARNESS MUST HONOUR THE SUMMARY'S VERDICT. *** STATIC, and

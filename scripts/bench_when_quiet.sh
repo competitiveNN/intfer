@@ -10,10 +10,13 @@
 # here stops it -- only you can -- but this will be waiting when you do.
 #
 # Usage: scripts/bench_when_quiet.sh [--max-wait SECONDS]
-#        scripts/bench_when_quiet.sh --guard-only   (test the artifact collision
-#        guard in seconds: rc=2 if the path exists, rc=0 if it does not)
-# Exit: 0 = the block ran; 2 = gave up waiting (nothing was measured);
+#        scripts/bench_when_quiet.sh --guard-only   (test BOTH setup guards in
+#        seconds: the concurrency lock and the artifact collision guard)
+# Exit: 0 = the block ran; 2 = gave up waiting, or a guard refused;
 #       the block's own rc otherwise.
+#
+# A second concurrent run is REFUSED, not accommodated: the guards below run before
+# the wait, so a second launch costs one second to reject rather than an hour.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -39,6 +42,50 @@ quiet() { awk -v l="$(load1)" -v q="$QLOAD" 'BEGIN{exit !(l < q)}'; }
 
 RUNLOG_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/bench_logs"
 mkdir -p "$RUNLOG_DIR" || { echo "FAIL: cannot create $RUNLOG_DIR" >&2; exit 2; }
+
+# *** A PID-OWNING LOCK, BECAUSE THE COLLISION GUARD BELOW CANNOT SEE A CONCURRENT RUN. ***
+# The guard refuses an EXISTING ARTIFACT PATH, and the artifact name carries $$ -- so
+# two LIVE runs get DIFFERENT names and neither one sees the other. That is not a
+# cosmetic gap. These are 27B --tp 2 batches: a second one loads the same CPU and the
+# same GPU, so BOTH runs' arms cross the load threshold and BOTH artifacts withhold
+# every figure. Two runs cannot each obtain the quiet window they are both waiting for,
+# and the artifacts stay perfectly clean while both are ruined -- so this is the same
+# concern as the collision guard one level up, and the guard's own name is the reason
+# it is missed.
+#
+# It is the discipline scripts/run_all_checks.sh already uses, for the same reason and
+# with the same two directions, both of which must hold:
+#   owner ALIVE -> refuse LOUDLY, and never instruct deleting the lock
+#   owner DEAD  -> self-heal, with a loud line naming the dead pid
+# Fail-closed on a RECYCLED pid (kill -0 succeeds, so the lock reads live and we
+# refuse): annoying, never dangerous.
+# INTFER_WQ_LOCK is a seam so both directions are testable in seconds. The
+# INTFER_SYCL_LS / INTFER_BUILD_DIR rationale: an assumption no harness can redirect
+# is an assumption no harness can test.
+WQ_LOCK="${INTFER_WQ_LOCK:-$RUNLOG_DIR/.bench_when_quiet.lock}"
+if ! mkdir "$WQ_LOCK" 2>/dev/null; then
+  wq_owner="$(cat "$WQ_LOCK/pid" 2>/dev/null || true)"
+  if [ -n "$wq_owner" ] && ! kill -0 "$wq_owner" 2>/dev/null; then
+    echo "STALE LOCK: $WQ_LOCK was held by pid $wq_owner, which is gone. Removing" >&2
+    echo "  it and continuing. Loud on purpose: a silent takeover would hide a run that" >&2
+    echo "  died mid-flight, leaving a truncated artifact that looks complete." >&2
+    rm -rf "$WQ_LOCK"
+    mkdir "$WQ_LOCK" 2>/dev/null || {
+      echo "FAIL: could not re-create $WQ_LOCK after removing a stale one." >&2; exit 2; }
+  else
+    echo "FAIL: another bench_when_quiet.sh holds $WQ_LOCK${wq_owner:+ (pid $wq_owner)}." >&2
+    echo "  These are 27B --tp 2 batches: a second one loads the same CPU and GPU, so" >&2
+    echo "  BOTH runs' arms would cross the load threshold and BOTH artifacts would" >&2
+    echo "  withhold every figure. Wait for it. Check the holder with:" >&2
+    echo "    kill -0 ${wq_owner:-<pid in $WQ_LOCK/pid>}" >&2
+    echo "  Do NOT delete the lock to get past this -- the artifact collision guard" >&2
+    echo "  cannot see a concurrent run, so this lock is the ONLY thing that can." >&2
+    exit 2
+  fi
+fi
+echo $$ > "$WQ_LOCK/pid" 2>/dev/null || true
+trap 'rm -rf "$WQ_LOCK" 2>/dev/null || true' EXIT INT TERM
+
 # *** THE ARTIFACT PATH AND ITS COLLISION GUARD ARE SETUP, NOT A WAIT RESULT. ***
 # Both used to sit AFTER the quiet-wait loop, which made the guard unreachable on a
 # busy box: the wait gave up and exited 2 for an entirely different reason, so the
@@ -82,17 +129,21 @@ echo "  byte offset, so a write-then-mv replacement leaves the live run executin
 echo "  the OLD inode -- which is the safer of the two, but means your edit does"
 echo "  not take effect until the next run."
 
-# --guard-only: evaluate the collision decision and stop. This exists so BOTH
-# directions of the guard are testable in seconds:
-#   existing path -> rc=2, refusal message, artifact untouched
-#   new path      -> rc=0, NO refusal message, nothing written
-# Without it the "must stay quiet" direction requires running the whole 27B block,
-# which is why it could only be OBSERVED (in the artifacts this script wrote) and
+# --guard-only: evaluate the two setup decisions and stop. This exists so BOTH
+# directions of BOTH guards are testable in seconds:
+#   live lock holder   -> rc=2, refusal, holder's lock untouched
+#   dead lock holder   -> rc=0, self-heal announced, run proceeds
+#   existing artifact  -> rc=2, refusal message, artifact untouched
+#   new artifact       -> rc=0, NO refusal message, nothing written
+# Without it the "must stay quiet" directions require running the whole 27B block,
+# which is why they could only be OBSERVED (in the artifacts this script wrote) and
 # never staged. An assumption a harness cannot redirect is one it cannot be tested
 # against -- and a direction that costs 20 minutes of GPU is one nobody re-runs.
+# The EXIT trap releases the lock on the way out, so this mode takes and frees it.
 case "${1:-}" in
   --guard-only)
-    echo "GUARD-ONLY: $RUNLOG is available (no refusal)"
+    echo "GUARD-ONLY: lock $WQ_LOCK acquired (no refusal)"
+    echo "GUARD-ONLY: artifact $RUNLOG is available (no refusal)"
     exit 0 ;;
 esac
 

@@ -499,6 +499,49 @@ MUTATE_FN() {
 run_state "B-R" 'B_R' 'guard-refuses-existing-path' \
   "the collision guard removed, so a second launch would append to the first run's artifact"
 
+# B-S: the lock's LIVENESS TEST, dropped. This is the safety state, and it is the
+# one the artifact's own comment claims: "self-heals only after kill -0 proves the
+# owner is gone". Remove that proof and the self-heal becomes unconditional, i.e. a
+# refusal turned into a takeover -- the run that was going to REFUSE a live holder
+# instead DELETES that holder's lock and proceeds, so two 27B --tp 2 batches run at
+# once and BOTH artifacts withhold every figure. Two assertions must fire: the
+# live-owner run stops returning rc=2, and the live holder's lock is gone.
+#
+# An ARTIFACT-defect state (AUDIT #21): the checker is correct by construction here,
+# so weakening it would be unobservable. The state damages the SCRIPT.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/bench_when_quiet.sh" \
+    'if [ -n "$wq_owner" ] && ! kill -0 "$wq_owner" 2>/dev/null; then' \
+    'if [ -n "$wq_owner" ]; then  #B_S the kill -0 liveness proof is gone' || return 1
+  bash -n "$SB/scripts/bench_when_quiet.sh" || return 1
+  grep -q 'B_S the kill -0' "$SB/scripts/bench_when_quiet.sh"
+}
+run_state "B-S" 'B_S' 'lock-refuses-a-live-owner|lock-LEFT-the-live-owners-lock-alone' \
+  "the kill -0 liveness proof removed, so a refusal became an unconditional takeover of a LIVE holder's lock"
+
+# B-T: THE CONVERSE, and the one that gets forgotten. B-S alone is satisfied by a
+# lock that refuses EVERYTHING -- never self-heals, never admits a second run, and is
+# therefore "safe" in the crudest possible sense while making the queued benchmark
+# impossible to start ever again without a manual `rm` of a lock nobody documented.
+# This state removes the self-heal, so a DEAD owner's lock blocks forever, and the
+# checker must reject it. Both directions are required: fire here, stay quiet there.
+#
+# The anchor spans the removal AND the re-mkdir. `rm -rf "$WQ_LOCK"` alone occurs
+# TWICE in the file (the EXIT trap does it too), and an anchor that matches two sites
+# proves nothing about which one was mutated -- patch_literal would rewrite whichever
+# came first. Re-point such an anchor; never loosen the uniqueness rule.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/bench_when_quiet.sh" \
+    '    rm -rf "$WQ_LOCK"
+    mkdir "$WQ_LOCK" 2>/dev/null' \
+    '    rm -rf "$WQ_LOCK.bogus"  #B_T the stale lock is never actually removed
+    mkdir "$WQ_LOCK" 2>/dev/null' || return 1
+  bash -n "$SB/scripts/bench_when_quiet.sh" || return 1
+  grep -q 'B_T the stale lock is never actually removed' "$SB/scripts/bench_when_quiet.sh"
+}
+run_state "B-T" 'B_T' 'lock-self-heals-a-dead-owner' \
+  "the self-heal deleted, so a dead owner's lock blocks forever and the queued benchmark can never be started again"
+
 restore
 echo
 echo "== residue + restore integrity =="
