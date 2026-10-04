@@ -241,6 +241,25 @@ dispatch() { # $1 = label -> runs it
       # verdict -- two earlier versions of the rule passed while a defect was
       # planted. Read-only, no GPU, no build.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_dri_probe.sh"; return $? ;;
+    check_trap_release.sh)
+      # AUDIT #31. A cleanup trap must release on EXIT/INT/TERM *and* the INT/TERM
+      # handlers must TERMINATE. `trap ... EXIT INT TERM` -- the AUDIT #29 remedy --
+      # cleans up and then resumes, so the process survives the signal; every
+      # dispatch arm wraps its target in `timeout`, which waits for the child, so
+      # one stubborn step HANGS the stack instead of failing it. And bash DEFERS a
+      # trap behind a foreground command, so a plain `sleep 30` delays it further.
+      # The population is derived from scripts/, and a five-case planted self-check
+      # gates the verdict. Read-only, no GPU, no build.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_trap_release.sh"; return $? ;;
+    check_guard_identity.sh)
+      # AUDIT #31. A guard keyed on a resource NAME cannot see duplicates when the
+      # name carries the per-instance discriminator: bench_when_quiet.sh guarded
+      # `$RUNLOG` and the name contains $$, so two LIVE runs get different names and
+      # neither saw the other -- while both 27B runs lost every figure and both
+      # artifacts stayed clean. Requires a shared lock whose own name does NOT carry
+      # the discriminator. The converse is load-bearing: a FIXED-name refusal is
+      # self-protecting and needs none. Read-only, no GPU, no build.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_guard_identity.sh"; return $? ;;
     check_stack_cert.sh)
       # AUDIT #29. Re-derives build/stack_cert/cert against THIS tree: sha, rc,
       # the census, and a clean tree. A seven-case behavioural self-check runs
@@ -334,6 +353,19 @@ dispatch() { # $1 = label -> runs it
       # the CONVERSE: a single-minor liveness probe must stay clean, without which
       # a rule that flagged everything would satisfy D-A..D-D.
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_dri_probe.sh"; return $? ;;
+    mutate_trap_release.sh)
+      # Every state damages a CORPUS script's cleanup trap via INTFER_SCRIPTS_DIR;
+      # the checker is correct by construction, so weakening the CHECKER would be
+      # unobservable (AUDIT #21). T-E is the CONVERSE: the compliant shape and a
+      # `trap -` disarm must stay clean, without which a rule that flagged every
+      # trap would satisfy T-A..T-D.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_trap_release.sh"; return $? ;;
+    mutate_guard_identity.sh)
+      # Same artifact-defect shape, on the guard-identity rule. G-E is the state
+      # that gets forgotten and the one that would have caught the first version of
+      # the rule: a FIXED-name refusal owes no lock, so demanding one there would
+      # force a pointless lock onto every idempotent re-run.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_guard_identity.sh"; return $? ;;
     mutate_stack_cert.sh)
       # AUDIT #29. Breaks the census DERIVATION and the dirty-tree test, both of
       # which the self-check cannot see because every fixture derives its census
@@ -592,12 +624,12 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
