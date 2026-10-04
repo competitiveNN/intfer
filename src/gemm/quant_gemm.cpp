@@ -569,6 +569,165 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
         });
       }
 
+      // --------------------------------------------------------------------
+      // INTFER_DECODE1_SPLITK -- split-K decode, default OFF, EXPERIMENTAL.
+      //
+      // WHY IT EXISTS. The M=1 kernel below launches EXACTLY N work-items, one
+      // per output element, and that count is invariant to the work-group
+      // shape. At 27B --tp 2 a layer GEMM has N ~ 2048 per rank across 512 Xe
+      // cores (~4 threads/EU), so the launch is PARALLELISM-bound, not
+      // bandwidth-bound: measured 9.16 GiB of weights per device per token in
+      // 257.7 ms of kernel = 35.5 GiB/s, about 21% of the B580's ~179 GB/s.
+      // The sibling experiment INTFER_DECODE1_MR tried to fix that by giving
+      // each work-item MORE outputs and came out 2.3x SLOWER, because dividing
+      // an already-starved work-item budget by four is anti-parallel here.
+      // This kernel goes the other way: N*S work-items, so parallelism RISES.
+      //
+      // BLOCK-CYCLIC, AND THAT IS THE WHOLE POINT. The other way to split K is
+      // contiguous chunks per work-item, and it does NOT coalesce: with
+      // K=2048, S=16, INT2 (8 codes per 2 bytes) lane L reads byte 32L+2j, so
+      // the lanes sit 32 bytes apart -- the same stride-K gather the un-split
+      // kernel has. Block-cyclic gives lane L the elements {L*8 + t*S*8 + j},
+      // so at step j the lanes read bytes 0,2,4,...,30: one contiguous run.
+      // Measured on the load pattern, not assumed. Parallelism AND coalescing,
+      // which is the whole stated goal, and contiguous chunks would have
+      // delivered only half of it.
+      //
+      // *** THE ARITHMETIC IS DELIBERATELY INLINED. DO NOT EXTRACT IT. ***
+      // gemm::quant_gemm_fused_decode1 did exactly that -- hoisted this same
+      // per-output body into a shared device function, and a normalized
+      // statement-by-statement diff of the two bodies said the arithmetic was
+      // identical. It WAS identical, and 27B decode still went 1284 ms ->
+      // 231 114 ms, bisected to the extraction itself and not to the fusion it
+      // was extracted for. Two homes for this arithmetic is the price of not
+      // repeating that. If you are tempted to factor it, that commit is the
+      // evidence.
+      //
+      // *** NUMERICS: NOT BIT-EXACT, BY CONTRACT. *** This reassociates the
+      // FP32 sum into S partials combined ascending. The tolerance is not a
+      // guess: examples/ksplit_contract measures it (gated by
+      // scripts/test_ksplit_contract.sh). Measured margin CONSUMED, in FP16
+      // ulps after the store the engine actually reads:
+      //     random / act-outliers / full cancellation ... 0 ulp  (all K)
+      //     adversarial escalating dataset ................ 2 ulp
+      // So the honest claim is "stream-identical on the gate models", NOT
+      // "bit-exact for all inputs". The store is FP16 and activations are FP16
+      // (|a| <= 65504), which caps the dot product and leaves ~2 orders of
+      // magnitude of slack; that slack is the entire safety argument and it is
+      // measured, not asserted.
+      //
+      // Gate: the arm that can actually reach this branch lives in
+      // scripts/test_tp2_27b.sh, the only gate whose model carries an INT2
+      // tensor (0.8B has zero). An arm in a 0.8B gate would be green because
+      // the path never runs.
+      const char* sk_env = std::getenv("INTFER_DECODE1_SPLITK");
+      const bool use_splitk =
+          (sk_env && sk_env[0] == '1' && sk_env[1] == '\0') &&
+          (std::getenv("INTFER_NO_DECODE1_SPLITK") == nullptr);
+      if (use_splitk && bits == 2 && num_groups > 0) {
+        // S must divide nWG, which is what puts all S work-items for one output
+        // inside a single work-group and makes the local reduction legal.
+        constexpr int kVSplit = 8;   // codes per vector load (matches the kernel)
+        int S = nWG;                  // full work-group == one output row
+        if (S > (K / kVSplit)) S = (K / kVSplit) > 1 ? (K / kVSplit) : 1;
+        while (S > 1 && (nWG % S) != 0) S >>= 1;
+        if (S > 1) {
+          const int nSk = N * S;
+          const int globalSk = ((nSk + nWG - 1) / nWG) * nWG;
+          const int step = S * kVSplit;   // block-cyclic period, in elements
+          const int packSk = pack;         // == 4 for INT2
+          // THE PATH ANNOUNCES ITSELF, ONCE -- same shape as INTFER_DECODE1_MR
+          // above and for the same reason: without it, an arm that compares
+          // this kernel's stream against the base run's cannot tell whether the
+          // flag reached the branch. The gate asserts the line is present.
+          static bool announced_sk = false;
+          if (!announced_sk) {
+            announced_sk = true;
+            std::fprintf(stderr,
+                         "[decode1-splitk] M=1 INT2 decode: split-K S=%d "
+                         "ACTIVE (N=%d K=%d bits=%d)\n",
+                         S, N, K, bits);
+          }
+          return q.submit([&](sycl::handler& h) {
+            h.depends_on(copy_dep);
+            auto lacc = sycl::local_accessor<float, 1>(nWG, h);
+            h.parallel_for<class gemm_usm_decode1_vec_splitk>(
+                sycl::nd_range<1>(sycl::range<1>(globalSk), sycl::range<1>(nWG)),
+                [=](sycl::nd_item<1> it) {
+                  const int g_id = static_cast<int>(it.get_global_id(0));
+                  const int lid  = static_cast<int>(it.get_local_id(0));
+                  const int n  = g_id / S;     // output element
+                  const int sp = g_id % S;     // which K-partial
+                  const bool live = (n < N);
+                  const int row_base = live ? static_cast<int>(
+                      static_cast<std::size_t>(n) * K) : 0;
+                  const std::uint16_t* sptr =
+                      live ? scale_usm + static_cast<std::size_t>(n) * num_groups_w
+                           : nullptr;
+
+                  float acc = 0.0f;
+                  const float alpha_f = alpha;
+                  sycl::multi_ptr<const std::uint16_t,
+                      sycl::access::address_space::global_space> act_mp(act_usm);
+
+                  // ---- INLINE arithmetic: do not factor this out. See above.
+                  if (live) {
+                    const int off = sp * kVSplit;
+                    const int g0 = off / Gw;
+                    const int g1last = (K - 1) / Gw;
+                    for (int g = g0; g <= g1last; ++g) {
+                      const int kg0 = g * Gw;
+                      int kg1 = kg0 + Gw;
+                      if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+                      const float scale = from_half_bits(sptr[g]) * alpha_f;
+                      const float wtab[4] = {scale * -1.0f,
+                                             scale * (-1.0f / 3.0f),
+                                             scale * (1.0f / 3.0f),
+                                             scale * 1.0f};
+                      // First k in [kg0,kg1) matching this split's phase.
+                      int k = kg0 + ((off - (kg0 % step) + step) % step);
+                      for (; k + kVSplit <= kg1; k += step) {
+                        sycl::vec<std::uint16_t, kVSplit> a16;
+                        a16.load(0, act_mp + k);
+                        const std::size_t b0 =
+                            (static_cast<std::size_t>(row_base) +
+                             static_cast<std::size_t>(k)) / packSk;
+                        const std::uint8_t b0v = code_u8[b0];
+                        const std::uint8_t b1v = code_u8[b0 + 1];
+                        for (int j = 0; j < kVSplit; ++j) {
+                          const float av = static_cast<float>(
+                              sycl::bit_cast<sycl::half>(a16[j]));
+                          const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                          const int code = (bv >> (j * 2)) & 3;
+                          acc += av * wtab[code];
+                        }
+                      }
+                      for (; k < kg1; ++k) {   // ragged tail of the group
+                        const float av = from_half_bits(act_usm[k]);
+                        const std::size_t idx =
+                            static_cast<std::size_t>(row_base) +
+                            static_cast<std::size_t>(k);
+                        const std::uint8_t byte = code_u8[idx / packSk];
+                        const int code = (byte >> ((idx % packSk) * 2)) & 3;
+                        acc += av * wtab[code];
+                      }
+                    }
+                  }
+
+                  // ---- reduce the S partials, ascending (contract split{S})
+                  lacc[lid] = acc;
+                  it.barrier(sycl::access::fence_space::local_space);
+                  if (live && sp == 0) {
+                    const int lane0 = (n * S) % nWG;
+                    float tot = 0.0f;
+                    for (int t = 0; t < S; ++t) tot += lacc[lane0 + t];
+                    out_usm[n] = to_half_bits(tot);
+                  }
+                });
+          });
+        }
+      }
+
       return q.submit([&](sycl::handler& h) {
         h.depends_on(copy_dep);
         h.parallel_for<class gemm_usm_decode1_vec>(

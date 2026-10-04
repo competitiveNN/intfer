@@ -90,9 +90,17 @@ mr_tp_sharded() {   # $1 = log. "TP=sharded" is a substring of the banner the CL
 # reasons. Defined HERE, at the top level with the other predicates, rather than
 # inline in the arm -- audit #3's shape is a rule re-derived at a second site,
 # and the whole point of this fix is that there is one home.
-mr_path_fired() {   # $1 = log; the kernel's one-time ACTIVE announcement.
-  grep -aq '\[decode1-mr\].*ACTIVE' "$1"
+decode1_path_fired() {   # $1 = log, $2 = announcement tag, e.g. decode1-mr
+  grep -aq "\[$2\].*ACTIVE" "$1"
 }
+mr_path_fired() { decode1_path_fired "$1" 'decode1-mr'; }
+# *** ONE HOME FOR "DID THE FLAG REACH ITS KERNEL". *** Added for
+# INTFER_DECODE1_SPLITK, which is the second flag in this file that needs the
+# subject-present question answered. Copy-pasting mr_path_fired with a different
+# tag would be the audit #3 shape -- one rule, two homes, and the second one free
+# to drift untested. Both flags go through decode1_path_fired; both arms go
+# through the same assertion function below.
+sk_path_fired()  { decode1_path_fired "$1" 'decode1-splitk'; }
 
 # *** AND THE ARM'S BODY IS ONE FUNCTION TOO, NOT THREE CALL SITES. *** Sharing
 # the predicates closed the "weakened predicate" class (measured: M-B/M-C/M-P/M-Q
@@ -107,35 +115,37 @@ mr_path_fired() {   # $1 = log; the kernel's one-time ACTIVE announcement.
 # Returns 0 = the arm is certified. Prints a GATE FAIL line per failed
 # assertion so a real failure names itself, and honours MR_DIAG for the
 # self-check's per-fixture message prefix (empty in the real arm).
-mr_arm_assert() {   # $1 = base log, $2 = MR log. $3 = diagnostic prefix.
-  local d="${3:-}" got mr_p mr_i ok=0
-  mr_p="$(cli_prefill "$2")"
-  mr_i="$(cli_ids "$2" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+decode1_arm_assert() {   # $1 = base log, $2 = flag-run log, $3 = prefix,
+                         # $4 = announcement tag, $5 = flag label.
+  local d="${3:-}" got p i ok=0
+  local tag="$4" lbl="$5"
+  p="$(cli_prefill "$2")"
+  i="$(cli_ids "$2" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
   got="$(cli_ids "$1" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
-  mr_prefill_ok "$mr_p" \
-    || { echo "${d}DECODE1_MR prefill '$mr_p' != 11751" >&2; ok=1; }
+  mr_prefill_ok "$p" \
+    || { echo "${d}${lbl} prefill '$p' != 11751" >&2; ok=1; }
   # NON-EMPTY FIRST lives inside mr_streams_agree: this arm compares two DERIVED
   # values (every other arm here compares to a literal oracle), so a log-format
   # change or broken pipe that emptied BOTH sides would make "" = "" and report
   # PASS having certified nothing.
-  mr_streams_agree "$got" "$mr_i" \
-    || { echo "${d}DECODE1_MR ids '$mr_i' != base '$got' (or a stream was EMPTY)" >&2; ok=1; }
+  mr_streams_agree "$got" "$i" \
+    || { echo "${d}${lbl} ids '$i' != base '$got' (or a stream was EMPTY)" >&2; ok=1; }
   mr_tp_sharded "$2" \
-    || { echo "${d}DECODE1_MR run was not TP=sharded (needs 2 devices)" >&2; ok=1; }
+    || { echo "${d}${lbl} run was not TP=sharded (needs 2 devices)" >&2; ok=1; }
   # FOURTH, and it is the one that decides whether the other three mean anything:
   # a flag that never reached the kernel makes BOTH runs produce the same tokens
   # for uninteresting reasons, so every comparison above would pass while
   # certifying nothing (audit #3's nested-flag vacuity). Inside this function
-  # rather than at the call site, so the arm keeps ONE assertion entry point --
-  # the audit #3 shape is a rule re-derived at a second site, and this fix exists
-  # to delete the second site.
-  mr_path_fired "$2" \
-    || { echo "${d}DECODE1_MR kernel never announced itself -- the flag did not" >&2
+  # rather than at the call site, so every arm keeps ONE assertion entry point.
+  decode1_path_fired "$2" "$tag" \
+    || { echo "${d}${lbl} kernel never announced itself -- the flag did not" >&2
          echo "${d}  reach the M=1 INT2 branch, so this arm compared base against" >&2
          echo "${d}  base and certified nothing." >&2
          ok=1; }
   return "$ok"
 }
+mr_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-mr' 'DECODE1_MR'; }
+sk_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-splitk' 'DECODE1_SPLITK'; }
 
 # --- SELF-CHECK (stubbed; no GPU, no model, no build) -----------------------
 # *** WHY THE DECODE1_MR ARM NEEDS ONE. *** That arm compares two DERIVED values
@@ -170,13 +180,22 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # rename it there and these fixtures stop matching, so (6) goes red rather than
   # going quietly vacuous.
   MR_ANNOUNCE='[decode1-mr] M=1 INT2 decode: MR=4 kernel ACTIVE (N=2048 K=1024 bits=2)'
+  # Same one-literal rule for the second flag: this text IS the contract, so a
+  # rename in quant_gemm.cpp turns the SPLITK cases red instead of vacuous.
+  SK_ANNOUNCE='[decode1-splitk] M=1 INT2 decode: split-K S=16 ACTIVE (N=2048 K=1024 bits=2)'
+  # *** ONE FIXTURE BUILDER FOR BOTH FLAGS. *** $ANNOUNCE_TEXT selects which
+  # flag's announcement the log carries; it defaults to the MR one so every
+  # existing case is unchanged. A second builder for SPLITK would be the audit
+  # #3 shape, and the case that matters -- "healthy pair" vs "healthy pair minus
+  # one line" -- only isolates its defect if both come from the same builder.
+  ANNOUNCE_TEXT="$MR_ANNOUNCE"
   mklog() { # $1 = path, $2.. = ids in step order. Appends the banner and the
-            # MR announcement, so every fixture is a COMPLETE, HEALTHY-SHAPED
-            # MR log and each negative case differs from it in exactly one way.
+            # announcement named by $ANNOUNCE_TEXT, so every fixture is a
+            # COMPLETE, HEALTHY-SHAPED log differing in exactly one way.
     local p="$1"; shift; : >"$p"; local i=0
     for t in "$@"; do echo "decode step $i: token=$t" >>"$p"; i=$((i+1)); done
     printf '%s\n' "$TP_BANNER" >>"$p"
-    printf '%s\n' "$MR_ANNOUNCE" >>"$p"
+    printf '%s\n' "$ANNOUNCE_TEXT" >>"$p"
   }
   # *** THESE DRIVE THE REAL ARM'S PREDICATES (mr_prefill_ok /
   # mr_streams_agree / mr_tp_sharded above), NOT COPIES OF THEM. *** There is no
@@ -312,6 +331,40 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   mr_arm_assert "$SB/tp_ok_ids" "$SB/not_announced" "SELFTEST (6) arm-refusal: " \
     && { echo "SELF-CHECK FAIL (6): mr_arm_assert ACCEPTED a log whose MR path never fired" >&2; bad=1; }
 
+  # (7) THE SAME QUESTION FOR THE SECOND FLAG. INTFER_DECODE1_SPLITK is also
+  #     guarded by `bits == 2`, so it inherits the same coverage constraint, and
+  #     it reaches it through decode1_path_fired -- one home, two callers. Both
+  #     directions again, healthy first, so the pair cannot pass by being
+  #     always-red. The fixture is a COMPLETE healthy log minus exactly the
+  #     SPLITK announcement line, built by deleting that line from mklog output,
+  #     so a refusal can only be about the line.
+  ANNOUNCE_TEXT="$SK_ANNOUNCE"
+  mklog "$SB/sk_announced"     11751 13 198 760 6511   # complete, healthy
+  mklog "$SB/sk_not_announced" 11751 13 198 760 6511   # same, minus the line
+  sed -i '/\[decode1-splitk\]/d' "$SB/sk_not_announced"
+  ANNOUNCE_TEXT="$MR_ANNOUNCE"
+  sk_path_fired "$SB/sk_announced" \
+    || { echo "SELF-CHECK FAIL (7): sk_path_fired must ACCEPT the ACTIVE announcement" >&2; bad=1; }
+  sk_path_fired "$SB/sk_not_announced" \
+    && { echo "SELF-CHECK FAIL (7): sk_path_fired ACCEPTED a log with no announcement" >&2; bad=1; }
+  sk_path_fired "$SB/empty" \
+    && { echo "SELF-CHECK FAIL (7): sk_path_fired ACCEPTED an EMPTY log (vacuity)" >&2; bad=1; }
+  # And through the SPLITK arm's own entry point.
+  sk_arm_assert "$SB/tp_ok_ids" "$SB/sk_not_announced" "SELFTEST (7) arm-refusal: " \
+    && { echo "SELF-CHECK FAIL (7): sk_arm_assert ACCEPTED a log whose SPLITK path never fired" >&2; bad=1; }
+  # And the healthy direction through the arm: a SPLITK log that DID announce
+  # must certify. Without this, case (7) would be satisfiable by a predicate
+  # that refuses everything -- the always-red twin.
+  sk_arm_assert "$SB/tp_ok_ids" "$SB/sk_announced" "SELFTEST (7) arm-accept: " \
+    || { echo "SELF-CHECK FAIL (7): sk_arm_assert REFUSED a healthy SPLITK pair" >&2; bad=1; }
+  # CROSS-FLAG: an MR announcement must NOT satisfy the SPLITK predicate and vice
+  # versa. Without this, a single tag-parameterized grep could match the wrong
+  # flag's line and the two arms would certify each other's absence.
+  sk_path_fired "$SB/announced" \
+    && { echo "SELF-CHECK FAIL (7): sk_path_fired matched the MR announcement" >&2; bad=1; }
+  mr_path_fired "$SB/sk_announced" \
+    && { echo "SELF-CHECK FAIL (7): mr_path_fired matched the SPLITK announcement" >&2; bad=1; }
+
   if [ "$bad" -eq 0 ]; then
     echo "TP2-27B SELF-CHECK: PASS (1) fixtures are full-length and differ only at step 4  (2) healthy pair accepted by all three predicates  (3) mr_arm_assert refused a late divergence  (4) mr_arm_assert refused an empty pair  (5) wrong-prefill and wrong-TP refusals fire"
     exit 0
@@ -354,6 +407,7 @@ CLI_OUT="$LOG.out"; CLI_ERR="$LOG.err"
 # armed below and their bodies expand these at trap time, so a definition further
 # down leaves every early-exit path expanding an unset variable.
 MR_OUT="$LOG.mr.out"; MR_ERR="$LOG.mr.err"
+SK_OUT="$LOG.sk.out"; SK_ERR="$LOG.sk.err"
 trap 'rc=$?; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR"; fi' EXIT
 trap 'rc=$?; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR"; fi; exit 130' INT
 trap 'rc=$?; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR"; fi; exit 143' TERM
@@ -434,6 +488,39 @@ else
   # in sync. What is left inline is a single echo, so a PASS log records WHICH
   # path ran rather than only that it agreed.
   grep -a '\[decode1-mr\]' "$MR_ERR" | head -1
+fi
+
+# --- INTFER_DECODE1_SPLITK certification ----------------------------------
+# *** SAME COVERAGE CONSTRAINT AS DECODE1_MR, AND THE SAME ARM FOR IT. *** The
+# split-K branch is guarded by `bits == 2` exactly like the MR branch, and the
+# scheme census is unchanged: Qwen3.5-0.8B.intifer has ZERO INT2 tensors, so no
+# 0.8B gate can reach it and an arm there would be green because the path never
+# ran. This gate is the only place the claim can be tested.
+#
+# *** BUT THE CLAIM IS WEAKER, AND THE ARM MUST NOT OVERSTATE IT. *** MR is
+# bit-exact by construction. Split-K is NOT: it reassociates the FP32 sum into S
+# partials combined ascending. Its tolerance is measured, in
+# examples/ksplit_contract (gated by scripts/test_ksplit_contract.sh): 0 FP16
+# ulps of margin consumed on realistic activations at every K tested, 2 ulps on
+# an adversarial escalating dataset. So what this arm certifies is
+# "stream-identical ON THIS MODEL against the fixed oracle" -- NOT bit-exactness
+# for all inputs, which is false and which the source comment refuses to claim.
+# An arm cannot be stronger than the contract it enforces; a green arm here means
+# the contract holds for the gate model, not that the kernel is exact.
+env INTFER_DECODE1_SPLITK=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$SK_OUT" 2>"$SK_ERR"; SK_RC=$?
+if [ "$SK_RC" -ne 0 ]; then
+  echo "GATE FAIL: INTFER_DECODE1_SPLITK=1 run exited rc=$SK_RC" >&2
+  tail -20 "$SK_ERR" >&2
+  PASS=0
+else
+  echo "DECODE1_SPLITK prefill: $(cli_prefill "$SK_ERR") (expect 11751)"
+  echo "DECODE1_SPLITK ids:      $(cli_ids "$SK_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  # Same single entry point as the MR arm, so both flags are held to one rule.
+  # If SPLITK had its own inline copies, the second copy would be free to drift
+  # untested -- the shape this file has been rebuilt around twice.
+  sk_arm_assert "$CLI_ERR" "$SK_ERR" "GATE FAIL: " || PASS=0
+  grep -a '\[decode1-splitk\]' "$SK_ERR" | head -1
 fi
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
 if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi

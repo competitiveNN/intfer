@@ -198,6 +198,8 @@ if [ "${1:-}" = "--list" ]; then
   echo "  MR-9  mr_arm_assert always certifies"
   echo "  MR-10 cli_ids returns nothing"
   echo "  MR-11 cli_prefill returns nothing"
+  echo "  SK-12  decode1_path_fired tag is ignored (matches EITHER announcement)"
+  echo "  SK-13  sk_path_fired aliases the MR tag instead of its own"
   exit 0
 fi
 
@@ -206,6 +208,7 @@ anchor PRED_STREAMS_FULL '  [ -n "$1" ] && [ -n "$2" ] && [ "$1" = "$2" ]'
 anchor PRED_PREFILL '  [ "$1" = "11751" ]'
 anchor PRED_TP '  grep -aq "TP=sharded" "$1"'
 anchor ARM_RETURN '  return "$ok"'
+anchor PATH_FIRED '  grep -aq "\[$2\].*ACTIVE" "$1"'
 preflight || exit 1
 
 echo "== baseline =="
@@ -229,6 +232,18 @@ m_mr8() { patch_literal "$1" "$(cat "$SB/anchor_PRED_TP.txt")" \
   '  grep -aq "TP=shardedX" "$1" #MR8 never matches'; }
 m_mr9() { patch_literal "$1" "$(cat "$SB/anchor_ARM_RETURN.txt")" \
   '  return 0 #MR9 always certifies'; }
+# *** SK-12/SK-13 PIN THE ONE GENUINELY NEW MECHANISM IN THIS CHANGE. ***
+# decode1_path_fired took a $2 tag so the second flag could share the rule. The
+# risk that creates is specific and new: a tag that is IGNORED still passes the
+# single-flag cases, because each arm's own log contains its own announcement. It
+# only shows up as a CROSS-FLAG failure -- MR's line satisfying SPLITK's check and
+# vice versa -- which is why the self-check has cases (7)'s last two lines and
+# why these two states target exactly that.
+m_sk12() { patch_literal "$1" "$(cat "$SB/anchor_PATH_FIRED.txt")" \
+  '  grep -aqE "decode1-(mr|splitk).*ACTIVE" "$1" #SK12 tag ignored'; }
+m_sk13() { patch_literal "$1" \
+  'sk_path_fired()  { decode1_path_fired "$1" '"'"'decode1-splitk'"'"'; }' \
+  'sk_path_fired()  { decode1_path_fired "$1" '"'"'decode1-mr'"'"'; } #SK13 wrong tag'; }
 m_mr10() { patch_literal "$1" \
   'cli_ids() { # $1 = log -- every decode-step token id, prefill included
   grep -a -oE "decode step [0-9]+: token=[0-9]+" "$1" | sed -E '"'"'s/.*token=//'"'"'
@@ -260,6 +275,8 @@ run_state MR-8  'SELF-CHECK FAIL \(2\).*TP'     m_mr8
 run_state MR-9  'SELF-CHECK FAIL \(3\)' m_mr9
 run_state MR-10 'SELF-CHECK FAIL \(1\)' m_mr10
 run_state MR-11 'SELF-CHECK FAIL \(2\).*prefill' m_mr11
+run_state SK-12 'SELF-CHECK FAIL \(7\)' m_sk12
+run_state SK-13 'SELF-CHECK FAIL \(7\)' m_sk13
 
 # --- residue: the tracked file must be byte-identical to HEAD ----------------
 if [ "$SB_DIGEST_BEFORE" != "$(cat "$TARGET" | cksum)" ]; then

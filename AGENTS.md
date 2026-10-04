@@ -184,8 +184,14 @@ SIMD. More outputs per work-item is *anti*-parallel at M=1. Do not re-attempt it
 cause.** Two ways to raise it:
 
 * **(a) split K across work-items** — raises parallelism *and* coalesces the weight
-  loads, but is **NOT bit-exact** (reassociates the FP32 sum). Needs a numerics
-  contract agreed **before** any code. **Still not started.**
+  loads, but is **NOT bit-exact** (reassociates the FP32 sum). **The numerics
+  contract is now MEASURED and the kernel is BUILT**: `INTFER_DECODE1_SPLITK`
+  (default OFF, `=1` exactly), block-cyclic assignment because that is the only
+  one that coalesces — contiguous chunks were measured and stay strided.
+  Measured margin consumed: **0 FP16 ulp** on random / act-outliers / full
+  cancellation, **2 ulp** on an adversarial escalating dataset. So the claim is
+  "stream-identical on the gate models", never "bit-exact". Gated in
+  `test_tp2_27b.sh`. **Unbenchmarked — the verdict is pending the box.**
 * **(b) fuse INDEPENDENT GEMMs into ONE `nd_range`** — bit-exact (each output keeps
   its own work-item and its own K order; only the launch boundary moves). **This
   is the live direction**, and it is also the standing fusion directive, so the two
@@ -252,6 +258,13 @@ fine".** Adding arms is NOT copy-paste: read each flag's semantics first, becaus
 some are *deliberately approximate* (`INTFER_PREFILL_RR` rounds in a different
 order by design) and asserting identity for those ships a gate that fails for a
 legitimate reason.
+
+**`INTFER_DECODE1_SPLITK` is the worked example of doing this right**, and the
+opposite of MR: the numerics contract was measured *before* the kernel existed
+(`examples/ksplit_contract`, gated by `test_ksplit_contract.sh`), and the arm
+lives in the one gate whose model can reach the branch. Its claim is deliberately
+weaker than MR's — stream-identical on the gate models, not bit-exact — and an
+arm must never be stronger than the contract it enforces.
 
 **`INTFER_DECODE1_MR` illustrates both halves.** MR is guarded by `bits == 2`, and
 only the 27B gate model has INT2 tensors (`Qwen3.8-27B-int2.intifer`: INT2 x110;
@@ -351,6 +364,7 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_DPAS_PREQ` | device-side GA64 act-quant pre-pass | recovers 52.7 ms of 2559.2 ms host act-quant but pays +30720 launches. **DO NOT PROMOTE** |
 | `INTFER_DPAS_ROW` | one WI owns many tiles | ~460x slower. Historical dead end, mutually exclusive with E4 |
 | `INTFER_DECODE1_MR` | 4 outputs per WI at M=1 INT2 | **2.3x slower.** Do not use |
+| `INTFER_DECODE1_SPLITK` | split-K block-cyclic M=1 INT2 decode: `N*S` work-items + coalesced weight loads. Exactly `=1`; kill switch `INTFER_NO_DECODE1_SPLITK` | **NOT YET BENCHMARKED.** Numerics contracted (0 FP16 ulp on realistic data) and gated in `test_tp2_27b.sh`, but no 27B run yet — see `reports/2026-10-04-ksplit-decode1.md` |
 | `INTFER_L4_FUSE` | fused ssm+norm+FP16 -> la_out GEMM (TP=1) | stream-identical, but M>1 nets ~-1.5% and scalar A/B was a variance wash |
 | `INTFER_L5_FRONT` | device-resident whole LA input path | **dead end as built**: +144 launches/token, waitblock 5x. More kernels lose |
 | `INTFER_SSM_GPU` | device SSM recurrence | declines under `INTFER_DPAS48=1` (its ~1ulp drift flips a GA64 code at a tie) |
