@@ -2,10 +2,28 @@ Port ninfer (https://github.com/Neroued/ninfer) to our local setup made of intel
 
 ## READ FIRST — current gate state, and how to read the history below
 
-**The box currently enumerates ONE Arc B580** (`sycl-ls` prints a single
-`[level_zero:gpu]` line). The design target is still 2 GPUs, but the second one
-is not currently visible — see AUDIT #11, where it vanished mid-session. That
-single fact governs how every gate result in this file must be read:
+**BOTH Arc B580s enumerate** (verified 2026-10-04 at the driver API:
+`scripts/l0_enumerate.sh` -> `zeDeviceGet rc=0 DEVICES=2`, UUIDs `...-0400-...`
+= 04:00.0 and `...-8600-...` = 86:00.0; `sycl-ls` prints 2 `[level_zero:gpu]`
+lines). **This has now happened four times**, and it has dropped as many times
+without anything in this repo changing — it is HOST-SIDE driver enumeration
+state, not a code fault. Two consequences that govern how the history below must
+be read:
+  * The 1-GPU investigation at lines ~10-255 is the record of ONE of those
+    windows. It is true history and stays. **Do not read it as the current box
+    state, and do not "fix" anything in it** — see the HISTORICAL marker below.
+  * A tally that depends on visible device count (PARTIAL / SKIPPED counts) is
+    only meaningful together with the device count it was measured at. Re-derive
+    it with `scripts/gate_inventory.sh`; do not read one off this file.
+  *** IF THE SECOND GPU VANISHES AGAIN: *** `scripts/gpu_recover.sh diag`
+    (read-only) -> `sudo scripts/gpu_recover.sh rebind` -> `verify`. A plain
+    rebind is what fixed it the last time; nothing about the hardware, the
+    driver-library version, cgroup, NUMA, power or BAR sizes had to change.
+    *** NEVER lead with the BAR/small-BAR theory *** — it was refuted when a
+    rebind fixed it with no BAR change.
+
+The history below opens with the 1-GPU era because that is when most of it was
+written. Its opening section reads:
 
   === 2026-10-01: THE HARDWARE IS FINE; ONLY THE *ENUMERATION* IS DOWN ===
   Re-measured from scratch. This is NOT a "1-GPU machine" and must not be
@@ -299,12 +317,8 @@ matrix, and the shared patch helper — all dispatched steps of
 - The correct present-tense sentence is: *"10 PASS, 0 PARTIAL, 0 SKIPPED; both
   B580s enumerate and TP=2 coverage is live."* Anything shorter is an overclaim
   in one direction; quoting the old tally is an overclaim in the other.
-- All 7 rc=0 gates were re-run after the audit #13 tooling/doc commits, to
-  confirm that pass was cosmetic-only (no engine source touched since ce2eb05):
-  ga64_recip, gguf_roundtrip, dpas_fold, cpu_parity, oracle_equiv, http_batch,
-  serve_load — all rc=0. The two TP=2-dependent gates and tp2_27b were not
-  re-run; their class is unchanged (still blocked on the second GPU).
-  correctness gate from source, and flags a whole-gate skip on a gate that has
+- `scripts/gate_inventory.sh` derives the gate population and each gate's
+  granularity/precondition from source, and flags a whole-gate skip on a gate that has
   1-GPU arms (the audit #13 over-skip bug, made mechanically detectable). It also
   **reconciles the doc tallies**: it derives the expected
   `N PASS / N PARTIAL / N SKIPPED` from each gate's own precondition plus the
@@ -481,7 +495,7 @@ flag, the honest state of the residue is **UNCERTIFIED**, not "probably fine".
 **exactly `N`** (one output element per work-item), and that is **invariant to the
 work-group shape**. So MR did not add parallelism; it **divided an already-starved
 budget by four**. At 27B TP=2 a layer GEMM has N about 2048 per rank over **512 Xe
-cores, about 4 threads/EU**, and `kThr=16` (`quant_gemm.cpp:63`) cannot even fill
+cores, about 4 threads/EU**, and `kThr=16` (`quant_gemm.cpp:64`) cannot even fill
 one SIMD. More outputs per work-item is *anti*-parallel at M=1.
 
 **So the target is EU occupancy, and the 21 % bandwidth figure is a symptom, not
@@ -553,9 +567,26 @@ copies against each other is the price of that.
 Both flags, `INTFER_FUSED_DECODE1` and `INTFER_DECODE1_WG`, are **gone**, along
 with their gate arms, their mutation matrix and their `run_all_checks.sh` wiring.
 The parallelism finding above stands: M=1 decode is EU-parallelism-bound.
+Batch report with the counters and blank `RESULT:` lines:
+`reports/2026-10-04-batch-fused-decode.md`.
 
-Both **default-OFF**, unset == byte-identical. Batch report with the counters and
-blank `RESULT:` lines: `reports/2026-10-04-batch-fused-decode.md`.
+*** HISTORICAL — DO NOT READ AS A LIVE SPECIFICATION. *** Everything from here to
+the end of this block describes the feature **as it shipped in 0961035, before the
+776ef33 revert**. It is kept because the lesson in it is the durable part and the
+revert destroyed the code that carried it — not because any of it describes the
+tree you are reading. In the current tree:
+  * neither `INTFER_FUSED_DECODE1` nor `INTFER_DECODE1_WG` exists anywhere
+    (verified by grep across the whole repo: 0 hits outside this file and the
+    batch report);
+  * `scripts/mutate_fused_decode.sh` does not exist and never reached
+    `dispatch()`/`STEPS`;
+  * the header declarations were removed in ce487fe — see AUDIT #31, which is
+    where the revert's incompleteness is recorded.
+  Where the text below says "default-OFF" or "Bit-exact **structurally**", read
+  it as: *this is what we believed when it shipped, and the belief about the
+  arithmetic being structural is exactly what the revert disproved.* In
+  particular the "extracted verbatim into ONE file-local routine" claim below is
+  **the thing that broke 27B decode by 180x** — see the REVERTED block above.
 
 **`INTFER_FUSED_DECODE1=1`** (kill switch `INTFER_NO_FUSED_DECODE1=1`) — one
 `nd_range` for a whole wave of independent GEMMs, so a launch carries `sum(N_i)`
@@ -812,7 +843,7 @@ that was not measured on a quiet box.
   are memory-bound).
 - XMX CORRECTION (2026-09-18, empirical via xmxmon after sysctl unlock):
   the "zero DPAS" verdict above is WRONG for lm_head — lm_head runs
-  INT8 DPAS (quant_gemm_dpas_s8w, main.cpp:1231 use_dpas, default-ON
+  INT8 DPAS (quant_gemm_dpas_s8w, main.cpp:1270 use_dpas, default-ON
   whenever the repack exists, no env gate). Measured: prefill-only
   361tok capture = 180M INT8 slots; decode-only M=1 = 5.5M INT8 slots
   (~0.8M/token, consistent with vocab/16 tiles x K/32 ops). Layer GEMMs
@@ -1091,7 +1122,7 @@ that was not measured on a quiet box.
    LD_LIBRARY_PATH gotcha (that one yields ZERO devices, not one).
    ~~TP=2 then slices every tensor into 2 shard ranges while only rank 0
    has a device, and the wave path walks ranges[d] -> wild pointer ->
-   SIGSEGV.~~  STRUCK BY AUDIT #11: FALSE. engine.cpp:361 already clamps
+   SIGSEGV.~~  STRUCK BY AUDIT #11: FALSE. engine.cpp:386 already clamps
    `n = min(tp_devices, dm.size())` and shards come from devices_.size(), so
    --tp 2 on a 1-GPU box is simply TP=1. Verified: 0.8B with `--gpu --tp 2`
    exits rc=0 with the expected ids. Real cause is 27B VRAM exhaustion
@@ -1113,7 +1144,7 @@ that was not measured on a quiet box.
    === AUDIT #11: AUDIT #9's ROOT CAUSE WAS WRONG (supersedes it) ===
    #9 attributed the tp2_27b rc=139 to TP sharding walking a missing device
    ("ranges[d] -> wild pointer"). TESTED AND DISPROVED: the clamp is real and
-   correct — engine.cpp:361 `n = (tp_devices==0) ? dm.size() :
+   correct — engine.cpp:386 `n = (tp_devices==0) ? dm.size() :
    std::min(tp_devices, dm.size())` and shards are built from devices_.size(),
    so --tp 2 on a 1-GPU box is simply TP=1. Verified: 0.8B with `--gpu --tp 2`
    on this 1-GPU box exits rc=0 with the expected ids and the banner
@@ -4020,7 +4051,7 @@ e.g. S3's contract column is 40 not 42).
 
    === AUDIT #3c: a build break the gates could NOT see (987c554 -> 1fbf9a6) ===
   ssm_gpu_allowed() was defined INSIDE #ifdef INTFER_HAS_GPU_BACKEND while
-  its step() call site (main.cpp:4985) sits OUTSIDE it, so the CLI failed to
+  its step() call site (main.cpp:4992) sits OUTSIDE it, so the CLI failed to
   compile without -DINTFER_HAS_GPU_BACKEND=1. All four gates still passed,
   because the define is unconditional in examples/intfer_cli/CMakeLists.txt.
   Lesson (same species as the two vacuous-gate bugs already recorded here):
@@ -4349,7 +4380,7 @@ e.g. S3's contract column is 40 not 42).
   multi-launch L0 lists (same seam work amortizes both). Standalone
   INTFER_SSM_GPU=1 stays default-off.
 - lm_head audit (2026-09-19): step_batch/serve scoring is ALREADY M-row
-  batched — run_lm_head_batch (main.cpp:1174, M>1) does one launch per
+  batched — run_lm_head_batch (main.cpp:1213, M>1) does one launch per
   device tile instead of M scalar calls; INTFER_LMHEAD_BATCH=0 restores
   per-row for bisection. Nothing to implement; todo item cancelled.
   Verified on HEAD: cpu parity + http batch + gpu-optin (10/10) PASS,
@@ -4564,6 +4595,85 @@ e.g. S3's contract column is 40 not 42).
   gate now has INTFER_LOAD_ORACLE override (249d3f8) for non-0.8B
   models — c8.parity byte-identical stays the real determinism gate.
   Cache fires under concurrency (pchit=16 at admit with pq=8).
+
+- **AUDIT #31 (2026-10-04): THE NEW GATE ARM'S SELF-CHECK TESTED A COPY OF THE
+  ARM — 3 OF ITS ASSERTIONS WERE UNOBSERVABLE. And the revert above was
+  incomplete.** No engine arithmetic touched. Audited this session's own work
+  (the DECODE1_MR arm in `test_tp2_27b.sh`, added 90b4865) with the standing
+  question: what does this claim, and can it be false?
+  - **THE DEFECT, MEASURED NOT ARGUED.** The self-check defined its own
+    `arm_ok` INSIDE the `--self-check` block, commented "the real arm's guard,
+    verbatim". It was not verbatim — it was a COPY, while the real arm carried
+    three separate inline tests. Applying one mutation at a time to a temp copy:
+    deleting the arm's stream comparison, its prefill oracle, or its
+    TP=sharded grep each left `--self-check` at rc=0 **PASS**. Three of the
+    arm's assertions were UNOBSERVABLE to the check written to cover them —
+    audit #3's shape, committed in the code written to avoid exactly that.
+  - **FIXED BY ONE HOME, NOT BY ADDING CASES.** `mr_arm_assert(base_log,
+    mr_log)` now holds all the assertions; the real arm calls it once and the
+    self-check calls it on fixtures. Sharing only the PREDICATES was tried
+    first and **measured insufficient** — deleting the arm's call sites still
+    left the self-check green, because a predicate-driven check never walks the
+    caller's plumbing. Both halves were needed; both are now measured.
+  - **TWO MORE DEFECTS, FOUND BY RUNNING THE FIX.** (a) A **masked case in the
+    guard I added to fix masking**: case (4) drove only `mr_arm_assert` on an
+    empty pair, which already fails its prefill and TP checks, so it went red
+    for THOSE reasons even after `mr_streams_agree` had its non-empty half
+    deleted — that mutation was **MISSED**. Fixed by driving the predicate
+    directly too. Audit #12's mutual masking, inside its own remedy. (b)
+    **fixtures that refused for two reasons**: MR fixtures had ids but no TP
+    banner, so every refusal also tripped the TP check.
+  - **THE SUBJECT-PRESENT GAP, one level below audit #3.** With the guard
+    shared, the arm still had **no proof the flag ever reached the kernel**. If
+    the flag were misspelled the arm compared base-vs-base and passed — audit
+    #3's nested-flag vacuity again, and no amount of stream comparison can see
+    it, because the subject is the flag's EFFECT. Fixed the way the repo
+    already does this (`INTFER_L4_DBG`): a one-time stderr line at the MR
+    branch, asserted by the arm. So "the two runs matched" now means "the MR
+    path ran and produced the same tokens".
+  - **EVIDENCE IN THE TREE, NOT A TRANSCRIPT** (audit #17/#19): new
+    `scripts/mutate_tp2_selfcheck.sh`. States are judged on their **own**
+    expected marker, never on rc alone — a state can go red for an unrelated
+    reason. Anchor pre-flight runs first, so a drifted anchor fails in the
+    second second instead of masquerading as a weak state. Live figures from
+    `build/tp2_selfcheck_mutate/last_pass.stamp`, never from here.
+    *** ONE STATE IS EXCLUDED WITH ITS REASON, NOT SCORED *** (MR-1: deleting
+    the arm's call site is invisible to a self-check that never runs the arm, a
+    grep over the file would match its own comments, and the only sound detector
+    needs 2 GPUs and an 18 GiB model load). Read the exclusion off the stamp.
+  - **THE MATRIX HAD NO DISPATCH ARM AND NO STEPS ENTRY** — the AUDIT #18 class
+    ("a matrix with no dispatch arm NEVER RUNS"), reproduced verbatim in a file
+    that has audited it four times, in a file written to prevent it. Caught by
+    an AGENTS.md staleness audit, not by a gate. Wired to both.
+  - **FOUR TOOLING DEFECTS found while wiring it**, all of the recorded kinds:
+    a guard whose stated reason did not apply (this matrix never edits a tracked
+    file, so the inherited dirty-tree guard blocked a legitimate run — a guard
+    whose rationale is false is worse than none); a **self-contradicting
+    verdict** that printed `FAIL (10/10 states caught)` because it demanded one
+    baseline *per state* and this shape has exactly one; **`_gate_pop.sh`'s
+    derivation read COMMENTS as declarations** (my own comment quoted a sibling's
+    real declaration as an example, and the helper harvested the prose, so the
+    matrix's own directory was reported as an unowned leak — fixed at the source
+    with a comment strip, NOT by rewording my comment, because the next matrix
+    will quote an example too; `check_gate_pop.sh` gains case (f), both
+    directions, negative-tested); and a **variable name the derivation could not
+    see** (`STAMP_DIR=` does not match `(WORK|LOG_DIR|STAMP)=`) — a
+    green-looking declaration is not a harvested one, and only the assertion said so.
+  - **THE REVERT AT 776ef33 WAS INCOMPLETE, AND THAT IS A SOURCE DEFECT.** It
+    restored `quant_gemm.cpp` and `engine.cpp` but not
+    `include/intfer/gemm/quant_gemm.hpp`, which still DECLARED
+    `FusedDecode1Set`, `fused_decode1_eligible()` and
+    `quant_gemm_fused_decode1()` with a 22-line comment asserting the
+    bit-exactness argument — **an API with no definition anywhere** (6 grep hits,
+    all in the header, none in any `.cpp`). Replaced with a note recording why
+    it went away and what the revert established. A stale document is
+    recoverable; a public header advertising an unlinkable kernel is not.
+  - *** STANDING RULE, FROM THE USER: NEVER RUN A FULL-27B GATE FROM AN AGENT
+    SESSION. *** Model load is minutes of VRAM residency work and the operator
+    measures. So the new arm's real-run half is **UNRUN by design**, and every
+    claim about it must say which half is proven (the self-check, by the matrix
+    above) and which is pending (the box). Allowed: `--self-check`, the matrix,
+    and any checker that binds no model. Memory: `no_full_27b_gate_runs.md`.
 
 
 # guidelines

@@ -163,49 +163,38 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                       const sycl::event& copy_dep);
 
 // ---------------------------------------------------------------------------
-// FUSED INDEPENDENT-GEMM LAUNCH, M=1 only (INTFER_FUSED_DECODE1, default OFF).
-//
-// One nd_range carrying several independent GEMMs' outputs, instead of one
-// N-wide launch each. Exists because M=1 decode is EU-parallelism-bound: the
-// single-GEMM kernel's total work-item count is exactly N and that is invariant
-// to the work-group shape (measured 2026-10-04 -- an output-tiling variant came
-// out 2.3x slower for exactly that reason). q/k/v are three independent GEMMs and
-// gate/up are two, so one launch can occupy 2-3x the EUs.
-//
-// BIT-EXACT: each output is computed by exactly one work-item running the SAME
-// per-output routine the single-GEMM path uses, so every output's K order is
-// untouched and only the launch boundary moves. That is why fusing is the chosen
-// direction and splitting K across work-items is not -- splitting K reassociates
-// the FP32 sum and needs a numerics contract agreed first.
-//
-// `out_offset` MUST be the host-computed prefix sum of the preceding sets' N;
-// the device consumes it and never re-derives the mapping. The eligibility check
-// refuses a set whose fields are not self-consistent rather than trusting them.
-//
-// Returns a default-constructed event when ineligible (the caller must then use
-// the sequential path); otherwise ONE event covering every set's output.
+// FUSED INDEPENDENT-GEMM LAUNCH (INTFER_FUSED_DECODE1) -- REMOVED 2026-10-04.
 // ---------------------------------------------------------------------------
-struct FusedDecode1Set {
-  const std::uint8_t* code;    // packed INT2 codes, K codes per row
-  const std::uint16_t* scale;  // FP16 per (row, group)
-  const std::uint16_t* act;    // this GEMM's FP16 activations, K values (M == 1)
-  std::uint16_t* out;          // this GEMM's FP16 output, N values
-  int N, K, group_size;
-  int num_groups;    // MUST equal ceil(K / group_size)
-  int num_groups_w;  // MUST equal num_groups (one home; see .cpp)
-  int out_offset;    // MUST equal the prefix sum of the preceding N
-  float alpha;
-};
-
-inline constexpr int kFusedDecode1MaxSets = 8;
-
-bool fused_decode1_eligible(const FusedDecode1Set* sets, int n);
-
-// nwg: work-group size for the fused launch (0 = default 16).
-sycl::event quant_gemm_fused_decode1(sycl::queue& q,
-                                     const FusedDecode1Set* sets, int n,
-                                     int nwg,
-                                     const sycl::event& copy_dep);
+// THERE IS NO SUCH API HERE, AND THE HEADER PREVIOUSLY ADVERTISED ONE. The
+// fused decode launch shipped in 0961035 and was reverted in 776ef33 because it
+// broke 27B decode catastrophically (1284 ms -> 231,114 ms per token), isolated
+// to EXTRACTING the M=1 INT2 body into a device function. The revert restored
+// src/gemm/quant_gemm.cpp and src/engine/engine.cpp but NOT this header, so
+// FusedDecode1Set, kFusedDecode1MaxSets, fused_decode1_eligible() and
+// quant_gemm_fused_decode1() were left declared here with a 22-line comment
+// asserting a bit-exactness argument -- an API with no definition anywhere.
+//
+// MEASURED, not inferred: the block below used to sit here and was deleted in
+// this commit. `grep -rn 'FusedDecode1Set' src/ include/ examples/` returned 6
+// hits, ALL in this header and NONE in any .cpp -- an unimplemented public API.
+// A stale document is recoverable; a header that advertises a kernel nobody can
+// link is not, and this file is exactly what a reader trusts over prose.
+//
+// WHY THE BLOCK IS REPLACED BY THIS NOTE RATHER THAN DELETED SILENTLY: the
+// revert's real lesson -- that moving arithmetic into a device function is NOT
+// a safe refactor on this toolchain -- lives in AGENTS.md and in the batch
+// report, and this is the one place a future implementer of the same idea will
+// look. If the fusion is ever re-attempted, it must go back to the SEAMS the
+// revert established (keep each GEMM's arithmetic INLINE at its own call site;
+// fuse by sharing a launch, not by extracting a body), and it must be gated
+// again -- and it must NOT be declared here until a definition exists.
+//
+// The perf context that motivated it still stands and is not in question: M=1
+// decode is EU-parallelism-bound, because this kernel's total work-item count is
+// exactly N and that is invariant to the work-group shape. Splitting K across
+// work-items would raise parallelism but reassociates the FP32 sum and needs a
+// numerics contract agreed first; fusing INDEPENDENT GEMMs keeps each output's
+// K order untouched and is the bit-exact direction.
 
 // FP16 x FP16 GEMM for non-quantized tensors like lm_head.
 // C[M,N] = A[M,K] * W[N,K]^T. A is row-major FP16, W is row-major FP16,
