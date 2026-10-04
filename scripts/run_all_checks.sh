@@ -251,7 +251,7 @@ dispatch() { # $1 = label -> runs it
       # a timeout. Its final assertion is a LIVE probe -- it runs the helper with
       # a PATH that has no sycl-ls -- so the banner is proved to print rather than
       # merely to exist.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_env_not_box_state.sh check_destructive_git.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_env_not_box_state.sh"; return $? ;;
     check_flag_gate_coverage.sh)
       # Classifies the ungated-flag residue: only the OPT-IN class is a
       # certification gap. No GPU, no model, no build. Exists because AGENTS.md's
@@ -424,7 +424,7 @@ dispatch() { # $1 = label -> runs it
       # Mutates scripts/_gate_precond.sh. EN-2 is the state that keeps EN-1
       # honest: delete the banner TEXT while every call site survives, so a
       # call-site count alone cannot pass.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_env_not_box_state.sh mutate_destructive_git.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_env_not_box_state.sh"; return $? ;;
     mutate_flag_gate_coverage.sh)
       # FG-1/FG-4 are the two states that FOUND real holes in the checker: a
       # census query with no floor of its own, and an opt-in class with no
@@ -691,12 +691,12 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh check_destructive_git.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
