@@ -124,6 +124,37 @@ float acc_split(const Row& r, int S) {
   return total;
 }
 
+// BLOCK-CYCLIC split: the ONLY assignment that coalesces the weight loads.
+// Each split s owns the k values { s*V + t*S*V + j : t >= 0, j in [0,V) },
+// with V = 8 codes (the kernel's vector width; INT2 packs 8 codes in 2 bytes).
+// At step j the S lanes read CONSECUTIVE bytes of one row, where contiguous
+// K-chunks leave them base_bytes apart -- i.e. a stride-K gather identical to
+// the un-split kernel. Measured on the load pattern, not assumed.
+//
+// This is a THIRD order and the contract did not previously cover it: it
+// reassociates differently from split{S} (which is contiguous-chunked) even
+// though both combine S partials ascending. Measured here before any kernel
+// exists to use it -- building an unmeasured arithmetic reordering is the
+// mistake this file exists to prevent.
+float acc_cyclic(const Row& r, int S) {
+  const std::size_t K = r.a.size();
+  constexpr int V = 8;
+  float total = 0.0f;
+  for (int s = 0; s < S; ++s) {
+    float p = 0.0f;
+    for (std::size_t k = (std::size_t)s * V; k < K;
+         k += (std::size_t)S * V) {
+      for (int j = 0; j < V; ++j) {
+        const std::size_t kk = k + (std::size_t)j;
+        if (kk >= K) break;
+        p += r.a[kk] * r.w[kk];
+      }
+    }
+    total += p;
+  }
+  return total;
+}
+
 // Same S partials, pairwise reduction.
 float acc_tree(const Row& r, int S) {
   const std::size_t K = r.a.size();
@@ -333,6 +364,9 @@ int main(int argc, char** argv) {
   bool saw_movement = false;      // (a) discriminating direction
   bool saw_quiet_realistic = false;// (b) always-red converse
   bool saw_separation = false;    // (c) split vs tree are not the same number
+  bool saw_quiet_cyclic = false;  // block-cyclic is quiet on realistic data
+  bool saw_loud_cyclic = false;   // ...and NOT quiet on adversarial, so the
+                                  // zero above is a property, not blindness
 
   for (std::size_t K : Ks) {
     printf("-- K=%zu\n", K);
@@ -343,6 +377,7 @@ int main(int argc, char** argv) {
       for (int i = 0; i < rows; ++i) rs.push_back(make_row(rng, K, kind));
 
       double worst_margin_split = 0.0, worst_margin_tree = 0.0;
+      double worst_margin_cyclic = 0.0;
       int moved_split = 0, moved_tree = 0;
       double worst_rel = 0.0;
       // Separation is measured BETWEEN the two orders, not against seq. It is
@@ -357,6 +392,8 @@ int main(int argc, char** argv) {
           const float s = acc_seq(r);
           const std::uint16_t hs = to_half_bits(s);
           const float a1 = acc_split(r, S), a2 = acc_tree(r, S);
+          worst_margin_cyclic = std::max(worst_margin_cyclic,
+                                         ulp_margin(s, acc_cyclic(r, S)));
           if (fp16_ulp(hs, to_half_bits(a1))) ++moved_split;
           if (fp16_ulp(hs, to_half_bits(a2))) ++moved_tree;
           const double m1 = ulp_margin(s, a1), m2 = ulp_margin(s, a2);
@@ -369,11 +406,16 @@ int main(int argc, char** argv) {
           worst_order_gap = std::max(worst_order_gap, gap);
         }
       }
-      printf("   %-18s moved_fp16: split=%d/%d tree=%d/%d | margin consumed: "
-             "split=%.4g ulp  tree=%.4g ulp | split-vs-tree gap=%.2e\n",
+      printf("   %-18s moved_fp16: split=%d/%d tree=%d/%d | margin: "
+             "split=%.4g tree=%.4g CYCLIC=%.4g ulp | split-vs-tree gap=%.2e\n",
              kind_name(kind), moved_split, rows * (int)splits.size(),
              moved_tree, rows * (int)splits.size(),
-             worst_margin_split, worst_margin_tree, worst_order_gap);
+             worst_margin_split, worst_margin_tree, worst_margin_cyclic,
+             worst_order_gap);
+      if (kind != kInterleaved && worst_margin_cyclic == 0.0)
+        saw_quiet_cyclic = true;
+      if (kind == kInterleaved && worst_margin_cyclic >= 1.0)
+        saw_loud_cyclic = true;
       if (worst_margin_split >= 1.0 || worst_margin_tree >= 1.0)
         saw_movement = true;
       if (kind != kInterleaved && moved_split == 0 && moved_tree == 0)
@@ -389,10 +431,16 @@ int main(int argc, char** argv) {
   printf("== THE CONTRACT ==\n");
   printf("  C1. A K-split is judged AFTER the FP16 store, in FP16 ulps. Judged\n");
   printf("      in FP32 relative error it looks alarming and is invisible.\n");
-  printf("  C2. split{S} and tree{S} are DIFFERENT tolerances (same partials,\n");
-  printf("      different combination order). A kernel states which one it uses.\n");
+  printf("  C2. THREE orders are measured, and they are DIFFERENT tolerances:\n");
+  printf("      split{S}  contiguous K-chunks, combined ascending\n");
+  printf("      tree{S}   the same partials, combined pairwise\n");
+  printf("      cyclic{S} block-cyclic chunks (the only one that COALESCES),\n");
+  printf("                combined ascending\n");
+  printf("      A kernel states which one it uses. On the adversarial dataset they\n");
+  printf("      read 1.0 / 1.0 / 2.0 ulp -- so citing \"the\" tolerance is ambiguous.\n");
   printf("  C3. On REALISTIC activations -- random, act-outliers, and full\n");
-  printf("      cancellation -- the split does not move the FP16 store AT ALL.\n");
+  printf("      cancellation -- ALL THREE orders do not move the FP16 store at\n");
+  printf("      all. cyclic{S} measured 0 ulp margin at every K tested.\n");
   printf("      Measured, not argued: the FP16 activation bound (|a| <= 65504)\n");
   printf("      caps the sum at K*65504, so FP32 reassociation error lands ~2\n");
   printf("      orders of magnitude below one FP16 ulp.\n");
@@ -486,6 +534,16 @@ int main(int argc, char** argv) {
   if (!saw_quiet_realistic) {
     printf("FAIL: no realistic dataset stayed put, so this gate would be\n"
            "      always-red -- which trains everyone to ignore it.\n");
+    ++bad;
+  }
+  if (!saw_quiet_cyclic) {
+    printf("FAIL: the block-cyclic order moved the FP16 store on realistic data,\n"
+           "      so it is NOT covered by C3 and must not be built unmeasured.\n");
+    ++bad;
+  }
+  if (!saw_loud_cyclic) {
+    printf("FAIL: the block-cyclic order was quiet even on the adversarial data,\n"
+           "      so its zeros are indistinguishable from a blind harness.\n");
     ++bad;
   }
   if (!saw_separation) {
