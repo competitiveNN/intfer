@@ -416,7 +416,54 @@ grouping them into a **single kernel launch**, not merely a single host phase.
 Do **not** re-attempt per-work-item output tiling at M=1. It is measured, and the
 mechanism is structural rather than a tuning miss.
 
-### ==> SHIPPED 2026-10-04: (b) IS NOW BUILT. `INTFER_FUSED_DECODE1` + `INTFER_DECODE1_WG`. <==
+### ==> REVERTED 2026-10-04: FUSED MULTI-GEMM DECODE. THE ARITHMETIC IS FINE; THE *EXTRACTION* IS NOT. <==
+
+**`(b)` was built, measured, found to break 27B decode, and reverted. Do not
+rebuild it in this shape.** The full story, because the negative result is worth
+more than the feature was.
+
+A `gemm::quant_gemm_fused_decode1` was written so one `nd_range` could carry a
+whole wave of independent GEMMs (q/k/v = 3, gate/up = 2) instead of one `N`-wide
+launch each — the right idea for a kernel whose work-item count is exactly `N`.
+To keep one home for the arithmetic (audit #3/#12), the M=1 INT2 per-output body
+was **extracted verbatim** into a device function `decode1_out_int2_tab` called by
+both the single-GEMM and the fused kernel. A normalized statement-by-statement
+diff of the two bodies showed the arithmetic **identical**.
+
+It still broke decode, catastrophically. 27B `--tp 2`, decode M=1, identical
+command, same quiet box, no env flags set:
+
+| build | decode `kernel` |
+|---|---|
+| pre-fused (works) | 1284.3 ms |
+| with the extracted helper | **231 114 ms** (≈180×) and `id=-1` |
+
+**Bisected to the extraction, not the fusion.** Pinned `nWG` back to `kThr`:
+unchanged (231 017 ms). Removed all three `__restrict` qualifiers: unchanged
+(231 063 ms). Restored the original body **inlined** at the call site: back to
+**1284.7 ms**. So the fusion was never reached — `INTFER_FUSED_DECODE1` was unset
+and the sequential loop ran — and the damage came entirely from moving
+straight-line device code into a function the SYCL device compiler then failed to
+optimize.
+
+**The lesson, and it is the generalizable one:** *"bit-exact by construction"* was
+established by **reading the two bodies and diffing them**, and the diff said they
+were identical — and they *were* identical, and it did not matter. Structural
+argument is not measurement, and the two failure modes this repo keeps auditing
+are the *same* failure: a claim that no artifact can contradict. Here the
+artifact was a 64-token decode that had not been run.
+
+**What this says about the remaining plan.** Splitting K across work-items (the
+only other lever on the M=1 budget) touches the *same* kernel body, so it inherits
+the same risk and must not be started on a structural argument either. And any
+future fused-GEMM work here should keep the arithmetic **inline** at each call
+site — accepting two homes — unless it can be shown that the device compiler
+optimizes a shared device function in this position. A gate that pins the two
+copies against each other is the price of that.
+
+Both flags, `INTFER_FUSED_DECODE1` and `INTFER_DECODE1_WG`, are **gone**, along
+with their gate arms, their mutation matrix and their `run_all_checks.sh` wiring.
+The parallelism finding above stands: M=1 decode is EU-parallelism-bound.
 
 Both **default-OFF**, unset == byte-identical. Batch report with the counters and
 blank `RESULT:` lines: `reports/2026-10-04-batch-fused-decode.md`.

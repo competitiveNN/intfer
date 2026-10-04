@@ -56,77 +56,6 @@ inline float canon_value(int bits, int code) {
   return c2[code & 3];
 }
 
-// ---------------------------------------------------------------------------
-// ONE HOME for the M=1 INT2 per-output decode arithmetic.
-//
-// Extracted VERBATIM from gemm_usm_decode1_vec's `use_int2_tab && bits == 2`
-// branch, statement for statement, INCLUDING the tail's different expression
-// (`av * scale * canon_value(...)` rather than `av * wtab[code]`). That
-// asymmetry is pre-existing and deliberate: it is the ~1ulp oracle-gated
-// consequence of folding the group scale into a register table, since the two
-// forms associate differently -- `(av*scale)*cv` vs `av*(scale*cv)`. It is
-// preserved rather than tidied.
-//
-// BOTH the single-GEMM kernel and the fused multi-GEMM kernel call THIS, so the
-// K order, the scale table, the tail form and the byte indexing cannot land in
-// one caller and not the other. That is the audit #3 / #12 shape: a rule fixed
-// at one site and merely re-derived at another.
-//
-// Indexing note, and it is why this takes the GLOBAL code pointer plus `ng`
-// rather than a pre-offset row pointer. Byte offsets are computed on the global
-// index `(ng*K + kg)/4`, so when K is not a multiple of 4 the rows are not
-// byte-aligned and `row_base/4` is fractional; pre-offsetting the row would
-// silently change WHICH BYTES ARE READ.
-inline float decode1_out_int2_tab(
-    const std::uint8_t* __restrict code_u8,
-    const std::uint16_t* __restrict scale_usm,
-    int ng, int num_groups_w,
-    const std::uint16_t* __restrict act_usm,
-    int K, int Gw, int num_groups, float alpha) {
-  sycl::multi_ptr<const std::uint16_t,
-      sycl::access::address_space::global_space> act_mp(act_usm);
-  const std::size_t pack = 4;  // 8 codes / 4 bytes at INT2
-  const int codes_per_chunk = 8;
-  const int bits = 2;
-  const std::size_t row_base = static_cast<std::size_t>(ng) * K;
-  const std::uint16_t* sptr = scale_usm + (std::size_t)ng * num_groups_w;
-  float acc = 0.0f;
-  for (int g = 0; g < num_groups; ++g) {
-    const float scale = from_half_bits(sptr[g]) * alpha;
-    const int kg0 = g * Gw;
-    int kg1 = kg0 + Gw;
-    if (kg1 > K) kg1 = K;
-    const float wtab[4] = {
-        scale * -1.0f, scale * (-1.0f / 3.0f),
-        scale * (1.0f / 3.0f), scale * 1.0f};
-    int kg = kg0;
-    std::size_t b0 = (row_base + (std::size_t)kg) / pack;
-    for (; kg + codes_per_chunk <= kg1; kg += codes_per_chunk) {
-      sycl::vec<std::uint16_t, 8> a16;
-      a16.load(0, act_mp + kg);
-      const std::uint8_t b0v = code_u8[b0];
-      const std::uint8_t b1v = code_u8[b0 + 1];
-      b0 += 2;
-      for (int j = 0; j < codes_per_chunk; ++j) {
-        const float av =
-            static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
-        const std::uint8_t bv = (j < 4) ? b0v : b1v;
-        const int code = (bv >> ((j & 3) * 2)) & 3;
-        acc += av * wtab[code];
-      }
-    }
-    for (; kg < kg1; ++kg) {
-      const float av = from_half_bits(act_usm[kg]);
-      const std::size_t idx = row_base + (std::size_t)kg;
-      const std::uint8_t byte = code_u8[idx / pack];
-      const int within = (int)(idx % pack);
-      const int code = (byte >> (within * bits)) & 3;
-      acc += av * scale * canon_value(bits, code);
-    }
-  }
-  return acc;
-}
-
 // Tile geometry (subgroup = 16x16 work-items, each covers a 4x4 output sub-tile).
 constexpr int kBM = 64;   // output rows per work-group
 constexpr int kBN = 64;   // output cols per work-group
@@ -135,104 +64,6 @@ constexpr int kThr = 16;  // threads per tile dimension
 constexpr int kSub = 4;   // sub-tile per thread
 
 }  // namespace
-
-// ---------------------------------------------------------------------------
-// FUSED INDEPENDENT-GEMM LAUNCH, M=1 only (INTFER_FUSED_DECODE1, default OFF).
-//
-// WHY. At M=1 the single-GEMM decode kernel's total work-item count is EXACTLY N,
-// and that is invariant to the work-group shape -- so M=1 decode is
-// EU-parallelism-bound, not bandwidth-bound. Measured 2026-10-04: decode reads
-// 9.16 GiB of weights per device per token at 35.5 GiB/s (~21 % of the B580's
-// ~179 GB/s) while a work-item-per-output-tiling variant came out 2.3x SLOWER,
-// precisely because it divided the starved budget. Independent GEMMs are the one
-// BIT-EXACT way to raise that budget: q/k/v are three independent GEMMs and
-// gate/up are two, all submitted back-to-back, and each currently launches its
-// own N-wide kernel. One launch carrying 2N-3N work-items occupies 2-3x the EUs
-// for identical arithmetic.
-//
-// BIT-EXACT, and that is why this shape rather than splitting K across
-// work-items (which would coalesce the weight loads too, but reassociates the
-// FP32 sum and needs a numerics contract first). Every output element is still
-// computed by exactly ONE work-item calling the SAME decode1_out_int2_tab above,
-// so every output's K order -- ascending group, ascending kg, ascending j -- is
-// untouched. Only the launch boundary moves.
-//
-// The slot -> (set, output) mapping is a HOST-computed prefix sum in
-// `out_offset`; the device consumes it and NEVER re-derives it, because a
-// geometry rule computed on both sides is a rule that will eventually disagree
-// (audit #12) and at M=1 such a disagreement is invisible in the counters.
-
-namespace {
-// File-local capture pack, so the descriptor travels to the device by value and
-// never has to live in USM. The SET type and both entry points are declared once
-// in the header.
-struct FusedDecode1Pack {
-  FusedDecode1Set s[kFusedDecode1MaxSets];
-  int nsets;
-  int total_slots;  // HOST-computed sum of N
-};
-}  // namespace
-
-bool fused_decode1_eligible(const FusedDecode1Set* s, int n) {
-  if (!s || n < 2 || n > kFusedDecode1MaxSets) return false;
-  int expect_offset = 0;
-  for (int i = 0; i < n; ++i) {
-    if (s[i].N <= 0 || s[i].K <= 0 || s[i].group_size <= 0) return false;
-    if (!s[i].code || !s[i].scale || !s[i].act || !s[i].out) return false;
-    // One home: num_groups must be the ceil(K/group_size) the single-GEMM path
-    // derives. If a caller ever supplies a different value the fused and
-    // sequential paths would disagree, so REFUSE rather than trust it.
-    if (s[i].num_groups !=
-        (s[i].K + s[i].group_size - 1) / s[i].group_size)
-      return false;
-    // The single-GEMM path uses ONE value for both the group count and the
-    // per-row scale stride (both are ceil(K/Gw)). Refuse anything else rather
-    // than re-derive it here.
-    if (s[i].num_groups_w != s[i].num_groups) return false;
-    // The prefix sum is the device's ONLY source of the slot mapping, so a wrong
-    // one is a silently wrong answer rather than a crash. Verify it.
-    if (s[i].out_offset != expect_offset) return false;
-    expect_offset += s[i].N;
-  }
-  return true;
-}
-
-sycl::event quant_gemm_fused_decode1(sycl::queue& q,
-                                     const FusedDecode1Set* sets, int n,
-                                     int nwg_in,
-                                     const sycl::event& copy_dep) {
-  if (!fused_decode1_eligible(sets, n)) return sycl::event{};
-  FusedDecode1Pack pack;
-  pack.nsets = n;
-  pack.total_slots = 0;
-  for (int i = 0; i < n; ++i) {
-    pack.s[i] = sets[i];
-    pack.total_slots += sets[i].N;
-  }
-  const int nwg = (nwg_in > 0) ? nwg_in : 16;
-  const int nblocks = (pack.total_slots + nwg - 1) / nwg;
-  const int global = nblocks * nwg;
-  return q.submit([&](sycl::handler& h) {
-    h.depends_on(copy_dep);
-    h.parallel_for<class gemm_usm_fused_decode1>(
-        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nwg)),
-        [=](sycl::nd_item<1> it) {
-          const int slot = (int)it.get_global_id(0);
-          if (slot >= pack.total_slots) return;
-          // Slot -> set: largest i with slot >= out_offset[i]. Driven ONLY by the
-          // host prefix sum; the device never recomputes it.
-          int s = 0;
-          for (int i = 1; i < pack.nsets; ++i)
-            if (slot >= pack.s[i].out_offset) s = i;
-          const FusedDecode1Set& st = pack.s[s];
-          const int ng = slot - st.out_offset;
-          const float acc = decode1_out_int2_tab(
-              st.code, st.scale, ng, st.num_groups_w, st.act, st.K,
-              st.group_size, st.num_groups, st.alpha);
-          st.out[ng] = to_half_bits(acc);
-        });
-  });
-}
 
 // ---------------------------------------------------------------------------
 // Host FP32 reference.
@@ -505,36 +336,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
   // output for a single row. A flat 1D kernel with one output element per
   // work-item is far more efficient for decode.
   if (M == 1) {
-    // INTFER_DECODE1_WG: work-group size for the M=1 decode kernels ONLY.
-    // Default 16 == the historical kThr, so unset is byte-identical behaviour.
-    //
-    // This is a PURE work-group SHAPE change: each output element is still
-    // computed by exactly one work-item running the same K loop in the same
-    // order, so it is BIT-EXACT BY CONSTRUCTION. kThr itself is deliberately
-    // NOT touched, because it also sets the M>1 tiled kernels' 2D geometry and
-    // prefill is a separate concern with its own measurements.
-    //
-    // REASONING, and the ceiling this has (stated so it is not oversold). The
-    // TOTAL work-item count is ceil(N/nWG)*nWG ~= N and is therefore
-    // essentially INVARIANT to nWG -- at N=2048 that is 2048 items whether nWG
-    // is 8, 16 or 32. So this knob cannot fix the real M=1 problem, which is
-    // ~4 threads/EU over 512 Xe cores (that needs more work-ITEMS, i.e. fusing
-    // independent GEMMs, or splitting K, which reassociates). What it CAN do is
-    // second-order lane utilisation: kThr=16 may under-fill a 32-wide SIMD, and
-    // the number of work-GROUPS (hence EUs the scheduler can spread across)
-    // does move: 256 groups at nWG=8, 128 at 16, 64 at 32. Expect at best a
-    // lane-utilisation effect, NOT a bandwidth or occupancy fix. Clamped to
-    // [1, 256] and forced to a power of two so the nd_range is well formed.
-    int nwg_req = kThr;
-    if (const char* e = std::getenv("INTFER_DECODE1_WG")) {
-      int v = std::atoi(e);
-      if (v >= 1 && v <= 256) {
-        int p = 1;
-        while (p * 2 <= v) p *= 2;
-        nwg_req = p;
-      }
-    }
-    const int nWG = nwg_req;
+    constexpr int nWG = kThr;
     const int nBlocks = (N + nWG - 1) / nWG;
     const int global = nBlocks * nWG;
 
@@ -797,15 +599,37 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                   // (load-immune) -12.8%, streams identical TP1/TP2,
                   // cpu parity + http batch + gpu-optin 10/10 PASS.
                   if (use_int2_tab && bits == 2) {
-                    // Delegated to the ONE home (decode1_out_int2_tab) so this
-                    // path and the fused multi-GEMM kernel cannot diverge in K
-                    // order, scale table, tail expression or byte indexing.
-                    // Verbatim extraction; see the note at its definition for
-                    // the two distinct scale-application forms.
-                    acc += decode1_out_int2_tab(code_u8, scale_usm, ng,
-                                                num_groups_w, act_usm, (int)K,
-                                                Gw, num_groups, alpha);
-                    (void)scale; (void)row_base; (void)kg0; (void)kg1;
+                    const float wtab[4] = {
+                        scale * -1.0f, scale * (-1.0f / 3.0f),
+                        scale * (1.0f / 3.0f), scale * 1.0f};
+                    int kg = kg0;
+                    std::size_t b0 =
+                        (row_base + (std::size_t)kg) / (std::size_t)pack;
+                    for (; kg + codes_per_chunk <= kg1;
+                         kg += codes_per_chunk) {
+                      sycl::vec<std::uint16_t, 8> a16;
+                      a16.load(0, act_mp + kg);
+                      const std::uint8_t b0v = code_u8[b0];
+                      const std::uint8_t b1v = code_u8[b0 + 1];
+                      b0 += 2;
+                      for (int j = 0; j < codes_per_chunk; ++j) {
+                        const float av = static_cast<float>(
+                            sycl::bit_cast<sycl::half>(a16[j]));
+                        const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                        const int code =
+                            (bv >> ((j & 3) * 2)) & 3;
+                        acc += av * wtab[code];
+                      }
+                    }
+                    for (; kg < kg1; ++kg) {
+                      const float av = from_half_bits(act_usm[kg]);
+                      const std::size_t idx = row_base + kg;
+                      const std::uint8_t byte = code_u8[idx / pack];
+                      const int within = (int)(idx % pack);
+                      const int code =
+                          (byte >> (within * bits)) & ((1 << bits) - 1);
+                      acc += av * scale * canon_value(bits, code);
+                    }
                   } else {
                   int kg = kg0;
                   std::size_t b0 =

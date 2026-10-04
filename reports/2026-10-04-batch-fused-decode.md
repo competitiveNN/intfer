@@ -1,36 +1,26 @@
 # Batch: fused multi-GEMM decode launch + decode1 work-group knob
 
-Date: 2026-10-04. Target: **27B `--tp 2`** prefill and inference.
-Scope: two default-OFF experiments that attack the measured M=1 decode
-bottleneck. Both are designed to be bit-exact — that is the whole design
-constraint, and it is why the alternative (splitting K) was rejected.
+> ## ==> REVERTED. THIS BATCH BROKE 27B DECODE AND HAS BEEN ROLLED BACK. <==
+>
+> Both experiments were implemented, then **measured to break 27B `--tp 2`
+> decode** (decode `kernel` 1284 ms → 231 114 ms, output `id=-1`), and the code,
+> the gate arms, the mutation matrix and the `run_all_checks.sh` wiring have all
+> been removed. `src/gemm/quant_gemm.cpp` and `src/engine/engine.cpp` are restored
+> to the last known-good state.
+>
+> **The finding that matters is kept** — M=1 decode is EU-parallelism-bound, and
+> a bit-exact multi-GEMM fusion is the right *direction*. What is wrong is the
+> *shape*: sharing the M=1 INT2 per-output arithmetic through a device function
+> breaks it, with identical arithmetic, and no flag was set.
+>
+> Full account, including the bisect and the generalizable lesson, is in
+> `AGENTS.md` under "REVERTED 2026-10-04: FUSED MULTI-GEMM DECODE". Read that
+> before re-attempting. **Do not start splitting K across work-items on a
+> structural argument** — it touches the same kernel body.
+>
+> Every `RESULT:` line below stays blank, permanently. There is nothing to fill:
+> the arms no longer exist.
 
-> ## ==> THIS BATCH IS **UNCERTIFIED**. DO NOT TRUST EITHER FLAG YET. <==
->
-> **"Bit-exact by construction" is a claim about the CODE, not a measurement.**
-> Nothing in it has been executed against the model. Specifically these have
-> **not** run:
->
-> * the **four mutation states** in `scripts/mutate_fused_decode.sh` (G-A..G-D);
-> * the **stream-identity arms** in `scripts/test_gpu_optin.sh` at TP=1 and TP=2.
->
-> Those are the certification. Until they run, the honest statement is *"the
-> argument for bit-exactness is structural and has been code-reviewed; the
-> empirical check has not been performed"* — **not** *"these are bit-exact"*.
->
-> **What HAS been verified, without the model:** three translation units compile
-> clean; `bash -n` clean on the three edited scripts; the mutation anchors are
-> located, and the anchor pre-flight provably refuses a drifted (0) and an
-> ambiguous (2) anchor in both directions; and the coverage sections confirm the
-> matrix is both dispatched and scheduled. Those are *harness* facts — they say
-> the checks are wired and can fail. They say nothing about the arithmetic.
->
-> **A model run is required before either flag is trustworthy**, and it is
-> deliberately NOT performed here: this round runs no model and no benchmark, per
-> the standing instruction. Every `RESULT:` line below is therefore blank and
-> must stay blank until you fill it.
-
-Read `AGENTS.md`'s PARAMOUNT DIRECTIVE first: wall-time benchmarking is retired,
 so **decide on the load-insensitive counters**.
 
 ---

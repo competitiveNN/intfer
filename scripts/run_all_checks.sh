@@ -366,16 +366,6 @@ dispatch() { # $1 = label -> runs it
       # the rule: a FIXED-name refusal owes no lock, so demanding one there would
       # force a pointless lock onto every idempotent re-run.
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_guard_identity.sh"; return $? ;;
-    mutate_fused_decode.sh)
-      # Artifact states for the fused multi-GEMM decode launch (INTFER_FUSED_DECODE1).
-      # The kernel is correct by construction once written, so weakening the CHECKER
-      # would be unobservable (audit #21). Each state damages the shared per-output
-      # routine, the slot prefix sum, the eligibility check, or the M!=1 decline, and
-      # requires the engine's stream-identity check to REJECT it. G-E is the CONVERSE
-      # and runs FIRST: healthy streams AND the fused path proven REACHABLE by
-      # launch-counter movement, because a kernel that always declines would satisfy
-      # every other state without ever running.
-      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_fused_decode.sh"; return $? ;;
     mutate_stack_cert.sh)
       # AUDIT #29. Breaks the census DERIVATION and the dirty-tree test, both of
       # which the self-check cannot see because every fixture derives its census
@@ -639,7 +629,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_fused_decode.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
