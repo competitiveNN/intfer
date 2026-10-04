@@ -2,12 +2,36 @@
 
 Date: 2026-10-04. Target: **27B `--tp 2`** prefill and inference.
 Scope: two default-OFF experiments that attack the measured M=1 decode
-bottleneck. **Both are bit-exact by construction** — that is the whole design
+bottleneck. Both are designed to be bit-exact — that is the whole design
 constraint, and it is why the alternative (splitting K) was rejected.
 
+> ## ==> THIS BATCH IS **UNCERTIFIED**. DO NOT TRUST EITHER FLAG YET. <==
+>
+> **"Bit-exact by construction" is a claim about the CODE, not a measurement.**
+> Nothing in it has been executed against the model. Specifically these have
+> **not** run:
+>
+> * the **four mutation states** in `scripts/mutate_fused_decode.sh` (G-A..G-D);
+> * the **stream-identity arms** in `scripts/test_gpu_optin.sh` at TP=1 and TP=2.
+>
+> Those are the certification. Until they run, the honest statement is *"the
+> argument for bit-exactness is structural and has been code-reviewed; the
+> empirical check has not been performed"* — **not** *"these are bit-exact"*.
+>
+> **What HAS been verified, without the model:** three translation units compile
+> clean; `bash -n` clean on the three edited scripts; the mutation anchors are
+> located, and the anchor pre-flight provably refuses a drifted (0) and an
+> ambiguous (2) anchor in both directions; and the coverage sections confirm the
+> matrix is both dispatched and scheduled. Those are *harness* facts — they say
+> the checks are wired and can fail. They say nothing about the arithmetic.
+>
+> **A model run is required before either flag is trustworthy**, and it is
+> deliberately NOT performed here: this round runs no model and no benchmark, per
+> the standing instruction. Every `RESULT:` line below is therefore blank and
+> must stay blank until you fill it.
+
 Read `AGENTS.md`'s PARAMOUNT DIRECTIVE first: wall-time benchmarking is retired,
-so **decide on the load-insensitive counters**. Every `RESULT:` line below is
-blank and is yours to fill, or to leave blank.
+so **decide on the load-insensitive counters**.
 
 ---
 
@@ -247,10 +271,20 @@ stale the moment a script is added.
 stream-identity arms themselves. Those are the certification of bit-exactness and
 they have not been executed. `RESULT:` lines stay blank until they are.
 
-**Commits for this batch**, each bisectable: `40219bf` (the measured negative
-result that motivates it) -> `0961035` (the two flags) -> `db0ce37` (gating) ->
-`030e0a6` (this report) -> `62694ea` (the pre-flight verdict fix) -> `af1d43b`
-(provenance reconciliation).
+**Commits for this batch are DERIVED, not transcribed here.** Listing the shas
+in prose was the previous version of this paragraph and it was wrong for the same
+reason the old census was wrong: a hand-maintained list in a document is a copy
+that goes stale, and a reader has no way to check it without re-deriving it anyway.
+Derive it instead -- the range starts at the commit that records the measured
+negative result which motivated the batch:
+
+```bash
+git log --oneline 40219bf^..HEAD
+```
+
+This paragraph closed at `af1d43b`; the commit that rewrote it is itself part of
+that range, which is why no sha list here can be complete. Re-run the command
+rather than trusting the sentence.
 
 ---
 
