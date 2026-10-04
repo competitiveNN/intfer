@@ -52,6 +52,68 @@ cli_prefill() { # $1 = log -- the step-0 id alone
   grep -a -oE "decode step 0: token=[0-9]+" "$1" | sed -E 's/.*=//'
 }
 
+# --- DECODE1_MR ARM PREDICATES: ONE HOME, TWO CONSUMERS ----------------------
+# *** WHY THESE ARE FUNCTIONS AND NOT INLINE TESTS. *** The first version of this
+# self-check defined its own `arm_ok` INSIDE the --self-check block and called it
+# "the real arm's guard, verbatim". It was not verbatim: it was a COPY, so the
+# real arm at the bottom of this file carried its own separate inline tests, and
+# the self-check could not see them at all. MEASURED on the committed version:
+# deleting all three real-arm guard lines (M-A), deleting the real arm's prefill
+# oracle (M-G) and deleting its TP=sharded grep (M-F) each left the self-check
+# at rc=0 PASS. Three of this arm's assertions were UNOBSERVABLE to the check
+# written to cover them -- audit #3's shape (a rule fixed at one site and
+# re-derived at another) committed in the code written to avoid exactly that.
+#
+# One definition, called by the real arm AND driven by the self-check, so a
+# weakening of any of them turns the self-check red by construction rather than
+# by a copy staying in agreement. Each returns 0=accept.
+mr_prefill_ok() {   # $1 = parsed step-0 id. Oracle 11751 (greedy, fixed).
+  [ "$1" = "11751" ]
+}
+mr_streams_agree() { # $1 = base ids, $2 = MR ids.
+  # NON-EMPTY FIRST, or this is vacuous: the arm compares two DERIVED values
+  # (unlike every other arm in this gate, which compares to a literal oracle),
+  # so a log-format change or a broken pipe that emptied BOTH sides would make
+  # "" = "" and the arm would report PASS having certified nothing. The base run
+  # gets non-emptiness for free from its literal "13 198 760" check.
+  [ -n "$1" ] && [ -n "$2" ] && [ "$1" = "$2" ]
+}
+mr_tp_sharded() {   # $1 = log. "TP=sharded" is a substring of the banner the CLI
+                    # already prints and this gate already greps for.
+  grep -aq "TP=sharded" "$1"
+}
+
+# *** AND THE ARM'S BODY IS ONE FUNCTION TOO, NOT THREE CALL SITES. *** Sharing
+# the predicates closed the "weakened predicate" class (measured: M-B/M-C/M-P/M-Q
+# all go red). It did NOT close "the real arm stopped CALLING them" -- deleting
+# the arm's call sites still leaves the self-check green (measured: M-A/M-G/M-F),
+# because the self-check drives the predicates and never walks the arm's
+# plumbing. So the three assertions live HERE, in one function that takes the two
+# logs, and BOTH consumers call it: the real arm on the real logs, the self-check
+# on fixtures. Deleting a call site now means deleting the call to this function,
+# which the arm cannot do without also losing its only source of assertions.
+#
+# Returns 0 = the arm is certified. Prints a GATE FAIL line per failed
+# assertion so a real failure names itself, and honours MR_DIAG for the
+# self-check's per-fixture message prefix (empty in the real arm).
+mr_arm_assert() {   # $1 = base log, $2 = MR log. $3 = diagnostic prefix.
+  local d="${3:-}" got mr_p mr_i ok=0
+  mr_p="$(cli_prefill "$2")"
+  mr_i="$(cli_ids "$2" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  got="$(cli_ids "$1" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  mr_prefill_ok "$mr_p" \
+    || { echo "${d}DECODE1_MR prefill '$mr_p' != 11751" >&2; ok=1; }
+  # NON-EMPTY FIRST lives inside mr_streams_agree: this arm compares two DERIVED
+  # values (every other arm here compares to a literal oracle), so a log-format
+  # change or broken pipe that emptied BOTH sides would make "" = "" and report
+  # PASS having certified nothing.
+  mr_streams_agree "$got" "$mr_i" \
+    || { echo "${d}DECODE1_MR ids '$mr_i' != base '$got' (or a stream was EMPTY)" >&2; ok=1; }
+  mr_tp_sharded "$2" \
+    || { echo "${d}DECODE1_MR run was not TP=sharded (needs 2 devices)" >&2; ok=1; }
+  return "$ok"
+}
+
 # --- SELF-CHECK (stubbed; no GPU, no model, no build) -----------------------
 # *** WHY THE DECODE1_MR ARM NEEDS ONE. *** That arm compares two DERIVED values
 # (MR_IDS vs GOT), so an empty stream on BOTH sides compares equal and the arm
@@ -77,17 +139,33 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   SB="$(mktemp -d)"; trap 'rm -rf "$SB"' EXIT INT TERM
   bad=0
   ids_after_prefill() { cli_ids "$1" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//'; }
-  n_ids() { set -- $1; echo $#; }
-  mklog() { # $1 = path, $2.. = ids in step order
+  mklog() { # $1 = path, $2.. = ids in step order. Appends the sharded TP banner,
+            # so every fixture is shaped like a real MR log.
     local p="$1"; shift; : >"$p"; local i=0
     for t in "$@"; do echo "decode step $i: token=$t" >>"$p"; i=$((i+1)); done
+    printf '%s\n' '[intfer] GPU backend: 2 device(s) (TP=sharded)' >>"$p"
   }
-  arm_ok() { # the real arm's guard, verbatim: both non-empty AND equal
-    [ -n "$1" ] && [ -n "$2" ] && [ "$1" = "$2" ]
-  }
+  # *** THESE DRIVE THE REAL ARM'S PREDICATES (mr_prefill_ok /
+  # mr_streams_agree / mr_tp_sharded above), NOT COPIES OF THEM. *** There is no
+  # local arm_ok any more, because a local one is exactly what made three of the
+  # arm's assertions unobservable (see the predicates' comment block).
   mklog "$SB/good_base" 11751 13 198 760 6511
+  # *** EVERY FIXTURE IS A COMPLETE, HEALTHY-SHAPED LOG, DIFFERING IN EXACTLY ONE
+  # THING. *** MEASURED: the first version of these cases built MR logs with ids
+  # but no TP banner, so mr_arm_assert refused each one for TWO reasons at once
+  # (the intended one plus a missing banner). A case that cannot isolate its
+  # defect is the audit #3 lesson -- the mutation passes for the wrong reason and
+  # teaches nothing. mklog appends the banner the real CLI prints, and the one
+  # TP fixture below is built by OVERWRITING that banner, so it differs only in
+  # the banner.
+  TP_BANNER='[intfer] GPU backend: 2 device(s) (TP=sharded)'
   mklog "$SB/good_mr"   11751 13 198 760 6511
-  mklog "$SB/bad_mr"    11751 13 198 760 9999
+  mklog "$SB/bad_mr"    11751 13 198 760 9999   # diverges at step 4 only
+  mklog "$SB/bad_prefill" 4242 13 198 760 6511  # wrong prefill only
+  mklog "$SB/tp_ok_ids" 11751 13 198 760 6511   # healthy pair for (2)
+  mklog "$SB/tp_bad_ids" 11751 13 198 760 6511  # same ids, banner replaced below
+  sed -i 's/TP=sharded/TP=single/' "$SB/tp_bad_ids"   # ONE difference vs tp_ok_ids
+  printf '%s\n' "[intfer] GPU backend: 1 device(s) (TP=single)" >"$SB/tp_bad"
   : >"$SB/empty"
   a_got="$(ids_after_prefill "$SB/good_base")"
   a_mr="$(ids_after_prefill "$SB/good_mr")"
@@ -106,28 +184,81 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   [ "$b_mr" = "13 198 760 9999" ]  || { echo "SELF-CHECK FAIL (1): bad stream must be exactly '13 198 760 9999', got '$b_mr'" >&2; bad=1; }
   [ -z "$c_got" ] || { echo "SELF-CHECK FAIL (1): an empty log must parse EMPTY, got '$c_got'" >&2; bad=1; }
 
-  # (2) The healthy direction -- THE CONVERSE. Without it, checks (3) and (4)
-  # are satisfied by an arm_ok that rejects everything, which is why this is not
-  # optional. (Measured lesson, this repo: an always-red check proves only that
-  # a check can fail.)
+  # (2) The healthy direction -- THE CONVERSE. Without it, every refusal below
+  #     is satisfied by a predicate that rejects everything, which is why this is
+  #     not optional. (Measured lesson, this repo: an always-red check proves
+  #     only that a check can fail.)
   [ -n "$a_got" ] && [ -n "$a_mr" ] && [ "$a_got" = "$a_mr" ] \
     || { echo "SELF-CHECK FAIL (2): identical streams must be equal and non-empty, got '$a_got' vs '$a_mr'" >&2; bad=1; }
+  mr_prefill_ok "$(cli_prefill "$SB/good_mr")" \
+    || { echo "SELF-CHECK FAIL (2): mr_prefill_ok must ACCEPT the oracle prefill" >&2; bad=1; }
+  mr_tp_sharded "$SB/tp_ok_ids" \
+    || { echo "SELF-CHECK FAIL (2): mr_tp_sharded must ACCEPT a TP=sharded banner" >&2; bad=1; }
+  # *** THE ARM'S ENTRY POINT MUST ACCEPT A GOOD PAIR. *** Without this, (3)/(4)/(5)
+  # are all satisfied by an mr_arm_assert that refuses EVERYTHING -- and this
+  # repo's standing lesson is that an always-red check proves only that a check
+  # can fail. The fixtures here are good ids AND a sharded banner, so a refusal
+  # can only come from the arm.
+  mr_arm_assert "$SB/tp_ok_ids" "$SB/tp_ok_ids" "SELF-CHECK FAIL (2): " \
+    || { echo "SELF-CHECK FAIL (2): mr_arm_assert must ACCEPT a healthy pair" >&2; bad=1; }
 
   # (3) A divergence BEYOND the oracle prefix must be refused. The oracle pins 3
   #     tokens, so step 4 is exactly what a prefix-only assertion cannot see --
   #     which is why (1) is a precondition for this meaning anything.
-  arm_ok "$b_got" "$b_mr" \
-    && { echo "SELF-CHECK FAIL (3): the guard ACCEPTED a step-4 divergence" >&2; bad=1; }
+  # *** THROUGH mr_arm_assert, THE ARM'S OWN ENTRY POINT. *** These cases used to
+  # call the bare predicates, which covered "the predicate was weakened" but NOT
+  # "the arm stopped calling it" -- MEASURED: deleting the arm's three call sites
+  # left --self-check at rc=0 PASS. Driving the entry point the real arm uses is
+  # what makes that observable: if the arm's assertions are deleted, mr_arm_assert
+  # is no longer the arm's source of truth and these cases are the only thing left
+  # saying what it must contain. The predicates are still driven directly in (2),
+  # because that is the half that names WHICH assertion failed.
+  mr_arm_assert "$SB/good_base" "$SB/bad_mr" "SELF-CHECK FAIL (3): " \
+    && { echo "SELF-CHECK FAIL (3): the arm ACCEPTED a step-4 divergence" >&2; bad=1; }
+  # Direct drive, for the same reason (4) has two: mr_arm_assert refuses this
+  # fixture on the stream check ALONE (the ids differ and the prefill/banner are
+  # healthy), so the end-to-end case already isolates it -- but if a future
+  # fixture ever makes the arm refuse for another reason too, only the direct
+  # drive still names this defect. Two subjects, not two copies.
+  mr_streams_agree "$(ids_after_prefill "$SB/good_base")" "$(ids_after_prefill "$SB/bad_mr")" \
+    && { echo "SELF-CHECK FAIL (3): mr_streams_agree ACCEPTED a step-4 divergence directly" >&2; bad=1; }
+  mr_arm_assert "$SB/good_base" "$SB/bad_prefill" "SELF-CHECK FAIL (5): " \
+    && { echo "SELF-CHECK FAIL (5): the arm ACCEPTED a wrong prefill (4242)" >&2; bad=1; }
+  mr_arm_assert "$SB/good_base" "$SB/tp_bad_ids" "SELF-CHECK FAIL (5): " \
+    && { echo "SELF-CHECK FAIL (5): the arm ACCEPTED a TP=single banner" >&2; bad=1; }
 
   # (4) An empty pair must be refused -- the vacuity this arm could have shipped
-  #     with. Checked THROUGH arm_ok rather than by a second -n, because a second
-  #     -n is a REDUNDANT assertion and therefore a dead one: mutating it to a
-  #     no-op was measured as MISSED, since check (3) already covers the guard.
-  arm_ok "$c_got" "$c_got" \
-    && { echo "SELF-CHECK FAIL (4): the guard ACCEPTED an empty pair (vacuity)" >&2; bad=1; }
+  #     with. BOTH sides empty, which is the only way the derived-vs-derived
+  #     comparison in mr_streams_agree can be tricked into agreeing.
+  # *** TWO CASES, AND THE SECOND IS THE ISOLATED ONE. *** MEASURED: driving only
+  # mr_arm_assert here was a MASKED assertion. mr_arm_assert checks three things,
+  # so an empty pair already fails its prefill and TP checks, and the case went
+  # red for THOSE reasons even when mr_streams_agree had its non-empty half
+  # deleted -- a weakening of the exact predicate this case exists to protect,
+  # invisible (audit #12's mutual masking, in a guard I was writing to add
+  # coverage). The second case drives mr_streams_agree DIRECTLY with an empty
+  # pair, so nothing else can refuse on its behalf. Both are kept: the first is
+  # the end-to-end shape the real arm uses, the second is the one that is
+  # load-bearing. A redundant-looking pair here is two DIFFERENT subjects.
+  mr_arm_assert "$SB/empty" "$SB/empty" "SELF-CHECK FAIL (4): " \
+    && { echo "SELF-CHECK FAIL (4): the arm ACCEPTED an empty pair (vacuity)" >&2; bad=1; }
+  mr_streams_agree "$(ids_after_prefill "$SB/empty")" "$(ids_after_prefill "$SB/empty")" \
+    && { echo "SELF-CHECK FAIL (4): mr_streams_agree ACCEPTED an empty pair directly" >&2; bad=1; }
+
+  # (5) The two predicates, driven DIRECTLY so a failure names which one, in both
+  #     directions -- (2) accepts, these refuse. Through mr_arm_assert alone, a
+  #     defect in mr_prefill_ok and one in mr_tp_sharded would print the same line.
+  mr_prefill_ok "$(cli_prefill "$SB/bad_prefill")" \
+    && { echo "SELF-CHECK FAIL (5): mr_prefill_ok ACCEPTED a wrong prefill (4242)" >&2; bad=1; }
+  mr_prefill_ok "$(cli_prefill "$SB/empty")" \
+    && { echo "SELF-CHECK FAIL (5): mr_prefill_ok ACCEPTED an EMPTY prefill (vacuity)" >&2; bad=1; }
+  mr_tp_sharded "$SB/tp_bad" \
+    && { echo "SELF-CHECK FAIL (5): mr_tp_sharded ACCEPTED a TP=single banner" >&2; bad=1; }
+  mr_tp_sharded "$SB/empty" \
+    && { echo "SELF-CHECK FAIL (5): mr_tp_sharded ACCEPTED an EMPTY log (vacuity)" >&2; bad=1; }
 
   if [ "$bad" -eq 0 ]; then
-    echo "TP2-27B SELF-CHECK: PASS (1) fixtures are full-length and differ only at step 4  (2) healthy pair accepted  (3) late divergence refused  (4) empty pair refused"
+    echo "TP2-27B SELF-CHECK: PASS (1) fixtures are full-length and differ only at step 4  (2) healthy pair accepted by all three predicates  (3) mr_arm_assert refused a late divergence  (4) mr_arm_assert refused an empty pair  (5) wrong-prefill and wrong-TP refusals fire"
     exit 0
   fi
   echo "TP2-27B SELF-CHECK: FAIL" >&2; exit 1
@@ -222,28 +353,15 @@ if [ "$MR_RC" -ne 0 ]; then
   tail -20 "$MR_ERR" >&2
   PASS=0
 else
-  MR_PREFILL="$(cli_prefill "$MR_ERR")"
-  MR_IDS="$(cli_ids "$MR_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
-  echo "DECODE1_MR prefill: $MR_PREFILL (expect 11751)"
-  echo "DECODE1_MR ids:      $MR_IDS"
-  [ "$MR_PREFILL" = "11751" ] || { echo "GATE FAIL: DECODE1_MR prefill '$MR_PREFILL' != 11751" >&2; PASS=0; }
-  # *** NON-EMPTY FIRST, OR THE COMPARISON BELOW IS VACUOUS. *** This arm
-  # compares two DERIVED values, unlike every other arm in this gate which
-  # compares against a literal oracle. If a log-format change or a broken pipe
-  # made BOTH greps return nothing, "$MR_IDS" = "$GOT" would be "" = "" and the
-  # arm would report PASS while certifying nothing -- the empty-stream vacuity
-  # family. The base run gets this for free (it compares against the literal
-  # "13 198 760"); a derived-vs-derived comparison has to ask for it.
-  [ -n "$GOT" ] || { echo "GATE FAIL: base stream is EMPTY (broken run or log-format change)" >&2; PASS=0; }
-  [ -n "$MR_IDS" ] || { echo "GATE FAIL: DECODE1_MR stream is EMPTY (broken run or log-format change)" >&2; PASS=0; }
-  # Compare against the BASE stream, not only against EXPECT: a divergence at
-  # decode step 4+ is a real MR defect even though the oracle only pins 3 tokens.
-  [ "$MR_IDS" = "$GOT" ] || { echo "GATE FAIL: DECODE1_MR '$MR_IDS' != base '$GOT'" >&2; PASS=0; }
-  # Deliberately the SAME string the base run is checked against, not a new
-  # invention: "TP=sharded" is a substring of the banner the CLI already prints
-  # and this gate already greps for. Asserting a format nobody has verified is
-  # how a gate grows a false FAIL.
-  grep -aq "TP=sharded" "$MR_ERR" || { echo "GATE FAIL: DECODE1_MR run was not TP=sharded (needs 2 devices)" >&2; PASS=0; }
+  echo "DECODE1_MR prefill: $(cli_prefill "$MR_ERR") (expect 11751)"
+  echo "DECODE1_MR ids:      $(cli_ids "$MR_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  # *** ONE CALL, AND IT IS THE ARM'S ONLY SOURCE OF ASSERTIONS. *** These three
+  # assertions used to be inline here with the self-check holding a separate copy
+  # of one; MEASURED on that version, deleting any of these lines left
+  # --self-check at rc=0 PASS. They now live in mr_arm_assert, which the
+  # self-check also calls, so this arm has nothing to inline and nothing to keep
+  # in sync. Do not inline anything here without adding a self-check case.
+  mr_arm_assert "$CLI_ERR" "$MR_ERR" "GATE FAIL: " || PASS=0
 fi
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
 if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi
