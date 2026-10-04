@@ -322,18 +322,37 @@ inv_devices="$(printf '%s\n' "$INV_TABLE" | awk '$NF=="via-count" || $NF=="rende
 # table at all, for any of its own reasons -- and its empty result is then read as
 # "the other side disagrees". So a table that did not arrive is refused in its own
 # terms, and says so, instead of being compared.
+# *** A FLAG, NOT A JUMP -- and the first version of this guard was a no-op. ***
+# It called an undefined `continue_gate`. That is neither a syntax error nor a
+# crash: `bash -n` stayed green, bash printed "command not found" on stderr, and
+# control fell STRAIGHT THROUGH -- so the comparison ran anyway and printed the
+# exact message these lines exist to prevent, "classification drift" with an EMPTY
+# gate_inventory side. MEASURED in a sandbox whose gate_inventory.sh exits early:
+#   line 330: continue_gate: command not found
+#   line 336: continue_gate: command not found
+#   FAIL  classification drift: this harness and gate_inventory.sh disagree
+#   FAIL    gate_inventory:                      <-- empty
+# A guard that records a failure and then does the forbidden thing anyway is the
+# audit-#12 shape, and a verdict printed beside a shell error is the
+# self-contradicting report that shape produces.
+#
+# Deliberately NOT `exit`: the matrix, the healthy column and the stamp below are
+# all derived from THIS HARNESS's own gate list and are unaffected by
+# gate_inventory, so bailing out would trade one misleading line for a large loss
+# of evidence that would still have been valid. Refuse the COMPARISON; keep the rest.
+XCHK_REFUSED=0
 case "$INV_TABLE" in
   *"RENDER-NODE"*) : ;;
   *) bad "gate_inventory.sh returned NO TABLE to cross-check (its own preconditions or"
      bad "  an early exit). That is not classification drift, so do not debug the gates:"
      bad "  there is nothing to compare against. Re-run gate_inventory.sh on its own."
-     continue_gate ;;
+     XCHK_REFUSED=1 ;;
 esac
-if [ -z "$inv_devices" ]; then
+if [ "$XCHK_REFUSED" = 0 ] && [ -z "$inv_devices" ]; then
   bad "gate_inventory.sh's table arrived but classifies NO gate as needing a device,"
   bad "  while this harness classifies at least one. One of the two derivations is"
   bad "  empty, and an empty harvest is not a disagreement (audit #20)."
-  continue_gate
+  XCHK_REFUSED=1
 fi
 own_devices=""
 for f in scripts/test_*.sh; do
@@ -355,7 +374,13 @@ for f in scripts/test_*.sh; do
 done
 own_devices="$(printf '%s\n' $own_devices | sort | tr '\n' ' ')"
 inv_devices="$(printf '%s\n' $inv_devices | sort | tr '\n' ' ')"
-if [ "$own_devices" != "$inv_devices" ]; then
+if [ "$XCHK_REFUSED" = 1 ]; then
+  # Stated, not silent: an assertion that did not run must never read as one that
+  # passed, and it must not borrow the neighbouring verdict's wording either.
+  note "  cross-check NOT PERFORMED (see the FAIL above) -- the agreement between"
+  note "  two derivations is UNPROVEN, not confirmed and not refuted. The matrix"
+  note "  below is derived from this harness's own list, so it still ran."
+elif [ "$own_devices" != "$inv_devices" ]; then
   bad "classification drift: this harness and gate_inventory.sh disagree"
   bad "  this harness: $own_devices"
   bad "  gate_inventory: $inv_devices"

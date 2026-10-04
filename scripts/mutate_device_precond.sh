@@ -48,6 +48,20 @@
 #        -- reject the CORRECT cause, by rewording only the synthetic gate's
 #        message. The always-red detection must fire, or a harness that
 #        rejects everything would look like a passing non-vacuity proof.
+#   M-G  gate_inventory.sh returns NO TABLE (an early exit of its own)
+#   M-H  gate_inventory.sh's table arrives but classifies NO device gate
+#        The cross-check compares two INDEPENDENT derivations that must agree, so
+#        "the other side produced nothing" is not "the other side disagrees" -- and
+#        reporting it as drift sends the next reader to reconcile two lists when
+#        there is nothing to reconcile. These two guards shipped INERT: they called
+#        an undefined `continue_gate`, which is not a syntax error and not a crash.
+#        `bash -n` stayed green, bash printed "command not found", control fell
+#        through, and the log carried the refusal AND the misleading
+#        "classification drift" line. So these states assert the ABSENCE of that
+#        line as well as the presence of the refusal -- an exit code cannot tell
+#        "refused correctly" from "refused and then did the forbidden thing".
+#        They are ARTIFACT states (audit #21): each stub is a legitimately
+#        reachable gate_inventory output, so the checker must reject all of them.
 #
 # WHY THE HEALTHY COLUMN IS DISABLED HERE. Every state sets
 # INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1. M-A/M-C break the GUARDS, so on a
@@ -78,6 +92,13 @@ LOCK="$LOG_DIR/.mutate.lock"
 export INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1
 mkdir -p "$LOG_DIR" || exit 1
 
+# Sourced at TOP LEVEL, never inside a conditional: a guard sourced only on an
+# error path is a guard that is usually absent, and its call site then dies with
+# "command not found" on the NORMAL path (recorded in AGENTS.md, and it is the
+# same shape as the defect this matrix now covers).
+# shellcheck source=scripts/_gate_pred.sh
+. "$SCRIPT_DIR/_gate_pred.sh"
+
 # --- lock --------------------------------------------------------------------
 if ! mkdir "$LOCK" 2>/dev/null; then
   echo "FAIL: another mutate_device_precond.sh is running (or died holding $LOCK)." >&2
@@ -95,6 +116,7 @@ TGT_C="scripts/test_http_batch.sh"
 TGT_B="scripts/fixtures/no-render-node/python3"
 TGT_H="scripts/check_device_precond.sh"
 TGT_P="scripts/_gate_precond.sh"
+TGT_G="scripts/gate_inventory.sh"
 DIRTY="$TGT_A $TGT_C $TGT_B $TGT_H $TGT_P"
 if ! git diff --quiet -- $DIRTY || ! git diff --cached --quiet -- $DIRTY; then
   echo "FAIL: uncommitted changes in: $DIRTY" >&2
@@ -140,7 +162,15 @@ check_anchor "$TGT_B" "$A_EXEC"  "M-B: the fixture whose execute bit is cleared"
 check_anchor "$TGT_H" "$A_TOKENS" "M-D: the GPU-token regex this checker derives its list from"
 check_anchor "$TGT_P" "$A_NOTAVAIL" "M-E: the unmeasurable branch of the count helper"
 check_anchor "$TGT_H" "$A_CASEC" "M-F: self-check case (c)'s synthetic correct-cause gate"
-echo "anchor pre-flight: ok (6/6 targets located exactly once)"
+# M-G / M-H REPLACE gate_inventory.sh wholesale with a stub, so there is no
+# literal anchor for patch_literal to drift against. What CAN go stale is the
+# COUPLING: the checker's refusal guards look for the string "RENDER-NODE" in
+# gate_inventory's output, so a rename of that column header would make the guards
+# fire forever on a healthy tree -- a checker that cries wolf. So the pre-flight
+# asserts the header the checker greps for is still emitted, exactly once.
+[ -f "$TGT_G" ] || { echo "FAIL: $TGT_G is gone; M-G/M-H cannot stub it." >&2; exit 1; }
+check_anchor "$TGT_G" '1-GPU-ARM RENDER-NODE' "M-G/M-H: the column header the cross-check greps for"
+echo "anchor pre-flight: ok (7/7 targets located exactly once)"
 
 CAUGHT=0
 TOTAL=0
@@ -194,8 +224,15 @@ assert_clean() { # $1 = file, $2 = state id -- must run BEFORE the mutation
   return 0
 }
 
-run_state() { # $1 = id, $2 = description, $3 = file to restore, $4 = expected reason
-  local id="$1" desc="$2" restore="$3" want="$4" log rc reason verdict
+# $5 = OPTIONAL pattern that must be ABSENT from the log. Some defects are not
+# "the checker stayed quiet" but "the checker said the RIGHT thing AND the
+# MISLEADING thing as well", and an rc alone cannot tell those apart -- which is
+# exactly the defect M-G/M-H exist for: the cross-check guards printed their
+# refusal and then ran the comparison anyway, so the log carried both the refusal
+# and the "classification drift" line they exist to suppress. Asserted through
+# _gate_pred.sh so the POLARITY is named at the call site, per the recorded rule.
+run_state() { # $1 = id, $2 = description, $3 = file to restore, $4 = expected reason, $5 = must-be-absent ERE
+  local id="$1" desc="$2" restore="$3" want="$4" absent="${5:-}" log rc reason verdict
   TOTAL=$((TOTAL + 1))
   log="$LOG_DIR/mutate_${id}.log"
   timeout 1800 bash "$CHECKER" >"$log" 2>&1
@@ -208,6 +245,8 @@ run_state() { # $1 = id, $2 = description, $3 = file to restore, $4 = expected r
     reason="<checker failed but named no assertion>"
   elif ! printf '%s' "$reason" | grep -qF -- "$want"; then
     reason="WRONG REASON: caught, but not by '$want' -> $reason"
+  elif [ -n "$absent" ] && ! pred_expect_absent "$id" "$(cat "$log")" "$absent"; then
+    reason="MISLEADING LINE STILL EMITTED: caught by '$want' AND also printed '$absent'"
   else
     verdict=ok
     CAUGHT=$((CAUGHT + 1))
@@ -223,12 +262,16 @@ run_state() { # $1 = id, $2 = description, $3 = file to restore, $4 = expected r
       "WRONG REASON"*)
         echo "         -> it DID fail, but on an unrelated assertion, so this state" | sed 's/^ *//'
         echo "            is not yet evidence. Fix the patch or the expectation." | sed 's/^ *//' ;;
+      "MISLEADING LINE"*)
+        echo "         -> it DID refuse, but also emitted the line the refusal is" | sed 's/^ *//'
+        echo "            meant to suppress. A guard that reports and then does the" | sed 's/^ *//'
+        echo "            forbidden thing anyway is worse than no guard." | sed 's/^ *//' ;;
       *)
         echo "         -> unattributed catch: a non-zero exit with no failing" | sed 's/^ *//'
         echo "            assertion named is not evidence of anything." | sed 's/^ *//' ;;
     esac
   fi
-  printf '%-4s verdict=%-6s want=%s\n' "$id" "$verdict" "$want" >>"$STATES_LOG"
+  printf '%-4s verdict=%-6s want=%s absent=%s\n' "$id" "$verdict" "$want" "${absent:-none}" >>"$STATES_LOG"
   # Restoring text is not restoring the experiment: prove the tree is clean
   # afterwards, or the next state inherits this mutation. `git checkout --`
   # restores the recorded mode too (verified: 644 -> 755), so M-B is covered.
@@ -243,6 +286,43 @@ run_state() { # $1 = id, $2 = description, $3 = file to restore, $4 = expected r
 }
 
 echo "== MUTATION MATRIX: check_device_precond.sh =="
+
+# --- BASELINE, and it is the CONVERSE that the firing states need ------------
+# There was no baseline in this matrix, so nothing asserted the checker is GREEN
+# on an unmodified tree -- and the two states below assert that two guards FIRE.
+# A guard that fires on a healthy tree satisfies both of them, so the quiet
+# direction is the half that gets forgotten (and it is the half that was actually
+# broken: the refusal guards fired AND the comparison ran anyway). Asserted
+# through pred_expect_absent so the polarity is named, not a bare grep -q.
+echo "-- baseline (unmutated tree must be GREEN and SILENT) --"
+BASE_LOG="$LOG_DIR/mutate_baseline.log"
+timeout 1800 bash "$CHECKER" >"$BASE_LOG" 2>&1
+BASE_RC=$?
+if [ "$BASE_RC" -ne 0 ]; then
+  echo "FAIL: the checker does not pass on a clean tree (rc=$BASE_RC), so every" >&2
+  echo "  state below would be scored against a broken baseline." >&2
+  grep -m3 -E 'FAIL' "$BASE_LOG" | sed 's/^/  /' >&2
+  exit 1
+fi
+pred_reset
+if pred_expect_absent baseline "$(cat "$BASE_LOG")" \
+     'NO TABLE to cross-check|classifies NO gate as needing|cross-check NOT PERFORMED|command not found'; then
+  echo "  ok    baseline: rc=0, both cross-check guards SILENT"
+else
+  echo "FAIL: a cross-check guard fires on a HEALTHY tree." >&2
+  echo "  Every state below would then be satisfied by an always-red guard." >&2
+  exit 1
+fi
+# And the other half of the converse, stated positively: the cross-check must
+# actually AGREE on the real tree, or "silent" would also be satisfied by a
+# cross-check that never runs at all.
+pred_reset
+if pred_expect_present baseline "$(cat "$BASE_LOG")" 'both derivations agree: [0-9]+ device gate'; then
+  echo "  ok    baseline: the cross-check really does run and agree"
+else
+  echo "FAIL: the cross-check did not report agreement on a healthy tree." >&2
+  exit 1
+fi
 
 # M-B first: cheapest, and it mutates a MODE, which a concurrent run silently
 # inherits. The clean-state assertion must run BEFORE the chmod, since the chmod
@@ -296,21 +376,59 @@ patch_literal "$TGT_H" "$A_CASEC" 'echo "SKIPPED: render node opens but Level Ze
 verify_patched "$TGT_H" M-F
 run_state "M-F" "self-check case (c) made always-red" "$TGT_H" "CORRECT cause was REJECTED"
 
+# M-G / M-H: the cross-check's REFUSAL guards, and the reason they are
+# ARTIFACT states (audit #21) rather than checker-weakening states. The checker is
+# correct by construction once it refuses properly, so weakening IT is
+# unobservable -- every stub below is a legitimately reachable gate_inventory
+# output, so the cross-check must reject all of them.
+#
+# The defect these two were written for is SPECIFIC and is not visible in an exit
+# code: both guards recorded their refusal and then fell through to the
+# comparison anyway, so the log carried the refusal AND "classification drift"
+# with an EMPTY gate_inventory side -- sending the next reader to reconcile two
+# lists when there was nothing to reconcile. Hence the must-be-absent assertion
+# (`$5`), which is why run_state grew that parameter.
+assert_clean "$TGT_G" M-G || exit 1
+printf '#!/bin/sh\nexit 2\n' >"$TGT_G"          # an early exit: NO table at all
+chmod +x "$TGT_G"
+verify_patched "$TGT_G" M-G
+run_state "M-G" "gate_inventory returns NO table (early exit)" "$TGT_G" \
+  "NO TABLE to cross-check" "classification drift"
+assert_clean "$TGT_G" M-G || exit 1
+
+assert_clean "$TGT_G" M-H || exit 1
+cat >"$TGT_G" <<'EOS'
+#!/bin/sh
+# A table that ARRIVES but classifies no gate as needing a device: the header the
+# checker greps for is present, every row is `not-gpu`. The audit-#20 shape -- an
+# empty harvest is not a disagreement.
+printf '%-26s %-9s %-22s %-11s %-12s %s\n' GATE BUILD-GUARD PRECONDITION GRANULARITY 1-GPU-ARM RENDER-NODE
+printf '%-26s %-9s %-22s %-11s %-12s %s\n' test_cpu_parity.sh none none whole-gate not-gpu
+echo "GATE INVENTORY: OK"
+EOS
+chmod +x "$TGT_G"
+verify_patched "$TGT_G" M-H
+run_state "M-H" "gate_inventory's table classifies NO device gate" "$TGT_G" \
+  "classifies NO gate as needing" "classification drift"
+
 echo
 if [ "$CAUGHT" -eq "$TOTAL" ]; then
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "states=M-B,M-A,M-C,M-D,M-E,M-F"
+    echo "states=$(awk '{printf "%s%s", (n++?",":""), $1}' "$STATES_LOG")"
     echo "caught=$CAUGHT/$TOTAL"
     echo "each_caught_for_its_own_reason=yes"
+    echo "baseline=green_and_both_crosscheck_guards_silent"
     echo "healthy_column=skipped_by_design(INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1)"
   } >"$STAMP"
   echo "DEVICE PRECOND MUTATION: PASS ($CAUGHT/$TOTAL caught, each for its OWN reason)"
-  echo "  check_device_precond.sh is non-vacuous: all six load-bearing mechanisms"
+  echo "  check_device_precond.sh is non-vacuous: every mechanism this matrix names"
   echo "  can be observed to fail, including the HALF-GUARD case a single-direction"
   echo "  matrix would have scored as a pass, the DRIFT comparison M-A never"
-  echo "  exercised, the ROTTED seam, and the always-red self-check."
+  echo "  exercised, the ROTTED seam, the always-red self-check, and the pair of"
+  echo "  cross-check guards that must refuse WITHOUT also printing the misleading"
+  echo "  'classification drift' line. Read the live counts from $STAMP."
   echo "  stamp: $STAMP"
   exit 0
 fi
