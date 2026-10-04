@@ -282,9 +282,10 @@ negative result which motivated the batch:
 git log --oneline 40219bf^..HEAD
 ```
 
-This paragraph closed at `af1d43b`; the commit that rewrote it is itself part of
-that range, which is why no sha list here can be complete. Re-run the command
-rather than trusting the sentence.
+No sha is named here, and that is deliberate: the commit that rewrites this
+sentence is itself inside the range above, so any sha it quoted would be stale
+the moment it landed. A paragraph that forbids transcription must not commit it
+in its own closing line. Re-run the command rather than trusting the sentence.
 
 ---
 

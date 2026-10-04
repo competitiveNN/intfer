@@ -163,6 +163,54 @@ else
   echo "   FAIL no UNVERIFIED marker at all"; bad=$((bad+1))
 fi
 
+# --- property 2: a DERIVATION-NAMING paragraph must not TRANSCRIBE ------------
+# WHY. This checker was scoped to ONE file, so it passed while a hand-transcribed
+# sha list sat in a DIFFERENT report -- the AUDIT #22 scope shape: a check that
+# greps one region cannot see a violation in another. And the violation was
+# subtler than a bare list: the paragraph that forbade transcription quoted a sha
+# in its own closing line, one commit after that sha became stale.
+#
+# So the property is stated on the SHAPE, not on a named file:
+#   SUBJECT  = a doc that tells the reader how to re-derive something with git
+#              (it names `git log --oneline` or `git rev-list`);
+#   FORBIDDEN= any single LINE of such a doc carrying three or more backticked
+#              shas, i.e. a transcribed list rather than a derivation.
+# Three is the floor deliberately: an index TABLE row carries exactly one sha and
+# must stay legal (the archived verdicts report has one), while a prose chain of
+# shas is always a copy somebody has to maintain by hand.
+#
+# ANTI-VACUITY. The guard is on the SUBJECT count, not the violation count: "no
+# violations" and "nothing to look at" are different claims, and only the first
+# is a pass.
+enum_reset
+subjects=""
+for f in reports/*.md reports/archive/*.md reports/active/*.md AGENTS.md; do
+  [ -f "$f" ] || continue
+  grep -qE 'git (log --oneline|rev-list)' "$f" || continue
+  subjects="$subjects $f"
+done
+n_subj="$(printf '%s\n' $subjects | grep -c . || true)"
+enum_require_min "derivation-naming docs" "$n_subj" 2 "docs that cite a git re-derivation" || true
+if [ -n "$subjects" ]; then
+  bad_list=""
+  for f in $subjects; do
+    while IFS= read -r ln; do
+      [ -n "$ln" ] && bad_list="$bad_list
+  $f: $ln"
+    done < <(grep -nE '(`[0-9a-f]{7,40}`[^0-9a-f]*){3,}' "$f" 2>/dev/null || true)
+  done
+  if [ -n "$bad_list" ]; then
+    echo "   FAIL $n_subj doc(s) name a git re-derivation, and these line(s) TRANSCRIBE instead:" >&2
+    printf '%s\n' "$bad_list" | sed 's/^/     /' >&2
+    echo "        Cite the command and let the reader run it. A sha list in prose is a" >&2
+    echo "        hand-maintained copy: it goes stale the moment the commit lands, and it" >&2
+    echo "        is stale in the very sentence that says not to transcribe." >&2
+    bad=$((bad + 1))
+  else
+    echo "   ok    $n_subj derivation-naming doc(s), none transcribes a sha list"
+  fi
+fi
+
 echo
 if [ "$bad" -eq 0 ]; then
   echo "DOC COUNT CHECK: PASS (derived counts reproduce; tally and TP=2 wording intact)"
