@@ -139,6 +139,7 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   SB="$(mktemp -d)"; trap 'rm -rf "$SB"' EXIT INT TERM
   bad=0
   ids_after_prefill() { cli_ids "$1" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//'; }
+  TP_BANNER='[intfer] GPU backend: 2 device(s) (TP=sharded)'
   mklog() { # $1 = path, $2.. = ids in step order. Appends the sharded TP banner,
             # so every fixture is shaped like a real MR log.
     local p="$1"; shift; : >"$p"; local i=0
@@ -158,7 +159,6 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # teaches nothing. mklog appends the banner the real CLI prints, and the one
   # TP fixture below is built by OVERWRITING that banner, so it differs only in
   # the banner.
-  TP_BANNER='[intfer] GPU backend: 2 device(s) (TP=sharded)'
   mklog "$SB/good_mr"   11751 13 198 760 6511
   mklog "$SB/bad_mr"    11751 13 198 760 9999   # diverges at step 4 only
   mklog "$SB/bad_prefill" 4242 13 198 760 6511  # wrong prefill only
@@ -199,7 +199,7 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # repo's standing lesson is that an always-red check proves only that a check
   # can fail. The fixtures here are good ids AND a sharded banner, so a refusal
   # can only come from the arm.
-  mr_arm_assert "$SB/tp_ok_ids" "$SB/tp_ok_ids" "SELF-CHECK FAIL (2): " \
+  mr_arm_assert "$SB/tp_ok_ids" "$SB/tp_ok_ids" "SELFTEST (2) arm-refusal: " \
     || { echo "SELF-CHECK FAIL (2): mr_arm_assert must ACCEPT a healthy pair" >&2; bad=1; }
 
   # (3) A divergence BEYOND the oracle prefix must be refused. The oracle pins 3
@@ -213,7 +213,7 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # is no longer the arm's source of truth and these cases are the only thing left
   # saying what it must contain. The predicates are still driven directly in (2),
   # because that is the half that names WHICH assertion failed.
-  mr_arm_assert "$SB/good_base" "$SB/bad_mr" "SELF-CHECK FAIL (3): " \
+  mr_arm_assert "$SB/good_base" "$SB/bad_mr" "SELFTEST (3) arm-refusal: " \
     && { echo "SELF-CHECK FAIL (3): the arm ACCEPTED a step-4 divergence" >&2; bad=1; }
   # Direct drive, for the same reason (4) has two: mr_arm_assert refuses this
   # fixture on the stream check ALONE (the ids differ and the prefill/banner are
@@ -222,9 +222,9 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # drive still names this defect. Two subjects, not two copies.
   mr_streams_agree "$(ids_after_prefill "$SB/good_base")" "$(ids_after_prefill "$SB/bad_mr")" \
     && { echo "SELF-CHECK FAIL (3): mr_streams_agree ACCEPTED a step-4 divergence directly" >&2; bad=1; }
-  mr_arm_assert "$SB/good_base" "$SB/bad_prefill" "SELF-CHECK FAIL (5): " \
+  mr_arm_assert "$SB/good_base" "$SB/bad_prefill" "SELFTEST (5) arm-refusal: " \
     && { echo "SELF-CHECK FAIL (5): the arm ACCEPTED a wrong prefill (4242)" >&2; bad=1; }
-  mr_arm_assert "$SB/good_base" "$SB/tp_bad_ids" "SELF-CHECK FAIL (5): " \
+  mr_arm_assert "$SB/good_base" "$SB/tp_bad_ids" "SELFTEST (5) arm-refusal: " \
     && { echo "SELF-CHECK FAIL (5): the arm ACCEPTED a TP=single banner" >&2; bad=1; }
 
   # (4) An empty pair must be refused -- the vacuity this arm could have shipped
@@ -240,7 +240,7 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # pair, so nothing else can refuse on its behalf. Both are kept: the first is
   # the end-to-end shape the real arm uses, the second is the one that is
   # load-bearing. A redundant-looking pair here is two DIFFERENT subjects.
-  mr_arm_assert "$SB/empty" "$SB/empty" "SELF-CHECK FAIL (4): " \
+  mr_arm_assert "$SB/empty" "$SB/empty" "SELFTEST (4) arm-refusal: " \
     && { echo "SELF-CHECK FAIL (4): the arm ACCEPTED an empty pair (vacuity)" >&2; bad=1; }
   mr_streams_agree "$(ids_after_prefill "$SB/empty")" "$(ids_after_prefill "$SB/empty")" \
     && { echo "SELF-CHECK FAIL (4): mr_streams_agree ACCEPTED an empty pair directly" >&2; bad=1; }
