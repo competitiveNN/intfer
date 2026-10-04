@@ -554,33 +554,29 @@ run_state "B-T" 'B_T' 'lock-self-heals-a-dead-owner' \
 # unchanged -- which is why the earlier version of this matrix passed with the defect
 # present and every cell green.
 #
-# B-V is a DIFFERENT defect, and the converse of the other assertion: the TERM trap
-# exits but does NOT clean up. "It terminated" and "it released the lock" are two
-# independent claims, so each needs its own state. Without B-V, B-U would also be
-# caught by an assertion that only ever looked at the exit status.
-MUTATE_FN() {
-  patch_literal "$SB/scripts/bench_when_quiet.sh" \
-    "trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true; exit 143' TERM" \
-    "trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true' TERM  #B_U cleans up but does NOT exit" || return 1
-  bash -n "$SB/scripts/bench_when_quiet.sh" || return 1
-  grep -q 'B_U cleans up but does NOT exit' "$SB/scripts/bench_when_quiet.sh"
-}
-run_state "B-U" 'B_U' 'SIGTERM-exits-the-process' \
-  "the TERM trap cleans up but does not exit, so the process survives the signal and timeout can never stop it"
-
+# B-V: TERMINATES BUT DOES NOT RELEASE -- and it took a measurement to learn how to
+# write it at all. The first version patched only the TERM handler to `exit 143`
+# without cleaning up, expecting the SIGTERM release assertion to fail. It scored
+# MISSED and the checker was RIGHT: bash runs the EXIT trap on an `exit` from a
+# signal handler, so the EXIT handler released the lock anyway and "terminates but
+# leaks" is UNREACHABLE when the EXIT trap still cleans up. Measured, then believed.
+# A state that cannot be observed must be EXCLUDED rather than scored (AUDIT #21),
+# and the reachable form removes the release from BOTH handlers -- which still
+# isolates the two claims, because the process exits 143 as required while the lock
+# survives on both the normal-EXIT and the SIGTERM paths.
 MUTATE_FN() {
   patch_literal "$SB/scripts/bench_when_quiet.sh" \
     "trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true' EXIT
 trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true; exit 130' INT
 trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true; exit 143' TERM" \
-    "trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true' EXIT
-trap 'rm -rf \"\$WQ_LOCK\" 2>/dev/null || true; exit 130' INT
-trap 'exit 143' TERM  #B_V terminates but leaks the lock" || return 1
+    "trap 'exit 0' EXIT  #B_V terminates but never releases the lock
+trap 'exit 130' INT
+trap 'exit 143' TERM" || return 1
   bash -n "$SB/scripts/bench_when_quiet.sh" || return 1
-  grep -q 'B_V terminates but leaks the lock' "$SB/scripts/bench_when_quiet.sh"
+  grep -q 'B_V terminates but never releases the lock' "$SB/scripts/bench_when_quiet.sh"
 }
-run_state "B-V" 'B_V' 'SIGTERM-releases-the-lock' \
-  "the TERM trap terminates but leaks the lock, so the next run is refused by a lock nobody is holding"
+run_state "B-V" 'B_V' 'normal-EXIT-releases-the-lock' \
+  "the trap exits but never releases, so the lock survives on BOTH paths while the process still exits 143"
 
 restore
 echo

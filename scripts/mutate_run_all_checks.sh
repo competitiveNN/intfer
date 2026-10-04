@@ -1024,12 +1024,26 @@ run_state_post "N-U" "the declaration is an indented body mention" \
 # STEPS, because that is the exact wiring that made the stack FAIL. The converse is
 # that adding it back to STEPS while keeping the declaration must be refused.
 reset_mutant
-python3 - "$MUTANT" <<'PYX'
+# *** THE ANCHOR IS RE-POINTED, NEVER LOOSENED, AND ITS FAILURE IS NOW LOUD. ***
+# The first version anchored on the END of the checkers STEPS line
+# ('check_verdict_scope.sh check_dri_probe.sh"'). Two checkers were added to that
+# line afterwards, so the anchor stopped existing: the assert raised
+# AssertionError: 0, the heredoc's non-zero status was DISCARDED (no set -e), the
+# state then ran against an UNMUTATED copy, and it scored MISSED -- a false MISSED
+# that cost a whole matrix run and read as "this state is weak". It is the recorded
+# stale-anchor class, reached the recorded way: an anchor pointing at text that
+# later commits moved.
+# Two changes, because the anchor going stale is expected and its FAILURE BEING
+# SILENT is not:
+#   * the anchor is the line's current tail, and
+#   * `|| exit 1` on the heredoc, so a drifted anchor stops the matrix in the first
+#     second instead of producing a confident verdict about nothing.
+python3 - "$MUTANT" <<'PYX' || { echo "N-V ANCHOR STALE: the STEPS tail moved -- re-point it, do not loosen it"; exit 1; }
 import sys
 p = sys.argv[1]
 s = open(p).read()
-old = 'check_verdict_scope.sh check_dri_probe.sh"'
-new = 'check_verdict_scope.sh check_dri_probe.sh check_stack_cert.sh"'
+old = 'check_trap_release.sh check_guard_identity.sh"'
+new = 'check_trap_release.sh check_guard_identity.sh check_stack_cert.sh"'
 assert s.count(old) == 1, s.count(old)
 open(p, "w").write(s.replace(old, new))
 PYX
