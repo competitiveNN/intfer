@@ -38,6 +38,106 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT" || exit 1
+
+# --- ANCHOR PRE-FLIGHT ------------------------------------------------------
+# A refactor can move or delete a mutation's target. The patch then matches
+# nothing, the file is unchanged, the model still agrees with itself, and the
+# state reads AS EXPECTED FOR THE WRONG REASON -- which is the recorded
+# anchor-drift class, and it costs a full model run per state to discover.
+#
+# So every anchor is located up front, and located MECHANICALLY: the count is
+# taken in python, counting SUBSTRING OCCURRENCES, because that is exactly what
+# patch_literal does. A grep -c based pre-flight and a python patch_literal
+# would disagree about what "exactly once" means (a multi-line anchor is one
+# line to grep and many occurrences to python), and a guard that measures
+# something different from the thing it guards is how the two drift apart.
+#
+# Patterns live in a QUOTED ARRAY with a parallel file array, NOT a `pat|desc`
+# table with IFS='|': these patterns contain '|' (ERE alternation, `||`) and a
+# pipe-delimited table silently truncates at the first one -- measured here in
+# this project already.
+#
+# `--anchors-only` runs just this and exits, with no build and no model, so a
+# drifted anchor is visible in under a second.
+check_anchor() { # $1 state id, $2 file, $3 exact literal
+  # *** THE VERDICT IS COUNTED, NOT INHERITED FROM python's EXIT CODE. ***
+  # The first version printed "ANCHOR STALE ... found 0 occurrences" and python
+  # DID exit 1 -- and the script then carried on to print "anchor pre-flight: ok"
+  # and exited 0, because this script is not `set -e`. A loud message followed by a
+  # green summary is the worst of both: it reads as a passing run while certifying
+  # a stale anchor, which is exactly how a mutation silently stops mutating. So the
+  # failure is accumulated in ANCHOR_BAD and BOTH the summary line and the exit code
+  # are derived from that count.
+  if python3 - "$2" "$3" "$1" <<'PY'
+import sys
+path, old, sid = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(path).read()
+n = src.count(old)
+if n != 1:
+    sys.stderr.write("ANCHOR STALE %s in %s: found %d occurrence(s), want 1.\n" % (sid, path, n))
+    first = old.split("\n")[0]
+    for l in src.split("\n"):
+        if first.strip()[:40] in l:
+            sys.stderr.write("  first line: %s\n" % l.strip()[:90])
+            break
+    sys.stderr.write("  Re-point the anchor. NEVER loosen the check: a loosened\n")
+    sys.stderr.write("  anchor is how a mutation silently stops mutating.\n")
+    sys.exit(1)
+print("  ok  %s anchor located exactly once in %s" % (sid, path))
+PY
+  then
+    ANCHOR_OK=$((ANCHOR_OK + 1))
+  else
+    ANCHOR_BAD=$((ANCHOR_BAD + 1))
+  fi
+  return 0
+}
+
+# ONE home for each anchor: the pre-flight and the state that uses it read the
+# SAME variable, so a re-point cannot fix the pre-flight and miss the patch.
+A_GA='const float acc = decode1_out_int2_tab(
+              st.code, st.scale, ng, st.num_groups_w, st.act, st.K,
+              st.group_size, st.num_groups, st.alpha);'
+A_GA_NEW='const float acc = decode1_out_int2_tab(
+              st.code, st.scale, ng, st.num_groups_w, st.act, st.K,
+              st.group_size, st.num_groups, st.alpha) * 1.0000001f;'
+A_GB='int s = 0;
+          for (int i = 1; i < pack.nsets; ++i)
+            if (slot >= pack.s[i].out_offset) s = i;'
+A_GB_NEW='int s = 0;
+          for (int i = 1; i < pack.nsets; ++i)
+            if (slot >= pack.s[i].N) s = i;'
+A_GC='if (s[i].num_groups !=
+        (s[i].K + s[i].group_size - 1) / s[i].group_size)
+      return false;'
+A_GC_NEW=''
+A_GD='if (fused_on && M == 1 && nl >= 2) {'
+A_GD_NEW='if (fused_on && nl >= 2) {'
+
+F_GEMM="src/gemm/quant_gemm.cpp"
+F_ENG="src/engine/engine.cpp"
+
+ANCHOR_OK=0
+ANCHOR_BAD=0
+echo "== anchor pre-flight =="
+check_anchor G-A "$F_GEMM" "$A_GA"
+check_anchor G-B "$F_GEMM" "$A_GB"
+check_anchor G-C "$F_GEMM" "$A_GC"
+check_anchor G-D "$F_ENG"  "$A_GD"
+ANCHOR_TOTAL=$((ANCHOR_OK + ANCHOR_BAD))
+if [ "$ANCHOR_BAD" -ne 0 ]; then
+  echo "anchor pre-flight: FAIL ($ANCHOR_BAD of $ANCHOR_TOTAL stale)" >&2
+  echo "  Refusing to start. Every state below would run against an UNMUTATED" >&2
+  echo "  target and then report 'the mechanism is NOT load-bearing' -- a" >&2
+  echo "  conclusion about the CHECKER when the real fault is in the state." >&2
+  exit 1
+fi
+echo "anchor pre-flight: ok ($ANCHOR_TOTAL/$ANCHOR_TOTAL targets located exactly once)"
+if [ "${1:-}" = "--anchors-only" ]; then
+  echo "  (--anchors-only: no build, no model, no mutation)"
+  exit 0
+fi
+
 LOG_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/fused_decode_mutate"
 STAMP="$LOG_DIR/last_pass.stamp"
 LOCK="$LOG_DIR/.mutate.lock"
@@ -94,6 +194,7 @@ verify_patched() { # $1 file, $2 state id
     exit 1
   fi
 }
+
 
 # --- the check, run for real -------------------------------------------------
 # Stream identity: the fused flag on vs the default path must produce the SAME
@@ -214,21 +315,13 @@ fi
 echo "  ok    G-E baseline: fused path is REACHABLE ($nk_base -> $nk_fused)"
 
 # --- states ------------------------------------------------------------------
-F_GEMM="src/gemm/quant_gemm.cpp"
-F_ENG="src/engine/engine.cpp"
 
 # G-A: the fused kernel stops calling the shared routine and inlines its own
 # copy of the K loop, with one term dropped. Stream identity MUST catch it --
 # this is the state that proves the shared-routine extraction is load-bearing
 # rather than decorative.
 git checkout -- "$F_GEMM" "$F_ENG"
-if patch_literal "$F_GEMM" \
-  'const float acc = decode1_out_int2_tab(
-              st.code, st.scale, ng, st.num_groups_w, st.act, st.K,
-              st.group_size, st.num_groups, st.alpha);' \
-  'const float acc = decode1_out_int2_tab(
-              st.code, st.scale, ng, st.num_groups_w, st.act, st.K,
-              st.group_size, st.num_groups, st.alpha) * 1.0000001f;'; then
+if patch_literal "$F_GEMM" "$A_GA" "$A_GA_NEW"; then
   verify_patched "$F_GEMM" G-A
   run_state "G-A" "fused kernel stops using the shared per-output routine" "$F_GEMM" "STREAM DIVERGED"
 else
@@ -239,13 +332,7 @@ fi
 # prefix sum -- the audit #12 shape, where a geometry rule ends up computed on
 # both sides and eventually disagrees.
 git checkout -- "$F_GEMM" "$F_ENG"
-if patch_literal "$F_GEMM" \
-  'int s = 0;
-          for (int i = 1; i < pack.nsets; ++i)
-            if (slot >= pack.s[i].out_offset) s = i;' \
-  'int s = 0;
-          for (int i = 1; i < pack.nsets; ++i)
-            if (slot >= pack.s[i].N) s = i;'; then
+if patch_literal "$F_GEMM" "$A_GB" "$A_GB_NEW"; then
   verify_patched "$F_GEMM" G-B
   run_state "G-B" "slot mapping re-derived on device (prefix sum ignored)" "$F_GEMM" "STREAM DIVERGED"
 else
@@ -255,11 +342,7 @@ fi
 # G-C: the eligibility check stops refusing an inconsistent num_groups. The
 # caller supplies ceil(K/group_size) and this stop trusting it.
 git checkout -- "$F_GEMM" "$F_ENG"
-if patch_literal "$F_GEMM" \
-  'if (s[i].num_groups !=
-        (s[i].K + s[i].group_size - 1) / s[i].group_size)
-      return false;' \
-  ''; then
+if patch_literal "$F_GEMM" "$A_GC" "$A_GC_NEW"; then
   verify_patched "$F_GEMM" G-C
   run_state "G-C" "eligibility no longer refuses an inconsistent num_groups" "$F_GEMM" "STREAM DIVERGED"
 else
@@ -270,9 +353,7 @@ fi
 # (M>1) prefill arm in test_gpu_optin.sh is what covers this; here we assert
 # the identity check notices when the decline is gone.
 git checkout -- "$F_GEMM" "$F_ENG"
-if patch_literal "$F_ENG" \
-  'if (fused_on && M == 1 && nl >= 2) {' \
-  'if (fused_on && nl >= 2) {'; then
+if patch_literal "$F_ENG" "$A_GD" "$A_GD_NEW"; then
   verify_patched "$F_ENG" G-D
   run_state "G-D" "fused path no longer declines at M != 1" "$F_ENG" "STREAM DIVERGED"
 else
