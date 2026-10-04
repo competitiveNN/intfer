@@ -1,0 +1,25 @@
+#!/bin/sh
+# Reports TWO Level Zero GPU devices, so gate_inventory.sh always takes its
+# "GPUs are visible" path regardless of what the real box is doing.
+#
+# WHY THIS EXISTS. check_device_precond.sh cross-checks its OWN device-gate list
+# against the RENDER-NODE column that gate_inventory.sh reports, and the two sides
+# must agree. It invoked gate_inventory.sh LIVE -- so on a box that momentarily
+# reported ZERO devices, gate_inventory took its BOX branch (a different verdict and
+# a different table, exit 2 per audit #29) and the cross-check reported
+# "classification drift". MEASURED: the step failed inside a saturated stack run and
+# PASSED when re-run directly seconds later, with no code change in between.
+#
+# The lesson is the same one the load gate keeps teaching: two derivations that must
+# agree must be compared under DETERMINISTIC conditions. A verdict that depends on
+# what the box happens to be doing is a flaky gate, and a flaky gate is worse than
+# none because it trains everyone to re-run it until it goes green.
+#
+# The count is 2 because that is this project's design target, and because the
+# RENDER-NODE column -- the thing being cross-checked -- is count-independent; any
+# count >= 1 would do. What matters is that it is PINNED rather than observed.
+#
+# Kept in the tree, not /tmp, so the reason is re-readable by the next session
+# instead of living in a transcript.
+printf '%s\n' '[level_zero:gpu] 0: Intel(R) Data Center GPU Max 1550' '[level_zero:gpu] 1: Intel(R) Data Center GPU Max 1550'
+exit 0

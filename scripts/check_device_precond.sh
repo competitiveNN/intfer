@@ -295,8 +295,46 @@ fi
 # derivations that must match: if a new GPU gate lands and only one side learns
 # about it, this fails loudly instead of the matrix quietly covering less.
 note "== CLASSIFICATION CROSS-CHECK (this list vs gate_inventory.sh) =="
-INV_TABLE="$(bash "$SCRIPT_DIR/gate_inventory.sh" 2>/dev/null)"
+# *** PINNED TO A DETERMINISTIC DEVICE COUNT, NOT THE REAL BOX. *** Two derivations
+# that must agree have to be compared under conditions that do not move, or the
+# comparison is a flaky gate. This invoked gate_inventory.sh LIVE, and on a box that
+# momentarily reported ZERO devices gate_inventory took its BOX branch -- a different
+# verdict, a different table, exit 2 by design since audit #29 -- and the cross-check
+# reported "classification drift" with nothing actually drifting.
+# MEASURED, both halves: the step FAILED inside a saturated stack run and PASSED when
+# re-run directly seconds later, with no code change in between. That is the shape of
+# a box-state flake, and the fix is not "re-run it until it goes green" -- it is to
+# stop the box from being an input at all.
+# The stub is a committed fixture (scripts/fixtures/two-device/sycl-ls) rather than a
+# generated one, so the reason is re-readable next to the thing it explains. The count
+# is 2, this project's design target; the RENDER-NODE column being cross-checked is
+# count-independent, so what matters is that it is PINNED rather than OBSERVED.
+TWO_DEV_STUB="$SCRIPT_DIR/fixtures/two-device/sycl-ls"
+[ -x "$TWO_DEV_STUB" ] || { echo "FAIL: missing $TWO_DEV_STUB -- the cross-check cannot be" >&2
+                           echo "      made deterministic, and a live gate_inventory makes it flaky." >&2
+                           exit 1; }
+INV_TABLE="$(INTFER_SYCL_LS="$TWO_DEV_STUB" bash "$SCRIPT_DIR/gate_inventory.sh" 2>/dev/null)"
 inv_devices="$(printf '%s\n' "$INV_TABLE" | awk '$NF=="via-count" || $NF=="render-node" {print $1}')"
+# *** A SHORT OR EMPTY TABLE IS NOT "THE OTHER SIDE DISAGREES". *** The observed
+# failure was gate_inventory's side MISSING ONE GATE, which the cross-check reported
+# as classification drift. Pinning the invocation removes the load-sensitivity, but
+# the honest residual risk is that gate_inventory exits EARLY -- before printing its
+# table at all, for any of its own reasons -- and its empty result is then read as
+# "the other side disagrees". So a table that did not arrive is refused in its own
+# terms, and says so, instead of being compared.
+case "$INV_TABLE" in
+  *"RENDER-NODE"*) : ;;
+  *) bad "gate_inventory.sh returned NO TABLE to cross-check (its own preconditions or"
+     bad "  an early exit). That is not classification drift, so do not debug the gates:"
+     bad "  there is nothing to compare against. Re-run gate_inventory.sh on its own."
+     continue_gate ;;
+esac
+if [ -z "$inv_devices" ]; then
+  bad "gate_inventory.sh's table arrived but classifies NO gate as needing a device,"
+  bad "  while this harness classifies at least one. One of the two derivations is"
+  bad "  empty, and an empty harvest is not a disagreement (audit #20)."
+  continue_gate
+fi
 own_devices=""
 for f in scripts/test_*.sh; do
   [ -f "$f" ] || continue
