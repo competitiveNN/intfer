@@ -77,7 +77,17 @@ SB="$(mktemp -d)"
 # another matrix in this repo shipped trap 'rm -rf \"$SB\"', which removes a
 # filename that does not exist -- cleanup got WORSE than EXIT-only and bash -n
 # stayed green, because it is syntactically valid and semantically wrong.
-trap 'rm -rf "$SB"' EXIT INT TERM
+# *** THREE SEPARATE TRAPS, AND THE EXIT CODES ARE NOT OPTIONAL. *** CAUGHT BY
+# check_trap_release.sh, which classifies a single combined
+# `trap ... EXIT INT TERM` as a FAILURE: the combined trap cleans up but does not
+# TERMINATE, and a shell that survives SIGTERM is exactly the defect
+# mutate_trap_release.sh's state T-B exists for -- `timeout` waits for the full
+# duration instead of the process dying. So this is not a style preference, it is
+# the same bug that class of guard was written to stop. Form per
+# mutate_gate_pop.sh / mutate_verdict_scope.sh.
+trap 'rm -rf "$SB"' EXIT
+trap 'rm -rf "$SB"; exit 130' INT
+trap 'rm -rf "$SB"; exit 143' TERM
 SB_DIGEST_BEFORE="$(cat "$TARGET" | cksum)"
 
 total=0; caught=0; bad=0; baselines=0
