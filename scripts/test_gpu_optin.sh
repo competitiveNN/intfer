@@ -249,6 +249,53 @@ for tp in $TPS; do
   TILDA="$(N=24 ids_of "$tp" INTFER_DPAS48_TILED=1)"
   echo "TP=$tp [INTFER_DPAS48_TILED=1 alone]: '$TILDA'"
   [ "$TILDA" = "$B24" ] || fail "TP=$tp [INTFER_DPAS48_TILED=1 alone] '$TILDA' != base '$B24'"
+
+  # --- INTFER_FUSED_DECODE1 arms (fused multi-GEMM M=1 decode launch) --------
+  # The fused kernel puts a whole wave of INDEPENDENT GEMMs in one nd_range. Its
+  # whole claim is that this is bit-exact, so these arms ARE the certification:
+  # if the per-output K order or the slot prefix sum were wrong, the greedy
+  # stream would diverge. Run at n=24 (many waves, many fused launches) and in
+  # the WIDE M>1 prefill arm below, where the kernel must DECLINE and be inert.
+  FUSED="$(N=24 ids_of "$tp" INTFER_FUSED_DECODE1=1)"
+  echo "TP=$tp [INTFER_FUSED_DECODE1=1 n=24]: '$FUSED'"
+  [ -n "$FUSED" ] || fail "TP=$tp INTFER_FUSED_DECODE1 stream empty (broken run)"
+  [ "$FUSED" = "$B24" ] || fail "TP=$tp [INTFER_FUSED_DECODE1] '$FUSED' != base '$B24'"
+  # Kill switch must be INERT relative to base, and must also be inert
+  # relative to the flag ON -- otherwise the kill switch is not restoring the
+  # default path and "default == base" would be certified by luck.
+  FUSDK="$(N=24 ids_of "$tp" INTFER_FUSED_DECODE1=1 INTFER_NO_FUSED_DECODE1=1)"
+  echo "TP=$tp [FUSED + NO_FUSED_DECODE1]: '$FUSDK'"
+  [ "$FUSDK" = "$B24" ] || fail "TP=$tp [FUSED+kill] '$FUSDK' != base '$B24'"
+  # INTFER_DECODE1_WG is a pure work-group SHAPE change on the same kernel, so
+  # it must be bit-exact at a DIFFERENT shape. 32 and 8 exercise both
+  # directions (bigger and smaller groups than the default 16).
+  for wg in 32 8; do
+    WG="$(N=24 ids_of "$tp" INTFER_DECODE1_WG=$wg)"
+    echo "TP=$tp [INTFER_DECODE1_WG=$wg n=24]: '$WG'"
+    [ -n "$WG" ] || fail "TP=$tp INTFER_DECODE1_WG=$wg stream empty (broken run)"
+    [ "$WG" = "$B24" ] || fail "TP=$tp [INTFER_DECODE1_WG=$wg] '$WG' != base '$B24'"
+  done
+  # Fused + a non-default work-group: the two interact through the same nd_range,
+  # and neither alone would catch a slot mapping that only breaks when the group
+  # boundary no longer coincides with a set boundary.
+  FUSW="$(N=24 ids_of "$tp" INTFER_FUSED_DECODE1=1 INTFER_DECODE1_WG=32)"
+  echo "TP=$tp [FUSED + WG=32 n=24]: '$FUSW'"
+  [ "$FUSW" = "$B24" ] || fail "TP=$tp [FUSED+WG=32] '$FUSW' != base '$B24'"
+
+  # The WIDE arm (~97-token prompt => ONE ~97-row batch) is where the fused
+  # kernel MUST DECLINE: M != 1 takes the M>1 tiled path, which the fused launch
+  # does not touch. The n=24 arms above never exercise M>1, so they CANNOT catch
+  # a decline that stopped happening -- this is the arm that does.
+  WB="$(wide_ids_of "$tp")"
+  WFUSED="$(wide_ids_of "$tp" INTFER_FUSED_DECODE1=1)"
+  echo "TP=$tp [wide INTFER_FUSED_DECODE1=1]: '$WFUSED'"
+  [ -n "$WFUSED" ] || fail "TP=$tp wide INTFER_FUSED_DECODE1 stream empty (broken run)"
+  [ "$WFUSED" = "$WB" ] || fail "TP=$tp [wide FUSED] '$WFUSED' != wide base '$WB'"
+  # And the work-group knob must be inert in the M>1 path too, for the same
+  # reason: it only touches the M==1 branch.
+  WWG="$(wide_ids_of "$tp" INTFER_DECODE1_WG=8)"
+  echo "TP=$tp [wide INTFER_DECODE1_WG=8]: '$WWG'"
+  [ "$WWG" = "$WB" ] || fail "TP=$tp [wide WG=8] '$WWG' != wide base '$WB'"
 done
 
 if [ "$PASS" != 1 ]; then
