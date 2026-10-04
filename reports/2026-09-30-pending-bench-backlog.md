@@ -254,6 +254,25 @@ matters for the next session reading this file:
   quoted from any of them yet**. The remaining blocker is unchanged and is NOT
   missing work: see the quiet-box note above.
 
+  *** NAMED LIMITATION OF THIS QUEUE PATH — read before trusting it. *** Three
+  things are now MECHANISED and one is not, and the difference matters:
+
+  | what | how it is proved |
+  |---|---|
+  | the artifact collision guard refuses an existing path | staged, both directions, no GPU (`--guard-only`), via `check_bench_load_gate.sh` |
+  | the same guard stays quiet on a NEW path | staged — it used to be **observed only**, because proving it for real ran the whole 27B block |
+  | the guard can actually fail | state **B-R** removes it from a sandbox copy and the checker must reject |
+  | **the block completes a 3-round interleaved set on the real model** | *** NEVER GATED — only ever OBSERVED, in the five artifacts above *** |
+
+  Every `bench_reports_batch.sh` case in the checker drives a **stub CLI**, so the
+  path those cases exercise is `guard -> refuse -> exit 2` and nothing past it. The
+  real block is gated for shape (syntax, per-arm logging, load gating, the summary's
+  own refusals) but not for *completion*: no gate has ever watched three rounds come
+  out all-`[USABLE]`, and nothing would catch a defect that only appears at round 3.
+  That is the recorded "a gate that cannot exercise the configuration cannot protect
+  it" family, and it is the honest reason this section is still open — **not** a
+  missing experiment. Closing it needs a quiet window, not a new checker.
+
   **LIVE STATE: nothing is queued or in flight.** Verified, not assumed — the last
   `bench_when_quiet.sh` process ended on its own abort and no `intfer_cli` process
   is advancing an artifact, so there is no run to wait for. Nothing in this section
