@@ -162,6 +162,51 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                       gemm::WeightScheme scheme,
                                       const sycl::event& copy_dep);
 
+// ---------------------------------------------------------------------------
+// FUSED INDEPENDENT-GEMM LAUNCH, M=1 only (INTFER_FUSED_DECODE1, default OFF).
+//
+// One nd_range carrying several independent GEMMs' outputs, instead of one
+// N-wide launch each. Exists because M=1 decode is EU-parallelism-bound: the
+// single-GEMM kernel's total work-item count is exactly N and that is invariant
+// to the work-group shape (measured 2026-10-04 -- an output-tiling variant came
+// out 2.3x slower for exactly that reason). q/k/v are three independent GEMMs and
+// gate/up are two, so one launch can occupy 2-3x the EUs.
+//
+// BIT-EXACT: each output is computed by exactly one work-item running the SAME
+// per-output routine the single-GEMM path uses, so every output's K order is
+// untouched and only the launch boundary moves. That is why fusing is the chosen
+// direction and splitting K across work-items is not -- splitting K reassociates
+// the FP32 sum and needs a numerics contract agreed first.
+//
+// `out_offset` MUST be the host-computed prefix sum of the preceding sets' N;
+// the device consumes it and never re-derives the mapping. The eligibility check
+// refuses a set whose fields are not self-consistent rather than trusting them.
+//
+// Returns a default-constructed event when ineligible (the caller must then use
+// the sequential path); otherwise ONE event covering every set's output.
+// ---------------------------------------------------------------------------
+struct FusedDecode1Set {
+  const std::uint8_t* code;    // packed INT2 codes, K codes per row
+  const std::uint16_t* scale;  // FP16 per (row, group)
+  const std::uint16_t* act;    // this GEMM's FP16 activations, K values (M == 1)
+  std::uint16_t* out;          // this GEMM's FP16 output, N values
+  int N, K, group_size;
+  int num_groups;    // MUST equal ceil(K / group_size)
+  int num_groups_w;  // MUST equal num_groups (one home; see .cpp)
+  int out_offset;    // MUST equal the prefix sum of the preceding N
+  float alpha;
+};
+
+inline constexpr int kFusedDecode1MaxSets = 8;
+
+bool fused_decode1_eligible(const FusedDecode1Set* sets, int n);
+
+// nwg: work-group size for the fused launch (0 = default 16).
+sycl::event quant_gemm_fused_decode1(sycl::queue& q,
+                                     const FusedDecode1Set* sets, int n,
+                                     int nwg,
+                                     const sycl::event& copy_dep);
+
 // FP16 x FP16 GEMM for non-quantized tensors like lm_head.
 // C[M,N] = A[M,K] * W[N,K]^T. A is row-major FP16, W is row-major FP16,
 // C is row-major FP16. Uses the XMX DPAS path via the portable FP16 kernel.

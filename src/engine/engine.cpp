@@ -1684,6 +1684,92 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
   // Phase 2: per device — submit all items' kernels back-to-back.
   std::vector<sycl::event> kernel_events;
   kernel_events.reserve(devices_.size() * nl);
+
+  // ---------------------------------------------------------------------
+  // INTFER_FUSED_DECODE1 (EXPERIMENTAL, default OFF; kill switch
+  // INTFER_NO_FUSED_DECODE1=1): ONE nd_range for the whole wave instead of one
+  // N-wide launch per item.
+  //
+  // WHY. At M=1 the single-GEMM decode kernel's total work-item count is exactly
+  // N and that is invariant to the work-group shape, so M=1 decode is
+  // EU-parallelism-bound rather than bandwidth-bound (measured 2026-10-04:
+  // 9.16 GiB of weights per device per token at ~21 % of peak bandwidth, while
+  // an output-tiling variant measured 2.3x SLOWER because it divided the
+  // starved budget). A wave holds `nl` INDEPENDENT GEMMs -- q/k/v is 3, gate/up
+  // is 2 -- so one launch can carry sum(N_i) work-items instead of N_i, which
+  // is the only BIT-EXACT way to raise that budget. Splitting K across
+  // work-items would raise it too, but reassociates the FP32 sum.
+  //
+  // BIT-EXACT: each output element is still computed by one work-item running
+  // the SAME per-output routine as the sequential path (decode1_out_int2_tab,
+  // which the single-GEMM kernel also calls -- one home, so the two cannot
+  // drift). Only the launch boundary moves.
+  //
+  // Declines -- falling through to the sequential loop below, bit-identically --
+  // on anything it is not provably identical on: M != 1, fewer than 2 items,
+  // DPAS48 (already handled above), a non-INT2 scheme, or any ineligible set.
+  const bool fused_on =
+      (std::getenv("INTFER_FUSED_DECODE1") != nullptr) &&
+      (std::getenv("INTFER_NO_FUSED_DECODE1") == nullptr);
+  bool did_fuse = false;
+  if (fused_on && M == 1 && nl >= 2) {
+    for (size_t d = 0; d < devices_.size() && !did_fuse; ++d) {
+      auto& dev = devices_[d];
+      sycl::queue& q = dev.queue;
+      gemm::FusedDecode1Set sets[gemm::kFusedDecode1MaxSets];
+      int ns = 0;
+      int prefix = 0;
+      bool ok = (int)nl <= gemm::kFusedDecode1MaxSets;
+      for (size_t i = 0; ok && i < nl; ++i) {
+        const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
+        const auto& sc = shard_cache_[(size_t)live[i]->tensor_index];
+        const auto& ranges = shards_[live[i]->tensor_index].ranges;
+        auto [start, end] = ranges[d];
+        const int Nl = (int)(end - start);
+        // INT2 only: the fused kernel's shared helper is the INT2 per-output
+        // routine. Any other scheme would be a DIFFERENT arithmetic path, so it
+        // must decline rather than be silently approximated.
+        if (Nl <= 0 || !(sc.scheme == gemm::WeightScheme::INT2)) { ok = false; break; }
+        if (sc.group_size <= 0) { ok = false; break; }
+        const int ng = (int)((t.K + (uint32_t)sc.group_size - 1) /
+                             (uint32_t)sc.group_size);
+        sets[ns].code = (const std::uint8_t*)sc.code_usm[d];
+        sets[ns].scale = sc.scale_usm[d];
+        sets[ns].act = wv_[d * wv_W_ + i].act;
+        sets[ns].out = wv_[d * wv_W_ + i].out;
+        sets[ns].N = Nl;
+        sets[ns].K = (int)t.K;
+        sets[ns].group_size = (int)sc.group_size;
+        sets[ns].num_groups = ng;
+        sets[ns].num_groups_w = ng;
+        sets[ns].out_offset = prefix;   // HOST-computed prefix sum, one home
+        sets[ns].alpha = sc.has_global_divisor ? sc.global_host : 1.0f;
+        prefix += Nl;
+        ++ns;
+      }
+      if (!ok || !gemm::fused_decode1_eligible(sets, ns)) continue;
+#ifdef INTFER_PROFILE_GPU
+      auto t_s0 = std::chrono::high_resolution_clock::now();
+#endif
+      sycl::event e = gemm::quant_gemm_fused_decode1(q, sets, ns, 0,
+                                                     sycl::event{});
+      if (e == sycl::event{}) continue;  // declined: sequential below
+#ifdef INTFER_PROFILE_GPU
+      {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        g_gpu_profile.total_submit_us +=
+            std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+      }
+#endif
+      // ONE event for all nl items: nk/nw drop by (nl-1) per device, which is
+      // the point -- fewer launches AND the same arithmetic.
+      kernel_events.push_back(e);
+      did_fuse = true;
+    }
+  }
+  if (did_fuse) {
+    // fused path handled every device; skip the sequential loop.
+  } else
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto& dev = devices_[d];
     sycl::queue& q = dev.queue;
