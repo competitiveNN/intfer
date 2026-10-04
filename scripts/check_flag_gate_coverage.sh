@@ -82,6 +82,31 @@ git grep -hoE 'getenv\("INTFER_[A-Z0-9_]+"\)[[:space:]]*(==|!=)[[:space:]]*nullp
   -- src examples include >"$TMP/polarity.txt" 2>/dev/null || true
 git grep -hoE '"INTFER_[A-Z0-9_]+"' -- src examples include \
   | tr -d '"' | sort -u >"$TMP/all_read.txt"
+# Flags whose source compares the VALUE to "0" -- i.e. 0 disables the feature.
+#
+# This needed a MULTILINE scan, and the reason is worth recording: the construct
+# is written across two lines --
+#     (std::getenv("INTFER_HOST_AVX2") != nullptr &&
+#      std::string(std::getenv("INTFER_HOST_AVX2")) == "0");
+# -- so every single-line pattern matched NOTHING and the class printed an empty
+# "<none>", which is a vacuous answer rather than a wrong one and is much easier
+# to miss. A harvest that finds zero members of a class expected to be populated
+# is a broken query, so the floor further down requires either a non-empty set
+# or the pattern to be absent from the source entirely.
+python3 -c '
+import os, re
+pat = re.compile(r"getenv\(\s*\"(INTFER_[A-Z0-9_]+)\"\s*\)\s*!=\s*nullptr[^;]*?==\s*\"0\"", re.S)
+found = set()
+for base in ("src", "examples", "include"):
+    for root, _, files in os.walk(base):
+        for fn in files:
+            if fn.endswith((".cpp", ".hpp")):
+                try:
+                    found.update(pat.findall(open(os.path.join(root, fn), errors="replace").read()))
+                except OSError:
+                    pass
+print("\n".join(sorted(found)))
+' >"$TMP/disabler.txt"
 
 # The census AGENTS.md documents: read by the engine, named by NO gate.
 git grep -hoE '[a-z_]*\("INTFER_[A-Z0-9_]+"' -- src examples include \
@@ -134,12 +159,30 @@ is_oper() { grep -qE '^(INTFER_(PRELOAD|SCHED|SERVE_MAX|SPEC_K|SPLIT_ITER|PCACHE
 # rests on. See the header for why the getenv test cannot decide it.
 is_kill() { grep -qE '^INTFER_NO_' <<<"$1"; }
 
-optin_res=""; kill_res=""; diag_res=""; oper_res=""; other_res=""
+# *** A THIRD SPELLING, AND IT IS THE ONE THAT SORTS WRONG. *** Besides the
+# NO_ prefix and plain opt-in, this tree has flags where the VALUE turns the
+# feature OFF: INTFER_HOST_AVX2 ( =0 -> no_avx2), INTFER_LMHEAD_DPAS ( =0),
+# INTFER_PREFILL_RR ( =0 -> rr_off). They are kill switches that do not use the
+# NO_ prefix, and MEASURED: the first version of this script filed all three
+# under "opt-in -- REAL GAP", which overstates the gap by three and points
+# someone at writing stream-identity arms for flags whose DEFAULT the gates
+# already test.
+#
+# The signal is DERIVED, not remembered: the source tests the value against "0",
+# so the flag being set to 0 is what disables the feature. That is the inverse of
+# an opt-in, whatever the variable happens to be named.
+is_disabler() {  # $1 = flag
+  grep -F "$1" "$TMP/disabler.txt" 2>/dev/null | grep -q . && return 0
+  return 1
+}
+
+optin_res=""; kill_res=""; diag_res=""; oper_res=""; dis_res=""
 while read -r f; do
   [ -n "$f" ] || continue
   if   is_diag "$f"; then diag_res="$diag_res $f"
   elif is_oper "$f"; then oper_res="$oper_res $f"
   elif is_kill "$f"; then kill_res="$kill_res $f"
+  elif is_disabler "$f"; then dis_res="$dis_res $f"
   else   optin_res="$optin_res $f"; fi
 done <"$TMP/residue.txt"
 
@@ -151,6 +194,9 @@ echo "  kill switch (default ON; gates already test the default path):"
 echo "     ${kill_res:-<none>}"
 echo "  diagnostic (print paths, not arithmetic):"
 echo "     ${diag_res:-<none>}"
+echo "  disabler (value 0 turns the feature OFF, no NO_ prefix -- also a kill"
+  echo "   switch; the default path is what the gates already test):"
+echo "     ${dis_res:-<none>}"
 echo "  operational (runtime knobs):"
 echo "     ${oper_res:-<none>}"
 echo "  (class rests on the INTFER_NO_* naming convention; the getenv"
@@ -192,7 +238,9 @@ if [ "$bad" -eq 0 ]; then
   echo "NOTE: only the OPT-IN class is a certification gap. A kill switch or a"
   echo "  diagnostic in the residue says nothing about whether the DEFAULT path"
   echo "  is certified -- the gates already exercise that."
-  echo "RESULT: flag/gate coverage classified by polarity; $n_opt opt-in flag(s) ungated"
+  n_dis="$(wc -w <<<"$dis_res" | tr -d ' ')"
+echo "RESULT: flag/gate coverage classified by polarity; $n_opt opt-in flag(s) ungated"
+echo "        ($n_dis more are '=0 disables' kill switches that do not use the NO_ prefix)"
   exit 0
 fi
 echo "FLAG/GATE COVERAGE: FAIL ($bad problem(s)) -- see above" >&2

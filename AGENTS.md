@@ -29,6 +29,15 @@ It is HOST-SIDE driver enumeration state, not a code fault. Three consequences:
 * The 1-GPU investigation is a record of ONE of those windows. It is true history
   and it stays, but **do not read it as the current box state and do not "fix"
   anything in it.**
+* **NEVER report "no GPU visible" from an agent session without sourcing
+  `setvars.sh` first.** MEASURED TWICE IN ONE SESSION, WRONG BOTH TIMES: a missing
+  `source /opt/intel/oneapi/setvars.sh` was reported as "the documented
+  container/host driver mismatch" and the operator was told a 27B handoff could
+  not run; the second time the same omission hung `check_device_precond.sh` to a
+  timeout. `SYCL: sycl-ls not available` is a statement about **PATH**, not about
+  the machine. The preconditions now print an `ENVIRONMENT, NOT BOX STATE` banner
+  with the remedy, pinned by `scripts/check_env_not_box_state.sh` (whose last
+  assertion is a live probe, so the banner is proved to print).
 * Any tally that depends on visible device count (PARTIAL / SKIPPED) is only
   meaningful together with the count it was measured at. **Re-derive it with
   `scripts/gate_inventory.sh`; never read one off this file.**
@@ -258,10 +267,20 @@ comm -23 /tmp/f_src /tmp/f_gate      # read by the engine, named by NO gate
 
 ```
 opt-in        default OFF, changes arithmetic, no gate names it -> A REAL GAP
-kill switch   the feature is ON by default and the env var turns it OFF
+kill switch   feature ON by default, env var turns it OFF (INTFER_NO_*)
+disabler      the VALUE turns it off (`X=0`), no NO_ prefix -- ALSO a kill
+              switch: INTFER_HOST_AVX2, INTFER_PREFILL_RR
 diagnostic    _DBG/_TRACE/_WHY/_TIME/_SNAP/_CHECK: print paths, not arithmetic
 operational   PRELOAD*/SCHED/SERVE_MAX/PCACHE*/KV_CAP/...: runtime knobs
 ```
+
+**There are three spellings of "this flag changes behaviour", and only one of
+them is a certification gap.** The `X=0` form was the one initially missed, which
+overstated the gap by two: a disabler's DEFAULT is what the gates already test.
+Its signal is derivable — the source compares the value to `"0"` — but only across
+a line break, so a single-line grep finds nothing and prints an empty class that
+looks like "no such flags". That is a vacuous answer, not a wrong one, and is
+much harder to notice.
 
 A kill switch in the residue says **nothing** about whether the default is
 certified: the gates already exercise the default path. Only the opt-in class is
@@ -282,6 +301,16 @@ deliberately approximate and asserting identity would ship a gate that fails for
 a legitimate reason. `INTFER_PREFILL_RR` is a good example of why reading
 matters — it is a *scheduling* knob (round-robin vs head-of-line), not a
 rounding-order flag, so an arm would be testing the wrong thing entirely.
+
+**`INTFER_LMHEAD_FP16` is DISCLAIMED, and here is why — do not add an arm for
+it.** It is read only at `M > 1` (the `M == 1` early return precedes it), so an
+arm must exercise prefill, not decode. And it swaps an **INT8-DPAS** lm_head for
+an **FP16** one, which is lossy *by construction* — the two paths are not
+expected to produce the same logits, and asserting they do would ship a gate that
+fails for a legitimate reason. Certifying it needs a tolerance-based numerics
+contract like the one in `examples/ksplit_contract`, calibrated against real
+activations, which cannot be done from an agent session. Recorded as
+**UNCERTIFIED-BY-DISCLAIM** rather than left to look like an oversight.
 
 **`INTFER_DECODE1_SPLITK` is the worked example of doing this right**, and the
 opposite of MR — including how a kernel is caught. It shipped with

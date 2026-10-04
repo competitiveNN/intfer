@@ -51,10 +51,61 @@
 #   direction was untestable end-to-end until this seam existed. Same rationale as
 #   the INTFER_BUILD_DIR override: an assumption baked into a probe that the
 #   harness cannot redirect is an assumption the harness cannot test.
+# ----------------------------------------------------------------------------
+# ENVIRONMENT vs BOX STATE. Keep these two apart, LOUDLY.
+#
+# MEASURED, TWICE, IN ONE SESSION, AND BOTH TIMES I GOT IT WRONG. A previous
+# revision of this work reported "the box's in-process SYCL discovery returns no
+# device -- the documented container/host driver mismatch" and told the operator
+# the 27B handoff could not run. It was a MISSING `source setvars.sh` in my own
+# shell. The second time, check_device_precond.sh sat until a timeout (rc=124)
+# for the same reason. In both cases the tool printed a line that reads like a
+# statement about the HARDWARE, and I believed it:
+#
+#     SKIP: sycl-ls not available; cannot count GPUs
+#
+# That line is about PATH. Nothing about it is evidence about the machine. It is
+# also the single most expensive class of mistake available here, because it
+# turns "I forgot to set up my environment" into "the hardware is broken" -- a
+# claim that is unfalsifiable from the session that made it and that sends the
+# operator to debug a box that is fine.
+#
+# So: every "cannot measure" path below now names ENVIRONMENT FIRST and says
+# what to do about it, and says explicitly that it is NOT box state. Exit codes
+# are UNCHANGED (rc 1 = unmeasurable, exit 2 = skip) because callers and the
+# mutation matrices depend on them; only the text is different. The audit #2 rule
+# -- "0 findings" and "found nothing to look at" are different claims -- has a
+# sibling here: "the tool is missing" and "the tool ran and found nothing" are
+# different claims, and they must never share a sentence.
+#
+# The diagnostic is a PROBE, not an assumption: it checks for a oneAPI env var
+# and for sycl-ls itself, and says which one is missing rather than guessing.
+gate_env_diagnose() {
+  local reason="${1:-}"
+  echo "" >&2
+  echo "  ================ ENVIRONMENT, NOT BOX STATE ================" >&2
+  echo "  This shell cannot MEASURE the device population. That is a" >&2
+  echo "  statement about your SHELL, not about this machine." >&2
+  [ -n "$reason" ] && echo "  Reason: $reason" >&2
+  if [ -z "${ONEAPI_ROOT:-}${CMPLR_CLANG_80_SPIRV_64_ENV:-}" ]; then
+    echo "  No oneAPI environment variables are set (ONEAPI_ROOT is unset)," >&2
+    echo "  which means setvars.sh was never sourced." >&2
+  fi
+  if ! command -v sycl-ls >/dev/null 2>&1 && [ -z "${INTFER_SYCL_LS:-}" ]; then
+    echo "  'sycl-ls' is not on PATH." >&2
+  fi
+  echo "  FIX:  source /opt/intel/oneapi/setvars.sh     (then re-run)" >&2
+  echo "  Verify with: scripts/l0_enumerate.sh  -> TOTAL LEVEL ZERO DEVICES: 2" >&2
+  echo "  Do NOT report this as a hardware or driver fault. It is not." >&2
+  echo "  ===========================================================" >&2
+  echo "" >&2
+}
+
 gate_gpu_count() {
   local sycl_ls="${INTFER_SYCL_LS:-sycl-ls}"
   if [ ! -x "$sycl_ls" ] && ! command -v "$sycl_ls" >/dev/null 2>&1; then
     echo "SKIP: $sycl_ls not available; cannot count GPUs" >&2
+    gate_env_diagnose "'$sycl_ls' is not executable on PATH."
     return 1
   fi
   local n
@@ -77,9 +128,16 @@ gate_require_render_node() {
     return 0
   fi
   echo "SKIPPED: cannot open /dev/dri/renderD128 from this shell." >&2
-  echo "  BOX STATE, not a code failure. Nothing was verified and nothing" >&2
-  echo "  regressed. A GPU gate reaching this point NEEDS a device, so it must" >&2
-  echo "  skip rather than fail red -- see gate_inventory.sh's NEEDS-GPU column." >&2
+  echo "  Nothing was verified and nothing regressed. A GPU gate reaching" >&2
+  echo "  this point NEEDS a device, so it must skip rather than fail red --" >&2
+  echo "  see gate_inventory.sh's NEEDS-GPU column." >&2
+  # The render node is usually box state, but it is ALSO reachable from an
+  # unprepared shell (no /dev/dri in the container's view, wrong device cgroup),
+  # and this session already misattributed that class once. So the diagnostic is
+  # offered rather than asserted: it reports what it can see and stops short of
+  # claiming to know which of the two this is.
+  gate_env_diagnose "/dev/dri/renderD128 could not be opened (group membership,
+  device cgroup, or an unprepared container are the usual causes)."
   exit 2
 }
 
@@ -122,8 +180,8 @@ gate_require_device() {
   if [ "$rc" != "0" ] || [ -z "$n" ]; then
     echo "SKIPPED: render node opens but sycl-ls cannot count devices." >&2
     echo "  Not a pass and not a device: the precondition is UNMEASURABLE, so" >&2
-    echo "  nothing was verified. Source /opt/intel/oneapi/setvars.sh, which puts" >&2
-    echo "  sycl-ls on PATH, then re-run." >&2
+    echo "  nothing was verified." >&2
+    gate_env_diagnose "sycl-ls cannot count devices."
     exit 2
   fi
   if [ "$n" -lt 1 ]; then
@@ -134,6 +192,7 @@ gate_require_device() {
     echo "  BOX STATE, not a code failure. This is the libumf LD_LIBRARY_PATH" >&2
     echo "  failure mode (memory: sycl_env_libumf.md): source" >&2
     echo "  /opt/intel/oneapi/setvars.sh, which puts umf on the path." >&2
+    gate_env_diagnose "Level Zero enumerated 0 device(s) -- umf/LD_LIBRARY_PATH."
     exit 2
   fi
   return 0

@@ -2,7 +2,10 @@
 
 **Date:** 2026-10-04
 **Status:** kernel BUILT, **stream-identical to base on 27B**, and
-**MEASURED SLOWER** — see §6. Default OFF, gated, `RESULT:` filled in.
+**MEASURED SLOWER** — see §6. Default OFF, gated.
+§8a carries the counter verdict I measured; **§8b is blank and yours** — it is
+the 64-token oracle run, and until it runs `check_engine_cert.sh` correctly
+reports the engine certification as STALE.
 
 ---
 
@@ -222,15 +225,49 @@ plus `local_accessor` cost against a kernel that is already latency-bound; in
 that case do **not** re-attempt per-work-item output tiling (measured, 2.3×
 slower) and do **not** retry contiguous chunks (measured strided).
 
-## 8. RESULT:
+## 8. RESULT — two separate claims, and only one is mine
+
+These are deliberately NOT one block. The protocol's rule is "a partially filled
+RESULT is worse than a blank one", and the reason is that three wall-time claims
+in this project were retracted for having no artifact behind them. The counter
+verdict below is mine, measured, paired, and spread-checked. The full-gate
+confirmation is yours and is still blank. Merging them would make a filled block
+look like a completed one.
+
+### 8a. COUNTER VERDICT — measured here, load-insensitive buckets only
 
 ```
-RESULT: 27B --tp 2 decode, 3 paired rounds, -n 8. kernel base 267 ms (spread 3)
-        vs split-K 384 ms (spread 6) -> +117 ms / +43.8 %, 3/3 same sign,
-        clears the 6 ms spread floor. nk/nw/nr identical (992/992/256).
-        Stream IDENTICAL to base. VERDICT: LOSS -- do not promote, flag stays
-        default OFF.
+RESULT (counters, measured 2026-10-04, 27B --tp 2 decode, -n 8, prompt "hello",
+        3 paired alternating rounds, warmed):
+        kernel   base 265/268/267 ms  median 267  spread 3
+        kernel   split-K 384/380/386  median 384  spread 6
+        delta    +117 ms  +43.8 %  3/3 same sign
+        spread floor = max(3,6) = 6 ms; delta clears it by ~19x
+        nk/nw/nr 992/992/256 IDENTICAL in both arms
+        stream   IDENTICAL to base (11 585 1044 264 5286 303 279 11759)
+        VERDICT  LOSS -- do not promote; the flag stays default OFF.
+        NOTE     `kernel` is the only load-insensitive bucket; no tok/s or
+                 wall-time figure is claimed anywhere in this file.
 ```
+
+### 8b. FULL-GATE CONFIRMATION — blank, yours
+
+This is the run that re-certifies the engine, and it cannot be done from an agent
+session (standing rule). It is currently **STALE**: `src/gemm/quant_gemm.cpp`
+changed, so `scripts/check_engine_cert.sh` reports that the ten-gate
+certification no longer carries to HEAD. Your run clears it.
+
+```sh
+cd /var/home/fra/dev/intfer
+source /opt/intel/oneapi/setvars.sh
+scripts/run_ten_gates.sh      # 64-token oracle; the SPLITK arm runs here
+scripts/check_engine_cert.sh  # must stop reporting STALE
+```
+
+```
+RESULT (full gate, operator):
+```
+
 
 ## 9. Two things deliberately NOT done
 
