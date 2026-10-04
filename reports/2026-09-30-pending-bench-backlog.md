@@ -254,7 +254,7 @@ matters for the next session reading this file:
   quoted from any of them yet**. The remaining blocker is unchanged and is NOT
   missing work: see the quiet-box note above.
 
-  *** NAMED LIMITATION OF THIS QUEUE PATH — read before trusting it. *** Six rows
+  *** NAMED LIMITATION OF THIS QUEUE PATH — read before trusting it. *** Nine rows
   below are now MECHANISED and one is not, and the difference matters:
 
   | what | how it is proved |
@@ -265,6 +265,9 @@ matters for the next session reading this file:
   | a CONCURRENT run is refused, and the live holder's lock SURVIVES | staged, all four cells (`--guard-only` + `INTFER_WQ_LOCK`) |
   | a DEAD holder's lock self-heals, loudly, naming the pid | staged — and state **B-T** deletes the self-heal, so it must be caught |
   | the concurrency guard can actually fail | state **B-S** drops the `kill -0` liveness proof, so the self-heal becomes a takeover |
+  | the lock is GONE after a run ends, on BOTH paths | staged: a normal EXIT, and a real SIGTERM mid-wait where the process must **exit 143** |
+  | "it terminated" and "it released the lock" are separate claims | state **B-U** (exits nothing) and **B-V** (exits but leaks) — one per claim |
+  | no script in `scripts/` repeats either trap defect | `scripts/check_trap_release.sh`, population derived (41 subjects), and `scripts/check_guard_identity.sh` for the name/lock family |
   | **the block completes a 3-round interleaved set on the real model** | *** NEVER GATED — only ever OBSERVED, in the five artifacts above *** |
 
   Every `bench_reports_batch.sh` case in the checker drives a **stub CLI**, so the
@@ -295,6 +298,16 @@ matters for the next session reading this file:
   waiting for. A lock was the only thing that could see it, and both directions
   are staged in `check_bench_load_gate.sh` — including that a refused run must NOT
   delete the live holder's lock, which is the whole safety argument.
+  *** AND THE LOCK HAS TO BE GIVABLE UP, which is a second defect found by
+  measuring it instead of trusting it. *** `trap ... EXIT INT TERM` — the AUDIT #29
+  remedy — cleans up and then **resumes**, so the process survives SIGTERM; and GNU
+  `timeout` waits for its child, so a step that ignores its signal does not fail, it
+  **hangs the whole stack**. Bash also DEFERS a trap behind a foreground command, so
+  a plain `sleep 30` in the wait loop delayed the handler by up to 30 s. Measured
+  before the fix: 10 s after SIGTERM the lock was still there and the process still
+  alive. After it: exit 143, lock gone. The sleep is now backgrounded and `wait`ed
+  on, and every `timeout` in `run_all_checks.sh` carries `-k 30`, so termination is
+  unconditional even if a step swallows the signal outright.
   Nothing in this section moves until a session starts one deliberately:
   `setsid bash scripts/bench_when_quiet.sh --max-wait 21600 > build/bench_logs/wq_$(date -u +%Y%m%dT%H%M%SZ).$$.out 2>&1 &`
   (the unique capture name is not optional — a fixed name silently overwrites the
