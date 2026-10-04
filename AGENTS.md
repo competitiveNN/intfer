@@ -416,6 +416,68 @@ grouping them into a **single kernel launch**, not merely a single host phase.
 Do **not** re-attempt per-work-item output tiling at M=1. It is measured, and the
 mechanism is structural rather than a tuning miss.
 
+### ==> SHIPPED 2026-10-04: (b) IS NOW BUILT. `INTFER_FUSED_DECODE1` + `INTFER_DECODE1_WG`. <==
+
+Both **default-OFF**, unset == byte-identical. Batch report with the counters and
+blank `RESULT:` lines: `reports/2026-10-04-batch-fused-decode.md`.
+
+**`INTFER_FUSED_DECODE1=1`** (kill switch `INTFER_NO_FUSED_DECODE1=1`) — one
+`nd_range` for a whole wave of independent GEMMs, so a launch carries `sum(N_i)`
+work-items instead of `N_i`. `nk`/`nw` drop by `(nl-1)` per device. Rides the
+existing wave seam, so `INTFER_NO_WAVE=1` still restores sequential.
+
+Bit-exact **structurally, not by inspection** — and that is the part worth
+carrying forward:
+
+* The per-output INT2 arithmetic was extracted **verbatim** into ONE file-local
+  routine `decode1_out_int2_tab`, called by **both** the single-GEMM and the fused
+  kernel. So K order, scale table, tail expression and byte indexing cannot land
+  in one caller and not the other.
+* The extraction **preserves a pre-existing asymmetry on purpose**: the main
+  chunk applies the scale via a register table (`av * wtab[code]`) while the
+  scalar tail uses `av * scale * canon_value(...)`. Those associate differently
+  — `(av*scale)*cv` vs `av*(scale*cv)` — and that ~1 ulp difference is the
+  oracle-gated consequence of the table hoist. **Tidying it would be a numerics
+  change disguised as a refactor.**
+* It takes the **global** code pointer plus `ng`, not a pre-offset row pointer.
+  Byte offsets use the global index `(ng*K + kg)/4`, so when `K % 4 != 0` the
+  rows are not byte-aligned and `row_base/4` is fractional; pre-offsetting would
+  have silently changed WHICH BYTES ARE READ.
+* The slot -> (set, output) mapping is a **host-computed prefix sum**
+  (`out_offset`). The device consumes it and never re-derives it.
+* `fused_decode1_eligible()` **verifies rather than trusts** `num_groups`,
+  `num_groups_w` and `out_offset`. `out_offset` is the device's only source of
+  the mapping, so a wrong one is a SILENTLY wrong answer, not a crash. Declines
+  on: `M != 1`, `nl < 2`, >8 sets, **any non-INT2 scheme**, null buffers,
+  `group_size <= 0`, and any inconsistent set.
+
+**`INTFER_DECODE1_WG=<n>`** — M=1 decode work-group size only, default 16 (the
+historical `kThr`), clamped [1,256], rounded down to a power of two. `kThr` is
+deliberately NOT touched: it also sets the M>1 tiled geometry and prefill has its
+own measurements. **Recorded with its ceiling:** total work-items is
+`ceil(N/nWG)*nWG ~= N` and is essentially **invariant** to `nWG`, so this cannot
+fix the ~4-threads/EU starvation. It moves lane utilisation (`kThr=16` may
+under-fill a 32-wide SIMD) and the work-group count the scheduler can spread
+across (256 groups at 8, 128 at 16, 64 at 32). Second-order, not a fix.
+
+**Gating.** `scripts/test_gpu_optin.sh` arms at TP=1 **and** TP=2: flag-on equals
+base at n=24; the **kill switch** also equals base (so "default == base" is not
+certified by luck); WG at 32 and 8; FUSED+WG=32 together; and the **wide ~97-row
+arm** where the kernel must decline — the only arm that can catch a broken
+decline, since the n=24 arms never exercise M>1.
+`scripts/mutate_fused_decode.sh` is 4 artifact states (G-A shared-routine bypass,
+G-B device-side slot re-derivation, G-C eligibility weakened, G-D the `M != 1`
+decline removed) **plus G-E, the converse, which runs FIRST**: healthy streams
+identical *and* the fused path proven **reachable** by launch-counter movement,
+because a kernel that always declines would satisfy every other state without
+ever running. Wired into BOTH `dispatch()` and `STEPS`.
+
+**What is still NOT done, and is the next thing to attempt:** splitting K across
+work-items. It raises parallelism *and* coalesces the weight loads, and it is the
+only remaining lever on the M=1 budget — but it **reassociates the FP32 sum**, so
+it needs a **tolerance-based numerics contract agreed BEFORE any code is
+written**. It is not a tuning change.
+
 ## ==> PARAMOUNT DIRECTIVE (2026-10-04): OPTIMIZE FIRST. WALL-TIME BENCHMARKING IS RETIRED. <==
 
 **The single objective of this project right now is to make 27B (`--tp 2`)
