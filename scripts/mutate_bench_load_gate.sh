@@ -477,6 +477,28 @@ MUTATE_FN() {
 run_state "B-Q" 'B_Q' 'e2e-prefill' \
   "the phase wildcard reverted to a hardcoded @decode, so a @prefill refusal is missed"
 
+# B-R: the artifact collision guard, BOTH directions. An ARTIFACT-defect state
+# (AUDIT #21): the checker is correct by construction, so weakening it would be
+# unobservable -- the guard lives in bench_when_quiet.sh, and the checker only
+# drives it.
+#
+# This state removes the refusal entirely, so a second launch would silently append
+# to the previous run's artifact. Measured consequence of that: with three launches
+# onto a fixed name, "which run produced the four [USABLE] arms" became
+# unanswerable, and the per-round table in the backlog had to be reconstructed from
+# five separate artifacts. The quiet direction is what makes the state decidable --
+# a checker that only ever saw the refusal would be satisfied by a guard that
+# refuses unconditionally, which is the mirror defect.
+MUTATE_FN() {
+  patch_literal "$SB/scripts/bench_when_quiet.sh" \
+    'if [ -e "$RUNLOG" ]; then' \
+    'if false; then  #B_R the collision guard, removed' || return 1
+  bash -n "$SB/scripts/bench_when_quiet.sh" || return 1
+  grep -q 'B_R the collision guard' "$SB/scripts/bench_when_quiet.sh"
+}
+run_state "B-R" 'B_R' 'guard-refuses-existing-path' \
+  "the collision guard removed, so a second launch would append to the first run's artifact"
+
 restore
 echo
 echo "== residue + restore integrity =="

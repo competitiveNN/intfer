@@ -663,6 +663,64 @@ STUB
     fi
   fi
 
+  # -- ARTIFACT COLLISION GUARD: BOTH directions, in seconds, no GPU ----------
+  # scripts/bench_when_quiet.sh captures itself to a per-run artifact path. A second
+  # launch onto the SAME path would append to it, and then the artifact could no
+  # longer say which run produced which line -- an ambiguous log, which is the
+  # AUDIT #22 artifact problem again. The script refuses an existing path.
+  #
+  # *** BOTH DIRECTIONS ARE REQUIRED AND BOTH ARE NOW STAGED. *** The "must stay
+  # quiet" half used to cost a whole 27B block, which is why it could only ever be
+  # OBSERVED (in the artifacts the script wrote) and never checked -- and a proof
+  # that lives only in a transcript is not a proof. `--guard-only` evaluates the
+  # collision decision and stops, so the quiet direction costs nothing.
+  #
+  # $LOADAVG is a seam, so this runs on a BUSY box: without it the script's quiet
+  # wait would give up first and the refusal would never be reached. Measured: that
+  # is what the first attempt proved -- the give-up path, not the guard.
+  GD="$(mktemp -d "$BUILD_DIR/.guardonly.XXXXXX")" 2>/dev/null \
+    || GD="$(mktemp -d "${TMPDIR:-/tmp}/intfer_guardonly.XXXXXX")"
+  printf '0.10 0.20 0.30\n' > "$GD/load"
+  printf 'PRECIOUS ARTIFACT\n' > "$GD/old.log"
+  g_before="$(cat "$GD/old.log")"
+  LOADAVG="$GD/load" INTFER_RUNLOG="$GD/old.log" \
+    timeout 60 bash "$SCRIPT_DIR/bench_when_quiet.sh" --guard-only >"$GD/hit.out" 2>&1
+  g_hit_rc=$?
+  LOADAVG="$GD/load" INTFER_RUNLOG="$GD/new.log" \
+    timeout 60 bash "$SCRIPT_DIR/bench_when_quiet.sh" --guard-only >"$GD/miss.out" 2>&1
+  g_miss_rc=$?
+  g_after="$(cat "$GD/old.log")"
+  # NOTE ON POLARITY: every one of these is pred_expect_present on '^0$' for an
+  # ABSENT thing, never pred_expect_absent on a COUNT. The second is the recorded
+  # inverted-predicate trap -- "0" as a haystack with '^0$' as the pattern asks for
+  # zero NOT to be present, so it fails on correct code. The helper failed loudly
+  # with the polarity named, which is exactly why the rule exists.
+  # (a) an EXISTING artifact is refused, and left byte-identical
+  # (b) a NEW path is accepted, the refusal message is ABSENT, nothing is created
+  if pred_expect_present "guard-refuses-existing-path" "$g_hit_rc" '^2$' \
+     && pred_expect_present "guard-refusal-names-the-path" \
+          "$(grep -c 'already exists -- refusing to append' "$GD/hit.out" || true)" '^[1-9]' \
+     && pred_expect_present "guard-left-the-artifact-untouched" \
+          "$([ "$g_before" = "$g_after" ] && echo same || echo differs)" '^same$' \
+     && pred_expect_present "guard-stays-quiet-on-a-new-path" "$g_miss_rc" '^0$' \
+     && pred_expect_present "guard-quiet-path-has-no-refusal" \
+          "$(grep -c 'refusing to append' "$GD/miss.out" || true)" '^0$' \
+     && pred_expect_present "guard-created-nothing-on-the-quiet-path" \
+          "$([ -e "$GD/new.log" ] && echo created || echo absent)" '^absent$'; then
+    echo "  ok    collision guard: an existing artifact path is REFUSED (rc=2) and"
+    echo "        left byte-identical; a NEW path is accepted (rc=0) with no"
+    echo "        refusal and nothing created -- both directions, no GPU"
+  else
+    echo "  FAIL  collision-guard: existing-path rc=$g_hit_rc, new-path rc=$g_miss_rc."
+    echo "        An artifact that two runs append to cannot say which run produced"
+    echo "        which line, and a guard that refuses everything would make the"
+    echo "        queued benchmark impossible to start at all. Got:"
+    sed 's/^/          [hit ] /' "$GD/hit.out" | tail -4
+    sed 's/^/          [miss] /' "$GD/miss.out" | tail -4
+    bad=$((bad + 1))
+  fi
+  rm -rf "$GD"
+
   # (7d) *** THE HARNESS MUST HONOUR THE SUMMARY'S VERDICT. *** STATIC, and
   # labelled so: driving the harness end-to-end needs a GPU and a model, and a
   # comment-shaped check would be worse than none (see the note at the top about
