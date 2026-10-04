@@ -648,9 +648,27 @@ fi
 # self-check and its matrix can drive synthetic steps, and requiring synthetic
 # coverage of the real scripts would make the seam unusable. It says SKIP rather
 # than passing silently, because a quiet skip reads as a verdict.
-if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
-  echo "== 0c STEPS-membership check SKIPPED (INTFER_RUN_ALL_STEPS is set: this run"
-  echo "      drives synthetic steps, so real coverage is NOT being asserted) =="
+#
+# ALSO skipped, LOUDLY, under INTFER_QUICK=1. That mode exists to run CHECKERS only
+# and deliberately leaves every matrix out of STEPS, so 0c saw the whole matrix
+# population as "never scheduled" and FAILED the run. That made INTFER_QUICK=1
+# STRUCTURALLY UNABLE TO PASS -- not "it failed once" but "no code state can make
+# it pass", which is the worst kind of gate result, because it trains everyone to
+# ignore the line. Found while re-certifying after a revert, i.e. exactly when a
+# fast check-only pass is most wanted.
+#
+# SKIP and not PASS: under QUICK the schedule genuinely is not being asserted,
+# and saying SKIP keeps "an assumption no harness can redirect is one no harness
+# can test" intact. QUICK removes steps, so membership cannot be checked.
+if [ -n "${INTFER_RUN_ALL_STEPS:-}" ] || [ "${INTFER_QUICK:-0}" = "1" ]; then
+  if [ "${INTFER_QUICK:-0}" = "1" ]; then
+    echo "== 0c STEPS-membership check SKIPPED (INTFER_QUICK=1: this run runs" >&2
+    echo "      CHECKERS only and leaves every matrix out of STEPS by design, so" >&2
+    echo "      scheduling is NOT being asserted. Not a pass, and not a failure.)" >&2
+  else
+    echo "== 0c STEPS-membership check SKIPPED (INTFER_RUN_ALL_STEPS is set: this run"
+    echo "      drives synthetic steps, so real coverage is NOT being asserted) =="
+  fi
 else
   echo "== 0c every check_*/mutate_* is SCHEDULED (an arm alone never runs) =="
   UNSCHEDULED=""
