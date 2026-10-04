@@ -594,6 +594,24 @@ narrative with the measurements is in `docs/audit-log-tooling.md`):
     was clean at HEAD and dirty after an edit means the edit.
 15. **No backticks in `git -m`** — the shell runs them as command substitution. A
     distinct heredoc delimiter when nesting `python3 - <<'PY'` inside another.
+16. **COMMIT BEFORE ANY DESTRUCTIVE GIT, and prefer a probe that never touches the
+    tracked tree.** Measured, expensively: a throwaway probe was reverted with
+    `git reset --hard HEAD~1` from a shell carrying ~40 minutes of unrelated
+    uncommitted work. The command succeeded, the work was gone, and nothing said
+    so. *No script did that — the hazard was a command typed at a prompt, which is
+    why this rule lives here and not only in the tooling.*
+    * Commit first. A `reset --hard` with uncommitted work on top is the single
+      most expensive command available, and it is indistinguishable from a safe one.
+    * Prefer a **non-destructive probe**: copy the file under `build/`, mutate the
+      copy, run the same function against it. Same evidence, zero risk. That is how
+      the `patch_literal` 0-match / 1-match / 2-match directions were proven.
+    * `scripts/check_destructive_git.sh` enforces the script half: any script
+      performing a destructive git op must refuse to run on a dirty tree. Its
+      harvest strips **comments first** — `mutate_tp2_selfcheck.sh` mentions
+      `git checkout --` exactly once, inside a comment explaining that it
+      deliberately needs no guard, so a naive grep flags a script that is correct.
+      That is the same lesson as deleting the hand-written flag census: derive from
+      the executable text, never from prose.
 
 ## Flag certification status
 
