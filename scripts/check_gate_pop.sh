@@ -48,7 +48,7 @@ echo "== GATE POP SELF-CHECK (_gate_pop.sh) =="
 # n_cases. A shared counter cannot be targeted by a single-line mutation
 # anchor (all five increments are identical text), so the matrix could not
 # remove one case without matching all five.
-n_a=0; n_b=0; n_c=0; n_d=0; n_e=0
+n_a=0; n_b=0; n_c=0; n_d=0; n_e=0; n_f=0
 
 # ---- (a) every REAL prefix form a matrix actually uses must be recognised ---
 echo "-- (a) prefix forms: every form a real matrix writes is OWNED --"
@@ -135,14 +135,40 @@ else
   bad=$((bad+1))
 fi
 
+# ---- (f) A COMMENT IS NOT A DECLARATION ------------------------------------
+# MEASURED 2026-10-04. A new matrix explained in its comment block that STAMP
+# declarations must start with a known base var, and quoted a sibling's real
+# declaration as an EXAMPLE. known_dirs() read that prose as a declaration, so
+# the new matrix's own directory was reported as an unowned leak -- a false alarm
+# on a healthy tree, which is the exact failure _gate_pop.sh's header says the
+# derivation exists to prevent. Both directions are required: the comment must be
+# IGNORED, and the real declaration in the same file must still be harvested.
+echo "-- (f) a comment quoting a declaration is ignored; the real one is not --"
+cat > "$SYN/mutate_f.sh" <<'EOF'   # MUTANT payload
+# e.g. mutate_l0_cite.sh: STAMP="$BUILD_DIR/quoted_example_mutate"
+LOG_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/real_decl_mutate"
+EOF
+k="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; known_dirs")"
+rm -f "$SYN/mutate_f.sh"
+if printf '%s' "$k" | tr ' ' '\n' | grep -qx 'real_decl_mutate' \
+   && ! printf '%s' "$k" | tr ' ' '\n' | grep -qx 'quoted_example_mutate'; then
+  echo "  ok    real declaration harvested, the commented one ignored"
+  n_f=$((n_f+1))
+else
+  echo "  FAIL  got: $k"
+  echo "        want real_decl_mutate present and quoted_example_mutate absent --"
+  echo "        reading a comment as a declaration is a false leak on a clean tree"
+  bad=$((bad+1))
+fi
+
 # A DROPPED CASE MUST FAIL. Each case bumps `bad` only when its assertion
 # FAILS; merely deleting a case removes an ok line and leaves bad=0, so the
 # checker still exited 0 with a measurement silently gone. Caught by
 # mutate_gate_pop.sh -- all five states scored MISSED until this existed.
 n_ok=0
-for v in "$n_a" "$n_b" "$n_c" "$n_d" "$n_e"; do n_ok=$((n_ok+v)); done
-if [ "$n_ok" -lt 5 ]; then
-  echo "  FAIL  [coverage] only $n_ok of 5 cases reached -- a case was"
+for v in "$n_a" "$n_b" "$n_c" "$n_d" "$n_e" "$n_f"; do n_ok=$((n_ok+v)); done
+if [ "$n_ok" -lt 6 ]; then
+  echo "  FAIL  [coverage] only $n_ok of 6 cases reached -- a case was"
   echo "        deleted rather than failed. A removed measurement is not a pass."
   bad=$((bad+1))
 fi

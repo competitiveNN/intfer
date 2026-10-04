@@ -82,6 +82,17 @@ mr_tp_sharded() {   # $1 = log. "TP=sharded" is a substring of the banner the CL
                     # already prints and this gate already greps for.
   grep -aq "TP=sharded" "$1"
 }
+# *** IS THE SUBJECT PRESENT AT ALL? *** The three predicates above compare two
+# streams or check a literal. This one checks that the code under test RAN, which
+# is a different question and the one that decides whether the rest means
+# anything: a flag that never reaches its kernel makes every stream comparison
+# vacuous, because both runs then produce the same tokens for uninteresting
+# reasons. Defined HERE, at the top level with the other predicates, rather than
+# inline in the arm -- audit #3's shape is a rule re-derived at a second site,
+# and the whole point of this fix is that there is one home.
+mr_path_fired() {   # $1 = log; the kernel's one-time ACTIVE announcement.
+  grep -aq '\[decode1-mr\].*ACTIVE' "$1"
+}
 
 # *** AND THE ARM'S BODY IS ONE FUNCTION TOO, NOT THREE CALL SITES. *** Sharing
 # the predicates closed the "weakened predicate" class (measured: M-B/M-C/M-P/M-Q
@@ -111,6 +122,18 @@ mr_arm_assert() {   # $1 = base log, $2 = MR log. $3 = diagnostic prefix.
     || { echo "${d}DECODE1_MR ids '$mr_i' != base '$got' (or a stream was EMPTY)" >&2; ok=1; }
   mr_tp_sharded "$2" \
     || { echo "${d}DECODE1_MR run was not TP=sharded (needs 2 devices)" >&2; ok=1; }
+  # FOURTH, and it is the one that decides whether the other three mean anything:
+  # a flag that never reached the kernel makes BOTH runs produce the same tokens
+  # for uninteresting reasons, so every comparison above would pass while
+  # certifying nothing (audit #3's nested-flag vacuity). Inside this function
+  # rather than at the call site, so the arm keeps ONE assertion entry point --
+  # the audit #3 shape is a rule re-derived at a second site, and this fix exists
+  # to delete the second site.
+  mr_path_fired "$2" \
+    || { echo "${d}DECODE1_MR kernel never announced itself -- the flag did not" >&2
+         echo "${d}  reach the M=1 INT2 branch, so this arm compared base against" >&2
+         echo "${d}  base and certified nothing." >&2
+         ok=1; }
   return "$ok"
 }
 
@@ -140,11 +163,20 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   bad=0
   ids_after_prefill() { cli_ids "$1" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//'; }
   TP_BANNER='[intfer] GPU backend: 2 device(s) (TP=sharded)'
-  mklog() { # $1 = path, $2.. = ids in step order. Appends the sharded TP banner,
-            # so every fixture is shaped like a real MR log.
+  # *** ONE LITERAL, READ BY THE FIXTURE BUILDER AND BY THE NEGATIVE CASES. ***
+  # MR_ANNOUNCE is what quant_gemm.cpp prints when the M=1 INT2 branch runs. A
+  # second copy of it here would be a second home, and the case that removes it
+  # would silently stop removing anything. The kernel's own text is the contract:
+  # rename it there and these fixtures stop matching, so (6) goes red rather than
+  # going quietly vacuous.
+  MR_ANNOUNCE='[decode1-mr] M=1 INT2 decode: MR=4 kernel ACTIVE (N=2048 K=1024 bits=2)'
+  mklog() { # $1 = path, $2.. = ids in step order. Appends the banner and the
+            # MR announcement, so every fixture is a COMPLETE, HEALTHY-SHAPED
+            # MR log and each negative case differs from it in exactly one way.
     local p="$1"; shift; : >"$p"; local i=0
     for t in "$@"; do echo "decode step $i: token=$t" >>"$p"; i=$((i+1)); done
-    printf '%s\n' '[intfer] GPU backend: 2 device(s) (TP=sharded)' >>"$p"
+    printf '%s\n' "$TP_BANNER" >>"$p"
+    printf '%s\n' "$MR_ANNOUNCE" >>"$p"
   }
   # *** THESE DRIVE THE REAL ARM'S PREDICATES (mr_prefill_ok /
   # mr_streams_agree / mr_tp_sharded above), NOT COPIES OF THEM. *** There is no
@@ -257,6 +289,29 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   mr_tp_sharded "$SB/empty" \
     && { echo "SELF-CHECK FAIL (5): mr_tp_sharded ACCEPTED an EMPTY log (vacuity)" >&2; bad=1; }
 
+  # (6) THE SUBJECT-PRESENT QUESTION, which the stream comparisons cannot see.
+  #     Both directions, and the healthy direction comes FIRST because an
+  #     always-red presence check is worse than none: it would refuse a run whose
+  #     MR path demonstrably fired. Fixtures differ from a real log in exactly one
+  #     way -- the announcement line -- so a refusal can only be about the line.
+  printf '%s\n' "$MR_ANNOUNCE" >"$SB/announced"
+  # A COMPLETE, HEALTHY log minus exactly ONE line: same ids, same banner, no
+  # announcement. Built by removing the line from a healthy fixture rather than
+  # assembled from scratch, which is what guarantees the refusal below is about
+  # the announcement and nothing else -- the audit #3 lesson, in a fixture.
+  mklog "$SB/not_announced" 11751 13 198 760 6511
+  sed -i '/\[decode1-mr\]/d' "$SB/not_announced"
+  mr_path_fired "$SB/announced" \
+    || { echo "SELF-CHECK FAIL (6): mr_path_fired must ACCEPT the ACTIVE announcement" >&2; bad=1; }
+  mr_path_fired "$SB/not_announced" \
+    && { echo "SELF-CHECK FAIL (6): mr_path_fired ACCEPTED a log with no announcement" >&2; bad=1; }
+  mr_path_fired "$SB/empty" \
+    && { echo "SELF-CHECK FAIL (6): mr_path_fired ACCEPTED an EMPTY log (vacuity)" >&2; bad=1; }
+  # And through the arm's own entry point, since this assertion is what decides
+  # whether the arm's stream comparisons mean anything.
+  mr_arm_assert "$SB/tp_ok_ids" "$SB/not_announced" "SELFTEST (6) arm-refusal: " \
+    && { echo "SELF-CHECK FAIL (6): mr_arm_assert ACCEPTED a log whose MR path never fired" >&2; bad=1; }
+
   if [ "$bad" -eq 0 ]; then
     echo "TP2-27B SELF-CHECK: PASS (1) fixtures are full-length and differ only at step 4  (2) healthy pair accepted by all three predicates  (3) mr_arm_assert refused a late divergence  (4) mr_arm_assert refused an empty pair  (5) wrong-prefill and wrong-TP refusals fire"
     exit 0
@@ -362,6 +417,23 @@ else
   # self-check also calls, so this arm has nothing to inline and nothing to keep
   # in sync. Do not inline anything here without adding a self-check case.
   mr_arm_assert "$CLI_ERR" "$MR_ERR" "GATE FAIL: " || PASS=0
+  # *** AND THE PATH MUST HAVE ACTUALLY FIRED. *** Everything above compares the
+  # MR run's stream against the base run's stream. If the flag never reached the
+  # M=1 INT2 decode kernel -- renamed, typo'd, stripped by a shell wrapper, or
+  # simply no `bits == 2` tensor occurring in this model's decode path -- then the
+  # two runs are IDENTICAL BY CONSTRUCTION and every assertion above passes
+  # having certified nothing. That is audit #3's nested-flag vacuity, and no
+  # amount of stream comparison can see it: the subject is the flag's EFFECT, not
+  # the stream. The kernel announces itself once (quant_gemm.cpp,
+  # "[decode1-mr] ... ACTIVE"); asserting that line is what turns "the two runs
+  # matched" into "the MR path ran and produced the same tokens".
+  # MEASURED as MISSED before this existed: deleting the arm's call to
+  # mr_arm_assert entirely left --self-check green, and a misspelled flag would
+  # have done the same. The presence check itself is mr_arm_assert's FOURTH
+  # assertion, not an inline test here -- one entry point, no second site to keep
+  # in sync. What is left inline is a single echo, so a PASS log records WHICH
+  # path ran rather than only that it agreed.
+  grep -a '\[decode1-mr\]' "$MR_ERR" | head -1
 fi
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
 if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi

@@ -16,6 +16,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <sycl/sycl.hpp>
 
@@ -468,6 +469,25 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
         const int per_group = nWG * MR;
         const int nB = (N + per_group - 1) / per_group;
         const int global_mr = nB * nWG;
+        // *** THE PATH ANNOUNCES ITSELF, ONCE. *** Same shape as INTFER_L4_DBG
+        // (main.cpp:3115) and for the same reason. MEASURED 2026-10-04: with
+        // nothing here, scripts/test_tp2_27b.sh's DECODE1_MR arm compares the
+        // MR run's stream against the base run's stream, and if the flag never
+        // reached this branch -- renamed, typo'd, dropped by a shell wrapper, or
+        // a `bits == 2` tensor that did not occur on this model -- the two runs
+        // are IDENTICAL BY CONSTRUCTION and the arm certifies nothing while
+        // printing nothing wrong. That is audit #3's nested-flag vacuity, one
+        // level below the one that commit fixed: it cannot see whether its own
+        // subject ran. A one-time host-side stderr line makes it seeable, and
+        // the gate asserts the line is present.
+        static bool announced = false;
+        if (!announced) {
+          announced = true;
+          std::fprintf(stderr,
+                       "[decode1-mr] M=1 INT2 decode: MR=%d kernel ACTIVE "
+                       "(N=%d K=%d bits=%d)\n",
+                       MR, N, K, bits);
+        }
         return q.submit([&](sycl::handler& h) {
           h.depends_on(copy_dep);
           h.parallel_for<class gemm_usm_decode1_vec_mr>(

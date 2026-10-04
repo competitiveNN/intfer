@@ -380,6 +380,14 @@ dispatch() { # $1 = label -> runs it
       # the artifact is deliberately stale -- legitimate only because the planted
       # artifact is itself defective (the AUDIT #21 rule).
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_engine_cert.sh"; return $? ;;
+    mutate_tp2_selfcheck.sh)
+      # AUDIT #31. The DECODE1_MR arm's --self-check in test_tp2_27b.sh. It runs
+      # ONLY the stubbed --self-check half on temp copies -- NO GPU, NO MODEL, NO
+      # 27B LOAD -- because the arm's real-run half is the operator's job and must
+      # never be driven from here (the standing rule: the user runs the 27B
+      # gates). That is also why this matrix is cheap enough to be an ordinary
+      # step rather than the excluded POST-STACK class.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_tp2_selfcheck.sh"; return $? ;;
     mutate_checker_matrix_coverage.sh)
       # Each state BOTH poisons the tree with an unmated checker AND removes the
       # requirement that would catch it -- weakening alone is unobservable while
@@ -629,7 +637,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------

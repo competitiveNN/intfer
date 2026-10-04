@@ -48,7 +48,20 @@ pop_dirs() {
 
 known_dirs() {
   local sd; sd="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  grep -hoE '(WORK|LOG_DIR|STAMP)="[^"]*"' "$sd"/mutate_*.sh 2>/dev/null \
+  # *** COMMENTS ARE STRIPPED, AND THIS WAS MEASURED, NOT STYLED. *** A matrix
+  # added 2026-10-04 explained in its comment block that STAMP declarations must
+  # start with a known base var, and quoted a sibling's real declaration as an
+  # example. This grep read that PROSE as a declaration -- so the new matrix's own
+  # directory was reported as an unowned leak, a false alarm on a healthy tree,
+  # which is precisely the failure this file's header says the derivation exists
+  # to prevent. The comment is not a declaration: strip it, per the AUDIT #23
+  # rule (strip when the match decides POPULATION MEMBERSHIP; a comment is not a
+  # behaviour). Kept deliberately in the strip list alongside the OTHER
+  # comment-aware classifiers -- and check_gate_pop.sh's own self-check is where
+  # this must stay honest, so it is recorded as its case (f) below.
+  for f in "$sd"/mutate_*.sh; do
+    sed -e 's/[[:space:]]*#.*$//' "$f" 2>/dev/null
+  done | grep -hoE '(WORK|LOG_DIR|STAMP)="[^"]*"' \
     | sed -e 's/^[A-Z_]*="//' -e 's/"$//' \
     | sed -E -e 's@^\$\{[^}]*\}/@@' -e 's@^\$(BUILD_DIR|ROOT|PWD)/build/@@' -e 's@^\$(BUILD_DIR|ROOT|PWD)/@@' \
     | grep -vE '^[\$/{]' \
