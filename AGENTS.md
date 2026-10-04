@@ -388,6 +388,95 @@ register; nothing is reassociated). It came out **2.3x SLOWER**:
 
 `nk`/`nw`/`nr` identical (7936/7936/2048), so this is device work, not plumbing.
 
+*** THE BIT-EXACTNESS CLAIM HAS A COVERAGE CONSTRAINT, AND IT IS NOT THE ONE YOU
+WOULD GUESS. *** MR is guarded by `bits == 2`, so the scheme census of the two gate
+models decides whether any arm can reach it at all:
+
+| gate model | scheme census | can reach `bits == 2`? |
+|---|---|---|
+| `Qwen3.5-0.8B.intifer` | INT4 x76, FP16 x93, INT8 x18 | **NO -- zero INT2** |
+| `Qwen3.8-27B-int2.intifer` | INT4 x116, FP16 x256, **INT2 x110**, INT8 x16 | yes |
+
+So **9 of the 10 correctness gates are structurally incapable of reaching that
+branch**, and a stream-identity arm added to `test_gpu_optin.sh` would be green
+*because the path never runs* -- audit #3's nested-flag vacuity, one level down.
+The single arm that actually tests the claim therefore lives in
+`scripts/test_tp2_27b.sh` (the only gate whose model has an INT2 tensor) and
+asserts the DECODE1_MR stream against the **same fixed oracle** the base run
+already uses, not a self-comparison. Re-derive the census with the two
+`intifer`-header reads recorded in that gate's new comment block; do not add
+0.8B arms for this flag.
+
+**== AUDIT 2026-10-04: A DEFAULT-OFF NUMERICS FLAG WAS SHIPPED WITH NO GATE THAT
+CAN REACH IT, AND THE SAME CLASS IS OPEN ON ~3x MORE FLAGS. ==**
+
+Found by deriving the population instead of trusting the list in the previous
+commit message: every `INTFER_*` flag `src/` or `examples/` actually **reads**,
+against every flag any `scripts/test_*.sh` **names**. No total is written down
+here -- a number in prose goes stale the moment a flag is added, and
+`check_checker_matrix_coverage.sh` exists precisely to refuse that. Re-derive:
+
+```
+git grep -hoE '[a-z_]*\("INTFER_[A-Z0-9_]+"' -- src examples \
+  | sed -E 's/^([a-z_]*)\("(INTFER_[A-Z0-9_]+)"$/\2/' | sort -u > /tmp/f_src
+git grep -hoE 'INTFER_[A-Z0-9_]+' -- 'scripts/test_*.sh' | sort -u > /tmp/f_gate
+comm -23 /tmp/f_src /tmp/f_gate      # read by the engine, named by NO gate
+```
+
+The diff between HEAD and the working tree is the only trustworthy delta, because
+both sides must be harvested the same way:
+
+```
+for f in $(git ls-tree --name-only HEAD scripts/ | grep '^scripts/test_'); do
+  git show "HEAD:$f"; done | grep -ohE 'INTFER_[A-Z0-9_]+' | sort -u > /tmp/g_head
+grep -ohE 'INTFER_[A-Z0-9_]+' scripts/test_*.sh | sort -u > /tmp/g_now
+comm -13 /tmp/g_head /tmp/g_now       # flags this change actually put under a gate
+```
+
+**MEASURED: this change moved exactly one flag, `INTFER_DECODE1_MR`, out of that
+set** (gate tokens 33 -> 34, un-gated 38 -> 37). Nothing else in the census moved,
+which is the point: the class is open, not closed.
+
+**THE CLASS, AND WHY IT MATTERS MORE THAN THE ONE INSTANCE.** The residue is
+dominated by *diagnostics* (`_DBG`, `_TRACE`, `_WHY`, `_TIME` -- derivable by
+suffix) and by *operational* knobs (`PRELOAD*`, `SCHED`, `SERVE_MAX`), which are
+legitimately not gate subjects. The interesting part is the middle: **opt-in and
+kill-switch flags that change arithmetic or control flow and that no gate ever
+sets.** Confirmed by `git log -S<flag> -- scripts`, which for `INTFER_L4_FUSE`
+returns only `bench_quiet_l4_ab.sh` -- a *benchmark* harness, not a gate:
+
+| flag | what AGENTS.md records as its certification | what a gate can re-run |
+|---|---|---|
+| `INTFER_DECODE1_MR` | "bit-exact by construction" (code read) | **now** `test_tp2_27b.sh` (this change) |
+| `INTFER_L4_FUSE` | "cpu parity + http batch (with L4 ON) + gpu-optin 10/10 PASS" | **nothing** -- transcript only |
+| `INTFER_L5_FRONT` | "Stream-gated TP1 ... base == L5 == ..." | **nothing** |
+| `INTFER_HOST_AVX2` | "scalar-vs-AVX2 streams identical on CPU AND GPU paths" | **nothing** |
+| `INTFER_NO_WAVE` | "decode streams identical TP1/TP2/NOWAVE" | **nothing** |
+| `INTFER_LMHEAD_FP16`, `INTFER_PREFILL_RR`, `INTFER_STREAM_F16` | (various) | **nothing** |
+
+Those four "stream-gated" lines were produced by **manually setting the env var
+and invoking a gate by hand**, which is a real measurement -- and it is recorded
+in a commit message, which is exactly AUDIT #22's shape: a claim whose backing is
+a transcript rather than an artifact that re-runs. Nobody is wrong about what was
+measured; what is missing is the *machinery* that makes it re-runnable, so the
+next edit to that kernel has nothing to fail.
+
+**THE RULE THIS EXPOSES, stated once:** a gate arm certifies a path only if the
+gate NAMES the flag. "I exported the variable and ran the gate" certifies
+something, but nothing re-runs it and nothing fails when it breaks. And the
+converse trap is just as bad -- see `INTFER_DECODE1_MR` above, where an arm in the
+*wrong* gate would have been green because the path never ran.
+
+**SCOPED, NOT DONE, and deliberately not mechanical.** Adding arms for the
+residue is NOT a copy-paste job and must not be attempted as one: each flag's
+semantics have to be read first, because some are **deliberately approximate**
+(`INTFER_PREFILL_RR` rounds in a different order by design). Asserting stream
+identity for those would ship a gate that fails for a legitimate reason -- the
+AUDIT #9/#11 defect ("a gate whose expectation encodes one configuration"). The
+batch needs, per flag: what it changes, whether bit-exactness is claimed or
+disclaimed, and which gate's model can reach it. Until that is written down per
+flag, the honest state of the residue is **UNCERTIFIED**, not "probably fine".
+
 **Why -- and this is the finding.** At M=1 this kernel's total work-item count is
 **exactly `N`** (one output element per work-item), and that is **invariant to the
 work-group shape**. So MR did not add parallelism; it **divided an already-starved

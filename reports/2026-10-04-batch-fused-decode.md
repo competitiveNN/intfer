@@ -288,6 +288,16 @@ in its own closing line. Re-run the command rather than trusting the sentence.
 * **Output tiling at M=1.** Measured 2.3× slower and structurally
   anti-parallel. `INTFER_DECODE1_MR` ships default-OFF and exists only as the
   artifact backing that measurement.
+  **Coverage, corrected 2026-10-04 (read this before adding an arm for it):** MR is
+  guarded by `bits == 2`, and only the 27B model has INT2 tensors — 0.8B is
+  `INT4 ×76 / FP16 ×93 / INT8 ×18`, **zero INT2**. So 9 of the 10 correctness
+  gates cannot reach that branch, and the "bit-exact by construction" claim was
+  until now supported only by reading the code. The one arm that can actually
+  test it was added to **`scripts/test_tp2_27b.sh`**, which runs the INT2 27B
+  model at `--tp 2` and now asserts the `INTFER_DECODE1_MR=1` stream against the
+  **same fixed oracle** as its base run. It is **UNRUN** — it needs the box and a
+  27B load, so treat it as pending, not as passing. Do **not** add 0.8B arms for
+  this flag: they would be green because the path never runs.
 * **Promoting either flag to default.** Both are opt-in until a counter verdict
   exists. Promoting on a reasoning argument rather than a measurement is the
   mistake this repo has retracted three times.

@@ -400,6 +400,24 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // elements per work-item instead of one. Kill switch
       // INTFER_NO_DECODE1_MR=1 additionally forces it off.
       //
+      // *** COVERAGE, AND IT IS A SHORT LIST. READ BEFORE ADDING AN ARM. ***
+      // The branch below is `bits == 2`, and the scheme census of the two gate
+      // models is decisive:
+      //     Qwen3.5-0.8B.intifer        INT4 x76, FP16 x93, INT8 x18
+      //                                -> ZERO INT2, so 9 of the 10 correctness
+      //                                   gates CANNOT reach this code at all.
+      //     Qwen3.8-27B-int2.intifer   INT4 x116, FP16 x256, INT2 x110, INT8 x16
+      // The MR path's safety claim -- each output accumulates its own K in
+      // ascending kg then ascending j, in its own register, so no FP32 add is
+      // reordered -- is a CODE-READ argument, which is not evidence. The one arm
+      // that actually tests it therefore lives in scripts/test_tp2_27b.sh, the
+      // only gate whose model carries an INT2 tensor, and it asserts the
+      // DECODE1_MR stream against the same fixed oracle the base run uses.
+      // DO NOT add stream-identity arms for this flag to test_gpu_optin.sh or any
+      // other 0.8B gate: they would be green because the path never runs, which
+      // is audit #3's nested-flag vacuity in a new place -- a gate that cannot
+      // reach its subject must not be allowed to certify it.
+      //
       // *** MEASURED 2026-10-04, 27B --tp 2, decode M=1, n=8: 2.3x SLOWER. ***
       // kernel 2055.1 ms -> 4698.7 ms, waitblock 1037.7 -> 2362.5 ms.
       // DEFAULT OFF, and the reason is the most useful thing this experiment
