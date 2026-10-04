@@ -364,6 +364,77 @@ SYCL Command Graphs: Replace CUDA Graphs with sycl::ext::oneapi::experimental::c
 Stage 3.
 Implement features for maximizing throughput for concurrent requests, starting from continuous batching.
 
+## ==> PARAMOUNT DIRECTIVE (2026-10-04): OPTIMIZE FIRST. WALL-TIME BENCHMARKING IS RETIREED. <==
+
+**The single objective of this project right now is to make 27B (`--tp 2`)
+prefill and inference as fast as possible.** Everything else is subordinate. This
+supersedes any instruction below that tells you to go and measure a tok/s.
+
+### What is retired, and it is a real retirement
+
+The **wall-time benchmark queue is closed.** The six blank `RESULT:` lines in
+`reports/2026-09-30-pending-bench-backlog.md` are **ABANDONED, not pending** — do
+not fill them, do not re-run the arms to fill them, do not move that report to
+`reports/archive/`. The reasons are measured, not stylistic:
+
+* a tok/s needs `load1 < 2` **for the whole of every arm**, and this box has not
+  held that window for sessions. `load1` runs 3–18 and the cause is **not ours**
+  (desktop + sibling agent sessions; the standing rule is not to kill them);
+* this project has **already retracted three separate wall-time claims** because a
+  number reached a report without an artifact behind it (see AUDIT #22, and the
+  `0.8B` 8.16/15.33/17.98 withdrawal);
+* the queue therefore produced **zero decisions** while consuming the sessions it
+  was supposed to inform.
+
+### What is explicitly NOT retired — read this before you "simplify"
+
+**The load-insensitive counters stay, and they are how every optimization gets
+decided.** `kernel` / `submit` / `waitblock` / `copy` / `usm_write` / `readback`
+and the exact integers `nk` / `nw` / `nr` are read from the **device's own event
+timestamps**, so they are immune to `load1` and are the only instrument that works
+on this box. This is not a hedge and not a compromise — it is the mechanism:
+
+* **four** optimizations in this repo were killed *by counters* and would have
+  survived a tok/s: L5 LA-front, DPAS48 at M=1, host-private DPAS staging, SYCL
+  command graphs on B580;
+* **two** were adopted *by counters*: fused MLP down-proj (+13 % decode, one host
+  wait and one D2H removed) and E3 `INTFER_DPAS48_FOLD` (−1.8 % kernel, replicated
+  at 0.8B and 27B);
+* **E4 `INTFER_DPAS48_TILED`** was accepted on a counter verdict alone
+  (−1851.9 ms prefill kernel, −9.95 %, 3/3 same sign, **clears** the spread floor,
+  zero added launches) with **no tok/s at all** — which is the proof that this
+  instrument is sufficient, not merely tolerable.
+
+So the rule is: **decide on counters, report counters, never wait for a quiet box.**
+`kernel` is the only bucket that is load-insensitive; `submit`, `waitblock`,
+`copy`, `readback` and `usm_write` are host wall-clock accumulators and are
+reported as `median(spread)` — read them as *relative*, never as a figure.
+
+### The correctness gates are unchanged and still binding
+
+Retiring benchmarking does **not** retire `scripts/run_ten_gates.sh` or the ten
+gates. Every optimization ships behind a flag and must be **stream-identical** to
+its base at TP=1 and TP=2 (`scripts/test_gpu_optin.sh`), plus a new mutation
+matrix before its checker is believed. A speedup that changes a token is not a
+speedup. This is unchanged doctrine and it is what makes the counters trustworthy:
+if the streams are identical, a kernel delta is attributable to the kernel.
+
+### Where the remaining headroom is (measured, 27B `--tp 2`)
+
+* **Prefill is EU-pipe-bound and E4 already fixes the geometry.**
+  `INTFER_DPAS48_TILED=1` is the cooperative-2D-block DPAS kernel, **bit-exact**
+  (device 4/4 template branches, 256/256 each; engine TP=1 and TP=2), default
+  **OFF**. It is the largest single measured win available and it is still not
+  promoted.
+* **Decode (M=1) is the open problem and E4 cannot touch it** — it declines at
+  M=1 by design. At M=1 the layer GEMM is a GEMV: bandwidth-bound, so a 16×16 DPAS
+  tile would waste 15/16 of itself on a memory problem. **Anything that speeds up
+  27B decode has to move fewer bytes or overlap them, not do more arithmetic per
+  byte.** Do not re-attempt XMX for M=1; it is the recorded reasoning above.
+* On 27B the device is the wall (`kernel` ≈ 66 % of decode; `waitblock` 520.6 ms
+  vs `kernel` 1031.7 ms), which **reverses** the 0.8B picture where submit
+  dominates. Optimize the device at 27B; do not port 0.8B conclusions across.
+
 ## Performance targets (2x Arc Pro B580)
 
 ### ALWAYS AIM FOR KERNEL FUSION to reduce CPU-GPU communication overhead

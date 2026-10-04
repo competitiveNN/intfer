@@ -1,5 +1,33 @@
 # Pending benchmark backlog — 27B on 2x Arc Pro B580
 
+> ## ==> CLOSED 2026-10-04: WALL-TIME BENCHMARKING IS RETIRED. DO NOT FILL THESE. <==
+>
+> **This queue is ABANDONED, not pending.** Every `RESULT:` line below stays blank
+> **permanently**. Do not run the arms to fill them, do not lower the quiet
+> threshold to make an arm read USABLE, and do not move this file to
+> `reports/archive/` — archiving an undecided batch would destroy the record of
+> what was decided and why.
+>
+> Read `AGENTS.md`'s **PARAMOUNT DIRECTIVE** for the replacement policy: decide
+> optimizations on the **load-insensitive counters** (`kernel`, `nk`/`nw`/`nr`),
+> never on a tok/s. That is not a downgrade — **E4 `INTFER_DPAS48_TILED` was
+> accepted on a counter verdict alone** (−1851.9 ms prefill kernel, −9.95 %, 3/3
+> same sign, zero added launches) with no tok/s ever measured.
+>
+> Why this queue is closed rather than merely deferred: a tok/s needs `load1 < 2`
+> for the *whole* of every arm, this box has not held that window for sessions, the
+> cause is not ours (desktop + sibling sessions; the standing rule is not to kill
+> them), and the queue therefore produced **zero decisions** while consuming the
+> sessions it was meant to inform. It also has a body count: this project has
+> already **retracted three separate wall-time claims** because a number reached a
+> report without an artifact behind it (AUDIT #22; the 0.8B 8.16/15.33/17.98
+> withdrawal).
+>
+> **The verdicts recorded in this file STAND and are not affected.** E4 KEEP, E3
+> FOLD KEEP, E1/E2/E3b DO-NOT-PROMOTE, and every load-insensitive bucket figure
+> below were measured from artifacts and remain the decision record. Only the
+> *tok/s* arms are retired.
+
 Date: 2026-09-30. Author: maki (agent). Nothing here has a wall-time number
 from me; every `RESULT:` line is deliberately blank and is yours to fill.
 
