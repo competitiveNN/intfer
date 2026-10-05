@@ -27,7 +27,8 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MODEL="${INTFER_08B:-$ROOT/test/models/Qwen3.5-0.8B.intifer}"
-BIN="${INTFER_BUILD_DIR:-$ROOT/build}/examples/intfer_cli/intfer_cli"
+BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
+BIN="$BUILD_DIR/examples/intfer_cli/intfer_cli"
 PROMPT="The capital of France is"
 # Wide prefill: ~97 prompt tokens, so the chunked prefill runs ONE ~97-row
 # batch instead of the ~5-row batch the short PROMPT produces.
@@ -122,6 +123,41 @@ for tp in $TPS; do
     echo "TP=$tp [$mode]: '$GOT'"
     [ "$GOT" = "$BASE" ] || fail "TP=$tp [$mode] '$GOT' != base '$BASE'"
   done
+
+  # --- INTFER_WEIGHTS_DEVICE: stream identity, and reachability is structural --
+  # Weight shards move from malloc_shared to malloc_device USM, filled by
+  # q.memcpy instead of a host memcpy. Same bytes, same kernels, same order, so
+  # this is BIT-EXACT and needs no numerics contract -- only proof that the stream
+  # did not move. Measured upside by examples/roofline_probe: +11 % to +16 % on the
+  # sequential-read ceiling for the identical buffer (206-231 -> 231-280 GB/s).
+  #
+  # WHY THIS GATE AND NOT A 27B ONE: the change is in pool_acquire, which every
+  # GEMM on every scheme goes through, so the 0.8B model reaches it. An arm in a
+  # gate whose model could not reach the branch would be green because the path
+  # never ran (audit #3).
+  #
+  # REACHABILITY IS ASSERTED, not assumed, and it is asserted DIFFERENTLY from the
+  # arms above. Those need a kernel announcement because they change a DEVICE
+  # kernel's behaviour. This one changes an ALLOCATOR, and the device-visible
+  # symptom is the opposite of an announcement: the engine must NOT print its
+  # device-USM-OOM abort, and the run must complete. So the arm checks the run
+  # exited 0 (which is where the abort would show up) and that the ids are
+  # non-empty. A stub that ignored the flag would also pass -- which is stated
+  # here rather than glossed, because the alternative (an announcement line for a
+  # memory property) would add a print to the hot preload path to certify a change
+  # that is bit-exact by construction.
+  WD_LOG="$BUILD_DIR/gpu_optin_weights_device_tp${tp}.log"
+  env INTFER_WEIGHTS_DEVICE=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$WD_LOG" 2>&1
+  WD_RC=$?
+  WD_IDS="$(grep -a -oE "decode step [0-9]+: token=[0-9]+" "$WD_LOG" \
+           | sed -E 's/.*token=//' | tr '\n' ' ' | sed 's/ *$//')"
+  echo "TP=$tp INTFER_WEIGHTS_DEVICE rc=$WD_RC: '$WD_IDS'"
+  [ "$WD_RC" -eq 0 ] || fail "TP=$tp INTFER_WEIGHTS_DEVICE run exited rc=$WD_RC (see $WD_LOG)"
+  [ -n "$WD_IDS" ] || fail "TP=$tp INTFER_WEIGHTS_DEVICE produced no tokens (see $WD_LOG)"
+  [ "$WD_IDS" = "$BASE" ] || fail "TP=$tp INTFER_WEIGHTS_DEVICE '$WD_IDS' != base '$BASE'"
+  grep -aq 'FATAL: USM alloc' "$WD_LOG" \
+    && fail "TP=$tp INTFER_WEIGHTS_DEVICE hit a device-USM OOM (see $WD_LOG)"
 
   # --- INTFER_FUSE_ACT: reachability AND stream identity, in one arm --------
   # Stream identity alone is not enough here. The optimization is "skip work when

@@ -77,6 +77,46 @@ Engine::~Engine() {
   wv_.clear(); wv_W_ = 0; wv_M_ = wv_K_ = wv_Nl_ = 0;
 }
 
+// INTFER_WEIGHTS_DEVICE -- allocate the WEIGHT shards as device USM instead of
+// shared USM. Default OFF; kill switch INTFER_NO_WEIGHTS_DEVICE=1.
+//
+// WHY. Every weight shard is allocated here and filled by a host memcpy
+// (ensure_shard_built), and the shards are 9.75 GB/device at 27B TP=2 -- read once
+// per token, and 100 % of decode's traffic
+// (scripts/model_byte_roofline.sh). So how this allocator is backed decides how
+// fast the entire engine can read weights.
+//
+// MEASURED, by examples/roofline_probe on the identical buffer and access pattern
+// (device event timestamps, so load-insensitive; the gate is
+// scripts/test_roofline_probe.sh):
+//
+//     sequential read, malloc_shared   206-231 GB/s   45-51 % of the 456 spec
+//     sequential read, malloc_device   231-280 GB/s   51-61 %  -> +11 % to +16 %
+//
+// Shared USM on a discrete card is host-accessible, so the runtime cannot use it
+// exactly as it would a device allocation; that the gap is small is the good
+// outcome -- it means shared USM is NOT the pathology this could have been, and
+// the same probe puts decode's measured 41.1 GB/s at 19.9 % of the shared ceiling.
+// The deficit is kernel-side, not allocator-side. That is a MEASURED negative for
+// "the allocator is the fix" and a MEASURED positive for "+11-16 % is free".
+//
+// BIT-EXACT, and that is why this is the cheapest change in the batch: same bytes,
+// same kernels, same order. It needs a stream-identity gate and NO numerics
+// contract. The one thing it does change is that device USM is not host-readable,
+// so every host-side read of code_usm must go through code_host instead. Audited:
+// the only host writes are the memcpys in ensure_shard_built, and the only
+// host-visible pointer handed out is `weights_for()`'s `v.code`, which the CLI
+// passes to the KERNEL and never dereferences (grepped: examples/intfer_cli
+// reads .code/.scale only to forward them).
+static bool weights_device_usm() {
+  static const bool on = [] {
+    const char* e = std::getenv("INTFER_WEIGHTS_DEVICE");
+    const bool no = (std::getenv("INTFER_NO_WEIGHTS_DEVICE") != nullptr);
+    return (e != nullptr) && !no;
+  }();
+  return on;
+}
+
 void* Engine::pool_acquire(size_t device, size_t bytes) {
   if (device >= devices_.size() || bytes == 0) return nullptr;
   if (device >= usm_pool_.size()) usm_pool_.resize(device + 1);
@@ -89,7 +129,9 @@ void* Engine::pool_acquire(size_t device, size_t bytes) {
     return p;
   }
   auto& dev = devices_[device];
-  void* p = sycl::malloc_shared(bytes, dev.sycl_device, dev.sycl_context);
+  void* p = weights_device_usm()
+               ? sycl::malloc_device(bytes, dev.sycl_device, dev.sycl_context)
+               : sycl::malloc_shared(bytes, dev.sycl_device, dev.sycl_context);
   if (!p) {
     // Device OOM under preload-all: fail loudly with the exact shortfall
     // instead of a downstream nullptr-memcpy SIGSEGV. Steady-state VRAM is
@@ -1930,6 +1972,19 @@ Engine::ShardView Engine::shard_view(int tensor_index) {
   return v;
 }
 
+// Fill a freshly-acquired weight shard. Device USM is not host-writable, so the
+// copy has to go through the queue there; shared USM keeps the plain memcpy it
+// always used (that path is what preload timing was measured against, and changing
+// it silently would move the 78 s preload number for no reason).
+static void shard_fill(sycl::queue& q, void* dst, const void* src, size_t bytes) {
+  if (bytes == 0) return;
+  if (weights_device_usm()) {
+    q.memcpy(dst, src, bytes).wait();
+  } else {
+    std::memcpy(dst, src, bytes);
+  }
+}
+
 bool Engine::ensure_shard_built(int tensor_index) {
   if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size()) return false;
   auto& sc = shard_cache_[tensor_index];
@@ -2039,22 +2094,26 @@ bool Engine::ensure_shard_built(int tensor_index) {
         sc.dpas48 = false;
         sc.code_usm[d] =
             static_cast<std::uint8_t*>(pool_acquire(d, code_bytes));
-        std::memcpy(sc.code_usm[d], code_ptr, code_bytes);
+        shard_fill(q, sc.code_usm[d], code_ptr, code_bytes);
       } else {
         sc.dpas_bytes[d] = dpas_tiles.size();
         sc.code_usm[d] = static_cast<std::uint8_t*>(
             pool_acquire(d, dpas_tiles.size()));
-        std::memcpy(sc.code_usm[d], dpas_tiles.data(), dpas_tiles.size());
+        shard_fill(q, sc.code_usm[d], dpas_tiles.data(), dpas_tiles.size());
       }
     } else {
       sc.code_usm[d] =
           static_cast<std::uint8_t*>(pool_acquire(d, code_bytes));
-      std::memcpy(sc.code_usm[d], code_ptr, code_bytes);
+      shard_fill(q, sc.code_usm[d], code_ptr, code_bytes);
     }
 
     // Scale: N_local * n_groups FP16
     sc.scale_usm[d] = static_cast<std::uint16_t*>(pool_acquire(d, scale_bytes));
-    std::memcpy(sc.scale_usm[d], scale_ptr, scale_bytes);
+    // Same allocator decision as the code bytes above: scales go through shard_fill
+    // so a device-USM scale buffer is filled by the queue, not by the host. They are
+    // 21.5 % of nothing on their own but they are read in the GEMV's innermost
+    // group loop, so their residency is the same question as the weights'.
+    shard_fill(q, sc.scale_usm[d], scale_ptr, scale_bytes);
     // NOTE: no global_usm alloc — alpha stays host-side (global_host) and is
     // passed to the kernel by value (see run_linear_tp).
 
