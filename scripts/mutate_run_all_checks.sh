@@ -1082,7 +1082,34 @@ if idx is None:
     sys.exit(1)
 line = lines[idx]
 body = re.match(r'(\s*STEPS=")([^"]*)("\s*)$', line)
+if not body:
+    # The line matched STEPS_ASSIGN but not the narrower STEPS body shape, so
+    # re-matching it here would raise on None and the state would die for a reason
+    # that looks like the defect it is testing. Refuse instead.
+    print("the chosen STEPS line does not match the body shape")
+    sys.exit(1)
 toks = body.group(2).split()
+# *** HARVEST ASSERTION ON THE TOKEN SET, added for the reason the whole
+# session has been about. *** Every silent no-op in this file's history has been a
+# harvest that matched nothing: a 0-match anchor, a regex whose backslashes were
+# mangled, a glob that collapsed, a flag pattern that matched two of four. This
+# derivation is floored on the LIST (idx is None -> exit), but nothing asserts the
+# list is made of the thing the state needs. If a future edit left it holding only
+# non-script tokens, `toks[-1]` would be one of them and the patch would append
+# check_stack_cert.sh after garbage -- a state that runs and scores nothing.
+if not toks:
+    print("the chosen STEPS list is EMPTY")
+    sys.exit(1)
+if not any(t.endswith(".sh") for t in toks):
+    print("the chosen STEPS list holds no script token: %r" % (toks[:4],))
+    sys.exit(1)
+if "check_stack_cert.sh" in toks:
+    # Already scheduled. The state asserts EXEMPT-AND-SCHEDULED is refused, so
+    # running it against an already-scheduled file would make the mutant's
+    # baseline red for a reason unrelated to the state.
+    print("check_stack_cert.sh is ALREADY in this STEPS list; the state needs an")
+    print("unscheduled file")
+    sys.exit(1)
 new_line = body.group(1) + " ".join(toks + ["check_stack_cert.sh"]) + body.group(3)
 lines[idx] = new_line
 open(p, "w").write("\n".join(lines))
