@@ -8,7 +8,12 @@
 > loop was the thing to fix. It runs at **98–123 % of the memory roofline**. It has
 > no headroom. Optimising it would have been work on a kernel already at the wall.
 >
-> **E2b (`INTFER_DECODE1_BLOCKLOAD`) is RETIRED for the INT2 path.** Widening the
+> **E2b — the wide-load / `block_load` direction — is RETIRED for the INT2 path.**
+> (Named `INTFER_DECODE1_BLOCKLOAD` in the plan, but it was **never shipped as a
+> flag**: a draft was written, found to duplicate the already-present
+> `INTFER_DECODE1_SUBGROUP`, and deleted before it was ever gated. See
+> `reports/2026-10-05-batch-upstream-simd-gemv.md` §2. Do not go looking for the
+> flag; what follows retires the *direction*.) Widening the
 > code chunk from 8 to 16 — more bytes in flight per iteration — measured
 > **0.25–0.35×, a 3–4× REGRESSION**. Register pressure dominates. This is the same
 > shape of result as sgl-kernel-xpu's own "do not prefetch scales" (~3 % loss).

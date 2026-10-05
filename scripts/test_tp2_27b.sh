@@ -151,7 +151,6 @@ decode1_arm_assert() {   # $1 = base log, $2 = flag-run log, $3 = prefix,
 }
 mr_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-mr' 'DECODE1_MR'; }
 sk_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-splitk' 'DECODE1_SPLITK'; }
-sg_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DECODE1_SUBGROUP'; }
 # One-line wrappers over the SHARED decode1_arm_assert, for the same reason the MR
 # and SPLITK wrappers are: a per-arm copy of the predicate is what made three of
 # the MR arm's assertions unobservable, and this gate has been rebuilt around that
@@ -159,7 +158,31 @@ sg_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DEC
 # label used in messages -- so a new arm cannot accidentally assert a different
 # flag's announcement, which would be green for the wrong reason.
 rp_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-rowpair' 'DECODE1_ROWPAIR'; }
-sg_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DECODE1_SUBGROUP'; }
+sg_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DECODE1_SUBGROUP'; }
+# The change that added the SUBGROUP arm DEFINED THIS TWICE -- once here and
+# once above beside rp_arm_assert -- and RAN the arm twice, so the gate paid
+# two full 27B decode runs of one flag in its most expensive operation. Bash
+# takes the last definition silently and the bodies were identical, so nothing
+# looked wrong; that is the whole reason it survived. The duplicate bodies are
+# gone and there is now ONE definition, shared by the two self-check cases and
+# the one real arm. Counts asserted below rather than trusted.
+sg_arm_assert_defs=$(grep -cE '^sg_arm_assert\(\)' "$0" || true)
+# BOTH counts above are LINE-ANCHORED, and that is not cosmetic. An unanchored
+# count matches THIS LINE as well as the arm, so it reports 2 when the answer
+# is 1 and the assertion can never be satisfied -- a guard that is always red,
+# which is the same defect as one that is always green. Neither is a guard.
+sg_arm_runs=$(grep -c '^env INTFER_DECODE1_SUBGROUP=1 ' "$0" || true)
+if [ "$sg_arm_defs" -ne 1 ] || [ "$sg_arm_runs" -ne 1 ]; then
+  echo "GATE FAIL: the SUBGROUP arm is defined $sg_arm_defs time(s) and run $sg_arm_runs time(s);" >&2
+  echo "        exactly one of each is required, or the gate pays for a 27B" >&2
+  echo "        decode it never reads and the copies are free to drift." >&2
+  exit 2
+fi
+# sg_arm_assert() was DEFINED TWICE by the change that added the SUBGROUP arm --
+# once here and once above with rp_arm_assert. Bash takes the last one silently,
+# the bodies are identical today, so it was invisible; but this file exists
+# because a duplicated assertion is free to drift from the one it shadows, and
+# the shadow is the copy that gets edited. One definition, asserted below.
 
 # --- SELF-CHECK (stubbed; no GPU, no model, no build) -----------------------
 # *** WHY THE DECODE1_MR ARM NEEDS ONE. *** That arm compares two DERIVED values
@@ -378,7 +401,21 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # healthy-pair-minus-one-line case are what isolate the defect; both come from
   # the SAME builder, so a builder change cannot quietly stop isolating it.
   sed "s|\\[decode1-splitk\\]|[decode1-subgroup]|g" "$SB/sk_announced" >"$SB/sg_announced"
+  # DERIVE the negative from the positive, do not author it: a separately
+  # written sg_not_announced can drift to be a valid log and the refusal case
+  # then passes for the wrong reason. That is exactly what happened on the
+  # first version of these two lines -- sg_not_announced was never created
+  # at all, sed printed 'No such file or directory', and the arm-refusal
+  # case came back green because the MISSING file was not TP=sharded. The
+  # assertion cannot tell a missing fixture from a rejected one, so the
+  # fixture's existence is asserted here instead.
+  cp "$SB/sg_announced" "$SB/sg_not_announced"
   sed -i '/\[decode1-subgroup\]/d' "$SB/sg_not_announced"
+  if [ ! -s "$SB/sg_not_announced" ] || [ "$(wc -c <"$SB/sg_announced")" -le "$(wc -c <"$SB/sg_not_announced")" ]; then
+    echo "SELF-CHECK FAIL (7): sg_not_announced was not derived as a STRICT" >&2
+    echo "  subset of sg_announced, so the refusal case proves nothing." >&2
+    bad=1
+  fi
   sg_arm_assert "$SB/tp_ok_ids" "$SB/sg_not_announced" "SELFTEST (7) subgroup-arm-refusal: " \
     && { echo "SELF-CHECK FAIL (7): sg_arm_assert ACCEPTED a log whose SUBGROUP path never fired" >&2; bad=1; }
   sg_arm_assert "$SB/tp_ok_ids" "$SB/sg_announced" "SELFTEST (7) subgroup-arm-accept: " \
@@ -548,37 +585,11 @@ else
   sk_arm_assert "$CLI_ERR" "$SK_ERR" "GATE FAIL: " || PASS=0
   grep -a '\[decode1-splitk\]' "$SK_ERR" | head -1
 fi
-# --- INTFER_DECODE1_SUBGROUP certification -----------------------------------
-# *** PORTED FROM llama.cpp's mmvq.cpp, AND THE REACHABILITY CONSTRAINT IS THE
-# *** SAME ONE THAT BINDS MR, SPLITK AND ROWPAIR. *** The branch is guarded by
-# `bits == 2` and Qwen3.5-0.8B.intifer has ZERO INT2 tensors, so an arm in a 0.8B
-# gate would be green BECAUSE THE PATH NEVER RUNS. Verified by construction while
-# writing it: on 0.8B the flag changes nothing and the kernel never announces.
-#
-# What the kernel changes relative to INTFER_DECODE1_SPLITK, which MEASURED
-# +43.8 % on kernel: only the reduction. SPLITK summed S partials through a
-# per-work-group `local_accessor` and an `it.barrier`, both on the critical path
-# of every output. This one reduces with `sycl::reduce_over_group`, a sub-group
-# collective: no shared allocation, no barrier, no serial lane loop. The
-# arithmetic is the same block-cyclic body over the same 8-element chunks, which
-# is `acc_cyclic(r, S)` in examples/ksplit_contract -- so the numerics claim is
-# the one already MEASURED there (0 FP16 ulp on realistic activations, 2 on the
-# adversarial escalating set), and this arm certifies stream-identity ON THIS
-# MODEL, not bit-exactness for all inputs.
-SG_OUT="$(mktemp)"; SG_ERR="$(mktemp)"
-env INTFER_DECODE1_SUBGROUP=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
-  -p "$PROMPT" -n "$N" >"$SG_OUT" 2>"$SG_ERR"; SG_RC=$?
-if [ "$SG_RC" -ne 0 ]; then
-  echo "GATE FAIL: INTFER_DECODE1_SUBGROUP=1 run exited rc=$SG_RC" >&2
-  tail -20 "$SG_ERR" >&2
-  PASS=0
-else
-  echo "DECODE1_SUBGROUP prefill: $(cli_prefill "$SG_ERR") (expect 11751)"
-  echo "DECODE1_SUBGROUP ids:      $(cli_ids "$SG_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
-  # The SAME single assertion entry point as the MR and SPLITK arms.
-  sg_arm_assert "$CLI_ERR" "$SG_ERR" "GATE FAIL: " || PASS=0
-  grep -a '\[decode1-subgroup\]' "$SG_ERR" | head -1
-fi
+# --- (the SUBGROUP arm below is the only one; a change once defined it twice
+# here and again above, and RAN it twice -- two full 27B decode runs of the
+# same flag in the most expensive operation this gate has. The identical
+# bodies made it invisible and harmless-looking, which is exactly why it
+# survived; the cost was silent and the drift risk was one edit away.)
 # --- INTFER_DECODE1_ROWPAIR certification --------------------------------------
 # *** SAME REACHABILITY CONSTRAINT AS MR AND SPLITK, AND IT IS BINDING AGAIN. ***
 # The row-pair branch is guarded by `bits == 2`, and Qwen3.5-0.8B.intifer has ZERO

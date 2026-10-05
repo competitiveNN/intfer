@@ -270,6 +270,37 @@ if [ "$n_opt" -lt 1 ]; then
   echo "        Do not widen is_diag/is_oper to make this go away." >&2
   exit 1
 fi
+
+
+# ---------- A RETIREMENT CLASS WAS WRITTEN HERE AND REMOVED. RECORDED, NOT
+# ERASED, because "that was tried and it does not work" is a result. ----------
+# The class was: "a document that names an INTFER_ flag which no source reads is a
+# claim that the flag still exists". It FIRES ON 42 CASES and 40 of them are
+# correct documents. They are:
+#
+#   * PLANS. AGENTS.md and the reports discuss INTFER_GPU_ATTN, INTFER_FP16_DECODE1,
+#     INTFER_DECODE1_OWN_TU, INTFER_DECODE1_WG and INTFER_FUSED_DECODE1 as work that
+#     is SPECIFIED or RETIRED. A rule that fails on a documented plan has to be
+#     taught about every plan, and that teaching IS the maintenance.
+#   * SEAMS AND BUILD MACROS. INTFER_BUILD_DIR, INTFER_GATE_GLOB, INTFER_DRI_ROOT and
+#     INTFER_HAS_L0 are read by scripts/ and by CMake, not by src/, so a source grep
+#     for getenv() cannot see them. An earlier draft scanned scripts/ as well and
+#     produced a wall of exactly these.
+#
+# So the general form is not a checker, it is a rule that needs an oracle nobody has.
+# A rule that cannot be made right is worse than no rule, and the only way to make
+# this one green was to enumerate its exceptions -- which is the "hand-written total
+# is a citation" failure wearing a different hat.
+#
+# WHAT SURVIVES IS THE NARROW, MECHANICAL VERSION OF THE SAME INVARIANT, and it is
+# already enforced: scripts/check_decode1_copies.sh DERIVES the live set of
+# `decode1` parallel_for bodies by enumeration and fails HARD on any entry that is
+# neither pinned nor exempted by a stated reason. That is what caught the original
+# defect -- the first run of the extended checker reported
+# gemm_usm_decode1_blockload as UNCOVERED the moment the duplicate flag was deleted.
+# The lesson generalises and is the reason this note stays: enforce the family where
+# the enumeration is, and do not try to infer it from prose.
+
 echo
 if [ "$bad" -eq 0 ]; then
   echo "FLAG/GATE COVERAGE: PASS ($n_src engine flags, $n_gate gate-named, $n_res ungated:"

@@ -196,7 +196,6 @@ remember"*. It now **derives** the population:
 ```
 -- decode1 parallel_for bodies found by ENUMERATION:
      covered-by-subset  gemm_usm_decode1
-     exempt-by-reason    gemm_usm_decode1_blockload  (SIMD reduce + xor butterfly)
      exempt-by-reason    gemm_usm_decode1_f16  (FP16 path: no 2-bit codebook)
      COVERED-BY-ATOM-PIN  gemm_usm_decode1_rowpair
      covered-by-subset  gemm_usm_decode1_vec
@@ -207,6 +206,12 @@ remember"*. It now **derives** the population:
 Enumerating immediately exposed **three pre-existing bodies the checker had never
 looked at** — `gemm_usm_decode1`, `gemm_usm_decode1_f16`, `gemm_usm_decode1_vec_mr`
 — so this was not about my new kernel; the checker had been blind to 3 of 6.
+
+`gemm_usm_decode1_subgroup` is also in the list, covered by the same subset
+relation. An `UNCOVERED` entry is a **hard failure**, so the exemption path cannot
+decay into "exempt everything new" — which is what happened transiently above,
+when the first run of this checker reported `gemm_usm_decode1_blockload` as
+UNCOVERED after the duplicate flag was deleted.
 
 **Both negative directions proven by hand, not asserted:**
 

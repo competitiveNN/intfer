@@ -95,10 +95,15 @@ fi
 #
 # So the population is DERIVED, not appended: every parallel_for in the file whose
 # name contains `decode1` is a body this pin must either cover or say why not.
-# INTFER_DECODE1_BLOCKLOAD's body is listed as EXEMPT-BY-REASON and not compared:
-# it does not share the arithmetic (it reduces a SIMD register array through a
-# xor butterfly), and the anti-vacuity floor below would reject it anyway -- which
-# is the correct outcome for a body that is not a copy.
+# Bodies that are NOT copies of the scalar per-output arithmetic are listed with a
+# STATED REASON and are not compared -- and the reason must be a reason, not a name
+# that happened to be there. The first version of this block named
+# gemm_usm_decode1_blockload, which was a flag written and then DELETED as a
+# duplicate of INTFER_DECODE1_SUBGROUP; leaving the name in the exemption list is
+# the retirement-family defect (a deleted thing leaving a checker reference behind)
+# and it was caught by `git grep` for the flag, not by this checker. So the list
+# below is the LIVE body set, and an UNCOVERED entry is a hard failure that fires
+# the moment a body is added or renamed.
 echo "-- decode1 parallel_for bodies found by ENUMERATION:"
 mapfile -t ALL_D1 < <(grep -oE 'parallel_for<class [a-z0-9_]*decode1[a-z0-9_]*>' "$SRC" \
                        | sed -E 's/.*<class ([a-z0-9_]*)>/\1/' | sort -u)

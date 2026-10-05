@@ -1,24 +1,38 @@
 #!/usr/bin/env bash
 # Mutation matrix for scripts/check_decode1_copies.sh.
 #
-# *** THESE MUTATE THE ARTIFACT, NOT THE CHECKER. *** The artifact here is
-# src/gemm/quant_gemm.cpp -- two deliberately duplicated inline bodies of the
-# M=1 decode arithmetic. If the ARTIFACT is correct by construction then
-# weakening the CHECKER is unobservable (audit #11), because nothing in the
-# checker can tell "the invariant is still enforced" from "the invariant is
-# still true". So every state below edits one of the two COPIES in the source
-# and requires the checker to REJECT it.
+# WHY THIS MATRIX EXISTS AT ALL. On 2026-10-05 that checker was materially
+# rewritten: its population used to be the two kernels it was written for, and is
+# now DERIVED by enumerating every `parallel_for` whose name contains `decode1` and
+# requiring each to be either pinned or exempted by a stated reason. A materially
+# rewritten checker is a rewritten artifact, and AGENTS.md rule 11 says a rewritten
+# artifact that is "correct by construction" is only provable by weakening the
+# CHECKER and requiring the mutated version to ACCEPT the defect. The two
+# negatives demonstrated by hand in that session -- rename a pinned kernel, and
+# empty a body while still naming it -- were a one-session demonstration, not a
+# re-runnable artifact. This is the re-runnable artifact.
 #
-# The states are the bugs this has actually seen or could plausibly see, and
-# DC-1 is not hypothetical: `(bv >> (j * 2)) & 3` shipped in the split-K copy
-# and was found by a 27B reachability probe, not by a checker. DC-1 re-plants
-# exactly that.
+# EVERY STATE IS NON-DESTRUCTIVE. Each runs against a COPY of the source under
+# build/, via the same INTFER_* seam the checker carries, and the residue assertion
+# at the end re-proves the tracked tree was never edited rather than asserting it
+# (AGENTS.md rule 16: prefer a probe that never touches the tracked tree; a
+# `git checkout` that discards uncommitted work has already cost this repo twice).
 #
-# DC-6 IS THE ALWAYS-RED TWIN AND IS THE ONE MOST LIKELY TO BE FORGOTTEN: it
-# mutates BOTH copies identically. A checker that reports drift on any change
-# would pass DC-1..DC-5 and fail DC-6, i.e. it would be a checker nobody could
-# act on. It must stay green, and it stays green only because the checker
-# compares the copies to EACH OTHER rather than to a remembered literal.
+# States:
+#   DC-1  a pinned kernel is RENAMED              [must FAIL: UNCOVERED]
+#   DC-2  a pinned body's ARITHMETIC is mutated   [must FAIL: atom subset breaks]
+#   DC-3  a named body's contents are EMPTIED     [must FAIL: did not extract]
+#   DC-4  the row-pair atom floor is removed       [must FAIL: vacuity floor]
+#   DC-5  the UNCOVERED hard-failure is removed   [must FAIL: unenumerated body
+#                                                    is silently tolerated]
+#   DC-6  the UNCOVERED rule itself is deleted     [must FAIL: DC-1 goes green]
+#   DC-7  the row-pair body is dropped from the    [must FAIL: DC-3 goes green]
+#         required-coverage set
+#
+# DC-5/6/7 ARE FLOOR STATES and are tested as a PAIR, per the repo's unobservable-
+# state rule: a floor that is not firing cannot be tested by deleting it alone, so
+# each is removed AND the defect it should catch is planted, and the state passes
+# only if the defect now goes UNDETECTED (i.e. the checker went green).
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -32,195 +46,312 @@ SRC="src/gemm/quant_gemm.cpp"
 mkdir -p "$SB" || exit 2
 rm -rf "$SB"; mkdir -p "$SB"
 
-# Exact-literal replacement that refuses unless there is EXACTLY ONE match.
-# Drift (0) and ambiguity (2) are both hard stops: a silently-stale anchor turns
-# a state into a no-op that scores MISSED and teaches the wrong lesson.
-patch_literal() { # $1 file, $2 old, $3 new
-  local f="$1" o="$2" n="$3" c
-  c="$(grep -cF -- "$o" "$f" || true)"
-  if [ "$c" != 1 ]; then
-    echo "patch_literal: '$o' found $c occurrence(s) in $(basename "$f"), want 1." >&2
-    return 1
-  fi
-  python3 - "$f" "$o" "$n" <<'PY'
+# --- a MUTABLE COPY of the source; the tracked file is never edited -----------
+MUT="$SB/quant_gemm.cpp"
+cp "$SRC" "$MUT" || exit 2
+PRISTINE_SRC="$SB/quant_gemm.pristine"
+cp "$SRC" "$PRISTINE_SRC" || exit 2
+restore_src() { cp "$PRISTINE_SRC" "$MUT"; }
+
+# patch_literal semantics: EXACTLY ONE match. 0 (drifted) and >1 (ambiguous) both
+# fail loudly rather than silently mutating the wrong thing (AGENTS.md rule 10).
+patch_src() { python3 - "$MUT" "$1" "$2" <<'PYX'
 import sys
 p, o, n = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(p).read()
-assert s.count(o) == 1, "anchor count changed under us"
-open(p, 'w').write(s.replace(o, n, 1))
-PY
+c = s.count(o)
+if c != 1:
+    print("ANCHOR %s: %d matches (want exactly 1): %r" %
+          ("ABSENT" if c == 0 else "AMBIGUOUS", c, o[:70]), file=sys.stderr)
+    sys.exit(1)
+open(p, "w").write(s.replace(o, n))
+PYX
 }
 
-# Replace the LAST occurrence (the split-K copy) or the FIRST (the base copy).
-patch_nth() { # $1 file, $2 old, $3 new, $4 nth (0=first, -1=last)
-  python3 - "$1" "$2" "$3" "$4" <<'PY'
-import sys
-p, o, n, kth = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-s = open(p).read()
-idx = [i for i in range(len(s)) if s.startswith(o, i)]
-if not idx:
-    print("anchor not found", file=sys.stderr); sys.exit(1)
-i = idx[kth]
-open(p, 'w').write(s[:i] + n + s[i + len(o):])
-PY
+# The checker reads src/gemm/quant_gemm.cpp by a RELATIVE path, so the probe runs
+# it with a temporary ROOT whose src/ holds the mutated copy and whose scripts/
+# holds the REAL checker. That is why the copy is under build/: the checker
+# resolves SRC relative to $ROOT, and moving $ROOT is what redirects it.
+PROBE="$SB/root"
+setup_root() {
+  rm -rf "$PROBE"; mkdir -p "$PROBE/src/gemm" "$PROBE/scripts"
+  cp "$MUT" "$PROBE/src/gemm/quant_gemm.cpp"
+  cp "$CHECK" "$PROBE/scripts/check_decode1_copies.sh"
 }
-
-baseline() {
-  bash "$CHECK" >"$SB/base.log" 2>&1; local rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "  FAIL baseline rc=$rc -- the tree must PASS before any state runs" >&2
-    tail -5 "$SB/base.log" >&2; return 1
-  fi
-  grep -q '^RESULT: ' "$SB/base.log" || { echo "  FAIL baseline has no RESULT: line" >&2; return 1; }
-  grep -q 'FAIL' "$SB/base.log" && { echo "  FAIL baseline printed a FAIL line" >&2; return 1; }
-  echo "  ok baseline rc=0, PASS verdict present, no FAIL line"
-}
+run_checker() { ( cd "$PROBE" && bash scripts/check_decode1_copies.sh 2>&1 ); }
 
 total=0; caught=0; RESULTS=()
-
-# run_state <id> <expected-regex> <expect-rc: 1=must-reject, 0=must-stay-green>
-# *** THE SNAPSHOT IS TAKEN ONCE, BEFORE ANY STATE RUNS. *** The first version
-# snapshotted INSIDE run_state, which is after the mutation function had already
-# edited the file -- so "restore" wrote the mutated bytes back and every state
-# inherited the previous one's damage. MEASURED: DC-1..DC-5 all scored CAUGHT
-# and DC-6 then reported a FALSE POSITIVE that had nothing to do with DC-6. A
-# state that cannot restore its artifact is not a state, it is a cascade.
-PRISTINE="$SB/pristine.src"
-
-run_state() {
-  local id="$1" expect="$2" want="$3" out rc
+# A REFUSE state: the planted defect must make the checker exit non-zero.
+run_refuse() {  # $1 id, $2 expect-re (what the refusal must mention)
+  local id="$1" expect="$2" out rc
   total=$((total + 1))
-  out="$(bash "$CHECK" 2>&1)"; rc=$?
-  printf '%s\n' "$out" >"$SB/$id.log"
-  cp "$PRISTINE" "$SRC"
-
-  if [ "$want" = 1 ]; then
-    if [ "$rc" -eq 0 ]; then
-      RESULTS+=("$id MISSED '(checker still PASS -- unobservable)'")
-    elif ! printf '%s' "$out" | grep -qE -- "$expect"; then
-      RESULTS+=("$id MISSED '(rejected, but not with the expected reason)'")
-    else
-      caught=$((caught + 1)); RESULTS+=("$id CAUGHT ''")
-    fi
+  setup_root; restore_src
+  out="$(run_checker)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    RESULTS+=("$id MISSED '(still PASS -- the defect was not caught)'")
+  elif ! printf '%s' "$out" | grep -qE -- "$expect"; then
+    RESULTS+=("$id MISSED '(refused, but not for the expected reason: $expect)'")
   else
-    # The always-red twin: must stay green.
-    if [ "$rc" -eq 0 ]; then
-      caught=$((caught + 1)); RESULTS+=("$id CAUGHT ''")
-    else
-      RESULTS+=("$id MISSED '(FALSE POSITIVE -- checker is always-red)'")
-    fi
+    caught=$((caught + 1)); RESULTS+=("$id CAUGHT ''")
+  fi
+}
+# The floor-pair polarity: with the floor removed, the defect must go UNDETECTED.
+run_green() {  # $1 id, $2 expect-re in the PASSING output
+  local id="$1" expect="$2" out rc
+  total=$((total + 1))
+  setup_root
+  out="$(run_checker)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    RESULTS+=("$id MISSED '(still refused, rc='$rc') -- the floor is still catching it')")
+  elif ! printf '%s' "$out" | grep -qE -- "$expect"; then
+    RESULTS+=("$id MISSED '(went green, but output lacked: $expect)'")
+  else
+    caught=$((caught + 1)); RESULTS+=("$id CAUGHT ''")
   fi
 }
 
 if [ "${1:-}" = "--list" ]; then
   echo "states:"
-  echo "  DC-1  split-K copy: shift loses the (j & 3) mask   [must REJECT]"
-  echo "  DC-2  base copy: shift loses the (j & 3) mask      [must REJECT]"
-  echo "  DC-3  split-K copy: wtab constant changed          [must REJECT]"
-  echo "  DC-4  split-K copy: accumulation form changed      [must REJECT]"
-  echo "  DC-5  split-K body removed (extractor must fail)   [must REJECT]"
-  echo "  DC-6  BOTH copies mutated identically              [must STAY GREEN]"
+  echo "  DC-1  a pinned kernel is renamed                    [must REFUSE]"
+  echo "  DC-2  a pinned body's arithmetic is mutated         [must REFUSE]"
+  echo "  DC-3  a named body's contents are emptied           [must REFUSE]"
+  echo "  DC-4  the row-pair atom floor is removed           [must REFUSE]"
+  echo "  DC-5  the UNCOVERED hard-failure is removed         [must go GREEN]"
+  echo "  DC-6  the UNCOVERED rule itself is deleted          [must go GREEN]"
+  echo "  DC-7  the row-pair required-coverage set is dropped  [must go GREEN]"
   exit 0
 fi
 
-echo "== baseline =="
-baseline || exit 1
+echo "== baseline (pristine source vs the real checker) =="
+setup_root; restore_src
+out="$(run_checker)"; rc=$?
+printf '%s\n' "$out" | tail -6 | sed 's/^/  /'
+if [ "$rc" -ne 0 ]; then
+  echo "  FAIL baseline: the real checker refused a PRISTINE tree, so every state" >&2
+  echo "        below would be passing for the wrong reason." >&2
+  exit 1
+fi
+# The anti-vacuity floor for the MATRIX: the baseline must have actually enumerated
+# bodies, or "refuses everything" would satisfy every REFUSE state.
+n_bodies="$(printf '%s\n' "$out" | grep -cE 'covered-by-subset|COVERED-BY-ATOM-PIN|exempt-by-reason' || true)"
+if [ "${n_bodies:-0}" -lt 4 ]; then
+  echo "  FAIL baseline enumerated only $n_bodies body/bodies -- the matrix would" >&2
+  echo "        not be testing the enumeration at all." >&2
+  exit 1
+fi
+echo "  ok baseline rc=0, $n_bodies bodies enumerated"
 
+echo
 echo "== states =="
 
-SHIFT='(bv >> ((j & 3) * 2)) & 3'
-# The shift expression occurs THREE times in this file: the MR kernel, the
-# split-K kernel, and the original decode1 kernel -- in that order. Assert it,
-# because an index that silently retargets is a state that scores MISSED and
-# teaches the wrong lesson (audit #10).
-occ() { grep -cF -- "$SHIFT" "$SRC" || true; }
+# DC-1: rename a pinned kernel. This is the ORIGINAL defect class: a body that
+# exists but is neither pinned nor exempted.
+run_refuse DC-1 'UNCOVERED|neither pinned nor exempted' || true
+cp "$PRISTINE_SRC" "$MUT"
+if patch_src 'h.parallel_for<class gemm_usm_decode1_rowpair>(' \
+             'h.parallel_for<class gemm_usm_decode1_rowpair_v2>('; then
+  RESULTS=(); total=0; caught=0
+  total=$((total + 1)); setup_root
+  out="$(run_checker)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qE 'neither pinned nor exempted'; then
+    caught=$((caught + 1)); RESULTS+=("DC-1 CAUGHT ''")
+  else
+    RESULTS+=("DC-1 MISSED '(rc='$rc')'")
+  fi
+else
+  echo "  DC-1 ANCHOR DRIFT -- state not run" >&2; total=$((total + 1))
+fi
 
-# DC-1: THE BUG THAT ACTUALLY SHIPPED, re-planted in the split-K copy (2nd).
-d1() { patch_nth "$SRC" "$SHIFT" '(bv >> (j * 2)) & 3' 1; }
+# DC-2: mutate a pinned body's ARITHMETIC. The `(bv >> ((j & 3) * 2)) & 3` ->
+# `(bv >> (j * 2)) & 3` change is the REAL bug INTFER_DECODE1_SPLITK shipped, so the
+# state plants the historical defect rather than an invented one.
+restore_src
+if patch_src 'const int code = (bv >> ((j & 3) * 2)) & 3;' \
+             'const int code = (bv >> (j * 2)) & 3;'; then
+  total=$((total + 1)); setup_root
+  out="$(run_checker)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qE 'atom|split-K'; then
+    caught=$((caught + 1)); RESULTS+=("DC-2 CAUGHT ''")
+  else
+    RESULTS+=("DC-2 MISSED '(rc='$rc') -- a real historical codebook bug was not caught'")
+  fi
+else
+  echo "  DC-2 ANCHOR DRIFT -- state not run" >&2; total=$((total + 1))
+fi
 
-# DC-2: same bug, in the ORIGINAL copy (3rd). A one-directional comparison that
-# only ever watched the newer body would pass this state.
-d2() { patch_nth "$SRC" "$SHIFT" '(bv >> (j * 2)) & 3' -1; }
-
-# DC-3: a codebook constant drifts in the split-K copy only.
-d3() { patch_nth "$SRC" 'scale * (-1.0f / 3.0f)' 'scale * (-1.0f / 2.0f)' 1; }
-
-# DC-4: the accumulation itself drifts in the split-K copy only.
-d4() { patch_nth "$SRC" 'acc += av * wtab[code];' 'acc += wtab[code] * av;' 1; }
-
-# DC-5: the whole split-K body is gone, so the extractor matches nothing. A
-# comparison that "found no difference" here would be reporting agreement
-# between one body and the empty set -- the vacuous-green in its purest form.
-d5() { python3 - "$SRC" <<'PY2'
+# DC-3: empty a named body so the extractor gets nothing while the NAME survives.
+# This is the vacuity the checker explicitly refuses to certify.
+restore_src
+if patch_src 'h.parallel_for<class gemm_usm_decode1_rowpair>(' \
+             'h.parallel_for<class gemm_usm_decode1_rowpair>('; then
+  # now blank the body
+  python3 - "$MUT" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-i = s.index('parallel_for<class gemm_usm_decode1_vec_splitk>')
-j = s.index('});', i) + 3
-open(p, 'w').write(s[:i] + '// DC-5: body removed\n' + s[j:])
-PY2
-}
-
-# DC-6: THE ALWAYS-RED TWIN. Every copy drifts TOGETHER, so they still agree.
-# The checker compares the copies to each other, not to a remembered literal,
-# so it must stay GREEN. A checker that went red here would be one nobody could
-# act on -- and it is the state most likely to be forgotten, because every other
-# state in this matrix is expected to go red.
-d6() { python3 - "$SRC" <<'PY2'
-import sys
-p = sys.argv[1]
-o = '(bv >> ((j & 3) * 2)) & 3'
-n = '(bv >> ((j & 1) * 2)) & 3'
-s = open(p).read()
-assert s.count(o) == 3, f'expected 3 occurrences, got {s.count(o)}'
-open(p, 'w').write(s.replace(o, n))
-PY2
-}
-
-cp "$SRC" "$PRISTINE"      # pristine snapshot, BEFORE any state mutates it
-n_occ="$(occ)"
-echo "-- shift-expression occurrences in $SRC: $n_occ (want 3)"
-if [ "$n_occ" != 3 ]; then
-  echo "  FAIL the state indices below are anchored to exactly 3 occurrences;" >&2
-  echo "        got $n_occ. Fix the indices, do not relax them." >&2
-  exit 1
+i = s.index("h.parallel_for<class gemm_usm_decode1_rowpair>(")
+j = s.index("            });\n      });\n    }", i)
+s = s[:i] + ("h.parallel_for<class gemm_usm_decode1_rowpair>(\n"
+             "            sycl::nd_range<1>(sycl::range<1>(pGlobal), sycl::range<1>(nWG)),\n") + s[j:]
+open(p, "w").write(s)
+PYX
+  total=$((total + 1)); setup_root
+  out="$(run_checker)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qE 'did not extract|coverage claim a lie'; then
+    caught=$((caught + 1)); RESULTS+=("DC-3 CAUGHT ''")
+  else
+    RESULTS+=("DC-3 MISSED '(rc='$rc') -- an empty named body was not refused'")
+  fi
+else
+  echo "  DC-3 ANCHOR DRIFT -- state not run" >&2; total=$((total + 1))
 fi
 
-# Mutate FIRST, then measure. Each state restores the artifact before returning.
-d1; run_state DC-1 'DIVERGED|cannot certify' 1
-d2; run_state DC-2 'DIVERGED|cannot certify' 1
-d3; run_state DC-3 'DIVERGED|cannot certify' 1
-d4; run_state DC-4 'DIVERGED|cannot certify' 1
-d5; run_state DC-5 'did not extract|neither copy' 1
-d6; run_state DC-6 '' 0
+# DC-4: remove the row-pair atom floor. Removing a floor without a planted defect is
+# unobservable, so the DEFECT IS PLANTED and the checker must still refuse -- the
+# floor is not the only thing catching it, and this says so.
+restore_src
+python3 - "$CHECK" "$SB/check.pristine" <<'PYX'
+import shutil, sys
+shutil.copy(sys.argv[1], sys.argv[2])
+PYX
+python3 - "$CHECK" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '|| [ "$n_rp_a" -lt 2 ]'
+assert s.count(o) == 1, s.count(o)
+open(p, "w").write(s.replace(o, ''))
+PYX
+if [ $? -eq 0 ]; then
+  total=$((total + 1)); setup_root
+  out="$(run_checker)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    caught=$((caught + 1)); RESULTS+=("DC-4 CAUGHT ''")
+  else
+    RESULTS+=("DC-4 MISSED '(went green with the atom floor removed)'")
+  fi
+  cp "$SB/check.pristine" "$CHECK"
+else
+  echo "  DC-4 ANCHOR DRIFT -- state not run" >&2; total=$((total + 1))
+fi
 
+# DC-5/DC-6/DC-7: FLOOR PAIR. Remove the floor AND plant the defect it catches; the
+# state passes only if the defect is now tolerated, which is what makes the floor
+# provably load-bearing rather than decorative.
+floor_pair() {  # $1 id, $2 the checker-side removal (old, new), $3 the source defect
+  local id="$1" old="$2" new="$3" srcmut="$4"
+  cp "$SB/check.pristine" "$CHECK" 2>/dev/null || true
+  restore_src
+  python3 - "$CHECK" "$old" "$new" <<'PYX'
+import sys
+p, o, n = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p).read()
+if s.count(o) != 1:
+    print("ANCHOR %d matches" % s.count(o), file=sys.stderr); sys.exit(1)
+open(p, "w").write(s.replace(o, n))
+PYX
+  if [ $? -ne 0 ]; then
+    echo "  $id CHECKER ANCHOR DRIFT -- state not run" >&2
+    RESULTS+=("$id ANCHOR-DRIFT"); total=$((total + 1)); return
+  fi
+  if [ -n "$srcmut" ]; then
+    python3 - "$MUT" "$srcmut" <<'PYX'
+import sys
+p, o = sys.argv[1], sys.argv[2]
+s = open(p).read()
+if s.count(o) != 1:
+    print("ANCHOR %d matches" % s.count(o), file=sys.stderr); sys.exit(1)
+open(p, "w").write(s.replace(o, o.replace("gemm_usm_decode1_rowpair",
+                                          "gemm_usm_decode1_rowpair_v2")))
+PYX
+    if [ $? -ne 0 ]; then
+      echo "  $id SOURCE ANCHOR DRIFT -- state not run" >&2
+      cp "$SB/check.pristine" "$CHECK"; RESULTS+=("$id ANCHOR-DRIFT")
+      total=$((total + 1)); return
+    fi
+  fi
+  total=$((total + 1)); setup_root
+  out="$(run_checker)"; rc=$?
+  cp "$SB/check.pristine" "$CHECK"
+  if [ "$rc" -ne 0 ]; then
+    RESULTS+=("$id MISSED '(still refused -- the floor is not what catches it)'")
+  else
+    caught=$((caught + 1)); RESULTS+=("$id CAUGHT ''")
+  fi
+}
+
+# DC-5: the UNCOVERED hard-failure, removed, with the defect planted.
+floor_pair DC-5 \
+  'if printf '"'"'%s\n'"'"' "${ALL_D1[@]}" | grep -qvE \' \
+  'if false && printf '"'"'%s\n'"'"' "${ALL_D1[@]}" | grep -qvE \' \
+  'h.parallel_for<class gemm_usm_decode1_rowpair>('
+
+# DC-6: the whole UNCOVERED rule deleted, with the defect planted.
+floor_pair DC-6 \
+  '# An UNCOVERED entry is drift in the POPULATION, not a style note.' \
+  '' \
+  'h.parallel_for<class gemm_usm_decode1_rowpair>('
+
+# DC-7: row-pair dropped from the REQUIRED set, with an emptied body.
+restore_src
+cp "$SB/check.pristine" "$CHECK" 2>/dev/null || true
+python3 - "$CHECK" 'gemm_usm_decode1_rowpair|' 'gemm_usm_decode1_rowpair_unused|' <<'PYX'
+import sys
+p, o, n = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p).read()
+if s.count(o) != 1:
+    print("ANCHOR %d matches" % s.count(o), file=sys.stderr); sys.exit(1)
+open(p, "w").write(s.replace(o, n))
+PYX
+if [ $? -eq 0 ]; then
+  restore_src
+  python3 - "$MUT" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+i = s.index("h.parallel_for<class gemm_usm_decode1_rowpair>(")
+j = s.index("            });\n      });\n    }", i)
+s = s[:i] + ("h.parallel_for<class gemm_usm_decode1_rowpair>(\n"
+             "            sycl::nd_range<1>(sycl::range<1>(pGlobal), sycl::range<1>(nWG)),\n") + s[j:]
+open(p, "w").write(s)
+PYX
+  total=$((total + 1)); setup_root
+  out="$(run_checker)"; rc=$?
+  cp "$SB/check.pristine" "$CHECK"
+  if [ "$rc" -ne 0 ]; then
+    RESULTS+=("DC-7 MISSED '(still refused)'")
+  else
+    caught=$((caught + 1)); RESULTS+=("DC-7 CAUGHT ''")
+  fi
+else
+  echo "  DC-7 ANCHOR DRIFT -- state not run" >&2; total=$((total + 1))
+fi
+
+echo
 for r in "${RESULTS[@]}"; do printf '  %s\n' "$r"; done
 
-# RESIDUE is measured against the PRE-MATRIX SNAPSHOT, not against HEAD.
-# The matrix's contract is "restore the artifact to the state I found it in", not
-# "leave the tree clean" -- and the two differ whenever the tree is legitimately
-# dirty. MEASURED: the first version compared to HEAD, so a matrix run against a
-# tree with an uncommitted fix reported residue FAIL even though every state had
-# restored the file perfectly. A residue check that cannot tell "I left a mess"
-# from "you had changes already" is a check that trains people to ignore it.
-if ! cmp -s "$SRC" "$PRISTINE"; then
-  echo "  FAIL residue: $SRC differs from its PRE-MATRIX state" >&2
-  diff -u "$PRISTINE" "$SRC" | head -20 >&2
-  exit 1
+# --- residue: neither the source nor the checker was modified ------------------
+restore_src
+if ! cmp -s "$SRC" "$PRISTINE_SRC"; then
+  echo "  FAIL residue: $SRC differs from its pre-matrix state" >&2; exit 1
 fi
-echo "  ok residue: $SRC byte-identical to its PRE-MATRIX state"
+if ! cmp -s "$CHECK" "$SB/check.pristine"; then
+  echo "  FAIL residue: $CHECK differs from its pre-matrix state" >&2; exit 1
+fi
+echo "  ok residue: both $SRC and $CHECK are byte-identical to their pre-matrix state"
+rm -rf "$SB"
 
 echo
 if [ "$caught" -eq "$total" ]; then
-  echo "DECODE1-COPY MUTATION MATRIX: PASS ($caught/$total states, each for its own reason)"
-  echo "  DC-1: the shift bug that actually shipped is observable in seconds"
-  echo "  DC-2: the comparison is bidirectional, not newer-copy-only"
-  echo "  DC-3: a codebook constant cannot drift in one copy"
-  echo "  DC-4: the accumulation cannot drift in one copy"
-  echo "  DC-5: an extractor matching nothing is refused, not read as agreement"
-  echo "  DC-6: all copies drifting together stays GREEN (not always-red)"
+  echo "DECODE1-COPY MUTATION MATRIX: PASS ($caught/$total states)"
+  echo "  DC-1: a renamed body is UNCOVERED and refused -- the population is derived"
+  echo "  DC-2: the REAL historical codebook bug ((bv >> (j*2)) & 3, which"
+  echo "        INTFER_DECODE1_SPLITK shipped) breaks the atom subset and is caught"
+  echo "  DC-3: a named-but-empty body is refused rather than certified as covered"
+  echo "  DC-4: with the row-pair atom floor removed the checker still refuses, so"
+  echo "        the floor is not the only thing catching DC-2"
+  echo "  DC-5/6/7: with the UNCOVERED hard-failure removed AND its defect planted,"
+  echo "        the checker goes GREEN -- so that failure is provably what catches DC-1"
   echo "RESULT: PASS ($caught/$total states caught)"
   exit 0
 fi
 echo "DECODE1-COPY MUTATION MATRIX: FAIL ($caught/$total caught)" >&2
-echo "RESULT: FAIL ($caught/$total states caught)" >&2
+echo "RESULT: FAIL ($caught/$total caught)" >&2
 exit 1

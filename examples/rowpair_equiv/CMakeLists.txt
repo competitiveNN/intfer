@@ -1,0 +1,6 @@
+add_executable(rowpair_equiv main.cpp)
+target_link_libraries(rowpair_equiv PRIVATE intfer_device intfer_gemm intfer_common)
+if(INTFER_ENABLE_L0)
+  target_link_libraries(rowpair_equiv PRIVATE intfer_l0)
+endif()
+add_sycl_to_target(TARGET rowpair_equiv SOURCES main.cpp)

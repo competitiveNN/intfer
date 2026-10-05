@@ -357,6 +357,16 @@ dispatch() { # $1 = label -> runs it
       # Read-only, no GPU, no build. rc=2 (no artifact) is UNPROVEN, not a
       # regression, and the 2b re-run path handles it.
       timeout -k 30 300 bash "$SCRIPT_DIR/check_engine_cert.sh"; return $? ;;
+    test_rowpair_equiv.sh)
+      # The MEASURED bitwise-equivalence check for INTFER_DECODE1_ROWPAIR. Runs the
+      # binary TWICE in two processes -- quant_gemm_forward_usm reads the flag into
+      # a function-local `static const bool`, so one process cannot hold both
+      # orders -- and diffs 200k+ element values. Binds no model. This gate exists
+      # because the kernel's "bit-exact by construction" argument was WRONG: the
+      # first version double-offset a row-relative multi_ptr and lost the device on
+      # both INT2 shapes, while passing on the FP16 and INT4 shapes the branch
+      # never reaches.
+      timeout -k 30 1800 bash "$SCRIPT_DIR/test_rowpair_equiv.sh"; return $? ;;
     test_roofline_probe.sh)
       # AUDIT #33 follow-on. The allocator-vs-kernel discriminator for decode's
       # bandwidth deficit. Device event timestamps (load-insensitive), binds NO
@@ -787,7 +797,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   # checkers-only, and a band that silently skipped a gate would be the
   # audit #18 shape (an arm that never runs certifies nothing).
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS test_roofline_probe.sh"
+    STEPS="$STEPS test_roofline_probe.sh test_rowpair_equiv.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \

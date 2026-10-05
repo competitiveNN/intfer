@@ -87,10 +87,13 @@ correct behaviour and not something to work around. Rewrite it when the gate
 population changes; the checker fails if you do not:
 
 ```
-gate tally: 12 PASS, 0 PARTIAL, 0 SKIPPED
+gate tally: 13 PASS, 0 PARTIAL, 0 SKIPPED
   (+1 on 2026-10-05: `test_roofline_probe`, the model-free
   allocator-vs-kernel discriminator for decode's bandwidth deficit.
-  Device event timestamps, no model bound, ~30 s.)
+  Device event timestamps, no model bound, ~30 s.
+  +1: `test_rowpair_equiv`, the MEASURED bitwise-equivalence check for
+  `INTFER_DECODE1_ROWPAIR` -- 227 835 element values over 8 shapes x 5
+  datasets, two process invocations, no model bound.)
 ```
 
 * Historical lines recording the 1-GPU-era tally are **records of that era**. Do
@@ -657,6 +660,7 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_DPAS_ROW` | one WI owns many tiles | ~460x slower. Historical dead end, mutually exclusive with E4 |
 | `INTFER_DECODE1_MR` | 4 outputs per WI at M=1 INT2 | **2.3x slower.** Do not use |
 | `INTFER_DECODE1_SPLITK` | split-K block-cyclic M=1 INT2 decode: `N*S` work-items + coalesced weight loads. Exactly `=1`; kill switch `INTFER_NO_DECODE1_SPLITK` | **MEASURED LOSS.** Stream-identical to base on 27B (so the numerics contract held), but kernel 267 -> 384 ms (+43.8%, 3/3 same sign, clears the 6 ms spread floor; `nk/nw/nr` identical). Both halves of the hypothesis delivered and it still lost. **Do not promote.** `reports/2026-10-04-ksplit-decode1.md` |
+| `INTFER_DECODE1_SUBGROUP` | llama.cpp mmvq shape: one SUB-GROUP per output row, lanes split K, reduced by `sycl::reduce_over_group` -- no `local_accessor`, no barrier. **PORTED 2026-10-05, PERF UNMEASURED.** Numerics are the already-measured cyclic contract (0 ulp realistic, 2 ulp adversarial); arm in `test_tp2_27b.sh`. Predicted NEUTRAL: removing a barrier from a kernel at ~9% of roofline is not a step change, and the weight REPACK that would make it large is deliberately NOT ported. `reports/2026-10-05-decode1-subgroup.md` |
 | `INTFER_L4_FUSE` | fused ssm+norm+FP16 -> la_out GEMM (TP=1) | stream-identical, but M>1 nets ~-1.5% and scalar A/B was a variance wash |
 | `INTFER_L5_FRONT` | device-resident whole LA input path | **dead end as built**: +144 launches/token, waitblock 5x. More kernels lose |
 | `INTFER_SSM_GPU` | device SSM recurrence | declines under `INTFER_DPAS48=1` (its ~1ulp drift flips a GA64 code at a tie) |

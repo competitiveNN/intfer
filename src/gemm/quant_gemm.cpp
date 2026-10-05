@@ -462,11 +462,25 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
               const std::size_t rbB = static_cast<std::size_t>(nb) * K;
               sycl::multi_ptr<const std::uint16_t,
                   sycl::access::address_space::global_space> act_mp(act_usm);
-              sycl::multi_ptr<const std::uint8_t,
-                  sycl::access::address_space::global_space> wA(code_u8 + rbA);
-              sycl::multi_ptr<const std::uint8_t,
-                  sycl::access::address_space::global_space> wB(code_u8 + rbB);
-
+              // *** NO wA/wB multi_ptrs, ON PURPOSE, AND THE COMMENT IS THE
+              // POST-MORTEM. *** The first version of this arm built two
+              // row-OFFSET multi_ptrs (`code_u8 + rbA`) and then indexed them with
+              // ABSOLUTE byte offsets, `(rbA + kg) / 4` -- which is the base
+              // kernel's own expression. Double offset: it read at
+              // rbA + (rbA+kg)/4, far past the shard, and the result was
+              // UR_RESULT_ERROR_DEVICE_LOST on both INT2 shapes. The FP16 and INT4
+              // shapes passed, because the branch is guarded on bits == 2 and never
+              // ran there -- so a smoke test on a shape the flag does not reach
+              // would have called this green.
+              //
+              // The "bit-exact by construction" argument looked at the arithmetic
+              // and said the indices matched the base kernel. They did not, and no
+              // reading would have found it. Two rows sharing one activation load is
+              // exactly where a base pointer you forgot to update lives. The fix is
+              // to use the SAME unoffset `code_u8` with the SAME absolute
+              // expressions the base kernel uses, so the only difference from the
+              // reference is the two accumulators -- which is the claim being
+              // certified.
               for (int g = 0; g < num_groups_w; ++g) {
                 const float scA = from_half_bits(sA[g]) * alpha;
                 const float scB = from_half_bits(sB[g]) * alpha;
@@ -483,11 +497,12 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                 std::size_t b0B = (rbB + static_cast<std::size_t>(kg)) / 4u;
                 for (; kg + CC <= kg1; kg += CC) {
                   // THE SHARED LOAD. One activation vector, two weight pairs, two
-                  // independent accumulators. This is the entire mechanism.
+                  // independent accumulators. This is the entire mechanism, and it
+                  // is the ONLY structural difference from the base kernel.
                   sycl::vec<std::uint16_t, 8> a16;
                   a16.load(0, act_mp + kg);
-                  const std::uint8_t a0 = wA[b0A], a1 = wA[b0A + 1];
-                  const std::uint8_t c0 = wB[b0B], c1 = wB[b0B + 1];
+                  const std::uint8_t a0 = code_u8[b0A], a1 = code_u8[b0A + 1];
+                  const std::uint8_t c0 = code_u8[b0B], c1 = code_u8[b0B + 1];
                   b0A += 2; b0B += 2;
                   for (int j = 0; j < CC; ++j) {
                     const float av =
@@ -495,17 +510,20 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                     const std::uint8_t va = (j < 4) ? a0 : a1;
                     const std::uint8_t vb = (j < 4) ? c0 : c1;
                     // Two SEPARATE accumulators: the chains are co-scheduled in the
-                    // instruction stream, never summed together.
+                    // instruction stream, never summed together. That is what makes
+                    // each output's addition sequence the base kernel's sequence.
                     accA += av * wA4[(va >> ((j & 3) * 2)) & 3];
                     accB += av * wB4[(vb >> ((j & 3) * 2)) & 3];
                   }
                 }
-                // Ragged group tail. Identical to the base kernel's, per row.
+                // Ragged group tail, per row, with the base kernel's expressions.
                 for (; kg < kg1; ++kg) {
                   const float av = from_half_bits(act_usm[kg]);
                   const std::size_t iA = rbA + kg, iB = rbB + kg;
-                  accA += av * scA * canon_value(2, (wA[iA / 4] >> ((iA % 4) * 2)) & 3);
-                  accB += av * scB * canon_value(2, (wB[iB / 4] >> ((iB % 4) * 2)) & 3);
+                  accA += av * scA *
+                          canon_value(2, (code_u8[iA / 4] >> ((iA % 4) * 2)) & 3);
+                  accB += av * scB *
+                          canon_value(2, (code_u8[iB / 4] >> ((iB % 4) * 2)) & 3);
                 }
               }
               out_usm[na] = to_half_bits(accA);
