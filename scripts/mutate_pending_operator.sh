@@ -101,8 +101,13 @@ sed -n '/classification of steps/,/CLEARABLE HERE/p' "$SB/base.log" | sed 's/^/ 
 if [ "$rc" -ne 0 ]; then
   echo "  FAIL baseline rc=$rc" >&2; tail -6 "$SB/base.log" >&2; exit 1
 fi
-if ! grep -q 'PENDING-OPERATOR (remediation needs the 27B run): 1' "$SB/base.log"; then
+# Match on the COUNT, not on the label's prose. An earlier version asserted the
+# whole sentence, so renaming the label (adding "step(s)", to make the unit
+# explicit) silently broke the baseline -- a checker whose expectation encodes one
+# exact wording is a checker that fails for a reason unrelated to its subject.
+if ! grep -qE 'PENDING-OPERATOR step\(s\).*: 1$' "$SB/base.log"; then
   echo "  FAIL baseline did not classify exactly 1 pending step" >&2
+  echo "        got: $(grep -E 'PENDING-OPERATOR|CLEARABLE' "$SB/base.log" | tr '\n' ' ')" >&2
   echo "        (the whole matrix measures the split, so a baseline that does not" >&2
   echo "         split proves nothing)" >&2
   exit 1

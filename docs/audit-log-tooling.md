@@ -3673,3 +3673,62 @@ e.g. S3's contract column is 40 not 42).
     and any checker that binds no model. Memory: `no_full_27b_gate_runs.md`.
 
 
+
+=== 2026-10-05 AUDIT #32: `shopt -s nullglob` + A BARE `ls` LISTS THE WRONG
+   DIRECTORY, AND THE VACUOUS CASE IT CREATES IS THE DANGEROUS ONE ===
+
+Added while writing scripts/check_pending_operator.sh, which exists to classify
+the stack's unproven steps into OPERATOR-DEFERRED (needs the 27B gate run, which an
+agent session must not drive) and CLEARABLE HERE. Its whole point is the EMPTY
+case: no logs means INCONCLUSIVE, not "nothing pending".
+
+The empty case was UNREACHABLE. The harvest read:
+
+    shopt -s nullglob
+    mapfile -t LOGS < <(ls -1 "$BUILD"/run_all_*.log 2>/dev/null)
+
+With nullglob ON, a glob that matches nothing expands to NOTHING -- not to the
+literal pattern. So `ls -1 "$BUILD"/run_all_*.log` became `ls -1` with no
+argument, which lists **the current directory**. An empty sandbox therefore
+reported "14 per-step logs found", the INCONCLUSIVE branch was never reached, and
+the anti-vacuity state PO-1 passed against a checker reading a completely
+unrelated directory listing.
+
+**WHY THIS IS WORSE THAN THE ORDINARY VACUOUS HARVEST.** The usual shape --
+`grep` matching nothing, a 0-count anchor -- at least announces itself: the count
+is 0 and an anti-vacuity floor fires. Here the harvest returned a HEALTHY-LOOKING
+non-zero count. Every floor that checks "did I find anything?" was satisfied by
+the wrong directory. A vacuous harvest that produces a plausible number is more
+dangerous than one that produces zero, because zero is visibly suspicious.
+
+**THE FIX, and the general form.** Use the glob DIRECTLY and let the array be the
+answer:
+
+    shopt -s nullglob
+    LOGS=("$BUILD"/run_all_*.log)
+    shopt -u nullglob
+    n_logs="${#LOGS[@]}"
+
+With nullglob the array is simply EMPTY when nothing matches -- which is the answer
+we want, and it cannot degenerate into "list something else". The anti-vacuity
+floor then works, because the count it checks is the count that was actually
+sought.
+
+**RULE: a glob whose emptiness you rely on must never be an ARGUMENT to a command
+that has a meaningful zero-argument form.** `ls`, `cat`, `rm`, `head` and `tar` all
+do something sensible with no arguments, so the mistake is silent and produces
+wrong data rather than an error. Prefer `arr=(glob)` / `mapfile -t arr < <(compgen
+-G glob)`, and if a command must take the expansion, assert non-emptiness first.
+
+**THE SESSION THIS COST.** Three separate harvests in one session silently matched
+nothing, and each surfaced as "0 results" rather than as an error:
+  1. a regex embedded in a bash heredoc whose backslashes were mangled;
+  2. an arm-body comparison that captured up to the first ".sh", so a mangled path
+     whose FIRST .sh still matched read as agreement;
+  3. this one, a nullglob collapse producing a plausible non-zero count.
+The common thread is that every one of them was CAUGHT BY A MUTATION STATE, never
+by reading the code, and never by the checker's own floor -- because the floor was
+checking the wrong number. That is the strongest argument yet for states over
+inspection in this repo: the defects were not subtle, the *harvests* were, and only
+something that deliberately broke the world noticed.
+

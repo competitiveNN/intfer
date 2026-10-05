@@ -81,9 +81,23 @@ fi
 
 # --- classify: a step is operator-deferred when its own remediation names a
 #     27B-bound step. Read from the log, so it cannot disagree with the advice. --
-pending=(); other=()
+pending=(); other=(); declare -A seen_step=()
+# The UNIT IS THE STEP, NOT THE LOG. A step that fails and is then re-run leaves
+# TWO logs (`run_all_X_sh.log` and `run_all_X_sh_rerun.log`) and the stack prints
+# the step once -- so counting logs reported "2 steps need the 27B run" for what is
+# ONE step. A count that does not mean what its label says is the class this repo
+# keeps auditing, and it overstates the operator's work, which is the one number in
+# this repo that must be exactly right.
+step_of() {  # $1 = log basename -> the step name it belongs to
+  local b="${1%.log}"
+  b="${b%_rerun}"
+  printf '%s\n' "$b"
+}
+
+pending=(); other=(); declare -A seen_step=()
 for f in "${LOGS[@]}"; do
   b="$(basename "$f")"
+  st="$(step_of "$b")"
   # Detect an unproven step from ITS OWN log, not from the stack's classification
   # line. The first version grepped for 'STALE rc=' and found nothing in any of
   # the 63 logs: that line is printed by run_all_checks.sh to STDERR, while a
@@ -91,20 +105,23 @@ for f in "${LOGS[@]}"; do
   # "0 pending, 0 clearable" on a tree where one step IS pending -- a vacuous
   # zero read as a clean bill of health. Each step announces itself; read that.
   if grep -qE '^RESULT:.*(STALE|UNPROVEN|FAIL)' "$f" 2>/dev/null; then
+    # One entry per STEP: the re-run of a step is the same obligation.
+    [ -n "${seen_step[$st]:-}" ] && continue
+    seen_step[$st]=1
     if grep -qE 'run_ten_gates\.sh|run_ten_gates\b' "$f" 2>/dev/null; then
-      pending+=("$b")
+      pending+=("$st")
     else
-      other+=("$b")
+      other+=("$st")
     fi
   fi
 done
 
 n_pending="${#pending[@]}"; n_other="${#other[@]}"
 echo
-echo "-- classification of steps whose own log reports STALE/UNPROVEN/FAIL --"
-echo "   PENDING-OPERATOR (remediation needs the 27B run): $n_pending"
+echo "-- classification (unit = STEP, not log; a re-run is the same debt) --"
+echo "   PENDING-OPERATOR step(s) (remediation needs the 27B run): $n_pending"
 [ "$n_pending" -gt 0 ] && printf '     %s\n' "${pending[@]}"
-echo "   CLEARABLE HERE (re-run on this machine): $n_other"
+echo "   CLEARABLE-HERE step(s) (re-run on this machine): $n_other"
 [ "$n_other" -gt 0 ] && printf '     %s\n' "${other[@]}"
 
 echo
@@ -120,6 +137,7 @@ fi
 
 echo
 echo "PENDING-OPERATOR: $n_pending step(s) need the 27B gate run; $n_other are clearable on this box."
+echo "  (counted in STEPS: a step that fails and is re-run leaves two logs but one debt)"
 echo "  This is why the stack ends rc=2 rather than rc=1: nothing is wrong with the"
 echo "  code, and no amount of work in an agent session will clear the pending set."
 echo "RESULT: $n_pending operator-deferred, $n_other locally clearable"

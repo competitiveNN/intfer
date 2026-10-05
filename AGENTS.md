@@ -475,6 +475,19 @@ rounding order), `INTFER_HOST_AVX2`, `INTFER_DPAS_PREQ`-independent bits.
 
 ## Architecture facts worth knowing before you edit
 
+* **BOTH FUSION SEAMS ARE TP=1 ONLY, so there is no local fusion at the target.**
+  `Engine::run_mlp_fused` (`engine.cpp:1352`) and `Engine::run_linear_tp_devact`
+  (`engine.cpp:1484`) both open with `if (devices_.size() != 1) return false;`.
+  **Read this before designing an E5.** Routing a fusion through
+  `run_linear_tp_devact` would make it dead code at 27B `--tp 2` — the exact
+  "default-OFF flag no gate can reach" class the flag census exists to kill.
+  The reason is structural, not an omission: TP slices N, so `gate`/`up` produce
+  only device *d*'s slice of `inter`, while `down` has K = the **full** `inter`
+  and therefore needs the other device's slice ⇒ the intermediate must cross the
+  host, and there is no P2P. The one TP=2-valid fusion is **gate+up in a single
+  launch** (both column-parallel over the same split, both device-local, and
+  bit-exact because each output's K accumulation is untouched). Spec and the
+  numerics argument: `reports/2026-10-05-tp2-fusion-surface.md`.
 * **TP is COLUMN-parallel with a HOST gather — there is no All-Reduce.** `shard_weight`
   slices the output dim N; `run_linear_tp` waits all ranks, then each rank's D2H is
   `half_to_float_batch`-ed into `out.data() + m*t.N + start`. `grep -riE
