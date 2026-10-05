@@ -1054,25 +1054,38 @@ python3 - "$MUTANT" <<'PYX' || { echo "N-V ANCHOR STALE: the STEPS list has no r
 import re, sys
 p = sys.argv[1]
 s = open(p).read()
-# Pick the LAST plain assignment whose tokens are ALL scripts. The FIRST
-# `STEPS="..."` in this file is the override `STEPS="$INTFER_RUN_ALL_STEPS"`, whose
-# single token is not a script -- and patching THAT produced a mutant whose STEPS
-# never changed, so N-V scored MISSED for a reason that had nothing to do with the
-# defect it exists to reproduce. A derived anchor is only better than a written
-# one if it derives the RIGHT thing.
-cands = [c for c in re.findall(r'STEPS="([^"]*)"', s)
-         if c.split() and all(t.endswith(".sh") for t in c.split())]
-if not cands:
-    print("no STEPS= line holds a script list")
+# Patch ONE LINE, chosen by shape, and append inside it.
+#
+# Two earlier attempts failed, both for the same reason -- the chosen token was
+# not unique:
+#   * patching the FIRST STEPS= hit the override `STEPS="$INTFER_RUN_ALL_STEPS"`,
+#     whose single token is not a script, so the mutant's list never moved and N-V
+#     scored MISSED for a reason unrelated to the defect;
+#   * patching the LAST list's tail found that tail occurring TWICE, because both
+#     the checkers list and the matrices list now end with the same script.
+# A derived anchor is only an improvement on a written one if it derives the RIGHT
+# thing AND scopes the edit; otherwise it just relocates the staleness.
+#
+# So: pick the FIRST assignment whose tokens are ALL scripts (that is the checkers
+# list, which is where a checker belongs), and rewrite THAT LINE only.
+lines = s.split("\n")
+idx = None
+for k, line in enumerate(lines):
+    m = re.match(r'\s*STEPS="([^"]*)"\s*$', line)
+    if m:
+        toks = m.group(1).split()
+        if toks and all(t.endswith(".sh") for t in toks):
+            idx = k
+            break
+if idx is None:
+    print("no STEPS= line holds a pure script list")
     sys.exit(1)
-toks = cands[-1].split()
-old_tail = toks[-1] + '"'
-new_tail = toks[-1] + ' check_stack_cert.sh"'
-if s.count(old_tail) != 1:
-    print("tail %r occurs %d times, want 1" % (old_tail, s.count(old_tail)))
-    sys.exit(1)
-open(p, "w").write(s.replace(old_tail, new_tail, 1))
-PYX
+line = lines[idx]
+body = re.match(r'(\s*STEPS=")([^"]*)("\s*)$', line)
+toks = body.group(2).split()
+new_line = body.group(1) + " ".join(toks + ["check_stack_cert.sh"]) + body.group(3)
+lines[idx] = new_line
+open(p, "w").write("\n".join(lines))
 PYX
 commit_mutant n-v
 conj_run "N-V.log"; nv=$?
