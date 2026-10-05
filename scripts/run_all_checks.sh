@@ -234,6 +234,13 @@ dispatch() { # $1 = label -> runs it
       # hold IN COMMON. Read-only, no GPU, no build; plants its own counter-
       # examples in a temp tree.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_verdict_scope.sh"; return $? ;;
+    check_act_cache_invalidation.sh)
+      # INTFER_FUSE_ACT caches FP16 activation bytes in ws_[d].act and skips a
+      # host convert + upload per device when the same vector arrives twice. That
+      # is bit-exact ONLY while the cached bytes are the bytes the GEMM reads, so
+      # every free of that buffer must clear the cache. Function-scoped, because
+      # the alias `w` names ws_ in one function and ws48_ in another.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_act_cache_invalidation.sh"; return $? ;;
     check_nullglob_sites.sh)
       # AUDIT #32 by ENUMERATION: derives every file that enables nullglob and
       # every glob-bearing command in those regions, so the next site is caught
@@ -435,6 +442,10 @@ dispatch() { # $1 = label -> runs it
       # the artifact is deliberately stale -- legitimate only because the planted
       # artifact is itself defective (the AUDIT #21 rule).
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_engine_cert.sh"; return $? ;;
+    mutate_act_cache_invalidation.sh)
+      # AC-1 removes an invalidation (a use-after-free no stream test finds);
+      # AC-4 inverts the checker's own comparison -- the bug it shipped with.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_act_cache_invalidation.sh"; return $? ;;
     mutate_nullglob_sites.sh)
       # NS-2 covers a blind spot the scanner REALLY had: a same-line
       # ( shopt -s nullglob; cmd GLOB ) was invisible to a line-start regex, and
@@ -725,12 +736,12 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_nullglob_sites.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------

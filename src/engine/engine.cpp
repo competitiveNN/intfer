@@ -50,6 +50,7 @@ Engine::~Engine() {
     }
   // Free the shared act/out workspaces (2 live allocs per device max).
   for (size_t d = 0; d < ws_.size() && d < devices_.size(); ++d) {
+    act_cache_ptr_ = nullptr; act_cache_M_ = 0; act_cache_K_ = 0;
     if (ws_[d].act) sycl::free(ws_[d].act, devices_[d].queue);
     if (ws_[d].out) sycl::free(ws_[d].out, devices_[d].queue);
     ws_[d].act = nullptr; ws_[d].out = nullptr;
@@ -654,6 +655,10 @@ void Engine::ensure_workspace(uint32_t M, uint32_t K, uint32_t Nl_max) {
     uint32_t nM = std::max(M, w.M);
     uint32_t nK = std::max(K, w.K);
     uint32_t nNl = std::max(Nl_max, w.Nl);
+    // The cached activation bytes lived in the buffer being freed. Clearing
+    // here is MANDATORY, not tidy: a surviving cache would let the next call
+    // skip an upload into memory that no longer exists.
+    act_cache_ptr_ = nullptr; act_cache_M_ = 0; act_cache_K_ = 0;
     if (w.act) { sycl::free(w.act, devices_[d].queue); w.act = nullptr; }
     if (w.out) { sycl::free(w.out, devices_[d].queue); w.out = nullptr; }
     auto& dev = devices_[d];
@@ -1216,21 +1221,38 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     return;
   }
  
-  // Pre-convert FP32 activation to FP16 once (shared by all devices).
-  // Staging buffer is reused across calls (resize only on shape growth).
+  // INTFER_FUSE_ACT (default OFF): an MLP's gate and up consume the SAME host
+  // activation vector, so the sequential path converts and uploads identical bits
+  // twice. Skipping the second is BIT-EXACT by construction -- the destination
+  // already holds exactly the bytes this call would write -- and it removes a
+  // full M*K host convert plus one M*K*2 upload per device, per repeat.
+  //
+  // It removes HOST work only: no launch is added or removed, and no arithmetic
+  // is touched, so it is the "exact" branch of the fusion directive rather than
+  // a tolerance question. With the flag OFF the cache is never consulted and
+  // never written, so the default path is byte-for-byte the old one.
+  const char* fa = std::getenv("INTFER_FUSE_ACT");
+  static const bool fuse_act =
+      (fa && fa[0] == '1' && fa[1] == '\0') &&
+      (std::getenv("INTFER_NO_FUSE_ACT") == nullptr);
+  const bool act_hit = fuse_act && act_cache_ptr_ == x.data() &&
+                       act_cache_M_ == M && act_cache_K_ == (uint32_t)t.K;
+  // Pre-convert FP32 activation to FP16 once (shared by all devices), unless
+  // the identical bits are already staged in every device's workspace.
+  if (!act_hit) {
 #ifdef INTFER_PROFILE_GPU
-  auto t_copy0 = std::chrono::high_resolution_clock::now();
+    auto t_copy0 = std::chrono::high_resolution_clock::now();
 #endif
-  if (act_staging_.size() != (size_t)M * t.K) act_staging_.resize((size_t)M * t.K);
-  std::vector<std::uint16_t>& act_fp16 = act_staging_;
-  dashq::float_to_half_batch(x.data(), act_fp16.data(), (size_t)M * t.K);
+    if (act_staging_.size() != (size_t)M * t.K) act_staging_.resize((size_t)M * t.K);
+    dashq::float_to_half_batch(x.data(), act_staging_.data(), (size_t)M * t.K);
 #ifdef INTFER_PROFILE_GPU
-  {
-    auto t1 = std::chrono::high_resolution_clock::now();
-    g_gpu_profile.total_copy_us += std::chrono::duration<double, std::micro>(t1 - t_copy0).count();
-    g_gpu_profile.copy_count++;
-  }
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_copy_us += std::chrono::duration<double, std::micro>(t1 - t_copy0).count();
+      g_gpu_profile.copy_count++;
+    }
 #endif
+  }  // !act_hit -- the convert above is skipped entirely on a cache hit
  
   // Issue all device work in parallel and collect kernel events.
   std::vector<sycl::event> kernel_events;
@@ -1248,7 +1270,9 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
 #ifdef INTFER_PROFILE_GPU
     auto t_w0 = std::chrono::high_resolution_clock::now();
 #endif
-    std::memcpy(act_ptr, act_fp16.data(), (size_t)M * t.K * sizeof(std::uint16_t));
+    if (!act_hit)
+      std::memcpy(act_ptr, act_staging_.data(),
+                  (size_t)M * t.K * sizeof(std::uint16_t));
 #ifdef INTFER_PROFILE_GPU
     {
       auto t1 = std::chrono::high_resolution_clock::now();
@@ -1286,6 +1310,22 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     kernel_events.push_back(kernel_evt);
   }
  
+  // The bytes are now in EVERY device's ws_[d].act, so the cache may record
+  // them. Recorded AFTER the per-device loop, never before: recording early
+  // would let a hit skip an upload that has not happened yet.
+  if (fuse_act) {
+    act_cache_ptr_ = x.data();
+    act_cache_M_ = M;
+    act_cache_K_ = (uint32_t)t.K;
+    static bool announced_act = false;
+    if (!announced_act) {
+      announced_act = true;
+      std::fprintf(stderr,
+                   "[fuse-act] activation staging reuse ACTIVE "
+                   "(identical FP16 bits already in every device workspace)\n");
+    }
+  }
+
   // Wait for all kernels, then read back from the shared workspace.
   // NOTE: the wait is load-bearing, not profiling — without it the host
   // reads ws out before the kernel runs (fresh zero pages => all-zero

@@ -278,6 +278,25 @@ class Engine {
   // Reusable FP16 activation staging for run_linear_tp (M*K). Resized only
   // when the shape grows: steady-state zero mallocs per GEMM call.
   std::vector<std::uint16_t> act_staging_;
+  // INTFER_FUSE_ACT (default OFF). Identity of the FP16 activation currently
+  // sitting in ws_[d].act for EVERY device: the host vector pointer it was
+  // converted from, plus the shape it was converted for.
+  //
+  // WHY IT IS SAFE, and the safety argument is an AUDIT, not a hope. ws_[d].act
+  // has exactly three classes of writer, enumerated from source:
+  //   * run_linear_tp itself, and nothing else (engine.cpp:1251);
+  //   * run_mlp_fused and the wave path, which write wv_[].act -- a DIFFERENT
+  //     buffer, so they cannot stale this;
+  //   * the DPAS path, which writes ws48_[d].act -- also a different buffer.
+  // So the only ways the cached bytes can go stale are (a) the workspace being
+  // freed/reallocated, which happens only in ensure_workspace's growth branch and
+  // the device reset, and both clear this; and (b) a different input vector.
+  // check_act_cache_invalidation.sh re-derives that writer set from source and
+  // fails if a writer appears that does not clear the cache, so the argument is
+  // re-checked on every stack run instead of being trusted after this comment.
+  const float* act_cache_ptr_ = nullptr;
+  uint32_t act_cache_M_ = 0;
+  uint32_t act_cache_K_ = 0;
   // Reusable INT8-act + scale staging for run_linear_tp_dpas48 (M*K int8,
   // M*nGA fp32, tight rows). The quant writes here (host memory), then one
   // memcpy per workspace row lands wide vectorized stores into the shared

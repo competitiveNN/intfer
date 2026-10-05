@@ -97,6 +97,22 @@ for tp in $TPS; do
   BASE="$(ids_of "$tp")"
   echo "TP=$tp base: '$BASE'"
   [ -n "$BASE" ] || fail "TP=$tp base empty (broken GPU run)"
+  # INTFER_FUSE_ACT=1 skips a redundant FP32->FP16 convert plus one host upload
+  # per device when consecutive linears consume the SAME activation vector (an
+  # MLP's gate and up). It touches no arithmetic -- the destination already holds
+  # exactly the bytes the skipped call would have written -- so it belongs in the
+  # stream-identity family above, not in the DPAS48 divergence family below.
+  #
+  # IT IS REACHABLE HERE, which is why this gate and not a 27B one: the branch is
+  # not guarded on `bits == 2`, so the 0.8B model enters it. An arm in a gate
+  # whose model could not reach the branch would be green because the path never
+  # ran (audit #3's nested-flag vacuity).
+  #
+  # The arm ALSO requires the kernel's one-time announcement, so "both runs
+  # produced the same tokens because the flag never took effect" cannot pass.
+  fuse_act_announced() {  # $1 = log
+    grep -aq '\[fuse-act\] activation staging reuse ACTIVE' "$1"
+  }
   for mode in "INTFER_INT8_KV=1" "INTFER_INT8_KV=1 INTFER_KV_Q8=1" "INTFER_INT8_KV=1 INTFER_KV_Q8=1 INTFER_KV_HAD=1" "INTFER_SSM_GPU=1"; do
     # shellcheck disable=SC2086
     GOT="$(env $mode "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" -n 4 \
@@ -106,6 +122,30 @@ for tp in $TPS; do
     echo "TP=$tp [$mode]: '$GOT'"
     [ "$GOT" = "$BASE" ] || fail "TP=$tp [$mode] '$GOT' != base '$BASE'"
   done
+
+  # --- INTFER_FUSE_ACT: reachability AND stream identity, in one arm --------
+  # Stream identity alone is not enough here. The optimization is "skip work when
+  # the activation repeats"; if it never repeats on this model, the flag is inert
+  # and the stream trivially matches. So the arm asserts the kernel ANNOUNCED a
+  # hit as well -- a vacuous-pass guard, not a second numerics claim.
+  {
+    # shellcheck disable=SC2086
+    FUSE_OUT="$(mktemp)"; FUSE_ERR="$(mktemp)"
+    env INTFER_FUSE_ACT=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" -n "${N:-4}" \
+      --no-stream --ids $TOK >"$FUSE_OUT" 2>"$FUSE_ERR"; FUSE_RC=$?
+    if [ "$FUSE_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_FUSE_ACT=1 run exited rc=$FUSE_RC"; tail -10 "$FUSE_ERR" >&2
+    else
+      FUSE_IDS="$(ids_of "$tp" INTFER_FUSE_ACT=1)"
+      echo "TP=$tp [INTFER_FUSE_ACT=1]: '$FUSE_IDS'"
+      [ -n "$FUSE_IDS" ] || fail "TP=$tp [INTFER_FUSE_ACT=1] stream EMPTY"
+      [ "$FUSE_IDS" = "$BASE" ] \
+        || fail "TP=$tp [INTFER_FUSE_ACT=1] '$FUSE_IDS' != base '$BASE' (it must be bit-exact)"
+      fuse_act_announced "$FUSE_ERR" \
+        || fail "TP=$tp [INTFER_FUSE_ACT=1] kernel never announced a staging HIT -- the flag never reached the repeat path, so the stream match above was vacuous"
+    fi
+    rm -f "$FUSE_OUT" "$FUSE_ERR"
+  }
 
   # --- DPAS48 family --------------------------------------------------------
   # INTFER_DPAS48=1 switches the GEMM to the INT8/GA64 act-quant DPAS path,

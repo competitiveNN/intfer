@@ -1,9 +1,11 @@
 # The TP=2 fusion surface — a premise correction, and the one candidate that is real
 
 **Date:** 2026-10-05
-**Status:** the fusion seam was derived from source; `INTFER_MLP_GU` was
-**implemented, measured DIVERGENT, and REVERTED** (§3b). Nothing from the attempt
-is in the tree.
+**Status:** the fusion seam was derived from source. `INTFER_MLP_GU` was
+implemented, measured DIVERGENT, and **fully reverted** (§3b) — it is **not** a
+pending experiment and there is nothing here to benchmark. The one optimization
+this session DID ship is `INTFER_FUSE_ACT` (§3c), which is in the tree behind a
+default-OFF flag with a live gate arm.
 **Answer to "do the rest of PLAN.md":** the remaining fusion work is not blocked on
 engineering — it is blocked on a seam that cannot execute at the target
 configuration, and the one candidate that IS valid at TP=2 was built and did not
@@ -97,8 +99,9 @@ So the next session has everything except the kernel:
 
 | | |
 |---|---|
-| flag | `INTFER_MLP_GU` (gate+up), exactly `=1`; default **OFF** |
+| flag | `INTFER_MLP_GU` (gate+up), exactly `=1`; default **OFF** — **SPECIFIED, NOT IMPLEMENTED** (§3b records the attempt and its outcome) |
 | kill switch | `INTFER_NO_MLP_GU=1` forces it off |
+| corrected slice math | the fused launch must be handed **`nl`, the device's own column slice**, never the tensor's `N`; and its output workspace must be reserved for **`2 * nl`**, not `nl`. Both were SIGSEGVs (§3b items 1 and 2) and both are now carried here as design constraints rather than as things to rediscover |
 | arm lives in | `scripts/test_tp2_27b.sh` — TP=2, so it is reachable (0.8B has zero INT2 and cannot reach a `bits==2` branch) |
 | assertion | stream identical to the same fixed oracle the base run uses — **not** a self-comparison |
 | numerics | **bit-exact, zero tolerance.** Each output element's K accumulation is untouched; only the launch boundary and work-item indexing move |
@@ -133,13 +136,82 @@ INTFER_MLP_GU   14354 9616 43047
    its neighbour's weights. **Under TP=1 `nl == N`, so a one-GPU smoke test would
    never have caught it** — which is the strongest argument yet for TP=2 coverage
    of any kernel that touches sharding.
-3. **Wrong results, no crash.** With the sharding fixed the kernel ran and
+3. **Wrong results, no crash — ROOT CAUSE NOT LOCATED. THIS IS AN OPEN
+   QUESTION, NOT A CLOSED ITEM.** With the sharding fixed the kernel ran and
    announced itself (`[mlp-gate-up] ... KERNEL ACTIVE, 2 x 8704 work-items
-   (N=8704 K=5120 bits=4)`), and the stream still diverged. The per-output
-   arithmetic was transcribed from `gemm_usm_decode1_vec` and reviewed against it
-   line for line, with no difference found — so the defect is in the engine seam
-   or the CLI wave wiring, not in the kernel body, and **it was not found within
-   this session's budget.**
+   (N=8704 K=5120 bits=4)`), and the stream still diverged.
+
+   **What is known:** the per-output arithmetic was transcribed from
+   `gemm_usm_decode1_vec` and compared against it statement by statement with no
+   difference found. The kernel reported the same shape the sequential path
+   reports. The two crashes were real bugs and are fixed.
+
+   **What is NOT known, and must not be assumed:** which of the remaining three
+   components is wrong — the kernel's operand selection, the engine seam's
+   read-back, or the CLI's gate/up name-to-tensor mapping. Reverting on
+   "reviewed line for line" is the structural-argument failure this repo audits;
+   it happened here and the evidence is why the kernel is out.
+
+   **The next attempt must BISECT, not re-derive.** The three components are
+   separable and the bisection is one line: run the fused pair AND then run the
+   same two items through `run_linear_wave`, and compare the two outputs host-side
+   in the same process. Agreement localises nothing; disagreement localises
+   immediately to kernel-vs-wiring. Do that before touching the kernel again.
+
+   **Untested hypotheses, in the order they are worth trying** (none is a
+   finding):
+   * the CLI maps gate/up by *substring* on the tensor name, and a model whose
+     names differ would swap the two operands — which would diverge at the FIRST
+     token, exactly as observed;
+   * the engine seam reads both operands out of one workspace and a later read
+     could see bytes the first `half_to_float_batch` already consumed;
+   * the kernel's `per` padding (`nBlocks * nWG`) makes operand B's row index
+     start at `per`, not at `nl`, so a slice whose length is not a multiple of
+     the work-group size would index operand B's scales with the wrong stride.
+
+## 3c. `INTFER_FUSE_ACT` — the optimization this session DID ship
+
+Gate+up turned out to be the wrong lever; a smaller one in the same code path is
+right, and it is in the tree.
+
+| | |
+|---|---|
+| flag | `INTFER_FUSE_ACT`, exactly `=1`; **default OFF**; kill switch `INTFER_NO_FUSE_ACT` |
+| what it does | when consecutive linears consume the SAME activation vector (an MLP's gate and up), it skips the second FP32→FP16 convert and the per-device host upload |
+| why it is bit-exact | the destination already holds exactly the bytes the skipped call would write — **no arithmetic is touched at all**, so this is the "exact" branch of the fusion directive, not a tolerance question |
+| what it costs | nothing: no launch added or removed, no kernel changed |
+| gate arm | `scripts/test_gpu_optin.sh` — **reachable there**, because the branch is not guarded on `bits == 2`, so the 0.8B model enters it. The arm asserts stream identity against the same base run AND requires the kernel's one-time `[fuse-act] ... ACTIVE` announcement, so an inert flag cannot pass by matching trivially |
+| guard | `scripts/check_act_cache_invalidation.sh` re-derives, from source, that every free of the cached buffer clears the cache — because the cache is bit-exact only while its bytes are the bytes the GEMM reads |
+| matrix | `mutate_act_cache_invalidation.sh` 4/4 |
+
+**The audit the guard exists for.** `ws_[d].act` is written by exactly one place,
+but freed by two that matter — `Engine::ensure_workspace` and `Engine::~Engine`
+— and a cache that outlives its buffer is a use-after-free that no stream-identity
+test finds until it is intermittent. The harvest is **function-scoped** because
+the local alias `w` names `ws_` in `ensure_workspace` and `ws48_` in
+`ensure_workspace48`: a line-local grep cannot tell them apart, and got it wrong
+in both directions here (counting only `ws_[d].act` MISSED an invalidation;
+counting `w.act` too failed a healthy tree over a buffer the cache never touches).
+
+## 3d. Quarantine of the two crash patterns — no live occurrence
+
+Both patterns from §3b were audited against the existing tree:
+
+* **full `N` handed to a kernel that should get `nl`.** No live occurrence.
+  `Engine::run_linear_tp` passes `N_local` (`engine.cpp:1272`), the DPAS
+  dispatch passes `N_local` (`engine.cpp:1706`), and
+  `Engine::run_linear_tp_devact` (`engine.cpp:1520`) refuses unless
+  `Nl == t.N` — it is TP-1-only by construction, so `nl == N` there. Verified:
+  `grep -n 'quant_gemm_forward_usm(' src/engine/engine.cpp` and read each site.
+* **an output workspace sized for one N-slice while two operands share it.** No
+  live occurrence. `Engine::run_mlp_fused` gives gate and up **separate** wave
+  slots (`wv_[0].out`, `wv_[1].out`) and reserves `ws_[0].out` for the down
+  projection alone (`engine.cpp:1415/1418/1439`); the wave path gives every item
+  its own slot.
+
+The first pattern is the more interesting result: it is **invisible at TP=1**,
+where `nl == N`, so a one-GPU smoke test can never find it. That is the concrete
+argument for keeping TP=2 coverage over any kernel that touches sharding.
 
 ## 4. Why the kernel is NOT in the tree
 
@@ -176,14 +248,20 @@ artifact that would catch a regression exists before the change rather than afte
 ## 5. What is left for the operator — one action
 
 ```
-RESULT (operator): scripts/run_ten_gates.sh
-        then scripts/check_engine_cert.sh
-        (the single operator-deferred step; derived by
-         scripts/check_pending_operator.sh)
+RESULT (operator):
+  (1) INTFER_FUSE_ACT counters -- §3c. Run scripts/test_gpu_optin.sh first (the
+      correctness arm is already wired and needs no benchmark); then the paired
+      3-round A/B for the copy/usm_write buckets, which is the only unmeasured
+      claim here. EXPECTED: `copy` and `usm_write` DOWN, `kernel` flat, `nk`
+      unchanged. Fill from a run you drive; this session ran no benchmark.
+  (2) scripts/run_ten_gates.sh
+      then scripts/check_engine_cert.sh
+      -- the single operator-deferred step, derived by
+      scripts/check_pending_operator.sh.
 ```
 
-Nothing in §3b needs a benchmark to believe: the arm's own stream comparison is
-the evidence, and it is a correctness measurement, not a timing one.
+Neither §3b nor §3c quotes a tok/s. §3b's evidence is a stream comparison, which
+is a correctness measurement, and §3c's counters are unmeasured here by rule.
 
 Nothing here needs a benchmark. Nothing here quotes a tok/s. The `RESULT:` line
 above is a command, not a measurement — there is deliberately no number to fill.
