@@ -1,0 +1,4 @@
+shopt -s nullglob
+arr=(scripts/*.sh)
+shopt -u nullglob
+echo "${#arr[@]}"

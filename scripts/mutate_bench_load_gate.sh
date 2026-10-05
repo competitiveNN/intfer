@@ -54,7 +54,16 @@ cp "$SCRIPT_DIR"/*.sh "$SB/scripts/"          # copies, NOT symlinks -- see head
 # the sandbox checker reported "summary missing" and would have failed the BASELINE
 # and every state for a reason unrelated to any mutation. A sandbox that does not
 # contain the files under test tests nothing.
-( shopt -s nullglob; cp "$SCRIPT_DIR"/*.py "$SB/scripts/" )
+# AUDIT #32 fix. `( shopt -s nullglob; cp "$DIR"/*.py "$DEST" )` -- with
+# nullglob on and no .py in the directory, the glob VANISHES and `cp` runs with
+# no file operand. That is a loud failure here ("missing destination file
+# operand"), but it is loud by luck: the same shape with `ls` reads the CURRENT
+# DIRECTORY instead. The glob becomes an array, so a no-match is an empty list
+# and that is the answer.
+shopt -s nullglob
+_py_globs=("$SCRIPT_DIR"/*.py)
+shopt -u nullglob
+[ "${#_py_globs[@]}" -gt 0 ] && cp "${_py_globs[@]}" "$SB/scripts/"
 TGT="$SB/scripts/check_bench_load_gate.sh"
 ORIG_T="$SB/.orig_target"
 ORIG_H="$SB/.orig_helper"

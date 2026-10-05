@@ -1,0 +1,1 @@
+( shopt -s nullglob; cp /nonexistent-path-xyz/*.py /tmp/dest )

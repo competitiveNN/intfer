@@ -1,0 +1,3 @@
+shopt -s nullglob
+ls /nonexistent-path-xyz/*.log
+shopt -u nullglob
