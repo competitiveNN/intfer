@@ -234,6 +234,14 @@ dispatch() { # $1 = label -> runs it
       # hold IN COMMON. Read-only, no GPU, no build; plants its own counter-
       # examples in a temp tree.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_verdict_scope.sh"; return $? ;;
+    check_dispatch_steps_consistency.sh)
+      # The dispatch case labels and the STEPS lists must AGREE. 0b asks whether
+      # every script HAS an arm; 0c asks whether every script is SCHEDULED;
+      # neither asks whether the two sets match, and both can pass while a step
+      # names a script that cannot run. Also asserts each arm executes the script
+      # its LABEL names -- the spaced-filename bug that shipped once and that
+      # `bash -n` cannot see.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_dispatch_steps_consistency.sh"; return $? ;;
     check_destructive_git.sh)
       # No script may destroy uncommitted work: any script performing
       # `git reset --hard` / `git clean -f` / `git checkout --` must refuse to run
@@ -414,6 +422,10 @@ dispatch() { # $1 = label -> runs it
       # the artifact is deliberately stale -- legitimate only because the planted
       # artifact is itself defective (the AUDIT #21 rule).
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_engine_cert.sh"; return $? ;;
+    mutate_dispatch_steps_consistency.sh)
+      # DS-1 re-arms the bug that shipped: a dispatch arm whose path becomes a
+      # filename containing a space. Valid shell, rc=127 at runtime.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_dispatch_steps_consistency.sh"; return $? ;;
     mutate_destructive_git.sh)
       # DG-2 is the state that makes the comment-strip load-bearing: without it
       # the mutate_tp2_selfcheck.sh DECOY is flagged. DG-4 is the anti-vacuity
@@ -691,12 +703,12 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh check_destructive_git.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
