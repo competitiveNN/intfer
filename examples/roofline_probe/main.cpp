@@ -53,6 +53,9 @@
 
 #include <sycl/sycl.hpp>
 
+// grf_size / grf_size_automatic live in their own header, not in sycl.hpp.
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -161,6 +164,152 @@ sycl::event stream_kernel(sycl::queue& q, const std::uint16_t* src,
       if (it.get_local_id(0) == 0) sink[ng] = a0 ^ a1 ^ a2 ^ a3;
     });
   });
+}
+
+
+// ---- the dequant-strategy sweep: WHAT MAKES INT2 33x SLOWER THAN FP16? --------
+//
+// E3.0's per-scheme split is the batch's load-bearing measurement:
+//     FP16 LA_QKV  554.9 GB/s   INT4 MLP_UP  72.8   INT2 MLP_DOWN 13.9
+// so the loss is in the packed-code paths, and the shape of it is specific. Per byte
+// of weight, FP16 does 1 FMA, INT4 does 4 and INT2 does 8. That alone predicts
+// INT4 ~4x and INT2 ~8x slower than FP16 on the SAME bytes -- and INT4 is in fact
+// 7.6x slower. INT2 is 40x. So the extra 5x is NOT the arithmetic count, and the
+// candidate is the DYNAMICALLY-INDEXED TABLE: both packed paths index a 4-entry
+// float array with a runtime value (`wtab[code]`, and canon_value's `c2[code & 3]`),
+// which on a GPU is either a chain of selects or a spill to local memory, and the
+// FP16 path has no such array.
+//
+// Four variants, same shape, same allocations, same instrument, so the RATIOS are
+// trustworthy even where the absolute GB/s is not (see the twin above):
+//
+//   DEQ 0  table  -- a verbatim copy of the shipped INT2 inner loop
+//   DEQ 1  select -- identical ARITHMETIC EXPRESSIONS, no array: the four scaled
+//                     coefficients live in registers and a select chain picks one.
+//                     Bit-identical by construction, which is why this one needs no
+//                     numerics contract if it wins.
+//   DEQ 2  table16  -- as 0, but 16 codes per chunk instead of 8: half the loop
+//                     overhead and twice the bytes in flight per iteration
+//   DEQ 3  select16 -- both changes, to separate the two effects
+// DEQ 4 is the SAME clone as DEQ 0 plus the two launch/kernel properties the
+// shipped kernel sets NEITHER of: sub_group_size<16> and grf_size_automatic.
+// Both are numerics-neutral (occupancy and register allocation, never FP order),
+// and both are what llama.cpp's fattn-common.hpp and vllm-xpu-kernels pin as
+// correctness constraints rather than tuning knobs.
+//
+// The point of testing it HERE and not in the shipped kernel: duplicating the
+// shipped lambda to give one copy the properties would be exactly the
+// "structural argument is not measurement" trap AGENTS.md records for the 180x
+// fused-decode regression, and it would leave two inline copies behind (the thing
+// check_decode1_copies.sh exists to guard). Measuring the hypothesis first costs
+// one clone here and zero risk to the engine.
+template <int DEQ>
+sycl::event int2_variant(sycl::queue& q, const std::uint8_t* code_u8,
+                         const std::uint16_t* act_usm,
+                         const std::uint16_t* scale_usm, float alpha,
+                         std::uint16_t* out_usm, std::uint32_t N, std::uint32_t K,
+                         std::uint32_t Gw) {
+  const std::uint32_t ng_total = N;
+  constexpr int nWG = 16;
+  const std::uint32_t global = ((N + nWG - 1) / nWG) * nWG;
+  const int num_groups = (K + Gw - 1) / Gw;
+  return q.submit([&](sycl::handler& h) {
+    h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+                   [=](sycl::nd_item<1> it) {
+      const int ng = static_cast<int>(it.get_global_id(0));
+      if (ng >= static_cast<int>(N)) return;
+      float acc = 0.0f;
+      const std::uint16_t* sptr = scale_usm + static_cast<std::size_t>(ng) * num_groups;
+      const std::size_t row_base = static_cast<std::size_t>(ng) * K;
+      sycl::multi_ptr<const std::uint16_t,
+          sycl::access::address_space::global_space> act_mp(act_usm);
+      sycl::multi_ptr<const std::uint8_t,
+          sycl::access::address_space::global_space> w_mp(code_u8 + row_base);
+      for (int g = 0; g < num_groups; ++g) {
+        const float scale =
+            static_cast<float>(sycl::bit_cast<sycl::half>(sptr[g])) * alpha;
+        const int kg0 = g * static_cast<int>(Gw);
+        int kg1 = kg0 + static_cast<int>(Gw);
+        if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+        // DEQ 1/3: the four scaled coefficients as REGISTERS. Same expressions as
+        // the table's initialisers, so the values are bit-identical.
+        const float w_n1 = scale * -1.0f;
+        const float w_n3 = scale * (-1.0f / 3.0f);
+        const float w_p3 = scale * (1.0f / 3.0f);
+        const float w_p1 = scale * 1.0f;
+        const float wtab[4] = {w_n1, w_n3, w_p3, w_p1};
+        constexpr int CC = (DEQ >= 2) ? 16 : 8;   // codes per chunk
+        int kg = kg0;
+        std::size_t b0 = (row_base + static_cast<std::size_t>(kg)) / 4u;
+        for (; kg + CC <= kg1; kg += CC) {
+          sycl::vec<std::uint16_t, 8> a_lo, a_hi;
+          a_lo.load(0, act_mp + kg);
+          if (CC == 16) a_hi.load(0, act_mp + kg + 8);
+          const std::uint8_t v0 = code_u8[b0];
+          const std::uint8_t v1 = code_u8[b0 + 1];
+          const std::uint8_t v2 = code_u8[b0 + 2];
+          const std::uint8_t v3 = code_u8[b0 + 3];
+          b0 += CC / 4;
+          for (int j = 0; j < CC; ++j) {
+            const int jh = j & 7;
+            const std::uint16_t abits =
+                (jh < 4) ? a_lo[jh] : a_hi[jh - 4];
+            const float av =
+                static_cast<float>(sycl::bit_cast<sycl::half>(abits));
+            const std::uint8_t bv =
+                (j < 4) ? v0 : (j < 8) ? v1 : (j < 12) ? v2 : v3;
+            const int code = (bv >> ((j & 3) * 2)) & 3;
+            if (DEQ == 0 || DEQ == 2) {
+              acc += av * wtab[code];
+            } else {
+              // No dynamically-indexed array. Same four values, chosen by compare.
+              const float w = (code == 0) ? w_n1
+                             : (code == 1) ? w_n3
+                             : (code == 2) ? w_p3 : w_p1;
+              acc += av * w;
+            }
+          }
+        }
+        for (; kg < kg1; ++kg) {
+          const float av = static_cast<float>(
+              sycl::bit_cast<sycl::half>(act_usm[kg]));
+          const std::size_t idx = row_base + static_cast<std::size_t>(kg);
+          const std::uint8_t byte = code_u8[idx / 4u];
+          const int code = (byte >> (static_cast<int>(idx % 4u) * 2)) & 3;
+          if (DEQ == 0 || DEQ == 2) {
+            acc += av * wtab[code];
+          } else {
+            const float w = (code == 0) ? w_n1
+                           : (code == 1) ? w_n3
+                           : (code == 2) ? w_p3 : w_p1;
+            acc += av * w;
+          }
+        }
+      }
+      out_usm[ng] = f32_to_f16_bits(acc);
+    });
+  });
+  const sycl::nd_range<1> nd(sycl::range<1>(global), sycl::range<1>(nWG));
+  // *** A LAUNCH-PROPERTIES ARM WAS ATTEMPTED HERE AND REMOVED, and the reason is
+  // recorded rather than the code. *** The hypothesis was that the shipped kernel's
+  // 6x deficit is register spilling, which sub_group_size<16> + grf_size_automatic
+  // would address -- both numerics-neutral, both pinned by upstream
+  // (llama.cpp fattn-common.hpp, vllm-xpu-kernels) as correctness constraints.
+  //
+  // It could not be measured here: the nd_range + properties overload does not
+  // resolve against a bare lambda in this SYCL version, and getting there took four
+  // spellings whose errors point nowhere near the cause --
+  //   properties<sub_group_size<16>, grf_size_automatic>
+  //       -> "template argument for template type parameter must be a type"
+  //          (those are key OBJECTS; the template wants the value TYPES)
+  //   properties<sub_group_size_key::value_t<16>, grf_size_automatic_key::value_t>
+  //       -> "too many template arguments" (properties takes ONE list type)
+  //   properties{ sub_group_size_key::value_t<16>{}, ... }   (CTAD, correct)
+  //       -> still "no matching member function for parallel_for"
+  // The remaining route is a kernel functor or launch_config, which is more
+  // scaffolding than this hypothesis is worth until the spill is CONFIRMED rather
+  // than suspected. The 6x gap is measured; its mechanism is not, and the report
+  // says so rather than shipping an untested fix for it.
 }
 
 }  // namespace
@@ -402,6 +551,27 @@ int main(int argc, char** argv) {
     }
     q.wait();
     std::sort(t.begin(), t.end());
+    // *** WHY IS THE SHIPPED KERNEL SO MUCH SLOWER THAN THE PROBE'S OWN CLONE OF
+    // THE SAME ALGORITHM? *** At MLP_GATE the clone runs at 264 GB/s and the
+    // shipped quant_gemm_forward_usm at 17 GB/s, on the same shape, the same
+    // buffers and the same instrument. One of the two is not doing what its name
+    // says, and the only way to find out which is to print what the engine's own
+    // weight layouts actually are -- a scheme/group combination that silently takes
+    // a different branch than the one under test is a measurement of the wrong
+    // kernel.
+    {
+      auto* cp = static_cast<std::uint8_t*>(code);
+      auto* ap = static_cast<std::uint16_t*>(act);
+      std::size_t nz_c = 0, nz_a = 0;
+      for (std::uint64_t i = 0; i < code_bytes; ++i) nz_c += (cp[i] != 0);
+      for (std::uint32_t i = 0; i < K; ++i) nz_a += (ap[i] != 0);
+      std::printf("[roofline]   diag %-18s code_bytes=%llu nonzero=%llu (%.1f%%) "
+                  "act nonzero=%zu/%u  code%%64=%llu  K%%8=%u\n",
+                  s.role, (unsigned long long)code_bytes,
+                  (unsigned long long)nz_c, 100.0 * double(nz_c) / double(code_bytes),
+                  nz_a, K, (unsigned long long)((reinterpret_cast<std::uintptr_t>(cp)) % 64),
+                  K % 8);
+    }
     Arm a;
     char nm[64];
     std::snprintf(nm, sizeof nm, "gemv/%s", s.role);
@@ -418,6 +588,88 @@ int main(int argc, char** argv) {
 
     sycl::free(out, q); sycl::free(act, q);
     sycl::free(scale, q); sycl::free(code, q);
+  }
+
+  // ---------------- the dequant-strategy sweep (the INT2 hypothesis) --------
+  // Same two shapes that bracket the INT2 spread in the per-scheme table above.
+  {
+    struct IS { const char* role; std::uint32_t N, K, G; };
+    const IS iss[] = {{"MLP_GATE(INT2)", 8704, 5120, 16},
+                      {"MLP_DOWN(INT2)", 2560, 17408, 16}};
+    for (const auto& sh2 : iss) {
+      const std::uint64_t cb = std::uint64_t(sh2.N) * sh2.K / 4u;
+      const std::uint32_t ng = (sh2.K + sh2.G - 1) / sh2.G;
+      void* c = sycl::malloc_shared(cb, dev.sycl_device, dev.sycl_context);
+      void* sc = sycl::malloc_shared(std::uint64_t(sh2.N) * ng * 2,
+                                     dev.sycl_device, dev.sycl_context);
+      void* a = sycl::malloc_shared(std::uint64_t(sh2.K) * 2,
+                                     dev.sycl_device, dev.sycl_context);
+      void* o = sycl::malloc_shared(std::uint64_t(sh2.N) * 2,
+                                     dev.sycl_device, dev.sycl_context);
+      if (!c || !sc || !a || !o) { std::fprintf(stderr, "[roofline] FAIL alloc\n"); return 1; }
+      {
+        auto* cp = static_cast<std::uint8_t*>(c);
+        for (std::uint64_t i = 0; i < cb; ++i) cp[i] = static_cast<std::uint8_t>((i * 40503u) >> 3);
+        auto* sp = static_cast<std::uint16_t*>(sc);
+        for (std::uint32_t i = 0; i < sh2.N * ng; ++i) sp[i] = f32_to_f16_bits(0.01f + 0.001f * (i % 7));
+        auto* ap = static_cast<std::uint16_t*>(a);
+        for (std::uint32_t i = 0; i < sh2.K; ++i) ap[i] = f32_to_f16_bits(0.5f + 0.01f * float(i % 13));
+      }
+      std::printf("[roofline] -- dequant sweep, %s (N_local=%u K=%u g%u) --\n",
+                  sh2.role, sh2.N, sh2.K, sh2.G);
+      // *** INTERLEAVED, AND THAT IS THE POINT. *** The first version ran the
+      // shipped kernel's arms in one loop and the clones in another, and the
+      // shipped MLP_GATE arm came out at 17.2, 39.3 and 41.3 GB/s on three
+      // consecutive runs of the SAME binary -- the box is contended, so a number
+      // measured minutes away from its comparator is not a comparison. Every rep
+      // here runs all five variants back to back, and only the RATIO is reported.
+      const char* names[5] = {"table", "select", "table16", "select16", "SHIPPED"};
+      std::vector<std::vector<double>> tt(5);
+      for (int r = 0; r < kReps; ++r) {
+        for (int v = 0; v < 5; ++v) {
+          sycl::event e;
+          switch (v) {
+            case 0: e = int2_variant<0>(q, (const std::uint8_t*)c, (const std::uint16_t*)a,
+                                        (const std::uint16_t*)sc, 1.0f, (std::uint16_t*)o,
+                                        sh2.N, sh2.K, sh2.G); break;
+            case 1: e = int2_variant<1>(q, (const std::uint8_t*)c, (const std::uint16_t*)a,
+                                        (const std::uint16_t*)sc, 1.0f, (std::uint16_t*)o,
+                                        sh2.N, sh2.K, sh2.G); break;
+            case 2: e = int2_variant<2>(q, (const std::uint8_t*)c, (const std::uint16_t*)a,
+                                        (const std::uint16_t*)sc, 1.0f, (std::uint16_t*)o,
+                                        sh2.N, sh2.K, sh2.G); break;
+            case 3: e = int2_variant<3>(q, (const std::uint8_t*)c, (const std::uint16_t*)a,
+                                        (const std::uint16_t*)sc, 1.0f, (std::uint16_t*)o,
+                                        sh2.N, sh2.K, sh2.G); break;
+            // The REAL thing, same buffers, same shape, same instrument.
+            default: e = intfer::gemm::quant_gemm_forward_usm(
+                             q, (std::uint16_t*)a, c, (const std::uint16_t*)sc, 1.0f,
+                             (std::uint16_t*)o, /*M=*/1, sh2.N, sh2.K, sh2.G,
+                             intfer::gemm::WeightScheme::INT2, sycl::event{});
+                       break;
+          }
+          tt[v].push_back(timed_ms(q, {e}));
+        }
+      }
+      double med[5];
+      for (int v = 0; v < 5; ++v) {
+        std::sort(tt[v].begin(), tt[v].end());
+        med[v] = tt[v][tt[v].size() / 2];
+      }
+      for (int v = 0; v < 5; ++v) {
+        const double gbs = double(cb) / (med[v] * 1e-3) / 1e9;
+        char nm[96];
+        std::snprintf(nm, sizeof nm, "deq/%s/%s", sh2.role, names[v]);
+        Arm arm;
+        arm.name = nm; arm.ms = med[v]; arm.bytes = cb;
+        arm.gbs = gbs; arm.pct_peak = 100.0 * gbs / kPeakBandwidthGBs;
+        arms.push_back(arm);
+        std::printf("[roofline]   %-9s %8.3f ms  %7.1f GB/s  %5.2fx vs table  "
+                    "%5.2fx vs SHIPPED\n",
+                    names[v], med[v], gbs, med[0] / med[v], med[4] / med[v]);
+      }
+      sycl::free(o, q); sycl::free(a, q); sycl::free(sc, q); sycl::free(c, q);
+    }
   }
 
   if (as_json) {

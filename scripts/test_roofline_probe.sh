@@ -95,6 +95,17 @@ need 'twin/quarter/device'  "the always-red twin on the device arm"
 need 'gemv/MLP_DOWN'        "the worst-performing scheme arm"
 need 'gemv/LA_QKV'          "the best-performing scheme arm"
 need 'max_compute_units='   "the device's own compute-unit count"
+# The dequant sweep is what killed the first hypothesis, so its arms are asserted
+# too: a probe that silently stopped running them would report PASS while the
+# report kept citing their numbers.
+# NB the arm NAMES carry the role (deq/MLP_GATE(INT2)/SHIPPED) but reach the log
+# only under --json; the console prints the bare variant name under a per-shape
+# header. So these assert the two header lines plus the ratio column, which is what
+# the report actually cites.
+need 'dequant sweep, MLP_GATE\(INT2\)' "the clone-vs-shipped sweep at MLP_GATE"
+need 'dequant sweep, MLP_DOWN\(INT2\)' "the clone-vs-shipped sweep at MLP_DOWN"
+need 'vs SHIPPED'                        "the interleaved ratio column"
+need 'table16'                           "the widened-chunk variant"
 
 # The twin's verdict, read back off the log rather than re-derived here.
 if ! grep -q 'RESULT: PASS' "$LOG"; then
@@ -104,5 +115,6 @@ fi
 
 echo "ROOFLINE-PROBE TEST: PASS"
 echo "RESULT: the allocator/kernel discriminator ran on all arms and its twin held;"
-echo "        the per-scheme GEMV rates above are the report's load-bearing numbers."
+echo "        the per-scheme GEMV rates and the interleaved clone-vs-shipped"
+echo "        ratios are the report's load-bearing numbers."
 exit 0
