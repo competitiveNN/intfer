@@ -450,6 +450,72 @@ current count — and an arm there would be green *because the path never runs*.
 arm therefore lives in `scripts/test_tp2_27b.sh` and asserts against the same fixed
 oracle the base run uses, not a self-comparison.
 
+## ==> THE M=1 INT2 GEMV IS 5.6-6.4x SLOWER THAN A CLONE OF ITS OWN
+## ==> ALGORITHM. MEASURED 2026-10-05. MECHANISM NOT LOCATED. <==
+
+Read this before touching `gemm_usm_decode1_vec`. It is the largest measured
+deficit in the engine and it is **not** an arithmetic problem.
+
+`examples/roofline_probe` (no model, device event timestamps, gated by
+`scripts/test_roofline_probe.sh`) runs a faithful clone of that kernel's algorithm
+-- same group loop, same 8-code chunk, same byte indexing, same 4-entry table, same
+ragged tail -- in its own translation unit, on the same buffers, with the same
+allocator, with every variant **interleaved** inside one rep loop:
+
+```
+MLP_GATE(INT2)  clone 260.9 GB/s   SHIPPED 40.8 GB/s   6.39x
+MLP_DOWN(INT2)  clone  77.6 GB/s   SHIPPED 13.8 GB/s   5.62x
+-- CITATION(roofline_probe, device 0, device event timestamps: medians over 12
+-- interleaved reps. COUNTERS, not wall time.)
+```
+
+Interleaving was forced by measurement: run separately, the shipped arm came out
+at 17.2, 39.3 and 41.3 GB/s CITATION(roofline_probe, three consecutive runs of
+the same binary) on three consecutive runs of the same binary on this contended
+box. Only the ratio is trustworthy.
+
+So the shipped lambda loses to something **outside the algorithm**. Candidate:
+register pressure -- it captures ~15 scalars, two `multi_ptr` objects and a
+dynamically-indexed float array, inside a **2378-line TU** that also holds the
+FP16, scalar, tiled and four DPAS kernels (two with inline vISA `dpas` asm).
+
+**What was tried and did not settle it:** a launch-properties arm
+(`sub_group_size<16>` + `grf_size_automatic`, both numerics-neutral, both pinned
+by llama.cpp's `fattn-common.hpp` and vllm-xpu-kernels as correctness
+constraints) could not be **built** -- four spellings of the SYCL properties API,
+three wrong with errors that point nowhere near the cause, and the correct CTAD
+form still fails to resolve against a bare lambda in SYCL 2026.1. All four are
+recorded in the probe. `IGC -Xsycl-target-backend -fsycl-report-stats` emits no
+stats on the `spir64` JIT target.
+
+**Named next experiment, not yet done:**
+`INTFER_DECODE1_OWN_TU` -- move `gemm_usm_decode1_vec` to its own translation
+unit. The clone *is* structurally that experiment. Same code, so bit-exact by
+construction and only stream identity needs asserting. **Kill criterion: if the
+own-TU kernel is not >= 2x the shipped one, the module-size theory is dead** and
+the next bisect is on the capture list. Full account, and the two hypotheses this
+same probe KILLED, in `reports/2026-10-05-batch-gemv-roofline.md`.
+
+### What the same probe retired, so nobody re-attempts them
+
+* **The FP16 M=1 path is NOT a bottleneck.** It runs at **98-123 % of the memory
+  roofline** (LA_QKV 559.9 GB/s, LA_OUT 477.1 GB/s against a 456 GB/s card
+  CITATION(techpowerup arc-b580.c4244)). It is 57.9 % of decode's traffic and it is
+  AT THE WALL. Any plan that proposes "fix the un-hoisted scale multiply in
+  `gemm_usm_decode1_f16`" is proposing to optimise a saturated kernel.
+* **The dynamically-indexed 4-entry table costs nothing.** `select` (identical
+  arithmetic expressions, no array) measures **1.01-1.02x** `table`. The
+  bit-identical arithmetic dequant is worthless as a consequence -- do not retry.
+* **Wider code chunks are a REGRESSION.** 16 codes/chunk instead of 8 measures
+  **0.25-0.35x**, a 3-4x loss. More bytes in flight per iteration does not help
+  here; register pressure dominates. This retires the llama.cpp `block_load`
+  direction for the INT2 path and matches sgl-kernel-xpu's own "do not prefetch
+  scales" (~3 % loss).
+* **`malloc_device` is worth +11 % to +16 % and is NOT the fix.** It is shipped as
+  `INTFER_WEIGHTS_DEVICE` (bit-exact, default OFF, gate arm TP=1 and TP=2), but
+  the same probe puts decode at 15.6-19.9 % of the *shared* ceiling. The allocator
+  is not the deficit; the kernel is.
+
 ## Performance targets (2x Arc Pro B580)
 
 * Token generation (decode): **40 tok/s** (per-stream, 27B model)
