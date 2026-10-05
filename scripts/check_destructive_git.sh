@@ -55,11 +55,23 @@ strip_comments() { sed -e 's/[[:space:]]#.*$//' -e 's/^[[:space:]]*#.*$//' "$1";
 #   checkout --    overwrites working-tree changes with HEAD
 DESTRUCTIVE_RE='git[[:space:]]+(reset[[:space:]]+--hard|clean[[:space:]]+-[a-zA-Z]*f|checkout[[:space:]]+--)'
 
-n_found=0; n_guarded=0; unguarded=""
+n_found=0; n_guarded=0; n_guards=0; unguarded=""
 for f in scripts/*.sh; do
   [ -f "$f" ] || continue
   ops="$(strip_comments "$f" | grep -cE "$DESTRUCTIVE_RE" || true)"
   [ "$ops" -gt 0 ] || continue
+  # A GUARD is not an EXECUTOR. scripts/guard.sh contains every destructive
+  # literal -- it is the thing that REFUSES them, and each occurrence ends in
+  # `command git "$@"`. Without this exemption the checker flags the guard for
+  # doing its job, and the tempting "fix" is to weaken the guard. Self-declared,
+  # for the same reason POST-STACK is: a second list in a checker is a
+  # hand-maintained inventory, which is what this repo keeps deleting.
+  if head -3 "$f" | grep -q '^# GUARD:'; then
+    printf '  ok    %-38s %s destructive literal(s), SELF-DECLARED GUARD\n' \
+      "$(basename "$f")" "$ops"
+    n_guards=$((n_guards + 1))
+    continue
+  fi
   n_found=$((n_found + 1))
   if strip_comments "$f" \
      | grep -qE 'git diff --quiet|git status --porcelain|git_guard_clean'; then
@@ -79,7 +91,7 @@ for f in scripts/*.sh; do
   fi
 done
 
-echo "-- destructive scripts found: $n_found (guarded $n_guarded, unguarded: ${unguarded:-none})"
+echo "-- destructive scripts: $n_found (guarded $n_guarded), self-declared guards: $n_guards, unguarded: ${unguarded:-none}"
 
 bad=0
 # ANTI-VACUITY: this corpus is populated, and stays populated. A refactor that
@@ -110,7 +122,7 @@ fi
 
 echo
 if [ "$bad" = 0 ]; then
-  echo "DESTRUCTIVE-GIT GUARD: PASS ($n_guarded/$n_found destructive scripts guarded;"
+  echo "DESTRUCTIVE-GIT GUARD: PASS ($n_guarded/$n_found destructive scripts guarded, $n_guards self-declared guard(s) exempt;"
   echo "  the AGENTS.md rule covers the prompt case)"
   echo "RESULT: no script can destroy uncommitted work, and the rule for the"
   echo "        prompt case is in the standing rules"

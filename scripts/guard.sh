@@ -1,3 +1,5 @@
+# GUARD: refuses destructive git on a dirty tree; shadows `git` for the session.
+#
 # Sourced by an interactive or agent shell to make destructive git refuse on a
 # dirty tree. NOT executable -- it must be SOURCED, because the whole point is to
 # shadow the `git` FUNCTION for the rest of the session.
