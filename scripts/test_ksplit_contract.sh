@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # K-split numerics contract gate (CPU-only, no model, no GPU, ~1s).
 #
-# 27B M=1 decode is EU-parallelism-bound (AGENTS.md), and the one remaining
-# lever is splitting K across work-items -- which raises parallelism AND
-# coalesces the weight loads, but reassociates the FP32 sum. AGENTS.md records
+# 27B M=1 decode WAS EU-parallelism-bound (AGENTS.md) -- that premise is
+# SUPERSEDED as of 2026-10-05, because it rested on the A770's 512 Xe cores
+# (the B580 has 20, and 456 GB/s, not ~179). What this gate certifies is
+# UNAFFECTED and is the reason it still matters: splitting K across work-items
+# reassociates the FP32 sum, and that cost must be characterised before any
+# such kernel is written -- including the re-examined shape that keeps the
+# 16-way split but reduces it with a sub-group xor butterfly
+# (INTFER_DECODE1_SUBGROUP, reports/2026-10-05-batch-gemv-roofline.md).
+# It also raises memory-level parallelism AND coalesces the weight loads. AGENTS.md records
 # that this "needs a tolerance-based numerics contract agreed BEFORE any code
 # is written". This gate is that contract, and it is a GATE rather than a note
 # so that the agreement is re-derivable instead of being prose somebody can

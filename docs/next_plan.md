@@ -106,9 +106,19 @@ weak, #4 blocked behind #1). The device-act seam family is EXHAUSTED on
 this hardware for the 27B — remaining paths are session-scale new
 machinery (XMX DPAS kernel rewrite + device act-quant; P2P reduction)
 or serve batching (Step 3, the documented 40 tok/s path, quiet box).
-Per-role 27B VRAM table (parsed 2026-09-28, keep for future budgeting):
-QKV 5.03 / Z 3.02 / OUT 3.02 / DOWN 2.10 / UP 2.16 / GATE 1.85 /
-ATTN_Q 0.50 / O 0.25 / K 0.17 / V 0.08 / EMBED+LM_HEAD 0.64 each GB.
+Per-role 27B VRAM table: **[SUPERSEDED 2026-10-05 — hand table removed, use the
+derivation]**. The hand table above said QKV 5.03 / Z 3.02 / OUT 3.02 / DOWN 2.10 /
+UP 2.16 / GATE 1.85 / ATTN_Q 0.50 / O 0.25 / K 0.17 / V 0.08 / EMBED+LM_HEAD 0.64
+each GB, which **sums to 25.5 GB while the same paragraph states 19.5 GB** — an
+internally inconsistent hand total, i.e. exactly the AGENTS.md rule-4 defect
+("a hand-written total is a citation, not a claim"). It is replaced by:
+
+```
+scripts/model_byte_roofline.sh            # reads code_bytes from the .intifer
+```
+
+which derives GB total, N_local at TP=2, and the per-token per-device share per
+role, and cannot drift from the model. Run it; never retype the table.
 
 ### Step 2 — Reduce sync count (not submit cost)
 Wave grouping (convert+submit back-to-back, one wait per wave) is done.

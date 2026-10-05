@@ -34,7 +34,11 @@ kernel 44 %   waitblock 22 %   submit 17 %   usm_write 9 %   readback 8 %
 ```
 
 Decode reads **9.16 GiB of weights per device per token** in **257.7 ms** of
-kernel = **35.5 GiB/s ≈ 21 % of the B580's ~179 GB/s**.
+kernel = **35.5 GiB/s ≈ 21 % of the B580's ~179 GB/s**
+CITATION(the ~179 GB/s denominator is the **A770's**; the B580's peak is 456 GB/s,
+so the real figure is ~9 % — see `reports/2026-10-05-batch-gemv-roofline.md`.
+CITATION(9.16 GiB: `scripts/model_byte_roofline.sh` derives 9.752 GB/device/token.
+CITATION(257.7 ms and the bucket split: counters-only `[GPU profile @decode]`.)).
 
 The obvious reading — "the GEMV kernel is not saturating bandwidth" — is
 **wrong**, and the batch exists because that was established by measurement
@@ -43,7 +47,11 @@ rather than left as a guess.
 **Why the kernel is parallelism-bound, not bandwidth-bound.** At M=1 the
 single-GEMM decode kernel's total work-item count is **exactly `N`** (one output
 element per work-item), and that is **invariant to the work-group shape**. At
-27B TP=2 a layer GEMM has N≈2048 per rank over **512 Xe cores ≈ 4 threads/EU**,
+27B TP=2 a layer GEMM has N≈2048 per rank over **512 Xe cores ≈ 4 threads/EU**
+CITATION(the B580 has **20** Xe cores and ~2560 FP32 lanes
+CITATION(techpowerup arc-b580.c4244), so "≈4 threads/EU" and "cannot fill one SIMD"
+do not describe this box — the occupancy model below is retracted while the MR
+measurement it was built to explain stands),
 and `kThr=16` cannot even fill one SIMD.
 
 `INTFER_DECODE1_MR=1` (MR=4 outputs per work-item, chosen to raise

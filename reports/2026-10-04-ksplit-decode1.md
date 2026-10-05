@@ -32,7 +32,15 @@ element**, and that count is invariant to the work-group shape. At 27B `--tp 2`
 a layer GEMM is N≈2048 per rank across 512 Xe cores (~4 threads/EU), so the
 launch is **parallelism-bound, not bandwidth-bound** — measured 9.16 GiB of
 weights per device per token in 257.7 ms of kernel = 35.5 GiB/s, ~21% of the
-B580's ~179 GB/s.
+B580's ~179 GB/s CITATION(SUPERSEDED 2026-10-05: the B580 has **20** Xe cores, not
+512, and 456 GB/s of bandwidth, not ~179 — so the premise "parallelism-bound" does
+not hold and the kernel is at ~9 % of the memory roofline. The SPLITK *measurement*
+(+43.8 % on `kernel`) stands and the flag stays closed; see
+`reports/2026-10-05-batch-gemv-roofline.md` for the re-examined form, which keeps
+the 16-way K split but reduces it with a sub-group xor butterfly and no
+`local_accessor`/barrier.
+CITATION(9.16 GiB: `scripts/model_byte_roofline.sh` -> 9.752 GB/device/token.
+CITATION(257.7 ms: counters-only `[GPU profile @decode]`.)).
 
 The sibling experiment `INTFER_DECODE1_MR` attacked this by giving each
 work-item *more* outputs and came out **2.3× slower**: dividing an

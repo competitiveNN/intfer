@@ -241,6 +241,14 @@ dispatch() { # $1 = label -> runs it
       # every free of that buffer must clear the cache. Function-scoped, because
       # the alias `w` names ws_ in one function and ws48_ in another.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_act_cache_invalidation.sh"; return $? ;;
+    check_hw_constants.sh)
+      # AUDIT #33 (2026-10-05). A hardware capability figure in a document must
+      # name its source. Written because "512 Xe cores / ~179 GB/s" sat in
+      # AGENTS.md and in three code comments describing the A770, and an entire
+      # session's optimization strategy was built on it. Plants its own
+      # counter-examples, so a vacuous green is impossible. Read-only, no GPU,
+      # no build.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_hw_constants.sh"; return $? ;;
     check_nullglob_sites.sh)
       # AUDIT #32 by ENUMERATION: derives every file that enables nullglob and
       # every glob-bearing command in those regions, so the next site is caught
@@ -463,6 +471,14 @@ dispatch() { # $1 = label -> runs it
       # ( shopt -s nullglob; cmd GLOB ) was invisible to a line-start regex, and
       # the scan reported POPULATION 0 over a tree that contained one.
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_nullglob_sites.sh"; return $? ;;
+    mutate_hw_constants.sh)
+      # AUDIT #33 matrix. Degrades the RULE (each unit class, the CITATION
+      # requirement, case-insensitivity, the corpus floor) and requires the
+      # checker's self-check to fire; HW-1b is the always-red twin that neuters the
+      # self-check gate too and requires the degraded rule to accept a defective
+      # corpus, which is what makes HW-1's catch attributable. Runs entirely
+      # against copies under build/ -- the tracked tree is never edited.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_hw_constants.sh"; return $? ;;
     mutate_dispatch_steps_consistency.sh)
       # DS-1 re-arms the bug that shipped: a dispatch arm whose path becomes a
       # filename containing a space. Valid shell, rc=127 at runtime.
@@ -756,12 +772,12 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_scripts_live.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_hw_constants.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_scripts_live.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------

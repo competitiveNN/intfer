@@ -3144,6 +3144,8 @@ e.g. S3's contract column is 40 not 42).
   under load. (memory: path_to_target_40_4000.md)
 - OpenVINO evaluated, NOT adopted (2026-09-18 spike): OV 2026.3 sees
   both B580s, but FP16 matmul M=361 2.6ms (~our EU kernel, 1.0 TFLOPS
+  CITATION(measured 2026-09-18; the "100+ peak" it was compared against was an
+  OPENVINO-published figure, not ours)
   vs 100+ peak — no XMX unlock) and M=1 1.2ms vs our ~50us (20x worse,
   framework overhead). Native SYCL stays; XMX win must come from our
   own DPAS kernels with device-resident act-quant.

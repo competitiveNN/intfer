@@ -190,7 +190,11 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
 // again -- and it must NOT be declared here until a definition exists.
 //
 // The perf context that motivated it still stands and is not in question: M=1
-// decode is EU-parallelism-bound, because this kernel's total work-item count is
+// decode was EU-parallelism-bound, because this kernel's total work-item count is
+// SUPERSEDED 2026-10-05: that premise rested on the A770's 512 Xe cores. The B580
+// has 20 Xe cores / ~2560 FP32 lanes and 456 GB/s, so decode is at ~9 % of the
+// memory roofline rather than ~21 %, and the GEMV is not lane-starved. The
+// MR/SPLITK measurements stand; the model does not. AGENTS.md, SUPERSEDED banner.
 // exactly N and that is invariant to the work-group shape. Splitting K across
 // work-items would raise parallelism but reassociates the FP32 sum and needs a
 // numerics contract agreed first; fusing INDEPENDENT GEMMs keeps each output's

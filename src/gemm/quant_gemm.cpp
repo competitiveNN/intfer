@@ -432,6 +432,14 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // even fill one SIMD. The kernel is PARALLELISM-bound, not bandwidth-
       // bound, and not issue/MLP-bound.
       //
+      // SUPERSEDED 2026-10-05: the occupancy model above is WRONG, because
+      // "512 Xe cores" was the A770's count. The B580 has 20 Xe cores and ~2560
+      // FP32 lanes, so a layer GEMM at N~2048-8704 is at or above 100% lane
+      // occupancy and the kernel is NOT lane-starved. The MR MEASUREMENT (2.3x
+      // slower) stands and MR stays closed; the EXPLANATION does not. See
+      // AGENTS.md's SUPERSEDED banner and
+      // reports/2026-10-05-batch-gemv-roofline.md.
+      //
       // That reframes the whole M=1 decode target: the only ways to raise
       // parallelism are (a) split K across work-items, which reassociates the
       // FP32 sum and is therefore NOT bit-exact, or (b) fuse INDEPENDENT GEMMs
@@ -450,6 +458,13 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // Measured effect at 27B: decode reads 9.16 GiB of weights per device per
       // token in 257.7 ms of kernel = 35.5 GiB/s, which is ~21 % of the B580's
       // ~179 GB/s. So the kernel is issue/MLP-bound, not bandwidth-bound.
+      //
+      // SUPERSEDED 2026-10-05: the "~21 % of ~179 GB/s" is wrong twice. Peak is
+      // 456 GB/s, so the real figure is ~9 %. The B580 is not bandwidth-bound at
+      // 9% -- something else is. Do not propagate the percentage above.
+      // CITATION(techpowerup arc-b580.c4244 / ARK 241598: 456.0 GB/s, 20 Xe
+      // cores. CITATION(scripts/model_byte_roofline.sh: 9.752 GB/device/token,
+      // 41.1 GB/s at 237.5 ms = 9.0%.)
       //
       // MR attacks BOTH causes without touching the arithmetic:
       //   * MR independent weight streams per lane => more memory-level
@@ -578,6 +593,14 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // cores (~4 threads/EU), so the launch is PARALLELISM-bound, not
       // bandwidth-bound: measured 9.16 GiB of weights per device per token in
       // 257.7 ms of kernel = 35.5 GiB/s, about 21% of the B580's ~179 GB/s.
+      //
+      // SUPERSEDED 2026-10-05: "512 Xe cores" is the A770's count; the B580 has
+      // 20, so the "parallelism-bound" premise above is void. The +43.8%
+      // MEASUREMENT this kernel produced stands and it stays default OFF; what
+      // is re-examined is the SHAPE -- same 16-way K split, but reduced with a
+      // sub-group xor butterfly and NO local_accessor / it.barrier, which is the
+      // specific cause the bisection named. See
+      // reports/2026-10-05-batch-gemv-roofline.md.
       // The sibling experiment INTFER_DECODE1_MR tried to fix that by giving
       // each work-item MORE outputs and came out 2.3x SLOWER, because dividing
       // an already-starved work-item budget by four is anti-parallel here.

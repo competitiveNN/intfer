@@ -171,15 +171,74 @@ A speedup that changes a token is not a speedup. This is what makes the counters
 trustworthy: if the streams are identical, a kernel delta is attributable to the
 kernel.
 
-## 27B DECODE IS **PARALLELISM-BOUND**, NOT BANDWIDTH-BOUND (measured 2026-10-04)
+## ==> SUPERSEDED 2026-10-05: THE "PARALLELISM-BOUND" MODEL WAS WRONG. THE
+## ==> MEASUREMENTS STAND; THE EXPLANATION DOES NOT. READ THIS FIRST. <==
+
+**This section argued that 27B decode is parallelism-bound rather than
+bandwidth-bound, and that the target is EU occupancy. Both halves of that are
+retracted, because the hardware model underneath them described a GPU this box is
+not.**
+
+| quantity | this section said | **actual** |
+|---|---|---|
+| Xe cores | 512 | **20** CITATION(techpowerup arc-b580.c4244) |
+| vector engines / XMX | not stated | 160 / 160 CITATION(techpowerup arc-b580.c4244) |
+| peak memory bandwidth | ~179 GB/s | **456.0 GB/s** CITATION(techpowerup arc-b580.c4244) |
+
+Full source: TechPowerUp `arc-b580.c4244`, saved at
+`docs/Intel Arc B580 Specs _ TechPowerUp GPU Database.html`; cross-checked against
+Intel ARK sku/241598 — both agree, and also give 12 GB GDDR6 192-bit @19 Gbps,
+18 MB L2, L1 256 KB/EU. `git log -S '512 Xe'` shows the figure entered at `40219bf`
+(2026-10-04) and was thereafter only propagated, never measured; the 512 Xe cores it
+names is the **A770's** count (4096 shader units / 8)
+CITATION(techpowerup arc-b580.c4244 / ARK 241598 — the B580's figures, replacing the
+A770's). Nothing on this box was ever asked.
+
+**Three consequences, each derived rather than asserted:**
+
+1. **Decode is at ~9 % of the memory roofline, not ~21 %.** The bucket split below
+   (`kernel` 44 %, `waitblock` 22 %, `submit` 17 %) is unchanged. The 9.75e9 B
+   per device per token is unchanged. Only the denominator was wrong:
+   41.1 GB/s against 456 GB/s CITATION(techpowerup arc-b580.c4244). Re-derive it
+   with `scripts/model_byte_roofline.sh`; never quote a roofline percentage off
+   this file.
+2. **The GEMV is NOT lane-starved.** FP32 13.67 TFLOPS at 2670 MHz
+   CITATION(techpowerup arc-b580.c4244) is ~2560 FP32 lanes. `MLP_DOWN` at TP=2 has
+   `N_local = 2560` work-items — one per lane, i.e. ~100 % lane occupancy. The
+   "2048 work-items over 512 cores, ~4 threads/EU, `kThr=16` cannot fill one SIMD"
+   argument is void: there are 20 cores, and `kThr=16` matches the Xe2 sub-group
+   width.
+3. **So MR and SPLITK were aimed at a bottleneck that does not exist.** Their
+   *measurements* are untouched and remain the reason those flags are default OFF:
+   MR was 2.3x slower and SPLITK +43.8 % on `kernel`. What is retracted is the
+   *reason* — "divided an already-starved budget" — which is why both directions are
+   re-examined against the bandwidth hypothesis in
+   `reports/2026-10-05-batch-gemv-roofline.md` rather than left closed.
+
+**The rest of this section is preserved verbatim below as the historical record.**
+It is a record of what was believed on 2026-10-04 and of measurements that still
+hold. Do not "correct" it into agreement — that is the same laundering failure in
+the other direction. `scripts/check_hw_constants.sh` now refuses an uncited
+capability figure anywhere in `AGENTS.md` / `docs/` / `reports/`.
+
+## 27B DECODE IS **PARALLELISM-BOUND**, NOT BANDWIDTH-BOUND (measured 2026-10-04) [SUPERSEDED 2026-10-05 — model void, measurements stand]
 
 Read this before optimizing decode. It overturns the natural first guess.
 
 27B `--tp 2`, decode M=1, counters only: `kernel` 44%, `waitblock` 22%, `submit`
 17%, `usm_write` 9%, `readback` 8%. Decode reads **9.16 GiB of weights per device
 per token** in **257.7 ms** of kernel = **35.5 GiB/s, ~21% of the B580's ~179
-GB/s**. The obvious reading — "the GEMV kernel is not saturating bandwidth" — is
-**wrong**.
+GB/s** CITATION(the ~179 GB/s denominator is the A770's; the B580's is 456 GB/s —
+see the SUPERSEDED banner above. The bucket split is
+CITATION(perf_base.err, `[GPU profile @decode]`)). The obvious reading — "the GEMV
+kernel is not saturating bandwidth" — is **wrong**.
+
+> CITATION(techpowerup arc-b580.c4244 / ARK 241598: the B580's peak bandwidth is
+> 456.0 GB/s, not the ~179 GB/s this section assumed — so "21 %" is really ~9 %,
+> and the conclusion drawn from it below is retracted. See the SUPERSEDED banner
+> above.) CITATION(perf_base.err: `total_kernel_us 1187601.2` over 5 tokens.)
+> The 9.16 GiB figure is reproduced by `scripts/model_byte_roofline.sh` as
+> 9.752 GB/device/token.
 
 **Proof by measurement, not argument.** `INTFER_DECODE1_MR=1` processes MR=4
 outputs per work-item, chosen because it raises memory-level parallelism and
@@ -193,8 +252,14 @@ plumbing.
 **exactly `N`** (one output element per work-item) and that is **invariant to the
 work-group shape**. So MR did not add parallelism; it **divided an already-starved
 budget by four**. At 27B TP=2 a layer GEMM has N ~ 2048 per rank over **512 Xe
-cores, ~4 threads/EU**, and `kThr=16` (`quant_gemm.cpp:64`) cannot even fill one
-SIMD. More outputs per work-item is *anti*-parallel at M=1. Do not re-attempt it.
+cores, ~4 threads/EU** CITATION(this is the A770's core count; the B580 has 20 —
+see the SUPERSEDED banner), and `kThr=16` (`quant_gemm.cpp:64`) cannot even fill
+one SIMD. More outputs per work-item is *anti*-parallel at M=1. Do not re-attempt
+it.
+
+> CITATION(techpowerup arc-b580.c4244 / ARK 241598: 20 Xe cores, not 512, so the
+> "already-starved budget" premise above does not hold. The MR *measurement*
+> stands and MR stays closed.)
 
 **The target is EU occupancy; the 21% bandwidth figure is a symptom, not the
 cause.** Two ways to raise it:
@@ -214,10 +279,23 @@ cause.** Two ways to raise it:
   per-work-group `local_accessor` + local barrier on the critical path of every
   output. Flag stays default OFF, kept as the worked example of a numerics
   contract passing while the performance hypothesis failed.
+
+> CITATION(techpowerup arc-b580.c4244: 20 Xe cores / 456 GB/s, so "raising
+> parallelism" was not the binding constraint. The +43.8 % *measurement* stands
+> and SPLITK stays closed; the re-examined form is
+> `INTFER_DECODE1_SUBGROUP` — same 16-way K split, but reduced by a sub-group
+> xor butterfly with **no `local_accessor` and no `it.barrier`**, which is the
+> specific cause the bisection above named. See
+> `reports/2026-10-05-batch-gemv-roofline.md`.)
+
 * **(b) fuse INDEPENDENT GEMMs into ONE `nd_range`** — bit-exact (each output keeps
   its own work-item and its own K order; only the launch boundary moves). **This
   is the live direction**, and it is also the standing fusion directive, so the two
   agree.
+
+> CITATION(reports/2026-10-05-tp2-fusion-surface.md §3b: `INTFER_MLP_GU` was built,
+> measured DIVERGENT at 27B TP=2, and fully reverted; root cause NOT located. (b)
+> is NOT live and is not a pending experiment.)
 
 ### ==> REVERTED 2026-10-04: FUSED MULTI-GEMM DECODE. THE ARITHMETIC IS FINE; THE *EXTRACTION* IS NOT. <==
 
