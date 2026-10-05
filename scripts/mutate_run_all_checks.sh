@@ -1038,24 +1038,37 @@ reset_mutant
 #   * the anchor is the line's current tail, and
 #   * `|| exit 1` on the heredoc, so a drifted anchor stops the matrix in the first
 #     second instead of producing a confident verdict about nothing.
-python3 - "$MUTANT" <<'PYX' || { echo "N-V ANCHOR STALE: the STEPS tail moved -- re-point it, do not loosen it"; exit 1; }
-import sys
+# *** THE TAIL IS DERIVED, NOT WRITTEN DOWN. *** This state schedules
+# check_stack_cert.sh (POST-STACK, so it must be refused) by appending to the end
+# of a STEPS list. It used to name that tail literally, and the anchor went stale
+# TWICE in one session -- once when three checkers were added, once when a fourth
+# was. Each abort said "re-point it, do not loosen it", and each re-point was
+# correct but temporary: the next checker added would break it again.
+#
+# So the anchor is DERIVED from the file at patch time: take the last token of the
+# list and append after it. Adding a checker can then never stale this state, and
+# the state still tests exactly one thing -- an EXEMPT-AND-SCHEDULED file is
+# refused. Generalising it to "patch anywhere in the list" would have made it test
+# nothing in particular, which is the failure the `|| exit 1` exists to prevent.
+python3 - "$MUTANT" <<'PYX' || { echo "N-V ANCHOR STALE: the STEPS list has no recognisable line -- re-point, do not loosen"; exit 1; }
+import re, sys
 p = sys.argv[1]
 s = open(p).read()
-# RE-POINTED TWICE on 2026-10-04: adding check_decode1_copies /
-# check_flag_gate_coverage / check_env_not_box_state moved this tail, and adding
-# check_destructive_git moved it AGAIN. That is the EXPECTED cost of a state anchored
-# to a moving list; the `|| exit 1` below is what keeps the drift loud instead of
-# scoring the state against an unmutated copy and reporting a false result.
-# The state's intent is unchanged -- schedule check_stack_cert.sh, which is
-# POST-STACK and must therefore be refused -- so only the tail is re-pointed, and
-# only as far as the list now extends. Loosening it to "whatever the last entry
-# is" would make the state test nothing in particular, which is the failure mode
-# the `|| exit 1` below exists to prevent.
-old = 'check_env_not_box_state.sh check_destructive_git.sh"'
-new = 'check_env_not_box_state.sh check_destructive_git.sh check_stack_cert.sh"'
-assert s.count(old) == 1, s.count(old)
-open(p, "w").write(s.replace(old, new))
+m = re.search(r'STEPS="([^"]*)"', s)
+if not m:
+    print("no STEPS= line found")
+    sys.exit(1)
+toks = m.group(1).split()
+if not toks:
+    print("STEPS list is empty")
+    sys.exit(1)
+old_tail = toks[-1] + '"'
+new_tail = toks[-1] + ' check_stack_cert.sh"'
+if s.count(old_tail) != 1:
+    print("tail %r occurs %d times, want 1" % (old_tail, s.count(old_tail)))
+    sys.exit(1)
+open(p, "w").write(s.replace(old_tail, new_tail, 1))
+PYX
 PYX
 commit_mutant n-v
 conj_run "N-V.log"; nv=$?
