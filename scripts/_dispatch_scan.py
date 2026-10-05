@@ -9,6 +9,10 @@ agreeing. That is the vacuous-green shape, arrived at through quoting.
 
 Prints, one per line, and exits 0 always so the caller decides the verdict:
 
+  STRAY-STEP-TOKEN <name> <line>
+      a .sh token on a STEPS line that sits OUTSIDE its quotes. It is not a step,
+      it is a COMMAND, and bash will run it.
+
   ARM-MISMATCH <label> <runs>
       a case arm whose body executes a path segment other than its own label.
       THIS IS THE SHIPPED BUG: an arm whose path became
@@ -62,18 +66,36 @@ def main(path):
             flush(cur, buf)
             cur, buf = m.group(1), []
             continue
-        m = STEPS_ASSIGN.match(line)
-        if m:
-            steps.update(t for t in m.group(1).split() if NAME_RE.match(t))
-        m = STEPS_APPEND.search(line)
-        if m:
-            steps.update(t for t in m.group(1).split() if NAME_RE.match(t))
+        # NOTE the distinct names. An earlier version reused `m` for both
+        # matches, so the stray-token check below read the SECOND one (the
+        # append form, usually None) instead of the assignment it needed -- and
+        # therefore never fired on the exact corruption it was written for.
+        # Verified by probe, not by reading: clean tree reports 0, a COPY with a
+        # token moved past the closing quote must report 1.
+        ma = STEPS_ASSIGN.match(line)
+        if ma:
+            steps.update(t for t in ma.group(1).split() if NAME_RE.match(t))
+            # STRAY TOKEN: a .sh token on a STEPS line but OUTSIDE its quotes
+            # is not a step -- it is a COMMAND, and bash runs it. MEASURED twice
+            # in this session: appending a token with the wrong anchor produced
+            #     STEPS="... check_pending_operator.sh" mutate_pending_operator.sh
+            # and the stack died with "command not found". A checker harvesting
+            # only INSIDE the quotes is structurally blind to it, because inside
+            # the quotes everything is fine -- the defect IS the token being on
+            # the wrong side of a quote.
+            inside = set(t for t in ma.group(1).split() if NAME_RE.match(t))
+            for tok in sorted(set(re.findall(r"([A-Za-z0-9_]+\.sh)", line)) - inside):
+                print("STRAY-STEP-TOKEN %s %s" % (tok, line.strip()[:60]))
+        mb = STEPS_APPEND.search(line)
+        if mb:
+            steps.update(t for t in mb.group(1).split() if NAME_RE.match(t))
         if cur:
             buf.append(line)
             if END_RE.match(line):
                 flush(cur, buf)
                 cur, buf = None, []
     flush(cur, buf)
+
 
     # Labels come from the same single pass but are emitted here so the caller can
     # assert the population is non-empty rather than trusting an empty set to agree

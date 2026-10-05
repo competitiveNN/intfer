@@ -88,6 +88,7 @@ if [ "${1:-}" = "--list" ]; then
   echo "  DS-2  a STEPS entry whose script has no arm                 [must REJECT]"
   echo "  DS-3  an arm removed while left scheduled                  [must REJECT]"
   echo "  DS-4  the POST-STACK self-declaration stripped              [must REJECT]"
+  echo "  DS-5  a step token moved OUTSIDE the STEPS quotes          [must REJECT]"
   exit 0
 fi
 
@@ -116,6 +117,14 @@ ds2; run_state DS-2 'has NO dispatch arm|FAIL'
 ds3; run_state DS-3 'NOT in STEPS|FAIL'
 ds4; run_state DS-4 'NOT in STEPS|FAIL'
 
+# DS-5 a .sh token moved past the closing quote of a STEPS line. Inside the
+# quotes everything is fine, which is why a checker that harvests only inside
+# them is structurally blind to this -- the defect IS the token being on the
+# wrong side of a quote. It becomes a COMMAND: the stack dies with
+# "mutate_pending_operator.sh: command not found".
+ds5() { patchN "$T" 'check_pending_operator.sh"' 'check_pending_operator.sh" mutate_pending_operator.sh'; }
+ds5; run_state DS-5 'stray step token|FAIL'
+
 for r in "${RESULTS[@]}"; do printf '  %s\n' "$r"; done
 
 leftover=""
@@ -133,6 +142,7 @@ if [ "$caught" -eq "$total" ]; then
   echo "  DS-2: a scheduled script with no arm is observable"
   echo "  DS-3: an arm removed while scheduled is observable"
   echo "  DS-4: the POST-STACK exemption is derived from the script, not a list here"
+  echo "  DS-5: a step token outside the quotes is a COMMAND, and is refused"
   echo "RESULT: PASS ($caught/$total states caught)"
   exit 0
 fi

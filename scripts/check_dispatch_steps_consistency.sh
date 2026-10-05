@@ -59,6 +59,7 @@ scan="$(python3 "$SCAN" "$T" 2>&1)" || {
 mapfile -t LABELS  < <(printf '%s\n' "$scan" | sed -n 's/^LABEL //p')
 mapfile -t STEPS_L < <(printf '%s\n' "$scan" | sed -n 's/^STEP //p')
 mapfile -t MISMATCH < <(printf '%s\n' "$scan" | sed -n 's/^ARM-MISMATCH //p')
+mapfile -t STRAY < <(printf '%s\n' "$scan" | sed -n 's/^STRAY-STEP-TOKEN //p')
 
 n_labels="${#LABELS[@]}"
 n_steps="${#STEPS_L[@]}"
@@ -97,6 +98,20 @@ for a in "${LABELS[@]}"; do
   echo "        POST-STACK -- audit #18: an arm that never runs certifies nothing" >&2
   bad=$((bad + 1))
 done
+
+# --- 2b. no .sh token may sit OUTSIDE a STEPS line's quotes -----------------
+# Inside the quotes everything is fine; the corruption is that ONE token ended up
+# on the wrong side of a quote, where it stops being a step and becomes a COMMAND.
+# A checker that harvests only inside the quotes is structurally blind to it.
+if [ "${#STRAY[@]}" -gt 0 ]; then
+  for t in "${STRAY[@]}"; do
+    echo "  FAIL  stray step token: $t -- outside the quotes it is a COMMAND" >&2
+  done
+  echo "        (observed twice: the stack died with 'command not found')" >&2
+  bad=$((bad + 1))
+else
+  echo "  ok    no .sh token escapes a STEPS line's quotes"
+fi
 
 # --- 3. each arm must EXECUTE the script its label names --------------------
 # This is the bug that shipped: an arm whose path became
