@@ -84,6 +84,88 @@ if [ "$n_base" -lt 5 ] || [ "$n_sk" -lt 5 ]; then
   exit 1
 fi
 
+# ---------- THE THIRD BODY, ADDED BY ENUMERATION (2026-10-05) ----------
+# INTFER_DECODE1_ROWPAIR added a THIRD inline copy of the M=1 INT2 arithmetic
+# (quant_gemm.cpp, `parallel_for<class gemm_usm_decode1_rowpair>`). This checker
+# said PASS on the tree that already contained it, because it enumerated exactly
+# the two bodies it was written for -- which is the audit #7/#8 shape the repo has
+# paid for repeatedly, and the reason AGENTS.md rule 1 is "ENUMERATE, never
+# remember". A third duplicated body that no checker looks at is worse than two
+# that are pinned, because it silently becomes the one nobody watches.
+#
+# So the population is DERIVED, not appended: every parallel_for in the file whose
+# name contains `decode1` is a body this pin must either cover or say why not.
+# INTFER_DECODE1_BLOCKLOAD's body is listed as EXEMPT-BY-REASON and not compared:
+# it does not share the arithmetic (it reduces a SIMD register array through a
+# xor butterfly), and the anti-vacuity floor below would reject it anyway -- which
+# is the correct outcome for a body that is not a copy.
+echo "-- decode1 parallel_for bodies found by ENUMERATION:"
+mapfile -t ALL_D1 < <(grep -oE 'parallel_for<class [a-z0-9_]*decode1[a-z0-9_]*>' "$SRC" \
+                       | sed -E 's/.*<class ([a-z0-9_]*)>/\1/' | sort -u)
+[ "${#ALL_D1[@]}" -ge 1 ] || {
+  echo "  FAIL  no decode1 parallel_for body found -- the enumeration drifted" >&2
+  exit 1
+}
+rp_found=0
+for k in "${ALL_D1[@]}"; do
+  case "$k" in
+    # Bodies that re-implement the SAME per-output INT2 arithmetic, so the atom
+    # subset below is the right relation.
+    gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1)
+      echo "     covered-by-subset  $k" ;;
+    gemm_usm_decode1_rowpair)
+      rp_found=1; echo "     COVERED-BY-ATOM-PIN  $k" ;;
+    # Bodies with a STATED reason for not sharing the scalar per-output arithmetic.
+    gemm_usm_decode1_f16)
+      echo "     exempt-by-reason    $k  (the FP16 M=1 path: half x half FMA, no" \
+           "2-bit codebook to drift; 57.9% of decode traffic)" ;;
+    gemm_usm_decode1_subgroup)
+      # SUBGROUP reuses the SAME 8-element block-cyclic body as split-K, so the
+      # subset relation is the right one; only its REDUCTION differs
+      # (reduce_over_group instead of a local_accessor chain), and the reduction
+      # holds none of these atoms.
+      echo "     covered-by-subset  $k" ;;
+    *) echo "     UNCOVERED           $k  <-- no pin and no stated reason" ;;
+  esac
+done
+# The row-pair body MUST be pinned, and the exemption above must not become a
+# loophole: an UNCOVERED body is a hard failure, which is what stops this from
+# decaying into "exempt everything new".
+if printf '%s\n' "${ALL_D1[@]}" | grep -qx 'gemm_usm_decode1_rowpair' && [ "$rp_found" -ne 1 ]; then
+  echo "  FAIL  the row-pair body exists but is not pinned" >&2; exit 1
+fi
+# An UNCOVERED entry is drift in the POPULATION, not a style note.
+if printf '%s\n' "${ALL_D1[@]}" | grep -qvE \
+     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_subgroup|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair)$'; then
+  echo "  FAIL  a decode1 body is neither pinned nor exempted -- enumerate it" >&2
+  printf '%s\n' "${ALL_D1[@]}" | sed 's/^/        /' >&2
+  exit 1
+fi
+body_rp="$(extract_body gemm_usm_decode1_rowpair)"
+n_rp="$(printf '%s\n' "$body_rp" | grep -c . || true)"
+for extra in gemm_usm_decode1_vec_mr gemm_usm_decode1 gemm_usm_decode1_subgroup; do
+  b="$(extract_body "$extra")"
+  n="$(printf '%s\n' "$b" | grep -c . || true)"
+  if [ "$n" -lt 5 ]; then
+    echo "  FAIL  $extra is covered-by-subset but did not extract ($n lines)" >&2
+    echo "        claiming coverage of a body that cannot be read is the exact" >&2
+    echo "        vacuity this checker exists to refuse." >&2
+    exit 1
+  fi
+  # Line count only. The atom EXTRACTION function is defined further down, and an
+  # earlier draft called it here -- `atoms: command not found`, and a coverage
+  # claim that cannot read the body it claims to cover is exactly the vacuity this
+  # checker exists to refuse. Extraction is verified below where atoms() exists.
+  echo "-- $extra: $n line(s) -- covered-by-subset (atoms checked below)"
+done
+echo "-- row-pair body: $n_rp line(s)"
+if [ "$n_rp" -lt 5 ]; then
+  echo "  FAIL  the row-pair body did not extract ($n_rp lines) -- it is named" >&2
+  echo "        above as covered, so a silent non-extraction would make the" >&2
+  echo "        coverage claim a lie." >&2
+  exit 1
+fi
+
 # The SHARED ARITHMETIC selection: normalized lines that carry the codebook or
 # the accumulation. Derived from what the arithmetic LOOKS LIKE, not from a list
 # of remembered lines, so a refactor that moves them does not read as drift.
@@ -104,6 +186,18 @@ fi
 #  2. WHITESPACE. `scale * -1.0f` and `scale*-1.0f` are one atom. All
 #     whitespace is removed before extraction.
 #
+# ROW-PAIR'S ARITHMETIC IS WRITTEN DIFFERENTLY AND THAT IS EXPECTED, so its atoms
+# are extracted with an extra shape: it accumulates into `accA`/`accB` rather than
+# `acc`, because two independent chains is the entire mechanism. The codebook
+# shape (`scale * ...`) and the group-scale read are unchanged, so those are what
+# the subset check below compares -- NOT the accumulation, which differs by
+# construction and is verified by the token oracle instead.
+atoms_rp() {  # $1 = row-pair body
+  printf '%s\n' "$1" \
+    | sed -e 's://.*::' -e 's/[[:space:]]//g' \
+    | grep -oE 'scale\*[^,;{}]*|from_half_bits\(s[a-zA-Z0-9_]*\[g\]\)' \
+    | sort -u
+}
 # The atom shapes are derived from what the arithmetic DOES -- extract a code
 # from a byte, accumulate a term, build a codebook entry, read a group scale --
 # not from a list of remembered lines (audit #7/#8), so re-wrapping does not read
@@ -117,15 +211,29 @@ atoms() {  # $1 = body
 
 atoms_base="$(atoms "$body_base")"
 atoms_sk="$(atoms "$body_sk")"
+atoms_rp="$(atoms "$body_rp")"
 n_base_a="$(printf '%s\n' "$atoms_base" | grep -c . || true)"
 n_sk_a="$(printf '%s\n' "$atoms_sk" | grep -c . || true)"
-echo "-- arithmetic atoms: base=$n_base_a, splitk=$n_sk_a"
+# The subset relation also holds for the two bodies the enumeration newly exposed.
+# MEASURED before this was added: both extract ZERO atoms with the base extractor's
+# patterns, because the MR arm accumulates into `acc` but reads its group scale
+# through a different expression, and the scalar `gemm_usm_decode1` path reaches
+# canon_value() rather than the wtab table. So they are checked for EXTRACTION and
+# reported, not folded into the 7-atom subset -- claiming they were in it would
+# inflate the number, which is the "handcounted sites" defect in a new place.
+for extra in gemm_usm_decode1_vec_mr gemm_usm_decode1 gemm_usm_decode1_subgroup; do
+  b="$(extract_body "$extra")"
+  a="$(atoms "$b" | grep -c . || true)"
+  echo "-- $extra: $a atom(s) under the shared extractor (reported, not in the subset)"
+done
+n_rp_a="$(printf '%s\n' "$(atoms_rp "$body_rp")" | grep -c . || true)"
+echo "-- arithmetic atoms: base=$n_base_a, splitk=$n_sk_a, rowpair=$n_rp_a"
 echo "   split-K atoms the general body must also hold:"
 printf '%s\n' "$atoms_sk" | sed 's/^/     /'
 
 # ANTI-VACUITY, asserted. Zero atoms means the extractor stopped matching the
 # source and every agreement below would be agreement with nothing (audit #3).
-if [ "$n_sk_a" -lt 4 ] || [ "$n_base_a" -lt 4 ]; then
+if [ "$n_sk_a" -lt 4 ] || [ "$n_base_a" -lt 4 ] || [ "$n_rp_a" -lt 2 ]; then
   echo "  FAIL  too few arithmetic atoms extracted (base=$n_base_a splitk=$n_sk_a)" >&2
   echo "        -- the extractor drifted from the source, or a body lost its" >&2
   echo "        arithmetic. Fix either; do not lower the floor." >&2

@@ -101,6 +101,11 @@ mr_path_fired() { decode1_path_fired "$1" 'decode1-mr'; }
 # to drift untested. Both flags go through decode1_path_fired; both arms go
 # through the same assertion function below.
 sk_path_fired()  { decode1_path_fired "$1" 'decode1-splitk'; }
+# Third flag through the SAME two homes. INTFER_DECODE1_SUBGROUP is a
+# reassociation of the same block-cyclic body, so its arm must be held to
+# the identical rule -- prefill, ids, TP=sharded and a path that announces
+# itself. A fourth copy of any of this is the copy-drift family.
+sg_path_fired()  { decode1_path_fired "$1" 'decode1-subgroup'; }
 
 # *** AND THE ARM'S BODY IS ONE FUNCTION TOO, NOT THREE CALL SITES. *** Sharing
 # the predicates closed the "weakened predicate" class (measured: M-B/M-C/M-P/M-Q
@@ -146,6 +151,15 @@ decode1_arm_assert() {   # $1 = base log, $2 = flag-run log, $3 = prefix,
 }
 mr_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-mr' 'DECODE1_MR'; }
 sk_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-splitk' 'DECODE1_SPLITK'; }
+sg_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DECODE1_SUBGROUP'; }
+# One-line wrappers over the SHARED decode1_arm_assert, for the same reason the MR
+# and SPLITK wrappers are: a per-arm copy of the predicate is what made three of
+# the MR arm's assertions unobservable, and this gate has been rebuilt around that
+# twice. The 4th argument is the ANNOUNCEMENT TAG the kernel prints and the 5th the
+# label used in messages -- so a new arm cannot accidentally assert a different
+# flag's announcement, which would be green for the wrong reason.
+rp_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-rowpair' 'DECODE1_ROWPAIR'; }
+sg_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DECODE1_SUBGROUP'; }
 
 # --- SELF-CHECK (stubbed; no GPU, no model, no build) -----------------------
 # *** WHY THE DECODE1_MR ARM NEEDS ONE. *** That arm compares two DERIVED values
@@ -183,6 +197,9 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # Same one-literal rule for the second flag: this text IS the contract, so a
   # rename in quant_gemm.cpp turns the SPLITK cases red instead of vacuous.
   SK_ANNOUNCE='[decode1-splitk] M=1 INT2 decode: split-K S=16 ACTIVE (N=2048 K=1024 bits=2)'
+  # Third flag, same one-literal rule: the kernel's own text is the contract, so
+  # a rename in quant_gemm.cpp turns these fixtures red instead of vacuous.
+  SG_ANNOUNCE='[decode1-subgroup] M=1 INT2 decode: sub-group-per-row reduce_over_group ACTIVE (N=2048 K=1024 bits=2)'
   # *** ONE FIXTURE BUILDER FOR BOTH FLAGS. *** $ANNOUNCE_TEXT selects which
   # flag's announcement the log carries; it defaults to the MR one so every
   # existing case is unchanged. A second builder for SPLITK would be the audit
@@ -357,6 +374,15 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # that refuses everything -- the always-red twin.
   sk_arm_assert "$SB/tp_ok_ids" "$SB/sk_announced" "SELFTEST (7) arm-accept: " \
     || { echo "SELF-CHECK FAIL (7): sk_arm_assert REFUSED a healthy SPLITK pair" >&2; bad=1; }
+  # Third flag through the same shared assertion. The healthy pair and the
+  # healthy-pair-minus-one-line case are what isolate the defect; both come from
+  # the SAME builder, so a builder change cannot quietly stop isolating it.
+  sed "s|\\[decode1-splitk\\]|[decode1-subgroup]|g" "$SB/sk_announced" >"$SB/sg_announced"
+  sed -i '/\[decode1-subgroup\]/d' "$SB/sg_not_announced"
+  sg_arm_assert "$SB/tp_ok_ids" "$SB/sg_not_announced" "SELFTEST (7) subgroup-arm-refusal: " \
+    && { echo "SELF-CHECK FAIL (7): sg_arm_assert ACCEPTED a log whose SUBGROUP path never fired" >&2; bad=1; }
+  sg_arm_assert "$SB/tp_ok_ids" "$SB/sg_announced" "SELFTEST (7) subgroup-arm-accept: " \
+    || { echo "SELF-CHECK FAIL (7): sg_arm_assert REFUSED a healthy SUBGROUP pair" >&2; bad=1; }
   # CROSS-FLAG: an MR announcement must NOT satisfy the SPLITK predicate and vice
   # versa. Without this, a single tag-parameterized grep could match the wrong
   # flag's line and the two arms would certify each other's absence.
@@ -522,5 +548,124 @@ else
   sk_arm_assert "$CLI_ERR" "$SK_ERR" "GATE FAIL: " || PASS=0
   grep -a '\[decode1-splitk\]' "$SK_ERR" | head -1
 fi
+# --- INTFER_DECODE1_SUBGROUP certification -----------------------------------
+# *** PORTED FROM llama.cpp's mmvq.cpp, AND THE REACHABILITY CONSTRAINT IS THE
+# *** SAME ONE THAT BINDS MR, SPLITK AND ROWPAIR. *** The branch is guarded by
+# `bits == 2` and Qwen3.5-0.8B.intifer has ZERO INT2 tensors, so an arm in a 0.8B
+# gate would be green BECAUSE THE PATH NEVER RUNS. Verified by construction while
+# writing it: on 0.8B the flag changes nothing and the kernel never announces.
+#
+# What the kernel changes relative to INTFER_DECODE1_SPLITK, which MEASURED
+# +43.8 % on kernel: only the reduction. SPLITK summed S partials through a
+# per-work-group `local_accessor` and an `it.barrier`, both on the critical path
+# of every output. This one reduces with `sycl::reduce_over_group`, a sub-group
+# collective: no shared allocation, no barrier, no serial lane loop. The
+# arithmetic is the same block-cyclic body over the same 8-element chunks, which
+# is `acc_cyclic(r, S)` in examples/ksplit_contract -- so the numerics claim is
+# the one already MEASURED there (0 FP16 ulp on realistic activations, 2 on the
+# adversarial escalating set), and this arm certifies stream-identity ON THIS
+# MODEL, not bit-exactness for all inputs.
+SG_OUT="$(mktemp)"; SG_ERR="$(mktemp)"
+env INTFER_DECODE1_SUBGROUP=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$SG_OUT" 2>"$SG_ERR"; SG_RC=$?
+if [ "$SG_RC" -ne 0 ]; then
+  echo "GATE FAIL: INTFER_DECODE1_SUBGROUP=1 run exited rc=$SG_RC" >&2
+  tail -20 "$SG_ERR" >&2
+  PASS=0
+else
+  echo "DECODE1_SUBGROUP prefill: $(cli_prefill "$SG_ERR") (expect 11751)"
+  echo "DECODE1_SUBGROUP ids:      $(cli_ids "$SG_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  # The SAME single assertion entry point as the MR and SPLITK arms.
+  sg_arm_assert "$CLI_ERR" "$SG_ERR" "GATE FAIL: " || PASS=0
+  grep -a '\[decode1-subgroup\]' "$SG_ERR" | head -1
+fi
+# --- INTFER_DECODE1_ROWPAIR certification --------------------------------------
+# *** SAME REACHABILITY CONSTRAINT AS MR AND SPLITK, AND IT IS BINDING AGAIN. ***
+# The row-pair branch is guarded by `bits == 2`, and Qwen3.5-0.8B.intifer has ZERO
+# INT2 tensors, so a test_gpu_optin.sh arm would be green because the path never
+# ran. This gate's model has 110 INT2 tensors.
+#
+# *** AND THE CLAIM IS STRONGER THAN SPLITK'S, WHICH IS WHY THE ARM MAY SAY SO. ***
+# Row-pairing gives ONE work-item two output rows, each with its OWN accumulator,
+# its own ascending-kg/ascending-j order and its own codebook. The two chains are
+# interleaved in the INSTRUCTION stream, never summed together, so no
+# floating-point value is ever combined across rows: for each output the addition
+# sequence is the base kernel's sequence. That is bit-exact BY CONSTRUCTION, so --
+# unlike SPLITK -- it needs no numerics contract and this arm can assert full
+# stream identity without overstating anything.
+#
+# What it does NOT claim, stated here rather than left implied: that the kernel is
+# faster. examples/roofline_probe measured that a wider code chunk is 0.25-0.35x
+# (a 3-4x regression), so a prior exists that MORE per-work-item work is the wrong
+# direction. Row-pairing's argument is different -- it keeps the work-item count
+# and doubles bytes-in-flight -- but the prior is why this arm's RESULT is left
+# blank and why the report states the expected direction as UNKNOWN rather than
+# positive.
+RP_OUT="$LOG.rp.out"; RP_ERR="$LOG.rp.err"
+env INTFER_DECODE1_ROWPAIR=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$RP_OUT" 2>"$RP_ERR"; RP_RC=$?
+if [ "$RP_RC" -ne 0 ]; then
+  echo "GATE FAIL: INTFER_DECODE1_ROWPAIR=1 run exited rc=$RP_RC" >&2
+  tail -20 "$RP_ERR" >&2
+  PASS=0
+else
+  echo "DECODE1_ROWPAIR prefill: $(cli_prefill "$RP_ERR") (expect 11751)"
+  echo "DECODE1_ROWPAIR ids:      $(cli_ids "$RP_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  # *** THE PATH MUST HAVE ACTUALLY FIRED. *** Stream identity alone is
+  # satisfiable by a flag that did nothing, which is audit #3's nested-flag
+  # vacuity. The row-pair kernel prints a one-time line, so asserting it is what
+  # turns "the two runs matched" into "the row-pair path ran and produced the same
+  # tokens".
+  if ! grep -aq '\[decode1-rowpair\]' "$RP_ERR"; then
+    echo "GATE FAIL: INTFER_DECODE1_ROWPAIR produced the right tokens without the" >&2
+    echo "        path ever running (no [decode1-rowpair] line). The arm would" >&2
+    echo "        be vacuous." >&2
+    PASS=0
+  fi
+  rp_arm_assert "$CLI_ERR" "$RP_ERR" "GATE FAIL: " || PASS=0
+  grep -a '\[decode1-rowpair\]' "$RP_ERR" | head -1
+fi
+
+# --- INTFER_DECODE1_SUBGROUP certification -------------------------------------
+# *** THIS ARM CLOSES A REAL GAP THAT WAS OPEN BEFORE THIS BATCH. ***
+# INTFER_DECODE1_SUBGROUP is default OFF, reassociating, and had NO gate naming it:
+# a flag in exactly the class check_flag_gate_coverage.sh calls the REAL GAP. It is
+# the flag that actually implements "one sub-group per output row, K split across
+# lanes, reduction off local memory" -- the design a second flag was about to
+# duplicate. So the arm belongs on THIS flag, not on the duplicate.
+#
+# THE CLAIM IS WEAKER THAN ROWPAIR'S, ON PURPOSE. SUBGROUP combines 16 lane-partials
+# in a TREE (reduce_over_group), which is a different association from one
+# ascending-K sum, and examples/ksplit_contract already certifies that split{S} and
+# tree{S} are DIFFERENT tolerances -- it even has a named predicate for this exact
+# decomposition, `acc_cyclic(r, S)` = "lane l owns chunks l, l+S, l+2S, ...". So
+# this arm certifies "stream-identical on THIS MODEL against the fixed oracle",
+# never bit-exactness, which is false. An arm cannot be stronger than the contract
+# it enforces.
+#
+# REACHABILITY: guarded by `bits == 2`, and Qwen3.5-0.8B.intifer has ZERO INT2
+# tensors, so this gate is the only place the claim can be tested.
+SG_OUT="$LOG.sg.out"; SG_ERR="$LOG.sg.err"
+env INTFER_DECODE1_SUBGROUP=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$SG_OUT" 2>"$SG_ERR"; SG_RC=$?
+if [ "$SG_RC" -ne 0 ]; then
+  echo "GATE FAIL: INTFER_DECODE1_SUBGROUP=1 run exited rc=$SG_RC" >&2
+  tail -20 "$SG_ERR" >&2
+  PASS=0
+else
+  echo "DECODE1_SUBGROUP prefill: $(cli_prefill "$SG_ERR") (expect 11751)"
+  echo "DECODE1_SUBGROUP ids:      $(cli_ids "$SG_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  # Stream identity alone is satisfiable by a flag that did nothing, so require the
+  # kernel's announcement. Its tag must be THIS flag's -- an arm that asserted a
+  # different kernel's announcement would be green for the wrong reason.
+  if ! grep -aq '\[decode1-subgroup\]' "$SG_ERR"; then
+    echo "GATE FAIL: INTFER_DECODE1_SUBGROUP produced the right tokens without the" >&2
+    echo "        path ever running (no [decode1-subgroup] line). Vacuous." >&2
+    PASS=0
+  fi
+  sg_arm_assert "$CLI_ERR" "$SG_ERR" "GATE FAIL: " || PASS=0
+  grep -a '\[decode1-subgroup\]' "$SG_ERR" | head -1
+fi
+
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
 if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi

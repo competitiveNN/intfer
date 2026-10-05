@@ -338,13 +338,85 @@ int main(int argc, char** argv) {
   auto& dev = mgr[dev_idx];
   sycl::queue q = dev.queue;
   q.wait_and_throw();
-  std::fprintf(stderr, "[roofline] device %d: %s  (max_compute_units=%u)\n",
-               dev_idx, dev.name.c_str(), dev.max_compute_units);
+  // *** THE LAUNCH-GEOMETRY FACTS, QUERIED RATHER THAN ASSUMED. *** llama.cpp's
+  // dmmv.cpp pins reqd_sub_group_size(16) as a correctness constraint, and the
+  // sub-group-per-row design (AGENTS.md's E2) divides K by that width, so 16 being
+  // this device's sub-group width is load-bearing for any such launch.
+  //
+  // IT IS ASKED FROM INSIDE A KERNEL, not from the host, and that is not a
+  // preference. Three host-side spellings were tried and none is a property in
+  // this SYCL: `sycl::info::device::sub_group_size` names no template (the
+  // compiler suggests `ext::oneapi::experimental::sub_group_size`, which is a
+  // VARIABLE TEMPLATE -- the compile-time property key -- so calling it as a
+  // function is a different error again). `sub_group_size` exists in this version
+  // only as `sub_group_size_key`, i.e. a KERNEL property. So the device is asked
+  // the question it can actually answer: a sub-group queried from inside a launched
+  // work-group. That is the width a launch will really get, which is exactly what
+  // the design decision needs and what a host-side spec number is not.
+  std::uint32_t* sg_probe = static_cast<std::uint32_t*>(
+      sycl::malloc_shared(4 * sizeof(std::uint32_t), dev.sycl_device,
+                          dev.sycl_context));
+  {
+    sycl::queue q0 = dev.queue;
+    q0.submit([&](sycl::handler& h) {
+      h.parallel_for(sycl::nd_range<1>(sycl::range<1>(16), sycl::range<1>(16)),
+                     [=](sycl::nd_item<1> it) {
+        const auto sg = it.get_sub_group();
+        if (it.get_local_id(0) == 0) {
+          sg_probe[0] = static_cast<std::uint32_t>(sg.get_local_range().size());
+          sg_probe[1] = static_cast<std::uint32_t>(it.get_local_range(0));
+          sg_probe[2] = static_cast<std::uint32_t>(it.get_group_range(0));
+          sg_probe[3] = 0u;  // no host-side sub_group_size property in this SYCL
+        }
+      });
+    }).wait();
+    // sg_probe[3] stays 0: the host-side query is not available in this SYCL, and
+    // writing 0 rather than a guess is the point.
+  }
+  const std::uint32_t sg_size = sg_probe[0];
+  const std::uint32_t wg_now = sg_probe[1];
+  const std::uint32_t gr_now = sg_probe[2];
+  std::fprintf(stderr,
+               "[roofline] device %d: %s\n"
+               "  max_compute_units = %u   (20 Xe cores x 8 vector engines; agrees\n"
+               "    with CITATION(techpowerup arc-b580.c4244))\n"
+               "  SUB_GROUP_SIZE (queried inside a kernel) = %u\n"
+               "  a 16-wide launch actually gets: local=%u group=%u\n",
+               dev_idx, dev.name.c_str(), dev.max_compute_units, sg_size, wg_now,
+               gr_now);
+  // Where intfer's CURRENT M=1 decode launch differs from that width, as a
+  // comparison rather than prose: quant_gemm.cpp declares
+  // `constexpr int kThr = 16` (line 64) and the M=1 branch uses
+  // `constexpr int nWG = kThr` (line 340), so it launches 16-wide work-groups.
+  std::fprintf(stderr,
+               "  intfer M=1 decode1 launch: nWG = kThr = 16 -> %s the sub-group "
+               "width (%u)\n",
+               (16u == sg_size) ? "EQUALS" : "DIFFERS FROM", sg_size);
+  // What E5's block_load arm may ask for: block_load<T,N> distributes N*sizeof(T)
+  // bytes across the sub-group, so 128 B at sub_group_size %u is %u B per lane.\n
+  std::fprintf(stderr,
+               "  esimd block_load<uint8_t,128> => %u B/lane at sg=%u; "
+               "block_load<uint8_t,256> => %u B/lane\n",
+               128u / (sg_size ? sg_size : 1u), sg_size,
+               256u / (sg_size ? sg_size : 1u));
+  sycl::free(sg_probe, q);
+  if (sg_size == 0) {
+    std::fprintf(stderr,
+                 "[roofline] FAIL: sub-group size came back 0, so every width\n"
+                 "        statement this run would make is ungrounded.\n");
+    return 1;
+  }
+
+  constexpr int kReps = 12;   // reps per arm; medians, not first-run noise
+  std::vector<Arm> arms;
 
   // *** THE 27B TP=2 SHAPES, from the .intifer metadata (derived, not remembered).
-  // scripts/model_byte_roofline.sh prints this table; the four rows here are the
-  // ones that bracket the traffic, and their N_local values are what the gemv arm
-  // sweeps.
+  // scripts/model_byte_roofline.sh prints this table; these are the rows that
+  // bracket the traffic, and their N_local values are what the per-scheme arms
+  // sweep. N_local is as low as 512 (ATTN_K) and 2560 (LA_OUT, ATTN_O, MLP_DOWN)
+  // against ~2560 FP32 lanes CITATION(techpowerup arc-b580.c4244), so the small
+  // shapes are launch-bound rather than bandwidth-bound -- which the per-scheme
+  // table then shows.
   struct Shape {
     const char* role;
     std::uint32_t N_local;
@@ -362,9 +434,6 @@ int main(int argc, char** argv) {
       {"LA_OUT(FP16)",         2560,  6144, 16,  0, intfer::gemm::WeightScheme::FP16},
       {"ATTN_K(FP16)",          512,  5120, 16,  0, intfer::gemm::WeightScheme::FP16},
   };
-  constexpr int kReps = 12;   // reps per arm; medians, not first-run noise
-
-  std::vector<Arm> arms;
 
   // ---------------- the allocator + ceiling discriminator ---------------------
   // One representative weight-sized buffer: LA_QKV's FP16 shard is 52.4 MB per

@@ -341,6 +341,179 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
     const int nBlocks = (N + nWG - 1) / nWG;
     const int global = nBlocks * nWG;
 
+    // --------------------------------------------------------------------
+    // INTFER_DECODE1_ROWPAIR -- default OFF, kill switch
+    // INTFER_NO_DECODE1_ROWPAIR=1. BIT-EXACT BY CONSTRUCTION.
+    //
+    // WHAT IT IS. One work-item computes TWO consecutive output rows instead of
+    // one: it loads the activation vector ONCE and runs TWO INDEPENDENT FMA chains
+    // against it, so the shared activation load is amortised over twice the weight
+    // traffic and -- the point -- there are twice as many weight loads in flight
+    // per work-item. Copied from llama.cpp ggml-sycl/esimd.hpp's `mac_pair`, whose
+    // own comment gives the reason: "the two FMA chains interleaved
+    // (co-scheduled to hide FMA latency)".
+    //
+    // *** THIS IS NOT INTFER_DECODE1_MR, AND THE DISTINCTION IS THE WHOLE POINT.
+    // MR gave each work-item MORE OUTPUTS and measured 2.3x SLOWER, because at M=1
+    // the work-item count IS N and dividing a fixed budget by four is
+    // anti-parallel. Row-pairing keeps the work-item count where it is
+    // (ceil(N/2) work-items instead of N -- HALF, not a quarter) and instead
+    // doubles the BYTES IN FLIGHT per work-item, which is the lever
+    // examples/roofline_probe says is live: decode sits at 15.6-19.9 % of the
+    // ceiling this card demonstrates with the same allocator and the same access
+    // pattern, and sustaining 456 GB/s at ~600 ns latency needs ~274 KB in flight.
+    //
+    // WHY IT IS BIT-EXACT. For output row n, the sequence of additions is
+    // unchanged: its own accumulator, ascending kg, ascending j, the same 8-code
+    // chunk, the same byte indexing, the same wtab lookup. The second row's chain
+    // is interleaved in the INSTRUCTION stream, not folded into the first row's
+    // accumulator, so no floating-point value is ever combined with another row's.
+    // So the claim is stream identity against the fixed oracle, and it needs NO
+    // numerics contract -- which is exactly what distinguishes it from
+    // INTFER_DECODE1_SPLITK and INTFER_DECODE1_SUBGROUP, both of which reassociate
+    // and both of which need one.
+    //
+    // NUMERICS IS NOT AN ARGUMENT HERE, IT IS A CHECK: scripts/check_decode1_copies.sh
+    // pins the two inline copies against each other (mutual agreement, NOT against
+    // remembered literals -- the first version of that checker failed its own "both
+    // copies changed together" state for exactly that reason), and
+    // scripts/test_tp2_27b.sh asserts the flag's arm against the same fixed oracle
+    // the base run uses, not a self-comparison.
+    //
+    // REACHABILITY: the branch is guarded on `bits == 2` exactly like the MR and
+    // SPLITK arms, and the 0.8B gate model has ZERO INT2 tensors -- so this arm
+    // MUST live in test_tp2_27b.sh, not test_gpu_optin.sh, or it would be green
+    // because the path never ran.
+    const bool use_rowpair =
+        (std::getenv("INTFER_DECODE1_ROWPAIR") != nullptr) &&
+        (std::getenv("INTFER_NO_DECODE1_ROWPAIR") == nullptr);
+    // *** INTFER_DECODE1_BLOCKLOAD WAS WRITTEN AND THEN DELETED, and the reason
+    // is the point. *** An earlier draft of this batch shipped a second flag doing
+    // "one sub-group per output row, K split across lanes, register-only
+    // reduction, no local_accessor and no barrier" -- and discovered on the way to
+    // the gate that INTFER_DECODE1_SUBGROUP ALREADY DOES EXACTLY THAT, and does it
+    // better on both counts:
+    //
+    //   * SUBGROUP reduces with `sycl::reduce_over_group(sg, acc, plus<float>())`.
+    //     This draft hand-rolled a 4-step `permute_group_by_xor` butterfly. The
+    //     collective is the idiomatic form, it is what llama.cpp's mmvq.cpp does,
+    //     and it is convergent without the author having to prove it.
+    //   * SUBGROUP's split is BLOCK-CYCLIC (lane l owns chunks l, l+S, l+2S, ...),
+    //     which is the one that coalesces. This draft's was a CONTIGUOUS K/16
+    //     slice per lane -- and AGENTS.md already records, from the SPLITK work,
+    //     that contiguous chunks stay strided.
+    //
+    // Shipping both would be the "two copies and flag polarity" defect this repo
+    // has a memory tag for: two flags naming one design, differing in the
+    // reduction primitive, neither certifiable on its own because a reader cannot
+    // tell which one a given measurement used. So the duplicate is deleted and the
+    // REAL flag gets the gate arm instead -- which is where the value was: that arm
+    // did not exist, and INTFER_DECODE1_SUBGROUP is default OFF and reassociating.
+    //
+    // The one genuinely NEW thing the deleted draft had was the esimd
+    // `block_load<uint8_t,128>` (8 B per lane at the measured sg=16) in place of
+    // scalar 2-byte `code_u8[]` reads. That is NOT lost, it is DOWNGRADED to what
+    // it should have been from the start: a single-change arm on top of SUBGROUP,
+    // measured by examples/roofline_probe, not a flag. And its prior is already
+    // negative -- the probe measured a 16-code chunk at 0.25-0.35x, a 3-4x
+    // REGRESSION, because register pressure dominates. If someone still wants the
+    // number, the arm is: SUBGROUP's body with the two `code_u8[b0]`/`[b0+1]`
+    // reads replaced by one `block_load<uint8_t,128>` per 32 codes. Kill criterion
+    // is the probe's own convention: below 2x it closes llama.cpp's block_load
+    // direction for intfer.
+
+    if (use_rowpair && bits == 2 && (N & 1) == 0) {
+      // Announce ONCE, on the host, not per launch: a 794-launches-per-token engine
+      // printing per launch would flood the log the gate parses. The gate's arm
+      // REQUIRES this line, because a stream comparison is satisfiable by a flag
+      // that did nothing -- audit #3's nested-flag vacuity, and the one thing that
+      // turns "the two runs matched" into "the row-pair path ran".
+      static const bool announced = [] {
+        std::fprintf(stderr,
+                     "[decode1-rowpair] 2 rows/work-item, shared activation, "
+                     "bit-exact (separate accumulators) ACTIVE\n");
+        return true;
+      }();
+      (void)announced;
+      const int npair = N / 2;
+      const int pBlocks = (npair + nWG - 1) / nWG;
+      const int pGlobal = pBlocks * nWG;
+      return q.submit([&](sycl::handler& h) {
+        h.depends_on(copy_dep);
+        h.parallel_for<class gemm_usm_decode1_rowpair>(
+            sycl::nd_range<1>(sycl::range<1>(pGlobal), sycl::range<1>(nWG)),
+            [=](sycl::nd_item<1> it) {
+              const int np = static_cast<int>(it.get_global_id(0));
+              if (np >= npair) return;
+              const int na = np * 2;      // row A = the even output
+              const int nb = np * 2 + 1;  // row B = the odd output
+
+              // INLINE AT EACH SITE, NEVER A SHARED DEVICE FUNCTION. The reverted
+              // fused-decode kernel cost 231 114 ms (a ~180x regression) with
+              // arithmetic that a normalized diff proved identical, and the
+              // generalised cause is that the SYCL device compiler failed to
+              // optimise the extracted body. So the two chains are written out
+              // here, twice, and the copies are pinned by a checker rather than
+              // shared.
+              float accA = 0.0f, accB = 0.0f;
+              const std::uint16_t* sA = scale_usm + na * num_groups_w;
+              const std::uint16_t* sB = scale_usm + nb * num_groups_w;
+              const std::size_t rbA = static_cast<std::size_t>(na) * K;
+              const std::size_t rbB = static_cast<std::size_t>(nb) * K;
+              sycl::multi_ptr<const std::uint16_t,
+                  sycl::access::address_space::global_space> act_mp(act_usm);
+              sycl::multi_ptr<const std::uint8_t,
+                  sycl::access::address_space::global_space> wA(code_u8 + rbA);
+              sycl::multi_ptr<const std::uint8_t,
+                  sycl::access::address_space::global_space> wB(code_u8 + rbB);
+
+              for (int g = 0; g < num_groups_w; ++g) {
+                const float scA = from_half_bits(sA[g]) * alpha;
+                const float scB = from_half_bits(sB[g]) * alpha;
+                const int kg0 = g * Gw;
+                int kg1 = kg0 + Gw;
+                if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+                const float wA4[4] = {scA * -1.0f, scA * (-1.0f / 3.0f),
+                                      scA * (1.0f / 3.0f), scA * 1.0f};
+                const float wB4[4] = {scB * -1.0f, scB * (-1.0f / 3.0f),
+                                      scB * (1.0f / 3.0f), scB * 1.0f};
+                constexpr int CC = 8;   // 16 codes/chunk measured 0.25-0.35x
+                int kg = kg0;
+                std::size_t b0A = (rbA + static_cast<std::size_t>(kg)) / 4u;
+                std::size_t b0B = (rbB + static_cast<std::size_t>(kg)) / 4u;
+                for (; kg + CC <= kg1; kg += CC) {
+                  // THE SHARED LOAD. One activation vector, two weight pairs, two
+                  // independent accumulators. This is the entire mechanism.
+                  sycl::vec<std::uint16_t, 8> a16;
+                  a16.load(0, act_mp + kg);
+                  const std::uint8_t a0 = wA[b0A], a1 = wA[b0A + 1];
+                  const std::uint8_t c0 = wB[b0B], c1 = wB[b0B + 1];
+                  b0A += 2; b0B += 2;
+                  for (int j = 0; j < CC; ++j) {
+                    const float av =
+                        static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                    const std::uint8_t va = (j < 4) ? a0 : a1;
+                    const std::uint8_t vb = (j < 4) ? c0 : c1;
+                    // Two SEPARATE accumulators: the chains are co-scheduled in the
+                    // instruction stream, never summed together.
+                    accA += av * wA4[(va >> ((j & 3) * 2)) & 3];
+                    accB += av * wB4[(vb >> ((j & 3) * 2)) & 3];
+                  }
+                }
+                // Ragged group tail. Identical to the base kernel's, per row.
+                for (; kg < kg1; ++kg) {
+                  const float av = from_half_bits(act_usm[kg]);
+                  const std::size_t iA = rbA + kg, iB = rbB + kg;
+                  accA += av * scA * canon_value(2, (wA[iA / 4] >> ((iA % 4) * 2)) & 3);
+                  accB += av * scB * canon_value(2, (wB[iB / 4] >> ((iB % 4) * 2)) & 3);
+                }
+              }
+              out_usm[na] = to_half_bits(accA);
+              out_usm[nb] = to_half_bits(accB);
+            });
+      });
+    }
+
     // FP16 fast path: load activations and weights as 8-wide vectors.
     // This halves the LSU pressure compared to scalar loads.
     if (bits == 16 && Gw == static_cast<int>(K)) {
@@ -759,6 +932,150 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                 });
           });
         }
+      }
+
+      // INTFER_DECODE1_SUBGROUP -- default OFF, EXPERIMENTAL.
+      //
+      // WHAT DIFFERS FROM INTFER_DECODE1_SPLITK. Only the work decomposition and
+      // the reduction. The arithmetic is the SAME block-cyclic body over the SAME
+      // 8-element chunks, so the numerics are the contract that already exists:
+      // `acc_cyclic(r, S)` in examples/ksplit_contract IS "lane l owns chunks
+      // l, l+S, l+2S, ...". That contract measured 0 FP16 ulp on random /
+      // act-outliers / full cancellation and 2 ulp on the adversarial escalating
+      // set, and it still passes. The claim is therefore "stream-identical on
+      // the gate models", never "bit-exact".
+      //
+      // WHY A SEPARATE FLAG RATHER THAN FIXING SPLITK. SPLITK MEASURED +43.8 % on
+      // kernel, 3/3 same sign, clearing the spread floor -- and the bisection in
+      // AGENTS.md named the cause precisely: the per-work-group `local_accessor`
+      // plus `it.barrier` on the critical path of EVERY output. That diagnosis
+      // predicts exactly this shape fixes it: same split, same order, and the
+      // reduction moved off local memory into `sycl::reduce_over_group`, a
+      // sub-group collective with no shared allocation, no barrier, and no
+      // lane0..lane0+S-1 serial loop. Both halves of the original hypothesis
+      // (more parallelism AND coalesced weight reads) were delivered and it still
+      // lost, which is what pointed at the barrier rather than the split.
+      //
+      // PORTED FROM llama.cpp, which has this shape in production:
+      // ggml/src/ggml-sycl/mmvq.cpp `mul_mat_vec_q_reorder` runs ONE SUB-GROUP PER
+      // OUTPUT ROW, QUERIES the sub-group width instead of assuming 16, splits K
+      // across the lanes, and finishes with
+      //   sycl::reduce_over_group(sg, partial, std::plus<>()); if (sg.leader())
+      // It also keeps `row` SUB-GROUP UNIFORM so a whole sub-group retires
+      // together and the collective stays convergent. True here too, because the
+      // mapping derives from sub-group ids and never from the lane.
+      //
+      // NOT PORTED: llama.cpp pre-transforms its weights into a reordered layout
+      // so consecutive lanes read consecutive addresses. That repack is a
+      // separate lift (it lives in the quantization pipeline, not the kernel), so
+      // this measures the parallel decomposition ALONE -- deliberately, so a win
+      // or a loss is attributable to the reduction and not to a layout change
+      // that arrived with it.
+      const char* sg_env = std::getenv("INTFER_DECODE1_SUBGROUP");
+      const bool use_sg =
+          (sg_env && sg_env[0] == '1' && sg_env[1] == '\0') &&
+          (std::getenv("INTFER_NO_DECODE1_SUBGROUP") == nullptr);
+      if (use_sg && bits == 2 && num_groups > 0) {
+        constexpr int kVSg = 8;   // same chunk as SPLITK, same contract
+        // One WORK-GROUP per output row. The sub-group width is QUERIED below and
+        // may be smaller than nWG, in which case several sub-groups share one row
+        // and row_lanes accounts for them. Hard-coding 16 would be the kind of
+        // assumption that holds until it does not.
+        const int nSGROW = (N + nWG - 1) / nWG;
+        const int globalSg = nSGROW * nWG;
+        static bool announced_sg = false;
+        if (!announced_sg) {
+          announced_sg = true;
+          std::fprintf(stderr,
+                       "[decode1-subgroup] M=1 INT2 decode: sub-group-per-row "
+                       "reduce_over_group ACTIVE (N=%d K=%d bits=%d)\n",
+                       N, K, bits);
+        }
+        return q.submit([&](sycl::handler& h) {
+          h.depends_on(copy_dep);
+          // NO local_accessor. That is the whole point, and it is also why this
+          // is a separate kernel class rather than a branch inside the SPLITK
+          // lambda: the local_accessor is allocated at submit time.
+          h.parallel_for<class gemm_usm_decode1_subgroup>(
+              sycl::nd_range<1>(sycl::range<1>(globalSg), sycl::range<1>(nWG)),
+              [=](sycl::nd_item<1> it) {
+                const auto sg = it.get_sub_group();
+                const int lane   = static_cast<int>(sg.get_local_linear_id());
+                const int sgw    = static_cast<int>(sg.get_local_linear_range());
+                const int sgid   = static_cast<int>(sg.get_group_linear_id());
+                const int sgs_wg = (sgw > 0) ? (nWG / sgw) : 1;   // sub-gps per WG
+                const int row    = static_cast<int>(it.get_group(0)) * sgs_wg + sgid;
+                const bool live  = (row < N);
+                const int row_lanes = sgs_wg * sgw;             // lanes on this row
+                const int step = row_lanes * kVSg;              // block-cyclic period
+                const int off  = lane * kVSg;                  // this lane's phase
+
+                float acc = 0.0f;
+                const float alpha_f = alpha;
+                const int packSg = pack;   // == 4 for INT2
+                sycl::multi_ptr<const std::uint16_t,
+                    sycl::access::address_space::global_space> act_mp(act_usm);
+
+                // ---- INLINE arithmetic: do not factor this out. See the reverted
+                // fused-decode kernel (231114 ms) and the two-copies checker.
+                if (live) {
+                  const int row_base = row * static_cast<int>(K);
+                  const std::uint16_t* sptr =
+                      scale_usm + static_cast<std::size_t>(row) * num_groups_w;
+                  const int g1last = (K - 1) / Gw;
+                  for (int g = 0; g <= g1last; ++g) {
+                    const int kg0 = g * Gw;
+                    int kg1 = kg0 + Gw;
+                    if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+                    const float scale = from_half_bits(sptr[g]) * alpha_f;
+                    const float wtab[4] = {scale * -1.0f,
+                                           scale * (-1.0f / 3.0f),
+                                           scale * (1.0f / 3.0f),
+                                           scale * 1.0f};
+                    // First k in [kg0,kg1) carrying this lane's phase.
+                    int k = kg0 + ((off - (kg0 % step) + step) % step);
+                    for (; k + kVSg <= kg1; k += step) {
+                      sycl::vec<std::uint16_t, kVSg> a16;
+                      a16.load(0, act_mp + k);
+                      const std::size_t b0 =
+                          (static_cast<std::size_t>(row_base) +
+                           static_cast<std::size_t>(k)) / packSg;
+                      const std::uint8_t b0v = code_u8[b0];
+                      const std::uint8_t b1v = code_u8[b0 + 1];
+                      for (int j = 0; j < kVSg; ++j) {
+                        const float av = static_cast<float>(
+                            sycl::bit_cast<sycl::half>(a16[j]));
+                        const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                        // (j & 3), NOT j -- see the identical note in the SPLITK
+                        // body: INT2 packs four codes per byte, and a uint8_t
+                        // shifted by >= 8 promotes to 0. That bug shipped once.
+                        const int code = (bv >> ((j & 3) * 2)) & 3;
+                        acc += av * wtab[code];
+                      }
+                    }
+                    for (; k < kg1; ++k) {   // ragged tail of the group
+                      const float av = from_half_bits(act_usm[k]);
+                      const std::size_t idx =
+                          static_cast<std::size_t>(row_base) +
+                          static_cast<std::size_t>(k);
+                      const std::uint8_t byte = code_u8[idx / packSg];
+                      const int code = (byte >> ((idx % packSg) * 2)) & 3;
+                      acc += av * wtab[code];
+                    }
+                  }
+                }
+
+                // ---- THE REDUCTION, and the entire delta from SPLITK.
+                // reduce_over_group is a sub-group collective: no local
+                // allocation, no barrier. The tree shape also combines the
+                // partials in a DIFFERENT order than SPLITK's ascending chain --
+                // inside the measured envelope above, and the reason the
+                // contract's claim is a margin and not a bit pattern.
+                const float tot = sycl::reduce_over_group(
+                    sg, acc, sycl::plus<float>());
+                if (live && sg.leader()) out_usm[row] = to_half_bits(tot);
+              });
+        });
       }
 
       return q.submit([&](sycl::handler& h) {
