@@ -282,21 +282,53 @@ class Engine {
   // sitting in ws_[d].act for EVERY device: the host vector pointer it was
   // converted from, plus the shape it was converted for.
   //
-  // WHY IT IS SAFE, and the safety argument is an AUDIT, not a hope. ws_[d].act
-  // has exactly three classes of writer, enumerated from source:
-  //   * run_linear_tp itself, and nothing else (engine.cpp:1251);
-  //   * run_mlp_fused and the wave path, which write wv_[].act -- a DIFFERENT
-  //     buffer, so they cannot stale this;
-  //   * the DPAS path, which writes ws48_[d].act -- also a different buffer.
-  // So the only ways the cached bytes can go stale are (a) the workspace being
-  // freed/reallocated, which happens only in ensure_workspace's growth branch and
-  // the device reset, and both clear this; and (b) a different input vector.
-  // check_act_cache_invalidation.sh re-derives that writer set from source and
-  // fails if a writer appears that does not clear the cache, so the argument is
-  // re-checked on every stack run instead of being trusted after this comment.
+  // *** THE POINTER IS NOT AN IDENTITY, AND THE FIRST VERSION OF THIS WAS A
+  // *** SHIPPED STREAM-DIVERGING BUG (found 2026-10-05, gate test_gpu_optin.sh).
+  // The original comment here argued the cache was safe because ws_[d].act has
+  // exactly three classes of writer, two of which write DIFFERENT buffers, and
+  // listed "(b) a different input vector" without ever asking how a different
+  // vector is DETECTED. It is not. run_linear_tp takes
+  // `const std::vector<float>& x` and a std::vector that is assigned into keeps
+  // its heap buffer, so the CLI's per-step hidden vector arrives at the SAME
+  // x.data() every decode step with DIFFERENT contents. M and K are constant too.
+  // The key therefore matched from step 2 onward, the convert and the upload
+  // were skipped, and the GEMM read the previous step's FP16 bytes.
+  // Measured: 0.8B TP=1, -n4, base '369 264 3177 13' vs flag
+  // '11 11 40252 306'. A repeated '11 11' is what stale workspace looks like --
+  // not a subtly different arithmetic result.
+  //
+  // The lesson generalises past this flag: an argument that enumerates the
+  // WRITERS of a destination and never examines the SOURCES feeding the lookup
+  // has not closed the case, and check_act_cache_invalidation.sh could not see
+  // it either because the defect is not a missing invalidation -- it is a lookup
+  // that cannot fail.
   const float* act_cache_ptr_ = nullptr;
   uint32_t act_cache_M_ = 0;
   uint32_t act_cache_K_ = 0;
+  // The exact FP32 bytes that produced act_staging_. A hit is admitted only if
+  // x still equals these, so the key is CONTENT and the guarantee holds for any
+  // caller that refills its buffer in place -- no invalidation site to forget.
+  // memcmp is the cheap half of the comparison it replaces: one vectorised,
+  // early-exit pass over contiguous bytes against a branchy scalar
+  // float->half convert, and it decides the same thing exactly. A sampled
+  // fingerprint would be cheaper and would be a probabilistic cache, which is a
+  // different thing than the bit-exact one the flag claims.
+  std::vector<float> act_src_;
+  // Monotonic generation of act_staging_, bumped by EVERY writer of it (three
+  // sites: this path, run_linear_tp_devact's wave phase, and run_linear_f16_tp's
+  // shared-staging phase). The cache records the generation it converted at, so
+  // a hit also requires that nothing has rewritten the staging since.
+  //
+  // This is the SECOND instance of the same family and it was latent, not
+  // observed: at TP=1 with the fused MLP ON, the down projection runs through
+  // run_linear_tp_devact, which rewrites act_staging_ from a different source.
+  // Today that is masked because the next call always misses on its content, but
+  // the content check is only half the invariant -- the cache claims to know what
+  // act_staging_ holds, and act_staging_ is shared with two other writers. A
+  // cache that caches a buffer without tracking that buffer's writers is the same
+  // defect one level down.
+  uint64_t act_staging_gen_ = 0;
+  uint64_t act_cache_gen_ = 0;
   // Reusable INT8-act + scale staging for run_linear_tp_dpas48 (M*K int8,
   // M*nGA fp32, tight rows). The quant writes here (host memory), then one
   // memcpy per workspace row lands wide vectorized stores into the shared

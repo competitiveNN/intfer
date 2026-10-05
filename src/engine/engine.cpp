@@ -1235,16 +1235,35 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   static const bool fuse_act =
       (fa && fa[0] == '1' && fa[1] == '\0') &&
       (std::getenv("INTFER_NO_FUSE_ACT") == nullptr);
-  const bool act_hit = fuse_act && act_cache_ptr_ == x.data() &&
-                       act_cache_M_ == M && act_cache_K_ == (uint32_t)t.K;
+  // A hit needs THREE things to agree, and the third is the one the first
+  // version was missing. The key alone is an address; `x` is a
+  // std::vector<float>& and a vector that is assigned into keeps its heap
+  // buffer, so consecutive decode steps hit the same key with different bytes.
+  // Comparing the source against the exact FP32 that produced the staged FP16
+  // makes the key CONTENT, which is what makes "the destination already holds
+  // exactly the bytes this call would write" true rather than merely plausible.
+  const size_t act_need = (size_t)M * t.K;
+  bool act_hit = fuse_act && act_cache_ptr_ == x.data() &&
+                 act_cache_M_ == M && act_cache_K_ == (uint32_t)t.K &&
+                 act_cache_gen_ == act_staging_gen_ &&
+                 act_src_.size() == act_need &&
+                 std::memcmp(act_src_.data(), x.data(),
+                             act_need * sizeof(float)) == 0;
   // Pre-convert FP32 activation to FP16 once (shared by all devices), unless
   // the identical bits are already staged in every device's workspace.
   if (!act_hit) {
 #ifdef INTFER_PROFILE_GPU
     auto t_copy0 = std::chrono::high_resolution_clock::now();
 #endif
-    if (act_staging_.size() != (size_t)M * t.K) act_staging_.resize((size_t)M * t.K);
-    dashq::float_to_half_batch(x.data(), act_staging_.data(), (size_t)M * t.K);
+    if (act_staging_.size() != act_need) act_staging_.resize(act_need);
+    ++act_staging_gen_;
+    dashq::float_to_half_batch(x.data(), act_staging_.data(), act_need);
+    // Shadow the SOURCE, not the staging: staging is regenerated on every miss,
+    // so shadowing it would make the comparison a tautology.
+    if (fuse_act) {
+      if (act_src_.size() != act_need) act_src_.resize(act_need);
+      std::memcpy(act_src_.data(), x.data(), act_need * sizeof(float));
+    }
 #ifdef INTFER_PROFILE_GPU
     {
       auto t1 = std::chrono::high_resolution_clock::now();
@@ -1317,6 +1336,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     act_cache_ptr_ = x.data();
     act_cache_M_ = M;
     act_cache_K_ = (uint32_t)t.K;
+    act_cache_gen_ = act_staging_gen_;
     static bool announced_act = false;
     if (!announced_act) {
       announced_act = true;
@@ -1426,6 +1446,12 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
 #endif
   const size_t need = (size_t)M * tg.K;
   if (act_staging_.size() != need) act_staging_.resize(need);
+  // act_staging_ is SHARED: this wave phase rewrites it from rin, so any
+  // INTFER_FUSE_ACT hit recorded before this point is now describing bytes that
+  // are no longer in it. Bumping the generation is what makes the recorded cache
+  // expire; without it the source-content check alone would still admit a hit
+  // whose staged bytes belong to a different tensor.
+  ++act_staging_gen_;
   dashq::float_to_half_batch(rin.data(), act_staging_.data(), need);
 #ifdef INTFER_PROFILE_GPU
   {
@@ -1677,6 +1703,7 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
       auto t_copy0 = std::chrono::high_resolution_clock::now();
 #endif
       if (act_staging_.size() != need) act_staging_.resize(need);
+      ++act_staging_gen_;   // shared buffer: see run_linear_tp_devact
       dashq::float_to_half_batch(x.data(), act_staging_.data(), need);
       if (reused) {
         if (shared_staging.size() != need) shared_staging.resize(need);
