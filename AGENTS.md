@@ -605,6 +605,17 @@ narrative with the measurements is in `docs/audit-log-tooling.md`):
     * Prefer a **non-destructive probe**: copy the file under `build/`, mutate the
       copy, run the same function against it. Same evidence, zero risk. That is how
       the `patch_literal` 0-match / 1-match / 2-match directions were proven.
+    * `. scripts/guard.sh` makes this a BEHAVIOUR rather than a note. Rule 16 and
+      the memory note both said "commit first" and both demonstrably failed to
+      change anything: `git checkout -- scripts/` destroyed uncommitted work
+      TWICE in the session that wrote them, the second time with the note already
+      in place. Sourcing the guard shadows `git` as a function, so `reset --hard`,
+      `checkout`, `clean -f` and `stash drop|clear` REFUSE on a dirty tree and name
+      the two non-destructive routes out. It refuses rather than prompts, because a
+      prompt is a decision point and the wrong decision was made at one twice.
+      Non-destructive git is untouched. Bypass: `INTFER_ALLOW_DESTRUCTIVE=1`.
+      *Limit, stated because it is the point:* it only covers shells that sourced
+      it. It is a seatbelt, not an interlock, and this rule remains the backstop.
     * `scripts/check_destructive_git.sh` enforces the script half: any script
       performing a destructive git op must refuse to run on a dirty tree. Its
       harvest strips **comments first** — `mutate_tp2_selfcheck.sh` mentions
