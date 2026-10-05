@@ -40,9 +40,34 @@ n_big="${#BIG_GATES[@]}"
 echo "-- gates that bind the 27B model (operator-only): $n_big"
 [ "$n_big" -gt 0 ] && printf '     %s\n' "${BIG_GATES[@]}"
 
+# *** FLOOR ON THE DERIVED 27B SET, added because PO-2 MISSED against it. *** PO-2
+# breaks the derivation (no gate script names the model) and nothing happened: the
+# classifier reports the count, prints "0", and carries on -- because the
+# classification itself keys off each step's REMEDIATION TEXT, not off this set,
+# so the set was decoration. A derived set that can come out EMPTY without
+# failing is a decorative set, and a decorative set is worse than none: it reads
+# as "there are no operator-only gates", which is a claim about the world.
+#
+# This repo has a TP=2 27B gate (test_tp2_27b.sh) and a standing rule that keeps
+# an agent session from driving it, so an empty set means the derivation broke.
+if [ "$n_big" -lt 1 ]; then
+  echo "  FAIL  no gate script names the 27B model, so the operator-only set is" >&2
+  echo "        EMPTY -- a broken derivation, not an absence. test_tp2_27b.sh" >&2
+  echo "        exists and binds it." >&2
+  exit 1
+fi
+
 # --- the per-step logs a stack run leaves behind ---------------------------
+# *** NULLGLOB + BARE ls IS A TRAP, AND IT BIT THIS FILE. *** With nullglob on, a
+# glob matching nothing expands to NOTHING -- so `ls -1 "$BUILD"/run_all_*.log`
+# became `ls -1` with no argument, which lists the CURRENT DIRECTORY. An empty
+# sandbox therefore reported "14 per-step logs found", the empty case was never
+# reached, and the PO-1 anti-vacuity state passed against a checker reading a
+# completely unrelated listing. The array form below cannot do that: with
+# nullglob the array is simply EMPTY, which is the answer we want.
 shopt -s nullglob
-mapfile -t LOGS < <(ls -1 "$BUILD"/run_all_*.log 2>/dev/null)
+LOGS=("$BUILD"/run_all_*.log)
+shopt -u nullglob
 n_logs="${#LOGS[@]}"
 echo "-- per-step logs found: $n_logs"
 
