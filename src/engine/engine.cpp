@@ -1477,6 +1477,79 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
 // run_linear_tp but the M*K activation bits come from a caller-owned device
 // buffer. Skips host FP32->FP16 convert + H2D; the dep chains after the
 // producer kernel so a device-side chain pays one host wait total.
+// INTFER_MLP_GU -- gate+up in one launch, TP=2-VALID, bit-exact. See
+// engine.hpp for the contract and quant_gemm.cpp's quant_gemm_forward_usm_pair
+// for the kernel and the "why this is NOT routed through run_mlp_fused" note.
+bool Engine::run_linear_tp_pair(int ti_a, int ti_b,
+                               const std::vector<float>& x,
+                               std::vector<float>& out_a,
+                               std::vector<float>& out_b) {
+  // exactly `=1` enables, matching the INTFER_DPAS* opt-in convention
+  const char* gu_env = std::getenv("INTFER_MLP_GU");
+  static const bool on = (gu_env && gu_env[0] == '1' && gu_env[1] == '\0') &&
+                         (std::getenv("INTFER_NO_MLP_GU") == nullptr);
+  if (!on) return false;
+  if (x.empty()) return false;
+  if (ti_a < 0 || (size_t)ti_a >= model_.tensors.size()) return false;
+  if (ti_b < 0 || (size_t)ti_b >= model_.tensors.size()) return false;
+  const auto& ta = model_.tensors[(size_t)ti_a];
+  const auto& tb = model_.tensors[(size_t)ti_b];
+  // geometry must match or the single launch is not the same two GEMMs
+  if (ta.N != tb.N || ta.K != tb.K) return false;
+  if (ta.qcfg.group_size != tb.qcfg.group_size) return false;
+  if (ta.qcfg.scheme != tb.qcfg.scheme) return false;
+  const uint32_t M = 1, N = ta.N, K = ta.K;
+  if (N == 0 || K == 0) return false;
+  const auto sa_ti = (size_t)ti_a, sb_ti = (size_t)ti_b;
+  if (!shard_cache_[sa_ti].built && !ensure_shard_built((int)sa_ti)) return false;
+  if (!shard_cache_[sb_ti].built && !ensure_shard_built((int)sb_ti)) return false;
+  const auto& sa = shard_cache_[sa_ti];
+  const auto& sb = shard_cache_[sb_ti];
+  // DPAS48 shards use a different kernel entirely; FP16 shards are memcpy.
+  if (sa.dpas48 || sb.dpas48) return false;
+  if (to_ws(ta.qcfg.scheme) != gemm::WeightScheme::INT2 &&
+      to_ws(ta.qcfg.scheme) != gemm::WeightScheme::INT4) return false;
+  if (sa.code_usm.empty() || sb.code_usm.empty()) return false;
+  if (sa.scale_usm.empty() || sb.scale_usm.empty()) return false;
+  if (sa.code_usm[0] == nullptr || sb.code_usm[0] == nullptr) return false;
+  if (sa.scale_usm[0] == nullptr || sb.scale_usm[0] == nullptr) return false;
+  if (sa.has_global_divisor != sb.has_global_divisor) return false;
+  if (out_a.size() != (size_t)M * N || out_b.size() != (size_t)M * N) return false;
+
+  // Column slices must be identical in extent, or the two operands are not the
+  // same launch's worth of work.
+  const auto& ra = shards_[sa_ti].ranges;
+  const auto& rb = shards_[sb_ti].ranges;
+  if (ra.size() != rb.size()) return false;
+  for (size_t d = 0; d < ra.size(); ++d)
+    if (ra[d].first != rb[d].first || ra[d].second != rb[d].second) return false;
+
+  ensure_workspace(M, K, ra[0].second - ra[0].first);
+
+  const std::uint16_t* act = ws_[0].act;
+  dashq::float_to_half_batch(x.data(), (std::uint16_t*)act, K);
+
+  const float aa = sa.has_global_divisor ? sa.global_host : 1.0f;
+  const float ab = sb.has_global_divisor ? sb.global_host : 1.0f;
+  sycl::queue& q = devices_[0].queue;
+  sycl::event e = gemm::quant_gemm_forward_usm_pair(
+      q, (std::uint16_t*)act,
+      sa.code_usm[0], sa.scale_usm[0], aa, (std::uint16_t*)ws_[0].out,
+      sb.code_usm[0], sb.scale_usm[0], ab,
+      (std::uint16_t*)(ws_[0].out + (size_t)M * (ra[0].second - ra[0].first)),
+      N, K, ta.qcfg.group_size, to_ws(ta.qcfg.scheme), sycl::event{});
+  e.wait();
+  // Both operands share ws_[0].out (sized for one N slice), so the second
+  // output must be read out BEFORE the first is converted in place -- or rather,
+  // both are read here, from distinct regions, before any host reuse.
+  const std::size_t nl = (size_t)(ra[0].second - ra[0].first);
+  const std::uint16_t* oa = ws_[0].out;
+  const std::uint16_t* ob = oa + (size_t)M * nl;
+  dashq::half_to_float_batch(oa, out_a.data(), (size_t)M * nl);
+  dashq::half_to_float_batch(ob, out_b.data(), (size_t)M * nl);
+  return true;
+}
+
 bool Engine::run_linear_tp_devact(int tensor_index,
                                   const std::uint16_t* dev_act,
                                   std::vector<float>& out, uint32_t M,

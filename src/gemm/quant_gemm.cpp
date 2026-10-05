@@ -512,7 +512,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                 const float alpha_f = alpha;
                 const std::size_t pack_sz = 4;  // 8 codes / 4 bytes at INT2
 
-                for (int g = 0; g < num_groups; ++g) {
+                for (int g = 0; g < num_groups_w; ++g) {
                   const int kg0 = g * Gw;
                   int kg1 = kg0 + Gw;
                   if (kg1 > static_cast<int>(K)) kg1 = (int)K;
@@ -755,7 +755,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
               sycl::multi_ptr<const std::uint8_t,
                   sycl::access::address_space::global_space> w_mp(wrow);
 
-              for (int g = 0; g < num_groups; ++g) {
+              for (int g = 0; g < num_groups_w; ++g) {
                 const float scale = from_half_bits(sptr[g]) * alpha;
                 const int kg0 = g * Gw;
                 int kg1 = kg0 + Gw;
@@ -1002,6 +1002,168 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
             out_usm[mg * N + ng] = to_half_bits(acc[i * kSub + j]);
         }
     });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// INTFER_MLP_GU: two GEMMs that share an activation, in ONE nd_range.
+//
+// WHY. Every MLP does gate and up back to back, and at 27B they are two
+// separate host phases -- two submissions, two waits -- over the SAME activation
+// row. At M=1 the kernel is parallelism-bound (AGENTS.md: the launch has exactly
+// N work-items, invariant to the work-group shape), so merging them raises the
+// work-item count for one host phase instead of dividing it.
+//
+// *** BIT-EXACT, AND THAT IS THE WHOLE ARGUMENT. *** For a given output element
+// the activation row, the weight row, the scale row and the strictly-ascending-K
+// accumulation are character-identical to what the single-GEMM path does. Only
+// the launch boundary and the work-item indexing move. So there is NO tolerance
+// to agree and no numerics contract to write: this is the "exact" branch of the
+// fusion directive (AGENTS.md), chosen deliberately over anything that reorders
+// FP32.
+//
+// *** THE ARITHMETIC IS INLINE, AND IT STAYS THAT WAY. *** There is exactly one
+// copy of this body, right here. gemm::quant_gemm_fused_decode1 extracted the
+// analogous body into a shared device function; a normalized
+// statement-by-statement diff of the two bodies said the arithmetic was identical
+// -- it WAS identical -- and 27B decode still went 1284 ms -> 231 114 ms,
+// bisected to the EXTRACTION and not to the fusion it was extracted for. Do not
+// factor this out to "share" it with the single-GEMM kernel. Two homes plus
+// scripts/check_decode1_copies.sh is the cheaper trade.
+//
+// *** NOT ROUTED THROUGH run_linear_tp_devact OR run_mlp_fused. *** Both
+// early-return on `devices_.size() != 1`, so anything they host is dead code at
+// 27B --tp 2 -- the default-OFF flag no gate can reach, which
+// scripts/check_flag_gate_coverage.sh exists to enumerate. This is valid at any
+// device count because each device simply computes its own column slice of both.
+//
+// Eligibility, and every rejection is LOUD-free (returns false; the caller keeps
+// the sequential path, never partial work): M==1 only, both operands the same
+// packed scheme, INT2 with the table hoist, and matching geometry.
+sycl::event quant_gemm_forward_usm_pair(
+    sycl::queue& q,
+    std::uint16_t* act_usm,
+    const void* code_a, const std::uint16_t* scale_a, float alpha_a,
+    std::uint16_t* out_a,
+    const void* code_b, const std::uint16_t* scale_b, float alpha_b,
+    std::uint16_t* out_b,
+    uint32_t N, uint32_t K, uint32_t group_size,
+    gemm::WeightScheme scheme,
+    const sycl::event& copy_dep) {
+  const int bits = (scheme == WeightScheme::INT2) ? 2
+                 : (scheme == WeightScheme::INT4) ? 4 : 16;
+  const int Gw = (group_size == 0) ? static_cast<int>(K) : static_cast<int>(group_size);
+  const int num_groups_w = (static_cast<int>(K) + Gw - 1) / Gw;
+  const int pack = 8 / bits;
+  const auto* code_a8 = static_cast<const std::uint8_t*>(code_a);
+  const auto* code_b8 = static_cast<const std::uint8_t*>(code_b);
+
+  constexpr int nWG = kThr;
+  const int nBlocks = (static_cast<int>(N) + nWG - 1) / nWG;
+  const int per = nBlocks * nWG;          // padded rows per operand
+  const int total = per * 2;              // both operands in ONE nd_range
+
+  profile_note_launch();
+  static bool announced = false;
+  if (!announced) {
+    announced = true;
+    std::fprintf(stderr,
+                 "[mlp-gate-up] M=1 INT2 gate+up fused into ONE launch: "
+                 "KERNEL ACTIVE, 2 x %d work-items (N=%d K=%d bits=%d)\n",
+                 per, N, K, bits);
+  }
+
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(copy_dep);
+    h.parallel_for<class gemm_usm_decode1_vec_pair>(
+        sycl::nd_range<1>(sycl::range<1>(total), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) {
+          const int gid = static_cast<int>(it.get_global_id(0));
+          const int half = gid / per;        // 0 = gate, 1 = up
+          const int ng   = gid - half * per; // row within this operand
+          if (ng >= static_cast<int>(N)) return;
+
+          // ---- operand selection, then the INLINE body (do not extract) ----
+          const std::uint8_t*  code_u8 = half ? code_b8 : code_a8;
+          const std::uint16_t* sptr   = (half ? scale_b : scale_a)
+                                       + static_cast<std::size_t>(ng) * num_groups_w;
+          const float alpha = half ? alpha_b : alpha_a;
+          std::uint16_t* dst = half ? out_b : out_a;
+          const std::size_t row_base = static_cast<std::size_t>(ng) * K;
+
+          sycl::multi_ptr<const std::uint16_t,
+              sycl::access::address_space::global_space> act_mp(act_usm);
+
+          float acc = 0.0f;
+          for (int g = 0; g < num_groups_w; ++g) {
+            const float scale = from_half_bits(sptr[g]) * alpha;
+            const int kg0 = g * Gw;
+            int kg1 = kg0 + Gw;
+            if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+            if (bits == 2) {
+              const float wtab[4] = {scale * -1.0f,
+                                     scale * (-1.0f / 3.0f),
+                                     scale * (1.0f / 3.0f),
+                                     scale * 1.0f};
+              constexpr int codes_per_chunk = 8;
+              int kg = kg0;
+              std::size_t b0 = (row_base + static_cast<std::size_t>(kg)) / pack;
+              for (; kg + codes_per_chunk <= kg1; kg += codes_per_chunk) {
+                sycl::vec<std::uint16_t, codes_per_chunk> a16;
+                a16.load(0, act_mp + kg);
+                const std::uint8_t b0v = code_u8[b0];
+                const std::uint8_t b1v = code_u8[b0 + 1];
+                b0 += 2;
+                for (int j = 0; j < codes_per_chunk; ++j) {
+                  const float av = static_cast<float>(
+                      sycl::bit_cast<sycl::half>(a16[j]));
+                  const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                  // (j & 3), NOT j: INT2 packs FOUR codes per byte, so j=4..7
+                  // must re-read bit 0 of b1v. Shifting by j*2 is past a
+                  // uint8_t's width and the promotion zeroes those codes --
+                  // that shipped once already in the split-K kernel.
+                  const int code = (bv >> ((j & 3) * 2)) & 3;
+                  acc += av * wtab[code];
+                }
+              }
+              for (; kg < kg1; ++kg) {
+                const float av = from_half_bits(act_usm[kg]);
+                const std::size_t idx = row_base + static_cast<std::size_t>(kg);
+                const std::uint8_t byte = code_u8[idx / pack];
+                const int code = (byte >> ((idx % pack) * 2)) & 3;
+                acc += av * wtab[code];
+              }
+            } else {
+              const int code_mask = (1 << bits) - 1;
+              constexpr int codes_per_chunk = 8;
+              const int shr = (bits == 4) ? 1 : 2;
+              int kg = kg0;
+              std::size_t b0 = (row_base + static_cast<std::size_t>(kg)) / pack;
+              for (; kg + codes_per_chunk <= kg1; kg += codes_per_chunk) {
+                sycl::vec<std::uint16_t, codes_per_chunk> a16;
+                a16.load(0, act_mp + kg);
+                std::uint8_t b[4];
+                for (int t = 0; t < codes_per_chunk / pack; ++t) b[t] = code_u8[b0 + t];
+                b0 += codes_per_chunk / pack;
+                for (int j = 0; j < codes_per_chunk; ++j) {
+                  const float av = static_cast<float>(
+                      sycl::bit_cast<sycl::half>(a16[j]));
+                  const int code =
+                      (b[j >> shr] >> ((j & (pack - 1)) * bits)) & code_mask;
+                  acc += av * scale * canon_value(bits, code);
+                }
+              }
+              for (; kg < kg1; ++kg) {
+                const float av = from_half_bits(act_usm[kg]);
+                const std::size_t idx = row_base + static_cast<std::size_t>(kg);
+                const std::uint8_t byte = code_u8[idx / pack];
+                const int code = (byte >> ((idx % pack) * bits)) & code_mask;
+                acc += av * scale * canon_value(bits, code);
+              }
+            }
+          }
+          dst[ng] = to_half_bits(acc);
+        });
   });
 }
 

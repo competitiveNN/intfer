@@ -101,6 +101,7 @@ mr_path_fired() { decode1_path_fired "$1" 'decode1-mr'; }
 # to drift untested. Both flags go through decode1_path_fired; both arms go
 # through the same assertion function below.
 sk_path_fired()  { decode1_path_fired "$1" 'decode1-splitk'; }
+gu_path_fired()  { decode1_path_fired "$1" 'mlp-gate-up'; }
 
 # *** AND THE ARM'S BODY IS ONE FUNCTION TOO, NOT THREE CALL SITES. *** Sharing
 # the predicates closed the "weakened predicate" class (measured: M-B/M-C/M-P/M-Q
@@ -146,6 +147,7 @@ decode1_arm_assert() {   # $1 = base log, $2 = flag-run log, $3 = prefix,
 }
 mr_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-mr' 'DECODE1_MR'; }
 sk_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-splitk' 'DECODE1_SPLITK'; }
+gu_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'mlp-gate-up' 'INTFER_MLP_GU'; }
 
 # --- SELF-CHECK (stubbed; no GPU, no model, no build) -----------------------
 # *** WHY THE DECODE1_MR ARM NEEDS ONE. *** That arm compares two DERIVED values
@@ -188,6 +190,12 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # existing case is unchanged. A second builder for SPLITK would be the audit
   # #3 shape, and the case that matters -- "healthy pair" vs "healthy pair minus
   # one line" -- only isolates its defect if both come from the same builder.
+  # The text MUST contain ACTIVE: decode1_path_fired's predicate is
+  # \[tag\].*ACTIVE, shared with the MR and SPLITK arms. The first version of the
+  # kernel printed no ACTIVE word, so the arm refused a healthy run and the
+  # self-check blamed the predicate. The predicate is right -- it is what makes
+  # 'the flag reached the kernel' observable -- so the kernel conforms.
+  GU_ANNOUNCE='[mlp-gate-up] M=1 INT2 gate+up fused into ONE launch: KERNEL ACTIVE, 2 x 2048 work-items (N=2048 K=1024 bits=2)'
   ANNOUNCE_TEXT="$MR_ANNOUNCE"
   mklog() { # $1 = path, $2.. = ids in step order. Appends the banner and the
             # announcement named by $ANNOUNCE_TEXT, so every fixture is a
@@ -365,6 +373,36 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   mr_path_fired "$SB/sk_announced" \
     && { echo "SELF-CHECK FAIL (7): mr_path_fired matched the SPLITK announcement" >&2; bad=1; }
 
+  # (8) THE SAME QUESTION FOR INTFER_MLP_GU. Third flag through decode1_arm_assert,
+  #     so all three are held to ONE rule rather than to two rules and a copy.
+  # A COMPLETE, HEALTHY-SHAPED log carrying the GU announcement -- built by
+  # mklog, not by printing the line alone. The first version wrote the bare
+  # announcement into gu_announced, so the arm-accept case was refused for TWO
+  # reasons at once (no ids, no TP banner) and the self-check blamed the wrong
+  # thing. A case that cannot isolate its defect teaches nothing.
+  ANNOUNCE_TEXT="$GU_ANNOUNCE"
+  mklog "$SB/gu_announced"     11751 13 198 760 6511
+  mklog "$SB/gu_not_announced" 11751 13 198 760 6511
+  sed -i '/\[mlp-gate-up\]/d' "$SB/gu_not_announced"
+  ANNOUNCE_TEXT="$MR_ANNOUNCE"
+  gu_path_fired "$SB/gu_announced" \
+    || { echo "SELF-CHECK FAIL (8): gu_path_fired must ACCEPT the ACTIVE announcement" >&2; bad=1; }
+  gu_path_fired "$SB/gu_not_announced" \
+    && { echo "SELF-CHECK FAIL (8): gu_path_fired ACCEPTED a log with no announcement" >&2; bad=1; }
+  gu_path_fired "$SB/empty" \
+    && { echo "SELF-CHECK FAIL (8): gu_path_fired ACCEPTED an EMPTY log (vacuity)" >&2; bad=1; }
+  gu_arm_assert "$SB/tp_ok_ids" "$SB/gu_not_announced" "SELFTEST (8) arm-refusal: " \
+    && { echo "SELF-CHECK FAIL (8): gu_arm_assert ACCEPTED a log whose MLP-GU path never fired" >&2; bad=1; }
+  gu_arm_assert "$SB/tp_ok_ids" "$SB/gu_announced" "SELFTEST (8) arm-accept: " \
+    || { echo "SELF-CHECK FAIL (8): gu_arm_assert REFUSED a healthy MLP-GU pair" >&2; bad=1; }
+  # CROSS-FLAG both ways, now that a THIRD tag shares the predicate.
+  gu_path_fired "$SB/announced" \
+    && { echo "SELF-CHECK FAIL (8): gu_path_fired matched the MR announcement" >&2; bad=1; }
+  sk_path_fired "$SB/gu_announced" \
+    && { echo "SELF-CHECK FAIL (8): sk_path_fired matched the MLP-GU announcement" >&2; bad=1; }
+  gu_path_fired "$SB/sk_announced" \
+    && { echo "SELF-CHECK FAIL (8): gu_path_fired matched the SPLITK announcement" >&2; bad=1; }
+
   if [ "$bad" -eq 0 ]; then
     echo "TP2-27B SELF-CHECK: PASS (1) fixtures are full-length and differ only at step 4  (2) healthy pair accepted by all three predicates  (3) mr_arm_assert refused a late divergence  (4) mr_arm_assert refused an empty pair  (5) wrong-prefill and wrong-TP refusals fire"
     exit 0
@@ -408,6 +446,7 @@ CLI_OUT="$LOG.out"; CLI_ERR="$LOG.err"
 # down leaves every early-exit path expanding an unset variable.
 MR_OUT="$LOG.mr.out"; MR_ERR="$LOG.mr.err"
 SK_OUT="$LOG.sk.out"; SK_ERR="$LOG.sk.err"
+GU_OUT="$LOG.gu.out"; GU_ERR="$LOG.gu.err"
 trap 'rc=$?; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR"; fi' EXIT
 trap 'rc=$?; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR"; fi; exit 130' INT
 trap 'rc=$?; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR"; fi; exit 143' TERM
@@ -522,5 +561,29 @@ else
   sk_arm_assert "$CLI_ERR" "$SK_ERR" "GATE FAIL: " || PASS=0
   grep -a '\[decode1-splitk\]' "$SK_ERR" | head -1
 fi
+# --- INTFER_MLP_GU certification -------------------------------------------
+# gate+up fused into ONE launch at M=1. Reachable HERE and nowhere else: the
+# branch is guarded on `bits == 2`, and Qwen3.5-0.8B.intifer carries ZERO INT2
+# tensors (INT4 x76, FP16 x93, INT8 x18), so an arm in a 0.8B gate would be green
+# BECAUSE THE PATH NEVER RUNS -- audit #3's nested-flag vacuity. This gate's model
+# does carry INT2 (x110), so the branch is reachable and an arm here is meaningful.
+#
+# The claim is BIT-EXACT -- each output element's K accumulation is identical to
+# the sequential path, only the launch boundary moves -- so the arm is a pure
+# stream identity against the SAME FIXED ORACLE the base run uses. Not a
+# self-comparison: "both runs broke the same way" must not be able to pass.
+env INTFER_MLP_GU=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$GU_OUT" 2>"$GU_ERR"; GU_RC=$?
+if [ "$GU_RC" -ne 0 ]; then
+  echo "GATE FAIL: INTFER_MLP_GU=1 run exited rc=$GU_RC" >&2
+  tail -20 "$GU_ERR" >&2
+  PASS=0
+else
+  echo "INTFER_MLP_GU prefill: $(cli_prefill "$GU_ERR") (expect 11751)"
+  echo "INTFER_MLP_GU ids:      $(cli_ids "$GU_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  gu_arm_assert "$CLI_ERR" "$GU_ERR" "GATE FAIL: " || PASS=0
+  grep -a '\[mlp-gate-up\]' "$GU_ERR" | head -1
+fi
+
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
 if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi

@@ -84,6 +84,19 @@ class Engine {
   };
   void run_linear_wave(const LinearWaveItem* items, size_t n, uint32_t M);
 
+  // INTFER_MLP_GU: run a gate/up PAIR in ONE launch at M=1, valid at ANY device
+  // count. Both tensors must share N, K, group size and packed scheme; each
+  // device computes its own column slice of both, exactly as the sequential path
+  // would, so the FP32 accumulation order per output is unchanged -- BIT-EXACT,
+  // no tolerance. Returns false (caller keeps the sequential path; never partial
+  // work) on M!=1, DPAS48 shards, FP16 shards, geometry mismatch, or when the
+  // flag is off. Unlike run_mlp_fused and run_linear_tp_devact this does NOT
+  // require TP=1, so it is reachable at the 27B --tp 2 target.
+  bool run_linear_tp_pair(int ti_a, int ti_b,
+                          const std::vector<float>& x,
+                          std::vector<float>& out_a,
+                          std::vector<float>& out_b);
+
   // Fused MLP down-projection (TP=1 only): gate/up wave-submit chained
   // on-device through silu-mul + FP16 convert straight into the down
   // GEMM — one host wait + one D2H per MLP instead of wave-wait +
