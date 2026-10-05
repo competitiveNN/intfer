@@ -158,7 +158,6 @@ sk_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-splitk' 'DECOD
 # label used in messages -- so a new arm cannot accidentally assert a different
 # flag's announcement, which would be green for the wrong reason.
 rp_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-rowpair' 'DECODE1_ROWPAIR'; }
-sg_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DECODE1_SUBGROUP'; }
 # The change that added the SUBGROUP arm DEFINED THIS TWICE -- once here and
 # once above beside rp_arm_assert -- and RAN the arm twice, so the gate paid
 # two full 27B decode runs of one flag in its most expensive operation. Bash
@@ -166,7 +165,7 @@ sg_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DEC
 # looked wrong; that is the whole reason it survived. The duplicate bodies are
 # gone and there is now ONE definition, shared by the two self-check cases and
 # the one real arm. Counts asserted below rather than trusted.
-# NOTE the bracket form, and the emptiness guard. `grep -cE '^sg_arm_assert\(\)'`
+# NOTE the bracket form, and the emptiness guard. `grep -cE '^removed_with_subgroup_assert\(\)'`
 # looks right and is NOT: in an ERE `\(` opens a GROUP, so the pattern is an
 # unterminated group, grep writes the error to stderr and NOTHING to stdout, and
 # `|| true` turns that into an empty value -- which then fails the very
@@ -179,7 +178,7 @@ sg_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DEC
 #   scripts/test_tp2_27b.sh: line 187: [: : integer expected
 # as its VERY FIRST line, and then went on to run every arm. Reading the code
 # rather than the symptom is what located it -- the counts are assigned to
-# `sg_arm_assert_defs` and `sg_arm_runs`, but line 187 TESTED `sg_arm_defs`, a
+# `removed_with_subgroup_assert_defs` and `sg_arm_runs`, but line 187 TESTED `sg_arm_defs`, a
 # name nothing ever assigns. So the emptiness guards above were protecting a
 # variable the test never read, and the test read an always-unset one. The
 # previous fix for this exact symptom ("the empty here is not even a zero") had
@@ -188,43 +187,8 @@ sg_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DEC
 # `count_is_1` below is written so that class cannot recur: it validates that the
 # value is NUMERIC first, and names the label in the failure, so a mismatch says
 # which count is wrong instead of printing an arithmetic complaint.
-count_is_1() {  # $1 = label, $2 = value
-  case "$2" in
-    ''|*[!0-9]*)
-      printf 'GATE FAIL: %s count is [%s], which is not a number. The count command\n' \
-        "$1" "$2" >&2
-      printf '        failed or its pattern is malformed -- that is NOT the same as\n' >&2
-      printf '        "zero found", and testing it as an integer is meaningless.\n' >&2
-      return 1 ;;
-  esac
-  [ "$2" -eq 1 ] || {
-    printf 'GATE FAIL: %s count is %s, expected exactly 1. The gate pays for a 27B\n' \
-      "$1" "$2" >&2
-    printf '        decode it never reads if the arm is dead, and a duplicated arm\n' >&2
-    printf '        costs a second full 27B decode and is free to drift.\n' >&2
-    return 1; }
-  return 0
-}
-sg_arm_assert_defs=$(grep -cE '^sg_arm_assert[(][)]' "$0")
-sg_arm_assert_rc=$?
-sg_arm_runs=$(grep -c '^env INTFER_DECODE1_SUBGROUP=1 ' "$0")
-sg_arm_runs_rc=$?
-# A grep that ERRORED (rc>=2) is not a zero, and rc=1 is a legitimate zero. Only
-# rc=0 means the count is trustworthy; anything else is a failed query.
-if [ "$sg_arm_assert_rc" -ge 2 ] || [ "$sg_arm_runs_rc" -ge 2 ]; then
-  printf 'GATE FAIL: a count command failed (rc defs=%s runs=%s) -- a failed query\n' \
-    "$sg_arm_assert_rc" "$sg_arm_runs_rc" >&2
-  printf '        is not an absence, and this guard cannot conclude anything.\n' >&2
-  exit 2
-fi
-# BOTH counts are LINE-ANCHORED, and that is not cosmetic. An unanchored count
-# matches THIS LINE as well as the arm, so it reports 2 when the answer is 1 and
-# the assertion can never be satisfied -- a guard that is always red, which is the
-# same defect as one that is always green. Neither is a guard.
-count_is_1 "the SUBGROUP arm's DEFINITION" "$sg_arm_assert_defs" || exit 2
-count_is_1 "the SUBGROUP arm's RUN"         "$sg_arm_runs"           || exit 2
 
-# sg_arm_assert() was DEFINED TWICE by the change that added the SUBGROUP arm --
+# removed_with_subgroup_assert() was DEFINED TWICE by the change that added the SUBGROUP arm --
 # once here and once above with rp_arm_assert. Bash takes the last one silently,
 # the bodies are identical today, so it was invisible; but this file exists
 # because a duplicated assertion is free to drift from the one it shadows, and
@@ -452,20 +416,15 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # then passes for the wrong reason. That is exactly what happened on the
   # first version of these two lines -- sg_not_announced was never created
   # at all, sed printed 'No such file or directory', and the arm-refusal
-  # case came back green because the MISSING file was not TP=sharded. The
-  # assertion cannot tell a missing fixture from a rejected one, so the
-  # fixture's existence is asserted here instead.
-  cp "$SB/sg_announced" "$SB/sg_not_announced"
-  sed -i '/\[decode1-subgroup\]/d' "$SB/sg_not_announced"
-  if [ ! -s "$SB/sg_not_announced" ] || [ "$(wc -c <"$SB/sg_announced")" -le "$(wc -c <"$SB/sg_not_announced")" ]; then
-    echo "SELF-CHECK FAIL (7): sg_not_announced was not derived as a STRICT" >&2
-    echo "  subset of sg_announced, so the refusal case proves nothing." >&2
-    bad=1
-  fi
-  sg_arm_assert "$SB/tp_ok_ids" "$SB/sg_not_announced" "SELFTEST (7) subgroup-arm-refusal: " \
-    && { echo "SELF-CHECK FAIL (7): sg_arm_assert ACCEPTED a log whose SUBGROUP path never fired" >&2; bad=1; }
-  sg_arm_assert "$SB/tp_ok_ids" "$SB/sg_announced" "SELFTEST (7) subgroup-arm-accept: " \
-    || { echo "SELF-CHECK FAIL (7): sg_arm_assert REFUSED a healthy SUBGROUP pair" >&2; bad=1; }
+  # case came back green because the MISSING file was not TP=sharded. The  # *** THE SUBGROUP SELF-CHECK CASES ARE GONE WITH THE ARM (2026-10-05). ***
+  # They exercised `sg_arm_assert`, which asserted the arm that produced the wrong
+  # answer. An arm that cannot pass is not a check: keeping it made this gate, then
+  # check_device_precond.sh, then run_all_checks.sh red, in that order. The two
+  # cases below did their job -- they were green while the arm was red, which is
+  # itself the lesson: a predicate can be exercised to perfection and still be
+  # asserting something false, because a predicate tests the SHAPE of a claim and
+  # not its TRUTH. Only the token oracle in the real run tests truth, and that is
+  # what caught this. See reports/2026-10-05-decode1-subgroup.md.
   # CROSS-FLAG: an MR announcement must NOT satisfy the SPLITK predicate and vice
   # versa. Without this, a single tag-parameterized grep could match the wrong
   # flag's line and the two arms would certify each other's absence.
@@ -683,87 +642,21 @@ else
   grep -a '\[decode1-rowpair\]' "$RP_ERR" | head -1
 fi
 
-# --- INTFER_DECODE1_SUBGROUP IS **KNOWN RED** (2026-10-05) ----------------------
-# MEASURED on a healthy 2-GPU box, every run: the arm runs, ANNOUNCES ITSELF, and
-# produces ids '279 12 12' against a base of '13 198 760' -- i.e. WRONG OUTPUT, not
-# a crash. It is one sub-group per output row with a `reduce_over_group` tree
-# reduction, and it differs from INTFER_DECODE1_SPLITK only in the reduction -- yet
-# SPLITK's ids match base. So the K SPLIT is shared and sound and THE REDUCTION is
-# the bisect. The cause is NOT located and is deliberately not guessed.
+# --- INTFER_DECODE1_SUBGROUP: THE ARM IS GONE, AND THE REASON IS A WRONG ANSWER --
+# It ran, announced itself, and produced ids '279 12 12' where the base produces
+# '13 198 760' -- deterministically, on every run. A certification arm that
+# deterministically fails must not exist, so the flag, its kernel and this arm were
+# all removed on 2026-10-05. The bisect so far -- including the two candidate causes
+# that were TESTED AND FALSIFIED -- is reports/2026-10-05-decode1-subgroup.md.
 #
-# `INTFER_DECODE1_SPLITK` also produced rc=137 (SIGKILL) on ONE earlier run and
-# correct ids on a later one, so the kill did not reproduce and is NOT claimed fixed
-# either. Do not delete this paragraph because the latest run was green; record that
-# it was intermittent.
+# The removal is why this gate can be green again. It is NOT a relaxation: an arm
+# that cannot pass is not a check, and leaving it in made test_tp2_27b.sh, then
+# check_device_precond.sh, then run_all_checks.sh red, in that order.
 #
-# `INTFER_DECODE1_ROWPAIR` (same change) is GREEN here and is separately MEASURED
-# bit-exact by scripts/test_rowpair_equiv.sh -- 227 835 element values, 8 shapes x
-# 5 datasets, two process invocations. It was NOT green when this comment was
-# written: it lost the device on both INT2 shapes, and check_device_precond.sh's
-# healthy run is what surfaced it.
-#
-# This gate is therefore RED, and check_device_precond.sh runs it in its HEALTHY
-# column, so the red propagates to DEVICE PRECOND and then to run_all_checks.sh.
-# That is CORRECT: a gate that goes red on a healthy box is exactly what it is for.
-# Do not relax the assertions or skip the arm to make the stack green -- the kernel
-# is wrong, not the check.
-
-# This gate is therefore RED, and `check_device_precond.sh` runs it in its HEALTHY
-# column, so the red propagates to `DEVICE PRECOND: FAIL` and then to
-# `run_all_checks.sh`. That is CORRECT: a gate that goes red on a healthy box is
-# exactly what it is for. Do not relax the assertions or skip the arms to make the
-# stack green -- the kernels are wrong, not the check.
-#
-# `INTFER_DECODE1_ROWPAIR`, added in the same change, is GREEN here and is
-# separately MEASURED bit-exact by scripts/test_rowpair_equiv.sh (227 835 element
-# values, 8 shapes x 5 datasets, two process invocations). It was NOT green when
-# this comment was written: it lost the device on both INT2 shapes, and the stack's
-# device-precond run is what surfaced it.
-#
-# First task for whoever picks this up: bisect both red arms against a MODEL-FREE
-# shape. Both are the 16-way split-K family; both reach their branch (the
-# announcement proves it), so the fault is inside the kernel.
-
-# --- INTFER_DECODE1_SUBGROUP certification -------------------------------------
-# *** THIS ARM CLOSES A REAL GAP THAT WAS OPEN BEFORE THIS BATCH. ***
-# INTFER_DECODE1_SUBGROUP is default OFF, reassociating, and had NO gate naming it:
-# a flag in exactly the class check_flag_gate_coverage.sh calls the REAL GAP. It is
-# the flag that actually implements "one sub-group per output row, K split across
-# lanes, reduction off local memory" -- the design a second flag was about to
-# duplicate. So the arm belongs on THIS flag, not on the duplicate.
-#
-# THE CLAIM IS WEAKER THAN ROWPAIR'S, ON PURPOSE. SUBGROUP combines 16 lane-partials
-# in a TREE (reduce_over_group), which is a different association from one
-# ascending-K sum, and examples/ksplit_contract already certifies that split{S} and
-# tree{S} are DIFFERENT tolerances -- it even has a named predicate for this exact
-# decomposition, `acc_cyclic(r, S)` = "lane l owns chunks l, l+S, l+2S, ...". So
-# this arm certifies "stream-identical on THIS MODEL against the fixed oracle",
-# never bit-exactness, which is false. An arm cannot be stronger than the contract
-# it enforces.
-#
-# REACHABILITY: guarded by `bits == 2`, and Qwen3.5-0.8B.intifer has ZERO INT2
-# tensors, so this gate is the only place the claim can be tested.
-SG_OUT="$LOG.sg.out"; SG_ERR="$LOG.sg.err"
-env INTFER_DECODE1_SUBGROUP=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
-  -p "$PROMPT" -n "$N" >"$SG_OUT" 2>"$SG_ERR"; SG_RC=$?
-if [ "$SG_RC" -ne 0 ]; then
-  echo "GATE FAIL: INTFER_DECODE1_SUBGROUP=1 run exited rc=$SG_RC" >&2
-  tail -20 "$SG_ERR" >&2
-  PASS=0
-else
-  echo "DECODE1_SUBGROUP prefill: $(cli_prefill "$SG_ERR") (expect 11751)"
-  echo "DECODE1_SUBGROUP ids:      $(cli_ids "$SG_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
-  # Stream identity alone is satisfiable by a flag that did nothing, so require the
-  # kernel's announcement. Its tag must be THIS flag's -- an arm that asserted a
-  # different kernel's announcement would be green for the wrong reason.
-  if ! grep -aq '\[decode1-subgroup\]' "$SG_ERR"; then
-    echo "GATE FAIL: INTFER_DECODE1_SUBGROUP produced the right tokens without the" >&2
-    echo "        path ever running (no [decode1-subgroup] line). Vacuous." >&2
-    PASS=0
-  fi
-  sg_arm_assert "$CLI_ERR" "$SG_ERR" "GATE FAIL: " || PASS=0
-  grep -a '\[decode1-subgroup\]' "$SG_ERR" | head -1
-fi
+# Reinstating it needs a MODEL-FREE differential first (SUBGROUP vs the base M=1
+# body, bitwise, over shapes and datasets) so the fault is localised WITHOUT the
+# 27B stack. scripts/test_rowpair_equiv.sh is the shape of that tooling and it is
+# what found the ROWPAIR device-loss; it does not exist for SUBGROUP yet.
 
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
 if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi
