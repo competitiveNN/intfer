@@ -1,5 +1,36 @@
 // src/quant_spec.cpp
 // Definitions for the Stage-1 Tensor-IR contract (docs/quant_spec.md).
+//
+// THIS FILE AND src/quant/quant_spec.cpp BOTH DEFINE default_candidates(), AND
+// THEY DISAGREE. Read this before editing either.
+//
+//   this file      compiled by scripts/build_quant_real.sh and by
+//                  src/CMakeLists.txt's intfer_quant_core -> THIS IS THE ONE THAT
+//                  PRODUCED Qwen3.8-27B-int2.intifer.
+//                  No case for TensorRole::LINEAR_ATTN_* -> those 7 roles fall
+//                  through to the `default:` branch and get FP16 as their ONLY
+//                  candidate. RCO therefore never had a choice to make for them.
+//   quant/ this    compiled by six examples/* targets (dashq_demo, quant_pipeline,
+//     copy         rco_demo, quant_merge, intfer_fidelity, intfer_gguf). DOES
+//                  extend the ladder to LINEAR_ATTN_*, so those demos offer
+//                  INT2/INT4/INT8 where the real quantizer offers only FP16.
+//
+// They cannot be linked together (duplicate symbols), so each target picks one
+// and the divergence is silent: every example prints a scheme distribution that
+// the real run cannot produce.
+//
+// MEASURED, not inferred. scripts/quant_precision_map.sh reads the shipped
+// artifact's own metadata header:
+//   LINEAR_ATTN_QKV 48 tensors  4.688 GiB  25.8% of bytes   all FP16
+//   LINEAR_ATTN_Z   48 tensors  2.812 GiB  15.5% of bytes   all FP16
+//   LINEAR_ATTN_OUT 48 tensors  2.812 GiB  15.5% of bytes   all FP16
+// i.e. 56.8% of the model's bytes are FP16 because of the `default:` arm below,
+// not because the budget search chose to spend them. 21.0% of parameters, 57.9%
+// of bytes, 256 of 498 tensors.
+//
+// Fixing this is not a one-line change: the 27B artifact would have to be
+// re-quantized, and every engine kernel reachable from a LINEAR_ATTN_* role
+// would change from the FP16 path to a dequant-on-the-fly path.
 #include "intfer/quant_spec.h"
 
 #include <cmath>
