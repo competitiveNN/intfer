@@ -197,10 +197,24 @@ fi
 # shape (`scale * ...`) and the group-scale read are unchanged, so those are what
 # the subset check below compares -- NOT the accumulation, which differs by
 # construction and is verified by the token oracle instead.
+# *** AND THE ACCUMULATION IS PINNED TOO -- the first version omitted it and the
+# mutation matrix caught the omission. *** It originally matched only the codebook
+# construction and the group-scale read, on the reasoning that row-pair accumulates
+# into accA/accB so its accumulation "differs by construction". True of the
+# ACCUMULATOR NAME and false of the INDEX: `(va >> ((j & 3) * 2)) & 3` is the
+# codebook-index expression, and planting the real INTFER_DECODE1_SPLITK bug there
+# -- `(va >> (j * 2)) & 3` -- left the checker PASS. So the extractor now takes the
+# whole accumulate term, and the name difference is carried by the two letters
+# rather than by dropping the shape.
+#
+# That is the second time in this file's history that a narrow extractor looked
+# conservative and was not (the first was line-vs-atom comparison, which invented
+# drift on a clean tree). A pattern that is too narrow is a silent gap, and only a
+# mutation matrix finds one.
 atoms_rp() {  # $1 = row-pair body
   printf '%s\n' "$1" \
     | sed -e 's://.*::' -e 's/[[:space:]]//g' \
-    | grep -oE 'scale\*[^,;{}]*|from_half_bits\(s[a-zA-Z0-9_]*\[g\]\)' \
+    | grep -oE 'scale\*[^,;{}]*|from_half_bits\(s[a-zA-Z0-9_]*\[g\]\)|acc[AB]\+=av\*w[AB]4\[[^;{}]*\]' \
     | sort -u
 }
 # The atom shapes are derived from what the arithmetic DOES -- extract a code
@@ -231,6 +245,71 @@ for extra in gemm_usm_decode1_vec_mr gemm_usm_decode1 gemm_usm_decode1_subgroup;
   a="$(atoms "$b" | grep -c . || true)"
   echo "-- $extra: $a atom(s) under the shared extractor (reported, not in the subset)"
 done
+# *** A REAL COMPARISON, ADDED BECAUSE THE MUTATION MATRIX PROVED THE LABEL WAS A
+# LIE. *** The enumeration above printed "COVERED-BY-ATOM-PIN" for the row-pair
+# body, but nothing compared its atoms to anything -- `n_rp_a` was a FLOOR, and
+# mutate_decode1_copies.sh DC-2 planted the real INTFER_DECODE1_SPLITK bug
+# (`(va >> (j * 2)) & 3` for `(va >> ((j & 3) * 2)) & 3`) in the row-pair body and
+# the checker still said PASS. A floor is not a pin, and a label that says
+# "ATOM-PIN" over a floor is the hand-written-claim failure in a checker.
+#
+# WHY THE WHOLE-ATOM SUBSET CANNOT WORK HERE, so this is not just "try harder": the
+# base body accumulates `acc += av * wtab[code]` with the index in a VARIABLE, while
+# row-pair inlines it as `accA += av * wA4[(va >> ((j & 3) * 2)) & 3]`. Normalising
+# the accumulator and table names is not enough -- the shapes genuinely differ, and
+# forcing them to match would either invent drift on a clean tree (which the checker's
+# own header records as a bug it once had) or need an exception list.
+#
+# SO THE PIN IS ON THE ONE THING THAT MUST NOT VARY: the codebook-index
+# expression. That is the exact expression INTFER_DECODE1_SPLITK shipped wrong, and
+# it is what a "one activation load, two code pointers" kernel is most likely to
+# get wrong.
+#
+# *** AND THE EXTRACTOR MUST MATCH THE WRONG FORM TOO, WHICH IT DID NOT AT FIRST.
+# *** The first version matched only `X >> ((j & 3) * 2)) & N`, i.e. the CORRECT
+# shape -- so mutating row-pair's accA line to `(va >> (j * 2)) & 3` did not break
+# the pin, because the mutated expression simply stopped matching and the remaining
+# UNMUTATED accB line supplied the good atom. DC-2 stayed green. That is this repo's
+# "matches one spelling and silently stops finding the defect" failure, one level
+# below the one it had already fixed once: a pattern that only recognises the right
+# answer cannot detect a wrong one.
+#
+# So the extractor is deliberately LOOSE -- any shift-into-mask over a packed byte
+# -- and the relation is EQUALITY, not subset. Both bodies must contain exactly the
+# same set, which is a strictly stronger claim than "row-pair's are among the base's"
+# and is what makes a mutated expression visible as an EXTRA element.
+shift_index_atoms() {  # $1 = body; normalises the packed-byte variable to V
+  printf '%s\n' "$1" \
+    | sed -e 's://.*::' -e 's/[[:space:]]//g' \
+    | grep -oE '[a-zA-Z0-9_]+>>[^;{}]{0,24}&[0-9]+' \
+    | sed -E 's/^[a-zA-Z0-9_]+>>/V>>/' \
+    | sort -u
+}
+idx_base="$(shift_index_atoms "$body_base")"
+idx_rp="$(shift_index_atoms "$body_rp")"
+n_idx_rp="$(printf '%s\n' "$idx_rp" | grep -c . || true)"
+n_idx_base="$(printf '%s\n' "$idx_base" | grep -c . || true)"
+echo "-- shift-into-mask atoms: base=$n_idx_base, rowpair=$n_idx_rp"
+printf '%s\n' "$idx_rp" | sed 's/^/     rowpair: /'
+if [ "$n_idx_base" -lt 1 ] || [ "$n_idx_rp" -lt 1 ]; then
+  echo "  FAIL  the shift-into-mask extractor found nothing (base=$n_idx_base" >&2
+  echo "        rowpair=$n_idx_rp) -- it drifted from the source, so the equality" >&2
+  echo "        below would be agreement with nothing." >&2
+  exit 1
+fi
+# EQUALITY, not subset: an expression in row-pair that the base does not have is the
+# bug, and a subset test would wave it through as long as one good atom remained.
+extra_idx="$(printf '%s\n' "$idx_rp" | grep -vxF "$idx_base" || true)"
+if [ -n "$extra_idx" ]; then
+  echo "  FAIL  the row-pair body uses a shift-into-mask the general body does not:" >&2
+  echo "        $extra_idx" >&2
+  echo "        *** This is the INTFER_DECODE1_SPLITK bug class: INT2 packs four" >&2
+  echo "        codes per byte, so the shift must be ((j & 3) * 2), and a uint8_t" >&2
+  echo "        shifted by >= 8 promotes to 0. ***" >&2
+  exit 1
+fi
+echo "  ok    the row-pair shift-into-mask set EQUALS the general body's"
+
 n_rp_a="$(printf '%s\n' "$(atoms_rp "$body_rp")" | grep -c . || true)"
 echo "-- arithmetic atoms: base=$n_base_a, splitk=$n_sk_a, rowpair=$n_rp_a"
 echo "   split-K atoms the general body must also hold:"
