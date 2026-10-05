@@ -122,7 +122,29 @@ ds4; run_state DS-4 'NOT in STEPS|FAIL'
 # them is structurally blind to this -- the defect IS the token being on the
 # wrong side of a quote. It becomes a COMMAND: the stack dies with
 # "mutate_pending_operator.sh: command not found".
-ds5() { patchN "$T" 'check_pending_operator.sh"' 'check_pending_operator.sh" mutate_pending_operator.sh'; }
+# DS-5's anchor is DERIVED, for the same reason N-V's is: it used to name the
+# checkers list's tail literally, and adding check_nullglob_sites moved that tail,
+# so the state MISSED while the checker was, correctly, still agreeing. A state
+# anchored to a moving list is the recurring failure in this session, and the fix
+# is always the same -- derive the anchor, do not re-point it.
+ds5() { python3 - "$T" <<'PYD'
+import re, sys
+p = sys.argv[1]
+lines = open(p).read().split("\n")
+idx = None
+for k, line in enumerate(lines):
+    m = re.match(r'\s*STEPS="([^"]*)"\s*$', line)
+    if m and m.group(1).split() and all(t.endswith(".sh") for t in m.group(1).split()):
+        idx = k
+        break
+if idx is None:
+    sys.exit("no checkers STEPS list found")
+body = re.match(r'(\s*STEPS=")([^"]*)("\s*)$', lines[idx])
+toks = body.group(2).split()
+lines[idx] = body.group(1) + " ".join(toks) + '" zz_stray_step_token.sh' + body.group(3)
+open(p, "w").write("\n".join(lines))
+PYD
+}
 ds5; run_state DS-5 'stray step token|FAIL'
 
 for r in "${RESULTS[@]}"; do printf '  %s\n' "$r"; done
