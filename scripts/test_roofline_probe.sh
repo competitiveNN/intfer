@@ -94,7 +94,17 @@ need 'twin/quarter/shared'  "the always-red twin on the shared arm"
 need 'twin/quarter/device'  "the always-red twin on the device arm"
 need 'gemv/MLP_DOWN'        "the worst-performing scheme arm"
 need 'gemv/LA_QKV'          "the best-performing scheme arm"
-need 'max_compute_units='   "the device's own compute-unit count"
+# *** WHITESPACE-TOLERANT, and it has to be. *** MEASURED: the probe prints
+# `max_compute_units = 160` -- with spaces around the '=' -- and the pin was
+# 'max_compute_units=', so it matched nothing and the gate went red on a probe
+# that had PASSED and printed the number. `grep -c 'max_compute_units'` found it;
+# `grep -qE 'max_compute_units='` did not, and only because the '=' was not
+# adjacent. The contract is "the probe REPORTS the device's own compute-unit
+# count", not "it reports it with zero spaces" -- a contract that pins cosmetic
+# formatting breaks on a harmless reformat and sends someone to edit working
+# code to satisfy it.
+need 'max_compute_units[[:space:]]*=[[:space:]]*[0-9]' \
+     "the device's own compute-unit count"
 # The dequant sweep is what killed the first hypothesis, so its arms are asserted
 # too: a probe that silently stopped running them would report PASS while the
 # report kept citing their numbers.

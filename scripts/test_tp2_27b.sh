@@ -166,12 +166,24 @@ sg_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DEC
 # looked wrong; that is the whole reason it survived. The duplicate bodies are
 # gone and there is now ONE definition, shared by the two self-check cases and
 # the one real arm. Counts asserted below rather than trusted.
-sg_arm_assert_defs=$(grep -cE '^sg_arm_assert\(\)' "$0" || true)
+# NOTE the bracket form, and the emptiness guard. `grep -cE '^sg_arm_assert\(\)'`
+# looks right and is NOT: in an ERE `\(` opens a GROUP, so the pattern is an
+# unterminated group, grep writes the error to stderr and NOTHING to stdout, and
+# `|| true` turns that into an empty value -- which then fails the very
+# `[ "$x" -ne 1 ]` below with "[: : integer expected". MEASURED: the gate went
+# red on a healthy box with exactly that line in its output. Two separate
+# lessons: write literal parens as `[(][)]` under -E, and never let a count
+# command reach an integer test without proving it produced a number -- the
+# audit-#2 rule ("0 findings" and "found nothing" are different claims), where
+# the empty here is not even a zero.
+sg_arm_assert_defs=$(grep -cE '^sg_arm_assert[(][)]' "$0" || true)
+[ -n "$sg_arm_assert_defs" ] || sg_arm_assert_defs=-1
 # BOTH counts above are LINE-ANCHORED, and that is not cosmetic. An unanchored
 # count matches THIS LINE as well as the arm, so it reports 2 when the answer
 # is 1 and the assertion can never be satisfied -- a guard that is always red,
 # which is the same defect as one that is always green. Neither is a guard.
 sg_arm_runs=$(grep -c '^env INTFER_DECODE1_SUBGROUP=1 ' "$0" || true)
+[ -n "$sg_arm_runs" ] || sg_arm_runs=-1
 if [ "$sg_arm_defs" -ne 1 ] || [ "$sg_arm_runs" -ne 1 ]; then
   echo "GATE FAIL: the SUBGROUP arm is defined $sg_arm_defs time(s) and run $sg_arm_runs time(s);" >&2
   echo "        exactly one of each is required, or the gate pays for a 27B" >&2
