@@ -569,6 +569,56 @@ Full account in `reports/2026-10-05-batch-gemv-roofline.md`.
   the same probe puts decode at 15.6-19.9 % of the *shared* ceiling. The allocator
   is not the deficit; the kernel is.
 
+## ==> LIVE RED GATES as of 2026-10-05. READ BEFORE TRUSTING ANY "ALL PASS". <==
+
+`scripts/test_tp2_27b.sh` is **RED** on a healthy 2-GPU box. Do not read a
+hand-written "all gates pass" as current; `scripts/gate_inventory.sh` reconciles
+the *count* of gates, not their colour, and a red gate is a gate.
+
+| arm | state | evidence |
+|---|---|---|
+| `INTFER_DECODE1_ROWPAIR` | **PASS** | 27B TP=2 arm green, and `scripts/test_rowpair_equiv.sh` measures **227 835 element values bitwise identical** to the base M=1 kernel over 8 shapes x 5 datasets |
+| `INTFER_DECODE1_SPLITK` | **RED, pre-existing, UNFIXED** | `rc=137` (SIGKILL) after `[decode1-splitk]` announces itself |
+| `INTFER_DECODE1_SUBGROUP` | **RED, pre-existing, UNFIXED** | `rc=137` (SIGKILL) after `[decode1-subgroup]` announces itself |
+
+Both reds are the 16-way split-K family. Both **announce themselves before dying**,
+so the branch is reached and the fault is inside the kernel, not a flag that failed
+to take effect. Host RAM was not the cause (44 GB free at the time). **The cause is
+NOT located** and is deliberately not guessed: `check_device_precond.sh` runs
+`test_tp2_27b.sh` in its healthy column, so this red propagates to
+`DEVICE PRECOND: FAIL`, which is why `run_all_checks.sh` is red.
+
+Next session, the first thing to do about them: bisect `INTFER_DECODE1_SPLITK` and
+`INTFER_DECODE1_SUBGROUP` against a model-free shape before anything else. Do not
+"fix" the gate by relaxing it -- the gate is right and the kernels are wrong.
+
+### What the stack found that a hand-picked check list never would have
+
+Running `scripts/run_all_checks.sh` (not a subset) found three things that nine
+hand-picked checks all reported as fine:
+
+1. **`test_tp2_27b.sh:187: [ : : integer expected`**, printed as the gate's FIRST
+   line. The cause was a **variable name mismatch**: the counts were assigned to
+   `sg_arm_assert_defs` and `sg_arm_runs`, but line 187 tested **`sg_arm_defs`** --
+   a name nothing ever assigns. So the emptiness guards above protected a variable
+   the test never read, and the test read an always-unset one. An earlier fix for
+   this same symptom ("the empty here is not even a zero") had hardened the wrong
+   operand and so could not have caught it. The block now validates that each count
+   is **numeric** before comparing it, distinguishes a grep **rc>=2** (failed query)
+   from **rc=1** (a legitimate zero), and names the label in the failure.
+2. **A duplicate dispatch arm and a duplicate STEPS entry** for
+   `mutate_decode1_copies.sh` (`run_all_checks.sh` step 0c printed
+   "scheduled MORE THAN ONCE"). Bash takes the last `case` arm silently, so the
+   matrix had been running once per arm with the wrong one winning.
+3. **`INTFER_DECODE1_ROWPAIR` lost the device** (`UR_RESULT_ERROR_DEVICE_LOST`) on
+   both INT2 shapes while passing FP16 and INT4 -- the branch is guarded on
+   `bits == 2`, so a smoke test on a shape the flag never reaches called it fine.
+   Cause: two ROW-OFFSET `multi_ptr`s indexed with the base kernel's ABSOLUTE byte
+   offsets, i.e. a double offset reading past the shard. The "bit-exact by
+   construction" reading had checked the chunk loop and assumed the tail matched.
+   Both bounds now use the unoffset `code_u8` with the base kernel's own
+   expressions, so the only difference from the reference is the two accumulators.
+
 ## Performance targets (2x Arc Pro B580)
 
 * Token generation (decode): **40 tok/s** (per-stream, 27B model)

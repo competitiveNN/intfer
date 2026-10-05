@@ -170,26 +170,60 @@ sg_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-subgroup' 'DEC
 # looks right and is NOT: in an ERE `\(` opens a GROUP, so the pattern is an
 # unterminated group, grep writes the error to stderr and NOTHING to stdout, and
 # `|| true` turns that into an empty value -- which then fails the very
-# `[ "$x" -ne 1 ]` below with "[: : integer expected". MEASURED: the gate went
-# red on a healthy box with exactly that line in its output. Two separate
-# lessons: write literal parens as `[(][)]` under -E, and never let a count
-# command reach an integer test without proving it produced a number -- the
-# audit-#2 rule ("0 findings" and "found nothing" are different claims), where
-# the empty here is not even a zero.
-sg_arm_assert_defs=$(grep -cE '^sg_arm_assert[(][)]' "$0" || true)
-[ -n "$sg_arm_assert_defs" ] || sg_arm_assert_defs=-1
-# BOTH counts above are LINE-ANCHORED, and that is not cosmetic. An unanchored
-# count matches THIS LINE as well as the arm, so it reports 2 when the answer
-# is 1 and the assertion can never be satisfied -- a guard that is always red,
-# which is the same defect as one that is always green. Neither is a guard.
-sg_arm_runs=$(grep -c '^env INTFER_DECODE1_SUBGROUP=1 ' "$0" || true)
-[ -n "$sg_arm_runs" ] || sg_arm_runs=-1
-if [ "$sg_arm_defs" -ne 1 ] || [ "$sg_arm_runs" -ne 1 ]; then
-  echo "GATE FAIL: the SUBGROUP arm is defined $sg_arm_defs time(s) and run $sg_arm_runs time(s);" >&2
-  echo "        exactly one of each is required, or the gate pays for a 27B" >&2
-  echo "        decode it never reads and the copies are free to drift." >&2
+# `[ "$x" -ne 1 ]` below with "[: : integer expected". Two separate lessons: write
+# literal parens as `[(][)]` under -E, and never let a count command reach an
+# integer test without proving it produced a NUMBER.
+#
+# *** AND THE THIRD LESSON, WHICH IS WHY THIS BLOCK IS BEING REWRITTEN AGAIN. ***
+# MEASURED on a healthy box, 2026-10-05: the gate printed
+#   scripts/test_tp2_27b.sh: line 187: [: : integer expected
+# as its VERY FIRST line, and then went on to run every arm. Reading the code
+# rather than the symptom is what located it -- the counts are assigned to
+# `sg_arm_assert_defs` and `sg_arm_runs`, but line 187 TESTED `sg_arm_defs`, a
+# name nothing ever assigns. So the emptiness guards above were protecting a
+# variable the test never read, and the test read an always-unset one. The
+# previous fix for this exact symptom ("the empty here is not even a zero") had
+# hardened the wrong operand and so could not have caught it.
+#
+# `count_is_1` below is written so that class cannot recur: it validates that the
+# value is NUMERIC first, and names the label in the failure, so a mismatch says
+# which count is wrong instead of printing an arithmetic complaint.
+count_is_1() {  # $1 = label, $2 = value
+  case "$2" in
+    ''|*[!0-9]*)
+      printf 'GATE FAIL: %s count is [%s], which is not a number. The count command\n' \
+        "$1" "$2" >&2
+      printf '        failed or its pattern is malformed -- that is NOT the same as\n' >&2
+      printf '        "zero found", and testing it as an integer is meaningless.\n' >&2
+      return 1 ;;
+  esac
+  [ "$2" -eq 1 ] || {
+    printf 'GATE FAIL: %s count is %s, expected exactly 1. The gate pays for a 27B\n' \
+      "$1" "$2" >&2
+    printf '        decode it never reads if the arm is dead, and a duplicated arm\n' >&2
+    printf '        costs a second full 27B decode and is free to drift.\n' >&2
+    return 1; }
+  return 0
+}
+sg_arm_assert_defs=$(grep -cE '^sg_arm_assert[(][)]' "$0")
+sg_arm_assert_rc=$?
+sg_arm_runs=$(grep -c '^env INTFER_DECODE1_SUBGROUP=1 ' "$0")
+sg_arm_runs_rc=$?
+# A grep that ERRORED (rc>=2) is not a zero, and rc=1 is a legitimate zero. Only
+# rc=0 means the count is trustworthy; anything else is a failed query.
+if [ "$sg_arm_assert_rc" -ge 2 ] || [ "$sg_arm_runs_rc" -ge 2 ]; then
+  printf 'GATE FAIL: a count command failed (rc defs=%s runs=%s) -- a failed query\n' \
+    "$sg_arm_assert_rc" "$sg_arm_runs_rc" >&2
+  printf '        is not an absence, and this guard cannot conclude anything.\n' >&2
   exit 2
 fi
+# BOTH counts are LINE-ANCHORED, and that is not cosmetic. An unanchored count
+# matches THIS LINE as well as the arm, so it reports 2 when the answer is 1 and
+# the assertion can never be satisfied -- a guard that is always red, which is the
+# same defect as one that is always green. Neither is a guard.
+count_is_1 "the SUBGROUP arm's DEFINITION" "$sg_arm_assert_defs" || exit 2
+count_is_1 "the SUBGROUP arm's RUN"         "$sg_arm_runs"           || exit 2
+
 # sg_arm_assert() was DEFINED TWICE by the change that added the SUBGROUP arm --
 # once here and once above with rp_arm_assert. Bash takes the last one silently,
 # the bodies are identical today, so it was invisible; but this file exists
@@ -648,6 +682,27 @@ else
   rp_arm_assert "$CLI_ERR" "$RP_ERR" "GATE FAIL: " || PASS=0
   grep -a '\[decode1-rowpair\]' "$RP_ERR" | head -1
 fi
+
+# --- INTFER_DECODE1_SPLITK / SUBGROUP ARE **KNOWN RED** (2026-10-05) -------------
+# MEASURED on a healthy 2-GPU box: both arms run, BOTH ANNOUNCE THEMSELVES, and
+# then the CLI dies with rc=137 (SIGKILL). Host RAM was not the cause (44 GB free).
+# The cause is NOT located and is deliberately not guessed.
+#
+# This gate is therefore RED, and `check_device_precond.sh` runs it in its HEALTHY
+# column, so the red propagates to `DEVICE PRECOND: FAIL` and then to
+# `run_all_checks.sh`. That is CORRECT: a gate that goes red on a healthy box is
+# exactly what it is for. Do not relax the assertions or skip the arms to make the
+# stack green -- the kernels are wrong, not the check.
+#
+# `INTFER_DECODE1_ROWPAIR`, added in the same change, is GREEN here and is
+# separately MEASURED bit-exact by scripts/test_rowpair_equiv.sh (227 835 element
+# values, 8 shapes x 5 datasets, two process invocations). It was NOT green when
+# this comment was written: it lost the device on both INT2 shapes, and the stack's
+# device-precond run is what surfaced it.
+#
+# First task for whoever picks this up: bisect both red arms against a MODEL-FREE
+# shape. Both are the 16-way split-K family; both reach their branch (the
+# announcement proves it), so the fault is inside the kernel.
 
 # --- INTFER_DECODE1_SUBGROUP certification -------------------------------------
 # *** THIS ARM CLOSES A REAL GAP THAT WAS OPEN BEFORE THIS BATCH. ***

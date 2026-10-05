@@ -55,8 +55,60 @@ than assumed.
 | **kill switch** | `INTFER_NO_DECODE1_ROWPAIR=1` |
 | **default** | **OFF** |
 | **guard** | `bits == 2` and `N` even |
-| **gate arm** | `scripts/test_tp2_27b.sh` — asserts the fixed oracle **and** requires the `[decode1-rowpair]` announcement line |
-| **numerics** | **bit-exact by construction → NO contract needed** |
+| **gate arm** | `scripts/test_tp2_27b.sh` — asserts the fixed oracle **and** requires the `[decode1-rowpair]` announcement line. **PASSES** on 27B TP=2. |
+| **numerics** | **bit-exact, and now MEASURED bitwise** — `scripts/test_rowpair_equiv.sh`, **227 835 element values identical** over 8 shapes x 5 datasets, two process invocations. No tolerance, because the claim is exactness. |
+
+### The "bit-exact by construction" argument was WRONG, and measuring it is what found out how
+
+Row-pairing's claim was originally a *reading*: each output keeps its own
+accumulator, its own ascending order, and the chains are interleaved in the
+instruction stream, never summed. That is the reasoning style this repo has been
+burned by twice on this very kernel — `INTFER_DECODE1_SPLITK` shipped
+`(bv >> (j * 2)) & 3` on exactly that reasoning, and the reverted fused-decode
+kernel was built on a normalized diff that said the arithmetic was identical and
+cost 231 114 ms. So it was measured, and the measurement found a **device-losing
+bug**:
+
+```
+UR_RESULT_ERROR_DEVICE_LOST (20) on both INT2 shapes;  PASS on FP16 and INT4
+```
+
+because the branch is guarded on `bits == 2`, so a smoke test on a shape the flag
+never reaches reports the kernel as fine.
+
+**Cause:** the first version built two ROW-OFFSET `multi_ptr`s
+(`code_u8 + rbA`) and then indexed them with the base kernel's **absolute** byte
+offsets, `(rbA + kg) / 4` — a double offset, reading at `rbA + (rbA+kg)/4`, far
+past the shard. The reading argument had examined the chunk loop, where the
+offset is correctly row-relative, and assumed the tail matched.
+
+**Fix:** the body now uses the unoffset `code_u8` with the base kernel's own
+expressions in both the chunk loop and the tail, so the *only* difference from the
+reference is the two accumulators — which is precisely the claim under test.
+
+**A coverage hole in the measurement itself.** The first negative run — a
+deliberately wrong index in the ragged tail — came back **green**, at every shape.
+The reason: with `Gw = 16` and an 8-code chunk, the chunk loop covers each group
+exactly, so the tail executes **zero** times at every real 27B shape (all of
+`K=5120` and `K=17408` divide 16). A shape with `K = 5122` was added, and the same
+negative now fails. A gate that passes the defect it was built to catch is worse
+than no gate, and this one passed while looking thorough.
+
+**Both negatives, re-runnable:**
+
+| planted defect | result |
+|---|---|
+| row-pair's two chains share ONE accumulator | `rc=1` — not bitwise identical |
+| a wrong (out-of-bounds) index in the ragged tail | `rc=1` — **only with the `K=5122` ragged shape present** |
+| pristine | `rc=0` |
+
+**Buckets I measured myself:** none for performance. This arm has not been
+benchmarked — build/lint/check only, per the standing rule. §1's expected-direction
+column is the honest prior, not a result.
+
+```
+RESULT: (blank -- not run; benchmark command in §5)
+```
 
 **What it changes.** One work-item computes **two consecutive output rows**
 instead of one: it loads the activation vector once and runs two independent FMA
@@ -86,9 +138,6 @@ that the SYCL device compiler failed to optimise the extracted body.
 `scripts/check_decode1_copies.sh` now **enumerates** every `decode1`
 `parallel_for` in the file and requires each to be pinned or exempted by a stated
 reason — see §4.
-
-**Buckets I measured myself:** none for this arm. It has not been run; §3 gives
-the prior from adjacent shapes.
 
 **Expected direction — UNKNOWN, and stated as such.** The probe measured a
 **16-code chunk at 0.25–0.35×**, a 3–4× regression, so there is a real prior that
@@ -253,7 +302,41 @@ RESULT: E-SUBGROUP
 
 ---
 
-## 6. Non-goals
+## 6. What the FULL STACK found that a hand-picked check list never would have
+
+The tooling here was verified with nine individually-run checks, all green. Running
+`scripts/run_all_checks.sh` instead — the repo's entry point, which writes
+`build/stack_cert/cert` — found three things that all nine had reported as fine.
+
+| found by the stack | why the subset missed it |
+|---|---|
+| `test_tp2_27b.sh:187: [ : : integer expected`, printed as the gate's **first** line | a **variable name mismatch**: counts assigned to `sg_arm_assert_defs`/`sg_arm_runs`, line 187 tested **`sg_arm_defs`**, which nothing assigns. The emptiness guards protected a variable the test never read. An *earlier* fix for this same symptom had hardened the wrong operand, so it could not have caught it. |
+| a **duplicate dispatch arm and a duplicate STEPS entry** for `mutate_decode1_copies.sh` | step 0c printed "scheduled MORE THAN ONCE". Bash takes the last `case` arm silently, so the matrix ran once per arm with the wrong one winning. |
+| `INTFER_DECODE1_ROWPAIR` **lost the device** (`UR_RESULT_ERROR_DEVICE_LOST`) | it passes FP16 and INT4 because the branch is guarded on `bits == 2`; a device run on a shape the flag never reaches certifies nothing. |
+
+The third is the important one, and it is why §1's claim is measured rather than
+argued. **The stack also found that two PRE-EXISTING arms kill the CLI**, and that
+is the reason the stack is red and not green:
+
+| arm | state | evidence |
+|---|---|---|
+| `INTFER_DECODE1_ROWPAIR` | **GREEN** | tp2 arm green; 227 835 element values bitwise identical |
+| `INTFER_DECODE1_SPLITK` | **RED, pre-existing, cause NOT located** | `rc=137` (SIGKILL) *after* `[decode1-splitk]` announces itself, so the branch is reached and the fault is in the kernel. Host RAM was not the cause (44 GB free). |
+| `INTFER_DECODE1_SUBGROUP` | **RED, pre-existing, cause NOT located** | `rc=137`, same shape |
+
+Because `check_device_precond.sh` runs `test_tp2_27b.sh` in its **healthy** column,
+those two reds propagate to `DEVICE PRECOND: FAIL` and then to
+`run_all_checks.sh`. That is the gate working: a gate that goes red on a healthy
+box is exactly what it is for. **They are recorded, not relaxed** — the next step
+is to bisect both against a model-free shape, not to skip the arms.
+
+A fourth finding, and the most uncomfortable: **I committed `4ddbfac` while a
+sibling session's `run_all_checks.sh` was live.** That is precisely the condition
+AGENTS.md's standing rule 2 names — it makes stamps name a different commit than
+the snapshot, and the stack then reports STALE with a printed remedy that cannot
+help. It is recorded here rather than quietly amended.
+
+## 7. Non-goals
 
 * **`grf_size_automatic` as a launch-property flag — the claim is WITHDRAWN, not
   softened.** The `sub_group_size<16>` *half* of it needs no change at all: §0
