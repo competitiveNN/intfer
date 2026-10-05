@@ -488,13 +488,63 @@ form still fails to resolve against a bare lambda in SYCL 2026.1. All four are
 recorded in the probe. `IGC -Xsycl-target-backend -fsycl-report-stats` emits no
 stats on the `spir64` JIT target.
 
-**Named next experiment, not yet done:**
-`INTFER_DECODE1_OWN_TU` -- move `gemm_usm_decode1_vec` to its own translation
-unit. The clone *is* structurally that experiment. Same code, so bit-exact by
-construction and only stream identity needs asserting. **Kill criterion: if the
-own-TU kernel is not >= 2x the shipped one, the module-size theory is dead** and
-the next bisect is on the capture list. Full account, and the two hypotheses this
-same probe KILLED, in `reports/2026-10-05-batch-gemv-roofline.md`.
+### ==> E-NEXT-1 RAN, AND IT KILLED THE MODULE THEORY. THE BISECT IS HALFWAY. <==
+
+The named next experiment was to move the kernel to its own TU behind
+`INTFER_DECODE1_OWN_TU`, with a pre-committed kill criterion: **>= 2x or the
+module theory is dead.** Rather than do the refactor first and interpret whatever
+came out, the probe grew a ladder of single-change steps from the shipped text,
+which answers the question without touching the engine:
+
+```
+arm                       MLP_GATE   vs SHIPPED
+table   (tidy rewrite)      193-244 GB/s   6.3x   <- 6.3x
+VERBATIM (shipped source,
+          small TU)           38.8 GB/s   1.26x   <- the module move alone
+VERB+TPL (shipped source,
+          if constexpr)       39.1 GB/s   1.28x   <- 1.007x VERBATIM
+SHIPPED (shipped source,
+          2378-line TU)       30.7-40.8   1.00x
+```
+-- CITATION(roofline_probe, device 0, device event timestamps, interleaved, medians
+-- over 12 reps. The GB/s ranges are ACROSS RUNS because this box is contended --
+-- the RATIOS are the claim, never a single run's absolute.)
+
+* **The module theory is DEAD, by its own criterion.** Moving the shipped source
+  to a small TU buys **1.26x**, not the 2x the criterion demanded. `INTFER_DECODE1_
+  OWN_TU` would be a real 1.26x and is NOT worth the refactor on its own.
+* **The runtime-branch theory is DEAD, measured.** `use_int2_tab` is a host-read
+  bool captured into the kernel and it guards a two-copy inner loop *inside* the
+  per-group loop, which runs 320 times per work-item at MLP_GATE -- so
+  "loop-unswitching is failing and costing registers" was the natural suspect.
+  Making it a **template parameter** (`if constexpr`, which deletes the branch and
+  one loop body at compile time) measures **1.007x**. Dead.
+* **So ~4.5-5x of the 5.6-6.4x sits in the shared text of the two functions**, not
+  in the module and not in the branch.
+
+### The bisect is half-finished, and the blocker is recorded rather than hidden
+
+The next two steps were single-change arms off `VERBATIM`, each differing in ONE
+place:
+
+* **`VERB+HALF`** -- `from_half_bits` (the engine's branchy scalar FP16->FP32
+  twiddle, 3 branches per call) replaced by `sycl::bit_cast<sycl::half>`. Called
+  once per GROUP, so 320x per work-item at MLP_GATE.
+* **`VERB+MP`** -- the weight side read through a `multi_ptr` instead of a raw
+  `code_u8[b0]` pointer.
+
+**Neither was measured.** Adding them pushed this translation unit past the
+**level-zero `UR_RESULT_ERROR_OUT_OF_RESOURCES` (40) limit on submit** -- nine
+near-identical kernel bodies in one JIT module will cross it, and deleting the
+already-settled arms (`select`, `table16`, `select16`, `VERB+TPL`) brought it back
+under but not far enough to fit both new arms.
+
+**That limit is itself the actionable finding**, and it is a real constraint on
+whoever continues: *one probe TU holds roughly six to eight INT2 kernel bodies.*
+The fix is to split the ladder across two probe binaries or accept a smaller
+ladder per run. Do not discover it again by adding one more arm.
+
+Full account in `reports/2026-10-05-batch-gemv-roofline.md`.
 
 ### What the same probe retired, so nobody re-attempts them
 

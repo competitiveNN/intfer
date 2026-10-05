@@ -203,6 +203,57 @@ interleaved.
 That is measured and reproduced across every run today. So the shipped lambda is
 losing to something **outside the algorithm**, and the arithmetic is not it.
 
+### 4a. E-NEXT-1 ran, and it killed two of the three candidates
+
+Rather than do the refactor and interpret whatever came out, the probe grew a
+ladder of **single-change steps from the shipped text**, which answers the question
+without touching the engine:
+
+| arm | MLP_GATE | vs SHIPPED |
+|---|---|---|
+| `table` (tidy rewrite of the algorithm) | 193–244 GB/s | 6.3× |
+| `VERBATIM` (shipped source, small TU) | 38.8 GB/s | **1.26×** |
+| `VERB+TPL` (shipped source, flag as a template param) | 39.1 GB/s | 1.28× |
+| `SHIPPED` (shipped source, 2378-line TU) | 30.7–40.8 | 1.00× |
+| | | CITATION(roofline_probe) |
+
+CITATION(roofline_probe, device 0, device event timestamps, interleaved, medians
+over 12 reps. The GB/s ranges are across runs because this box is contended — the
+**ratios** are the claim, never a single run's absolute.)
+
+* **The MODULE theory is dead, by its own pre-committed criterion.** The plan said
+  "≥2× or the theory is dead". Moving the shipped source to a small TU buys
+  **1.26×**. So `INTFER_DECODE1_OWN_TU` would be a real 1.26× and is **not worth
+  the refactor on its own**.
+* **The RUNTIME-BRANCH theory is dead, measured.** `use_int2_tab` is a host-read
+  bool captured into the kernel, guarding a two-copy inner loop *inside* the
+  per-group loop — which runs **320 times per work-item** at MLP_GATE. "Loop
+  unswitching is failing and costing registers" was the natural suspect. Making it
+  a **template parameter**, so `if constexpr` deletes the branch *and* one loop body
+  at compile time, measures **1.007×**.
+* **So ~4.5–5× of the 5.6–6.4× sits in the shared text of those two functions.**
+
+### 4b. The bisect is half-finished, and the blocker is part of the finding
+
+The next two steps were single-change arms off `VERBATIM`:
+
+* **`VERB+HALF`** — `from_half_bits` (the engine's branchy scalar FP16→FP32
+  twiddle, 3 branches per call, once per group ⇒ 320× per work-item) replaced by
+  `sycl::bit_cast<sycl::half>`.
+* **`VERB+MP`** — the weight side read through a `multi_ptr` rather than a raw
+  `code_u8[b0]`.
+
+**Neither was measured.** Adding them pushed the probe's translation unit past the
+**level-zero `UR_RESULT_ERROR_OUT_OF_RESOURCES` (40) limit on submit** — nine
+near-identical kernel bodies in one JIT module will cross it. Deleting the
+already-settled arms brought it back under, but not far enough to fit both new
+ones.
+
+**That limit is the actionable part**, and it is a real constraint for whoever
+continues: **one probe TU holds roughly six to eight INT2 kernel bodies.** Split
+the ladder across two probe binaries, or run a smaller ladder — but do not
+rediscover it by adding one arm.
+
 **The mechanism is NOT located, and this report does not guess.** The candidate is
 register pressure: the shipped lambda captures ~15 scalars, two `multi_ptr`
 objects and a 4-float dynamically-indexed array, inside a **2378-line translation
@@ -218,17 +269,11 @@ recorded in the probe source. An attempt to get IGC spill stats
 (`-Xsycl-target-backend -fsycl-report-stats`) emitted no stats on the `spir64`
 JIT target.
 
-Rather than ship an untested fix for a suspected cause, here is the **named next
-experiment**:
-
-> **E-NEXT-1 — put `gemm_usm_decode1_vec` in its own translation unit.** The clone
-> is, structurally, exactly that experiment: a small module IGC compiles
-> differently from a 2378-line one. Move the kernel to `src/gemm/decode1_vec.cpp`
-> behind `INTFER_DECODE1_OWN_TU` (default ON once proven — it is the same code, so
-> bit-exactness is by construction and only stream identity needs asserting).
-> Predicted: recovers a large fraction of the 5.6–6.4×. **Kill criterion:** if the
-> own-TU kernel is not at least 2× the shipped one, the module-size theory is dead
-> and the next bisect is on the capture list, not on the module.
+Rather than ship an untested fix for a suspected cause, §4a runs the named next
+experiment as a measurement ladder. It answered: **the module theory is dead
+(1.26× against a ≥2× criterion) and the runtime-branch theory is dead (1.007×).**
+The bisect continues at `VERB+HALF` / `VERB+MP` and is blocked on the module size
+limit in §4b, not on anything undecided.
 
 ---
 
