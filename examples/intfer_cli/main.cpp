@@ -1119,40 +1119,6 @@ struct GpuBackend : public LinearBackend {
       eng->begin_layer(wave_layer);
       cur_layer_ = wave_layer;
     }
-
-    // INTFER_MLP_GU: an MLP's gate+up are two items in this wave sharing one
-    // activation. When the flag is on and M==1 they go out as ONE launch.
-    // Skipped entirely when ne != 2 or the pair is not gate/up, so the fused
-    // path can never fire on an unrelated pair -- and if the engine declines
-    // (shape, scheme, DPAS48), the wave below runs them as before.
-    if (ne == 2 && std::getenv("INTFER_MLP_GU") != nullptr) {
-      auto ia = ti_cache.find(items[0].name);
-      auto ib = ti_cache.find(items[1].name);
-      if (ia != ti_cache.end() && ib != ti_cache.end()) {
-        const std::string& na = items[0].name, nb = items[1].name;
-        const bool gate_up =
-            (na.find("mlp.gate_proj") != std::string::npos &&
-             nb.find("mlp.up_proj") != std::string::npos) ||
-            (nb.find("mlp.gate_proj") != std::string::npos &&
-             na.find("mlp.up_proj") != std::string::npos);
-        std::vector<float>* po_a = items[0].out;
-        std::vector<float>* po_b = items[1].out;
-        const std::vector<float>* px = items[0].x;
-        if (gate_up && po_a && po_b && px &&
-            po_a->size() > 0 && po_b->size() > 0) {
-          const bool a_is_gate = (na.find("mlp.gate_proj") != std::string::npos);
-          const int tg = a_is_gate ? ia->second : ib->second;
-          const int tu = a_is_gate ? ib->second : ia->second;
-          std::vector<float>& og = a_is_gate ? *po_a : *po_b;
-          std::vector<float>& ou = a_is_gate ? *po_b : *po_a;
-          if (eng->run_linear_tp_pair(tg, tu, *px, og, ou)) {
-            std::fprintf(stderr, "[mlp-gate-up] fused wave pair ACTIVE\n");
-            return;
-          }
-        }
-      }
-    }
-
     eng->run_linear_wave(eitems, ne, 1);
   }
   // M-row wave (see LinearBackend::run_linear_wave_batch): same grouping

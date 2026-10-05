@@ -150,24 +150,6 @@ void build_vnni_int8(const std::int8_t* w, std::int8_t* out,
 // local memory, no barriers) to avoid the overhead of the tiled kernel.
 // For M>1, a tiled 2D kernel with shared local memory is used.
 // ---------------------------------------------------------------------------
-// INTFER_MLP_GU: gate+up in ONE nd_range, M=1, packed INT2/INT4. BIT-EXACT --
-// each output element's K accumulation is identical to the single-GEMM path;
-// only the launch boundary moves, so there is no tolerance to agree. Arithmetic
-// is INLINE and must not be extracted into a shared device function (the
-// quant_gemm_fused_decode1 231 114 ms regression). Valid at ANY device count,
-// unlike run_linear_tp_devact / run_mlp_fused which early-return on TP>1 and so
-// would make any flag routed through them dead code at 27B --tp 2.
-sycl::event quant_gemm_forward_usm_pair(
-    sycl::queue& q,
-    std::uint16_t* act_usm,
-    const void* code_a, const std::uint16_t* scale_a, float alpha_a,
-    std::uint16_t* out_a,
-    const void* code_b, const std::uint16_t* scale_b, float alpha_b,
-    std::uint16_t* out_b,
-    uint32_t N, uint32_t K, uint32_t group_size,
-    gemm::WeightScheme scheme,
-    const sycl::event& copy_dep);
-
 sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                       // Activation: M*K FP16 bits (pre-allocated, updated every call)
                                       std::uint16_t* act_usm,
