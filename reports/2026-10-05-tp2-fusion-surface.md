@@ -1,10 +1,13 @@
 # The TP=2 fusion surface — a premise correction, and the one candidate that is real
 
 **Date:** 2026-10-05
-**Status:** finding derived from source; **no kernel written**, deliberately.
-**Answer to "do the rest of PLAN.md":** the remaining fusion work is *not* blocked
-on engineering — it is blocked on a seam that cannot execute at the target
-configuration. Details below.
+**Status:** the fusion seam was derived from source; `INTFER_MLP_GU` was
+**implemented, measured DIVERGENT, and REVERTED** (§3b). Nothing from the attempt
+is in the tree.
+**Answer to "do the rest of PLAN.md":** the remaining fusion work is not blocked on
+engineering — it is blocked on a seam that cannot execute at the target
+configuration, and the one candidate that IS valid at TP=2 was built and did not
+meet its bit-exact claim.
 
 ---
 
@@ -104,7 +107,57 @@ So the next session has everything except the kernel:
 | expected direction | `kernel` down or flat; `submit`/`waitblock` down by one launch+wait per MLP; `nk` changes by the *added* work-items, so `nk` is a DIAGNOSTIC here, not an invariant |
 | risk | adds a launch-sized work unit per MLP; the L4 M-row case shows an added launch can lose even while removing waits. If it loses, that is a result — record it, do not retry per-work-item tiling |
 
-## 4. Why no kernel is in this report
+## 3b. ATTEMPTED, MEASURED DIVERGENT, REVERTED
+
+`INTFER_MLP_GU` was implemented (fused `quant_gemm_forward_usm_pair`, engine seam
+`run_linear_tp_pair`, CLI wave wiring, gate arm in `test_tp2_27b.sh`, four
+mutation states) and then **reverted**, because its own gate arm falsified the
+bit-exact claim that was the entire argument for it.
+
+Measured on 27B `--tp 2`, the arm's stream diverged from the base run at the first
+token:
+
+```
+base            13 198 760
+INTFER_MLP_GU   14354 9616 43047
+```
+
+**Three real bugs, in order, and the tooling caught the first two — not me:**
+
+1. **SIGSEGV (rc=139).** The output workspace was sized for ONE N slice while
+   operand B was written at `ws_[0].out + M*nl`, past the end of the allocation.
+   Found by `check_device_precond.sh`, which runs the gate as part of its
+   healthy-box check.
+2. **SIGSEGV again, after fixing that.** The kernel was handed the tensor's full
+   `N` instead of the device's own column slice `nl`, so at TP=2 each device read
+   its neighbour's weights. **Under TP=1 `nl == N`, so a one-GPU smoke test would
+   never have caught it** — which is the strongest argument yet for TP=2 coverage
+   of any kernel that touches sharding.
+3. **Wrong results, no crash.** With the sharding fixed the kernel ran and
+   announced itself (`[mlp-gate-up] ... KERNEL ACTIVE, 2 x 8704 work-items
+   (N=8704 K=5120 bits=4)`), and the stream still diverged. The per-output
+   arithmetic was transcribed from `gemm_usm_decode1_vec` and reviewed against it
+   line for line, with no difference found — so the defect is in the engine seam
+   or the CLI wave wiring, not in the kernel body, and **it was not found within
+   this session's budget.**
+
+## 4. Why the kernel is NOT in the tree
+
+Because its gate arm rejects it. The claim was *bit-exact*, which is the one
+property that makes this fusion cheap enough to want; a kernel that needs a
+tolerance instead is a different, worse experiment that would need its own
+contract before any code. Shipping it "flagged and pending" would leave the repo
+holding an uncertified kernel whose one justification is falsified.
+
+What is kept: nothing from the attempt. The seam analysis, the TP=1-only
+constraint, and the bit-exact argument above stand, and the diagnosis is recorded
+here so the next attempt starts from two crashes already fixed and one
+divergence already measured.
+
+**The next attempt's first job is to bisect bug 3**, not to re-derive the design:
+the engine seam and the CLI wiring are separable, and a single fused-pair call with
+the wave path also executed would say immediately which of the two is wrong.
+
 
 This file contains **no `INTFER_*` flag**, because shipping one would put the
 repo back in the state the last session was built to leave:
@@ -125,9 +178,12 @@ artifact that would catch a regression exists before the change rather than afte
 ```
 RESULT (operator): scripts/run_ten_gates.sh
         then scripts/check_engine_cert.sh
-        (this is the single operator-deferred step; see
-         scripts/check_pending_operator.sh for the derived classification)
+        (the single operator-deferred step; derived by
+         scripts/check_pending_operator.sh)
 ```
+
+Nothing in §3b needs a benchmark to believe: the arm's own stream comparison is
+the evidence, and it is a correctness measurement, not a timing one.
 
 Nothing here needs a benchmark. Nothing here quotes a tok/s. The `RESULT:` line
 above is a command, not a measurement — there is deliberately no number to fill.
