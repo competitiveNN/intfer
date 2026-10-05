@@ -88,6 +88,22 @@ candidate: **bit-exact, therefore zero tolerance.** The only thing to assert is
 stream identity against the fixed oracle — which is an existing kind of gate arm,
 not a new numerics exercise.
 
+## 3a. The candidate, specified (nothing here is implemented)
+
+So the next session has everything except the kernel:
+
+| | |
+|---|---|
+| flag | `INTFER_MLP_GU` (gate+up), exactly `=1`; default **OFF** |
+| kill switch | `INTFER_NO_MLP_GU=1` forces it off |
+| arm lives in | `scripts/test_tp2_27b.sh` — TP=2, so it is reachable (0.8B has zero INT2 and cannot reach a `bits==2` branch) |
+| assertion | stream identical to the same fixed oracle the base run uses — **not** a self-comparison |
+| numerics | **bit-exact, zero tolerance.** Each output element's K accumulation is untouched; only the launch boundary and work-item indexing move |
+| inline? | **yes, arithmetic stays inline at its call site.** Do not extract a shared device function — that is the 231 114 ms lesson |
+| mutation matrix | write it BEFORE the kernel, and assert the HARVEST (per NS-3/NS-4), not the list |
+| expected direction | `kernel` down or flat; `submit`/`waitblock` down by one launch+wait per MLP; `nk` changes by the *added* work-items, so `nk` is a DIAGNOSTIC here, not an invariant |
+| risk | adds a launch-sized work unit per MLP; the L4 M-row case shows an added launch can lose even while removing waits. If it loses, that is a result — record it, do not retry per-work-item tiling |
+
 ## 4. Why no kernel is in this report
 
 This file contains **no `INTFER_*` flag**, because shipping one would put the
