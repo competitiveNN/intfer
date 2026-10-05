@@ -221,6 +221,26 @@ print(f"\noverhead: code {code_bytes/GiB:.3f} GiB | scales {scale_bytes/1024:.1f
       f"({100*scale_bytes/total_bytes:.4f}%) | globals {glob_bytes} B "
       f"({100*glob_bytes/total_bytes:.5f}%)")
 
+# The scale layout decides what "group size" costs, and the two disagree.
+# src/quant/dashq.cpp:640 sizes the scale array as n_groups * 2 -- ONE FP16 scale
+# per K-group for the WHOLE tensor, broadcast across all N output rows (the
+# layout dequant_tensor reads back). So the real overhead is
+# scale_bits / (group_size * N), not the scale_bits / group_size that
+# effective_bits() in src/quant_spec.cpp:19 reports. Print both.
+def eff_bits_reported(q):
+    s = q.get("scheme")
+    if s == "FP16":
+        return 16.0
+    code = {"INT2": 2.0, "INT4": 4.0, "INT8": 8.0}[s]
+    return code + 16.0 / float(q.get("group_size") or 1)
+
+rep_bits = sum(eff_bits_reported(t["qcfg"]) * params(t) for t in tensors) / total_params
+real_bits = 8.0 * total_bytes / total_params
+print(f"stored bits/weight, from the file's own bytes : {real_bits:.4f}")
+print(f"stored bits/weight, as effective_bits() reports: {rep_bits:.4f} "
+      f"(overstates by {rep_bits/real_bits:.3f}x; RCO's COST is real bytes "
+      f"[src/quant/rco.cpp:98] so only RcoReport::mean_eff_bits is affected)")
+
 # ---------------------------------------------------------------------------
 # 4. Per-layer matrix
 # ---------------------------------------------------------------------------
@@ -263,6 +283,47 @@ if want_map:
         c = collections.Counter(rows[L].get(role, "?") for L in sorted(rows))
         mix = "  ".join(f"{k} x{v}" for k, v in sorted(c.items(), key=lambda kv: -kv[1]))
         print(f"  {role:10s} {mix}")
+
+    # ---- chunk-class cross-tab --------------------------------------------
+    # The 27B was not quantized in one pass: it was 32 chunks of 2 layers
+    # (scripts/archive/run_27b_int2_chunks.sh), each with its OWN budget =
+    # (that chunk's FP16 bytes) x budget_frac. The chunk a layer lands in is
+    # therefore derivable from the layer index, and so is the budget class:
+    #   chunk_start = 2*floor(L/2); a chunk whose start % 4 == 0 and > 0
+    #   holds two linear-attention layers (LIN+LIN) and got frac 0.305;
+    #   a chunk whose start % 4 == 2 holds LIN+FULL (LIN+SELF) and got 0.29.
+    # Chunk 0 holds layers 0,1 and also carries embed_tokens.
+    # THAT IS AN ASSUMPTION ABOUT THE RUN, not a property of the file -- the
+    # chunking is not recorded in the metadata. It is stated here because it
+    # makes a falsifiable prediction, and the cross-tab below is the test:
+    # scripts/rco_chunk_feasibility.sh derives that a LIN+LIN chunk's budget
+    # clears its INT2 floor by 9.9 MiB while one bit-width upgrade costs
+    # 21.25 MiB, so NO MLP tensor in a LIN+LIN chunk can leave INT2. If the
+    # cross-tab shows an INT4 MLP there, the assumption is wrong.
+    def chunk_class(L):
+        start = 2 * (L // 2)
+        if start == 0:
+            return "chunk0(LIN+LIN)"
+        return "LIN+LIN" if start % 4 == 0 else "LIN+SELF"
+
+    print()
+    print("MLP scheme by CHUNK CLASS (chunking is derived from the layer index;")
+    print("see the assumption note in scripts/quant_precision_map.sh)")
+    print(f"  {'class':18s} {'layers':>7s}  " +
+          "  ".join(f"{t:>6s}" for t in ("2g16", "2g32", "4g64", "8g32")))
+    for cls in ("chunk0(LIN+LIN)", "LIN+LIN", "LIN+SELF"):
+        ls = [L for L in sorted(rows) if chunk_class(L) == cls]
+        c = collections.Counter(rows[L].get(r) for L in ls for r in
+                                ("MLP_GATE", "MLP_UP", "MLP_DOWN"))
+        tot = sum(c.values())
+        print(f"  {cls:18s} {len(ls):7d}  " +
+              "  ".join(f"{c.get(t, 0):6d}" for t in ("2g16", "2g32", "4g64", "8g32")) +
+              f"   (of {tot} MLP tensors)")
+    bad = [L for L in sorted(rows) if chunk_class(L).startswith("LIN+LIN")
+           and any(rows[L].get(r, "").startswith(("4g", "8g"))
+                   for r in ("MLP_GATE", "MLP_UP", "MLP_DOWN"))]
+    print(f"  prediction: zero INT4/INT8 MLPs in a LIN+LIN chunk. "
+          f"Observed violations: {bad if bad else 'none'}")
 
 # ---------------------------------------------------------------------------
 # 5. The FP16-by-omission check
