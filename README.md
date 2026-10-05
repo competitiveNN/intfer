@@ -114,7 +114,10 @@ Built under `examples/` (enabled by `INTFER_BUILD_EXAMPLES`):
 - `quant_pipeline` — full SpinQuant → DASH-Q → RCO pipeline (needs `INTFER_BUILD_QUANT`).
 - `gemm_demo` — quantized GEMM / DPAS kernel.
 
-Run via `scripts/run.sh` / `scripts/run_bin.sh` after building.
+Run via `scripts/run.sh` / `scripts/run_bin.sh` after building, or prefix any command
+with `scripts/with_oneapi.sh` — a bare shell cannot enumerate either B580 (libumf
+is off the default `LD_LIBRARY_PATH`, so every UR adapter fails to load), and
+`source setvars.sh` cannot be used to prefix a command because it ends in `exit`.
 
 ---
 
@@ -127,7 +130,10 @@ docs/                Quantization spec + ninfer analysis
 include/intfer/      Public headers (quant, gemm, attention, device, l0)
 src/                 Implementation (quant, gemm, attention, device, l0, common)
 examples/            Demo programs
-scripts/             build.sh / run.sh / run_bin.sh
+scripts/             build.sh / run.sh / run_bin.sh / with_oneapi.sh
+                     (gate + tooling entry points: run_all_checks.sh,
+                      run_ten_gates.sh, gate_inventory.sh;
+                      retired scripts live in scripts/archive/)
 ```
 
 ---

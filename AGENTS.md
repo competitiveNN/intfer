@@ -55,6 +55,13 @@ It is HOST-SIDE driver enumeration state, not a code fault. Three consequences:
     `renderD129`->`renderD130`->`renderD129` across sessions. `renderD128` is the
     stable liveness probe; two or more distinct minors in one script is the defect
     `scripts/check_dri_probe.sh` refuses.
+  * **IF A REBIND STOPS WORKING, the deeper investigation kit is in
+    `scripts/archive/`**, one rung below the remedy above: `gpu_health_check.sh`
+    (diffs the two cards at the kernel/sysfs layer), `l0_enum_trace.sh` (runs the
+    driver's own discovery code with its debug keys on, to see WHICH of its five
+    silent skips fires) and `gpu_driver_lib_ab.sh` (proves a driver-library swap
+    actually happened). They were archived as retired, not deleted, precisely
+    because this fault has recurred; `scripts/archive/README.md` says so.
 
 ### Gates: all PASS, nothing PARTIAL, nothing SKIPPED
 
@@ -554,6 +561,7 @@ Revisit a dead end only if a profile shows the thing it removed is now >10% of a
 | `scripts/check_stack_cert.sh` | grades the stack certificate (POST-STACK, not a step) |
 | `scripts/check_engine_cert.sh` | does the engine certification still carry to HEAD? |
 | `scripts/gate_inventory.sh` | derives the gate population, preconditions, render-node guards, and reconciles the doc tallies |
+| `scripts/check_scripts_live.sh` | every `scripts/` entry is reachable: NAMED by a live source, or matched by the gate runner's own `GATE_GLOB` parsed out of `run_ten_gates.sh`. `docs/`, `reports/` and `scripts/archive/` are records, not call sites |
 
 **The rules this repo learned by breaking them** (each cost a full run; the full
 narrative with the measurements is in `docs/audit-log-tooling.md`):
@@ -561,7 +569,13 @@ narrative with the measurements is in `docs/audit-log-tooling.md`):
 1. **Enumerate, never remember.** A family is closed by deriving its instances from
    the source of truth, not from the names a previous fix happened to touch.
    `ls scripts/test_*.sh` DEFINES the gate population; `ls scripts/check_*.sh`
-   defines the checker population.
+   defines the checker population; `scripts/check_scripts_live.sh` closes the
+   *retirement* family, which is the one that needs closing most because a
+   **`docs/` or `reports/` citation is not a call site** — that misreading is what
+   let sixteen dead scripts (superseded 27B quantize/merge drivers, retired
+   wall-time A/B harnesses, one-GPU probes) sit in `scripts/` looking like tooling.
+   Retire by `git mv` into `scripts/archive/`, which `maxdepth 1` keeps out of
+   every family, and say why in `scripts/archive/README.md`.
 2. **"0 findings" and "found nothing to look at" are different claims.** A checker
    must assert it harvested something BEFORE reporting a verdict on it. A `WARN ...
    skip` path in a correctness checker is a defect.

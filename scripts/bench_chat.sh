@@ -28,7 +28,7 @@ done
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }
 # NOTE: setvars.sh is not `set -u`-clean; drop nounset across the source, exactly
-# as bench_gpu_ab.sh and every other `set -u` harness here does. bench_chat.sh was
+# as every other `set -u` harness here does. bench_chat.sh was
 # the last harness without nounset, and it was the reason `$_LL_USABLE` was only
 # safe by ACCIDENT: an unset verdict compared unequal to "1" and silently
 # withheld. With nounset on, and _ll_need inside the helper, that wiring mistake

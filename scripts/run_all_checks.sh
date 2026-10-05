@@ -296,6 +296,18 @@ dispatch() { # $1 = label -> runs it
       # shared-device-function alternative cost 231 114 ms) and deliberate
       # duplication is only acceptable while it is pinned.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_decode1_copies.sh"; return $? ;;
+    check_scripts_live.sh)
+      # MEASURED 2026-10-05, not predicted: a full reference-graph derivation of
+      # scripts/ found SIXTEEN entries that no code referenced -- a superseded
+      # generation of one-shot 27B quantize/merge drivers, four wall-time A/B
+      # harnesses for experiments already recorded as dead ends or withdrawn, and
+      # three probes for the one-GPU driver window. Every one survived on a `docs/`
+      # or `reports/` citation, which is why a cleanup by eye does not find them.
+      # This derives the rule (NAMED by a live source, or matched by the gate
+      # runner's own GATE_GLOB parsed out of run_ten_gates.sh) and proves both
+      # polarities on planted trees, so scripts/ cannot drift back. No GPU, no
+      # build, no model.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_scripts_live.sh"; return $? ;;
     check_dri_probe.sh)
       # Closes the /dev/dri family: no script may identify a GPU card by its DRM
       # minor, which is not stable (the 2nd B580 became card2/renderD130). The
@@ -484,6 +496,14 @@ dispatch() { # $1 = label -> runs it
       # COPY only and restores from a pre-matrix snapshot, never from git, so it
       # is safe on a legitimately dirty tree.
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_decode1_copies.sh"; return $? ;;
+    mutate_scripts_live.sh)
+      # SL states weaken the reachability RULE (the corpus is a temp tree, never
+      # the tracked scripts/), which is the audit #21 direction for a checker
+      # whose artifact is its own classification: the rule must be shown to fire
+      # AND to stay quiet before either version is believed. SL-C is the state
+      # that would have caught the first version of the checker, whose own header
+      # prose named real scripts and so satisfied the rule with itself.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_scripts_live.sh"; return $? ;;
     mutate_tp2_selfcheck.sh)
       # AUDIT #31. The DECODE1_MR arm's --self-check in test_tp2_27b.sh. It runs
       # ONLY the stubbed --self-check half on temp copies -- NO GPU, NO MODEL, NO
@@ -736,12 +756,12 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh"
+  STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_scripts_live.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------

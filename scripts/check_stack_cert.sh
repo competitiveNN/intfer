@@ -315,9 +315,12 @@ done
 #
 # The rule is UNIFORM (every scripts/*.sh is executable) rather than
 # "executable unless something sources it". A sourced library has no legal
-# reason to be non-executable, the other 75 scripts already were, and an
+# reason to be non-executable, every other scripts/*.sh already was, and an
 # exemption would be a hand-maintained list -- the copy-drift family (audit
-# #3/#12) with a brand-new population to rot.
+# #3/#12) with a brand-new population to rot. (The count that used to sit here
+# was a CITATION of the population and not a claim about it, and 16 scripts have
+# since been archived, so it was dropped rather than restated: `n_sh` below is
+# the derived number and this rule has no hand-written total in it at all.)
 n_sh=0; n_x=0
 for f in "$REPO"/scripts/*.sh; do
   [ -f "$f" ] || continue
