@@ -569,35 +569,60 @@ Full account in `reports/2026-10-05-batch-gemv-roofline.md`.
   the same probe puts decode at 15.6-19.9 % of the *shared* ceiling. The allocator
   is not the deficit; the kernel is.
 
-## ==> LIVE RED GATES as of 2026-10-05. READ BEFORE TRUSTING ANY "ALL PASS". <==
+## ==> STACK STATE 2026-10-05: no regressions; one operator-only UNPROVEN <==
 
-`scripts/test_tp2_27b.sh` is **RED** on a healthy 2-GPU box. Do not read a
-hand-written "all gates pass" as current; `scripts/gate_inventory.sh` reconciles
-the *count* of gates, not their colour, and a red gate is a gate.
+`scripts/run_all_checks.sh` on `4319345`, run clean with no concurrent instance:
 
-| arm | state | evidence |
-|---|---|---|
-| `INTFER_DECODE1_ROWPAIR` | **GREEN** | 27B TP=2 ids match base, and `scripts/test_rowpair_equiv.sh` measures **227 835 element values bitwise identical** to the base M=1 kernel over 8 shapes x 5 datasets |
-| `INTFER_DECODE1_MR` | **GREEN** | ids match base |
-| `INTFER_DECODE1_SPLITK` | **GREEN here**, but ONE `rc=137` (SIGKILL) on an earlier run that did **not** reproduce | ids match base on the later run; the kill is not explained and is not claimed fixed |
-| `INTFER_DECODE1_SUBGROUP` | **RED — NUMERICALLY WRONG, deterministic, cause NOT located** | `ids '279 12 12'` vs base `'13 198 760'`, on every run, after `[decode1-subgroup]` announces itself |
+```
+rc=2  verdict=UNPROVEN   failed=0  stale=0  unproven=1
+24 stamps, 28 checks, 32 matrices
+```
 
-*** CORRECTION TO AN EARLIER STATEMENT IN THIS FILE. *** A previous revision of
-this banner recorded SPLITK as red alongside SUBGROUP, on the strength of one
-`rc=137`. Re-running the gate showed SPLITK producing the correct ids. So the
-honest state is: **only SUBGROUP is reliably red**, and its symptom is not a crash
-but **wrong output** -- a stronger claim than "it dies", and a different bug class.
+**`failed=0`** -- there is no regression, and the previously-red
+`check_device_precond.sh` is `ok`. **`stale=0`** -- every matrix stamp names HEAD.
 
-`INTFER_DECODE1_SUBGROUP` **announces itself before producing the wrong answer**,
-so the branch is reached and the fault is inside the kernel, not a flag that failed
-to take effect. It is one sub-group per output row with a `reduce_over_group` tree
-reduction, and it differs from `INTFER_DECODE1_SPLITK` only in the reduction -- yet
-SPLITK is right and SUBGROUP is wrong. **That difference is the bisect**: the K
-split is shared, so the reduction is the thing to test. Do NOT "fix" the gate by
-relaxing it -- the gate is right and the kernel is wrong.
+The one UNPROVEN step is `check_engine_cert.sh`, and its own printed remedy is
+`re-run scripts/run_ten_gates.sh`. That is the 10-gate ENGINE run: tens of minutes of
+model loads, and AGENTS.md's standing rule 1 forbids an agent session from running
+it. It is UNPROVEN because I changed engine code (the SUBGROUP quarantine below), so
+the engine certification legitimately needs re-running on the new tree. **Only the
+operator can close it.**
 
-`check_device_precond.sh` runs `test_tp2_27b.sh` in its healthy column, so this one
-red propagates to `DEVICE PRECOND: FAIL`, which is why `run_all_checks.sh` is red.
+**Do not read this as "all green".** `check_stack_cert.sh` says `NOT A PASS at HEAD`,
+and it is right: rc=2 is not rc=0.
+
+### `INTFER_DECODE1_SUBGROUP` is QUARANTINED, not fixed
+
+It produced ids `'279 12 12'` where the base produces `'13 198 760'` --
+deterministically, on every 27B TP=2 run, after announcing itself. A default-OFF flag
+that is **numerically wrong** is worse than no flag. Flag, kernel, gate arm, wrapper,
+count guards and self-check cases were **removed**; nothing was loosened or skipped.
+
+**The cause is NOT located, and two candidates were TESTED AND FALSIFIED first:**
+`step = row_lanes*kVSg = 128` against a 16-wide group (reproducing the phase formula
+gave 128/128 k-values covered, all 16 lanes contributing), and a lane offset in
+`code_u8[b0]` (it indexes the UNOFFSET base with ABSOLUTE offsets -- correct; the
+ROWPAIR double-offset was the opposite shape). What remains untested is
+`reduce_over_group`'s interaction with the queried sub-group geometry, and the
+`sg.leader()` write. Full bisect and the order to test it:
+`reports/2026-10-05-decode1-subgroup.md`.
+
+### `INTFER_DECODE1_ROWPAIR` is GREEN and MEASURED
+
+27B TP=2 ids match base, and `scripts/test_rowpair_equiv.sh` measures **227 835 element
+values BITWISE IDENTICAL** to the base M=1 kernel over 8 shapes x 5 datasets in two
+process invocations. It was **not** green until this session: it lost the device
+(`UR_RESULT_ERROR_DEVICE_LOST`) on both INT2 shapes while passing FP16 and INT4,
+because the branch is guarded on `bits == 2`. Full write-up:
+`reports/2026-10-05-batch-upstream-simd-gemv.md`.
+
+### The lesson the SUBGROUP self-check teaches
+
+**Its self-check cases were green the entire time the arm was wrong.** Two predicates
+exercised to perfection, asserting something false, is worse than no predicate: a
+predicate tests the SHAPE of a claim, not its TRUTH. Only the token oracle in the real
+run tests truth, and that is what caught it. A green self-check is not evidence that
+the thing being asserted is true.
 
 ### What the stack found that a hand-picked check list never would have
 
