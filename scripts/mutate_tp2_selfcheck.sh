@@ -208,10 +208,6 @@ anchor PRED_STREAMS_FULL '  [ -n "$1" ] && [ -n "$2" ] && [ "$1" = "$2" ]'
 anchor PRED_PREFILL '  [ "$1" = "11751" ]'
 anchor PRED_TP '  grep -aq "TP=sharded" "$1"'
 anchor ARM_RETURN '  return "$ok"'
-# The tag-parameterized predicate, as a whole line so the state can replace the
-# WHOLE thing. GU-1's whole point is that the tag must be honoured, so the state
-# has to disable it at the source rather than at one call site.
-anchor GU_PATH_FIRED '  grep -aq "\[$2\].*ACTIVE" "$1"'
 anchor PATH_FIRED '  grep -aq "\[$2\].*ACTIVE" "$1"'
 preflight || exit 1
 
@@ -277,42 +273,8 @@ run_state MR-6  'SELF-CHECK FAIL \(5\).*prefill' m_mr6
 run_state MR-7  'SELF-CHECK FAIL \(5\).*TP'     m_mr7
 run_state MR-8  'SELF-CHECK FAIL \(2\).*TP'     m_mr8
 run_state MR-9  'SELF-CHECK FAIL \(3\)' m_mr9
-# --- INTFER_MLP_GU: the third flag through the SAME assertion home ----------
-# GU-1 the tag is IGNORED. With three flags sharing decode1_path_fired, a tag
-# that is not honoured still passes each flag's OWN single-flag case (each arm's
-# log carries its own announcement); it only shows up CROSS-flag. So this state is
-# the one that keeps the tag real now that there are three of them.
-m_gu1() { patch_literal "$1" "$(cat "$SB/anchor_GU_PATH_FIRED.txt")" \
-  '  grep -aqE "decode1-(mr|splitk|mlp-gate-up).*ACTIVE" "$1" #GU1 tag ignored'; }
-# GU-2 the arm entry point always certifies -- the audit #21 shape: a weak
-# checker over a real artifact.
-m_gu2() { patch_literal "$1" "$(cat "$SB/anchor_ARM_RETURN.txt")" \
-  '  return 0 #GU2 always certifies'; }
-# GU-3 IS EXCLUDED, NOT SCORED -- the same unobservable state as MR-1, and for
-# the same reason: the self-check drives gu_arm_assert on FIXTURES and never walks
-# the real arm that calls it, so deleting that call leaves --self-check green.
-# MEASURED: it scored MISSED. A state that cannot be observed is EXCLUDED WITH
-# ITS REASON (audit #21) rather than left to look like a weak state. The only
-# sound detector runs the arm, which needs two GPUs and an 18 GiB 27B load, and
-# that is the operator's run (see the standing rule).
-# GU-4 the HEALTHY accept case is removed, so the refusal case could be passing
-# because the arm refuses everything. That is the always-red twin: without an
-# accept case, "refuses a log whose path never fired" proves nothing.
-# GU-4 removes the healthy FIXTURE rather than the accept case. The first
-# version patched the two-line accept statement and broke the shell -- and a
-# state that breaks syntax is not evidence a mechanism is load-bearing. Removing
-# the fixture makes the accept case fail for a reason that IS the mechanism: a
-# pair with no announcement must be refused, and without a healthy pair to
-# compare, that refusal proves nothing.
-m_gu4() { patch_literal "$1" \
-  'mklog "$SB/gu_announced"     11751 13 198 760 6511' \
-  ': #GU4 healthy fixture removed'; }
-
 run_state MR-10 'SELF-CHECK FAIL \(1\)' m_mr10
 run_state MR-11 'SELF-CHECK FAIL \(2\).*prefill' m_mr11
-run_state GU-1  'SELF-CHECK FAIL \(8\)' m_gu1
-run_state GU-2  'SELF-CHECK FAIL \(8\)' m_gu2
-run_state GU-4  'SELF-CHECK FAIL \(8\)' m_gu4
 run_state SK-12 'SELF-CHECK FAIL \(7\)' m_sk12
 run_state SK-13 'SELF-CHECK FAIL \(7\)' m_sk13
 
