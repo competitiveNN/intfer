@@ -87,7 +87,10 @@ correct behaviour and not something to work around. Rewrite it when the gate
 population changes; the checker fails if you do not:
 
 ```
-gate tally: 11 PASS, 0 PARTIAL, 0 SKIPPED
+gate tally: 12 PASS, 0 PARTIAL, 0 SKIPPED
+  (+1 on 2026-10-05: `test_roofline_probe`, the model-free
+  allocator-vs-kernel discriminator for decode's bandwidth deficit.
+  Device event timestamps, no model bound, ~30 s.)
 ```
 
 * Historical lines recording the 1-GPU-era tally are **records of that era**. Do

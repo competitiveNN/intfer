@@ -357,6 +357,14 @@ dispatch() { # $1 = label -> runs it
       # Read-only, no GPU, no build. rc=2 (no artifact) is UNPROVEN, not a
       # regression, and the 2b re-run path handles it.
       timeout -k 30 300 bash "$SCRIPT_DIR/check_engine_cert.sh"; return $? ;;
+    test_roofline_probe.sh)
+      # AUDIT #33 follow-on. The allocator-vs-kernel discriminator for decode's
+      # bandwidth deficit. Device event timestamps (load-insensitive), binds NO
+      # model (AGENTS.md standing rule 1), and carries its own always-red twin: a
+      # quarter of the bytes must take about a quarter of the time, or the GB/s
+      # figures are not tracking traffic and the run exits 1. That twin caught two
+      # real bugs in the probe itself.
+      timeout -k 30 900 bash "$SCRIPT_DIR/test_roofline_probe.sh"; return $? ;;
     run_ten_gates.sh)
       # AUDIT #24 -- SELF-CHECK ONLY, never the gates themselves. run_ten_gates.sh
       # runs the engine on both GPUs for tens of minutes and is deliberately NOT a
@@ -774,6 +782,12 @@ if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
 else
   STEPS="gate_inventory.sh fold_report_counts.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_fold_report_class.sh check_result_block.sh check_bench_load_gate.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_doc_counts.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_flag_gate_coverage.sh check_hw_constants.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_scripts_live.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
+  # A REAL gate, but it needs a GPU and takes ~30 s, so it sits in the
+  # same INTFER_QUICK-off band as check_l0_cite.sh. Quick mode is meant to be
+  # checkers-only, and a band that silently skipped a gate would be the
+  # audit #18 shape (an arm that never runs certifies nothing).
+  [ "${INTFER_QUICK:-0}" = "1" ] || \
+    STEPS="$STEPS test_roofline_probe.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
