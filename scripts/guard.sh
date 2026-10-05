@@ -1,7 +1,10 @@
 # GUARD: refuses destructive git on a dirty tree; shadows `git` for the session.
 #
 # Sourced by an interactive or agent shell to make destructive git refuse on a
-# dirty tree. NOT executable -- it must be SOURCED, because the whole point is to
+# dirty tree. Running it directly is harmless and merely announces that the guard
+# is available -- it defines the wrapper and exits. It carries a shebang and is
+# +x because scripts/ mut_exec requires every shebang'd script there to be runnable,
+# and a documented entry point that cannot be run is the defect that rule exists for. NOT executable -- it must be SOURCED, because the whole point is to
 # shadow the `git` FUNCTION for the rest of the session.
 #
 #   . scripts/guard.sh
