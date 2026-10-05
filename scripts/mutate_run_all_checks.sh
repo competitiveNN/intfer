@@ -1054,14 +1054,18 @@ python3 - "$MUTANT" <<'PYX' || { echo "N-V ANCHOR STALE: the STEPS list has no r
 import re, sys
 p = sys.argv[1]
 s = open(p).read()
-m = re.search(r'STEPS="([^"]*)"', s)
-if not m:
-    print("no STEPS= line found")
+# Pick the LAST plain assignment whose tokens are ALL scripts. The FIRST
+# `STEPS="..."` in this file is the override `STEPS="$INTFER_RUN_ALL_STEPS"`, whose
+# single token is not a script -- and patching THAT produced a mutant whose STEPS
+# never changed, so N-V scored MISSED for a reason that had nothing to do with the
+# defect it exists to reproduce. A derived anchor is only better than a written
+# one if it derives the RIGHT thing.
+cands = [c for c in re.findall(r'STEPS="([^"]*)"', s)
+         if c.split() and all(t.endswith(".sh") for t in c.split())]
+if not cands:
+    print("no STEPS= line holds a script list")
     sys.exit(1)
-toks = m.group(1).split()
-if not toks:
-    print("STEPS list is empty")
-    sys.exit(1)
+toks = cands[-1].split()
 old_tail = toks[-1] + '"'
 new_tail = toks[-1] + ' check_stack_cert.sh"'
 if s.count(old_tail) != 1:
