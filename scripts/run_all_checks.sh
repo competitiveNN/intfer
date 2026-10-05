@@ -357,6 +357,15 @@ dispatch() { # $1 = label -> runs it
       # Read-only, no GPU, no build. rc=2 (no artifact) is UNPROVEN, not a
       # regression, and the 2b re-run path handles it.
       timeout -k 30 300 bash "$SCRIPT_DIR/check_engine_cert.sh"; return $? ;;
+    test_roofline_bisect.sh)
+      # The SECOND half of the M=1 INT2 GEMV bisect, in its own translation unit.
+      # The single-TU probe could not hold it: one probe TU crosses the level-zero
+      # OUT_OF_RESOURCES (40) limit at roughly six to eight INT2 kernel bodies, which
+      # is why two single-change arms (VERB+HALF, VERB+MP) were written and never
+      # measured. No model bound; device event timestamps; runs its own always-red
+      # twin first. It may only claim ITS OWN ratios -- the module and branch
+      # candidates were falsified by roofline_probe.
+      timeout -k 30 1800 bash "$SCRIPT_DIR/test_roofline_bisect.sh"; return $? ;;
     test_rowpair_equiv.sh)
       # The MEASURED bitwise-equivalence check for INTFER_DECODE1_ROWPAIR. Runs the
       # binary TWICE in two processes -- quant_gemm_forward_usm reads the flag into
@@ -807,7 +816,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   # checkers-only, and a band that silently skipped a gate would be the
   # audit #18 shape (an arm that never runs certifies nothing).
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS test_roofline_probe.sh test_rowpair_equiv.sh"
+    STEPS="$STEPS test_roofline_probe.sh test_roofline_bisect.sh test_rowpair_equiv.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \

@@ -1,0 +1,6 @@
+add_executable(roofline_probe_bisect main.cpp)
+target_link_libraries(roofline_probe_bisect PRIVATE intfer_device intfer_gemm intfer_common)
+if(INTFER_ENABLE_L0)
+  target_link_libraries(roofline_probe_bisect PRIVATE intfer_l0)
+endif()
+add_sycl_to_target(TARGET roofline_probe_bisect SOURCES main.cpp)

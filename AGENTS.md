@@ -87,10 +87,13 @@ correct behaviour and not something to work around. Rewrite it when the gate
 population changes; the checker fails if you do not:
 
 ```
-gate tally: 13 PASS, 0 PARTIAL, 0 SKIPPED
+gate tally: 14 PASS, 0 PARTIAL, 0 SKIPPED
   (+1 on 2026-10-05: `test_roofline_probe`, the model-free
   allocator-vs-kernel discriminator for decode's bandwidth deficit.
   Device event timestamps, no model bound, ~30 s.
+  +1 on 2026-10-06: `test_roofline_bisect`, the second half of the M=1
+  INT2 GEMV bisect, in its own translation unit because one probe TU
+  crosses the level-zero OUT_OF_RESOURCES limit. No model bound, ~1 min.
   +1: `test_rowpair_equiv`, the MEASURED bitwise-equivalence check for
   `INTFER_DECODE1_ROWPAIR` -- 227 835 element values over 8 shapes x 5
   datasets, two process invocations, no model bound.)
@@ -525,29 +528,46 @@ SHIPPED (shipped source,
 * **So ~4.5-5x of the 5.6-6.4x sits in the shared text of the two functions**, not
   in the module and not in the branch.
 
-### The bisect is half-finished, and the blocker is recorded rather than hidden
+### The bisect: two candidates falsified, two arms LANDED BUT UNMEASURED
 
 The next two steps were single-change arms off `VERBATIM`, each differing in ONE
-place:
+place. They were **written and never measured**, because adding them pushed that
+probe's translation unit past the level-zero `UR_RESULT_ERROR_OUT_OF_RESOURCES` (40)
+limit on submit.
 
-* **`VERB+HALF`** -- `from_half_bits` (the engine's branchy scalar FP16->FP32
-  twiddle, 3 branches per call) replaced by `sycl::bit_cast<sycl::half>`. Called
-  once per GROUP, so 320x per work-item at MLP_GATE.
-* **`VERB+MP`** -- the weight side read through a `multi_ptr` instead of a raw
-  `code_u8[b0]` pointer.
+**That limit is the actionable finding**: *one probe TU holds roughly six to eight
+INT2 kernel bodies.* The fix is to split the ladder across two binaries, not to shrink
+it further -- a smaller ladder answers fewer questions. `examples/roofline_probe_bisect`
+is that second binary (arms: `table` control, `VERBATIM`, `VERB+HALF`, `VERB+MP`,
+`SHIPPED`, all interleaved), gated by `scripts/test_roofline_bisect.sh`.
 
-**Neither was measured.** Adding them pushed this translation unit past the
-**level-zero `UR_RESULT_ERROR_OUT_OF_RESOURCES` (40) limit on submit** -- nine
-near-identical kernel bodies in one JIT module will cross it, and deleting the
-already-settled arms (`select`, `table16`, `select16`, `VERB+TPL`) brought it back
-under but not far enough to fit both new arms.
+**IT HAS NEVER COMPLETED A RUN, AND NO RESULT IS CLAIMED FROM IT.** Every arm hangs
+including `table`; each arm tested ALONE also hangs, so the fault is **not** in the
+shipped call; the sibling `roofline_probe` completes in 6.3 s on the same box at the
+same moment, so it is not a GPU-wide outage; and the timed-out runs wedged the
+driver's `kworker/*+xe_page_fault_work_queue` (a documented box condition --
+`scripts/gpu_recover.sh`, remedy `rebind`, needs sudo).
 
-**That limit is itself the actionable finding**, and it is a real constraint on
-whoever continues: *one probe TU holds roughly six to eight INT2 kernel bodies.*
-The fix is to split the ladder across two probe binaries or accept a smaller
-ladder per run. Do not discover it again by adding one more arm.
+**Two hypotheses were falsified before any were asserted**, which is the part worth
+keeping:
 
-Full account in `reports/2026-10-05-batch-gemv-roofline.md`.
+* **"The module."** DEAD by its own pre-committed criterion: moving the shipped source
+  to a small TU buys **1.26x**, not the 2x the criterion demanded.
+* **"The runtime branch."** DEAD, measured: `use_int2_tab` is a host-read bool
+  guarding a two-copy inner loop *inside* the per-group loop, which runs 320x per
+  work-item at MLP_GATE; making it a **template parameter** so `if constexpr` deletes
+  the branch AND one loop body measures **1.007x**.
+* And, before asserting either of my own: **"the chunk loop overshoots because
+  `step = row_lanes*kVSg = 128` while a group is 16 wide, so half of every group is
+  dropped." FALSE** -- reproducing the phase formula on the CPU gave **128 of 128
+  k-values covered and all 16 lanes contributing** (group g is served by lanes 2g and
+  2g+1, cycling with period 8). I was about to "fix" a working decomposition.
+* **"A lane offset in `code_u8[b0]`.** FALSE: it indexes the UNOFFSET base with ABSOLUTE
+  offsets, which is correct.
+
+So **~4.5-5x of the 5.6-6.4x is still unexplained**, and the honest state is two
+candidates dead, two named, neither measured. Full account and the certification set an
+arm would need if it wins: `reports/2026-10-06-decode1-gemv-bisect.md`.
 
 ### What the same probe retired, so nobody re-attempts them
 
