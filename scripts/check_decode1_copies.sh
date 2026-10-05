@@ -125,11 +125,14 @@ for k in "${ALL_D1[@]}"; do
       echo "     exempt-by-reason    $k  (the FP16 M=1 path: half x half FMA, no" \
            "2-bit codebook to drift; 57.9% of decode traffic)" ;;
     gemm_usm_decode1_subgroup)
-      # SUBGROUP reuses the SAME 8-element block-cyclic body as split-K, so the
-      # subset relation is the right one; only its REDUCTION differs
-      # (reduce_over_group instead of a local_accessor chain), and the reduction
-      # holds none of these atoms.
-      echo "     covered-by-subset  $k" ;;
+      # QUARANTINED 2026-10-05: the kernel produced a wrong answer and was removed.
+      # The enumeration is DERIVED from the source, so once the body is gone this
+      # case is unreachable -- and leaving it here would be worse than dead code,
+      # because the checker itself caught it: "covered-by-subset but did not
+      # extract (0 lines)". Keeping the required-set entry would have turned the
+      # quarantine into a red stack.
+      echo "     quarantined        $k  (kernel removed 2026-10-05; see" \
+           "reports/2026-10-05-decode1-subgroup.md)" ;;
     *) echo "     UNCOVERED           $k  <-- no pin and no stated reason" ;;
   esac
 done
@@ -141,14 +144,14 @@ if printf '%s\n' "${ALL_D1[@]}" | grep -qx 'gemm_usm_decode1_rowpair' && [ "$rp_
 fi
 # An UNCOVERED entry is drift in the POPULATION, not a style note.
 if printf '%s\n' "${ALL_D1[@]}" | grep -qvE \
-     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_subgroup|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair)$'; then
+     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair)$'; then
   echo "  FAIL  a decode1 body is neither pinned nor exempted -- enumerate it" >&2
   printf '%s\n' "${ALL_D1[@]}" | sed 's/^/        /' >&2
   exit 1
 fi
 body_rp="$(extract_body gemm_usm_decode1_rowpair)"
 n_rp="$(printf '%s\n' "$body_rp" | grep -c . || true)"
-for extra in gemm_usm_decode1_vec_mr gemm_usm_decode1 gemm_usm_decode1_subgroup; do
+for extra in gemm_usm_decode1_vec_mr gemm_usm_decode1; do
   b="$(extract_body "$extra")"
   n="$(printf '%s\n' "$b" | grep -c . || true)"
   if [ "$n" -lt 5 ]; then
@@ -240,7 +243,7 @@ n_sk_a="$(printf '%s\n' "$atoms_sk" | grep -c . || true)"
 # canon_value() rather than the wtab table. So they are checked for EXTRACTION and
 # reported, not folded into the 7-atom subset -- claiming they were in it would
 # inflate the number, which is the "handcounted sites" defect in a new place.
-for extra in gemm_usm_decode1_vec_mr gemm_usm_decode1 gemm_usm_decode1_subgroup; do
+for extra in gemm_usm_decode1_vec_mr gemm_usm_decode1; do
   b="$(extract_body "$extra")"
   a="$(atoms "$b" | grep -c . || true)"
   echo "-- $extra: $a atom(s) under the shared extractor (reported, not in the subset)"
