@@ -318,17 +318,36 @@ The third is the important one, and it is why §1's claim is measured rather tha
 argued. **The stack also found that two PRE-EXISTING arms kill the CLI**, and that
 is the reason the stack is red and not green:
 
-| arm | state | evidence |
+| arm | state | evidence, on a healthy 2-GPU box, every run |
 |---|---|---|
-| `INTFER_DECODE1_ROWPAIR` | **GREEN** | tp2 arm green; 227 835 element values bitwise identical |
-| `INTFER_DECODE1_SPLITK` | **RED, pre-existing, cause NOT located** | `rc=137` (SIGKILL) *after* `[decode1-splitk]` announces itself, so the branch is reached and the fault is in the kernel. Host RAM was not the cause (44 GB free). |
-| `INTFER_DECODE1_SUBGROUP` | **RED, pre-existing, cause NOT located** | `rc=137`, same shape |
+| `INTFER_DECODE1_ROWPAIR` | **GREEN** | ids match base; 227 835 element values bitwise identical |
+| `INTFER_DECODE1_MR` | **GREEN** | ids match base |
+| `INTFER_DECODE1_SPLITK` | **GREEN here**; one `rc=137` (SIGKILL) earlier that did **not** reproduce | ids match base on the later run; the kill is unexplained and **not** claimed fixed |
+| `INTFER_DECODE1_SUBGROUP` | **RED — NUMERICALLY WRONG, deterministic** | `ids '279 12 12'` vs base `'13 198 760'`, after `[decode1-subgroup]` announces itself |
 
-Because `check_device_precond.sh` runs `test_tp2_27b.sh` in its **healthy** column,
-those two reds propagate to `DEVICE PRECOND: FAIL` and then to
-`run_all_checks.sh`. That is the gate working: a gate that goes red on a healthy
-box is exactly what it is for. **They are recorded, not relaxed** — the next step
-is to bisect both against a model-free shape, not to skip the arms.
+*** A CORRECTION TO THIS REPORT'S OWN EARLIER TEXT. *** An earlier revision recorded
+SPLITK as red too, on the strength of one `rc=137`. Re-running showed it producing
+the correct ids. So only **SUBGROUP** is reliably red, and its symptom is **wrong
+output, not a crash** — a different and stronger claim.
+
+That is a useful bisect rather than just a defect: SUBGROUP and SPLITK are both the
+16-way K split and differ **only in the reduction** (sub-group
+`reduce_over_group` tree vs per-work-group `local_accessor` chain). SPLITK's ids are
+right and SUBGROUP's are wrong, so **the K split is shared and sound, and the
+reduction is what to test.** Nothing is guessed beyond that, and the cause is not
+located.
+
+`check_device_precond.sh` runs this gate in its **healthy** column, so the one red
+propagates to `DEVICE PRECOND: FAIL` and then to `run_all_checks.sh`. That is the
+gate working. **It is recorded, not relaxed** — relaxing the assertion to make the
+stack green would invert the gate's purpose.
+
+### The quick stack's actual result
+
+`INTFER_QUICK=1 ./scripts/run_all_checks.sh` on this tree: **exactly one step fails**,
+`check_device_precond.sh`, and it fails for the reason above and no other. Every
+other checker is `ok`. The 24 `STALE` matrix stamps are the expected
+stale-evidence class after a commit, not a regression.
 
 A fourth finding, and the most uncomfortable: **I committed `4ddbfac` while a
 sibling session's `run_all_checks.sh` was live.** That is precisely the condition

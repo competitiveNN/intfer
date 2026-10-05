@@ -683,11 +683,31 @@ else
   grep -a '\[decode1-rowpair\]' "$RP_ERR" | head -1
 fi
 
-# --- INTFER_DECODE1_SPLITK / SUBGROUP ARE **KNOWN RED** (2026-10-05) -------------
-# MEASURED on a healthy 2-GPU box: both arms run, BOTH ANNOUNCE THEMSELVES, and
-# then the CLI dies with rc=137 (SIGKILL). Host RAM was not the cause (44 GB free).
-# The cause is NOT located and is deliberately not guessed.
+# --- INTFER_DECODE1_SUBGROUP IS **KNOWN RED** (2026-10-05) ----------------------
+# MEASURED on a healthy 2-GPU box, every run: the arm runs, ANNOUNCES ITSELF, and
+# produces ids '279 12 12' against a base of '13 198 760' -- i.e. WRONG OUTPUT, not
+# a crash. It is one sub-group per output row with a `reduce_over_group` tree
+# reduction, and it differs from INTFER_DECODE1_SPLITK only in the reduction -- yet
+# SPLITK's ids match base. So the K SPLIT is shared and sound and THE REDUCTION is
+# the bisect. The cause is NOT located and is deliberately not guessed.
 #
+# `INTFER_DECODE1_SPLITK` also produced rc=137 (SIGKILL) on ONE earlier run and
+# correct ids on a later one, so the kill did not reproduce and is NOT claimed fixed
+# either. Do not delete this paragraph because the latest run was green; record that
+# it was intermittent.
+#
+# `INTFER_DECODE1_ROWPAIR` (same change) is GREEN here and is separately MEASURED
+# bit-exact by scripts/test_rowpair_equiv.sh -- 227 835 element values, 8 shapes x
+# 5 datasets, two process invocations. It was NOT green when this comment was
+# written: it lost the device on both INT2 shapes, and check_device_precond.sh's
+# healthy run is what surfaced it.
+#
+# This gate is therefore RED, and check_device_precond.sh runs it in its HEALTHY
+# column, so the red propagates to DEVICE PRECOND and then to run_all_checks.sh.
+# That is CORRECT: a gate that goes red on a healthy box is exactly what it is for.
+# Do not relax the assertions or skip the arm to make the stack green -- the kernel
+# is wrong, not the check.
+
 # This gate is therefore RED, and `check_device_precond.sh` runs it in its HEALTHY
 # column, so the red propagates to `DEVICE PRECOND: FAIL` and then to
 # `run_all_checks.sh`. That is CORRECT: a gate that goes red on a healthy box is

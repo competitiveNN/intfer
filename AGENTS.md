@@ -577,20 +577,27 @@ the *count* of gates, not their colour, and a red gate is a gate.
 
 | arm | state | evidence |
 |---|---|---|
-| `INTFER_DECODE1_ROWPAIR` | **PASS** | 27B TP=2 arm green, and `scripts/test_rowpair_equiv.sh` measures **227 835 element values bitwise identical** to the base M=1 kernel over 8 shapes x 5 datasets |
-| `INTFER_DECODE1_SPLITK` | **RED, pre-existing, UNFIXED** | `rc=137` (SIGKILL) after `[decode1-splitk]` announces itself |
-| `INTFER_DECODE1_SUBGROUP` | **RED, pre-existing, UNFIXED** | `rc=137` (SIGKILL) after `[decode1-subgroup]` announces itself |
+| `INTFER_DECODE1_ROWPAIR` | **GREEN** | 27B TP=2 ids match base, and `scripts/test_rowpair_equiv.sh` measures **227 835 element values bitwise identical** to the base M=1 kernel over 8 shapes x 5 datasets |
+| `INTFER_DECODE1_MR` | **GREEN** | ids match base |
+| `INTFER_DECODE1_SPLITK` | **GREEN here**, but ONE `rc=137` (SIGKILL) on an earlier run that did **not** reproduce | ids match base on the later run; the kill is not explained and is not claimed fixed |
+| `INTFER_DECODE1_SUBGROUP` | **RED — NUMERICALLY WRONG, deterministic, cause NOT located** | `ids '279 12 12'` vs base `'13 198 760'`, on every run, after `[decode1-subgroup]` announces itself |
 
-Both reds are the 16-way split-K family. Both **announce themselves before dying**,
+*** CORRECTION TO AN EARLIER STATEMENT IN THIS FILE. *** A previous revision of
+this banner recorded SPLITK as red alongside SUBGROUP, on the strength of one
+`rc=137`. Re-running the gate showed SPLITK producing the correct ids. So the
+honest state is: **only SUBGROUP is reliably red**, and its symptom is not a crash
+but **wrong output** -- a stronger claim than "it dies", and a different bug class.
+
+`INTFER_DECODE1_SUBGROUP` **announces itself before producing the wrong answer**,
 so the branch is reached and the fault is inside the kernel, not a flag that failed
-to take effect. Host RAM was not the cause (44 GB free at the time). **The cause is
-NOT located** and is deliberately not guessed: `check_device_precond.sh` runs
-`test_tp2_27b.sh` in its healthy column, so this red propagates to
-`DEVICE PRECOND: FAIL`, which is why `run_all_checks.sh` is red.
+to take effect. It is one sub-group per output row with a `reduce_over_group` tree
+reduction, and it differs from `INTFER_DECODE1_SPLITK` only in the reduction -- yet
+SPLITK is right and SUBGROUP is wrong. **That difference is the bisect**: the K
+split is shared, so the reduction is the thing to test. Do NOT "fix" the gate by
+relaxing it -- the gate is right and the kernel is wrong.
 
-Next session, the first thing to do about them: bisect `INTFER_DECODE1_SPLITK` and
-`INTFER_DECODE1_SUBGROUP` against a model-free shape before anything else. Do not
-"fix" the gate by relaxing it -- the gate is right and the kernels are wrong.
+`check_device_precond.sh` runs `test_tp2_27b.sh` in its healthy column, so this one
+red propagates to `DEVICE PRECOND: FAIL`, which is why `run_all_checks.sh` is red.
 
 ### What the stack found that a hand-picked check list never would have
 
