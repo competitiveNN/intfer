@@ -19,7 +19,7 @@ Two GPUs present and healthy this run. Source:
 M=1 INT2 GEMV ladder. It answers one narrow question, set up so a "no" is still
 a result:
 
-> Does the ~7x gap between the transcribed SHIPPED source (VERBATIM, ~30 GB/s)
+> Does the ~7x gap between the transcribed SHIPPED source (VERBATIM, ~30 GB/s) CITATION(bisect-4, device 0: device event timestamps, medians over 12 interleaved reps, dual Arc Pro B580)
 > and the roofline_probe `int2_variant<0>` clone (~58 GB/s) live in any of
 > these **single changes**, or in the shared text of the two functions?
 
@@ -29,7 +29,7 @@ as every other bisect binary (MLP_GATE 8704×5120 g16, MLP_DOWN 2560×17408 g16)
 
 | arm | ONE change from VERBATIM | MLP_GATE | MLP_DOWN |
 |---|---|---|---|
-| VERBATIM | (baseline) | 31.3 GB/s | 18.1 GB/s |
+| VERBATIM | (baseline) | 31.3 GB/s | 18.1 GB/s | CITATION(bisect-4, device 0: device event timestamps)
 | VERB+bitcast | group scale + tail activation via `bit_cast<half>` instead of branchy `half_to_float` | 35.0 GB/s | 20.7 GB/s |
 | VERB+bitcast+4 | + probe's 4-byte code loads (`v0..v3`) | 34.9 | 20.7 |
 | VERB+bitcast+4+vsel | + probe's 3-ternary `bv` selector | 34.9 | 20.7 |
@@ -60,7 +60,7 @@ that hypothesis is expected to fail too; this run does not test it directly.
 
 ## The always-red twin (held)
 
-`ceiling 0.206 ms 254.7 GB/s (55.9% of peak)`; `twin ... ratio to full = 0.23
+`ceiling 0.206 ms 254.7 GB/s (55.9% of peak)` CITATION(docs/Intel Arc B580 Specs _ TechPowerUp GPU Database.html; roofline_probe, device 0: device event timestamps, medians over 12 interleaved reps); `twin ... ratio to full = 0.23
 (linear would be 0.25)`. A quarter of the bytes taking ~0.23x of the time
 holds, so the device event timestamps are tracking traffic.
 
