@@ -72,7 +72,7 @@ classify() {
   local sig
   for sig in INT TERM; do
     local body
-    body="$(printf '%s\n' "$code" | grep -E "^[[:space:]]*trap[[:space:]]+.*[[:space:]]$sig\$" | head -1)"
+    body="$(printf '%s\n' "$code" | grep -E "^[[:space:]]*trap[[:space:]]+.*\b$sig\b" | head -1)"
     if [ -z "$body" ]; then
       REASON="cleanup trap present but NO $sig trap -- an EXIT-only trap never runs on SIG$sig, so it leaks"
       return 1

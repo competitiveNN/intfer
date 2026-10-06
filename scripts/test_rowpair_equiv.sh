@@ -110,7 +110,9 @@ marker_verdict() {
 # MUST be refused. No GPU, no launch, no binary.
 if [ "${1:-}" = "--self-check" ]; then
   SC="$(mktemp -d "${TMPDIR:-/dev/shm}/rpequiv.XXXXXX")"
-  trap 'rm -rf "$SC"' EXIT INT TERM
+  trap 'rm -rf "$SC"' EXIT
+  trap 'rm -rf "$SC"; exit 130' INT
+  trap 'rm -rf "$SC"; exit 143' TERM
   bad=0
   # FIXTURES. Each is a COMPLETE, correctly-shaped stderr; they differ in EXACTLY
   # ONE thing, because a fixture that differs in several cannot isolate its defect.
