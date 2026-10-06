@@ -531,6 +531,14 @@ dispatch() { # $1 = label -> runs it
       # non-empty floor. FG-3 is the inverse that proves the floors are what does
       # the catching rather than the state passing for an unrelated reason.
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_flag_gate_coverage.sh"; return $? ;;
+    mutate_roofline_bisect.sh)
+      # The gate for test_roofline_bisect.sh enforces EXIT SEMANTICS rather than
+      # source correctness, and those semantics were themselves the defect: the
+      # first version returned rc=124 with EMPTY OUTPUT, which the runner reads as a
+      # REGRESSION and which cost it the whole step budget. 4 states, all caught,
+      # against a STUB probe so no real GPU job is launched; 2 states excluded with
+      # their reason and 1 dropped with its reason, all recorded in the file.
+      timeout -k 30 1200 bash "$SCRIPT_DIR/mutate_roofline_bisect.sh"; return $? ;;
     mutate_decode1_copies.sh)
       # AUDIT #11 direction: these states mutate the ARTIFACT (quant_gemm.cpp),
       # not the checker, because an artifact that is correct by construction
@@ -820,7 +828,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_roofline_bisect.sh mutate_build_dir_consumers.sh mutate_doc_counts.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_fold_report_class.sh mutate_gate_pop.sh mutate_result_block.sh mutate_bench_load_gate.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
