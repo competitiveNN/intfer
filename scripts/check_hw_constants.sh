@@ -44,35 +44,20 @@
 # today's hardware is the same laundering failure AGENTS.md warns about in the
 # other direction (see its [SUPERSEDED ...] discipline on gate tallies). The
 # correction is delivered instead as an annotation on the LIVE doc plus this
-# checker, which stops the claim from being re-read as current. `reports/` was
-# retired 2026-10-06 with the batch-and-test loop and no longer holds live
-# reports. `scripts/` is excluded because the subject is documents, not tooling;
-# a checker here legitimately contains the defect text as a fixture, and gating
-# itself on its own fixtures would be a class of defect this repo has already
-# paid for.
+# checker, which stops the claim from being re-read as current.
 #
-# Exit: 0 = every figure is cited; 1 = an uncited figure, or the self-check could
-#        not behave (a rule that cannot fail proves nothing); 2 = corpus empty.
-set -u
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-# Seam: the subject is OTHER files, so a mutation harness must be able to hand this
-# a corpus of its own. Same reason INTFER_SCRIPTS_DIR exists on check_dri_probe.sh.
-DOCS_DIR="${INTFER_DOCS_DIR:-$ROOT}"
-REPORTS_SUBDIR="reports"
-
-# classify <file>: 0 = clean, 1 = VIOLATION (uncited hardware figure)
-#                2 = not applicable (states no such figure at all)
+# *** CORRECTION TO THE NOTE AT LINE 47-48, 2026-10-06: `reports/` WAS NOT
+# retired and DOES hold live reports. The claim that it no longer holds live
+# reports was itself a stale prose assertion about scope -- precisely the
+# laundering this checker exists to stop -- and it let an uncited figure
+# through (reports/2026-10-06-batch-bisect-4.md). The note is corrected here
+# rather than the scope quietly widened, because widening scope until a
+# defect disappears is the failure this file was written to prevent.
+# `scripts/` IS excluded: the subject is documents, not tooling, and a checker
+# here legitimately contains the defect text as a fixture; gating itself on its
+# own fixtures would be a class of defect this repo has already paid for.
 #
-# IMPLEMENTED IN PYTHON, and the reason is recorded because the first bash version
-# was wrong in three ways the self-check caught: `sed -n "0,2p"` is a hard error when
-# a figure sits on line 1 (so line-1 figures were never counted as cited); the +/-1
-# window forced a CITATION() marker into the middle of narrative prose at every
-# figure, which is unreadable and would have been "fixed" by widening the window
-# until it meant nothing; and the case-insensitivity of the unit match was implicit
-# in one place and absent in another.
-#
-# SCOPE OF THE CITATION WINDOW, chosen deliberately: a figure is cited if a
+# Scope of the citation window, chosen deliberately: a figure is cited if a
 # CITATION(...) marker appears anywhere in the same blank-line-delimited PARAGRAPH.
 # That is "at the claim site" -- not on the same line, and emphatically not
 # somewhere in the document, which is the vacuous version. It still rejects every
