@@ -855,6 +855,255 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
         });
       }
 
+      // ====================================================================
+      // BISECT ROUND 2. Three more single-change arms off the SHIPPED body, all
+      // BIT-EXACT BY CONSTRUCTION so `examples/rowpair_equiv` can give a hard
+      // verdict on them TODAY without a model and without a 27B load. Round 1's
+      // VERBHALF is the exception and is stream-identity only.
+      //
+      // WHY THESE THREE AND NOT THE OBVIOUS ONES. Two candidates that sound
+      // equivalent are not, and writing them would have been bugs:
+      //   * "hoist the group scale out of the per-group loop". IMPOSSIBLE as stated:
+      //     the scale is PER GROUP -- `from_half_bits(sptr[g])` with
+      //     num_groups = K/Gw = 320 at MLP_GATE. Hoisting it out would reuse one
+      //     group's scale for all 320 and change the arithmetic. What CAN be hoisted
+      //     is the code AROUND it, which is VERBDEAD below.
+      //   * "avoid the per-group multi_ptr re-derivation". The base kernel already
+      //     constructs `act_mp` and `wmp` ONCE, outside the group loop; there is
+      //     nothing per-group to avoid.
+      // ====================================================================
+
+      // ---- INTFER_DECODE1_VERBDEAD: dead per-group locals removed -----------
+      // ONE change, and it is pure CODE MOTION: `bytes_per_chunk` and `code_mask`
+      // are computed INSIDE the per-group loop and are dead on the `use_int2_tab`
+      // path (they belong to the generic `else` branch, which this guard does not
+      // take). The compiler must prove that per iteration. Hoisting them to the
+      // function scope -- or deleting them, since this arm never takes the branch
+      // that uses them -- is arithmetically a no-op, so this arm is BIT-EXACT BY
+      // CONSTRUCTION and a difference means the compiler did something we did not
+      // ask for. It is the cheapest arm in the batch and the first thing to run,
+      // because if it pays the others are not needed.
+      const bool use_verbdead =
+          (std::getenv("INTFER_DECODE1_VERBDEAD") != nullptr) &&
+          (std::getenv("INTFER_NO_DECODE1_VERBDEAD") == nullptr);
+      if (use_verbdead && bits == 2 && use_int2_tab && num_groups > 0) {
+        static const bool announced = [] {
+          std::fprintf(stderr,
+                       "[decode1-verbdead] dead per-group locals removed "
+                       "(bit-exact by construction: pure code motion) ACTIVE\n");
+          return true;
+        }();
+        (void)announced;
+        // Hoisted OUT of the group loop and, on this path, UNUSED -- which is the
+        // point. `bytes_per_chunk`/`code_mask` feed only the generic packed branch
+        // below, which this guard excludes.
+        const int bytes_per_chunk = 8 / 4;
+        const int code_mask = 3;
+        (void)bytes_per_chunk; (void)code_mask;
+        return q.submit([&](sycl::handler& h) {
+          h.depends_on(copy_dep);
+          h.parallel_for<class gemm_usm_decode1_verbdead>(
+              sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+              [=](sycl::nd_item<1> it) {
+                const int ng = static_cast<int>(it.get_global_id(0));
+                if (ng >= N) return;
+                float acc = 0.0f;
+                const std::uint16_t* sptr = scale_usm + ng * num_groups_w;
+                const std::size_t row_base = static_cast<std::size_t>(ng) * K;
+                sycl::multi_ptr<const std::uint16_t,
+                    sycl::access::address_space::global_space> act_mp(act_usm);
+                sycl::multi_ptr<const std::uint8_t,
+                    sycl::access::address_space::global_space> wmp(code_u8 + row_base);
+                for (int g = 0; g < num_groups; ++g) {
+                  const float scale = from_half_bits(sptr[g]) * alpha;
+                  const int kg0 = g * Gw;
+                  int kg1 = kg0 + Gw;
+                  if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+                  const float wtab[4] = {scale * -1.0f, scale * (-1.0f / 3.0f),
+                                         scale * (1.0f / 3.0f), scale * 1.0f};
+                  constexpr int CC = 8;
+                  int kg = kg0;
+                  std::size_t b0 = (row_base + static_cast<std::size_t>(kg)) / 4u;
+                  for (; kg + CC <= kg1; kg += CC) {
+                    sycl::vec<std::uint16_t, 8> a16;
+                    a16.load(0, act_mp + kg);
+                    const std::uint8_t b0v = code_u8[b0];
+                    const std::uint8_t b1v = code_u8[b0 + 1];
+                    b0 += 2;
+                    for (int j = 0; j < CC; ++j) {
+                      const float av =
+                          static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                      const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                      const int code = (bv >> ((j & 3) * 2)) & 3;
+                      acc += av * wtab[code];
+                    }
+                  }
+                  for (; kg < kg1; ++kg) {
+                    const float av = from_half_bits(act_usm[kg]);
+                    const std::size_t idx = row_base + static_cast<std::size_t>(kg);
+                    const int code =
+                        static_cast<int>((code_u8[idx / 4] >> ((idx % 4) * 2)) & 3);
+                    acc += av * scale * canon_value(2, code);
+                  }
+                }
+                out_usm[ng] = to_half_bits(acc);
+              });
+        });
+      }
+
+      // ---- INTFER_DECODE1_VERBSEL: the 4-float codebook by SELECT ------------
+      // ONE change: `wtab[code]` (a 4-float array indexed by a runtime value)
+      // becomes a select chain over the SAME four values held in named registers.
+      //
+      // *** AND THIS IS THE HYPOTHESIS THAT WAS FALSIFIED IN THE WRONG BODY. ***
+      // examples/roofline_probe compared `table` against `select` and got 1.01x --
+      // but BOTH of those were in the probe's own TIDY CLONE, where the compiler
+      // had already normalised the array. This tests the SAME transformation in
+      // the SHIPPED body, which is 5.6-6.4x slower than that clone and may not
+      // normalise the same way. So the earlier result does not falsify this; it
+      // falsifies the claim that the array is free *in a well-formed copy*.
+      //
+      // BIT-EXACT BY CONSTRUCTION: the four values are the same expressions, so the
+      // selected value is bit-for-bit what the array held. (The arithmetic form
+      // `(2*code-3)/3` is ALSO bit-identical and was verified exhaustively on the
+      // CPU over all 4 codes x 64 scales -- but it is a different change and is not
+      // conflated with this one.)
+      const bool use_verbsel =
+          (std::getenv("INTFER_DECODE1_VERBSEL") != nullptr) &&
+          (std::getenv("INTFER_NO_DECODE1_VERBSEL") == nullptr);
+      if (use_verbsel && bits == 2 && use_int2_tab && num_groups > 0) {
+        static const bool announced = [] {
+          std::fprintf(stderr,
+                       "[decode1-verbsel] 4-float codebook by select, no array "
+                       "(bit-exact by construction) ACTIVE\n");
+          return true;
+        }();
+        (void)announced;
+        return q.submit([&](sycl::handler& h) {
+          h.depends_on(copy_dep);
+          h.parallel_for<class gemm_usm_decode1_verbsel>(
+              sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+              [=](sycl::nd_item<1> it) {
+                const int ng = static_cast<int>(it.get_global_id(0));
+                if (ng >= N) return;
+                float acc = 0.0f;
+                const std::uint16_t* sptr = scale_usm + ng * num_groups_w;
+                const std::size_t row_base = static_cast<std::size_t>(ng) * K;
+                sycl::multi_ptr<const std::uint16_t,
+                    sycl::access::address_space::global_space> act_mp(act_usm);
+                sycl::multi_ptr<const std::uint8_t,
+                    sycl::access::address_space::global_space> wmp(code_u8 + row_base);
+                for (int g = 0; g < num_groups; ++g) {
+                  const float scale = from_half_bits(sptr[g]) * alpha;
+                  const int kg0 = g * Gw;
+                  int kg1 = kg0 + Gw;
+                  if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+                  // THE CHANGE: four named registers instead of an indexed array.
+                  const float w_n1 = scale * -1.0f;
+                  const float w_n3 = scale * (-1.0f / 3.0f);
+                  const float w_p3 = scale * (1.0f / 3.0f);
+                  const float w_p1 = scale * 1.0f;
+                  constexpr int CC = 8;
+                  int kg = kg0;
+                  std::size_t b0 = (row_base + static_cast<std::size_t>(kg)) / 4u;
+                  for (; kg + CC <= kg1; kg += CC) {
+                    sycl::vec<std::uint16_t, 8> a16;
+                    a16.load(0, act_mp + kg);
+                    const std::uint8_t b0v = code_u8[b0];
+                    const std::uint8_t b1v = code_u8[b0 + 1];
+                    b0 += 2;
+                    for (int j = 0; j < CC; ++j) {
+                      const float av =
+                          static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                      const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                      const int code = (bv >> ((j & 3) * 2)) & 3;
+                      const float w = (code == 0) ? w_n1
+                                     : (code == 1) ? w_n3
+                                     : (code == 2) ? w_p3 : w_p1;
+                      acc += av * w;
+                    }
+                  }
+                  for (; kg < kg1; ++kg) {
+                    const float av = from_half_bits(act_usm[kg]);
+                    const std::size_t idx = row_base + static_cast<std::size_t>(kg);
+                    const int code =
+                        static_cast<int>((code_u8[idx / 4] >> ((idx % 4) * 2)) & 3);
+                    acc += av * scale * canon_value(2, code);
+                  }
+                }
+                out_usm[ng] = to_half_bits(acc);
+              });
+        });
+      }
+
+      // ---- INTFER_DECODE1_VERBVEC: activations through a plain pointer --------
+      // ONE change, ADDRESSING ONLY: the activation load goes through a raw
+      // `const std::uint16_t*` + offset instead of a `multi_ptr`. The bytes read and
+      // the arithmetic are unchanged, so this is bit-exact by construction, and it
+      // is the LAST addressing difference between the shipped body and the probe's
+      // tidy clone (which uses a multi_ptr too -- so this tests whether the
+      // multi_ptr is costing anything in EITHER form).
+      const bool use_verbvec =
+          (std::getenv("INTFER_DECODE1_VERBVEC") != nullptr) &&
+          (std::getenv("INTFER_NO_DECODE1_VERBVEC") == nullptr);
+      if (use_verbvec && bits == 2 && use_int2_tab && num_groups > 0) {
+        static const bool announced = [] {
+          std::fprintf(stderr,
+                       "[decode1-verbvec] activations through a plain pointer "
+                       "(addressing only, bit-exact by construction) ACTIVE\n");
+          return true;
+        }();
+        (void)announced;
+        return q.submit([&](sycl::handler& h) {
+          h.depends_on(copy_dep);
+          h.parallel_for<class gemm_usm_decode1_verbvec>(
+              sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+              [=](sycl::nd_item<1> it) {
+                const int ng = static_cast<int>(it.get_global_id(0));
+                if (ng >= N) return;
+                float acc = 0.0f;
+                const std::uint16_t* sptr = scale_usm + ng * num_groups_w;
+                const std::size_t row_base = static_cast<std::size_t>(ng) * K;
+                const std::uint16_t* actp = act_usm;   // THE CHANGE
+                sycl::multi_ptr<const std::uint8_t,
+                    sycl::access::address_space::global_space> wmp(code_u8 + row_base);
+                for (int g = 0; g < num_groups; ++g) {
+                  const float scale = from_half_bits(sptr[g]) * alpha;
+                  const int kg0 = g * Gw;
+                  int kg1 = kg0 + Gw;
+                  if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+                  const float wtab[4] = {scale * -1.0f, scale * (-1.0f / 3.0f),
+                                         scale * (1.0f / 3.0f), scale * 1.0f};
+                  constexpr int CC = 8;
+                  int kg = kg0;
+                  std::size_t b0 = (row_base + static_cast<std::size_t>(kg)) / 4u;
+                  for (; kg + CC <= kg1; kg += CC) {
+                    sycl::vec<std::uint16_t, 8> a16;
+                    a16.load(0, actp + kg);          // THE CHANGE
+                    const std::uint8_t b0v = code_u8[b0];
+                    const std::uint8_t b1v = code_u8[b0 + 1];
+                    b0 += 2;
+                    for (int j = 0; j < CC; ++j) {
+                      const float av =
+                          static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                      const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                      const int code = (bv >> ((j & 3) * 2)) & 3;
+                      acc += av * wtab[code];
+                    }
+                  }
+                  for (; kg < kg1; ++kg) {
+                    const float av = from_half_bits(act_usm[kg]);
+                    const std::size_t idx = row_base + static_cast<std::size_t>(kg);
+                    const int code =
+                        static_cast<int>((code_u8[idx / 4] >> ((idx % 4) * 2)) & 3);
+                    acc += av * scale * canon_value(2, code);
+                  }
+                }
+                out_usm[ng] = to_half_bits(acc);
+              });
+        });
+      }
+
       if (use_mr && bits == 2 && use_int2_tab && num_groups > 0) {
         constexpr int MR = 4;
         const int per_group = nWG * MR;

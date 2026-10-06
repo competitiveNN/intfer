@@ -73,17 +73,62 @@ run_order() {  # $1 = order tag
 
 B_RC=0; run_order base "$BASE" || B_RC=$?
 R_RC=0; run_order rp   "$RP"   || R_RC=$?
-VH_RC=0; run_order vh "$BUILD_DIR/rowpair_equiv.verbhalf.txt" || VH_RC=$?
-VM_RC=0; run_order vm "$BUILD_DIR/rowpair_equiv.verbmp.txt"   || VM_RC=$?
+# *** THE ARM TABLE IS DERIVED, NOT TYPED TWICE. *** Adding an order to the binary
+# and forgetting it here would leave an arm silently uncertified, which is how
+# INTFER_DECODE1_SUBGROUP ended up red in the first place -- so the names live in
+# one place and the case arm loop reads them.
+# ONE SPELLING. The binary's order table uses the short tags below; an earlier draft
+# of this gate passed the long names (verbhalf, verbdead, ...) and every new order
+# failed with "unknown DECODE1_EQUIV_ORDER", which is exactly the "added to one place,
+# forgotten in the other" failure this table exists to prevent. The long names are the
+# FLAG names, not the ORDER names; keep the two vocabularies distinct.
+ARMS="rp vh vm vd vs vv"
+ORDERS="base $ARMS"
 
-if [ "$B_RC" -ne 0 ] || [ "$R_RC" -ne 0 ] || [ "$VH_RC" -ne 0 ] || [ "$VM_RC" -ne 0 ]; then
-  echo "FAIL: decode1 equiv orders rc: base=$B_RC rp=$R_RC verbhalf=$VH_RC verbmp=$VM_RC" >&2
-  for t in base rp verbhalf verbmp; do
-    echo "--- $t stderr ---" >&2
-    tail -10 "$BUILD_DIR/rowpair_equiv.$t.err" 2>/dev/null >&2
-  done
-  exit 1
-fi
+rcs=""
+for t in $ORDERS; do
+  f="$BUILD_DIR/rowpair_equiv.$t.txt"
+  case "$t" in
+    base) f="$BASE" ;;
+    rp)   f="$RP" ;;
+    vh)   f="$VH" ;;
+    vm)   f="$VM" ;;
+    vd)   f="$VD" ;;
+    vs)   f="$VS" ;;
+    vv)   f="$VV" ;;
+  esac
+  r=0; run_order "$t" "$f" || r=$?
+  # *** THE ARM MUST HAVE ACTUALLY FIRED. *** A killed arm produces the base kernel's
+  # output, so base-vs-base diffs CLEAN and reads as a pass -- which is precisely the
+  # vacuity that made the previous turn's "VERBMP is BITWISE IDENTICAL" meaningless:
+  # its kill switch was set to "" rather than unset, so the arm never ran. The engine
+  # announces each arm once per process on stderr, so that announcement is the ONLY
+  # evidence the branch was taken, and it is now REQUIRED.
+  if [ "$t" != base ]; then
+    case "$t" in
+      rp) want=decode1-rowpair ;; vh) want=decode1-verbhalf ;;
+      vm) want=decode1-verbmp ;;  vd) want=decode1-verbdead ;;
+      vs) want=decode1-verbsel ;; vv) want=decode1-verbvec ;;
+    esac
+    if ! grep -aq "\[$want\]" "$BUILD_DIR/rowpair_equiv.$t.err" 2>/dev/null; then
+      echo "FAIL: order $t completed but the kernel never announced [$want]." >&2
+      echo "      The arm was KILLED, so this order diffed the base kernel against" >&2
+      echo "      itself and would have reported a clean pass. Vacuous." >&2
+      r=1
+    fi
+  fi
+  rcs="$rcs $t=$r"
+done
+for t in $ORDERS; do
+  case "$rcs" in *"$t=0") ;; *)
+    echo "FAIL: decode1 equiv order $t did not complete ($rcs)" >&2
+    for u in $ORDERS; do
+      echo "--- $u stderr ---" >&2
+      tail -8 "$BUILD_DIR/rowpair_equiv.$u.err" 2>/dev/null >&2
+    done
+    exit 1 ;;
+  esac
+done
 
 # *** THE ASSERTION IS A DIFF, AND A DIFF IS NOT ENOUGH ON ITS OWN. *** A diff of
 # two empty files is a PASS, and "the probe printed nothing" and "the probe agreed"
@@ -93,8 +138,12 @@ fi
 # own checker for, in miniature.
 VH="$BUILD_DIR/rowpair_equiv.verbhalf.txt"
 VM="$BUILD_DIR/rowpair_equiv.verbmp.txt"
+VD="$BUILD_DIR/rowpair_equiv.verbdead.txt"
+VS="$BUILD_DIR/rowpair_equiv.verbsel.txt"
+VV="$BUILD_DIR/rowpair_equiv.verbvec.txt"
 n_base="$(grep -c '|0x' "$BASE" || true)"
-for pair in "rowpair:$RP" "verbhalf:$VH" "verbmp:$VM"; do
+for pair in "rowpair:$RP" "verbhalf:$VH" "verbmp:$VM" \
+            "verbdead:$VD" "verbsel:$VS" "verbvec:$VV"; do
   lbl="${pair%%:*}"; f="${pair#*:}"
   n="$(grep -c '|0x' "$f" || true)"
   if [ "${n_base:-0}" -lt 1000 ] || [ "${n:-0}" -lt 1000 ]; then
@@ -124,7 +173,7 @@ sed 's/|base$//' "$BASE" >"$BASE.norm"
 #             information, not a failure, and is reported as such.
 check_identical() {  # $1 = label, $2 = file
   local lbl="$1" f="$2"
-  sed 's/|rowpair$//; s/|verbhalf$//; s/|verbmp$//' "$f" >"$f.norm"
+  sed 's/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//' "$f" >"$f.norm"
   if cmp -s "$BASE.norm" "$f.norm"; then
     echo "  ok    $lbl is BITWISE IDENTICAL to base ($n_base element values)"
   else
@@ -138,8 +187,13 @@ check_identical() {  # $1 = label, $2 = file
   fi
 }
 rc=0
-check_identical "INTFER_DECODE1_ROWPAIR" "$RP" || rc=1
-check_identical "INTFER_DECODE1_VERBMP " "$VM" || rc=1
+# Every arm whose claim is BIT-EXACT must be IDENTICAL, or the claim is wrong and
+# the gate says so. Round 2's three are all in this class by construction.
+check_identical "INTFER_DECODE1_ROWPAIR " "$RP" || rc=1
+check_identical "INTFER_DECODE1_VERBMP  " "$VM" || rc=1
+check_identical "INTFER_DECODE1_VERBDEAD" "$VD" || rc=1
+check_identical "INTFER_DECODE1_VERBSEL " "$VS" || rc=1
+check_identical "INTFER_DECODE1_VERBVEC " "$VV" || rc=1
 # VERBHALF: report, do not gate.
 sed 's/|verbhalf$//' "$VH" >"$VH.norm"
 if cmp -s "$BASE.norm" "$VH.norm"; then
@@ -176,6 +230,9 @@ echo "RESULT: on $n_base element values over $n_runs (shape,dataset) runs,"
 echo "        $n_shapes distinct shapes x $n_ds distinct datasets:"
 echo "          INTFER_DECODE1_ROWPAIR  BITWISE IDENTICAL  -- claim MEASURED"
 echo "          INTFER_DECODE1_VERBMP   BITWISE IDENTICAL  -- claim MEASURED"
+echo "          INTFER_DECODE1_VERBDEAD BITWISE IDENTICAL  -- pure code motion"
+echo "          INTFER_DECODE1_VERBSEL  BITWISE IDENTICAL  -- codebook by select"
+echo "          INTFER_DECODE1_VERBVEC  BITWISE IDENTICAL  -- activation ptr type"
 echo "        INTFER_DECODE1_VERBHALF reported above: it is claimed NOT bit-exact"
 echo "        (denormal + default FTZ), so a difference is information, not a failure."
 echo "        PERFORMANCE IS STILL UNMEASURED for all three; see"

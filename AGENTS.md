@@ -606,16 +606,44 @@ That looseness is load-bearing and is the second time this repo has paid for it:
 first version matched only the correct `((j & 3) * 2)`, so planting the real
 `INTFER_DECODE1_SPLITK` bug simply stopped it matching and the checker **passed**.
 
-*** `VERBMP`'s CORRECTNESS claim is settled; its PERFORMANCE is not. *** The source
-said "bit-exact BY CONSTRUCTION — A CLAIM, NOT A VERIFIED PROPERTY", on the
-`ROWPAIR` precedent that a bit-exactness *argument* is worth nothing until measured.
-`test_rowpair_equiv.sh` was extended from two orders to FOUR (one PROCESS each --
-the flags are read into a function-local `static const bool`, so an order is a
-process, not a loop) and now reports `INTFER_DECODE1_VERBMP is BITWISE IDENTICAL to
-base (227835 element values)`. **No model, no 27B load.** `VERBHALF` is identical on
-these datasets too, which is information and NOT exoneration: the differing case is a
-zero or subnormal group scale, and synthetic `to_half_bits(~1.0..1.5)` scales never
-produce one.
+*** ==> `VERBMP`'s "bit-exact BY CONSTRUCTION" IS **STILL A CLAIM**. THE MEASUREMENT
+*** ==> THAT SETTLED IT WAS VACUOUS, AND IS RETRACTED HERE. <==
+
+`test_rowpair_equiv.sh` now **REQUIRES each order's kernel to have announced
+itself** before it will diff anything, because a KILLED arm produces the base
+kernel's output and a base-vs-base diff reads as a clean pass. The guard fired
+immediately and killed the previous turn's headline:
+
+```
+FAIL: order vm completed but the kernel never announced [decode1-verbmp].
+```
+
+**Two causes, both mine:**
+
+1. **The binary set the KILL SWITCH instead of unsetting it.** `setenv(KILL, "")`
+   does not unset anything -- `getenv` returns a NON-NULL pointer to an empty
+   string, and every kill switch here reads `== nullptr`, so **every arm read as
+   killed**. `examples/gemm_bench`'s note about a presence-only flag being enabled
+   by `X=0` is the same trap, and the differential walked straight into it.
+   Now `unsetenv(KILL)` for the selected order.
+2. **The verb\* arms still do not fire under the differential even after (1),
+   and the cause is NOT YET LOCATED.** Instrumenting the guard directly
+   (`use_verbhalf=1 bits=2 tab=1 ng=320`) shows the guard's four conditions are
+   ALL TRUE, and the arm body follows the guard in the same block -- yet no
+   `[decode1-verb*]` line reaches stderr. That contradiction is unresolved, and it
+   is recorded unresolved rather than guessed at.
+
+**SO: `VERBMP`, `VERBDEAD`, `VERBSEL` and `VERBVEC` have NO correctness
+measurement, and the earlier `VERBMP` result is withdrawn.** `ROWPPAIR` alone is
+measured (227 835 values, announced, bitwise identical). `test_rowpair_equiv.sh` is
+**RED** on `ad71739`+ because it refuses to certify arms it cannot see running --
+which is the correct behaviour for a gate whose whole purpose is to not certify
+nothing.
+
+**The transferable lesson, and it is the third time this shape has appeared in this
+session:** a diff between two runs proves nothing until you have proved both runs
+did the thing you think they did. Two arms silently ran the base path and reported
+a perfect match.
 
 **PERFORMANCE is UNMEASURED for all three and the direction is UNKNOWN, not
 positive.** Both need

@@ -160,6 +160,9 @@ sk_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-splitk' 'DECOD
 rp_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-rowpair' 'DECODE1_ROWPAIR'; }
 vh_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbhalf' 'DECODE1_VERBHALF'; }
 vm_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbmp' 'DECODE1_VERBMP'; }
+vd_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbdead' 'DECODE1_VERBDEAD'; }
+vs_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbsel' 'DECODE1_VERBSEL'; }
+vv_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbvec' 'DECODE1_VERBVEC'; }
 # The change that added the SUBGROUP arm DEFINED THIS TWICE -- once here and
 # once above beside rp_arm_assert -- and RAN the arm twice, so the gate paid
 # two full 27B decode runs of one flag in its most expensive operation. Bash
@@ -684,6 +687,42 @@ fi
 #           an argument, so this arm is stream-identity only and NOT an arithmetic
 #           claim, in the same class as INTFER_DECODE1_SPLITK.
 for spec in "VERBHALF:vh:decode1-verbhalf" "VERBMP:vm:decode1-verbmp"; do
+  NAME="${spec%%:*}"; rest="${spec#*:}"; abbr="${rest%%:*}"; tag="${rest#*:}"
+  OUT="$LOG.${abbr}.out"; ERR="$LOG.${abbr}.err"
+  env "INTFER_DECODE1_${NAME}=1" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+    -p "$PROMPT" -n "$N" >"$OUT" 2>"$ERR"; RC=$?
+  if [ "$RC" -ne 0 ]; then
+    echo "GATE FAIL: INTFER_DECODE1_${NAME}=1 run exited rc=$RC" >&2
+    tail -20 "$ERR" >&2
+    PASS=0
+  else
+    echo "DECODE1_${NAME} prefill: $(cli_prefill "$ERR") (expect 11751)"
+    echo "DECODE1_${NAME} ids:      $(cli_ids "$ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    if ! grep -aq "\[$tag\]" "$ERR"; then
+      echo "GATE FAIL: INTFER_DECODE1_${NAME} produced the right tokens without the" >&2
+      echo "        path ever running (no [$tag] line). Vacuous." >&2
+      PASS=0
+    fi
+    "${abbr}_arm_assert" "$CLI_ERR" "$ERR" "GATE FAIL: " || PASS=0
+    grep -a "\[$tag\]" "$ERR" | head -1
+  fi
+done
+
+# --- BISECT ROUND 2: VERBDEAD / VERBSEL / VERBVEC, default OFF -----------------
+# *** SAME REACHABILITY CONSTRAINT, STILL BINDING: guarded on `bits == 2`, and the
+# 0.8B gate model has ZERO INT2 tensors, so a test_gpu_optin.sh arm would be green
+# because the path never ran.
+#
+# ALL THREE ARE BIT-EXACT BY CONSTRUCTION and therefore claim NO arithmetic
+# difference -- VERBDEAD is pure code motion, VERBSEL selects the same four codebook
+# VALUES out of named registers instead of an indexed array, and VERBVEC changes the
+# activation POINTER TYPE and nothing else. So stream identity is the entire claim
+# for all three, and `examples/rowpair_equiv` measures it model-free (227 835
+# element values, 8 shapes x 5 datasets) WITHOUT a 27B load. PERFORMANCE is still
+# unmeasured for every arm in this batch; see
+# reports/2026-10-06-batch-decode1-gemv-bisect-2.md.
+for spec in "VERBDEAD:vd:decode1-verbdead" "VERBSEL:vs:decode1-verbsel" \
+            "VERBVEC:vv:decode1-verbvec"; do
   NAME="${spec%%:*}"; rest="${spec#*:}"; abbr="${rest%%:*}"; tag="${rest#*:}"
   OUT="$LOG.${abbr}.out"; ERR="$LOG.${abbr}.err"
   env "INTFER_DECODE1_${NAME}=1" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \

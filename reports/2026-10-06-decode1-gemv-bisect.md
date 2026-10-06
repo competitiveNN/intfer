@@ -113,11 +113,37 @@ operator can measure them on real weights in one pass:
 | **body** | **INLINE at the call site**, a separate `parallel_for` | same |
 | **numerics** | **NOT bit-exact by construction** — `from_half_bits` returns 0 for a zero/subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert which flushes to zero under default FTZ. Stream-identity only, same class as `INTFER_DECODE1_SPLITK` | **bit-exact — NOW MEASURED, NOT ARGUED** (see below) |
 | **gate arm** | `scripts/test_tp2_27b.sh`, TP=2 | same |
-| **CORRECTNESS measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets — which does **not** prove the FTZ concern away, only that these synthetic scales never reach it | `test_rowpair_equiv.sh`: **BITWISE IDENTICAL to base on 227 835 element values**, 8 shapes × 5 datasets |
+| **CORRECTNESS measured** | **NONE — arm does not fire under the differential; cause not located** | **NONE — an earlier "bitwise identical, 227 835 values" result is WITHDRAWN as vacuous (see below)** |
 | **buckets I measured (perf)** | **none** — not run | **none** — not run |
 | **expected direction** | **UNKNOWN**, not positive | **UNKNOWN**, not positive |
 
-### `VERBMP`'s bit-exactness is now MEASURED, not argued
+### ==> WITHDRAWN: the `VERBMP` "bitwise identical, 227 835 values" result was VACUOUS <==
+
+`test_rowpair_equiv.sh` now **requires each order's kernel to have announced itself**
+before it will diff anything, because a KILLED arm emits the base kernel's output
+and a base-vs-base diff reads as a clean pass. The guard fired at once:
+
+```
+FAIL: order vm completed but the kernel never announced [decode1-verbmp].
+```
+
+Two causes, both mine:
+
+1. **The binary set the KILL SWITCH rather than unsetting it.**
+   `setenv(KILL, "")` leaves the variable PRESENT with an empty value; `getenv`
+   returns a non-null pointer to it; every kill switch here reads `== nullptr`, so
+   **every arm read as killed**. Same trap as a presence-only flag being enabled by
+   `X=0`. Fixed with `unsetenv`.
+2. **The verb\* arms still do not fire after (1), cause NOT LOCATED.**
+   Instrumenting the guard shows all four of its conditions TRUE
+   (`use_verbhalf=1 bits=2 tab=1 ng=320`) and the arm body immediately follows in the
+   same block -- yet no announcement reaches stderr. Recorded unresolved.
+
+`ROWPPAIR` alone is measured (announced, 227 835 values, bitwise identical). This
+is the third time this session that "two runs agreed" turned out to mean "two runs
+did the same nothing".
+
+### `VERBMP`'s bit-exactness -- what this section originally claimed, and why it was wrong
 
 Its source claim was *"bit-exact by construction — a claim, not a verified
 property"*, because the `ROWPAIR` precedent is that a bit-exactness **argument** is

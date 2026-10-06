@@ -217,7 +217,11 @@ int main(int argc, char** argv) {
     void* out_rp = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
     void* out_vh = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
     void* out_vm = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
-    if (!code || !sc || !act || !out_base || !out_rp || !out_vh || !out_vm) {
+    void* out_vd = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
+    void* out_vs = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
+    void* out_vv = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
+    if (!code || !sc || !act || !out_base || !out_rp || !out_vh || !out_vm ||
+        !out_vd || !out_vs || !out_vv) {
       std::fprintf(stderr, "FAIL: allocation for %s\n", sh.name);
       return 1;
     }
@@ -270,28 +274,54 @@ int main(int argc, char** argv) {
       if (const char* oldw = std::getenv("ROWPAIR_EQUIV_ORDER")) {
         if (ord == "base" && std::string(oldw) == "rp") ord = "rp";
       }
-      int slot = 0;                 // 0 base, 1 rp, 2 verbhalf, 3 verbmp
-      if (ord == "rp")   slot = 1;
-      else if (ord == "vh") slot = 2;
-      else if (ord == "vm") slot = 3;
-      else if (ord != "base") {
-        std::fprintf(stderr, "FAIL: unknown DECODE1_EQUIV_ORDER=%s "
-                             "(want base|rp|vh|vm)\n", ord.c_str());
+      // DERIVED order table, not a chain of ifs: every arm is declared once with
+      // its env var, kill switch and output slot, so adding an arm cannot leave the
+      // dispatch, the env plumbing or the payload tag out of sync -- which is the
+      // failure a hand-written chain invites on the NEXT arm.
+      struct Order { const char* tag; const char* set; const char* kill; int slot; };
+      static const Order kOrders[] = {
+        {"base", "", "", 0},
+        {"rp", "INTFER_DECODE1_ROWPAIR", "INTFER_NO_DECODE1_ROWPAIR", 1},
+        {"vh", "INTFER_DECODE1_VERBHALF", "INTFER_NO_DECODE1_VERBHALF", 2},
+        {"vm", "INTFER_DECODE1_VERBMP", "INTFER_NO_DECODE1_VERBMP", 3},
+        {"vd", "INTFER_DECODE1_VERBDEAD", "INTFER_NO_DECODE1_VERBDEAD", 4},
+        {"vs", "INTFER_DECODE1_VERBSEL", "INTFER_NO_DECODE1_VERBSEL", 5},
+        {"vv", "INTFER_DECODE1_VERBVEC", "INTFER_NO_DECODE1_VERBVEC", 6},
+      };
+      int slot = -1;
+      for (const auto& od : kOrders)
+        if (ord == od.tag) { slot = od.slot; break; }
+      if (slot < 0) {
+        std::fprintf(stderr, "FAIL: unknown DECODE1_EQUIV_ORDER=%s (want:", ord.c_str());
+        for (const auto& od : kOrders) std::fprintf(stderr, " %s", od.tag);
+        std::fprintf(stderr, ")\n");
         return 1;
       }
       std::vector<std::uint16_t> out;
       {
         void* dst = (slot == 0) ? out_base
                   : (slot == 1) ? out_rp
-                  : (slot == 2) ? out_vh : out_vm;
+                  : (slot == 2) ? out_vh
+                  : (slot == 3) ? out_vm
+                  : (slot == 4) ? out_vd
+                  : (slot == 5) ? out_vs : out_vv;
         // The arm is a HOST env var read by quant_gemm_forward_usm into a
         // function-local `static const bool`, so it is set ONCE PER PROCESS and the
         // order therefore has to be a separate process -- which is why the gate runs
         // four of them and diffs the payloads rather than looping in one binary.
-        setenv("INTFER_DECODE1_VERBHALF", slot == 2 ? "1" : "", 1);
-        setenv("INTFER_NO_DECODE1_VERBHALF", slot == 2 ? "" : "1", 1);
-        setenv("INTFER_DECODE1_VERBMP", slot == 3 ? "1" : "", 1);
-        setenv("INTFER_NO_DECODE1_VERBMP", slot == 3 ? "" : "1", 1);
+        // *** unsetenv, NOT setenv(name, ""). *** This is the bug that made a whole
+        // turn's headline vacuous. Every arm's kill switch is written
+        // `std::getenv(KILL) == nullptr`, and setenv(KILL, "") leaves the variable
+        // PRESENT with an empty value -- getenv returns a non-NULL pointer to it, so
+        // the arm read as KILLED on every order. The differential then diffed the
+        // BASE kernel against itself and printed "BITWISE IDENTICAL" for arms that
+        // had never run. An empty string is not absence; see scripts/test_gpu_optin.sh's
+        // note that a presence-only flag is enabled by `X=0` for the same reason.
+        for (const auto& od : kOrders) {
+          if (od.slot == 0 || *od.set == '\0') continue;
+          if (slot == od.slot) { setenv(od.set, "1", 1); unsetenv(od.kill); }
+          else { unsetenv(od.set); setenv(od.kill, "1", 1); }
+        }
         sycl::event e = intfer::gemm::quant_gemm_forward_usm(
             q, static_cast<std::uint16_t*>(act), code,
             static_cast<const std::uint16_t*>(sc), 1.0f,
@@ -303,7 +333,9 @@ int main(int argc, char** argv) {
       }
       // Name the dataset+shape in the payload so the diff below is self-describing.
       const char* tag = (slot == 0) ? "base" : (slot == 1) ? "rowpair"
-                        : (slot == 2) ? "verbhalf" : "verbmp";
+                        : (slot == 2) ? "verbhalf" : (slot == 3) ? "verbmp"
+                        : (slot == 4) ? "verbdead" : (slot == 5) ? "verbsel"
+                        : "verbvec";
       std::printf("%s|%s|%d|%s|%s\n", sh.name, sh.scheme_name, d, dataset_name(d), tag);
       for (std::uint32_t i = 0; i < sh.N; ++i) {
         std::printf("%s|%s|%d|%s|%u|0x%04x\n", sh.name, sh.scheme_name, d,
@@ -315,6 +347,7 @@ int main(int argc, char** argv) {
                      std::getenv("DECODE1_EQUIV_ORDER") ? std::getenv("DECODE1_EQUIV_ORDER")
                                                          : "base");
     }
+    sycl::free(out_vv, q); sycl::free(out_vs, q); sycl::free(out_vd, q);
     sycl::free(out_vm, q); sycl::free(out_vh, q);
     sycl::free(out_rp, q); sycl::free(out_base, q);
     sycl::free(act, q); sycl::free(sc, q); sycl::free(code, q);

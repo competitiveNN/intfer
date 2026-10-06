@@ -118,8 +118,8 @@ for k in "${ALL_D1[@]}"; do
     # subset below is the right relation.
     gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1)
       echo "     covered-by-subset  $k" ;;
-    gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp)
-      # The two bisect arms. Each is a SEPARATE inline parallel_for differing from
+    gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp|gemm_usm_decode1_verbdead|gemm_usm_decode1_verbsel|gemm_usm_decode1_verbvec)
+      # The five bisect arms. Each is a SEPARATE inline parallel_for differing from
       # the base body in exactly ONE place -- verbhalf in how the group scale is
       # converted, verbmp in the pointer TYPE the weight side is read through. They
       # re-implement the same per-output INT2 arithmetic, so the subset relation and
@@ -153,7 +153,7 @@ if printf '%s\n' "${ALL_D1[@]}" | grep -qx 'gemm_usm_decode1_rowpair' && [ "$rp_
 fi
 # An UNCOVERED entry is drift in the POPULATION, not a style note.
 if printf '%s\n' "${ALL_D1[@]}" | grep -qvE \
-     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp)$'; then
+     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp|gemm_usm_decode1_verbdead|gemm_usm_decode1_verbsel|gemm_usm_decode1_verbvec)$'; then
   echo "  FAIL  a decode1 body is neither pinned nor exempted -- enumerate it" >&2
   printf '%s\n' "${ALL_D1[@]}" | sed 's/^/        /' >&2
   exit 1
@@ -299,8 +299,6 @@ shift_index_atoms() {  # $1 = body; normalises the packed-byte variable to V
 }
 idx_base="$(shift_index_atoms "$body_base")"
 idx_rp="$(shift_index_atoms "$body_rp")"
-idx_vh="$(shift_index_atoms "$(extract_body gemm_usm_decode1_verbhalf)")"
-idx_vm="$(shift_index_atoms "$(extract_body gemm_usm_decode1_verbmp)")"
 n_idx_rp="$(printf '%s\n' "$idx_rp" | grep -c . || true)"
 n_idx_base="$(printf '%s\n' "$idx_base" | grep -c . || true)"
 echo "-- shift-into-mask atoms: base=$n_idx_base, rowpair=$n_idx_rp"
@@ -329,21 +327,33 @@ echo "  ok    the row-pair shift-into-mask set EQUALS the general body's"
 # WRONG form too), because an extractor that only recognises the right answer cannot
 # detect a wrong one -- which is how the first version of this check passed a planted
 # bug.
-for pair in "VERBHALF:$idx_vh" "VERBMP:$idx_vm"; do
-  lbl="${pair%%:*}"; set="${pair#*:}"
+# Every `verb*` body is checked, DERIVED from the parallel_for names rather than
+# listed -- so an arm added today is pinned today, which is the whole point after
+# three separate incidents of a checker enumerating fewer bodies than existed.
+# The relation is EQUALITY of the shift-into-mask set against the general body, and
+# the extractor is deliberately LOOSE (it matches the WRONG form too), because an
+# extractor that only recognises the right answer cannot detect a wrong one -- which
+# is how the first version of this check passed a planted INTFER_DECODE1_SPLITK bug.
+verb_bodies="$(printf '%s\n' "${ALL_D1[@]}" | grep '^gemm_usm_decode1_verb' || true)"
+if [ -z "$verb_bodies" ]; then
+  echo "  FAIL  no verb* body was enumerated -- the enumeration drifted" >&2
+  exit 1
+fi
+for k in $verb_bodies; do
+  set="$(shift_index_atoms "$(extract_body "$k")")"
   if [ -z "$set" ]; then
-    echo "  FAIL  the $lbl arm extracted no shift-into-mask atom at all" >&2
+    echo "  FAIL  $k extracted no shift-into-mask atom at all" >&2
     exit 1
   fi
   d="$(printf '%s\n' "$set" | grep -vxF "$idx_base" || true)"
   if [ -n "$d" ]; then
-    echo "  FAIL  the $lbl arm's shift-into-mask set differs from the general body:" >&2
+    echo "  FAIL  $k's shift-into-mask set differs from the general body's:" >&2
     echo "        $d" >&2
     echo "        *** INTFER_DECODE1_SPLITK bug class: INT2 packs FOUR codes per" >&2
     echo "        byte, so the shift must be ((j & 3) * 2). ***" >&2
     exit 1
   fi
-  echo "  ok    the $lbl arm's shift-into-mask set EQUALS the general body's"
+  echo "  ok    $k's shift-into-mask set EQUALS the general body's"
 done
 
 n_rp_a="$(printf '%s\n' "$(atoms_rp "$body_rp")" | grep -c . || true)"
