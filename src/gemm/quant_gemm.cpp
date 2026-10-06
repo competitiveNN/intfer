@@ -472,13 +472,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // REQUIRES this line, because a stream comparison is satisfiable by a flag
       // that did nothing -- audit #3's nested-flag vacuity, and the one thing that
       // turns "the two runs matched" into "the row-pair path ran".
-      static const bool announced = [] {
-        std::fprintf(stderr,
-                     "[decode1-rowpair] 2 rows/work-item, shared activation, "
-                     "bit-exact (separate accumulators) ACTIVE\n");
-        return true;
-      }();
-      (void)announced;
+      decode1_announce("decode1-rowpair");
       const int npair = N / 2;
       const int pBlocks = (npair + nWG - 1) / nWG;
       const int pGlobal = pBlocks * nWG;
@@ -945,13 +939,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
           (std::getenv("INTFER_DECODE1_VERBDEAD") != nullptr) &&
           (std::getenv("INTFER_NO_DECODE1_VERBDEAD") == nullptr);
       if (use_verbdead && bits == 2 && use_int2_tab && num_groups > 0) {
-        static const bool announced = [] {
-          std::fprintf(stderr,
-                       "[decode1-verbdead] dead per-group locals removed "
-                       "(bit-exact by construction: pure code motion) ACTIVE\n");
-          return true;
-        }();
-        (void)announced;
+        decode1_announce("decode1-verbdead");
         // Hoisted OUT of the group loop and, on this path, UNUSED -- which is the
         // point. `bytes_per_chunk`/`code_mask` feed only the generic packed branch
         // below, which this guard excludes.
@@ -1030,13 +1018,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
           (std::getenv("INTFER_DECODE1_VERBSEL") != nullptr) &&
           (std::getenv("INTFER_NO_DECODE1_VERBSEL") == nullptr);
       if (use_verbsel && bits == 2 && use_int2_tab && num_groups > 0) {
-        static const bool announced = [] {
-          std::fprintf(stderr,
-                       "[decode1-verbsel] 4-float codebook by select, no array "
-                       "(bit-exact by construction) ACTIVE\n");
-          return true;
-        }();
-        (void)announced;
+        decode1_announce("decode1-verbsel");
         return q.submit([&](sycl::handler& h) {
           h.depends_on(copy_dep);
           h.parallel_for<class gemm_usm_decode1_verbsel>(
@@ -1140,13 +1122,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       }
 
       if (use_verbvec && bits == 2 && use_int2_tab && num_groups > 0) {
-        static const bool announced = [] {
-          std::fprintf(stderr,
-                       "[decode1-verbvec] activations through a plain pointer "
-                       "(addressing only, bit-exact by construction) ACTIVE\n");
-          return true;
-        }();
-        (void)announced;
+        decode1_announce("decode1-verbvec");
         return q.submit([&](sycl::handler& h) {
           h.depends_on(copy_dep);
           h.parallel_for<class gemm_usm_decode1_verbvec>(
