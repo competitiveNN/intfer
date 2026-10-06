@@ -141,7 +141,7 @@ for k in "${ALL_D1[@]}"; do
       # extract (0 lines)". Keeping the required-set entry would have turned the
       # quarantine into a red stack.
       echo "     quarantined        $k  (kernel removed 2026-10-05; see" \
-           "AGENTS.md) ;;
+           "AGENTS.md)" ;;
     *) echo "     UNCOVERED           $k  <-- no pin and no stated reason" ;;
   esac
 done
