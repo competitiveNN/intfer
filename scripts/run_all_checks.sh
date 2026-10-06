@@ -369,6 +369,16 @@ dispatch() { # $1 = label -> runs it
       # of the 5.6-6.4x gap that survives the module move (1.26x) and the branch
       # (1.007x) sits between VERBATIM and SHIPPED -- this is where it is measured.
       timeout -k 30 1800 bash "$SCRIPT_DIR/test_roofline_bisect3.sh"; return $? ;;
+     test_roofline_bisect4.sh)
+       # Bisect-4 of the M=1 INT2 GEMV probe ladder: the DIFFERENTIAL between the
+       # bisect-2 VERBATIM body and the roofline_probe int2_variant<0> transcription.
+       # Five incremental arms (VERBATIM / VERB+bitcast / VERB+bitcast+4 /
+       # VERB+bitcast+4+vsel / CLONE) in one TU, interleaved on the same buffers.
+       # This is the run that settled the question "does the ~7x sit in the
+       # cosmetic single-changes" -- it does not (every arm lands at ~1.11x), so
+       # the gap is in the shared text, not in any of these four changes. No model
+       # bound; device event timestamps; the same always-red twin as bisect-2.
+       timeout -k 30 1800 bash "$SCRIPT_DIR/test_roofline_bisect4.sh"; return $? ;;
     test_rowpair_equiv.sh)
       # The MEASURED bitwise-equivalence check for INTFER_DECODE1_ROWPAIR. Runs the
       # binary TWICE in two processes -- quant_gemm_forward_usm reads the flag into
@@ -419,6 +429,12 @@ dispatch() { # $1 = label -> runs it
       # add_executable list plus every script touching a build tree, then fails
       # on any that hardcodes one. No GPU, no build, seconds.
       timeout -k 30 900 bash "$SCRIPT_DIR/check_build_dir_consumers.sh"; return $? ;;
+    mutate_build_dir_consumers.sh)
+      # Proves check_build_dir_consumers.sh is non-vacuous: plants a consumer that
+      # hardcodes "$ROOT/build" (and "${ROOT}/build"), rejects it, then verifies
+      # a comment-only mention is NOT graded as a consumer and that a compliant
+      # override is accepted. Sandbox OUTSIDE $BUILD_DIR, never touches scripts/.
+      timeout -k 30 1200 bash "$SCRIPT_DIR/mutate_build_dir_consumers.sh"; return $? ;;
     mutate_e2_ctx.sh)
       # Proves check_e2_ctx.sh's SELF-CHECK half. The real-run half is not
       # mutation-testable (its artifact is correct by construction) and one
@@ -531,6 +547,11 @@ dispatch() { # $1 = label -> runs it
       # VERB+MP / SHIPPED) enforces EXIT SEMANTICS via the probe-timeout bound; states
       # run against a STUB probe so no real GPU job is launched.
       timeout -k 30 1200 bash "$SCRIPT_DIR/mutate_roofline_bisect3.sh"; return $? ;;
+     mutate_roofline_bisect4.sh)
+       # The gate for test_roofline_bisect4.sh enforces EXIT SEMANTICS via the
+       # probe-timeout bound; states run against a STUB probe so no real GPU job is
+       # launched.
+       timeout -k 30 1200 bash "$SCRIPT_DIR/mutate_roofline_bisect4.sh"; return $? ;;
     mutate_decode1_copies.sh)
       # AUDIT #11 direction: these states mutate the ARTIFACT (quant_gemm.cpp),
       # not the checker, because an artifact that is correct by construction
@@ -809,11 +830,11 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   # checkers-only, and a band that silently skipped a gate would be the
   # audit #18 shape (an arm that never runs certifies nothing).
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS test_roofline_probe.sh test_roofline_bisect.sh test_roofline_bisect1.sh test_roofline_bisect3.sh test_rowpair_equiv.sh"
+    STEPS="$STEPS test_roofline_probe.sh test_roofline_bisect.sh test_roofline_bisect1.sh test_roofline_bisect3.sh test_roofline_bisect4.sh test_rowpair_equiv.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------

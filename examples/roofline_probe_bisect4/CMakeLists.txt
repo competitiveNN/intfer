@@ -1,0 +1,3 @@
+add_executable(roofline_probe_bisect4 main.cpp)
+target_link_libraries(roofline_probe_bisect4 PRIVATE intfer_device intfer_common)
+add_sycl_to_target(TARGET roofline_probe_bisect4 SOURCES main.cpp)

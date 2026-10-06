@@ -19,9 +19,11 @@ add_subdirectory(roofline_probe)
 add_subdirectory(roofline_probe_bisect)
 add_subdirectory(roofline_probe_bisect1)
 add_subdirectory(roofline_probe_bisect3)
-# probe_common.hpp lives in the shared bisect dir; give bisect-1/3 access to it.
+add_subdirectory(roofline_probe_bisect4)
+# probe_common.hpp lives in the shared bisect dir; give bisect-1/3/4 access to it.
 target_include_directories(roofline_probe_bisect1 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/roofline_probe_bisect)
 target_include_directories(roofline_probe_bisect3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/roofline_probe_bisect)
+target_include_directories(roofline_probe_bisect4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/roofline_probe_bisect)
 add_subdirectory(rowpair_equiv)
 add_subdirectory(qwen_forward_gpu)
 add_subdirectory(qwen_forward_intfer)

@@ -251,9 +251,13 @@ sycl::event int2_variant(sycl::queue& q, const std::uint8_t* code_u8,
           const std::uint8_t v3 = code_u8[b0 + 3];
           b0 += CC / 4;
           for (int j = 0; j < CC; ++j) {
-            const int jh = j & 7;
+            // CC is constexpr: for CC=8 we never read a_hi (it is only loaded
+            // when CC==16, so a_lo[j] alone is correct). For CC=16 we read
+            // a_lo[0..7] then a_hi[0..7]. This replaces the buggy `jh = j & 7`
+            // indexing, which (a) read uninitialized a_hi for j=4..7 at CC=8
+            // and (b) read a_lo[0..3] a second time for j=8..11 at CC=16.
             const std::uint16_t abits =
-                (jh < 4) ? a_lo[jh] : a_hi[jh - 4];
+                (CC == 16 && j >= 8) ? a_hi[j - 8] : a_lo[j];
             const float av =
                 static_cast<float>(sycl::bit_cast<sycl::half>(abits));
             const std::uint8_t bv =
@@ -291,25 +295,79 @@ sycl::event int2_variant(sycl::queue& q, const std::uint8_t* code_u8,
   });
   const sycl::nd_range<1> nd(sycl::range<1>(global), sycl::range<1>(nWG));
   // *** A LAUNCH-PROPERTIES ARM WAS ATTEMPTED HERE AND REMOVED, and the reason is
-  // recorded rather than the code. *** The hypothesis was that the shipped kernel's
-  // 6x deficit is register spilling, which sub_group_size<16> + grf_size_automatic
-  // would address -- both numerics-neutral, both pinned by upstream
-  // (llama.cpp fattn-common.hpp, vllm-xpu-kernels) as correctness constraints.
-  //
-  // It could not be measured here: the nd_range + properties overload does not
-  // resolve against a bare lambda in this SYCL version, and getting there took four
-  // spellings whose errors point nowhere near the cause --
-  //   properties<sub_group_size<16>, grf_size_automatic>
-  //       -> "template argument for template type parameter must be a type"
-  //          (those are key OBJECTS; the template wants the value TYPES)
-  //   properties<sub_group_size_key::value_t<16>, grf_size_automatic_key::value_t>
-  //       -> "too many template arguments" (properties takes ONE list type)
-  //   properties{ sub_group_size_key::value_t<16>{}, ... }   (CTAD, correct)
-  //       -> still "no matching member function for parallel_for"
-  // The remaining route is a kernel functor or launch_config, which is more
-  // scaffolding than this hypothesis is worth until the spill is CONFIRMED rather
-  // than suspected. The 6x gap is measured; its mechanism is not, and the report
-  // says so rather than shipping an untested fix for it.
+
+}  // namespace  (closes int2_variant template)
+
+// --- bisect VERBATIM body, brought into this TU for a direct comparison ----
+// Same function signature the probe sweep expects: int2_variant<N,K,G> shape,
+// engine-shared buffers. This is the bisect-2 VERBATIM arm verbatim: branchy
+// scalar `half_to_float` for scale and tail, and the `canon`-style tail
+// accumulation. If it still measures ~260 GB/s like int2_variant<0>, then the
+// difference is NOT in these micro-details but in the TU/kernel-launch context
+// (or in something the diff above missed).
+inline float bisect_half_to_float(std::uint16_t h) {
+  const std::uint32_t s = (std::uint32_t(h & 0x8000u)) << 16;
+  const std::uint32_t e = (h >> 10) & 0x1Fu;
+  const std::uint32_t m = h & 0x3FFu;
+  if (e == 0) return std::bit_cast<float>(s);
+  if (e == 31) return std::bit_cast<float>(s | 0x7F800000u | (m << 13));
+  return std::bit_cast<float>(s | ((e - 15u + 127u) << 23) | (m << 13));
+}
+inline float bisect_canon(int code) {
+  static const float c2[4] = {-1.0f, -1.0f / 3.0f, 1.0f / 3.0f, 1.0f};
+  return c2[code & 3];
+}
+
+sycl::event arm_bisect_verbatim(sycl::queue& q, const std::uint8_t* code,
+                                const std::uint16_t* act,
+                                const std::uint16_t* scale, float alpha,
+                                std::uint16_t* out, std::uint32_t N,
+                                std::uint32_t K, std::uint32_t Gw) {
+  (void)alpha;  // not used by the bisect body
+  const int num_groups = (static_cast<int>(K) + Gw - 1) / Gw;
+  const std::uint32_t global = ((N + 15) / 16) * 16;
+  return q.submit([&](sycl::handler& h) {
+    h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(16)),
+                   [=](sycl::nd_item<1> it) {
+      const int ng = static_cast<int>(it.get_global_id(0));
+      if (ng >= static_cast<int>(N)) return;
+      float acc = 0.0f;
+      const std::uint16_t* sptr = scale + static_cast<std::size_t>(ng) * num_groups;
+      const std::size_t row_base = static_cast<std::size_t>(ng) * K;
+      sycl::multi_ptr<const std::uint16_t,
+          sycl::access::address_space::global_space> act_mp(act);
+      for (int g = 0; g < num_groups; ++g) {
+        const float scale = bisect_half_to_float(sptr[g]);   // bisect VERBATIM style
+        const int kg0 = g * static_cast<int>(Gw);
+        const int kg1 = std::min(kg0 + static_cast<int>(Gw),
+                                 static_cast<int>(K));
+        const float wtab[4] = {scale * -1.0f, scale * (-1.0f / 3.0f),
+                               scale * (1.0f / 3.0f), scale * 1.0f};
+        int kg = kg0;
+        std::size_t b0 = (row_base + static_cast<std::size_t>(kg)) / 4u;
+        for (; kg + 8 <= kg1; kg += 8) {
+          sycl::vec<std::uint16_t, 8> a16;
+          a16.load(0, act_mp + kg);
+          const std::uint8_t b0v = code[b0];
+          const std::uint8_t b1v = code[b0 + 1];
+          b0 += 2;
+          for (int j = 0; j < 8; ++j) {
+            const float av =
+                static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+            const std::uint8_t bv = (j < 4) ? b0v : b1v;
+            acc += av * wtab[(bv >> ((j & 3) * 2)) & 3];
+          }
+        }
+        for (; kg < kg1; ++kg) {
+          const float av = bisect_half_to_float(act[kg]);   // bisect style
+          const std::size_t idx = row_base + static_cast<std::size_t>(kg);
+          const int cod = (code[idx / 4] >> ((idx % 4) * 2)) & 3;
+          acc += av * scale * bisect_canon(cod);             // canon-style
+        }
+      }
+      out[ng] = f32_to_f16_bits(acc);
+    });
+  });
 }
 
 }  // namespace
@@ -692,10 +750,10 @@ int main(int argc, char** argv) {
       // consecutive runs of the SAME binary -- the box is contended, so a number
       // measured minutes away from its comparator is not a comparison. Every rep
       // here runs all five variants back to back, and only the RATIO is reported.
-      const char* names[5] = {"table", "select", "table16", "select16", "SHIPPED"};
-      std::vector<std::vector<double>> tt(5);
+      const char* names[6] = {"table", "select", "table16", "select16", "bisect", "SHIPPED"};
+      std::vector<std::vector<double>> tt(6);
       for (int r = 0; r < kReps; ++r) {
-        for (int v = 0; v < 5; ++v) {
+        for (int v = 0; v < 6; ++v) {
           sycl::event e;
           switch (v) {
             case 0: e = int2_variant<0>(q, (const std::uint8_t*)c, (const std::uint16_t*)a,
@@ -710,6 +768,10 @@ int main(int argc, char** argv) {
             case 3: e = int2_variant<3>(q, (const std::uint8_t*)c, (const std::uint16_t*)a,
                                         (const std::uint16_t*)sc, 1.0f, (std::uint16_t*)o,
                                         sh2.N, sh2.K, sh2.G); break;
+            // Bisect VERBATIM body brought into this TU for a direct comparison.
+            case 4: e = arm_bisect_verbatim(q, (const std::uint8_t*)c, (const std::uint16_t*)a,
+                                            (const std::uint16_t*)sc, 1.0f, (std::uint16_t*)o,
+                                            sh2.N, sh2.K, sh2.G); break;
             // The REAL thing, same buffers, same shape, same instrument.
             default: e = intfer::gemm::quant_gemm_forward_usm(
                              q, (std::uint16_t*)a, c, (const std::uint16_t*)sc, 1.0f,
@@ -720,12 +782,12 @@ int main(int argc, char** argv) {
           tt[v].push_back(timed_ms(q, {e}));
         }
       }
-      double med[5];
-      for (int v = 0; v < 5; ++v) {
+      double med[6];
+      for (int v = 0; v < 6; ++v) {
         std::sort(tt[v].begin(), tt[v].end());
         med[v] = tt[v][tt[v].size() / 2];
       }
-      for (int v = 0; v < 5; ++v) {
+      for (int v = 0; v < 6; ++v) {
         const double gbs = double(cb) / (med[v] * 1e-3) / 1e9;
         char nm[96];
         std::snprintf(nm, sizeof nm, "deq/%s/%s", sh2.role, names[v]);
@@ -735,7 +797,7 @@ int main(int argc, char** argv) {
         arms.push_back(arm);
         std::printf("[roofline]   %-9s %8.3f ms  %7.1f GB/s  %5.2fx vs table  "
                     "%5.2fx vs SHIPPED\n",
-                    names[v], med[v], gbs, med[0] / med[v], med[4] / med[v]);
+                    names[v], med[v], gbs, med[0] / med[v], med[5] / med[v]);
       }
       sycl::free(o, q); sycl::free(a, q); sycl::free(sc, q); sycl::free(c, q);
     }
