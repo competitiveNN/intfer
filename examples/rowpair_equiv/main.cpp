@@ -56,6 +56,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -214,7 +215,9 @@ int main(int argc, char** argv) {
     void* act = sycl::malloc_shared(std::uint64_t(sh.K) * 2, dev.sycl_device, dev.sycl_context);
     void* out_base = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
     void* out_rp = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
-    if (!code || !sc || !act || !out_base || !out_rp) {
+    void* out_vh = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
+    void* out_vm = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
+    if (!code || !sc || !act || !out_base || !out_rp || !out_vh || !out_vm) {
       std::fprintf(stderr, "FAIL: allocation for %s\n", sh.name);
       return 1;
     }
@@ -249,12 +252,46 @@ int main(int argc, char** argv) {
       };
       (void)run;
 
-      // ONE order per process; see run()'s comment.
-      const char* which = std::getenv("ROWPAIR_EQUIV_ORDER");
-      const bool do_rp = (which != nullptr && std::string(which) == "rp");
+      // ONE order per process; see run()'s comment. Extended from two orders to
+      // FOUR on 2026-10-06 so the same machinery -- 8 shapes x 5 datasets, bitwise,
+      // two process invocations per arm -- can test INTFER_DECODE1_VERBHALF and
+      // INTFER_DECODE1_VERBMP as well.
+      //
+      // WHY THAT MATTERS MORE THAN A PERF RUN RIGHT NOW: VERBMP's "bit-exact BY
+      // CONSTRUCTION" is a CLAIM, and the ROWPAIR precedent says a bit-exactness
+      // ARGUMENT is worth nothing until measured -- ROWPAIR's is precisely what
+      // shipped a device-losing double offset. This is the cheapest place to settle
+      // it, because it needs no model and no 27B load.
+      const char* which = std::getenv("DECODE1_EQUIV_ORDER");
+      std::string ord(which ? which : "base");
+      // Kept for compatibility with the older ROWPAIR_EQUIV_ORDER spelling; the gate
+      // uses DECODE1_EQUIV_ORDER. Two names for one switch is a papercut, but
+      // silently ignoring the old one would break any invocation already in a log.
+      if (const char* oldw = std::getenv("ROWPAIR_EQUIV_ORDER")) {
+        if (ord == "base" && std::string(oldw) == "rp") ord = "rp";
+      }
+      int slot = 0;                 // 0 base, 1 rp, 2 verbhalf, 3 verbmp
+      if (ord == "rp")   slot = 1;
+      else if (ord == "vh") slot = 2;
+      else if (ord == "vm") slot = 3;
+      else if (ord != "base") {
+        std::fprintf(stderr, "FAIL: unknown DECODE1_EQUIV_ORDER=%s "
+                             "(want base|rp|vh|vm)\n", ord.c_str());
+        return 1;
+      }
       std::vector<std::uint16_t> out;
       {
-        void* dst = do_rp ? out_rp : out_base;
+        void* dst = (slot == 0) ? out_base
+                  : (slot == 1) ? out_rp
+                  : (slot == 2) ? out_vh : out_vm;
+        // The arm is a HOST env var read by quant_gemm_forward_usm into a
+        // function-local `static const bool`, so it is set ONCE PER PROCESS and the
+        // order therefore has to be a separate process -- which is why the gate runs
+        // four of them and diffs the payloads rather than looping in one binary.
+        setenv("INTFER_DECODE1_VERBHALF", slot == 2 ? "1" : "", 1);
+        setenv("INTFER_NO_DECODE1_VERBHALF", slot == 2 ? "" : "1", 1);
+        setenv("INTFER_DECODE1_VERBMP", slot == 3 ? "1" : "", 1);
+        setenv("INTFER_NO_DECODE1_VERBMP", slot == 3 ? "" : "1", 1);
         sycl::event e = intfer::gemm::quant_gemm_forward_usm(
             q, static_cast<std::uint16_t*>(act), code,
             static_cast<const std::uint16_t*>(sc), 1.0f,
@@ -265,16 +302,20 @@ int main(int argc, char** argv) {
         std::memcpy(out.data(), dst, std::uint64_t(sh.N) * 2);
       }
       // Name the dataset+shape in the payload so the diff below is self-describing.
-      std::printf("%s|%s|%d|%s|%s\n", sh.name, sh.scheme_name, d, dataset_name(d),
-                  do_rp ? "rowpair" : "base");
+      const char* tag = (slot == 0) ? "base" : (slot == 1) ? "rowpair"
+                        : (slot == 2) ? "verbhalf" : "verbmp";
+      std::printf("%s|%s|%d|%s|%s\n", sh.name, sh.scheme_name, d, dataset_name(d), tag);
       for (std::uint32_t i = 0; i < sh.N; ++i) {
         std::printf("%s|%s|%d|%s|%u|0x%04x\n", sh.name, sh.scheme_name, d,
                     dataset_name(d), i, out[i]);
       }
       checks++;
-      if (verbose) std::fprintf(stderr, "  ran %s / %s / %s\n", sh.name, dataset_name(d),
-                                do_rp ? "rowpair" : "base");
+      if (verbose)
+        std::fprintf(stderr, "  ran %s / %s / order=%s\n", sh.name, dataset_name(d),
+                     std::getenv("DECODE1_EQUIV_ORDER") ? std::getenv("DECODE1_EQUIV_ORDER")
+                                                         : "base");
     }
+    sycl::free(out_vm, q); sycl::free(out_vh, q);
     sycl::free(out_rp, q); sycl::free(out_base, q);
     sycl::free(act, q); sycl::free(sc, q); sycl::free(code, q);
   }

@@ -111,10 +111,33 @@ operator can measure them on real weights in one pass:
 | **guard** | `bits == 2 && use_int2_tab` | same |
 | **the one change** | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` | weight side through a row-base `multi_ptr` |
 | **body** | **INLINE at the call site**, a separate `parallel_for` | same |
-| **numerics** | **NOT bit-exact by construction** — `from_half_bits` returns 0 for a zero/subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert which flushes to zero under default FTZ. Stream-identity only, same class as `INTFER_DECODE1_SPLITK` | **bit-exact by construction** — same expressions, same index *values*, only the pointer *type* the compiler folds them through. Stream identity is the whole claim; no contract |
+| **numerics** | **NOT bit-exact by construction** — `from_half_bits` returns 0 for a zero/subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert which flushes to zero under default FTZ. Stream-identity only, same class as `INTFER_DECODE1_SPLITK` | **bit-exact — NOW MEASURED, NOT ARGUED** (see below) |
 | **gate arm** | `scripts/test_tp2_27b.sh`, TP=2 | same |
-| **buckets I measured** | **none** — not run | **none** — not run |
+| **CORRECTNESS measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets — which does **not** prove the FTZ concern away, only that these synthetic scales never reach it | `test_rowpair_equiv.sh`: **BITWISE IDENTICAL to base on 227 835 element values**, 8 shapes × 5 datasets |
+| **buckets I measured (perf)** | **none** — not run | **none** — not run |
 | **expected direction** | **UNKNOWN**, not positive | **UNKNOWN**, not positive |
+
+### `VERBMP`'s bit-exactness is now MEASURED, not argued
+
+Its source claim was *"bit-exact by construction — a claim, not a verified
+property"*, because the `ROWPAIR` precedent is that a bit-exactness **argument** is
+worth nothing until measured: `ROWPAIR`'s is precisely what shipped a
+device-losing double offset. `scripts/test_rowpair_equiv.sh` was extended from two
+orders to four (one process each — the flags are read into a function-local `static
+const bool`, so an order is a process, not a loop) and now reports:
+
+```
+ok  INTFER_DECODE1_VERBMP  is BITWISE IDENTICAL to base (227835 element values)
+ok  INTFER_DECODE1_VERBHALF is bitwise identical to base on THESE datasets
+    -- which does NOT prove the FTZ/denormal concern away, only that these
+    synthetic scales never reach it.
+```
+
+So `VERBMP`'s correctness claim is settled **without a model and without a 27B
+load**. `VERBHALF` being identical here is information, not exoneration: the
+differing case is a zero or subnormal group scale, and these synthetic scales
+(`to_half_bits` of ~1.0–1.5) never produce one. **Performance is still unmeasured
+for all three.**
 
 **Why inline and not a shared device function:** the reverted
 `quant_gemm_fused_decode1` cost 231 114 ms with arithmetic a normalized diff proved

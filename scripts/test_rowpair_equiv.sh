@@ -53,17 +53,35 @@ RP="$BUILD_DIR/rowpair_equiv.rp.txt"
 # harness's note: `INTFER_X=0` still ENABLES an X read with getenv() != nullptr,
 # so the only way to express OFF is for the variable to be unset. `env -u` on
 # EVERY arm, for the same reason.
-env -u INTFER_DECODE1_ROWPAIR ROWPAIR_EQUIV_ORDER=base \
-    "$SCRIPT_DIR/with_oneapi.sh" "$BIN" >"$BASE" 2>"$BUILD_DIR/rowpair_equiv.base.err"
-B_RC=$?
-env INTFER_DECODE1_ROWPAIR=1 ROWPAIR_EQUIV_ORDER=rp \
-    "$SCRIPT_DIR/with_oneapi.sh" "$BIN" >"$RP" 2>"$BUILD_DIR/rowpair_equiv.rp.err"
-R_RC=$?
+# FOUR ORDERS, ONE PROCESS EACH. quant_gemm_forward_usm reads each arm's flag into a
+# function-local `static const bool`, so a flag is set ONCE PER PROCESS; one binary
+# cannot hold two orders. Hence four invocations and three diffs.
+#
+# The two extra orders are INTFER_DECODE1_VERBHALF and INTFER_DECODE1_VERBMP, and
+# they are here for a REASON beyond symmetry: VERBMP's "bit-exact BY CONSTRUCTION"
+# is a CLAIM, and the ROWPAIR precedent is that a bit-exactness argument is worth
+# nothing until measured -- ROWPAIR's is exactly what shipped a device-losing
+# double offset. This settles it without a model and without a 27B load.
+run_order() {  # $1 = order tag
+  local tag="$1" f="$2"
+  env -u INTFER_DECODE1_ROWPAIR -u INTFER_DECODE1_VERBHALF -u INTFER_DECODE1_VERBMP \
+    DECODE1_EQUIV_ORDER="$tag" \
+    "$SCRIPT_DIR/with_oneapi.sh" "$BIN" >"$f" \
+    2>"$BUILD_DIR/rowpair_equiv.$tag.err"
+  return $?
+}
 
-if [ "$B_RC" -ne 0 ] || [ "$R_RC" -ne 0 ]; then
-  echo "FAIL: rowpair_equiv base rc=$B_RC rowpair rc=$R_RC" >&2
-  echo "--- base stderr ---" >&2; tail -15 "$BUILD_DIR/rowpair_equiv.base.err" >&2
-  echo "--- rowpair stderr ---" >&2; tail -15 "$BUILD_DIR/rowpair_equiv.rp.err" >&2
+B_RC=0; run_order base "$BASE" || B_RC=$?
+R_RC=0; run_order rp   "$RP"   || R_RC=$?
+VH_RC=0; run_order vh "$BUILD_DIR/rowpair_equiv.verbhalf.txt" || VH_RC=$?
+VM_RC=0; run_order vm "$BUILD_DIR/rowpair_equiv.verbmp.txt"   || VM_RC=$?
+
+if [ "$B_RC" -ne 0 ] || [ "$R_RC" -ne 0 ] || [ "$VH_RC" -ne 0 ] || [ "$VM_RC" -ne 0 ]; then
+  echo "FAIL: decode1 equiv orders rc: base=$B_RC rp=$R_RC verbhalf=$VH_RC verbmp=$VM_RC" >&2
+  for t in base rp verbhalf verbmp; do
+    echo "--- $t stderr ---" >&2
+    tail -10 "$BUILD_DIR/rowpair_equiv.$t.err" 2>/dev/null >&2
+  done
   exit 1
 fi
 
@@ -73,34 +91,69 @@ fi
 # emitted a non-trivial number of per-element lines, and the two must cover the
 # same case set. That is the empty-stream vacuity the repo's bench harness has its
 # own checker for, in miniature.
+VH="$BUILD_DIR/rowpair_equiv.verbhalf.txt"
+VM="$BUILD_DIR/rowpair_equiv.verbmp.txt"
 n_base="$(grep -c '|0x' "$BASE" || true)"
-n_rp="$(grep -c '|0x' "$RP" || true)"
-if [ "${n_base:-0}" -lt 1000 ] || [ "${n_rp:-0}" -lt 1000 ]; then
-  echo "FAIL: the harvest is too small to conclude anything" >&2
-  echo "      base=$n_base rowpair=$n_rp element lines (need >= 1000 each)." >&2
-  echo "      An empty payload compares EQUAL to any other empty payload, so a" >&2
-  echo "      diff alone would certify a probe that measured nothing." >&2
-  exit 1
-fi
-if [ "$n_base" -ne "$n_rp" ]; then
-  echo "FAIL: the two arms emitted different case counts (base=$n_base rowpair=$n_rp)" >&2
-  exit 1
-fi
+for pair in "rowpair:$RP" "verbhalf:$VH" "verbmp:$VM"; do
+  lbl="${pair%%:*}"; f="${pair#*:}"
+  n="$(grep -c '|0x' "$f" || true)"
+  if [ "${n_base:-0}" -lt 1000 ] || [ "${n:-0}" -lt 1000 ]; then
+    echo "FAIL: the harvest is too small to conclude anything" >&2
+    echo "      base=$n_base $lbl=$n element lines (need >= 1000 each)." >&2
+    echo "      An empty payload compares EQUAL to any other empty payload, so a" >&2
+    echo "      diff alone would certify a probe that measured nothing." >&2
+    exit 1
+  fi
+  if [ "$n_base" -ne "$n" ]; then
+    echo "FAIL: base and $lbl emitted different case counts ($n_base vs $n)" >&2
+    exit 1
+  fi
+done
 
 # Strip the order marker and compare VALUES only. The order tag differs by design,
 # so diffing the raw text would always differ.
-sed 's/|rowpair$//' "$RP" >"$RP.norm"
-sed 's/|base$//'   "$BASE" >"$BASE.norm"
+sed 's/|base$//' "$BASE" >"$BASE.norm"
 
-if ! cmp -s "$BASE.norm" "$RP.norm"; then
-  echo "FAIL: INTFER_DECODE1_ROWPAIR is NOT bitwise identical to the base kernel." >&2
-  echo "      first differing lines:" >&2
-  diff "$BASE.norm" "$RP.norm" | head -20 >&2
-  echo "      (The construction argument predicted exact equality. It is wrong, and" >&2
-  echo "       this is the measurement that says so.)" >&2
-  [ "$KEEP" -eq 1 ] || rm -f "$BASE" "$RP" "$BASE.norm" "$RP.norm"
-  exit 1
+# One comparison function, three callers. The EXPECTATION DIFFERS PER ARM and that
+# difference is the point:
+#   rowpair   was claimed bit-exact  -> must be IDENTICAL, or the claim is wrong.
+#   verbmp    is claimed bit-exact  -> must be IDENTICAL, same reason.
+#   verbhalf  is claimed NOT exact  -> may differ; it is STREAM-IDENTITY-ONLY on the
+#             real model, and the question here is whether the denormal/FTZ concern
+#             is REAL on these datasets or merely theoretical. A difference is
+#             information, not a failure, and is reported as such.
+check_identical() {  # $1 = label, $2 = file
+  local lbl="$1" f="$2"
+  sed 's/|rowpair$//; s/|verbhalf$//; s/|verbmp$//' "$f" >"$f.norm"
+  if cmp -s "$BASE.norm" "$f.norm"; then
+    echo "  ok    $lbl is BITWISE IDENTICAL to base ($n_base element values)"
+  else
+    echo "FAIL: $lbl is NOT bitwise identical to base -- and it was CLAIMED to be." >&2
+    echo "      (A bit-exactness ARGUMENT is what shipped the ROWPAIR double" >&2
+    echo "       offset and lost the device. This is the measurement saying the" >&2
+    echo "       argument is wrong.)" >&2
+    echo "      first differing lines:" >&2
+    diff "$BASE.norm" "$f.norm" | head -20 >&2
+    return 1
+  fi
+}
+rc=0
+check_identical "INTFER_DECODE1_ROWPAIR" "$RP" || rc=1
+check_identical "INTFER_DECODE1_VERBMP " "$VM" || rc=1
+# VERBHALF: report, do not gate.
+sed 's/|verbhalf$//' "$VH" >"$VH.norm"
+if cmp -s "$BASE.norm" "$VH.norm"; then
+  echo "  ok    INTFER_DECODE1_VERBHALF is bitwise identical to base on THESE datasets"
+  echo "        -- which does NOT prove the FTZ/denormal concern away, only that"
+  echo "        these synthetic scales never reach it."
+else
+  nd="$(diff "$BASE.norm" "$VH.norm" | grep -c '^<' || true)"
+  echo "  ..   INTFER_DECODE1_VERBHALF DIFFERS from base in ~${nd} of ${n_base}"
+  echo "        values. EXPECTED IN PRINCIPLE and not a gate failure: this arm is"
+  echo "        claimed NOT bit-exact (denormal + default FTZ). It is reported so"
+  echo "        the magnitude is on the record rather than assumed."
 fi
+[ "$rc" -eq 0 ] || { [ "$KEEP" -eq 1 ] || rm -f "$BASE" "$RP" "$VH" "$VM" "$BASE.norm"; exit 1; }
 
 # Per-dataset coverage, so a green verdict says WHICH cases passed rather than only
 # that they agreed. Derived from the payload, not from a remembered list.
@@ -118,12 +171,13 @@ echo "   fallback to a different kernel is visible rather than assumed)"
 
 [ "$KEEP" -eq 1 ] || rm -f "$BASE" "$RP" "$BASE.norm" "$RP.norm"
 echo
-echo "ROWPAIR-EQUIV TEST: PASS"
-# DERIVED, never hardcoded: an earlier revision printed "5 datasets x 7 shapes"
-# and went on saying 7 after a shape was added. That is the hand-written-total
-# defect in its smallest form, and it was in the line that states the gate's claim.
-echo "RESULT: INTFER_DECODE1_ROWPAIR is BITWISE IDENTICAL to the base M=1 kernel"
-echo "        on $n_base element values over $n_runs (shape,dataset) runs:"
-echo "        $n_shapes distinct shapes x $n_ds distinct datasets -- the claim is"
-echo "        MEASURED, not argued from the construction."
+echo "DECODE1-EQUIV TEST: PASS"
+echo "RESULT: on $n_base element values over $n_runs (shape,dataset) runs,"
+echo "        $n_shapes distinct shapes x $n_ds distinct datasets:"
+echo "          INTFER_DECODE1_ROWPAIR  BITWISE IDENTICAL  -- claim MEASURED"
+echo "          INTFER_DECODE1_VERBMP   BITWISE IDENTICAL  -- claim MEASURED"
+echo "        INTFER_DECODE1_VERBHALF reported above: it is claimed NOT bit-exact"
+echo "        (denormal + default FTZ), so a difference is information, not a failure."
+echo "        PERFORMANCE IS STILL UNMEASURED for all three; see"
+echo "        reports/2026-10-06-decode1-gemv-bisect.md."
 exit 0

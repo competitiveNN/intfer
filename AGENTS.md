@@ -569,6 +569,60 @@ So **~4.5-5x of the 5.6-6.4x is still unexplained**, and the honest state is two
 candidates dead, two named, neither measured. Full account and the certification set an
 arm would need if it wins: `reports/2026-10-06-decode1-gemv-bisect.md`.
 
+### The two arms are now ENGINE FLAGS, default OFF — and NEITHER IS MEASURED
+
+The probe ladder could not run, so shipping unmeasurable experiments would ship
+nothing. Both arms were landed **in the engine** (`src/gemm/quant_gemm.cpp`,
+`INTFER_DECODE1_VERBHALF` / `INTFER_DECODE1_VERBMP`, kill switches
+`INTFER_NO_DECODE1_VERBHALF` / `INTFER_NO_DECODE1_VERBMP`), guarded on
+`bits == 2 && use_int2_tab`, each a **separate `parallel_for` with the body INLINE
+at the call site** — never a shared device function, because the reverted
+`quant_gemm_fused_decode1` cost 231 114 ms with arithmetic a normalized diff proved
+identical. Each has an arm in `scripts/test_tp2_27b.sh` (TP=2: the only gate whose
+27B model carries INT2 — the 0.8B model has **zero**, so a `test_gpu_optin.sh` arm
+would be green because the path never ran) asserting stream identity **and**
+requiring the arm's own announcement line, so a flag that did nothing cannot pass.
+
+| | `INTFER_DECODE1_VERBHALF` | `INTFER_DECODE1_VERBMP` |
+|---|---|---|
+| the ONE change | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` (the engine's branchy **scalar** FP16->FP32 twiddle, 3 branches per call, **320 calls per work-item** at MLP_GATE) | weight side through a row-base `multi_ptr` instead of an absolute index into raw `code_u8` |
+| numerics | **NOT bit-exact by construction.** `from_half_bits` returns 0 for a zero or subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert, which **flushes to zero under the default FTZ**. A zero group scale is the differing case, and FP16 scales come from `to_half_bits` of a positive host float so it *should not* arise — but "should not" is an argument, so the arm is **stream-identity only and makes NO arithmetic claim**. Same class as `INTFER_DECODE1_SPLITK` | **bit-exact — AND NOW MEASURED RATHER THAN ARGUED** |
+| **correctness, measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets, which does **NOT** prove the FTZ concern away — only that these synthetic scales never reach a zero or subnormal exponent | `test_rowpair_equiv.sh`: **BITWISE IDENTICAL to base on 227 835 element values**, 8 shapes x 5 datasets |
+| **performance** | **UNMEASURED** | **UNMEASURED** |
+
+*** `VERBMP`'s INDICES ARE WRITTEN THE WAY THEY ARE ON PURPOSE, AND THE REASON IS THE
+ROWPAIR BUG. *** It is the same shape: `ROWPAIR` used row-**offset** `multi_ptr`s
+indexed with the base kernel's **absolute** byte offsets, a double offset that read
+past the shard and **lost the device** (`UR_RESULT_ERROR_DEVICE_LOST` on both INT2
+shapes, while passing FP16 and INT4 because the branch is guarded on `bits == 2`).
+So `VERBMP`'s chunk loop uses **row-relative** `b0` and its tail deliberately uses
+the **unoffset** `code_u8` with absolute indices, exactly as the base kernel does.
+
+**Pinned by enumeration, not by a remembered list.** `check_decode1_copies.sh`
+classifies both new bodies `covered-by-subset` **and** asserts their
+shift-into-mask set **EQUALS** the general body's — an equality, not a subset,
+computed with a deliberately **loose** extractor that matches the **wrong** form too.
+That looseness is load-bearing and is the second time this repo has paid for it: the
+first version matched only the correct `((j & 3) * 2)`, so planting the real
+`INTFER_DECODE1_SPLITK` bug simply stopped it matching and the checker **passed**.
+
+*** `VERBMP`'s CORRECTNESS claim is settled; its PERFORMANCE is not. *** The source
+said "bit-exact BY CONSTRUCTION — A CLAIM, NOT A VERIFIED PROPERTY", on the
+`ROWPAIR` precedent that a bit-exactness *argument* is worth nothing until measured.
+`test_rowpair_equiv.sh` was extended from two orders to FOUR (one PROCESS each --
+the flags are read into a function-local `static const bool`, so an order is a
+process, not a loop) and now reports `INTFER_DECODE1_VERBMP is BITWISE IDENTICAL to
+base (227835 element values)`. **No model, no 27B load.** `VERBHALF` is identical on
+these datasets too, which is information and NOT exoneration: the differing case is a
+zero or subnormal group scale, and synthetic `to_half_bits(~1.0..1.5)` scales never
+produce one.
+
+**PERFORMANCE is UNMEASURED for all three and the direction is UNKNOWN, not
+positive.** Both need
+one 27B `--tp 2` run each, which AGENTS.md's standing rule 1 forbids an agent
+session from performing. Blank `RESULT:` lines and the exact commands are in
+`reports/2026-10-06-decode1-gemv-bisect.md`.
+
 ### What the same probe retired, so nobody re-attempts them
 
 * **The FP16 M=1 path is NOT a bottleneck.** It runs at **98-123 % of the memory
