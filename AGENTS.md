@@ -87,7 +87,7 @@ correct behaviour and not something to work around. Rewrite it when the gate
 population changes; the checker fails if you do not:
 
 ```
-gate tally: 16 PASS, 0 PARTIAL, 0 SKIPPED
+gate tally: 17 PASS, 0 PARTIAL, 0 SKIPPED
   (+1 on 2026-10-05: `test_roofline_probe`, the model-free
   allocator-vs-kernel discriminator for decode's bandwidth deficit.
   Device event timestamps, no model bound, ~30 s.
@@ -106,6 +106,13 @@ gate tally: 16 PASS, 0 PARTIAL, 0 SKIPPED
   module move (1.26x) and the runtime branch (1.007x) sits between VERBATIM and
   SHIPPED, measured here on the SAME buffers in the SAME TU). No model bound, ~1
   min.
+  +1 on 2026-10-06: `test_roofline_bisect4`, the DIFFERENTIAL between the
+  bisect-2 VERBATIM body and the roofline_probe `int2_variant<0>` transcription --
+  five incremental arms (VERBATIM / VERB+bitcast / VERB+bitcast+4 /
+  VERB+bitcast+4+vsel / CLONE) in one TU. Settled that the ~7x does NOT sit in any
+  single-change arm (each lands at ~1.11x vs VERBATIM); the gap is in the shared
+  text of the two functions, not in these four cosmetic differences. No model
+  bound, mutation matrix RB4-1/RB4-2/RB4-3/RB4-4 (4/4). ~1 min.
   +1: `test_rowpair_equiv`, the MEASURED bitwise-equivalence check for
   `INTFER_DECODE1_ROWPAIR` -- 227 835 element values over 8 shapes x 5
   datasets, two process invocations, no model bound.)

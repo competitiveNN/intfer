@@ -53,7 +53,11 @@ echo "  engine : $ENGINE_REL (INT2 table-hoist path)"
 
 # --- archive the committed tree so the real checkout is never mutated --------
 setup() {
-  rm -rf "$SB"
+  # rm -rf then mkdir -p, NOT just rm: mktemp -d created the dir, so a bare
+  # rm leaves it gone and `tar -x -C "$SB"` fails with "Cannot open: No such
+  # file or directory" -- which the matrix then reports as "could not archive
+  # HEAD into sandbox", i.e. a matrix fault read as a checker fault.
+  rm -rf "$SB"; mkdir -p "$SB"
   git -C "$ROOT" archive --format=tar HEAD | tar -x -f - -C "$SB" || {
     echo "FAIL: could not archive HEAD into sandbox"; exit 2; }
   [ -f "$SB/$ANCHOR_REL" ] || { echo "FAIL: anchor missing in sandbox"; exit 2; }
