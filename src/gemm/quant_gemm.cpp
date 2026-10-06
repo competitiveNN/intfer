@@ -18,6 +18,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <set>
+#include <string>
 #include <sycl/sycl.hpp>
 
 #include <vector>
@@ -35,6 +39,46 @@ __attribute__((weak)) void profile_note_launch() {}
 #endif
 
 namespace {
+
+// ---- DECODE1 ARM ANNOUNCEMENT -------------------------------------------------
+// A function-local `static const bool announced = [] { fprintf(...); }();` inside
+// EACH arm's guard is, in principle, a per-arm latch -- and in practice it made
+// `[decode1-rowpair]` appear for EVERY non-base order in examples/rowpair_equiv,
+// including orders whose env the binary had just set to kill rowpair. Six such
+// statics, six identical names, and a harness that could not tell which arm had run.
+// This replaces all six with ONE explicitly-keyed function:
+//
+//   * the latch is keyed by the arm's TAG, held in a set, so it is per-arm BY
+//     CONSTRUCTION rather than per-arm by accident of lexical scope. Two arms can
+//     never suppress each other's line, and re-entering an arm cannot re-print.
+//   * the line carries a CALL COUNTER, so "announced" and "how many launches took
+//     this branch" are both observable, and a latch that fires late is visible.
+//   * INTFER_DECODE1_ANNOUNCE_EVERY=1 disables the once-only latch and prints every
+//     launch, which is how the harness can PROVE the latch is not what decides
+//     which arm appears.
+//
+// It is deliberately host-side and NOT a device function: extracting arithmetic
+// into a shared device function is what cost 231114 ms once already.
+inline void decode1_announce(const char* tag) {
+  static std::set<std::string> seen;
+  static std::mutex mu;
+  static int n_calls = 0;
+  const bool every =
+      (std::getenv("INTFER_DECODE1_ANNOUNCE_EVERY") != nullptr);
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    ++n_calls;
+    if (!every && !seen.insert(tag).second) return;
+    const int n = n_calls;
+    if (every) {
+      std::fprintf(stderr, "[%s] call %d ACTIVE\n", tag, n);
+    } else {
+      std::fprintf(stderr, "[%s] call %d ACTIVE (once; "
+                           "set INTFER_DECODE1_ANNOUNCE_EVERY=1 for every launch)\n",
+                   tag, n);
+    }
+  }
+}
 
 inline float lf(sycl::half h) { return static_cast<float>(h); }
 inline std::uint16_t to_half_bits(float f) {
@@ -722,11 +766,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
         // them and the arms were indistinguishable from dead ones. A gate that
         // requires proof-of-execution cannot be satisfied by an arm that never
         // emits proof, and the failure mode is exactly the vacuous PASS.
-        static const bool announced = [] {
-          std::fprintf(stderr, "[decode1-verbhalf] group scale via sycl::bit_cast<sycl::half> (NOT bit-exact: denormal+FTZ) ACTIVE\\n");
-          return true;
-        }();
-        (void)announced;
+        decode1_announce("decode1-verbhalf");
         return q.submit([&](sycl::handler& h) {
           h.depends_on(copy_dep);
           h.parallel_for<class gemm_usm_decode1_verbhalf>(
@@ -816,11 +856,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
         // them and the arms were indistinguishable from dead ones. A gate that
         // requires proof-of-execution cannot be satisfied by an arm that never
         // emits proof, and the failure mode is exactly the vacuous PASS.
-        static const bool announced = [] {
-          std::fprintf(stderr, "[decode1-verbmp] weight side through a row-base multi_ptr (bit-exact by construction) ACTIVE\\n");
-          return true;
-        }();
-        (void)announced;
+        decode1_announce("decode1-verbmp");
         return q.submit([&](sycl::handler& h) {
           h.depends_on(copy_dep);
           h.parallel_for<class gemm_usm_decode1_verbmp>(

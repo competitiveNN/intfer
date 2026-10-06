@@ -98,26 +98,41 @@ for t in $ORDERS; do
     vv)   f="$VV" ;;
   esac
   r=0; run_order "$t" "$f" || r=$?
-  # *** THE ARM MUST HAVE ACTUALLY FIRED. *** A killed arm produces the base kernel's
-  # output, so base-vs-base diffs CLEAN and reads as a pass -- which is precisely the
-  # vacuity that made the previous turn's "VERBMP is BITWISE IDENTICAL" meaningless:
-  # its kill switch was set to "" rather than unset, so the arm never ran. The engine
-  # announces each arm once per process on stderr, so that announcement is the ONLY
-  # evidence the branch was taken, and it is now REQUIRED.
+  # *** THE ARM MUST HAVE ACTUALLY FIRED, AND *ONLY* IT. *** A killed arm emits the
+  # base kernel's output, so a base-vs-base diff reads as a clean pass. That guard was
+  # added and immediately killed a whole turn's headline.
+  #
+  # It is now STRICTER: the order's OWN marker must be present AND NO OTHER arm's
+  # marker may be. Presence alone was fooled too -- `[decode1-rowpair]` appeared for
+  # every non-base order while `vh`/`vm` were actually the arms running, because
+  # each arm's announcement was a `static const bool` latch initialised once per
+  # PROCESS on the first kernel call. That latch is gone (one keyed
+  # `decode1_announce(tag)` in quant_gemm.cpp, per-ARM by construction and carrying
+  # a call counter), and this is the always-red twin that pins it: a wrong marker is
+  # a FAILURE, and FP16/INT4 orders stay silent because their branches are guarded
+  # on `bits == 2` and never print.
   if [ "$t" != base ]; then
     case "$t" in
       rp) want=decode1-rowpair ;; vh) want=decode1-verbhalf ;;
       vm) want=decode1-verbmp ;;  vd) want=decode1-verbdead ;;
       vs) want=decode1-verbsel ;; vv) want=decode1-verbvec ;;
     esac
-    if ! grep -aq "\[$want\]" "$BUILD_DIR/rowpair_equiv.$t.err" 2>/dev/null; then
-      echo "FAIL: order $t completed but the kernel never announced [$want]." >&2
-      echo "      The arm was KILLED, so this order diffed the base kernel against" >&2
-      echo "      itself and would have reported a clean pass. Vacuous." >&2
+    errf="$BUILD_DIR/rowpair_equiv.$t.err"
+    if ! grep -aq "\[$want\]" "$errf" 2>/dev/null; then
+      echo "FAIL: order $t did not announce ITS OWN marker [$want]." >&2
+      echo "      present instead:" >&2
+      grep -aoE '\[decode1-[a-z-]+\]' "$errf" 2>/dev/null | sort -u | sed 's/^/        /' >&2
+      r=1
+    fi
+    others="$(grep -aoE '\[decode1-[a-z-]+\]' "$errf" 2>/dev/null \
+              | sort -u | grep -v "^\[$want\]$" || true)"
+    if [ -n "$others" ]; then
+      echo "FAIL: order $t ALSO announced another arm: $others" >&2
+      echo "      One arm's marker must never stand in for another's -- that is" >&2
+      echo "      exactly how a wrong arm certified itself before." >&2
       r=1
     fi
   fi
-  rcs="$rcs $t=$r"
 done
 for t in $ORDERS; do
   case "$rcs" in *"$t=0") ;; *)
