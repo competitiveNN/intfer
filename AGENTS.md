@@ -654,16 +654,44 @@ FAIL: order vm completed but the kernel never announced [decode1-verbmp].
      `exec`s exactly the binary it is given;
    * a CLEAN rebuild (library and object deleted, then rebuilt) does not change it.
 
-   *** THE UNTESTED SUSPECT, NAMED FOR THE NEXT SESSION: the announcement is a
-   `static const bool` latch. *** It is initialised once per PROCESS on the first
-   kernel call, and `rowpair_equiv` re-enters its env block once per
-   (shape, dataset) -- so the FIRST call in a process decides what prints, forever.
-   If any call happens with an env state the trace did not capture, ROWPAIR latches
-   and no later order in that process can print anything else. The fix is a
-   **per-order marker INSIDE the engine** so a latch cannot masquerade as a
-   different arm, pinned by the always-red twin that already exists (FP16/INT4
-   orders must stay silent). That is why the round-2 arms were restored rather than
-   deleted a second time.
+*** THE LATCH WAS FIXED, AND HERE IS THE PER-ORDER MEASUREMENT. *** The six
+`static const bool announced` latches are gone, replaced by ONE
+`decode1_announce(tag)` whose latch is keyed by the arm's tag in a `std::set`
+behind a mutex -- per-arm BY CONSTRUCTION, not by accident of lexical scope -- and
+whose line carries a CALL COUNTER. `INTFER_DECODE1_ANNOUNCE_EVERY=1` disables the
+once-only latch entirely, so a harness can prove the latch is not what decides the
+marker.
+
+| order | marker | verdict |
+|---|---|---|
+| base | (none) | **correct** -- no arm live |
+| rp | `[decode1-rowpair]` | **correct** |
+| vh | `[decode1-verbhalf]` | **correct** (was `[decode1-rowpair]`) |
+| vm | `[decode1-verbmp]` | marker right, **but the process DIES right after** |
+| vd | `[decode1-rowpair]` | **WRONG**, unresolved |
+| vs | `[decode1-rowpair]` | **WRONG**, unresolved |
+| vv | `[decode1-rowpair]` | **WRONG**, unresolved |
+
+The latch was one real bug and it is fixed: `vh` and `vm` now announce THEMSELVES,
+which is the first time any verb* arm has been shown to execute.
+
+*** TWO DEFECTS REMAIN, AND NEITHER IS THE LATCH. ***
+* **`vm` ANNOUNCES AND THEN DIES** -- 196 B of stderr against 298 B for `rp`, so it
+  stops before the final line. That is a fault signal INSIDE THE VERBMP KERNEL, and
+  it is the shape of the defect ROWPAIR had before its double-offset was found. It
+  is the first evidence that a round-1 kernel may itself be wrong.
+* **`vd`/`vs`/`vv` take ROWPAIR.** Their order-table entries are correct
+  (`{"vd", "INTFER_DECODE1_VERBDEAD", "INTFER_NO_DECODE1_VERBDEAD", 4}` etc.), so the
+  loop must be killing `INTFER_DECODE1_ROWPAIR` for those slots. It demonstrably
+  is not. **NOT DIAGNOSED.**
+
+*** AND A LATE FINDING THAT IS EMBARRASSING: THE ORDER-EXCLUSIVITY GUARD IS DEAD
+CODE. *** It sits AFTER all six arms' blocks, and each arm ends in
+`return q.submit(...)`, so control can never reach it. It was added to catch
+precisely this situation and cannot. It belongs immediately after the sixth flag
+read, before the first arm. Recorded rather than quietly fixed, because the fix
+should ship with a mutation state proving the guard fires.
+
 
 **SO: NO `verb*` ARM HAS A CORRECTNESS MEASUREMENT, and the earlier `VERBMP`
 result is withdrawn.** `ROWPAIR`'s own 227 835-value result is ALSO withdrawn as
