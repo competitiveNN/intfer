@@ -864,8 +864,14 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                 sycl::multi_ptr<const std::uint16_t,
                     sycl::access::address_space::global_space> act_mp(act_usm);
                 // *** THE ONE CHANGE: the weight side through a row-base multi_ptr. ***
+                // row_base is an ELEMENT offset (ng * K); the weight side is packed
+                // four INT2 codes per byte, so the multi_ptr base must be converted
+                // to bytes. This is the same double-offset class of defect that made
+                // the ORIGINAL INTFER_DECODE1_ROWPAIR lose the device (row-offset
+                // multi_ptr indexed with the base kernel's ABSOLUTE byte offsets);
+                // if the /4 is wrong, the arm reads past the shard and DEVICE_LOSTs.
                 sycl::multi_ptr<const std::uint8_t,
-                    sycl::access::address_space::global_space> wmp(code_u8 + row_base);
+                    sycl::access::address_space::global_space> wmp(code_u8 + row_base / 4u);
                 for (int g = 0; g < num_groups; ++g) {
                   const float scale = from_half_bits(sptr[g]) * alpha;
                   const int kg0 = g * Gw;

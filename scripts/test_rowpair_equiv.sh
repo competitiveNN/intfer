@@ -19,8 +19,8 @@
 #
 # Row-pairing shares ONE activation load across TWO code pointers, which is
 # precisely the lane where an index that assumes a single pointer goes wrong. So
-# the claim is worth nothing until measured, and this measures it: bitwise, not to
-# a tolerance, because the claim is exactness.
+# the claim is worth nothing until measured, and this measures it: bitwise, not
+# to a tolerance, because the claim is exactness.
 #
 # TWO PROCESSES, NOT ONE. quant_gemm_forward_usm reads the flag into a
 # function-local `static const bool` (the same pattern every engine flag uses; a
@@ -30,7 +30,7 @@
 #
 # NO MODEL: this binds none, per AGENTS.md's standing rule 1.
 #
-# Usage: scripts/test_rowpair_equiv.sh [--keep]
+# Usage: scripts/test_rowpair_equiv.sh [--keep] [--self-check]
 # Exit:  0 = row-pair output is BITWISE IDENTICAL to base on every shape and
 #           dataset; 1 = a difference, or a case that produced no output.
 set -o pipefail
@@ -41,10 +41,6 @@ BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
 BIN="$BUILD_DIR/examples/rowpair_equiv/rowpair_equiv"
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
-
-. "$SCRIPT_DIR/_gate_build.sh"
-gate_require_build rowpair_equiv || exit 1
-[ -x "$BIN" ] || { echo "FAIL: rowpair_equiv binary missing: $BIN" >&2; exit 1; }
 
 BASE="$BUILD_DIR/rowpair_equiv.base.txt"
 RP="$BUILD_DIR/rowpair_equiv.rp.txt"
@@ -62,6 +58,89 @@ RP="$BUILD_DIR/rowpair_equiv.rp.txt"
 # is a CLAIM, and the ROWPAIR precedent is that a bit-exactness argument is worth
 # nothing until measured -- ROWPAIR's is exactly what shipped a device-losing
 # double offset. This settles it without a model and without a 27B load.
+# ---- THE MARKER PREDICATE, AS A FUNCTION, so it can be twin-tested -------------
+# Rule 6: a check needs a case where the thing MUST appear AND a case where it must
+# stay quiet, or "0 findings" and "found nothing" are the same claim. Both directions
+# are exercised below against SYNTHETIC logs, in --self-check, with no GPU and no
+# launch -- because the real logs are only obtainable on a healthy two-GPU box, and a
+# check that can only be verified there is a check nobody verifies.
+marker_for() {  # $1 = order tag -> the marker that order MUST print
+  case "$1" in
+    rp) echo decode1-rowpair ;; vh) echo decode1-verbhalf ;;
+    vm) echo decode1-verbmp ;;  vd) echo decode1-verbdead ;;
+    vs) echo decode1-verbsel ;; vv) echo decode1-verbvec ;;
+    *)   echo "" ;;
+  esac
+}
+# marker_verdict <order> <errfile> -> 0 ok, 1 must-fail.
+# The QUIET direction: base prints NO [decode1-*] marker at all, because no arm is
+# live. If base ever prints one, an arm ran when none was selected -- which is the
+# vacuous-pass shape this gate exists to refuse.
+marker_verdict() {
+  local t="$1" errf="$2" want others
+  want="$(marker_for "$t")"
+  others="$(grep -aoE '\[decode1-[a-z-]+\]' "$errf" 2>/dev/null \
+            | sort -u | grep -v '^\[decode1-bisect\]$' || true)"
+  if [ "$t" = base ]; then
+    if [ -n "$others" ]; then
+      echo "    base printed a marker but no arm was selected: $others" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if ! grep -aq "\[$want\]" "$errf" 2>/dev/null; then
+    echo "    order $t did not announce ITS OWN marker [$want]; present instead:" >&2
+    printf '%s\n' "$others" | sed 's/^/        /' >&2
+    return 1
+  fi
+  local foreign
+  foreign="$(printf '%s\n' "$others" | grep -v "^\[$want\]$" || true)"
+  if [ -n "$foreign" ]; then
+    echo "    order $t ALSO announced another arm: $foreign" >&2
+    echo "    one arm's marker must never stand in for another's" >&2
+    return 1
+  fi
+  return 0
+}
+
+# ---- SELF-CHECK, BEFORE any build or GPU requirement -----------------------
+# The real stderr logs are only obtainable on a healthy two-GPU box, so the
+# predicate itself is certified here against synthetic logs: one case where the
+# marker MUST appear, one where it MUST stay quiet, three where a wrong marker
+# MUST be refused. No GPU, no launch, no binary.
+if [ "${1:-}" = "--self-check" ]; then
+  SC="$(mktemp -d "${TMPDIR:-/dev/shm}/rpequiv.XXXXXX")"
+  trap 'rm -rf "$SC"' EXIT INT TERM
+  bad=0
+  # FIXTURES. Each is a COMPLETE, correctly-shaped stderr; they differ in EXACTLY
+  # ONE thing, because a fixture that differs in several cannot isolate its defect.
+  printf 'x\n[decode1-rowpair] 2 rows/work-item ACTIVE\ny\n' >"$SC/rp.good"
+  printf 'x\ny\n'                                              >"$SC/base.quiet"
+  printf 'x\n[decode1-verbhalf] scale via bit_cast ACTIVE\ny\n' >"$SC/vh.good"
+  printf 'x\n[decode1-rowpair] 2 rows/work-item ACTIVE\ny\n'    >"$SC/vh.wrong"
+  printf 'x\n[decode1-verbhalf] a\n[decode1-rowpair] b\ny\n'    >"$SC/vh.two"
+  printf 'x\ny\n'                                              >"$SC/rp.silent"
+  # tc <expected-rc> <label> <order> <fixture>
+  tc() { local want_rc=$1 lbl=$2 ord=$3 f=$4 rc=0
+         marker_verdict "$ord" "$f" >/dev/null 2>&1 || rc=1
+         if [ "$rc" -eq "$want_rc" ]; then echo "  ok   $lbl"
+         else echo "  SELF-CHECK FAIL: $lbl" >&2; bad=1; fi; }
+  tc 0 "rp + its own marker                          -> ACCEPTED" rp    "$SC/rp.good"
+  tc 0 "base + NO marker (the QUIET direction)       -> ACCEPTED" base  "$SC/base.quiet"
+  tc 0 "vh + its own marker                          -> ACCEPTED" vh    "$SC/vh.good"
+  tc 1 "vh carrying ROWPAIR's marker instead         -> REFUSED"  vh    "$SC/vh.wrong"
+  tc 1 "vh carrying TWO markers                      -> REFUSED"  vh    "$SC/vh.two"
+  tc 1 "rp silent (the MUST-appear direction)        -> REFUSED"  rp    "$SC/rp.silent"
+  if [ "$bad" -ne 0 ]; then echo "DECODE1-EQUIV SELF-CHECK: FAIL" >&2; exit 1; fi
+  echo "DECODE1-EQUIV SELF-CHECK: PASS (1 must-appear, 1 must-stay-quiet,"
+  echo "  3 must-be-refused -- synthetic logs, no GPU, no launch)"
+  exit 0
+fi
+
+. "$SCRIPT_DIR/_gate_build.sh"
+gate_require_build rowpair_equiv || exit 1
+[ -x "$BIN" ] || { echo "FAIL: rowpair_equiv binary missing: $BIN" >&2; exit 1; }
+
 run_order() {  # $1 = order tag
   local tag="$1" f="$2"
   env -u INTFER_DECODE1_ROWPAIR -u INTFER_DECODE1_VERBHALF -u INTFER_DECODE1_VERBMP \
@@ -71,8 +150,6 @@ run_order() {  # $1 = order tag
   return $?
 }
 
-B_RC=0; run_order base "$BASE" || B_RC=$?
-R_RC=0; run_order rp   "$RP"   || R_RC=$?
 # *** THE ARM TABLE IS DERIVED, NOT TYPED TWICE. *** Adding an order to the binary
 # and forgetting it here would leave an arm silently uncertified, which is how
 # INTFER_DECODE1_SUBGROUP ended up red in the first place -- so the names live in
@@ -84,6 +161,15 @@ R_RC=0; run_order rp   "$RP"   || R_RC=$?
 # FLAG names, not the ORDER names; keep the two vocabularies distinct.
 ARMS="rp vh vm vd vs vv"
 ORDERS="base $ARMS"
+# The per-order payload paths, in ONE place, BEFORE the loop that reads them --
+# bash expands an unset variable to the empty string, and `run_order t ""` would
+# silently write the payload to a file with no name. Defining them after the loop
+# is the same "added to one place, forgotten in the other" failure again.
+VH="$BUILD_DIR/rowpair_equiv.verbhalf.txt"
+VM="$BUILD_DIR/rowpair_equiv.verbmp.txt"
+VD="$BUILD_DIR/rowpair_equiv.verbdead.txt"
+VS="$BUILD_DIR/rowpair_equiv.verbsel.txt"
+VV="$BUILD_DIR/rowpair_equiv.verbvec.txt"
 
 rcs=""
 for t in $ORDERS; do
@@ -98,41 +184,11 @@ for t in $ORDERS; do
     vv)   f="$VV" ;;
   esac
   r=0; run_order "$t" "$f" || r=$?
-  # *** THE ARM MUST HAVE ACTUALLY FIRED, AND *ONLY* IT. *** A killed arm emits the
-  # base kernel's output, so a base-vs-base diff reads as a clean pass. That guard was
-  # added and immediately killed a whole turn's headline.
-  #
-  # It is now STRICTER: the order's OWN marker must be present AND NO OTHER arm's
-  # marker may be. Presence alone was fooled too -- `[decode1-rowpair]` appeared for
-  # every non-base order while `vh`/`vm` were actually the arms running, because
-  # each arm's announcement was a `static const bool` latch initialised once per
-  # PROCESS on the first kernel call. That latch is gone (one keyed
-  # `decode1_announce(tag)` in quant_gemm.cpp, per-ARM by construction and carrying
-  # a call counter), and this is the always-red twin that pins it: a wrong marker is
-  # a FAILURE, and FP16/INT4 orders stay silent because their branches are guarded
-  # on `bits == 2` and never print.
-  if [ "$t" != base ]; then
-    case "$t" in
-      rp) want=decode1-rowpair ;; vh) want=decode1-verbhalf ;;
-      vm) want=decode1-verbmp ;;  vd) want=decode1-verbdead ;;
-      vs) want=decode1-verbsel ;; vv) want=decode1-verbvec ;;
-    esac
-    errf="$BUILD_DIR/rowpair_equiv.$t.err"
-    if ! grep -aq "\[$want\]" "$errf" 2>/dev/null; then
-      echo "FAIL: order $t did not announce ITS OWN marker [$want]." >&2
-      echo "      present instead:" >&2
-      grep -aoE '\[decode1-[a-z-]+\]' "$errf" 2>/dev/null | sort -u | sed 's/^/        /' >&2
-      r=1
-    fi
-    others="$(grep -aoE '\[decode1-[a-z-]+\]' "$errf" 2>/dev/null \
-              | sort -u | grep -v "^\[$want\]$" || true)"
-    if [ -n "$others" ]; then
-      echo "FAIL: order $t ALSO announced another arm: $others" >&2
-      echo "      One arm's marker must never stand in for another's -- that is" >&2
-      echo "      exactly how a wrong arm certified itself before." >&2
-      r=1
-    fi
+  if ! marker_verdict "$t" "$BUILD_DIR/rowpair_equiv.$t.err"; then
+    echo "FAIL: order $t marker contract violated" >&2
+    r=1
   fi
+  rcs="$rcs $t=$r"
 done
 for t in $ORDERS; do
   case "$rcs" in *"$t=0") ;; *)
@@ -151,11 +207,6 @@ done
 # emitted a non-trivial number of per-element lines, and the two must cover the
 # same case set. That is the empty-stream vacuity the repo's bench harness has its
 # own checker for, in miniature.
-VH="$BUILD_DIR/rowpair_equiv.verbhalf.txt"
-VM="$BUILD_DIR/rowpair_equiv.verbmp.txt"
-VD="$BUILD_DIR/rowpair_equiv.verbdead.txt"
-VS="$BUILD_DIR/rowpair_equiv.verbsel.txt"
-VV="$BUILD_DIR/rowpair_equiv.verbvec.txt"
 n_base="$(grep -c '|0x' "$BASE" || true)"
 for pair in "rowpair:$RP" "verbhalf:$VH" "verbmp:$VM" \
             "verbdead:$VD" "verbsel:$VS" "verbvec:$VV"; do

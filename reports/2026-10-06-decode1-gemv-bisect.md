@@ -111,9 +111,9 @@ operator can measure them on real weights in one pass:
 | **guard** | `bits == 2 && use_int2_tab` | same |
 | **the one change** | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` | weight side through a row-base `multi_ptr` |
 | **body** | **INLINE at the call site**, a separate `parallel_for` | same |
-| **numerics** | **NOT bit-exact by construction** — `from_half_bits` returns 0 for a zero/subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert which flushes to zero under default FTZ. Stream-identity only, same class as `INTFER_DECODE1_SPLITK` | **bit-exact — NOW MEASURED, NOT ARGUED** (see below) |
+| **numerics** | **NOT bit-exact by construction** — `from_half_bits` returns 0 for a zero/subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert which flushes to zero under default FTZ. Stream-identity only, same class as `INTFER_DECODE1_SPLITK` | **bit-exact by construction — but BUGGY: the row-base `multi_ptr` base treated the element offset as a byte offset, so the arm read past the shard and lost the device; FIXED by this session, to be re-measured** (see below) |
 | **gate arm** | `scripts/test_tp2_27b.sh`, TP=2 | same |
-| **CORRECTNESS measured** | **NONE — arm does not fire under the differential; cause not located** | **NONE — an earlier "bitwise identical, 227 835 values" result is WITHDRAWN as vacuous (see below)** |
+| **CORRECTNESS measured** | **NONE — arm does not fire under the differential; cause not located** | **BROKEN and FOUND: the gate rejected `vm` — it announced `[decode1-verbmp]` then aborted `UR_RESULT_ERROR_DEVICE_LOST` (rc=134) deterministically on the current box; root cause located (double-offset class, missing `/4`; see below); FIXED by this session. Re-measure after rebuild.** |
 | **buckets I measured (perf)** | **none** — not run | **none** — not run |
 | **expected direction** | **UNKNOWN**, not positive | **UNKNOWN**, not positive |
 
@@ -179,6 +179,18 @@ shapes, while passing FP16 and INT4 because the branch is guarded on `bits == 2`
 `VERBMP`'s chunk loop uses **row-relative** `b0` and its tail deliberately uses the
 **unoffset** `code_u8` with absolute indices, exactly as the base kernel does.
 
+**This reasoning was WRONG.** `row_base` is an **element** offset (`ng * K`), but the
+`multi_ptr` base was written as `code_u8 + row_base`, treating it as a **byte**
+offset; with the local byte offset `b0 = kg / 4` the effective byte index became
+`ng * K + kg / 4` instead of the base kernel's correct `(ng * K + kg) / 4`. The
+effective index is wrong by `3 * ng * K / 4` bytes: for `ng ≳ 2176` (roughly N/4) on
+MLP_GATE (`N = 8704, K = 5120`, 11 141 120-byte buffer) it read past the shard and
+**lost the device** — the same double-offset class of defect as the ORIGINAL
+`INTFER_DECODE1_ROWPAIR`. A reading of the two bodies would not have caught it; only
+the gate rejecting the arm that dies did. **FIXED by this session:** `code_u8 +
+row_base / 4u` (element → byte offset), so `wmp[b0]` evaluates to the base kernel's
+byte index; arithmetic and index VALUES unchanged.
+
 **How they are pinned:** `scripts/check_decode1_copies.sh` now enumerates both new
 bodies (`covered-by-subset`) *and* asserts their **shift-into-mask set EQUALS the
 general body's** — an equality, not a subset, computed with a deliberately loose
@@ -226,6 +238,60 @@ to 120 s, refuses to start if `INTFER_BISECT_TIMEOUT` is at or above the runner'
 consequence.
 
 **I am not claiming a result from this binary.** The two arms' ratios are unknown.
+
+---
+
+## 4. This session's re-verification: VERBMP found and fixed
+
+The box is in its documented degraded state this session: the diag probe reads
+`zeDeviceGet rc=0 DEVICES=1`, and the SYCL/runtime side cannot even bootstrap (the
+oneAPI tree lives in an unmapped container overlay and `/opt` is unwritable). The gate
+was run anyway with the build skipped (`INTFER_GATE_NO_BUILD=1`; the on-disk binary
+was built from the committed source and is current, and `git log cf63f1a..HEAD --
+src/ include/ examples/intfer_cli/` is empty):
+
+```
+order  rc    note
+base   0
+rp     0
+vh     0
+vm     134   <-- ANNOUNCED THEN DEVICE_LOST (SIGABRT, core dumped)
+vd     0
+vs     0
+vv     0
+```
+
+The abort was **not flaky** — reproduced over two runs — and it is specific to `vm`:
+all five other arms launched successfully on this exact box. So it is not the
+"second GPU dropped out of enumeration" fault (which hangs EVERY arm uniformly,
+including `rp`); it is an arm-specific kernel fault.
+
+Root cause: `wmp = code_u8 + row_base` where `row_base = ng * K` is an **element**
+offset but is treated as a **byte** offset; with the local byte offset `b0 = kg / 4`
+the effective byte index becomes `ng * K + kg / 4` instead of the base kernel's
+correct `(ng * K + kg) / 4 = ng * K / 4 + kg / 4`. The effective index is wrong by
+`3 * ng * K / 4` bytes: for `ng ≳ 2176` (roughly N/4) on MLP_GATE (`N = 8704, K =
+5120`, 11 141 120-byte buffer) it reads past the shard and the kernel **loses the
+device** (`UR_RESULT_ERROR_DEVICE_LOST`). This is the same double-offset class of
+defect that made the ORIGINAL `INTFER_DECODE1_ROWPAIR` lose the device — and it would
+NOT have been caught by reading the code, only by the gate rejecting the arm that
+dies. The interrupted session's retraction (the `VERBMP` correctness measurement was
+VACUOUS) is confirmed: no correct measurement for `VERBMP` ever existed.
+
+**Fixed by this session:** `code_u8 + row_base / 4u` — the element offset is
+converted to the row's byte start, so `wmp[b0]` with the local byte offset `kg / 4`
+evaluates to exactly the base kernel's byte index. The chunk loop and tail are
+unchanged, and `VERBHALF` / `VERBDEAD` / `VERBSEL` / `VERBVEC` use the same
+base-identical indexing and launched cleanly. Once rebuilt and re-verified on a
+healthy 2-GPU box, `INTFER_DECODE1_VERBMP` should pass `check_identical` (bit-exact
+by construction: arithmetic and index VALUES unchanged, only the pointer type the
+compiler folds the address through).
+
+**Caveat:** the identity-to-base `cmp` never ran this session — the gate failed at
+its completion check (because `vm` did not complete) before reaching the diff step.
+The other five orders' green verdict is "they launched and returned 0", not "they
+matched base this run". A rebuild + healthy-box run is required to complete the
+measurement.
 
 ---
 
@@ -338,5 +404,9 @@ INTFER_DECODE1_VERBMP=1   bash scripts/run_ten_gates.sh
 
 ```
 RESULT: E-VERBHALF  kernel=__ ms/token (baseline __)  nk/nw/nr = __/__/__  [win|neutral|loss]
-RESULT: E-VERBMP    kernel=__ ms/token (baseline __)  nk/nw/nr = __/__/__  [win|neutral|loss]
+RESULT: E-VERBMP    BROKEN (DEVICE_LOST, double-offset class) — missing /4 on the
+                      row-base `multi_ptr` base; FIXED by this session;
+                      re-measure after rebuild: rebuild + `bash scripts/test_rowpair_equiv.sh`
+                      on a healthy 2-GPU box; then `INTFER_DECODE1_VERBMP=1
+                      bash scripts/run_ten_gates.sh` with load1 < 2, counters only.
 ```

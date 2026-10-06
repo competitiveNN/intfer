@@ -587,7 +587,7 @@ requiring the arm's own announcement line, so a flag that did nothing cannot pas
 |---|---|---|
 | the ONE change | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` (the engine's branchy **scalar** FP16->FP32 twiddle, 3 branches per call, **320 calls per work-item** at MLP_GATE) | weight side through a row-base `multi_ptr` instead of an absolute index into raw `code_u8` |
 | numerics | **NOT bit-exact by construction.** `from_half_bits` returns 0 for a zero or subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert, which **flushes to zero under the default FTZ**. A zero group scale is the differing case, and FP16 scales come from `to_half_bits` of a positive host float so it *should not* arise — but "should not" is an argument, so the arm is **stream-identity only and makes NO arithmetic claim**. Same class as `INTFER_DECODE1_SPLITK` | **bit-exact — AND NOW MEASURED RATHER THAN ARGUED** |
-| **correctness, measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets, which does **NOT** prove the FTZ concern away — only that these synthetic scales never reach a zero or subnormal exponent | `test_rowpair_equiv.sh`: **BITWISE IDENTICAL to base on 227 835 element values**, 8 shapes x 5 datasets |
+| **correctness, measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets, which does **NOT** prove the FTZ concern away — only that these synthetic scales never reach a zero or subnormal exponent | **BROKEN — DEVICE_LOST on this box (double-offset class, missing `/4` on the row-base `multi_ptr` base); FIXED by this session, to be re-measured after rebuild** |
 | **performance** | **UNMEASURED** | **UNMEASURED** |
 
 *** `VERBMP`'s INDICES ARE WRITTEN THE WAY THEY ARE ON PURPOSE, AND THE REASON IS THE
@@ -725,6 +725,64 @@ positive.** Both need
 one 27B `--tp 2` run each, which AGENTS.md's standing rule 1 forbids an agent
 session from performing. Blank `RESULT:` lines and the exact commands are in
 `reports/2026-10-06-decode1-gemv-bisect.md`.
+
+### This session's re-verification (box: single device, degraded): `VERBMP` found and fixed
+
+The box entered this session in its documented degraded state: the diag probe reads
+`zeDeviceGet rc=0 DEVICES=1`, and the SYCL/runtime side is not bootstrappable at all
+(this shell has no oneAPI compiler — the tree lives in an unmapped container overlay
+and `/opt` is unwritable). I ran the gate anyway with the build skipped
+(`INTFER_GATE_NO_BUILD=1`; the on-disk binary was built from the committed source and
+is current, and `git log cf63f1a..HEAD -- src/ include/ examples/intfer_cli/` is
+empty).
+
+```
+order  rc    note
+base   0
+rp     0
+vh     0
+vm     134   <-- ANNOUNCED THEN DEVICE_LOST (SIGABRT, core dumped)
+vd     0
+vs     0
+vv     0
+```
+
+The abort was **not flaky** — reproduced over two runs — and it is specific to `vm`:
+all five other arms launched successfully on this exact box. So it is not the
+"second GPU dropped out of enumeration" fault (which hangs EVERY arm uniformly,
+including `rp`); it is an arm-specific kernel fault.
+
+Root cause: `wmp = code_u8 + row_base` where `row_base = ng * K` is an **element**
+offset but is treated as a **byte** offset; with the local byte offset `b0 = kg / 4`
+the effective byte index becomes `ng * K + kg / 4` instead of the base kernel's
+correct `(ng * K + kg) / 4 = ng * K / 4 + kg / 4`. The effective index is wrong by
+`3 * ng * K / 4` bytes: for `ng ≳ 2176` (roughly N/4) on MLP_GATE (`N = 8704, K =
+5120`, 11 141 120-byte buffer) it reads past the shard and the kernel **loses the
+device** (`UR_RESULT_ERROR_DEVICE_LOST`). This is the same double-offset class of
+defect that made the ORIGINAL `INTFER_DECODE1_ROWPAIR` lose the device — and it would
+NOT have been caught by reading the code, only by the gate rejecting the arm that
+dies.
+
+The interrupted session's own retraction (`"SO: NO verb* ARM HAS A CORRECTNESS
+MEASUREMENT, and the earlier VERBMP result is withdrawn"`) is confirmed: no correct
+correctness measurement for `VERBMP` ever existed.
+
+**Fixed by this session:** `code_u8 + row_base / 4u` — the element offset is
+converted to the row's byte start, so `wmp[b0]` with the local byte offset `kg / 4`
+evaluates to exactly the base kernel's byte index. The chunk loop and the tail are
+unchanged, and `VERBHALF` / `VERBDEAD` / `VERBSEL` / `VERBVEC` use the same
+base-identical indexing and launched cleanly. Once rebuilt and re-verified on a
+healthy 2-GPU box, `INTFER_DECODE1_VERBMP` should pass `test_rowpair_equiv.sh`'s
+`check_identical` (bit-exact by construction: the arithmetic and the index VALUES
+are unchanged, only the pointer type the compiler folds the address through).
+
+One box caveat, stated explicitly: the identity-to-base diffs never ran this
+session — the gate failed at its completion check (because `vm` did not complete)
+before reaching the `cmp` step. The green verdict for the other five orders is
+"they launched and returned 0", not "they matched base this run". A rebuild + healthy
+box run is required to complete the measurement.
+
+---
 
 ### What the same probe retired, so nobody re-attempts them
 
