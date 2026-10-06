@@ -111,7 +111,12 @@ if [ "$brc" -ne 0 ]; then
   total=$((total + 1)); bad=$((bad + 1))
 else
   pred_expect_present "baseline harvested a subject" "$b" 'BUILD-DIR CONSUMER CHECK: PASS'
-  pred_expect_present "baseline is non-vacuous" "$b" 'consumer(s), all honor INTFER_BUILD_DIR' \
+  # NOTE the parens: the checker prints `consumer(s)` literally, and an ERE
+  # without them matches the bare word `consumers` -- which the checker
+  # prints nowhere. Escaping is load-bearing here; the first version of this
+  # matrix failed its own baseline for exactly that reason and every state
+  # below scored against a broken baseline.
+  pred_expect_present "baseline is non-vacuous" "$b" 'consumer\(s\), all honor INTFER_BUILD_DIR' \
     || { echo "  FAIL baseline verdict looks vacuous (no subject inspected)" >&2; bad=$((bad + 1)); }
   echo "  ok    baseline rc=0, population non-empty"
   total=$((total + 1)); caught=$((caught + 1))
