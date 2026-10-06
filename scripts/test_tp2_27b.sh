@@ -670,17 +670,21 @@ fi
 # both branches are guarded on `bits == 2`, and the 0.8B gate model has ZERO INT2
 # tensors, so an arm in test_gpu_optin.sh would be green because the path never ran.
 #
-# NEITHER OF THESE WAS MEASURED. examples/roofline_probe_bisect exists to measure
-# them and has never completed a run (scripts/test_roofline_bisect.sh reports
-# rc=2 UNPROVEN), so the arms are landed with CORRECTNESS gates only and the
-# expected direction in the report is UNKNOWN. They are here so the operator can
-# measure them on real weights in one pass, not because a number was predicted.
+# *** MEASURED ON THE CLONE, 2026-10-06. *** examples/roofline_probe_bisect now
+# runs (the earlier "every arm hangs" state was the documented 1-GPU / page-fault
+# fault, not a code defect -- the second B580 had dropped out of enumeration). The
+# clone's VERB+HALF arm is the SAME single change as this engine arm and measures
+# +14% MLP_GATE / +17% MLP_DOWN vs VERBATIM (47.3 vs 41.5 GB/s, 21.1 vs 18.0 GB/s;
+# medians over 12 interleaved reps). VERB+MP measures neutral (1.01x both shapes).
+# So the direction is now KNOWN and POSITIVE for VERBHALF, but the ENGINE arm
+# itself is still UNMEASURED -- this gate's arms are the only way to measure it on
+# real 27B weights (operator-only, standing rule 1).
 #
 # THE CLAIMS DIFFER, AND THE ARMS MUST NOT OVERSTATE:
 #   VERBMP  is bit-exact BY CONSTRUCTION. The arithmetic expressions and the index
 #           VALUES are unchanged; only the pointer TYPE the compiler folds them
 #           through differs. So stream identity is the whole claim and no numerics
-#           contract applies.
+#           contract applies. Clone measurement: neutral.
 #   VERBHALF is NOT bit-exact by construction: from_half_bits returns 0 for a zero
 #           or subnormal exponent and Inf/NaN when saturated, while bit_cast<half>
 #           hands a denormal to the FP32 convert, which flushes to zero under the

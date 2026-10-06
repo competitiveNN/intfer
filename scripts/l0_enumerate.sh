@@ -26,8 +26,9 @@ trap 'rm -f "$OUT" "$OUT.bin"; exit 143' TERM
 
 # Locate the compiler the same way scripts/build.sh does (avoids sourcing
 # setvars.sh, which calls exit and would kill this script).
-CBIN="$(ls -dv /opt/intel/oneapi/compiler/[0-9]*/bin 2>/dev/null | sort -V | tail -1)"
-CLIB="$(ls -dv /opt/intel/oneapi/compiler/[0-9]*/lib 2>/dev/null | sort -V | tail -1)"
+ROOT="${ONEAPI_ROOT:-/opt/intel/oneapi}"
+CBIN="$(ls -dv "$ROOT"/compiler/[0-9]*/bin 2>/dev/null | sort -V | tail -1)"
+CLIB="$(ls -dv "$ROOT"/compiler/[0-9]*/lib 2>/dev/null | sort -V | tail -1)"
 [ -n "$CBIN" ] || { echo "SKIP: no oneAPI compiler found."; exit 2; }
 INC=/usr/include/level_zero
 [ -f "$INC/ze_api.h" ] || INC="$(dirname "$(find / -name ze_api.h 2>/dev/null | head -1)")"
@@ -37,15 +38,18 @@ INC=/usr/include/level_zero
 # repo keeps auditing -- a probe that silently re-runs yesterday's build is
 # worse than no probe.
 rm -f "$OUT" "$OUT.bin"
-PATH="$CBIN:$PATH" LD_LIBRARY_PATH="$CLIB:${LD_LIBRARY_PATH:-}" \
-  icpx -x c -o "$OUT.bin" "$SCRIPT_DIR/l0_enumerate.c" -I"$INC" -lze_loader 2>&1 \
+export L0_SYS_LIB="/usr/lib64"  # system Level Zero (libze_loader.so.1 + driver)
+# linker wants libze_loader.so; only the versioned .so.1 exists, so link verbatim
+PATH="$CBIN:$PATH" LD_LIBRARY_PATH="$CLIB:$L0_SYS_LIB:${LD_LIBRARY_PATH:-}" \
+  icpx -x c -o "$OUT.bin" "$SCRIPT_DIR/l0_enumerate.c" -I"$INC" \
+  -L"$L0_SYS_LIB" -l:libze_loader.so.1 2>&1 \
   | grep -vi deprecated | head -5
 if [ ! -x "$OUT.bin" ]; then
   echo "FAIL: probe did not build; refusing to report (a stale binary would lie)."
   exit 1
 fi
 
-export LD_LIBRARY_PATH="/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$ROOT/umf/1.0/lib:$L0_SYS_LIB:${LD_LIBRARY_PATH:-}"
 if [ -n "${INTFER_L0_DRIVER_LIB:-}" ]; then
   export LD_LIBRARY_PATH="$INTFER_L0_DRIVER_LIB:$LD_LIBRARY_PATH"
   echo "forced driver lib from: $INTFER_L0_DRIVER_LIB"

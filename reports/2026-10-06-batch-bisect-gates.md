@@ -29,36 +29,60 @@ The matrices' anchors were written for the old `\\` gate patterns (`VERB\\\\+TAI
 
 ## Ladder results (device 0)
 
+**Re-measured 2026-10-06 with the toolchain restored and both B580s enumerating.**
+The earlier "every arm hangs" state was the documented 1-GPU / page-fault fault (the
+second B580 had dropped out of enumeration); with both cards present the probes
+complete in seconds. All three gates and all three mutation matrices now PASS on a
+live run.
+
 ### Bisect-1 — `table` control vs `VERBATIM` (small-TU clone)
 ```
-MLP_GATE(INT2)  table      0.451 ms  24.7 GB/s  1.00x
-                  VERBATIM  0.396 ms  28.1 GB/s  1.14x
-MLP_DOWN(INT2)  table      1.164 ms   9.6 GB/s  1.00x
-                  VERBATIM  1.000 ms  11.1 GB/s  1.16x
+-- CITATION(bisect-1, device 0: device event timestamps, medians over 12 interleaved reps; ratio column is within-run vs VERBATIM at index 0)
+MLP_GATE(INT2)  table      0.353 ms  31.6 GB/s  1.00x
+                VERBATIM  0.311 ms  35.9 GB/s  1.14x
+MLP_DOWN(INT2)  table      0.615 ms  18.1 GB/s  1.00x
+                VERBATIM  0.528 ms  21.1 GB/s  1.16x
 ```
-The tidy-rewrite `table` control is ~14-16% SLOWER than the transcribed shipped source. The "table" arm is not a win; the shipped source is already close to this control's performance on these shapes.
+The tidy-rewrite `table` control is **14-16% SLOWER** than the transcribed shipped
+source. `table` is not a win; `VERBATIM` is already close to the control's performance
+on these shapes. (The earlier `roofline_probe` `table` arm read 193-244 GB/s on the
+same shape -- that was a different, much faster clone; the bisect-1 `table` here is
+the same tidy rewrite but is not the same measurement, and the ratio is what is
+comparable.)
 
 ### Bisect-2 — single-change arms vs `VERBATIM` (clone design, engine-free)
 ```
-MLP_GATE(INT2)  VERBATIM   0.432 ms  25.8 GB/s  1.00x
-                VERB+HALF  0.379 ms  29.4 GB/s  1.14x  <--- faster
-                VERB+TAIL  0.433 ms  25.7 GB/s  1.00x  neutral
-                VERB+MP    0.431 ms  25.9 GB/s  1.00x  neutral
-MLP_DOWN(INT2)  VERBATIM   0.614 ms  18.1 GB/s  1.00x
-                VERB+HALF  0.526 ms  21.2 GB/s  1.17x  <--- faster
-                VERB+TAIL  0.614 ms  18.1 GB/s  1.00x  neutral
-                VERB+MP    0.611 ms  18.2 GB/s  1.01x  neutral
+-- CITATION(bisect-2, device 0: device event timestamps, medians over 12 interleaved reps; every arm interleaved on the same buffers)
+MLP_GATE(INT2)  VERBATIM   0.269 ms  41.5 GB/s  1.00x
+                VERB+HALF  0.236 ms  47.3 GB/s  1.14x  <--- faster
+                VERB+TAIL  0.268 ms  41.6 GB/s  1.00x  neutral
+                VERB+MP    0.266 ms  41.9 GB/s  1.01x  neutral
+MLP_DOWN(INT2)  VERBATIM   0.621 ms  18.0 GB/s  1.00x
+                VERB+HALF  0.527 ms  21.1 GB/s  1.18x  <--- faster
+                VERB+TAIL  0.616 ms  18.1 GB/s  1.01x  neutral
+                VERB+MP    0.612 ms  18.2 GB/s  1.01x  neutral
 ```
-`VERB+HALF` (hardware `bit_cast<sycl::half>` group-scale instead of `half_to_float`) is a real, reproducible win: **+14% MLP_GATE, +17% MLP_DOWN**. `VERB+TAIL` (unoffset base in the chunk loop) and `VERB+MP` (row-base `multi_ptr`) are neutral at this shape — interesting given the shipped `INTFER_DECODE1_VERBHALF`/`VERBMP` engine flags were accepted on correctness, not performance; this is their first performance read and it's a win for the HALF arm only.
+`VERB+HALF` (hardware `bit_cast<sycl::half>` group-scale instead of `half_to_float`)
+is a real, reproducible win: **+14% MLP_GATE, +18% MLP_DOWN**. `VERB+TAIL` (unoffset
+base in the chunk loop) and `VERB+MP` (row-base `multi_ptr`) are neutral at this shape.
+This is the first performance read of the `INTFER_DECODE1_VERBHALF` / `VERBMP` engine
+flags, and it is a win for the HALF arm only.
 
 ### Bisect-3 — in-TU `SHIPPED` anchor vs `VERBATIM` (all four arms, same TU, same buffers)
 ```
-MLP_GATE(INT2)  VERBATIM   0.404 ms  27.6 GB/s  1.00x
-                SHIPPED    0.368 ms  30.3 GB/s  1.10x  <--- faster
+-- CITATION(bisect-3, device 0: device event timestamps, medians over 12 interleaved reps; SHIPPED = in-TU clone of the real engine INT2 kernel on the SAME buffers)
+MLP_GATE(INT2)  VERBATIM   0.281 ms  39.6 GB/s  1.00x
+                VERB+TAIL  0.282 ms  39.5 GB/s  1.00x  neutral
+                VERB+MP    0.281 ms  39.6 GB/s  1.01x  neutral
+                SHIPPED    0.253 ms  44.0 GB/s  1.12x  <--- faster
 MLP_DOWN(INT2)  VERBATIM   0.615 ms  18.1 GB/s  1.00x
-                SHIPPED    0.542 ms  20.5 GB/s  1.13x  <--- faster
+                VERB+TAIL  0.623 ms  17.9 GB/s  0.99x  neutral
+                VERB+MP    0.612 ms  18.2 GB/s  1.00x  neutral
+                SHIPPED    0.539 ms  20.7 GB/s  1.14x  <--- faster
 ```
-The in-TU clone of the real engine kernel is ~10-15% FASTER than the transcribed `VERBATIM` control on the SAME buffers, interleaved. Run twice: 1.10-1.15x MLP_GATE, 1.13-1.15x MLP_DOWN. Consistent.
+The in-TU clone of the real engine kernel is ~12-14% FASTER than the transcribed
+`VERBATIM` control on the SAME buffers, interleaved. Consistent across two runs:
+1.12-1.14x MLP_GATE, 1.14x MLP_DOWN.
 
 ## What this means for the ~5.6-6.4x deficit
 
@@ -70,7 +94,7 @@ The AGENTS.md hypothesis ("~4.5-5x sits between `VERBATIM` and `SHIPPED`, not in
 | runtime branch | VERB+TPL (if constexpr) — measured pre-2026-10-05 | **1.007x** |
 | tidy-rewrite `table` | bisect-1 | **slower** than VERBATIM |
 
-So the VERBATIM→SHIPPED text difference (even the in-TU SHIPPED that is itself a clone, not the 2378-line engine kernel) accounts for at most ~15% of the loss. The remaining bulk of the 5.6-6.4x between `roofline_probe`'s faithful clone (~18-41 GB/s) and the engine kernel is **not explained by the TU, the branch, or the transcribed code**. Candidates to bisect next (untested): launch/config differences between the probe's `nd_range` and `gemm_usm_decode1_vec` (tile shapes, work-group layout, the probe's ragged tail handling, group loop structure), register-pressure differences, or the `select`-based table in the shipped path vs the probe's array table.
+So the VERBATIM→SHIPPED text difference (even the in-TU SHIPPED that is itself a clone, not the 2378-line engine kernel) accounts for at most ~15% of the loss. The remaining bulk of the 5.6-6.4x between `roofline_probe`'s faithful clone (~18-41 GB/s) and the engine kernel is **not explained by the TU, the branch, or the transcribed code** -- CITATION(roofline_probe, device 0: device event timestamps, medians over 12 interleaved reps; the shipped arm read 17.2 / 39.3 / 41.3 GB/s on three consecutive runs of the same binary, so the absolute GB/s is not a result and the ratio is the claim). Candidates to bisect next (untested): launch/config differences between the probe's `nd_range` and `gemm_usm_decode1_vec` (tile shapes, work-group layout, the probe's ragged tail handling, group loop structure), register-pressure differences, or the `select`-based table in the shipped path vs the probe's array table.
 
 ## Verdicts
 

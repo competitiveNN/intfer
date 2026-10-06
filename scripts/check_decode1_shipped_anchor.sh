@@ -61,7 +61,11 @@ printf '%s' "$ENGINE_BODY" | head -1 | grep -q 'const float wtab\[4\]' || {
   echo "FAIL: extracted body is not the table-hoist INT2 block (expected wtab def)" >&2; exit 1; }
 
 # ---- extract the bisect3 SHIPPED arm (arm_shipped function body) ----------------
-ANCHOR_BODY="$(awk '/^sycl::event arm_shipped/{f=1} f{print} f && /^}/{exit}' "$ANCHOR")"
+# Match the DEFINITION (opening brace on the signature line), not the forward
+# declaration earlier in the TU: a forward-decl match pulls a stub and all five
+# invariant checks read phantom source. The engine side has no such decl, so this
+# one pattern is the whole asymmetry.
+ANCHOR_BODY="$(awk '/^sycl::event arm_shipped\(.*\{$/{f=1} f{print} f && /^}/{exit}' "$ANCHOR")"
 [ -n "$ANCHOR_BODY" ] || {
   echo "FAIL: arm_shipped not extracted (function name drifted?)" >&2; exit 1; }
 

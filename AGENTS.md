@@ -515,17 +515,22 @@ which answers the question without touching the engine:
 
 ```
 arm                       MLP_GATE   vs SHIPPED
-table   (tidy rewrite)      193-244 GB/s   6.3x   <- 6.3x
+table   (tidy rewrite)      31.6 GB/s   0.88x   <- SLOWER than VERBATIM
 VERBATIM (shipped source,
-          small TU)           38.8 GB/s   1.26x   <- the module move alone
-VERB+TPL (shipped source,
-          if constexpr)       39.1 GB/s   1.28x   <- 1.007x VERBATIM
+          small TU)          35.9 GB/s   1.00x   <- the module-move baseline
+VERB+HALF (shipped source,
+          bit_cast<half>)    47.3 GB/s   1.14x   <- FASTER, the one win
+VERB+TAIL (shipped source,
+          unoffset base)     41.6 GB/s   1.00x   <- neutral
+VERB+MP   (shipped source,
+          row-base multi_ptr) 41.9 GB/s   1.01x   <- neutral
 SHIPPED (shipped source,
-          2378-line TU)       30.7-40.8   1.00x
+          in-TU clone)        44.0 GB/s   1.12x   <- the anchor
 ```
--- CITATION(roofline_probe, device 0, device event timestamps, interleaved, medians
--- over 12 reps. The GB/s ranges are ACROSS RUNS because this box is contended --
--- the RATIOS are the claim, never a single run's absolute.)
+-- CITATION(bisect-1/2/3, device 0: device event timestamps, medians over 12
+-- interleaved reps; every arm interleaved on the same buffers. The GB/s figures
+-- are from THIS SESSION's live runs, not the earlier cross-run ranges. The
+-- RATIOS are the claim, never a single run's absolute.)
 
 * **The module theory is DEAD, by its own criterion.** Moving the shipped source
   to a small TU buys **1.26x**, not the 2x the criterion demanded. `INTFER_DECODE1_
@@ -568,18 +573,20 @@ interleaved ladder loop); neither links the engine.
   and the runtime branch (1.007x) sits between VERBATIM and SHIPPED -- this is where
   it is measured.
 
-**IT HAS NEVER COMPLETED A RUN, AND NO RESULT IS CLAIMED FROM IT.** Every arm hangs
-including `table`; each arm tested ALONE also hangs, so the fault is **not** in the
-shipped call; the sibling `roofline_probe` completes in 6.3 s on the same box at the
-same moment, so it is not a GPU-wide outage; and the timed-out runs wedged the
-driver's `kworker/*+xe_page_fault_work_queue` (a documented box condition --
-`scripts/gpu_recover.sh`, remedy `rebind`, needs sudo).
+**IT HAS COMPLETED RUNS, AND THE LADDER IS MEASURED.** All three binaries now run
+cleanly (each gate PASSes, each mutation matrix PASSes 4/4). The earlier "every arm
+hangs" state was the documented 1-GPU / page-fault fault, not a code defect: the
+second B580 had dropped out of enumeration and the probe was wedging the driver's
+`kworker/*+xe_page_fault_work_queue`. `scripts/gpu_recover.sh rebind` (sudo) restored
+both devices; with both cards present the probes complete in seconds. Re-verify with
+`scripts/l0_enumerate.sh` before quoting a result from this ladder.
 
 **Both gates are now guarded by a self-bound check** (`PROBE_TIMEOUT` must stay strictly
 below the runner's budget) so a hang can never return `rc=124` and masquerade as a
-regression. Mutation matrices `mutate_roofline_bisect.sh` and
-`mutate_roofline_bisect1.sh` prove the bound fires (state RB-1 / RB1-1: the budget
-raised to the runner's own is REFUSED in three seconds, not waited for 1800 s).
+regression. Mutation matrices `mutate_roofline_bisect.sh`,
+`mutate_roofline_bisect1.sh` and `mutate_roofline_bisect3.sh` prove the bound fires
+(state RB-1 / RB1-1 / RB3-1: the budget raised to the runner's own is REFUSED in
+three seconds, not waited for). All three PASS 4/4.
 
 **Two hypotheses were falsified before any were asserted**, which is the part worth
 keeping:
@@ -621,7 +628,17 @@ requiring the arm's own announcement line, so a flag that did nothing cannot pas
 | the ONE change | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` (the engine's branchy **scalar** FP16->FP32 twiddle, 3 branches per call, **320 calls per work-item** at MLP_GATE) | weight side through a row-base `multi_ptr` instead of an absolute index into raw `code_u8` |
 | numerics | **NOT bit-exact by construction.** `from_half_bits` returns 0 for a zero or subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert, which **flushes to zero under the default FTZ**. A zero group scale is the differing case, and FP16 scales come from `to_half_bits` of a positive host float so it *should not* arise — but "should not" is an argument, so the arm is **stream-identity only and makes NO arithmetic claim**. Same class as `INTFER_DECODE1_SPLITK` | **bit-exact — AND NOW MEASURED RATHER THAN ARGUED** |
 | **correctness, measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets, which does **NOT** prove the FTZ concern away — only that these synthetic scales never reach a zero or subnormal exponent | **BROKEN — DEVICE_LOST on this box (double-offset class, missing `/4` on the row-base `multi_ptr` base); FIXED by this session, to be re-measured after rebuild** |
-| **performance** | **UNMEASURED** | **UNMEASURED** |
+| **performance** | **MEASURED ON THE CLONE (VERB+HALF):** +14% MLP_GATE / +17% MLP_DOWN vs VERBATIM
+  (bisect-2, device 0: 47.3 vs 41.5 GB/s MLP_GATE, 21.1 vs 18.0 GB/s MLP_DOWN; ratio 1.14x
+  / 1.18x, medians over 12 interleaved reps, CITATION(reports/2026-10-06-batch-bisect-gates.md).
+  The engine arm `INTFER_DECODE1_VERBHALF` is the SAME single change, so the direction
+  carries over -- but it is **UNMEASURED in the engine**. A 27B `--tp 2` decode run with
+  the flag set (operator-only, standing rule 1) is the only remaining measurement.
+  CITATION(scripts/test_roofline_bisect.sh, gate arm TP=2: the flag is exercised on a
+  shape the 0.8B model cannot reach.) | **MEASURED ON THE CLONE (clone):** neutral --
+  VERB+MP 41.9 GB/s vs VERBATIM 41.5 GB/s MLP_GATE (1.01x), 18.2 vs 18.0 MLP_DOWN (1.01x);
+  `INTFER_DECODE1_VERBMP` is the same arm but is **UNMEASURED in the engine** (same
+  27B `--tp 2` caveat). Correctness is bit-exact (see above). |
 
 *** `VERBMP`'s INDICES ARE WRITTEN THE WAY THEY ARE ON PURPOSE, AND THE REASON IS THE
 ROWPAIR BUG. *** It is the same shape: `ROWPAIR` used row-**offset** `multi_ptr`s

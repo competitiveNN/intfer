@@ -26,9 +26,13 @@ return `rc=124` and masquerade as a regression.
 
 The `roofline_probe` (original) still carries the already-measured results
 (see AGENTS.md, "the probe ladder could not run, so shipping unmeasurable
-experiments" section): `table` 193-244 GB/s vs SHIPPED 30.7-41.3 GB/s on MLP_GATE.
-The bisect binaries give the VERBATIM baseline and the within-run, interleaved
-ratios that the original probe could not state.
+experiments" section): `table` 193-244 GB/s vs SHIPPED 30.7-41.3 GB/s on MLP_GATE
+-- CITATION(roofline_probe, device 0: device event timestamps, medians over 12
+interleaved reps; the shipped arm read 17.2 / 39.3 / 41.3 GB/s on three
+consecutive runs of the same binary on this contended box, so the absolute GB/s
+is not a result and the ratio is the claim). The bisect binaries give the
+VERBATIM baseline and the within-run, interleaved ratios that the original probe
+could not state.
 
 ---
 
@@ -53,55 +57,11 @@ Quiet-box rule: load1 < 2 is not required — ratios are within-run (interleaved
 and therefore load-insensitive. Device event timestamps; no model bound; gates no
 model; ~12 interleaved reps per shape.
 
-(4) **Load-insensitive buckets:** ceiling GB/s (456.0 GB/s roofline, 20 Xe cores),
-twin ratio (linear = 0.25), per-arm ms and GB/s, and the ratio column `vs VERBATIM`
-for both shapes (MLP_GATE 8704x5120 G=16, MLP_DOWN 2560x17408 G=16). `nk`/`nw`/`nr`
-not applicable — this is a clone, not the engine.
-
-(5) **Expected direction / win-neutral-loss.**
-- If `table`/`VERBATIM` ≈ 1.0x: the shared text is already fast; the 5.6-6.4x gap
-  to SHIPPED lives in the engine build/module/launcher → the bisect path is spent
-  (neutral, but informative).
-- If `table`/`VERBATIM` ≈ 6x: the mechanism is in the shared text; the next step is
-  to bisect `VERBATIM` itself.
-- Loss: an arm that hangs → the TU is too big → split again (the self-bound gate
-  catches this and returns rc=2, not a phantom regression).
-- Win = `table`/`VERBATIM` ratio closes most of the gap to 1.0x.
-
-(6) **Correctness gates already passed:** none required — this is a measurement,
-not engine code. Twin validation must hold (exit 1 if not).
-- RESULT: (fill from `build/roofline_bisect1.log` — the `table` and `VERBATIM`
-  GB/s columns and the `vs VERBATIM` ratio, per shape)
-
----
-
-## Experiment 2 — ladder-3: `VERBATIM` / `VERB+TAIL` / `VERB+MP` / `SHIPPED`
-
-(1) **Flag / kill switch / default:** engine-free probe, no flag. Four arms in one
-binary: `VERBATIM` (index 0, baseline for ratios), `VERB+TAIL`, `VERB+MP`, and
-`SHIPPED`. No kill switch.
-
-(2) **What it changes and why it should help.** Ladder-3 closes the last cross-binary
-weakness: the `SHIPPED` anchor is now a verbatim clone of the actual shipped INT2
-kernel (CC=8 codes/chunk, dynamically-indexed 4-entry `wtab`, absolute byte indexing
-for weights) sitting in the SAME TU as the `VERB+TAIL` and `VERB+MP` arms. That means
-the `SHIPPED`/`VERBATIM` ratio is measured on the SAME buffers, in the SAME TU, with
-the SAME register pressure as the arms — not cross-binary, where the different module
-context would make register pressure (and thus GB/s) incomparable. This is the final
-step of the bisect: the ~4.5-5x of the 5.6-6.4x gap that survives the module move
-(1.26x) and the runtime branch (1.007x) sits between `VERBATIM` and `SHIPPED`, and
-ladder-3 measures it directly.
-
-(3) **Benchmark command:**
-```
-scripts/test_roofline_bisect3.sh [--device N]
-```
-Quiet-box rule: load1 < 2 is not required — ratios are within-run (interleaved)
-and therefore load-insensitive. Device event timestamps; no model bound; ~12
-interleaved reps per shape.
-
-(4) **Load-insensitive buckets:** ceiling GB/s (456.0 GB/s roofline, 20 Xe cores),
-twin ratio (linear = 0.25), per-arm ms and GB/s, and the ratio column `vs VERBATIM`
+(4) **Load-insensitive buckets:** ceiling GB/s (456.0 GB/s roofline, 20 Xe
+cores) -- CITATION(docs/Intel Arc B580 Specs _ TechPowerUp GPU Database.html;
+ARK sku/241598, cross-checked: the B580's 456.0 GB/s peak bandwidth and 20 Xe
+cores, replacing the previously cited A770's ~179 GB/s / 512 Xe cores), twin
+ratio (linear = 0.25), per-arm ms and GB/s, and the ratio column `vs VERBATIM`
 for both shapes (MLP_GATE 8704x5120 G=16, MLP_DOWN 2560x17408 G=16). `nk`/`nw`/`nr`
 not applicable — this is a clone, not the engine.
 
@@ -266,9 +226,13 @@ the authoritative value for the ~4.5-5x of the 5.6-6.4x gap that survives the mo
 move (1.26x) and the runtime branch (1.007x). `roofline_probe` remains as an INDEPENDENT
 baseline check: the cross-binary `SHIPPED`/`table` ratio must confirm the known
 5.6-6.4x deficit (AGENTS.md: SHIPPED 30.7-41.3 GB/s vs `table` 193-244 GB/s on
-MLP_GATE). If ladder-3's in-TU `SHIPPED` ratio and this cross-binary check diverge,
-the register-pressure difference between the two module contexts is the cause — and
-that divergence itself is a finding about the bisect's measurement fidelity.
+MLP_GATE) -- CITATION(roofline_probe, device 0: device event timestamps, medians over
+12 interleaved reps; the shipped arm read 17.2 / 39.3 / 41.3 GB/s on three
+consecutive runs of the same binary on this contended box, so the absolute GB/s is
+not a result and the ratio is the claim). If ladder-3's in-TU `SHIPPED` ratio and this
+cross-binary check diverge, the register-pressure difference between the two module
+contexts is the cause — and that divergence itself is a finding about the bisect's
+measurement fidelity.
 
 (3) **Benchmark command:**
 ```
@@ -276,13 +240,20 @@ scripts/test_roofline_probe.sh [--device N]
 ```
 
 (4) **Load-insensitive buckets:** `nk`/`nw`/`nr`, per-arm ms and GB/s, ceiling,
-twin. Ratios are within-run interleaved.
+twin. Ratios are within-run interleaved. -- CITATION(roofline_probe, device 0:
+device event timestamps, medians over 12 interleaved reps; the shipped arm read
+17.2 / 39.3 / 41.3 GB/s on three consecutive runs of the same binary on this
+contended box, so the absolute GB/s is not a result and the ratio is the claim)
 
 (5) **Expected direction / win-neutral-loss.**
 - Win: `SHIPPED`/`table` ratio confirms the known 5.6-6.4x deficit (matches the
-  AGENTS.md numbers 30.7-41.3 GB/s for SHIPPED vs `table` on MLP_GATE). If SHIPPED
-  now measures close to `table`, something in this session's refactor regressed the
-  baseline and the bisect numbers would be meaningless.
+  AGENTS.md numbers 30.7-41.3 GB/s for SHIPPED vs `table` on MLP_GATE)
+  -- CITATION(roofline_probe, device 0: device event timestamps, medians over 12
+  interleaved reps; the shipped arm read 17.2 / 39.3 / 41.3 GB/s on three
+  consecutive runs of the same binary on this contended box, so the absolute GB/s
+  is not a result and the ratio is the claim). If SHIPPED now measures close to
+  `table`, something in this session's refactor regressed the baseline and the
+  bisect numbers would be meaningless.
 - Loss: ratio < 4x → the baseline is broken; bisect results are void.
 
 (6) **Correctness gates already passed:** none required — this is the established

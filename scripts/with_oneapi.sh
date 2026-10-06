@@ -19,10 +19,11 @@
 # Usage: scripts/with_oneapi.sh <cmd> [args...]
 #   e.g. scripts/with_oneapi.sh build/examples/intfer_cli/intfer_cli --help
 set -uo pipefail
-_ACTIVE_BIN="$(ls -dv /opt/intel/oneapi/compiler/[0-9]*/bin/icpx 2>/dev/null | sort -V | tail -1)"
+ROOT="${ONEAPI_ROOT:-/opt/intel/oneapi}"
+_ACTIVE_BIN="$(ls -dv "$ROOT"/compiler/[0-9]*/bin/icpx 2>/dev/null | sort -V | tail -1)"
 _ACTIVE_LIB="$(dirname "$(dirname "$_ACTIVE_BIN")")/lib"
 _new_ld=""
-for d in /opt/intel/oneapi/*/*/lib /opt/intel/oneapi/*/lib; do
+for d in "$ROOT"/*/*/lib "$ROOT"/*/lib; do
   [ -d "$d" ] || continue
   case "$d" in
     */compiler/*) [ "$d" = "$_ACTIVE_LIB" ] || continue ;;
