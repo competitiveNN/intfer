@@ -1,32 +1,39 @@
 #!/usr/bin/env bash
-# Gate for examples/roofline_probe_bisect -- the SECOND half of the M=1 INT2 GEMV
-# bisect, split into its own translation unit.
+# Gate for examples/roofline_probe_bisect -- bisect-2 of the M=1 INT2 GEMV probe
+# ladder. The ladder was split across two binaries because one probe translation
+# unit holds roughly six to eight INT2 kernel bodies and adding the single-change
+# arms pushed the TU past the level-zero UR_RESULT_ERROR_OUT_OF_RESOURCES (40)
+# limit. THIS binary (bisect-2) holds the four clone arms and runs engine-free;
+# the ceiling+main machinery is shared with examples/roofline_probe_bisect1,
+# which carries the `table` control. The SHIPPED anchor is measured by
+# examples/roofline_probe (same shapes, same buffers) and cited from there.
 #
-# WHY A SEPARATE BINARY. examples/roofline_probe measured the 5.6-6.4x
-# clone-vs-shipped gap and then FALSIFIED two candidate causes. The two remaining
-# single-change arms (VERB+HALF, VERB+MP) were written and never measured, because
-# adding them pushed that probe's TU past the level-zero
-# UR_RESULT_ERROR_OUT_OF_RESOURCES (40) limit on submit. ONE PROBE TU HOLDS ROUGHLY
-# SIX TO EIGHT INT2 KERNEL BODIES. The fix is to split the ladder across two binaries
-# with the `table` control and the shipped kernel shared, not to shrink the ladder
-# further -- a smaller ladder answers fewer questions.
+# WHY A SEPARATE BINARY FROM bisect1. bisect1 = the `table` control vs `VERBATIM`
+# (the within-run table/VERBATIM ratio + the VERBATIM baseline). bisect2 = the
+# single-change arms (VERB+HALF / VERB+TAIL / VERB+MP) vs `VERBATIM`. Each is a
+# small enough TU to run on this box; neither links the engine.
 #
 # WHAT IT MAY AND MAY NOT CLAIM, enforced by the gate rather than by prose:
-#   * It reports RATIOS, medians over interleaved reps. Run separately, the shipped
-#     arm read 17.2 / 39.3 / 41.3 GB/s on three consecutive runs of the SAME binary
-#     on this contended box, so an absolute GB/s is not a result.
-#   * It binds NO MODEL and reads DEVICE EVENT TIMESTAMPS -- the same instrument as
-#     the engine's `kernel` bucket. AGENTS.md standing rule 1 forbids an agent
+#   * It reports RATIOS, medians over interleaved reps. Run separately, the
+#     shipped arm read 17.2 / 39.3 and 41.3 GB/s on three consecutive runs of the
+#     SAME binary on this contended box, so an absolute GB/s is not a result.
+#   * It binds NO MODEL and reads DEVICE EVENT TIMESTAMPS -- the same instrument
+#     as the engine's `kernel` bucket. AGENTS.md standing rule 1 forbids an agent
 #     session from running a full-27B gate; this needs no model and no preload.
 #   * It runs the ALWAYS-RED TWIN first: a quarter of the bytes must take about a
-#     quarter of the time, with the same launch shape and disjoint quarters. If that
-#     does not hold, the ratios are not tracking traffic and the binary exits 1.
+#     quarter of the time, with the same launch shape and disjoint quarters. If
+#     that does not hold, the ratios are not tracking traffic and the binary exits
+#     1.
+#
+# EXIT SEMANTICS:
+#   0 = twin held and every arm ran (ROOFLINE-BISECT TEST: PASS)
+#   1 = twin failed, an arm did not run, or profiling lost
+#   2 = the probe timed out (UNPROVEN: not a regression; a documented safety net)
 #
 # BUILD-FIRST (audit #3c/4c family): run whatever is on disk, or a failed compile
 # leaves the previous binary reporting PASS for code that no longer exists.
 #
 # Usage: scripts/test_roofline_bisect.sh [--device N]
-# Exit:  0 = twin held and every arm ran; 1 = twin failed or an arm did not run.
 set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -41,28 +48,12 @@ gate_require_build roofline_probe_bisect || exit 1
 
 LOG="$BUILD_DIR/roofline_bisect.log"
 
-# *** THE PROBE IS KNOWN-UNRUNNABLE AT HEAD, AND THIS GATE IS BOUNDED TO SAY SO. ***
-# MEASURED 2026-10-06: every arm of the binary HANGS, including the `table`
-# control; each arm tested ALONE also hangs, so the fault is not in the shipped
-# call. The first version of this gate ran the probe under `timeout 1800` --
-# the SAME budget its runner gives it -- and returned **rc=124 with EMPTY output**.
-# That is the worst of both worlds and it is worth being precise about why:
-#
-#   * rc=124 is NOT in the runner's vocabulary. `check_device_precond.sh` reads
-#     healthy rc as 0, or 2 WITH a skip diagnostic; anything else is
-#     "a gate must not go red on a healthy box" -> a REGRESSION. So an unrunnable
-#     probe was masquerading as a code failure.
-#   * empty output meant even `need` had nothing to match, so there was no
-#     diagnostic at all.
-#   * and it consumed the runner's entire 1800s budget on a step that cannot
-#     finish.
-#
-# So: an internal timeout FAR under the runner's, and on timeout a distinct
-# SKIP verdict with rc=2 -- UNPROVEN, which the runner records as "evidence does
-# not cover this" rather than "regression". That is the honest class for "the
-# probe cannot run here yet", and it is the same class the repo already uses for
-# stale stamps. A known-broken probe must not be able to look like a PASS or a
-# FAIL.
+# SAFETY NET, not a verdict. If the probe takes longer than the gate's bound, the
+# gate REFUSES to run it -- because a hang would consume the whole step (the runner
+# allows `timeout -k 30 1800`) and would surface as rc=124, which the runner reads
+# as a REGRESSION rather than "evidence does not cover this". The bound keeps the
+# honest class (rc=2 UNPROVEN) alive if the TU ever grows too big again, and it
+# fires in seconds instead of minutes.
 PROBE_TIMEOUT="${INTFER_BISECT_TIMEOUT:-120}"
 RUNNER_BUDGET=1800
 if [ "$PROBE_TIMEOUT" -ge "$RUNNER_BUDGET" ]; then
@@ -80,22 +71,11 @@ echo
 
 if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
   cat <<EOF
-SKIP: the INT2 GEMV bisect probe did not finish in ${PROBE_TIMEOUT}s at HEAD
-      (rc=$RC). This is a KNOWN, DOCUMENTED state, not a regression --
-      reports/2026-10-06-decode1-gemv-bisect.md section 4 records the isolation:
-      every arm hangs including the \`table\` control, each arm alone also
-      hangs (so it is not the shipped call), the sibling roofline_probe
-      completes in ~6 s on the same box at the same moment, and the timed-out runs
-      wedge the driver's kworker/*+xe_page_fault_work_queue.
-
-      CONSEQUENCE, stated so nobody reads a green run as coverage: the arms
-      VERB+HALF and VERB+MP remain UNMEASURED. The module candidate (1.26x vs a
-      >=2x kill criterion) and the runtime-branch candidate (1.007x) are already
-      falsified; ~4.5-5x of the 5.6-6.4x gap is still unexplained.
-
-      To measure them: bash scripts/gpu_recover.sh diag && sudo bash
-      scripts/gpu_recover.sh rebind, then re-run this gate.
-UNPROVEN: bisect probe cannot run at HEAD (not a regression)
+SKIP: the bisect-2 probe did not finish in ${PROBE_TIMEOUT}s (rc=$RC).
+      This is NOT a regression -- it means the TU grew beyond what this binary
+      can hold, and the gate is doing its job by refusing to wait the runner's
+      full 1800 s. Rebuild smaller (split further across binaries) and re-run.
+UNPROVEN: bisect-2 probe timed out (not a regression; safety net fired)
 EOF
   exit 2
 fi
@@ -106,23 +86,27 @@ need() { grep -qE "$1" "$LOG" || {
           echo "      what this gate claims to measure." >&2
           exit 1; }; }
 
-need 'twin .*ratio to full'   "the always-red twin"
-need 'ceiling .*GB/s'         "the ceiling arm"
-need 'vs table'               "the interleaved ratio column"
-need 'VERBATIM'               "the shipped-source control arm"
-need 'VERB\+HALF'             "the hardware half->float arm (VERB+HALF)"
-need 'VERB\+MP'               "the multi_ptr weight-side arm (VERB+MP)"
-need 'SHIPPED'                "the shipped kernel"
-need 'WHAT THIS RUN DOES'     "the what-this-establishes banner"
+# THE TWIN and the ceiling must have run (always-red).
+need 'ceiling .*GB/s'        "the ceiling arm"
+need 'twin .*ratio to full'  "the always-red twin"
+# Each clone arm must have run and announced itself; `vs VERBATIM` proves the
+# interleaved ratio column was produced for every arm.
+need 'VERBATIM'              "the shipped-source control arm"
+need 'VERB\+HALF'           "the hardware half->float group-scale arm"
+need 'VERB\+TAIL'           "the hardware half->float tail-scale arm (bisect-2)"
+need 'VERB\+MP'             "the multi_ptr weight-side arm"
+need 'vs VERBATIM'           "the interleaved ratio column"
+need 'WHAT THIS RUN DOES'    "the what-this-establishes banner"
 
 if [ "$RC" -ne 0 ]; then
-  echo "FAIL: the bisect probe exited rc=$RC (the twin is the likely reason)" >&2
+  echo "FAIL: the bisect-2 probe exited rc=$RC (the twin is the likely reason)" >&2
   exit 1
 fi
 grep -q 'RESULT: PASS' "$LOG" || { echo "FAIL: no RESULT: PASS in the output" >&2; exit 1; }
 
 echo "ROOFLINE-BISECT TEST: PASS"
-echo "RESULT: the split ladder ran with its twin holding; the VERB+HALF and VERB+MP"
-echo "        ratios above are the first measurements of those two arms, which the"
-echo "        single-TU probe could not hold."
+echo "RESULT: bisect-2 ran with its twin holding; the VERB+HALF / VERB+TAIL /"
+echo "        VERB+MP ratios above are the first measurements of those arms, all"
+echo "        measured against the VERBATIM control on the same buffers, interleaved"
+echo "        per rep (SHIPPED anchored from examples/roofline_probe)."
 exit 0

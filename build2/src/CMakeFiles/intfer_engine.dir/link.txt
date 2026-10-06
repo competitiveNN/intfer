@@ -1,0 +1,2 @@
+/usr/bin/ar qc libintfer_engine.a CMakeFiles/intfer_engine.dir/engine/engine.cpp.o
+/usr/bin/ranlib libintfer_engine.a

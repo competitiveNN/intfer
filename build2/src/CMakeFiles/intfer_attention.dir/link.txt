@@ -1,0 +1,2 @@
+/usr/bin/ar qc libintfer_attention.a CMakeFiles/intfer_attention.dir/attention/flash_attention.cpp.o
+/usr/bin/ranlib libintfer_attention.a

@@ -21,12 +21,10 @@
 # WHAT COUNTS AS A REFERENCE. Two classes, both derived from the tree:
 #
 #   NAMED  the filename appears verbatim in a LIVE SOURCE. Live sources are every
-#          text file in the tree EXCEPT `docs/`, `reports/` and `scripts/archive/`.
-#          The first two are records -- `docs/audit-log-tooling.md` is a verbatim
-#          audit log and the `reports/` verdicts are dated findings; neither is an
-#          entry point, and treating a citation as a call site is the mistake that
-#          hid all sixteen. `scripts/archive/` is excluded because otherwise the
-#          archived set keeps itself alive forever and this checker can never fire.
+#          text file in the tree EXCEPT `docs/` and `scripts/archive/`.
+#          Both are records, not entry points: `docs/audit-log-tooling.md` is a
+#          verbatim audit log and `scripts/archive/` is the retired set. Treating a
+#          citation in either as a call site is the mistake that hid all sixteen.
 #
 #   GLOB   the filename matches a glob that a live runner EXPANDS, so it runs
 #          without being named anywhere. Exactly one family does this: the
@@ -86,19 +84,19 @@ mapfile -t POP < <(find "$SCRIPTS" -maxdepth 1 -type f \
                      \( -name '*.sh' -o -name '*.py' -o -name '*.c' \) -printf '%f\n' | sort)
 enum_require_nonempty "scripts-live population" "${#POP[@]}" "scripts/*.{sh,py,c}" || exit 2
 
-# The exclusion of docs/ reports/ archive/ is the RULE, so the filter is asserted
+# The exclusion of docs/ archive/ is the RULE, so the filter is asserted
 # to have removed something. A filter that silently matched nothing would make
 # every script reachable-by-anything and report green on a tree full of corpses
 # -- the vacuous-green shape, reached through a broken query instead of a broken
 # regex.
 mapfile -t PROSE < <(find "$SL_ROOT" -type f \
-                       \( -path "$SL_ROOT/docs/*" -o -path "$SL_ROOT/reports/*" \
+                       \( -path "$SL_ROOT/docs/*" \
                           -o -path "$SCRIPTS/archive/*" \) \
                        \( -name '*.sh' -o -name '*.py' -o -name '*.c' -o -name '*.md' \
                           -o -name '*.txt' -o -name '*.cpp' -o -name '*.hpp' \
                           -o -name '*.h' -o -name '*.cmake' \) 2>/dev/null | sort)
 enum_require_nonempty "live-source EXCLUSION removed the record files" "${#PROSE[@]}" \
-  "docs/ + reports/ + scripts/archive/ prose (if this is 0 the filter is broken)" || exit 2
+  "docs/ + scripts/archive/ prose (if this is 0 the filter is broken)" || exit 2
 
 # ------------------------------------------------------------- the gate glob
 # Parsed out of the runner. Restating `test_*.sh` here would make the class a

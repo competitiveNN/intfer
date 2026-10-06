@@ -8,7 +8,7 @@
 # reassociates the FP32 sum, and that cost must be characterised before any
 # such kernel is written -- including the re-examined shape that keeps the
 # 16-way split but reduces it with a sub-group xor butterfly
-# (INTFER_DECODE1_SUBGROUP, reports/2026-10-05-batch-gemv-roofline.md).
+# (INTFER_DECODE1_SUBGROUP, AGENTS.md).
 # It also raises memory-level parallelism AND coalesces the weight loads. AGENTS.md records
 # that this "needs a tolerance-based numerics contract agreed BEFORE any code
 # is written". This gate is that contract, and it is a GATE rather than a note

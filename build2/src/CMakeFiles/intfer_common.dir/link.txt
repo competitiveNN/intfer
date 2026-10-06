@@ -1,0 +1,2 @@
+/usr/bin/ar qc libintfer_common.a CMakeFiles/intfer_common.dir/common/logger.cpp.o
+/usr/bin/ranlib libintfer_common.a

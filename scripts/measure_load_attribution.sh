@@ -9,8 +9,8 @@
 # of waiting will ever help. If the arm is cheap and the crossings come from
 # elsewhere, waiting is the whole answer.
 #
-# MEASURED 2026-10-03 (this script's output, quoted in the commit and in
-# reports/2026-09-30-pending-bench-backlog.md): on a box settled to load1=0.70,
+# MEASURED 2026-10-03 (this script's output, quoted in the commit and in AGENTS.md
+# under the retired wall-time-benchmark section): on a box settled to load1=0.70,
 # across one 27B `--tp 2` arm, load1 had median 0.62 and max 2.82, and the CLI's own
 # process tree used a mean of 0.94 cores. So the arm is NOT sustainably CPU-bound --
 # its median load is BELOW the reading taken before it started -- and the crossings

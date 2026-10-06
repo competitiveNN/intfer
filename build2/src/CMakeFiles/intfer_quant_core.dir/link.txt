@@ -1,0 +1,2 @@
+/usr/bin/ar qc libintfer_quant_core.a CMakeFiles/intfer_quant_core.dir/quant_spec.cpp.o CMakeFiles/intfer_quant_core.dir/spinquant.cpp.o CMakeFiles/intfer_quant_core.dir/quant/dashq.cpp.o CMakeFiles/intfer_quant_core.dir/quant/output.cpp.o CMakeFiles/intfer_quant_core.dir/quant/safetensors.cpp.o
+/usr/bin/ranlib libintfer_quant_core.a

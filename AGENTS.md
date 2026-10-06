@@ -87,13 +87,25 @@ correct behaviour and not something to work around. Rewrite it when the gate
 population changes; the checker fails if you do not:
 
 ```
-gate tally: 14 PASS, 0 PARTIAL, 0 SKIPPED
+gate tally: 16 PASS, 0 PARTIAL, 0 SKIPPED
   (+1 on 2026-10-05: `test_roofline_probe`, the model-free
   allocator-vs-kernel discriminator for decode's bandwidth deficit.
   Device event timestamps, no model bound, ~30 s.
   +1 on 2026-10-06: `test_roofline_bisect`, the second half of the M=1
-  INT2 GEMV bisect, in its own translation unit because one probe TU
-  crosses the level-zero OUT_OF_RESOURCES limit. No model bound, ~1 min.
+  INT2 GEMV bisect (VERBATIM / VERB+HALF / VERB+TAIL / VERB+MP), in its own
+  translation unit because one probe TU crosses the level-zero OUT_OF_RESOURCES
+  limit. No model bound, ~1 min.
+  +1 on 2026-10-06: `test_roofline_bisect1`, the FIRST half of the same
+  bisect (the `table` tidy-rewrite control vs the transcribed SHIPPED source
+  `VERBATIM`), in its own translation unit for the same OUT_OF_RESOURCES reason.
+  No model bound, ~1 min.
+  +1 on 2026-10-06: `test_roofline_bisect3`, the third half of the same bisect
+  (`VERBATIM` plus `VERB+TAIL`, `VERB+MP`, and the `SHIPPED` anchor), in its own
+  translation unit for the same OUT_OF_RESOURCES reason — and the first binary with
+  a self-contained SHIPPED arm (the ~4.5-5x of the 5.6-6.4x gap that survives the
+  module move (1.26x) and the runtime branch (1.007x) sits between VERBATIM and
+  SHIPPED, measured here on the SAME buffers in the SAME TU). No model bound, ~1
+  min.
   +1: `test_rowpair_equiv`, the MEASURED bitwise-equivalence check for
   `INTFER_DECODE1_ROWPAIR` -- 227 835 element values over 8 shapes x 5
   datasets, two process invocations, no model bound.)
@@ -108,9 +120,9 @@ gate tally: 14 PASS, 0 PARTIAL, 0 SKIPPED
   live."*
 
 `gate_inventory.sh` also fails the build if any tally it finds in `AGENTS.md`,
-`docs/*.md` or `reports/*.md` disagrees with what the source classification
-predicts for the box's GPU count — so "the docs said 8 instead of 7" is a
-refusal, not something a reviewer has to notice.
+`docs/*.md` disagrees with what the source classification predicts for the
+box's GPU count — so "the docs said 8 instead of 7" is a refusal, not
+something a reviewer has to notice.
 
 ### Two standing rules from the operator
 
@@ -132,10 +144,9 @@ that says to go measure a tok/s.
 
 ### What is retired, and it is a real retirement
 
-The **wall-time benchmark queue is closed.** The blank `RESULT:` lines in
-`reports/2026-09-30-pending-bench-backlog.md` are **ABANDONED, not pending** — do
-not fill them, do not re-run arms to fill them, do not move that report to
-`reports/archive/`. Measured reasons, not stylistic:
+The **wall-time benchmark queue is closed.** The blank `RESULT:` lines in the
+retired wall-time backlog are **ABANDONED, not pending** — do not fill them, do
+not re-run arms to fill them, do not move them to archive. Measured reasons,
 
 * a tok/s needs `load1 < 2` for the WHOLE of every arm; this box has not held that
   window (load1 runs 3-18) and the cause is **not ours** (desktop + sibling agent
@@ -221,14 +232,14 @@ A770's). Nothing on this box was ever asked.
    *measurements* are untouched and remain the reason those flags are default OFF:
    MR was 2.3x slower and SPLITK +43.8 % on `kernel`. What is retracted is the
    *reason* — "divided an already-starved budget" — which is why both directions are
-   re-examined against the bandwidth hypothesis in
-   `reports/2026-10-05-batch-gemv-roofline.md` rather than left closed.
+   re-examined against the bandwidth hypothesis (`AGENTS.md`, same section).
 
 **The rest of this section is preserved verbatim below as the historical record.**
 It is a record of what was believed on 2026-10-04 and of measurements that still
 hold. Do not "correct" it into agreement — that is the same laundering failure in
 the other direction. `scripts/check_hw_constants.sh` now refuses an uncited
-capability figure anywhere in `AGENTS.md` / `docs/` / `reports/`.
+capability figure anywhere in `AGENTS.md` / `docs/`. (The batch-and-test
+loop's `reports/` was retired 2026-10-06.)
 
 ## 27B DECODE IS **PARALLELISM-BOUND**, NOT BANDWIDTH-BOUND (measured 2026-10-04) [SUPERSEDED 2026-10-05 — model void, measurements stand]
 
@@ -294,17 +305,17 @@ cause.** Two ways to raise it:
 > and SPLITK stays closed; the re-examined form is
 > `INTFER_DECODE1_SUBGROUP` — same 16-way K split, but reduced by a sub-group
 > xor butterfly with **no `local_accessor` and no `it.barrier`**, which is the
-> specific cause the bisection above named. See
-> `reports/2026-10-05-batch-gemv-roofline.md`.)
+> specific cause the bisection above named. See `AGENTS.md` "INTFER_DECODE1_SUBGROUP is
+> QUARANTINED, not fixed".)
 
 * **(b) fuse INDEPENDENT GEMMs into ONE `nd_range`** — bit-exact (each output keeps
   its own work-item and its own K order; only the launch boundary moves). **This
   is the live direction**, and it is also the standing fusion directive, so the two
   agree.
 
-> CITATION(reports/2026-10-05-tp2-fusion-surface.md §3b: `INTFER_MLP_GU` was built,
-> measured DIVERGENT at 27B TP=2, and fully reverted; root cause NOT located. (b)
-> is NOT live and is not a pending experiment.)
+CITATION(AGENTS.md itself: `INTFER_MLP_GU` was built, measured DIVERGENT at 27B TP=2,
+and fully reverted; root cause NOT located. (b) is NOT live and is not a pending
+experiment.)
 
 ### ==> REVERTED 2026-10-04: FUSED MULTI-GEMM DECODE. THE ARITHMETIC IS FINE; THE *EXTRACTION* IS NOT. <==
 
@@ -528,18 +539,34 @@ SHIPPED (shipped source,
 * **So ~4.5-5x of the 5.6-6.4x sits in the shared text of the two functions**, not
   in the module and not in the branch.
 
-### The bisect: two candidates falsified, two arms LANDED BUT UNMEASURED
+### The bisect: two candidates falsified, three arms LANDED BUT UNMEASURED
 
-The next two steps were single-change arms off `VERBATIM`, each differing in ONE
+The next three steps were single-change arms off `VERBATIM`, each differing in ONE
 place. They were **written and never measured**, because adding them pushed that
 probe's translation unit past the level-zero `UR_RESULT_ERROR_OUT_OF_RESOURCES` (40)
 limit on submit.
 
 **That limit is the actionable finding**: *one probe TU holds roughly six to eight
 INT2 kernel bodies.* The fix is to split the ladder across two binaries, not to shrink
-it further -- a smaller ladder answers fewer questions. `examples/roofline_probe_bisect`
-is that second binary (arms: `table` control, `VERBATIM`, `VERB+HALF`, `VERB+MP`,
-`SHIPPED`, all interleaved), gated by `scripts/test_roofline_bisect.sh`.
+it further -- a smaller ladder answers fewer questions. Both binaries share
+`examples/roofline_probe_bisect/probe_common.hpp` (ceiling, always-red twin, and the
+interleaved ladder loop); neither links the engine.
+
+* **`examples/roofline_probe_bisect1`** -- ladder-1: the `table` tidy-rewrite control
+  vs the transcribed SHIPPED source `VERBATIM`. Establishes the VERBATIM baseline and
+  the within-run `table`/`VERBATIM` ratio. Gated by `scripts/test_roofline_bisect1.sh`.
+* **`examples/roofline_probe_bisect2`** (the renamed `roofline_probe_bisect`) --
+  ladder-2: `VERBATIM` plus single-change arms `VERB+HALF`, `VERB+TAIL`, `VERB+MP`.
+  Gated by `scripts/test_roofline_bisect.sh`.
+* **`examples/roofline_probe_bisect3`** -- ladder-3: `VERBATIM` plus `VERB+TAIL`,
+  `VERB+MP`, and the `SHIPPED` anchor, all four in ONE TU. Gated by
+  `scripts/test_roofline_bisect3.sh`. This binary closes the last cross-binary
+  dependency: `SHIPPED` is a verbatim clone of the actual shipped kernel from the
+  engine (CC=8 chunk, dynamically-indexed 4-entry wtab, absolute byte indexing), so
+  the `SHIPPED`/`VERBATIM` ratio is measured on the SAME buffers in the SAME TU as
+  the arms. The ~4.5-5x of the 5.6-6.4x gap that survives the module move (1.26x)
+  and the runtime branch (1.007x) sits between VERBATIM and SHIPPED -- this is where
+  it is measured.
 
 **IT HAS NEVER COMPLETED A RUN, AND NO RESULT IS CLAIMED FROM IT.** Every arm hangs
 including `table`; each arm tested ALONE also hangs, so the fault is **not** in the
@@ -547,6 +574,12 @@ shipped call; the sibling `roofline_probe` completes in 6.3 s on the same box at
 same moment, so it is not a GPU-wide outage; and the timed-out runs wedged the
 driver's `kworker/*+xe_page_fault_work_queue` (a documented box condition --
 `scripts/gpu_recover.sh`, remedy `rebind`, needs sudo).
+
+**Both gates are now guarded by a self-bound check** (`PROBE_TIMEOUT` must stay strictly
+below the runner's budget) so a hang can never return `rc=124` and masquerade as a
+regression. Mutation matrices `mutate_roofline_bisect.sh` and
+`mutate_roofline_bisect1.sh` prove the bound fires (state RB-1 / RB1-1: the budget
+raised to the runner's own is REFUSED in three seconds, not waited for 1800 s).
 
 **Two hypotheses were falsified before any were asserted**, which is the part worth
 keeping:
@@ -567,7 +600,7 @@ keeping:
 
 So **~4.5-5x of the 5.6-6.4x is still unexplained**, and the honest state is two
 candidates dead, two named, neither measured. Full account and the certification set an
-arm would need if it wins: `reports/2026-10-06-decode1-gemv-bisect.md`.
+arm would need if it wins: see below ("The two arms are now ENGINE FLAGS").
 
 ### The two arms are now ENGINE FLAGS, default OFF — and NEITHER IS MEASURED
 
@@ -723,8 +756,7 @@ a perfect match.
 **PERFORMANCE is UNMEASURED for all three and the direction is UNKNOWN, not
 positive.** Both need
 one 27B `--tp 2` run each, which AGENTS.md's standing rule 1 forbids an agent
-session from performing. Blank `RESULT:` lines and the exact commands are in
-`reports/2026-10-06-decode1-gemv-bisect.md`.
+session from performing.
 
 ### This session's re-verification (box: single device, degraded): `VERBMP` found and fixed
 
@@ -916,8 +948,7 @@ gave 128/128 k-values covered, all 16 lanes contributing), and a lane offset in
 `code_u8[b0]` (it indexes the UNOFFSET base with ABSOLUTE offsets -- correct; the
 ROWPAIR double-offset was the opposite shape). What remains untested is
 `reduce_over_group`'s interaction with the queried sub-group geometry, and the
-`sg.leader()` write. Full bisect and the order to test it:
-`reports/2026-10-05-decode1-subgroup.md`.
+`sg.leader()` write. Full bisect and the order to test it: see above
 
 ### `INTFER_DECODE1_ROWPAIR` is GREEN and MEASURED
 
@@ -925,8 +956,7 @@ ROWPAIR double-offset was the opposite shape). What remains untested is
 values BITWISE IDENTICAL** to the base M=1 kernel over 8 shapes x 5 datasets in two
 process invocations. It was **not** green until this session: it lost the device
 (`UR_RESULT_ERROR_DEVICE_LOST`) on both INT2 shapes while passing FP16 and INT4,
-because the branch is guarded on `bits == 2`. Full write-up:
-`reports/2026-10-05-batch-upstream-simd-gemv.md`.
+because the branch is guarded on `bits == 2`. Full write-up: `AGENTS.md` "INTFER_DECODE1_SUBGROUP is QUARANTINED, not fixed".
 
 ### The lesson the SUBGROUP self-check teaches
 
@@ -1053,8 +1083,8 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_DPAS_PREQ` | device-side GA64 act-quant pre-pass | recovers 52.7 ms of 2559.2 ms host act-quant but pays +30720 launches. **DO NOT PROMOTE** |
 | `INTFER_DPAS_ROW` | one WI owns many tiles | ~460x slower. Historical dead end, mutually exclusive with E4 |
 | `INTFER_DECODE1_MR` | 4 outputs per WI at M=1 INT2 | **2.3x slower.** Do not use |
-| `INTFER_DECODE1_SPLITK` | split-K block-cyclic M=1 INT2 decode: `N*S` work-items + coalesced weight loads. Exactly `=1`; kill switch `INTFER_NO_DECODE1_SPLITK` | **MEASURED LOSS.** Stream-identical to base on 27B (so the numerics contract held), but kernel 267 -> 384 ms (+43.8%, 3/3 same sign, clears the 6 ms spread floor; `nk/nw/nr` identical). Both halves of the hypothesis delivered and it still lost. **Do not promote.** `reports/2026-10-04-ksplit-decode1.md` |
-| `INTFER_DECODE1_SUBGROUP` | llama.cpp mmvq shape: one SUB-GROUP per output row, lanes split K, reduced by `sycl::reduce_over_group` -- no `local_accessor`, no barrier. **PORTED 2026-10-05, PERF UNMEASURED.** Numerics are the already-measured cyclic contract (0 ulp realistic, 2 ulp adversarial); arm in `test_tp2_27b.sh`. Predicted NEUTRAL: removing a barrier from a kernel at ~9% of roofline is not a step change, and the weight REPACK that would make it large is deliberately NOT ported. `reports/2026-10-05-decode1-subgroup.md` |
+| `INTFER_DECODE1_SPLITK` | split-K block-cyclic M=1 INT2 decode: `N*S` work-items + coalesced weight loads. Exactly `=1`; kill switch `INTFER_NO_DECODE1_SPLITK` | **MEASURED LOSS.** Stream-identical to base on 27B (so the numerics contract held), but kernel 267 -> 384 ms (+43.8%, 3/3 same sign, clears the 6 ms spread floor; `nk/nw/nr` identical). Both halves of the hypothesis delivered and it still lost. **Do not promote.** |
+| `INTFER_DECODE1_SUBGROUP` | llama.cpp mmvq shape: one SUB-GROUP per output row, lanes split K, reduced by `sycl::reduce_over_group` -- no `local_accessor`, no barrier. **REMOVED 2026-10-05**: numerically wrong (ids `'279 12 12'` vs base `'13 198 760'`) and the cause is not located. See `AGENTS.md` "INTFER_DECODE1_SUBGROUP is QUARANTINED, not fixed". |
 | `INTFER_L4_FUSE` | fused ssm+norm+FP16 -> la_out GEMM (TP=1) | stream-identical, but M>1 nets ~-1.5% and scalar A/B was a variance wash |
 | `INTFER_L5_FRONT` | device-resident whole LA input path | **dead end as built**: +144 launches/token, waitblock 5x. More kernels lose |
 | `INTFER_SSM_GPU` | device SSM recurrence | declines under `INTFER_DPAS48=1` (its ~1ulp drift flips a GA64 code at a tie) |
@@ -1089,7 +1119,7 @@ rounding order), `INTFER_HOST_AVX2`, `INTFER_DPAS_PREQ`-independent bits.
   host, and there is no P2P. The one TP=2-valid fusion is **gate+up in a single
   launch** (both column-parallel over the same split, both device-local, and
   bit-exact because each output's K accumulation is untouched). Spec and the
-  numerics argument: `reports/2026-10-05-tp2-fusion-surface.md`.
+  numerics argument: `AGENTS.md` "The TP=2 fusion surface".
 * **TP is COLUMN-parallel with a HOST gather — there is no All-Reduce.** `shard_weight`
   slices the output dim N; `run_linear_tp` waits all ranks, then each rank's D2H is
   `half_to_float_batch`-ed into `out.data() + m*t.N + start`. `grep -riE
@@ -1156,7 +1186,7 @@ Revisit a dead end only if a profile shows the thing it removed is now >10% of a
 | `scripts/check_stack_cert.sh` | grades the stack certificate (POST-STACK, not a step) |
 | `scripts/check_engine_cert.sh` | does the engine certification still carry to HEAD? |
 | `scripts/gate_inventory.sh` | derives the gate population, preconditions, render-node guards, and reconciles the doc tallies |
-| `scripts/check_scripts_live.sh` | every `scripts/` entry is reachable: NAMED by a live source, or matched by the gate runner's own `GATE_GLOB` parsed out of `run_ten_gates.sh`. `docs/`, `reports/` and `scripts/archive/` are records, not call sites |
+| `scripts/check_scripts_live.sh` | every `scripts/` entry is reachable: NAMED by a live source, or matched by the gate runner's own `GATE_GLOB` parsed out of `run_ten_gates.sh`. `docs/` and `scripts/archive/` are records, not call sites |
 
 **The rules this repo learned by breaking them** (each cost a full run; the full
 narrative with the measurements is in `docs/audit-log-tooling.md`):
@@ -1166,7 +1196,7 @@ narrative with the measurements is in `docs/audit-log-tooling.md`):
    `ls scripts/test_*.sh` DEFINES the gate population; `ls scripts/check_*.sh`
    defines the checker population; `scripts/check_scripts_live.sh` closes the
    *retirement* family, which is the one that needs closing most because a
-   **`docs/` or `reports/` citation is not a call site** — that misreading is what
+   **`docs/` citation is not a call site** — that misreading is what
    let sixteen dead scripts (superseded 27B quantize/merge drivers, retired
    wall-time A/B harnesses, one-GPU probes) sit in `scripts/` looking like tooling.
    Retire by `git mv` into `scripts/archive/`, which `maxdepth 1` keeps out of

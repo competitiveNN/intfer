@@ -271,7 +271,6 @@ cmd_verify() {
     echo "    2. re-run scripts/run_all_checks.sh end-to-end (stamps must name HEAD)"
     echo "    3. re-run scripts/test_tp2_27b.sh  (the only gate whose sole arm"
     echo "       is --tp 2 on 27B)"
-    echo "    4. then fill the RESULT: lines in reports/ and re-decide E1/E2/E3"
     exit 0
   fi
   echo "RESULT: MEASURED ${n:-?} device(s). The rebind did not restore enumeration."

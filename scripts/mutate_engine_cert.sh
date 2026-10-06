@@ -309,9 +309,9 @@ fi
 # E-D: weaken the engine-input filter while the artifact is STALE.
 #
 # *** THE REPLACEMENT MUST MATCH NOTHING, AND THE FIRST ATTEMPT DID NOT. *** It
-# weakened the filter to docs/|reports/|\.md$ -- but the artifact is planted at the
-# ROOT commit, and this repo really does have doc and report changes since then, so
-# the weakened filter still found "touched" files and still returned STALE. The
+# weakened the filter to docs/|\.md$ -- but the artifact is planted at the
+# ROOT commit, and this repo really does have doc changes since then, so the weakened
+# filter still found "touched" files and still returned STALE. The
 # state then reported "the filter is not load-bearing", which was a confident false
 # conclusion about a mechanism that HAD been broken. A weakening must be provably
 # total, not merely weaker.

@@ -1,0 +1,29 @@
+{
+	"InstallScripts" : 
+	[
+		"/var/home/fra/dev/intfer/build2/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/src/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/quant_merge/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/intfer_fidelity/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/intfer_gguf/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/hello_sycl/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/flash_attention_demo/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/spinquant_test/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/spinquant_demo/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/ga64_recip_test/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/ksplit_contract/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/dpas_fold_probe/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/quant_pipeline/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/gemm_demo/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/engine_demo/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/gemm_bench/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/roofline_probe/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/roofline_probe_bisect/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/rowpair_equiv/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/qwen_forward_gpu/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/qwen_forward_intfer/cmake_install.cmake",
+		"/var/home/fra/dev/intfer/build2/examples/intfer_cli/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

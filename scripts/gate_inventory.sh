@@ -406,7 +406,9 @@ NDEV="$(gate_gpu_count)" || NDEV=0
 # Two sites here, not one: the shell tally loop and the python handcounted
 # harvest below are SEPARATE enumerations of the same corpus (the audit #3 shape
 # -- a rule fixed at one site and merely assumed at the next).
-DOCS="AGENTS.md $(ls reports/*.md docs/*.md 2>/dev/null)"
+# `reports/*.md` was part of the retired 2026-10-06 batch-and-test loop and is
+# gone; the corpus is now AGENTS.md plus docs/ records.
+DOCS="AGENTS.md $(ls docs/*.md 2>/dev/null)"
 
 if [ "${NDEV:-0}" -lt 1 ]; then
   echo "doc-tally: SKIPPED (${NDEV} level_zero GPU(s) visible -- cannot derive the expected rc classes)."
@@ -609,9 +611,9 @@ for path in docs:
                 continue
             # A QUOTED claim is one the doc REFUTES, not makes. Without this the
             # single live hit was '"4 gates is enough"' -- argued against in
-            # reports/archive/2026-09-30-dpas48-fold.md -- so flagging it is a false
-            # positive. Quoted spans are excluded explicitly rather than by
-            # loosening the pattern.
+            # the retired DPAS48-fold batch report (now in AGENTS.md, "Flag inventory")
+            # -- so flagging it is a false positive. Quoted spans are excluded explicitly
+            # rather than by loosening the pattern.
             q = re.compile(r'["\u201c\u201d][^"\u201c\u201d]*' + re.escape(m.group(0)))
             if q.search(para):
                 quoted += 1

@@ -22,9 +22,11 @@
 # baseline on the same tree -- a mutant that agrees is a MISS, and that comparison
 # is the point: it is what makes each state a claim about this rule rather than
 # about a tree):
-#   SL-A  the docs/ + reports/ exclusion dropped        -> a CITATION becomes a
+#   SL-A  the docs/ exclusion dropped                     -> a CITATION becomes a
 #          call site, so every retired script survives. This is the exact defect
-#          that hid all sixteen scripts during the 2026-10-05 cleanup.
+#          that hid all sixteen scripts during the 2026-10-05 cleanup. `reports/`
+#          was retired 2026-10-06 with the batch-and-test loop; the tree now only
+#          holds `docs/` as a prose record, so the exclusion is a single site.
 #   SL-B  the scripts/archive/ exclusion dropped         -> the retired set becomes
 #          immortal, because each archived script keeps its siblings alive.
 #   SL-C  the GLOB class disabled                       -> every gate reads dead,

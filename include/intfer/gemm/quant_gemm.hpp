@@ -412,7 +412,7 @@ sycl::event quant_gemm_dpas48(sycl::queue& q, const Dpas48Params& p,
 // BIT-EXACT by construction, and that is a property of the geometry rather than
 // a lucky tolerance: each (row, tile) keeps ONE accumulator and still sums over
 // ops o = 0..nOp-1 in the same order with the same operands, so no FP32 add is
-// reordered. E4's numerics contract (reports/archive/) was written for a design
+// reordered. E4's numerics contract (retired batch report; see AGENTS.md) was written for a design
 // that combines per-block partial sums in a different order; this geometry has
 // no partial sums, so it does not have that hazard. Per the contract, identity
 // is REPORTED, never used as the gate.

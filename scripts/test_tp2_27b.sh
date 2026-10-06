@@ -429,7 +429,8 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # itself the lesson: a predicate can be exercised to perfection and still be
   # asserting something false, because a predicate tests the SHAPE of a claim and
   # not its TRUTH. Only the token oracle in the real run tests truth, and that is
-  # what caught this. See reports/2026-10-05-decode1-subgroup.md.
+  # what caught this. See AGENTS.md under "INTFER_DECODE1_SUBGROUP is
+  # QUARANTINED, not fixed".
   # CROSS-FLAG: an MR announcement must NOT satisfy the SPLITK predicate and vice
   # versa. Without this, a single tag-parameterized grep could match the wrong
   # flag's line and the two arms would certify each other's absence.
@@ -652,7 +653,8 @@ fi
 # '13 198 760' -- deterministically, on every run. A certification arm that
 # deterministically fails must not exist, so the flag, its kernel and this arm were
 # all removed on 2026-10-05. The bisect so far -- including the two candidate causes
-# that were TESTED AND FALSIFIED -- is reports/2026-10-05-decode1-subgroup.md.
+# that were TESTED AND FALSIFIED -- is in AGENTS.md under "INTFER_DECODE1_SUBGROUP
+# is QUARANTINED, not fixed".
 #
 # The removal is why this gate can be green again. It is NOT a relaxation: an arm
 # that cannot pass is not a check, and leaving it in made test_tp2_27b.sh, then
@@ -719,8 +721,8 @@ done
 # activation POINTER TYPE and nothing else. So stream identity is the entire claim
 # for all three, and `examples/rowpair_equiv` measures it model-free (227 835
 # element values, 8 shapes x 5 datasets) WITHOUT a 27B load. PERFORMANCE is still
-# unmeasured for every arm in this batch; see
-# reports/2026-10-06-batch-decode1-gemv-bisect-2.md.
+# unmeasured for every arm in this batch; see AGENTS.md under the M=1 INT2
+# GEMV bisect section.
 for spec in "VERBDEAD:vd:decode1-verbdead" "VERBSEL:vs:decode1-verbsel" \
             "VERBVEC:vv:decode1-verbvec"; do
   NAME="${spec%%:*}"; rest="${spec#*:}"; abbr="${rest%%:*}"; tag="${rest#*:}"

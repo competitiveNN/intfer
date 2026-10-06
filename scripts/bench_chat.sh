@@ -68,8 +68,8 @@ export INTFER_BENCH_URL="$URL" INTFER_BENCH_TURNS="$TURNS" INTFER_BENCH_MT="$MT"
 # AUDIT #23 follow-up. This harness publishes TTFT / TPOT / E2E in SECONDS off the
 # SSE stream rather than a CLI tok/s, which is why it fell outside the original
 # derivation and was recorded as SCOPED, NOT DONE. It is a wall-time harness all
-# the same, and the prefix-cache A/B in reports/2026-09-26 is read off exactly
-# these numbers. So: sample the load for the WHOLE run and judge on the maximum,
+# the same, and the prefix-cache A/B it ran is read off exactly these numbers.
+# So: sample the load for the WHOLE run and judge on the maximum,
 # keep the raw per-turn lines in a log, and surface them ONLY when the run stayed
 # under the threshold. The parity assertion still runs either way -- a withheld
 # figure is not a failed correctness check.

@@ -301,6 +301,6 @@ echo "          INTFER_DECODE1_VERBSEL  BITWISE IDENTICAL  -- codebook by select
 echo "          INTFER_DECODE1_VERBVEC  BITWISE IDENTICAL  -- activation ptr type"
 echo "        INTFER_DECODE1_VERBHALF reported above: it is claimed NOT bit-exact"
 echo "        (denormal + default FTZ), so a difference is information, not a failure."
-echo "        PERFORMANCE IS STILL UNMEASURED for all three; see"
-echo "        reports/2026-10-06-decode1-gemv-bisect.md."
+echo "        PERFORMANCE IS STILL UNMEASURED for all three; see AGENTS.md under"
+echo "        the M=1 INT2 GEMV bisect section."
 exit 0

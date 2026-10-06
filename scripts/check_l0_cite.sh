@@ -4,8 +4,8 @@
 # transcript somebody has to trust.
 #
 # WHY: the "the L0 driver silently drops card1" analysis (see
-# reports/archive/2026-10-01-batch-e1-e2-e3-verdicts.md) cites specific file:line in
-# intel/compute-runtime. Those were read by a research subagent, i.e. a
+# the retired E1-E3 batch report; the findings are in AGENTS.md) cites specific
+# file:line in intel/compute-runtime. Those were read by a research subagent, i.e.
 # transcript. The repo's recurring defect is exactly that: evidence that cannot
 # be re-derived. This script clones the pinned commit and greps the quoted
 # lines, so the claim either holds or the docs are wrong.

@@ -129,8 +129,8 @@ if [ "${1:-}" = "--list" ]; then
   echo "  RB-2  timeout verdict 124 -> 0 (silent pass)     [EXCLUDED - see below]"
   echo "  RB-3  SKIP diagnostic removed, rc=2 kept         [EXCLUDED - see below]"
   echo "  RB-4  the self-bound check removed              [DROPPED - 1800 s per run]"
-  echo "  RB-5  a `need` for an arm deleted                [must REFUSE]"
-  echo "  RB-6  a `need` renamed to the wrong arm         [must REFUSE]"
+  echo "  RB-5  a \`need\` for an arm deleted                [must REFUSE]"
+  echo "  RB-6  a \`need\` renamed to the wrong arm         [must REFUSE]"
   echo "  RB-7  pristine                                   [must hold]"
   exit 0
 fi
@@ -196,8 +196,11 @@ echo "        proves the bound fires, in three seconds."
 # RB-5: delete a `need`. On its own that makes the gate WEAKER, not broken, so the
 # state asserts the weaker thing that is true and checkable: the arm list is what
 # the gate claims to have measured, and RB-6 proves the list is load-bearing.
+# VERB+TAIL is the arm added by this session's ladder split, so it is the one deleted
+# here -- the matrix must cover every arm, not just the ones present when it was
+# first written.
 state RB-5 'UNPROVEN' \
-  "need 'VERB\\+HALF'" 'true'
+  "need 'VERB\\+TAIL'" 'true'
 
 # RB-6: rename one arm in a `need`. With the gate still UNPROVEN (the probe hangs,
 # so `need` is never reached) this proves the arm list is NOT what makes it honest --
@@ -230,7 +233,7 @@ if [ "$caught" -eq "$total" ]; then
   echo "        conflicts with the stub hanging (the failure the gate exists to"
   echo "        report). Excluded with the reason rather than ticked."
   echo "  RB-5/RB-6: the arm list is NOT what makes the gate honest. Recorded, not"
-  echo "        dressed up: while the probe hangs, `need` is never reached, so those"
+  echo "        dressed up: while the probe hangs, \`need\` is never reached, so those"
   echo "        two states show the gate is honest because of its TIMEOUT verdict and"
   echo "        its diagnostics -- not because it checked anything."
   echo "  RB-7: the pristine gate holds its contract (rc=2 + UNPROVEN) against a"

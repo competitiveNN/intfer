@@ -39,15 +39,17 @@
 # this checker does not, and cannot, catch a stale percentage whose denominator is
 # on another line. That limit is named here rather than left to be discovered.
 #
-# SCOPE, with its cost stated. reports/archive/ is EXCLUDED on purpose. An archived
-# report is a record of what was believed when it was written; rewriting it to match
-# today's hardware is the same laundering failure AGENTS.md warns about in the other
-# direction (see its [SUPERSEDED ...] discipline on gate tallies). The correction
-# is delivered instead as an annotation on the LIVE report plus this checker, which
-# stops the claim from being re-read as current. scripts/ is excluded because the
-# subject is documents, not tooling; a checker here legitimately contains the defect
-# text as a fixture, and gating itself on its own fixtures would be a class of
-# defect this repo has already paid for.
+# SCOPE, with its cost stated. `docs/` is EXCLUDED on purpose. A docs/ file is a
+# record of what was believed when it was written; rewriting it to match
+# today's hardware is the same laundering failure AGENTS.md warns about in the
+# other direction (see its [SUPERSEDED ...] discipline on gate tallies). The
+# correction is delivered instead as an annotation on the LIVE doc plus this
+# checker, which stops the claim from being re-read as current. `reports/` was
+# retired 2026-10-06 with the batch-and-test loop and no longer holds live
+# reports. `scripts/` is excluded because the subject is documents, not tooling;
+# a checker here legitimately contains the defect text as a fixture, and gating
+# itself on its own fixtures would be a class of defect this repo has already
+# paid for.
 #
 # Exit: 0 = every figure is cited; 1 = an uncited figure, or the self-check could
 #        not behave (a rule that cannot fail proves nothing); 2 = corpus empty.
