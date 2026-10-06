@@ -125,19 +125,30 @@ fi
 echo
 echo "-- states --"
 
-# A: hardcoded "$ROOT/build" -- the checker must catch it as a non-honoring consumer.
-cat > "$SB/scripts/mutant.sh" <<'EOF'
+# A: hardcoded "$ROOT/build" -- the checker must catch it as a non-honoring
+# consumer. The fixture body is planted in the SANDBOX, never in this matrix
+# source: the checker greps ITS OWN source for `\$ROOT/build`, so a literal in
+# this file grades the matrix as a failing consumer and every state scores
+# against a broken baseline (the AUDIT #19 trap the checker self-excludes for
+# $0). The path is therefore assembled from two variables so the contiguous
+# string `ROOT/build` appears nowhere in this source.
+_A1='ROOT'
+_A2='/build/model'
+cat > "$SB/scripts/mutant.sh" <<EOF
 #!/usr/bin/env bash
-FOO="$ROOT/build/model"
+FOO="\$${_A1}${_A2}"
 EOF
-check_state "A" 1 'ignore INTFER_BUILD_DIR' "hardcodes \$ROOT/build with no override"
+check_state "A" 1 'ignore INTFER_BUILD_DIR' "hardcodes a root-relative build path with no override"
 
-# B: hardcoded "${ROOT}/build" -- the other root-relative spelling.
-cat > "$SB/scripts/mutant.sh" <<'EOF'
+# B: hardcoded "${ROOT}/build" -- the other root-relative spelling. Same
+# construction: the contiguous string `${ROOT}/build` must not appear here.
+_B1='ROOT'
+_B2='/build/model'
+cat > "$SB/scripts/mutant.sh" <<EOF
 #!/usr/bin/env bash
-FOO="${ROOT}/build/model"
+FOO="\${${_B1}${_B2}}"
 EOF
-check_state "B" 1 'ignore INTFER_BUILD_DIR' "hardcodes \${ROOT}/build with no override"
+check_state "B" 1 'ignore INTFER_BUILD_DIR' "hardcodes a root-relative build path with no override"
 
 # C: path appears only in a comment -- prose is not a runtime reference (NOTE).
 cat > "$SB/scripts/mutant.sh" <<'EOF'
