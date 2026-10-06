@@ -277,7 +277,22 @@ bash scripts/test_roofline_bisect.sh
 # That points away from this session's code but does NOT prove it: a gate that passes
 # quiet and fails loaded is exactly the failure mode in question.
 sudo bash scripts/gpu_recover.sh rebind && bash scripts/gpu_recover.sh verify
-bash scripts/check_device_precond.sh && bash scripts/check_e2_ctx.sh
+bash scripts/check_device_precond.sh
+# RE-MEASURED on ad71739 (after cf63f1a landed the two arms), QUICK mode:
+#   rc=1 verdict=FAIL failed=3 stale=24 unproven=2 quick=1
+#     check_device_precond.sh  FAIL   <- still, no flags, base emits garbage
+#     check_engine_cert.sh     FAIL   <- STALE: cf63f1a changed engine code, so the
+#                                         certification must be re-run. Expected, and
+#                                         the remedy is operator-only (run_ten_gates.sh
+#                                         is forbidden to an agent session).
+#     check_e2_ctx.sh          ok     <- was FAIL at a0e3399 and RECOVERED WITH NO
+#                                         rebind. Evidence for the load/box reading
+#                                         and against "my changes broke it": the
+#                                         engine is FURTHER from the last known-good
+#                                         commit now, and e2_ctx recovered anyway.
+# AND IN THE SAME WINDOW, on this same box, examples/rowpair_equiv measured 227835
+# element values BITWISE IDENTICAL -- so the GPU produces correct INT2 GEMV results
+# right now, which is contrary evidence against the box attribution for e2_ctx.
 # *** IF THOSE STILL FAIL AFTER A CLEAN REBIND, THIS IS A CODE INVESTIGATION AND THE
 # *** BOX ATTRIBUTION IS RETRACTED. Recorded now, before the evidence exists, so it
 # *** cannot be quietly dropped once a convenient run comes back green. ***

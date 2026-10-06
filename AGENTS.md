@@ -684,76 +684,63 @@ BEFORE a later change as if it were current. A stack number is evidence about a
 *named commit*, and quoting it after changing the tree is a citation presented as a
 claim. `check_stack_cert.sh` exists because of exactly that.
 
-## ==> STACK STATE 2026-10-06: **NOT CERTIFIED. verdict=FAIL, failed=2.** <==
+## ==> STACK STATE 2026-10-06: **NOT CERTIFIED.** verdict=FAIL, failed=3. <==
 
-**The stack is red and the reason has NOT been established. Do not read any earlier
-number here as current.** An earlier revision of this banner carried
-`failed=0 stale=0 unproven=1`; that was measured BEFORE the bisect gate was added and
-quoting it afterwards was a citation presented as a claim. Current, measured, on
-`a0e3399`:
+**The stack is red. It has not been certified and this banner is not a claim that
+it has.** Measured on `ad71739` with `INTFER_QUICK=1`:
 
 ```
-INTFER_QUICK=1 ./scripts/run_all_checks.sh
-rc=1  verdict=FAIL  failed=2  stale=24  unproven=2  quick=1
-  check_device_precond.sh  FAIL rc=1   (4 assertions)
-  check_e2_ctx.sh          FAIL rc=1   (2 violations)
+rc=1  verdict=FAIL  failed=3  stale=24  unproven=2  quick=1
+  check_device_precond.sh  FAIL rc=1
+  check_engine_cert.sh     FAIL -- engine certification STALE (certified tree 6c9fa15)
+  check_e2_ctx.sh          ok        <- was FAIL, and recovered with NO rebind
 ```
 
 * **`stale=24` is not damage.** QUICK mode leaves matrices out of STEPS, so their
-  stamps cannot match HEAD; that is what quick mode is. A non-QUICK run is needed for
-  a gradeable cert, and one has not been obtained.
-* **`failed=2` is NOT fixed.** The remedy needs sudo and has not been applied.
+  stamps cannot match HEAD; that is what quick mode *is*. A non-QUICK run for a
+  gradeable cert has not been obtained.
+* **`check_engine_cert.sh` is the EXPECTED consequence of this session's own work.**
+  `cf63f1a` added two inline INT2 kernels to `src/gemm/quant_gemm.cpp`, so the
+  engine certification legitimately needs re-running. Its own printed remedy is
+  `scripts/run_ten_gates.sh`, and AGENTS.md standing rule 1 forbids an agent
+  session from that (tens of minutes of model loads). **Operator only.**
 
-### The symptom, and it is the BASE run that is wrong
+### The box attribution: PLAUSIBLE, AND ONE PIECE OF IT HAS NOW FALLEN AWAY
 
-With **NO flags set**, the base 27B `--tp 2` run emits:
+`check_e2_ctx.sh` was FAIL at `a0e3399` and is **ok** at `ad71739`, with **no
+rebind applied**. That is evidence for the load/box reading and against "my changes
+broke it" — the engine is now *further* from `a6c2c73` than when it was passing,
+and e2_ctx recovered anyway.
+
+`check_device_precond.sh` still fails, with **no flags set** the base 27B `--tp 2`
+run emitting:
 
 ```
 The capital of France isrowned_x财神      prefill token 42624, expected 11751
 ```
 
 CITATION(measured 2026-10-06:
-`build/device_precond_matrix/test_tp2_27b.healthy.log` line 2, saved with the rest to
-`build/boxstate/diag_2026-10-06.txt`)
+`build/device_precond_matrix/test_tp2_27b.healthy.log` line 2; box diagnostics saved
+to `build/boxstate/`)
 
-### The box attribution: PLAUSIBLE, AND **NOT CONFIRMED**
+**The attribution is still NOT confirmed**, and the contrary evidence stands:
+both render nodes present and `zeDeviceGet` reports 2 devices
+CITATION(`scripts/gpu_recover.sh diag` -> `build/boxstate/diag_2026-10-06.txt`);
+`examples/roofline_probe` passes its always-red twin at a 452 GB/s ceiling
+CITATION(`build/boxstate/probe_now.txt`), so GPU compute behaves; and
+`examples/rowpair_equiv` measured **227 835 element values bitwise identical** on
+this same box minutes ago, so the GPU produces correct results for INT2 GEMV.
 
-Evidence **for** a box fault: the failure is in gates that run the model; the base
-run with no flags is the wrong one; `kworker/*+xe_page_fault_work_queue` was observed
-spinning at **61 % CPU** on one sample.
-
-Evidence **against** it, or at least complicating it -- and this is why the
-attribution is NOT claimed:
-
-* both render nodes present and `zeDeviceGet` reports **2 devices**
-  CITATION(`scripts/gpu_recover.sh diag`, saved to `build/boxstate/diag_2026-10-06.txt`)
-* the page-fault worker is **not** spinning at the next sample, so the 61 % figure is
-  point-in-time and does not reproduce;
-* `examples/roofline_probe` on the same box **passes its always-red twin** (ratio
-  0.23 against an expected 0.25) and reads a **452 GB/s** streaming ceiling
-  CITATION(`build/boxstate/probe_now.txt`, 99.2 % of the 456 GB/s spec -- the
-  206-264 GB/s of earlier runs was a CONTENDED box, not a slow one), so GPU compute
-  is behaving;
-* **the engine has not changed since the tp2 gate passed.**
-  CITATION(`git log a6c2c73..HEAD -- src/ include/ examples/intfer_cli/` is EMPTY.
-  `a6c2c73` is the SUBGROUP quarantine, and `bash scripts/test_tp2_27b.sh` returned
-  **PASS rc=0** immediately after it. Everything since is docs, `scripts/`, and one
-  new example binary that no gate path invokes.)
-
-That last item is the strongest discriminator available without root, and it points
-AWAY from this session's code. **But it is not proof**, because a gate that passes on
-a quiet box and fails on a loaded one is exactly the failure mode in question.
-
-**WHAT WOULD SETTLE IT, and it needs sudo, so it is the operator's:**
+**WHAT WOULD SETTLE IT, and it needs sudo:**
 
 ```
 sudo bash scripts/gpu_recover.sh rebind && bash scripts/gpu_recover.sh verify
-bash scripts/check_device_precond.sh && bash scripts/check_e2_ctx.sh
+bash scripts/check_device_precond.sh
 ```
 
-**IF THOSE STILL FAIL AFTER A CLEAN REBIND, THIS IS A CODE INVESTIGATION AND THE BOX
-ATTRIBUTION IS RETRACTED.** That retraction is written down here now, before the
-evidence exists, so it cannot be quietly dropped later.
+**IF device_precond STILL FAILS AFTER A CLEAN REBIND, THIS IS A CODE INVESTIGATION
+AND THE BOX ATTRIBUTION IS RETRACTED.** Recorded before the evidence exists, so it
+cannot be quietly dropped once a convenient run comes back green.
 
 ### `INTFER_DECODE1_SUBGROUP` is QUARANTINED, not fixed
 
