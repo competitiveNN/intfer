@@ -626,34 +626,50 @@ FAIL: order vm completed but the kernel never announced [decode1-verbmp].
    killed**. `examples/gemm_bench`'s note about a presence-only flag being enabled
    by `X=0` is the same trap, and the differential walked straight into it.
    Now `unsetenv(KILL)` for the selected order.
-2. **The verb\* arms still do not fire under the differential even after (1).
-   The diagnosis is a CONTRADICTION, not an answer, so it is recorded as one.**
-   Three measurements disagree:
+2. **THE HARNESS IS THE FAULT, AND IT AFFECTS *EVERY* ARM INCLUDING ROUND 1.
+   THE ROUND-2 ARMS WERE DELETED ON A CONCLUSION THAT WAS WRONG, AND RESTORED.**
 
-   * the guard's four conditions are **ALL TRUE** --
-     `use_verbhalf=1 bits=2 tab=1 ng=320`;
-   * the binary's env plumbing is **provably correct at the call site** --
-     `ENVSET slot=4 ROWPAIR=[(null)] NO_ROWP=[1] VERBDEAD=[1]`;
-   * and yet `[decode1-rowpair]` -- which lives INSIDE `if (use_rowpair && ...)`
-     whose guard reads `getenv(FLAG) != nullptr && getenv(KILL) == nullptr` --
-     **fires for all six orders**, after a CLEAN rebuild that deleted
-     `libintfer_gemm.a` and the object file.
+   Measured, reproducibly, for every non-base order:
 
-   With `FLAG=(null)` and `KILL=1` that guard is `false && false`, so the
-   announcement cannot be reached. **Not a staleness artefact** (the library was
-   deleted and rebuilt) and **not the env plumbing** (traced at the call site).
-   I could not reconcile the two within this session.
+   ```
+   base -> (nothing)   rp -> [decode1-rowpair]   vh -> [decode1-rowpair]
+   vm -> [decode1-rowpair]   vd -> [decode1-rowpair]   vs/vv likewise
+   ```
 
-   *** CONSEQUENCE, stated so it is not softened into "cause not located": the three
-   round-2 arms are LANDED BUT UNVERIFIED, and per this repo's own rule an arm
-   that cannot be shown firing is DELETED with its gate arm, kill switch and report
-   stanza rather than shipped as a silently-dead kernel. That deletion is the next
-   session's first job, and the harness bug that makes the decision hard is the
-   thing to fix before it. ***
+   So `vh` (INTFER_DECODE1_VERBHALF, **round 1**) shows EXACTLY the symptom `vd`
+   did. "The round-2 arms cannot be shown firing" therefore does not follow from
+   the evidence; **"no verb* arm can be certified, and the fault is in the harness"**
+   does. All three were restored from `git` -- deleting correct kernels because my
+   own test harness lies is the wrong fix, and the reversal is recorded here because
+   I made it.
 
-**SO: `VERBMP`, `VERBDEAD`, `VERBSEL` and `VERBVEC` have NO correctness
-measurement, and the earlier `VERBMP` result is withdrawn.** `ROWPPAIR` alone is
-measured (227 835 values, announced, bitwise identical). `test_rowpair_equiv.sh` is
+   What IS established about the ENGINE side, and it stands on its own:
+
+   * every arm's guard is a plain `getenv(FLAG) != nullptr &&
+     getenv(KILL) == nullptr` on the SAME names the harness sets -- traced at the
+     call site: `ENVSET slot=4 ROWPAIR=[(null)] NO_ROWP=[1] VERBDEAD=[1]`;
+   * the announcement string exists in exactly ONE place,
+     `src/gemm/quant_gemm.cpp`, INSIDE its own `if (use_X && ...)` block -- the
+     example does not print it, `find` shows one binary, and `with_oneapi.sh`
+     `exec`s exactly the binary it is given;
+   * a CLEAN rebuild (library and object deleted, then rebuilt) does not change it.
+
+   *** THE UNTESTED SUSPECT, NAMED FOR THE NEXT SESSION: the announcement is a
+   `static const bool` latch. *** It is initialised once per PROCESS on the first
+   kernel call, and `rowpair_equiv` re-enters its env block once per
+   (shape, dataset) -- so the FIRST call in a process decides what prints, forever.
+   If any call happens with an env state the trace did not capture, ROWPAIR latches
+   and no later order in that process can print anything else. The fix is a
+   **per-order marker INSIDE the engine** so a latch cannot masquerade as a
+   different arm, pinned by the always-red twin that already exists (FP16/INT4
+   orders must stay silent). That is why the round-2 arms were restored rather than
+   deleted a second time.
+
+**SO: NO `verb*` ARM HAS A CORRECTNESS MEASUREMENT, and the earlier `VERBMP`
+result is withdrawn.** `ROWPAIR`'s own 227 835-value result is ALSO withdrawn as
+unverifiable by this harness, because the same fault lets a row-pair line appear
+for an order that is supposed to be running something else -- so "it announced"
+no longer distinguishes "it ran". `test_rowpair_equiv.sh` is
 **RED** on `ad71739`+ because it refuses to certify arms it cannot see running --
 which is the correct behaviour for a gate whose whole purpose is to not certify
 nothing.
