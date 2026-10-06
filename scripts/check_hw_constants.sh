@@ -54,8 +54,18 @@
 # rather than the scope quietly widened, because widening scope until a
 # defect disappears is the failure this file was written to prevent.
 # `scripts/` IS excluded: the subject is documents, not tooling, and a checker
-# here legitimately contains the defect text as a fixture; gating itself on its
+# here legitimately contains the defect text as a fixture, gating itself on its
 # own fixtures would be a class of defect this repo has already paid for.
+#
+# Exit: 0 = every figure is cited; 1 = an uncited figure, or the self-check could
+#        not behave (a rule that cannot fail proves nothing); 2 = corpus empty.
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Seam: the subject is OTHER files, so a mutation harness must be able to hand this
+# a corpus of its own. Same reason INTFER_SCRIPTS_DIR exists on check_dri_probe.sh.
+DOCS_DIR="${INTFER_DOCS_DIR:-$ROOT}"
+REPORTS_SUBDIR="reports"
 #
 # Scope of the citation window, chosen deliberately: a figure is cited if a
 # CITATION(...) marker appears anywhere in the same blank-line-delimited PARAGRAPH.
