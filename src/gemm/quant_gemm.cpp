@@ -716,6 +716,17 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
           (std::getenv("INTFER_DECODE1_VERBHALF") != nullptr) &&
           (std::getenv("INTFER_NO_DECODE1_VERBHALF") == nullptr);
       if (use_verbhalf && bits == 2 && use_int2_tab && num_groups > 0) {
+        // *** THE ANNOUNCEMENT WAS MISSING HERE AT FIRST. *** Round 1 added
+        // announcement lines to the round-2 arms and not to these two, so the
+        // differential's announcement requirement could never be satisfied for
+        // them and the arms were indistinguishable from dead ones. A gate that
+        // requires proof-of-execution cannot be satisfied by an arm that never
+        // emits proof, and the failure mode is exactly the vacuous PASS.
+        static const bool announced = [] {
+          std::fprintf(stderr, "[decode1-verbhalf] group scale via sycl::bit_cast<sycl::half> (NOT bit-exact: denormal+FTZ) ACTIVE\\n");
+          return true;
+        }();
+        (void)announced;
         return q.submit([&](sycl::handler& h) {
           h.depends_on(copy_dep);
           h.parallel_for<class gemm_usm_decode1_verbhalf>(
@@ -799,6 +810,17 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
           (std::getenv("INTFER_DECODE1_VERBMP") != nullptr) &&
           (std::getenv("INTFER_NO_DECODE1_VERBMP") == nullptr);
       if (use_verbmp && bits == 2 && use_int2_tab && num_groups > 0) {
+        // *** THE ANNOUNCEMENT WAS MISSING HERE AT FIRST. *** Round 1 added
+        // announcement lines to the round-2 arms and not to these two, so the
+        // differential's announcement requirement could never be satisfied for
+        // them and the arms were indistinguishable from dead ones. A gate that
+        // requires proof-of-execution cannot be satisfied by an arm that never
+        // emits proof, and the failure mode is exactly the vacuous PASS.
+        static const bool announced = [] {
+          std::fprintf(stderr, "[decode1-verbmp] weight side through a row-base multi_ptr (bit-exact by construction) ACTIVE\\n");
+          return true;
+        }();
+        (void)announced;
         return q.submit([&](sycl::handler& h) {
           h.depends_on(copy_dep);
           h.parallel_for<class gemm_usm_decode1_verbmp>(
@@ -1046,6 +1068,41 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       const bool use_verbvec =
           (std::getenv("INTFER_DECODE1_VERBVEC") != nullptr) &&
           (std::getenv("INTFER_NO_DECODE1_VERBVEC") == nullptr);
+      // *** ARMS ARE ORDER-EXCLUSIVE BY CONSTRUCTION, AND THAT IS A TRAP. *** Each
+      // arm below ends in `return q.submit(...)`, so with two flags set the EARLIEST
+      // one wins and every later arm is silently unreachable. ROWPAIR sits first (it
+      // predates this round), so `INTFER_DECODE1_ROWPAIR=1` plus any VERB* flag
+      // measures ROWPAIR and nothing else -- and the differential initially looked
+      // exactly like that. It is asserted now rather than documented, because the
+      // failure is invisible: the run completes, the output is plausible, and the
+      // flag you set appears to be ignored.
+      //
+      // The arms are therefore ordered and the guard below refuses to let two of
+      // them be live at once, naming the pair. This is a correctness guard on the
+      // MEASUREMENT HARNESS, not on the engine: in production exactly one is set.
+      {
+        int live = 0; const char* first = nullptr; const char* second = nullptr;
+        auto note = [&](const char* n) {
+          if (first) { second = n; } else { first = n; }
+          ++live;
+        };
+        if (use_rowpair)                 note("INTFER_DECODE1_ROWPAIR");
+        if (use_verbhalf)                note("INTFER_DECODE1_VERBHALF");
+        if (use_verbmp)                  note("INTFER_DECODE1_VERBMP");
+        if (use_verbdead)                note("INTFER_DECODE1_VERBDEAD");
+        if (use_verbsel)                 note("INTFER_DECODE1_VERBSEL");
+        if (use_verbvec)                 note("INTFER_DECODE1_VERBVEC");
+        if (live > 1) {
+          std::fprintf(stderr,
+                       "[decode1-bisect] REFUSING: %s and %s are both live. The\n"
+                       "  M=1 decode1 arms each end in `return q.submit(...)`, so the\n"
+                       "  EARLIEST one wins and the later one is silently unreachable.\n"
+                       "  Exactly one arm at a time.\n",
+                       first, second);
+          return sycl::event();
+        }
+      }
+
       if (use_verbvec && bits == 2 && use_int2_tab && num_groups > 0) {
         static const bool announced = [] {
           std::fprintf(stderr,
