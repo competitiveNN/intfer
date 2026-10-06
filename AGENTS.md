@@ -654,43 +654,52 @@ FAIL: order vm completed but the kernel never announced [decode1-verbmp].
      `exec`s exactly the binary it is given;
    * a CLEAN rebuild (library and object deleted, then rebuilt) does not change it.
 
-*** THE LATCH WAS FIXED, AND HERE IS THE PER-ORDER MEASUREMENT. *** The six
-`static const bool announced` latches are gone, replaced by ONE
-`decode1_announce(tag)` whose latch is keyed by the arm's tag in a `std::set`
-behind a mutex -- per-arm BY CONSTRUCTION, not by accident of lexical scope -- and
-whose line carries a CALL COUNTER. `INTFER_DECODE1_ANNOUNCE_EVERY=1` disables the
-once-only latch entirely, so a harness can prove the latch is not what decides the
-marker.
+*** THE LATCH THEORY IS CONFIRMED, AND THE CONVERSION WAS THE FIX. ***
 
-| order | marker | verdict |
-|---|---|---|
-| base | (none) | **correct** -- no arm live |
-| rp | `[decode1-rowpair]` | **correct** |
-| vh | `[decode1-verbhalf]` | **correct** (was `[decode1-rowpair]`) |
-| vm | `[decode1-verbmp]` | marker right, **but the process DIES right after** |
-| vd | `[decode1-rowpair]` | **WRONG**, unresolved |
-| vs | `[decode1-rowpair]` | **WRONG**, unresolved |
-| vv | `[decode1-rowpair]` | **WRONG**, unresolved |
+| order | marker | rc | verdict |
+|---|---|---|---|
+| base | (none) | 0 | **correct** -- no arm live |
+| rp | `[decode1-rowpair]` | 0 | **correct** |
+| vh | `[decode1-verbhalf]` | 0 | **correct** |
+| vm | `[decode1-verbmp]` | **124** | marker **correct**; then HANGS |
+| vd | `[decode1-verbdead]` | **124** | marker **correct**; then HANGS |
+| vs | `[decode1-verbsel]` | **124** | marker **correct**; then HANGS |
+| vv | `[decode1-verbvec]` | **124** | marker **correct**; then HANGS |
 
-The latch was one real bug and it is fixed: `vh` and `vm` now announce THEMSELVES,
-which is the first time any verb* arm has been shown to execute.
+**All six arms now announce THEMSELVES.** The `[decode1-rowpair]` that stood in
+for `vd`/`vs`/`vv` was the four UNCONVERTED latches, and converting all six fixed
+it. The latch theory is confirmed, not falsified -- so the fault was never in the
+env/kill-switch plumbing, which was measured correct at the call site
+(`ROWPAIR=[-|1] VERBDEAD=[1|-]` for slot 4).
 
-*** TWO DEFECTS REMAIN, AND NEITHER IS THE LATCH. ***
-* **`vm` ANNOUNCES AND THEN DIES** -- 196 B of stderr against 298 B for `rp`, so it
-  stops before the final line. That is a fault signal INSIDE THE VERBMP KERNEL, and
-  it is the shape of the defect ROWPAIR had before its double-offset was found. It
-  is the first evidence that a round-1 kernel may itself be wrong.
-* **`vd`/`vs`/`vv` take ROWPAIR.** Their order-table entries are correct
-  (`{"vd", "INTFER_DECODE1_VERBDEAD", "INTFER_NO_DECODE1_VERBDEAD", 4}` etc.), so the
-  loop must be killing `INTFER_DECODE1_ROWPAIR` for those slots. It demonstrably
-  is not. **NOT DIAGNOSED.**
+*** AND A NEW, SHARPER FINDING FALLS OUT: FOUR OF THE SIX ARMS HANG. *** `vm`,
+`vd`, `vs` and `vv` announce correctly and then do not return (`rc=124` under a
+60 s timeout), while `rp` and `vh` complete cleanly. The four share something the
+two do not: each declares
 
-*** AND A LATE FINDING THAT IS EMBARRASSING: THE ORDER-EXCLUSIVITY GUARD IS DEAD
-CODE. *** It sits AFTER all six arms' blocks, and each arm ends in
-`return q.submit(...)`, so control can never reach it. It was added to catch
-precisely this situation and cannot. It belongs immediately after the sixth flag
-read, before the first arm. Recorded rather than quietly fixed, because the fix
-should ship with a mutation state proving the guard fires.
+```cpp
+sycl::multi_ptr<const std::uint8_t,
+    sycl::access::address_space::global_space> wmp(code_u8 + row_base);
+```
+
+and then, in THREE of the four (`VERBDEAD`, `VERBSEL`, `VERBVEC`), **never uses
+it** -- they index `code_u8[b0]` with the base kernel's absolute indices, so
+`wmp` is a dead construction. The fourth (`VERBMP`) does use it, with row-relative
+`b0`. A `multi_ptr` built at a large offset and then unused is the one construct
+these four share and `rp`/`vh` do not, so it is the prime suspect.
+
+*** THAT IS A HYPOTHESIS WITH A MEASUREMENT BEHIND IT, NOT A CONCLUSION. *** The
+distinguishing test is cheap and not done: delete the unused `wmp` from the three
+dead arms and re-run those three orders. If they then return rc=0, the suspect is
+confirmed.
+
+**THE BOX MAY NOW NEED RECOVERY.** Repeated aborted launches can wedge the Xe
+page-fault worker, after which every launch hangs. If orders `rp`/`vh` also start
+timing out, that is it:
+
+```
+sudo bash scripts/gpu_recover.sh rebind && bash scripts/gpu_recover.sh verify
+```
 
 
 **SO: NO `verb*` ARM HAS A CORRECTNESS MEASUREMENT, and the earlier `VERBMP`
