@@ -117,6 +117,26 @@ read the hang as "the shipped kernel is broken here too", on no evidence. And th
 first draft genuinely *did* have a buffer bug — it passed the output buffer as the
 activation buffer — which I fixed, and which was still not the cause.
 
+**The gate's OBSERVED return status, measured rather than predicted:**
+
+```
+$ bash scripts/test_roofline_bisect.sh          # ~2 min
+GATE_RC=2   SKIP: ... did not finish in 120s at HEAD (rc=124)
+            UNPROVEN: bisect probe cannot run at HEAD (not a regression)
+```
+
+**The FIRST version of this gate was much worse and that is worth recording.**
+`timeout 300 bash scripts/test_roofline_bisect.sh` returned **rc=124 with EMPTY
+OUTPUT**, because its internal timeout was the same 1800 s the runner allows. Three
+defects in one: rc=124 is not in the runner's vocabulary (`expect_healthy` reads 0, or
+2 *with* a skip diagnostic; anything else is "a gate must not go red on a healthy
+box" → a regression), so an unrunnable probe **masqueraded as a code failure**; the
+empty output meant not even the `need` assertions had anything to match; and it
+consumed the runner's entire budget on a step that cannot finish. It now self-bounds
+to 120 s, refuses to start if `INTFER_BISECT_TIMEOUT` is at or above the runner's
+1800 s, and exits **2 = UNPROVEN** with a `SKIP:` block naming the isolation and the
+consequence.
+
 **I am not claiming a result from this binary.** The two arms' ratios are unknown.
 
 ---

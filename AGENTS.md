@@ -589,6 +589,47 @@ arm would need if it wins: `reports/2026-10-06-decode1-gemv-bisect.md`.
   the same probe puts decode at 15.6-19.9 % of the *shared* ceiling. The allocator
   is not the deficit; the kernel is.
 
+## ==> BOX STATE 2026-10-06: THE 27B MODEL IS EMITTING GARBAGE. READ FIRST. <==
+
+**With NO flags set, the base 27B `--tp 2` run emits**
+
+```
+The capital of France isrowned_x财神        prefill token 42624, expected 11751
+```
+
+and `check_device_precond.sh` (4 assertions) and `check_e2_ctx.sh` (2) both fail on
+it. **This is not a code regression and no flag is involved** — the base run is the
+one that is wrong. Both render nodes are present and `zeDeviceGet` reports 2 devices,
+so it is not enumeration either; it is the USM page-migration fault this file already
+documents, and the driver's `kworker/*+xe_page_fault_work_queue` was observed
+spinning at **61 % CPU** at the same time.
+
+CITATION(measured 2026-10-06: `build/device_precond_matrix/test_tp2_27b.healthy.log`
+line 2, and `scripts/gpu_recover.sh diag` reporting both render nodes present)
+
+**REMEDY, and it needs sudo so an agent session cannot apply it:**
+
+```
+sudo bash scripts/gpu_recover.sh rebind && bash scripts/gpu_recover.sh verify
+```
+
+**Current stack numbers, measured and NOT carried forward from an earlier run**
+(`INTFER_QUICK=1`, which skips matrices and therefore reports every matrix stamp
+stale by design):
+
+```
+rc=1  verdict=FAIL  failed=2  stale=24  unproven=2  quick=1
+```
+
+**Do not read the stale=24 as damage.** QUICK mode leaves matrices out of STEPS, so
+their stamps cannot match HEAD. And do not read `failed=2` as a regression in this
+session's code: both failures are the garbage-output fault above.
+
+**A caution this session earned twice:** I twice reported a stack state measured
+BEFORE a later change as if it were current. A stack number is evidence about a
+*named commit*, and quoting it after changing the tree is a citation presented as a
+claim. `check_stack_cert.sh` exists because of exactly that.
+
 ## ==> STACK STATE 2026-10-05: no regressions; one operator-only UNPROVEN <==
 
 `scripts/run_all_checks.sh` on `4319345`, run clean with no concurrent instance:
