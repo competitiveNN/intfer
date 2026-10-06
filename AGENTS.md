@@ -654,52 +654,56 @@ FAIL: order vm completed but the kernel never announced [decode1-verbmp].
      `exec`s exactly the binary it is given;
    * a CLEAN rebuild (library and object deleted, then rebuilt) does not change it.
 
-*** THE LATCH THEORY IS CONFIRMED, AND THE CONVERSION WAS THE FIX. ***
+*** THE LATCH THEORY IS CONFIRMED. *** All six arms announce THEMSELVES:
 
-| order | marker | rc | verdict |
-|---|---|---|---|
-| base | (none) | 0 | **correct** -- no arm live |
-| rp | `[decode1-rowpair]` | 0 | **correct** |
-| vh | `[decode1-verbhalf]` | 0 | **correct** |
-| vm | `[decode1-verbmp]` | **124** | marker **correct**; then HANGS |
-| vd | `[decode1-verbdead]` | **124** | marker **correct**; then HANGS |
-| vs | `[decode1-verbsel]` | **124** | marker **correct**; then HANGS |
-| vv | `[decode1-verbvec]` | **124** | marker **correct**; then HANGS |
+| order | marker | rc at the time |
+|---|---|---|
+| base | (none) | 0 |
+| rp | `[decode1-rowpair]` | 0 |
+| vh | `[decode1-verbhalf]` | 0 |
+| vm | `[decode1-verbmp]` | 124 |
+| vd | `[decode1-verbdead]` | 124 |
+| vs | `[decode1-verbsel]` | 124 |
+| vv | `[decode1-verbvec]` | 124 |
 
-**All six arms now announce THEMSELVES.** The `[decode1-rowpair]` that stood in
-for `vd`/`vs`/`vv` was the four UNCONVERTED latches, and converting all six fixed
-it. The latch theory is confirmed, not falsified -- so the fault was never in the
-env/kill-switch plumbing, which was measured correct at the call site
-(`ROWPAIR=[-|1] VERBDEAD=[1|-]` for slot 4).
+The `[decode1-rowpair]` that stood in for `vd`/`vs`/`vv` was the **four
+UNCONVERTED LATCHES**. The env/kill-switch plumbing was never at fault and was
+measured correct at the call site (`ROWPAIR=[-|1] VERBDEAD=[1|-]` for slot 4).
 
-*** AND A NEW, SHARPER FINDING FALLS OUT: FOUR OF THE SIX ARMS HANG. *** `vm`,
-`vd`, `vs` and `vv` announce correctly and then do not return (`rc=124` under a
-60 s timeout), while `rp` and `vh` complete cleanly. The four share something the
-two do not: each declares
+*** ==> AND THEN THE "FOUR ARMS HANG" CONCLUSION IS WITHDRAWN. IT WAS THE BOX. <==
 
-```cpp
-sycl::multi_ptr<const std::uint8_t,
-    sycl::access::address_space::global_space> wmp(code_u8 + row_base);
+I reported that four of the six arms announce and then hang, and named an unused
+`multi_ptr` built at `row_base` as the prime suspect. **That was wrong**, and the
+evidence is one command:
+
+```
+scripts/gpu_recover.sh diag   ->  zeDeviceGet rc=0 DEVICES=1     (was 2)
+ROWPAIR_EQUIV_ONLY=0 DECODE1_EQUIV_ORDER=rp ...  ->  rc=124       (was rc=0)
 ```
 
-and then, in THREE of the four (`VERBDEAD`, `VERBSEL`, `VERBVEC`), **never uses
-it** -- they index `code_u8[b0]` with the base kernel's absolute indices, so
-`wmp` is a dead construction. The fourth (`VERBMP`) does use it, with row-relative
-`b0`. A `multi_ptr` built at a large offset and then unused is the one construct
-these four share and `rp`/`vh` do not, so it is the prime suspect.
+**`rp` -- which completed cleanly minutes earlier -- now hangs too, and the second
+B580 has dropped out of enumeration.** So the four hangs were the documented
+device-fallback fault producing the IDENTICAL symptom to a kernel fault. This is
+exactly the trap AGENTS.md records: `SYCL: sycl-ls not available` is a statement
+about PATH, and a hang is a statement about the box until the box is checked first.
 
-*** THAT IS A HYPOTHESIS WITH A MEASUREMENT BEHIND IT, NOT A CONCLUSION. *** The
-distinguishing test is cheap and not done: delete the unused `wmp` from the three
-dead arms and re-run those three orders. If they then return rc=0, the suspect is
-confirmed.
-
-**THE BOX MAY NOW NEED RECOVERY.** Repeated aborted launches can wedge the Xe
-page-fault worker, after which every launch hangs. If orders `rp`/`vh` also start
-timing out, that is it:
+**SO: the `wmp` hypothesis is FALSIFIED and withdrawn, un-tested as it was.** The
+distinguishing test (delete the unused `wmp`, re-run `vd`/`vs`/`vv`) is still NOT
+DONE and cannot be done until the box has two devices again.
 
 ```
 sudo bash scripts/gpu_recover.sh rebind && bash scripts/gpu_recover.sh verify
 ```
+
+*** AND THE EXCLUSIVITY GUARD HAS BEEN MOVED. *** It sat after all six arms'
+blocks, and every arm ends in `return q.submit(...)`, so control could never reach
+it -- it was added to catch exactly the two-flags-live case and could catch
+nothing. It now sits immediately after the sixth flag read, before the first
+arm's `if`. **Its mutation state is WRITTEN BUT NOT MEASURED**: with two flags set
+the binary must print `[decode1-bisect] REFUSING` and the control with one flag
+must stay quiet, but the two-flags run returned `rc=124` without reaching the
+guard -- the box, again. Rule 13 says a self-proving state proves nothing, so this
+one is recorded as UNMEASURED rather than counted.
 
 
 **SO: NO `verb*` ARM HAS A CORRECTNESS MEASUREMENT, and the earlier `VERBMP`

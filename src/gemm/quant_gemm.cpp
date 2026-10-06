@@ -1086,6 +1086,14 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       const bool use_verbvec =
           (std::getenv("INTFER_DECODE1_VERBVEC") != nullptr) &&
           (std::getenv("INTFER_NO_DECODE1_VERBVEC") == nullptr);
+
+      // *** THE GUARD IS HERE NOW; IT WAS DEAD CODE WHERE IT USED TO BE. ***
+      // It sat AFTER all six arms' blocks, and every arm ends in
+      // `return q.submit(...)`, so control could never reach it -- it was added
+      // to catch exactly the two-flags-live case and could catch nothing.
+      // Moved to immediately after the sixth flag read, the only place from
+      // which it can observe anything.
+
       // *** ARMS ARE ORDER-EXCLUSIVE BY CONSTRUCTION, AND THAT IS A TRAP. *** Each
       // arm below ends in `return q.submit(...)`, so with two flags set the EARLIEST
       // one wins and every later arm is silently unreachable. ROWPAIR sits first (it
