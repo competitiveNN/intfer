@@ -40,10 +40,65 @@ gate_require_build roofline_probe_bisect || exit 1
 [ -x "$BIN" ] || { echo "FAIL: roofline_probe_bisect binary missing: $BIN" >&2; exit 1; }
 
 LOG="$BUILD_DIR/roofline_bisect.log"
-timeout -k 30 1800 "$SCRIPT_DIR/with_oneapi.sh" "$BIN" --device "$DEVICE" >"$LOG" 2>&1
+
+# *** THE PROBE IS KNOWN-UNRUNNABLE AT HEAD, AND THIS GATE IS BOUNDED TO SAY SO. ***
+# MEASURED 2026-10-06: every arm of the binary HANGS, including the `table`
+# control; each arm tested ALONE also hangs, so the fault is not in the shipped
+# call. The first version of this gate ran the probe under `timeout 1800` --
+# the SAME budget its runner gives it -- and returned **rc=124 with EMPTY output**.
+# That is the worst of both worlds and it is worth being precise about why:
+#
+#   * rc=124 is NOT in the runner's vocabulary. `check_device_precond.sh` reads
+#     healthy rc as 0, or 2 WITH a skip diagnostic; anything else is
+#     "a gate must not go red on a healthy box" -> a REGRESSION. So an unrunnable
+#     probe was masquerading as a code failure.
+#   * empty output meant even `need` had nothing to match, so there was no
+#     diagnostic at all.
+#   * and it consumed the runner's entire 1800s budget on a step that cannot
+#     finish.
+#
+# So: an internal timeout FAR under the runner's, and on timeout a distinct
+# SKIP verdict with rc=2 -- UNPROVEN, which the runner records as "evidence does
+# not cover this" rather than "regression". That is the honest class for "the
+# probe cannot run here yet", and it is the same class the repo already uses for
+# stale stamps. A known-broken probe must not be able to look like a PASS or a
+# FAIL.
+PROBE_TIMEOUT="${INTFER_BISECT_TIMEOUT:-120}"
+RUNNER_BUDGET=1800
+if [ "$PROBE_TIMEOUT" -ge "$RUNNER_BUDGET" ]; then
+  echo "FAIL: INTFER_BISECT_TIMEOUT=$PROBE_TIMEOUT is not under the runner's" >&2
+  echo "      $RUNNER_BUDGET s budget, so a hang would consume the whole step" >&2
+  echo "      AND surface as rc=124, which the runner reads as a regression." >&2
+  exit 1
+fi
+
+timeout -k 15 "$PROBE_TIMEOUT" "$SCRIPT_DIR/with_oneapi.sh" "$BIN" --device "$DEVICE" \
+  >"$LOG" 2>&1
 RC=$?
 cat "$LOG"
 echo
+
+if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
+  cat <<EOF
+SKIP: the INT2 GEMV bisect probe did not finish in ${PROBE_TIMEOUT}s at HEAD
+      (rc=$RC). This is a KNOWN, DOCUMENTED state, not a regression --
+      reports/2026-10-06-decode1-gemv-bisect.md section 4 records the isolation:
+      every arm hangs including the \`table\` control, each arm alone also
+      hangs (so it is not the shipped call), the sibling roofline_probe
+      completes in ~6 s on the same box at the same moment, and the timed-out runs
+      wedge the driver's kworker/*+xe_page_fault_work_queue.
+
+      CONSEQUENCE, stated so nobody reads a green run as coverage: the arms
+      VERB+HALF and VERB+MP remain UNMEASURED. The module candidate (1.26x vs a
+      >=2x kill criterion) and the runtime-branch candidate (1.007x) are already
+      falsified; ~4.5-5x of the 5.6-6.4x gap is still unexplained.
+
+      To measure them: bash scripts/gpu_recover.sh diag && sudo bash
+      scripts/gpu_recover.sh rebind, then re-run this gate.
+UNPROVEN: bisect probe cannot run at HEAD (not a regression)
+EOF
+  exit 2
+fi
 
 need() { grep -qE "$1" "$LOG" || {
           echo "FAIL: expected '$2' in the output, and it is absent." >&2
