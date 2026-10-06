@@ -670,6 +670,191 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // too, but it reassociates the FP32 sum and is therefore NOT bit-exact.
       // This changes only WHICH work-item computes an output and how many loads
       // it shares, never the order of any accumulation.
+      // --------------------------------------------------------------------
+      // INTFER_DECODE1_VERBHALF -- default OFF, kill switch
+      // INTFER_NO_DECODE1_VERBHALF=1. EXPERIMENTAL, UNMEASURED.
+      //
+      // WHAT IT IS. EXACTLY ONE change to this kernel: the per-group scale is read
+      // with `sycl::bit_cast<sycl::half>` (one hardware convert) instead of
+      // `from_half_bits`, the engine's branchy SCALAR FP16->FP32 twiddle
+      // (3 branches per call). The twiddle is called once per GROUP, and
+      // num_groups = K/Gw = 5120/16 = 320 at MLP_GATE -- so 320 calls per
+      // work-item, in the loop that also carries the dequant and the FMA chain.
+      //
+      // WHY IT IS HERE. examples/roofline_probe measured this kernel at 13.8-41.3
+      // GB/s against 78-261 GB/s for a faithful clone of the SAME algorithm --
+      // a 5.6-6.4x gap reproduced interleaved. Two causes were then measured and
+      // FALSIFIED: module size (the shipped source in a small TU bought 1.26x
+      // against a >=2x kill criterion) and the runtime branch (making use_int2_tab
+      // a template parameter bought 1.007x). This arm is the first remaining
+      // single-change step, and it was blocked only because one probe TU crosses
+      // the level-zero OUT_OF_RESOURCES limit -- so it is landed HERE, where it can
+      // be measured on real weights.
+      //
+      // *** NOT MEASURED. *** examples/roofline_probe_bisect exists to measure it
+      // and has NEVER COMPLETED A RUN (every arm hangs at HEAD, including the
+      // `table` control; scripts/test_roofline_bisect.sh reports rc=2 UNPROVEN).
+      // So the direction is UNKNOWN, not positive.
+      //
+      // NUMERICS. NOT bit-exact by construction, and the two forms are not
+      // interchangeable: `from_half_bits` returns 0 for a subnormal or zero
+      // exponent and Inf/NaN for the saturated cases, while `bit_cast<half>` hands
+      // the denormal to the FP32 convert, which flushes it to zero under the
+      // default FTZ. A zero-group scale is the case that differs, and FP16 scale
+      // values come from `to_half_bits` of a positive host float, so it should not
+      // arise -- but "should not" is an argument, not a measurement, and this arm
+      // therefore needs a stream-identity gate and NOT an arithmetic claim. It is
+      // in the same class as INTFER_DECODE1_SPLITK, whose contract
+      // (`examples/ksplit_contract`) measures 0 FP16 ulp on realistic activations
+      // and 2 on an adversarial escalating set.
+      //
+      // INLINE AT THE CALL SITE. The reverted `quant_gemm_fused_decode1` cost
+      // 231114 ms with arithmetic a normalized diff proved identical, and the
+      // generalised cause is that the SYCL device compiler failed to optimise an
+      // extracted body. So this is a SEPARATE parallel_for, not a helper.
+      const bool use_verbhalf =
+          (std::getenv("INTFER_DECODE1_VERBHALF") != nullptr) &&
+          (std::getenv("INTFER_NO_DECODE1_VERBHALF") == nullptr);
+      if (use_verbhalf && bits == 2 && use_int2_tab && num_groups > 0) {
+        return q.submit([&](sycl::handler& h) {
+          h.depends_on(copy_dep);
+          h.parallel_for<class gemm_usm_decode1_verbhalf>(
+              sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+              [=](sycl::nd_item<1> it) {
+                const int ng = static_cast<int>(it.get_global_id(0));
+                if (ng >= N) return;
+                float acc = 0.0f;
+                const std::uint16_t* sptr = scale_usm + ng * num_groups_w;
+                const std::size_t row_base = static_cast<std::size_t>(ng) * K;
+                sycl::multi_ptr<const std::uint16_t,
+                    sycl::access::address_space::global_space> act_mp(act_usm);
+                for (int g = 0; g < num_groups; ++g) {
+                  // *** THE ONE CHANGE. Everything else below is the base kernel. ***
+                  const float scale =
+                      static_cast<float>(sycl::bit_cast<sycl::half>(sptr[g])) * alpha;
+                  const int kg0 = g * Gw;
+                  int kg1 = kg0 + Gw;
+                  if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+                  const float wtab[4] = {scale * -1.0f, scale * (-1.0f / 3.0f),
+                                         scale * (1.0f / 3.0f), scale * 1.0f};
+                  constexpr int CC = 8;   // 16 codes/chunk measured 0.25-0.35x
+                  int kg = kg0;
+                  std::size_t b0 = (row_base + static_cast<std::size_t>(kg)) / 4u;
+                  for (; kg + CC <= kg1; kg += CC) {
+                    sycl::vec<std::uint16_t, 8> a16;
+                    a16.load(0, act_mp + kg);
+                    const std::uint8_t b0v = code_u8[b0];
+                    const std::uint8_t b1v = code_u8[b0 + 1];
+                    b0 += 2;
+                    for (int j = 0; j < CC; ++j) {
+                      const float av =
+                          static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                      const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                      // (j & 3), NOT j: INT2 packs FOUR codes per byte, so a shift
+                      // of >= 8 on a uint8_t promotes to 0. That bug shipped once.
+                      const int code = (bv >> ((j & 3) * 2)) & 3;
+                      acc += av * wtab[code];
+                    }
+                  }
+                  for (; kg < kg1; ++kg) {
+                    const float av = from_half_bits(act_usm[kg]);
+                    const std::size_t idx = row_base + static_cast<std::size_t>(kg);
+                    const int code =
+                        static_cast<int>((code_u8[idx / 4] >> ((idx % 4) * 2)) & 3);
+                    acc += av * scale * canon_value(2, code);
+                  }
+                }
+                out_usm[ng] = to_half_bits(acc);
+              });
+        });
+      }
+
+      // --------------------------------------------------------------------
+      // INTFER_DECODE1_VERBMP -- default OFF, kill switch
+      // INTFER_NO_DECODE1_VERBMP=1. EXPERIMENTAL, UNMEASURED.
+      //
+      // WHAT IT IS. EXACTLY ONE change to this kernel: the weight side is read
+      // through a `multi_ptr` built on the row base, instead of indexing the raw
+      // `code_u8[b0]` with an absolute byte offset. A multi_ptr is what lets the
+      // compiler keep the base in a register and fold the addressing rather than
+      // re-materialising `code_u8 + b0` every iteration.
+      //
+      // *** AND THIS IS THE SHAPE OF AN ALREADY-FOUND BUG, WHICH IS WHY IT IS
+      // WORTH A SEPARATE ARM AND WHY IT IS INLINE. *** INTFER_DECODE1_ROWPAIR
+      // shipped row-OFFSET multi_ptrs indexed with the base kernel's ABSOLUTE byte
+      // offsets -- a double offset that read past the shard and LOST THE DEVICE
+      // (UR_RESULT_ERROR_DEVICE_LOST on both INT2 shapes). A CPU reproduction of the
+      // indexing arithmetic, and a model-free bitwise differential
+      // (scripts/test_rowpair_equiv.sh), are what caught it; a reading did not.
+      // The indices below are therefore `b0` RELATIVE to the row base, and the tail
+      // deliberately uses the UNOFFSET `code_u8` with absolute indices exactly as
+      // the base kernel does -- so the only difference is which pointer type the
+      // chunk loop uses.
+      //
+      // UNMEASURED, same as VERBHALF, and for the same reason. NUMERICS: this one
+      // IS bit-exact by construction -- the arithmetic expressions and the index
+      // VALUES are unchanged, only the pointer type the compiler folds them
+      // through. So it needs a stream-identity gate and no numerics contract.
+      const bool use_verbmp =
+          (std::getenv("INTFER_DECODE1_VERBMP") != nullptr) &&
+          (std::getenv("INTFER_NO_DECODE1_VERBMP") == nullptr);
+      if (use_verbmp && bits == 2 && use_int2_tab && num_groups > 0) {
+        return q.submit([&](sycl::handler& h) {
+          h.depends_on(copy_dep);
+          h.parallel_for<class gemm_usm_decode1_verbmp>(
+              sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+              [=](sycl::nd_item<1> it) {
+                const int ng = static_cast<int>(it.get_global_id(0));
+                if (ng >= N) return;
+                float acc = 0.0f;
+                const std::uint16_t* sptr = scale_usm + ng * num_groups_w;
+                const std::size_t row_base = static_cast<std::size_t>(ng) * K;
+                sycl::multi_ptr<const std::uint16_t,
+                    sycl::access::address_space::global_space> act_mp(act_usm);
+                // *** THE ONE CHANGE: the weight side through a row-base multi_ptr. ***
+                sycl::multi_ptr<const std::uint8_t,
+                    sycl::access::address_space::global_space> wmp(code_u8 + row_base);
+                for (int g = 0; g < num_groups; ++g) {
+                  const float scale = from_half_bits(sptr[g]) * alpha;
+                  const int kg0 = g * Gw;
+                  int kg1 = kg0 + Gw;
+                  if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+                  const float wtab[4] = {scale * -1.0f, scale * (-1.0f / 3.0f),
+                                         scale * (1.0f / 3.0f), scale * 1.0f};
+                  constexpr int CC = 8;
+                  int kg = kg0;
+                  // RELATIVE to the row base, because `wmp` already carries it.
+                  std::size_t b0 = static_cast<std::size_t>(kg) / 4u;
+                  for (; kg + CC <= kg1; kg += CC) {
+                    sycl::vec<std::uint16_t, 8> a16;
+                    a16.load(0, act_mp + kg);
+                    const std::uint8_t b0v = wmp[b0];
+                    const std::uint8_t b1v = wmp[b0 + 1];
+                    b0 += 2;
+                    for (int j = 0; j < CC; ++j) {
+                      const float av =
+                          static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                      const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                      const int code = (bv >> ((j & 3) * 2)) & 3;
+                      acc += av * wtab[code];
+                    }
+                  }
+                  for (; kg < kg1; ++kg) {
+                    const float av = from_half_bits(act_usm[kg]);
+                    // UNOFFSET base with ABSOLUTE indices, exactly as the base
+                    // kernel's tail -- NOT `wmp[idx / 4]`, which is the ROWPAIR
+                    // double-offset that lost the device.
+                    const std::size_t idx = row_base + static_cast<std::size_t>(kg);
+                    const int code =
+                        static_cast<int>((code_u8[idx / 4] >> ((idx % 4) * 2)) & 3);
+                    acc += av * scale * canon_value(2, code);
+                  }
+                }
+                out_usm[ng] = to_half_bits(acc);
+              });
+        });
+      }
+
       if (use_mr && bits == 2 && use_int2_tab && num_groups > 0) {
         constexpr int MR = 4;
         const int per_group = nWG * MR;

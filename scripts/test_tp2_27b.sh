@@ -158,6 +158,8 @@ sk_arm_assert()  { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-splitk' 'DECOD
 # label used in messages -- so a new arm cannot accidentally assert a different
 # flag's announcement, which would be green for the wrong reason.
 rp_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-rowpair' 'DECODE1_ROWPAIR'; }
+vh_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbhalf' 'DECODE1_VERBHALF'; }
+vm_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbmp' 'DECODE1_VERBMP'; }
 # The change that added the SUBGROUP arm DEFINED THIS TWICE -- once here and
 # once above beside rp_arm_assert -- and RAN the arm twice, so the gate paid
 # two full 27B decode runs of one flag in its most expensive operation. Bash
@@ -657,6 +659,51 @@ fi
 # body, bitwise, over shapes and datasets) so the fault is localised WITHOUT the
 # 27B stack. scripts/test_rowpair_equiv.sh is the shape of that tooling and it is
 # what found the ROWPAIR device-loss; it does not exist for SUBGROUP yet.
+
+# --- INTFER_DECODE1_VERBHALF / VERBMP: the two bisect arms, default OFF --------
+# *** SAME REACHABILITY CONSTRAINT AS EVERY OTHER DECODE1 ARM, AND IT IS BINDING:
+# both branches are guarded on `bits == 2`, and the 0.8B gate model has ZERO INT2
+# tensors, so an arm in test_gpu_optin.sh would be green because the path never ran.
+#
+# NEITHER OF THESE WAS MEASURED. examples/roofline_probe_bisect exists to measure
+# them and has never completed a run (scripts/test_roofline_bisect.sh reports
+# rc=2 UNPROVEN), so the arms are landed with CORRECTNESS gates only and the
+# expected direction in the report is UNKNOWN. They are here so the operator can
+# measure them on real weights in one pass, not because a number was predicted.
+#
+# THE CLAIMS DIFFER, AND THE ARMS MUST NOT OVERSTATE:
+#   VERBMP  is bit-exact BY CONSTRUCTION. The arithmetic expressions and the index
+#           VALUES are unchanged; only the pointer TYPE the compiler folds them
+#           through differs. So stream identity is the whole claim and no numerics
+#           contract applies.
+#   VERBHALF is NOT bit-exact by construction: from_half_bits returns 0 for a zero
+#           or subnormal exponent and Inf/NaN when saturated, while bit_cast<half>
+#           hands a denormal to the FP32 convert, which flushes to zero under the
+#           default FTZ. A zero group scale is the differing case and should not
+#           arise from `to_half_bits` of a positive host float -- but "should not" is
+#           an argument, so this arm is stream-identity only and NOT an arithmetic
+#           claim, in the same class as INTFER_DECODE1_SPLITK.
+for spec in "VERBHALF:vh:decode1-verbhalf" "VERBMP:vm:decode1-verbmp"; do
+  NAME="${spec%%:*}"; rest="${spec#*:}"; abbr="${rest%%:*}"; tag="${rest#*:}"
+  OUT="$LOG.${abbr}.out"; ERR="$LOG.${abbr}.err"
+  env "INTFER_DECODE1_${NAME}=1" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+    -p "$PROMPT" -n "$N" >"$OUT" 2>"$ERR"; RC=$?
+  if [ "$RC" -ne 0 ]; then
+    echo "GATE FAIL: INTFER_DECODE1_${NAME}=1 run exited rc=$RC" >&2
+    tail -20 "$ERR" >&2
+    PASS=0
+  else
+    echo "DECODE1_${NAME} prefill: $(cli_prefill "$ERR") (expect 11751)"
+    echo "DECODE1_${NAME} ids:      $(cli_ids "$ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    if ! grep -aq "\[$tag\]" "$ERR"; then
+      echo "GATE FAIL: INTFER_DECODE1_${NAME} produced the right tokens without the" >&2
+      echo "        path ever running (no [$tag] line). Vacuous." >&2
+      PASS=0
+    fi
+    "${abbr}_arm_assert" "$CLI_ERR" "$ERR" "GATE FAIL: " || PASS=0
+    grep -a "\[$tag\]" "$ERR" | head -1
+  fi
+done
 
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
 if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi

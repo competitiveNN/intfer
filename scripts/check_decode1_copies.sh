@@ -118,6 +118,15 @@ for k in "${ALL_D1[@]}"; do
     # subset below is the right relation.
     gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1)
       echo "     covered-by-subset  $k" ;;
+    gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp)
+      # The two bisect arms. Each is a SEPARATE inline parallel_for differing from
+      # the base body in exactly ONE place -- verbhalf in how the group scale is
+      # converted, verbmp in the pointer TYPE the weight side is read through. They
+      # re-implement the same per-output INT2 arithmetic, so the subset relation and
+      # the shift-into-mask equality are the right relations, and BOTH are enforced
+      # below rather than asserted here.
+      echo "     covered-by-subset  $k  (one-change bisect arm; see the" \
+           "shift-into-mask equality below)" ;;
     gemm_usm_decode1_rowpair)
       rp_found=1; echo "     COVERED-BY-ATOM-PIN  $k" ;;
     # Bodies with a STATED reason for not sharing the scalar per-output arithmetic.
@@ -144,7 +153,7 @@ if printf '%s\n' "${ALL_D1[@]}" | grep -qx 'gemm_usm_decode1_rowpair' && [ "$rp_
 fi
 # An UNCOVERED entry is drift in the POPULATION, not a style note.
 if printf '%s\n' "${ALL_D1[@]}" | grep -qvE \
-     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair)$'; then
+     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp)$'; then
   echo "  FAIL  a decode1 body is neither pinned nor exempted -- enumerate it" >&2
   printf '%s\n' "${ALL_D1[@]}" | sed 's/^/        /' >&2
   exit 1
@@ -290,6 +299,8 @@ shift_index_atoms() {  # $1 = body; normalises the packed-byte variable to V
 }
 idx_base="$(shift_index_atoms "$body_base")"
 idx_rp="$(shift_index_atoms "$body_rp")"
+idx_vh="$(shift_index_atoms "$(extract_body gemm_usm_decode1_verbhalf)")"
+idx_vm="$(shift_index_atoms "$(extract_body gemm_usm_decode1_verbmp)")"
 n_idx_rp="$(printf '%s\n' "$idx_rp" | grep -c . || true)"
 n_idx_base="$(printf '%s\n' "$idx_base" | grep -c . || true)"
 echo "-- shift-into-mask atoms: base=$n_idx_base, rowpair=$n_idx_rp"
@@ -312,6 +323,28 @@ if [ -n "$extra_idx" ]; then
   exit 1
 fi
 echo "  ok    the row-pair shift-into-mask set EQUALS the general body's"
+# The two bisect arms are one-change VARIANTS, so their shift-into-mask set must be
+# identical to the base's -- a difference there is the INTFER_DECODE1_SPLITK bug
+# class. Checked as EQUALITY, and the extractor is deliberately loose (it matches the
+# WRONG form too), because an extractor that only recognises the right answer cannot
+# detect a wrong one -- which is how the first version of this check passed a planted
+# bug.
+for pair in "VERBHALF:$idx_vh" "VERBMP:$idx_vm"; do
+  lbl="${pair%%:*}"; set="${pair#*:}"
+  if [ -z "$set" ]; then
+    echo "  FAIL  the $lbl arm extracted no shift-into-mask atom at all" >&2
+    exit 1
+  fi
+  d="$(printf '%s\n' "$set" | grep -vxF "$idx_base" || true)"
+  if [ -n "$d" ]; then
+    echo "  FAIL  the $lbl arm's shift-into-mask set differs from the general body:" >&2
+    echo "        $d" >&2
+    echo "        *** INTFER_DECODE1_SPLITK bug class: INT2 packs FOUR codes per" >&2
+    echo "        byte, so the shift must be ((j & 3) * 2). ***" >&2
+    exit 1
+  fi
+  echo "  ok    the $lbl arm's shift-into-mask set EQUALS the general body's"
+done
 
 n_rp_a="$(printf '%s\n' "$(atoms_rp "$body_rp")" | grep -c . || true)"
 echo "-- arithmetic atoms: base=$n_base_a, splitk=$n_sk_a, rowpair=$n_rp_a"

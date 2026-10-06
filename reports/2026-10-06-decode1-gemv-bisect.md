@@ -98,7 +98,46 @@ Arms in the binary: `table` (control, shared with the other probe), `VERBATIM`
 The ladder was split, with the control and the shipped arm shared, so each binary can
 report a **within-binary ratio** and cross-binary absolutes are never compared.
 
-### Status: BUILT, WIRED, GATED — **AND NOT MEASURED**
+### Status: LANDED AS ENGINE FLAGS, CORRECTNESS-GATED — **AND NOT MEASURED**
+
+The probe could not run, so the two arms were landed **in the engine** where the
+operator can measure them on real weights in one pass:
+
+| | E-VERBHALF | E-VERBMP |
+|---|---|---|
+| **flag** | `INTFER_DECODE1_VERBHALF` (presence-only) | `INTFER_DECODE1_VERBMP` (presence-only) |
+| **kill switch** | `INTFER_NO_DECODE1_VERBHALF=1` | `INTFER_NO_DECODE1_VERBMP=1` |
+| **default** | **OFF** | **OFF** |
+| **guard** | `bits == 2 && use_int2_tab` | same |
+| **the one change** | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` | weight side through a row-base `multi_ptr` |
+| **body** | **INLINE at the call site**, a separate `parallel_for` | same |
+| **numerics** | **NOT bit-exact by construction** — `from_half_bits` returns 0 for a zero/subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert which flushes to zero under default FTZ. Stream-identity only, same class as `INTFER_DECODE1_SPLITK` | **bit-exact by construction** — same expressions, same index *values*, only the pointer *type* the compiler folds them through. Stream identity is the whole claim; no contract |
+| **gate arm** | `scripts/test_tp2_27b.sh`, TP=2 | same |
+| **buckets I measured** | **none** — not run | **none** — not run |
+| **expected direction** | **UNKNOWN**, not positive | **UNKNOWN**, not positive |
+
+**Why inline and not a shared device function:** the reverted
+`quant_gemm_fused_decode1` cost 231 114 ms with arithmetic a normalized diff proved
+identical, and the generalised cause is that the SYCL device compiler failed to
+optimise an extracted body. Each arm is a separate `parallel_for` with its own copy
+of the loop.
+
+**Why `VERBMP`'s indices are written the way they are:** it is the *shape of the bug
+that already shipped*. `INTFER_DECODE1_ROWPAIR` used row-**offset** `multi_ptr`s
+indexed with the base kernel's **absolute** byte offsets — a double offset that read
+past the shard and **lost the device** (`UR_RESULT_ERROR_DEVICE_LOST` on both INT2
+shapes, while passing FP16 and INT4 because the branch is guarded on `bits == 2`). So
+`VERBMP`'s chunk loop uses **row-relative** `b0` and its tail deliberately uses the
+**unoffset** `code_u8` with absolute indices, exactly as the base kernel does.
+
+**How they are pinned:** `scripts/check_decode1_copies.sh` now enumerates both new
+bodies (`covered-by-subset`) *and* asserts their **shift-into-mask set EQUALS the
+general body's** — an equality, not a subset, computed with a deliberately loose
+extractor that matches the **wrong** form too. That looseness is load-bearing: the
+first version of this check matched only the correct `((j & 3) * 2)`, so planting the
+real `INTFER_DECODE1_SPLITK` bug simply stopped matching and the checker passed.
+
+### Status of the PROBE: BUILT, WIRED, GATED — **AND NOT MEASURED**
 
 `scripts/test_roofline_bisect.sh` exists, has a `dispatch()` arm and a `STEPS` entry,
 and asserts that the twin and **all five arms** ran. It has **never reached a green
@@ -226,6 +265,14 @@ bash scripts/run_ten_gates.sh
 ```
 
 ```
-RESULT: E-BISECT/VERB+HALF   (blank -- not measured; see section 4)
-RESULT: E-BISECT/VERB+MP     (blank -- not measured; see section 4)
+# E-VERBHALF / E-VERBMP, 27B --tp 2, load1 < 2. Counters only; never a tok/s claim.
+# Expected direction is UNKNOWN for both (see the table), so a red kernel bucket is
+# as informative as a green one.
+INTFER_DECODE1_VERBHALF=1 bash scripts/run_ten_gates.sh
+INTFER_DECODE1_VERBMP=1   bash scripts/run_ten_gates.sh
+```
+
+```
+RESULT: E-VERBHALF  kernel=__ ms/token (baseline __)  nk/nw/nr = __/__/__  [win|neutral|loss]
+RESULT: E-VERBMP    kernel=__ ms/token (baseline __)  nk/nw/nr = __/__/__  [win|neutral|loss]
 ```
