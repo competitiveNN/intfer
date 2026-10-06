@@ -181,13 +181,48 @@ same way*, and no arithmetic argument substitutes for it.
 # the two arms this batch could not measure (no model, ~1 min, counters only)
 bash scripts/test_roofline_bisect.sh
 
-# the UNPROVEN stack step. ONLY THE OPERATOR: AGENTS.md standing rule 1 forbids an
-# agent session from run_ten_gates.sh (tens of minutes of model loads). The stack is
-# at failed=0 stale=0 unproven=1 and this is the one item that closes it.
-bash scripts/run_ten_gates.sh
+# *** THE STACK IS RED AND THE CAUSE IS NOT ESTABLISHED. DO THIS FIRST. ***
+# Current, MEASURED -- the "failed=0 stale=0 unproven=1" that an earlier revision of
+# this report carried was measured BEFORE the bisect gate existed and was quoted
+# afterwards as if current, which is a citation presented as a claim:
+#     INTFER_QUICK=1 ./scripts/run_all_checks.sh
+#     rc=1  verdict=FAIL  failed=2  stale=24  unproven=2  quick=1
+#       check_device_precond.sh  FAIL rc=1  (4 assertions)
+#       check_e2_ctx.sh          FAIL rc=1  (2 violations)
+# With NO flags set the base 27B TP=2 run emits
+#   "The capital of France isrowned_x财神"   prefill token 42624, expected 11751
+# CITATION(measured 2026-10-06:
+# build/device_precond_matrix/test_tp2_27b.healthy.log line 2, saved with the rest to
+# build/boxstate/diag_2026-10-06.txt)
+#
+# THE BOX ATTRIBUTION IS PLAUSIBLE AND NOT CONFIRMED, and the evidence cuts BOTH
+# ways, so both sides are recorded rather than the convenient one:
+#   FOR:    every failure is a model-running gate and the BASE run with no flags is
+#           the wrong one; kworker/*+xe_page_fault_work_queue was observed at 61% CPU
+#           on ONE sample.
+#   AGAINST: both render nodes present and zeDeviceGet reports 2 devices
+#           CITATION(scripts/gpu_recover.sh diag ->
+#           build/boxstate/diag_2026-10-06.txt); the page-fault worker is NOT
+#           spinning at the next sample, so 61% is point-in-time and does not
+#           reproduce; and examples/roofline_probe PASSES its always-red twin (0.23 vs
+#           an expected 0.25) at a 452 GB/s ceiling
+#           CITATION(build/boxstate/probe_now.txt), so GPU compute is behaving.
+#           STRONGEST: the ENGINE HAS NOT CHANGED since the tp2 gate passed --
+#           `git log a6c2c73..HEAD -- src/ include/ examples/intfer_cli/` is EMPTY,
+#           a6c2c73 is the SUBGROUP quarantine, and `bash scripts/test_tp2_27b.sh`
+#           returned PASS rc=0 immediately after it. Everything since is docs,
+#           scripts/, and one example binary no gate path invokes.
+# That points away from this session's code but does NOT prove it: a gate that passes
+# quiet and fails loaded is exactly the failure mode in question.
+sudo bash scripts/gpu_recover.sh rebind && bash scripts/gpu_recover.sh verify
+bash scripts/check_device_precond.sh && bash scripts/check_e2_ctx.sh
+# *** IF THOSE STILL FAIL AFTER A CLEAN REBIND, THIS IS A CODE INVESTIGATION AND THE
+# *** BOX ATTRIBUTION IS RETRACTED. Recorded now, before the evidence exists, so it
+# *** cannot be quietly dropped once a convenient run comes back green. ***
 
-# if the bisect binary hangs again, the box's page-fault worker is wedged
-bash scripts/gpu_recover.sh diag && sudo bash scripts/gpu_recover.sh rebind
+# the engine gate, after the box is healthy. ONLY THE OPERATOR: AGENTS.md standing
+# rule 1 forbids an agent session from run_ten_gates.sh (tens of minutes of loads).
+bash scripts/run_ten_gates.sh
 ```
 
 ```
