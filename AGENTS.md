@@ -626,12 +626,30 @@ FAIL: order vm completed but the kernel never announced [decode1-verbmp].
    killed**. `examples/gemm_bench`'s note about a presence-only flag being enabled
    by `X=0` is the same trap, and the differential walked straight into it.
    Now `unsetenv(KILL)` for the selected order.
-2. **The verb\* arms still do not fire under the differential even after (1),
-   and the cause is NOT YET LOCATED.** Instrumenting the guard directly
-   (`use_verbhalf=1 bits=2 tab=1 ng=320`) shows the guard's four conditions are
-   ALL TRUE, and the arm body follows the guard in the same block -- yet no
-   `[decode1-verb*]` line reaches stderr. That contradiction is unresolved, and it
-   is recorded unresolved rather than guessed at.
+2. **The verb\* arms still do not fire under the differential even after (1).
+   The diagnosis is a CONTRADICTION, not an answer, so it is recorded as one.**
+   Three measurements disagree:
+
+   * the guard's four conditions are **ALL TRUE** --
+     `use_verbhalf=1 bits=2 tab=1 ng=320`;
+   * the binary's env plumbing is **provably correct at the call site** --
+     `ENVSET slot=4 ROWPAIR=[(null)] NO_ROWP=[1] VERBDEAD=[1]`;
+   * and yet `[decode1-rowpair]` -- which lives INSIDE `if (use_rowpair && ...)`
+     whose guard reads `getenv(FLAG) != nullptr && getenv(KILL) == nullptr` --
+     **fires for all six orders**, after a CLEAN rebuild that deleted
+     `libintfer_gemm.a` and the object file.
+
+   With `FLAG=(null)` and `KILL=1` that guard is `false && false`, so the
+   announcement cannot be reached. **Not a staleness artefact** (the library was
+   deleted and rebuilt) and **not the env plumbing** (traced at the call site).
+   I could not reconcile the two within this session.
+
+   *** CONSEQUENCE, stated so it is not softened into "cause not located": the three
+   round-2 arms are LANDED BUT UNVERIFIED, and per this repo's own rule an arm
+   that cannot be shown firing is DELETED with its gate arm, kill switch and report
+   stanza rather than shipped as a silently-dead kernel. That deletion is the next
+   session's first job, and the harness bug that makes the decision hard is the
+   thing to fix before it. ***
 
 **SO: `VERBMP`, `VERBDEAD`, `VERBSEL` and `VERBVEC` have NO correctness
 measurement, and the earlier `VERBMP` result is withdrawn.** `ROWPPAIR` alone is
