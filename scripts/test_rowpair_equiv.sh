@@ -244,7 +244,7 @@ sed 's/|base$//' "$BASE" >"$BASE.norm"
 #             information, not a failure, and is reported as such.
 check_identical() {  # $1 = label, $2 = file
   local lbl="$1" f="$2"
-  sed 's/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//' "$f" >"$f.norm"
+  sed 's/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//' "$f" >"$f.norm"
   if cmp -s "$BASE.norm" "$f.norm"; then
     echo "  ok    $lbl is BITWISE IDENTICAL to base ($n_base element values)"
   else
