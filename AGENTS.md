@@ -652,7 +652,7 @@ verbhalf against verbhalf.
 |---|---|---|
 | the ONE change | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` (the engine's branchy **scalar** FP16->FP32 twiddle, 3 branches per call, **320 calls per work-item** at MLP_GATE) | weight side through a row-base `multi_ptr` instead of an absolute index into raw `code_u8` |
 | numerics | **NOT bit-exact by construction.** `from_half_bits` returns 0 for a zero or subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert, which **flushes to zero under the default FTZ**. A zero group scale is the differing case, and FP16 scales come from `to_half_bits` of a positive host float so it *should not* arise — but "should not" is an argument, so the arm is **stream-identity only and makes NO arithmetic claim**. Same class as `INTFER_DECODE1_SPLITK` | **bit-exact — AND NOW MEASURED RATHER THAN ARGUED** |
-| **correctness, measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets, which does **NOT** prove the FTZ concern away — only that these synthetic scales never reach a zero or subnormal exponent | **BROKEN — DEVICE_LOST on this box (double-offset class, missing `/4` on the row-base `multi_ptr` base); FIXED by this session, to be re-measured after rebuild** |
+| **correctness, measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets, which does **NOT** prove the FTZ concern away — only that these synthetic scales never reach a zero or subnormal exponent | **MEASURED 2026-10-07, after rebuild:** `test_rowpair_equiv.sh` reports INTFER_DECODE1_VERBMP BITWISE IDENTICAL to base on 143 355 INT2 element values (4 shapes x 5 datasets). The earlier DEVICE_LOST was the missing `/4` on the row-base `multi_ptr` base; fixed by `code_u8 + row_base / 4u`, and the fix is now measured, not argued. |
 | **performance** | **MEASURED ON THE CLONE (VERB+HALF):** +14% MLP_GATE / +17% MLP_DOWN vs VERBATIM
   (bisect-2, device 0: 47.3 vs 41.5 GB/s MLP_GATE, 21.1 vs 18.0 GB/s MLP_DOWN; ratio 1.14x
   / 1.18x, medians over 12 interleaved reps, CITATION(scripts/test_roofline_bisect.sh,
@@ -666,7 +666,17 @@ verbhalf against verbhalf.
   shape the 0.8B model cannot reach.) | **MEASURED ON THE CLONE (clone):** neutral --
   VERB+MP 41.9 GB/s vs VERBATIM 41.5 GB/s MLP_GATE (1.01x), 18.2 vs 18.0 MLP_DOWN (1.01x);
   `INTFER_DECODE1_VERBMP` is the same arm but is **UNMEASURED in the engine** (same
-  27B `--tp 2` caveat). Correctness is bit-exact (see above). |
+  27B `--tp 2` caveat). Correctness is bit-exact **AND NOW MEASURED** (see above). |
+
+*** THE GATE IS RED ON THIS BOX, AND IT IS NOT A CODE FAULT. *** `test_rowpair_equiv.sh`
+ran at 2026-10-07 with the rebuilt tree and failed `check_identical` on VERBMP /
+VERBSEL / VERBVEC -- but the differing lines were **all `LA_QKV(FP16)`**, a shape the
+`bits == 2`-guarded arms cannot reach. Tight-interleaved measurement: `vm` is
+self-consistent (vm1==vm2==vm3) and **vm1 is BYTE-IDENTICAL to b1, 0 diff lines on
+every shape**, while `base` itself flickers (b1==b2==b4, b1!=b3) on the FP16 shapes.
+So the FP16 decode kernel (`gemm_usm_decode1_f16`) is nondeterministic on this box.
+The gate now **compares INT2 shapes only**, withholds FP16 by name and reason, and
+refuses to certify a reference that moves. See `scripts/mutate_rowpair_equiv.sh`.
 
 *** `VERBMP`'s INDICES ARE WRITTEN THE WAY THEY ARE ON PURPOSE, AND THE REASON IS THE
 ROWPAIR BUG. *** It is the same shape: `ROWPAIR` used row-**offset** `multi_ptr`s
