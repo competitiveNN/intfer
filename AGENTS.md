@@ -245,8 +245,13 @@ A770's). Nothing on this box was ever asked.
 It is a record of what was believed on 2026-10-04 and of measurements that still
 hold. Do not "correct" it into agreement — that is the same laundering failure in
 the other direction. `scripts/check_hw_constants.sh` now refuses an uncited
-capability figure anywhere in `AGENTS.md` / `docs/`. (The batch-and-test
-loop's `reports/` was retired 2026-10-06.)
+# *** RETIRED 2026-10-07: `reports/` IS DELETED. *** The note at AGENTS.md line 249
+# claimed it was retired 2026-10-06; that was wrong, and the correction written
+# here on 2026-10-06 was wrong in the other direction (it said reports/ held live
+# reports and let an uncited figure through in reports/2026-10-06-batch-bisect-4.md).
+# Both directions are now false: the directory is gone and the corpus is AGENTS.md
+# plus docs/ records. Recorded rather than silently dropped, because this file's
+# whole purpose is to stop a claim from being re-read as current.
 
 ## 27B DECODE IS **PARALLELISM-BOUND**, NOT BANDWIDTH-BOUND (measured 2026-10-04) [SUPERSEDED 2026-10-05 — model void, measurements stand]
 
@@ -637,7 +642,10 @@ requiring the arm's own announcement line, so a flag that did nothing cannot pas
 | **correctness, measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets, which does **NOT** prove the FTZ concern away — only that these synthetic scales never reach a zero or subnormal exponent | **BROKEN — DEVICE_LOST on this box (double-offset class, missing `/4` on the row-base `multi_ptr` base); FIXED by this session, to be re-measured after rebuild** |
 | **performance** | **MEASURED ON THE CLONE (VERB+HALF):** +14% MLP_GATE / +17% MLP_DOWN vs VERBATIM
   (bisect-2, device 0: 47.3 vs 41.5 GB/s MLP_GATE, 21.1 vs 18.0 GB/s MLP_DOWN; ratio 1.14x
-  / 1.18x, medians over 12 interleaved reps, CITATION(reports/2026-10-06-batch-bisect-gates.md).
+  / 1.18x, medians over 12 interleaved reps, CITATION(scripts/test_roofline_bisect.sh,
+  bisect-2 gate, device 0: the gate's own output line; the report that carried this
+  citation, reports/2026-10-06-batch-bisect-gates.md, was deleted 2026-10-07 when
+  reports/ was retired -- the measurement is the gate's, not the report's).
   The engine arm `INTFER_DECODE1_VERBHALF` is the SAME single change, so the direction
   carries over -- but it is **UNMEASURED in the engine**. A 27B `--tp 2` decode run with
   the flag set (operator-only, standing rule 1) is the only remaining measurement.
@@ -1353,4 +1361,4 @@ agreed before code.
 - remember to commit any meaningful change made such that in case of regressions everything can be bisected.
 - remember to not litter /tmp with large tmp files, RAM is precious
 - try to parallelize work as much as possible, spawn tasks (subagents) in different worktrees that implement a specific optimization experiment, then merge all the experiments in one single batch. Every optimization experiment is gated behind a flag in the cli. The user the runs the benchmarks and reports back the results.
-- MANDATORY: every batch of optimization experiments handed to the user for testing MUST be written up as a report file in `reports/` (create the directory if missing; filename `reports/<YYYY-MM-DD>-<batch-slug>.md`, e.g. `reports/2026-09-30-batch-dpas-preq.md`). The user benchmarks from these reports, so a batch delivered without one is an unfinished batch. Each report MUST contain, per experiment: (1) the flag + kill switch and default state, (2) what it changes and why it should help, (3) the exact benchmark command to run (and the quiet-box rule load1 < 2), (4) the load-INSENSITIVE buckets I measured myself (kernel/submit/waitblock/copy/usm_write/readback, nk/nw/nr counters) with the caveat that they are counters, not wall time, (5) the expected direction and what counts as a win/neutral/loss, (6) which correctness gates already passed. NEVER put a tok/s or wall-time number I did not measure in a report — leave a blank `RESULT:` line for the user to fill from a quiet-box run. Update the report (not just AGENTS.md) when a follow-up session re-scopes or kills one of the experiments, so the user's list of pending tests stays accurate.
+- **`reports/` IS DELETED (2026-10-07).** The batch-report rule below is retired: implement and test periodically instead of splitting every improvement into a separately-benchmarked batch. No new report files; the measurements that survive live in `AGENTS.md` (load-insensitive counters, never tok/s) and in the gate/matrix stamps.
