@@ -104,6 +104,33 @@ if [ "$RC" -ne 0 ]; then
 fi
 grep -q 'RESULT: PASS' "$LOG" || { echo "FAIL: no RESULT: PASS in the output" >&2; exit 1; }
 
+# *** THE VACUITY FLOOR. *** `need()` asserts that the arm strings EXIST, and on
+# this box bisect-2 prints every arm at `0.000 ms / inf GB/s / -nanx vs VERBATIM`
+# -- including the 52 MB ceiling -- and still prints RESULT: PASS. A string
+# assertion cannot see that the numbers are NaN: it certifies that the probe
+# RAN, not that it MEASURED. This floor reads the actual numeric columns and
+# refuses any run whose VERBATIM median is not a finite positive millisecond,
+# which is the one number every ratio in the table is divided by. Without it the
+# gate reports PASS for a probe that produced no measurement, and that PASS is
+# what the default-ON promotion of INTFER_DECODE1_VERBHALF rests on.
+if grep -qE 'VERBATIM +0\.000 ms' "$LOG"; then
+  echo "FAIL: the bisect-2 probe printed a ZERO VERBATIM median -- the device" >&2
+  echo "      timer reported command_start == command_end, so every GB/s and" >&2
+  echo "      ratio in the table is inf/-nan and the run measured nothing. The" >&2
+  echo "      probe itself now refuses this (zero is a failure, not a result);" >&2
+  echo "      this floor catches the case where it does not. MEASURED on this" >&2
+  echo "      box: bisect-2 prints all-zero for all four arms including the" >&2
+  echo "      ceiling, while examples/roofline_probe measures the same kernel" >&2
+  echo "      at 0.120 ms / 436.8 GB/s. Do not quote the +14% MLP_GATE figure" >&2
+  echo "      until this gate prints a real median." >&2
+  exit 1
+fi
+if ! grep -qE 'VERBATIM +[1-9][0-9]*\.[0-9]+ ms' "$LOG"; then
+  echo "FAIL: no finite positive VERBATIM median in the bisect-2 output -- the" >&2
+  echo "      ratios are not anchored to a real measurement." >&2
+  exit 1
+fi
+
 echo "ROOFLINE-BISECT TEST: PASS"
 echo "RESULT: bisect-2 ran with its twin holding; the VERB+HALF / VERB+TAIL /"
 echo "        VERB+MP ratios above are the first measurements of those arms, all"

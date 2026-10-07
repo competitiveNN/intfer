@@ -549,6 +549,21 @@ int main(int argc, char** argv) {
         }
         std::sort(t.begin(), t.end());
         sink0 = sink[N / 2];
+        // *** AND THE KERNEL MUST HAVE RUN. *** A zero time is only a profiling
+        // failure if the kernel actually executed; if the sink is still zero the
+        // work never reached the device and the timestamps are meaningless for a
+        // different reason. MEASURED 2026-10-07: on this box the ceiling arm
+        // returns 0.000 ms for all 12 reps, so both halves are asserted.
+        if (sink0 == 0) {
+          std::fprintf(stderr,
+                       "[roofline] FAIL VACUOUS: the ceiling kernel never wrote to\n"
+                       "        the sink (sink[N/2]=0 after %zu reps), so the 0.000 ms\n"
+                       "        above is a launch that did not run, not a profiling\n"
+                       "        zero. The buffer is %llu bytes of non-constant data.\n",
+                       t.size(), (unsigned long long)bytes);
+          sycl::free(sink, q); sycl::free(p, q);
+          return 1;
+        }
         Arm a;
         a.name = std::string(stride_sel == 0 ? (shared ? "stream/shared" : "stream/device")
                                              : (shared ? "unstream/shared" : "unstream/device"));
@@ -611,6 +626,33 @@ int main(int argc, char** argv) {
                       "(linear would be 0.25)\n",
                       (shared ? "twin/quarter/shared" : "twin/quarter/device"),
                       ms_quarter, ratio);
+          // *** THE VACUITY FLOOR, and it is a FLOOR, not a range. *** A zero
+          // ceiling is a profiling failure, not a measurement: the twin's ratio is
+          // then 0/0 = -nan, which is neither < 0.10 nor > 0.55, so the range test
+          // above passes it. MEASURED 2026-10-07: this box returns 0.000 ms for
+          // every arm on every run while the SAME binary's saved log (13:37:59)
+          // read SHIPPED 0.279 ms / 39.9 GB/s with a 0.21 twin -- so the probe is
+          // flaky and a vacuous run must not be readable. The floor is the ceiling
+          // arm's own median, asserted before any ratio is computed.
+          if (*full <= 0.0) {
+            std::fprintf(stderr,
+                         "[roofline] FAIL VACUOUS: the ceiling arm measured %.3f ms --\n"
+                         "        device event profiling returned zero, so every GB/s\n"
+                         "        below is inf and every ratio is -nan. Nothing here is\n"
+                         "        readable. A real ceiling on this card is ~0.120 ms\n"
+                         "        (52.43 MB / 436.8 GB/s, same allocator, same access\n"
+                         "        pattern). Re-run; if it stays zero the profiling path\n"
+                         "        is broken on this box.\n",
+                         *full);
+            std::fprintf(stderr,
+                         "[roofline] DIAG ceiling raw: %zu reps, med=%.6f ms, "
+                         "min=%.6f, max=%.6f\n",
+                         t.size(), *full,
+                         t.empty() ? -1.0 : t.front(),
+                         t.empty() ? -1.0 : t.back());
+            sycl::free(sink, q); sycl::free(p, q);
+            return 1;
+          }
           if (ratio < 0.10 || ratio > 0.55) {
             std::fprintf(stderr,
                          "[roofline] FAIL VACUOUS: a QUARTER of the bytes took %.0f%% of\n"

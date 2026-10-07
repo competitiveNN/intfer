@@ -200,6 +200,42 @@ int bisect_main(int argc, char** argv) {
     const double ratio = quarter_ms / ceil_ms;
     std::printf("[bisect-%s] twin     %8.3f ms  ratio to full = %.2f "
                 "(linear would be 0.25)\n", BISECT_NAME, quarter_ms, ratio);
+    // *** THE VACUITY FLOOR, and it is a FLOOR, not a range. *** A zero ceiling is
+    // a profiling failure, not a measurement: the ratio is then 0/0 = -nan, which
+    // is neither < 0.10 nor > 0.55, so the range test above passes it. MEASURED
+    // 2026-10-07: this box returns 0.000 ms for every arm on every run of every
+    // bisect binary, while the SAME probe_common's sibling examples/roofline_probe
+    // saved a log (13:37:59) reading SHIPPED 0.279 ms / 39.9 GB/s with a 0.21 twin.
+    // So the bisect gates were reporting PASS on a run that measured nothing, and
+    // their need() predicates (string existence) could not fail them. The floor is
+    // the ceiling arm's own median, asserted before any ratio is computed.
+    if (ceil_ms <= 0.0) {
+      std::fprintf(stderr,
+          "FAIL VACUOUS: the ceiling arm measured %.3f ms -- device event\n"
+          "        profiling returned zero, so every GB/s below is inf and the\n"
+          "        ratios are -nan. Nothing here is readable. A real ceiling on\n"
+          "        this card is ~0.120 ms (52.43 MB / 436.8 GB/s, same allocator,\n"
+          "        same access pattern). Re-run; if it stays zero the profiling\n"
+          "        path is broken on this box.\n",
+          ceil_ms);
+      sycl::free(sink, q); sycl::free(p, q);
+      return 1;
+    }
+    // *** AND THE KERNEL MUST HAVE RUN. *** A zero time is only a profiling
+    // failure if the kernel actually executed; if the sink is still zero the work
+    // never reached the device and the timestamps are meaningless for a different
+    // reason. MEASURED 2026-10-07: on this box the ceiling arm returns 0.000 ms
+    // for all 12 reps, so both halves are asserted.
+    if (sink[0] == 0 && sink[N - 1] == 0) {
+      std::fprintf(stderr,
+          "FAIL VACUOUS: the ceiling kernel never wrote to the sink (sink[0]=\n"
+          "        sink[N-1]=0 after the ceiling run), so the 0.000 ms above is a\n"
+          "        launch that did not run, not a profiling zero. The buffer is\n"
+          "        %llu bytes of non-constant data.\n",
+          (unsigned long long)bytes);
+      sycl::free(sink, q); sycl::free(p, q);
+      return 1;
+    }
     if (ratio < 0.10 || ratio > 0.55) {
       std::fprintf(stderr,
           "FAIL VACUOUS: a QUARTER of the bytes took %.0f%% of the time (%.2fx,\n"
