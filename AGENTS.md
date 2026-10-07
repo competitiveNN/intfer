@@ -648,6 +648,36 @@ explicitly sets both kill switches to restore the reference path, because with
 nothing set it would run the two defaults and the differential would compare
 verbhalf against verbhalf.
 
+*** RETRACTED 2026-10-07: THE BISECT-2 CLONE MEASUREMENT IS VACUOUS, AND THE
+*** "+14% MLP_GATE" FIGURE ABOVE IS NOT REPRODUCIBLE. *** `scripts/test_roofline_
+bisect.sh` reports PASS while `build/roofline_bisect.log` reads **every** arm at
+`0.000 ms / inf GB/s / -nanx vs VERBATIM` — including the 52 MB ceiling, which the
+SAME kernel in `examples/roofline_probe` measures at `0.120 ms / 436.8 GB/s` on the
+SAME card with the SAME allocator. So the ratios this block quotes were computed
+from a numerator and denominator that were both zero, and the gate's `need()`
+predicates assert only that the strings *exist*, so a vacuous run cannot fail them.
+This was re-derived, not remembered: `cmake --build build --target
+roofline_probe_bisect` then `scripts/with_oneapi.sh
+build/examples/roofline_probe_bisect/roofline_probe_bisect --device 0` still prints
+all-zero timings, so it is not a stale binary.
+
+**What this does NOT touch.** The clone measurements are *still* the reason the
+direction is known-positive; they are just not re-derivable from the bisect-2 gate
+on this box today. The `roofline_probe` SHIPPED anchor (`0.279 ms / 39.9 GB/s`
+MLP_GATE, `0.804 ms / 13.9 GB/s` MLP_DOWN) is unaffected and still live. And the
+correctness half of the default-ON change is unaffected: `test_rowpair_equiv.sh`
+measures 143 355 INT2 element values bitwise identical to base, and
+`mutate_rowpair_equiv.sh` proves the rewritten gate refuses the real codebook-index
+bug on both VERBMP and VERBSEL (PASS 3/3).
+
+**What this DOES touch, and it is the honest state:** the performance half of the
+default-ON promotion is **UNMEASURED**, not merely unreported. The clone says +14%
+but the clone's own gate is vacuous today, and the engine arms have never run on
+real 27B weights. So `INTFER_DECODE1_VERBHALF` is default-ON on a direction that
+looks positive and is not currently re-derivable. Re-derive it with
+`scripts/test_roofline_bisect.sh` after the profiling defect is fixed; do not quote
+the +14% as settled until it prints a real median.
+
 | | `INTFER_DECODE1_VERBHALF` | `INTFER_DECODE1_VERBMP` |
 |---|---|---|
 | the ONE change | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` (the engine's branchy **scalar** FP16->FP32 twiddle, 3 branches per call, **320 calls per work-item** at MLP_GATE) | weight side through a row-base `multi_ptr` instead of an absolute index into raw `code_u8` |
