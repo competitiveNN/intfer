@@ -170,8 +170,19 @@ if [ "$rc" -ne 0 ] && grep -qE 'INTFER_DECODE1_VERBMP.*NOT bitwise identical' "$
   && grep -qa 'decode1-verbmp' "$SB/RPE1/build/rowpair_equiv.vm.err"; then
   record "RPE-1 REFUSED (INT2 diff + arm announced itself)" ok
 else
+  # DEBUG: the state tree and the gate's own stderr are the evidence for why
+  # this state missed; print them before the verdict so a failure is
+  # self-explaining rather than a bare MISSED.
   echo "  RPE-1 MISSED (rc=$rc): defect escaped the rewritten gate." >&2
-  tail -8 "$LOG_DIR/RPE1.err" >&2
+  echo "  --- $LOG_DIR/RPE1.err ---" >&2
+  [ -s "$LOG_DIR/RPE1.err" ] && tail -8 "$LOG_DIR/RPE1.err" >&2 \
+    || echo "    (empty or absent)" >&2
+  echo "  --- $LOG_DIR/RPE1.log ---" >&2
+  [ -s "$LOG_DIR/RPE1.log" ] && tail -8 "$LOG_DIR/RPE1.log" >&2 \
+    || echo "    (empty or absent)" >&2
+  echo "  --- $SB/RPE1/build/rowpair_equiv.vm.err (the seeded arm's stderr) ---" >&2
+  [ -s "$SB/RPE1/build/rowpair_equiv.vm.err" ] && tail -8 "$SB/RPE1/build/rowpair_equiv.vm.err" >&2 \
+    || echo "    (empty or absent -- the arm never ran)" >&2
   record "RPE-1" "MISSED (rc=$rc)"
 fi
 
