@@ -45,19 +45,27 @@ KEEP=0
 BASE="$BUILD_DIR/rowpair_equiv.base.txt"
 RP="$BUILD_DIR/rowpair_equiv.rp.txt"
 
-# The flag is a presence-only getenv, so OFF is ABSENCE, not `=0`. See the bench
-# harness's note: `INTFER_X=0` still ENABLES an X read with getenv() != nullptr,
-# so the only way to express OFF is for the variable to be unset. `env -u` on
-# EVERY arm, for the same reason.
+# THE DEFAULTS CHANGED 2026-10-07. ROWPAIR / VERBDEAD / VERBSEL / VERBVEC are
+# still presence-only opt-ins (OFF is ABSENCE, not `=0`; see the bench harness's
+# note that `INTFER_X=0` still ENABLES an X read with getenv() != nullptr, so the
+# only way to express OFF is for the variable to be unset, hence `env -u` on every
+# arm). VERBHALF and VERBMP are now DEFAULT-ON kill switches: the feature runs
+# unless `INTFER_NO_DECODE1_VERBHALF=1` / `=1` is set. So `base` is no longer "the
+# state with nothing set" -- with nothing set it would run the two default-ON arms
+# and its payload would be the thing under test, not the reference. The BINARY
+# restores the reference for the base order by setting both kill switches; the gate
+# does not have to, and must not (it would be a no-op on the two opt-in arms).
 # FOUR ORDERS, ONE PROCESS EACH. quant_gemm_forward_usm reads each arm's flag into a
 # function-local `static const bool`, so a flag is set ONCE PER PROCESS; one binary
-# cannot hold two orders. Hence four invocations and three diffs.
+# cannot hold two orders. Hence six invocations and five diffs.
 #
 # The two extra orders are INTFER_DECODE1_VERBHALF and INTFER_DECODE1_VERBMP, and
 # they are here for a REASON beyond symmetry: VERBMP's "bit-exact BY CONSTRUCTION"
 # is a CLAIM, and the ROWPAIR precedent is that a bit-exactness argument is worth
 # nothing until measured -- ROWPAIR's is exactly what shipped a device-losing
 # double offset. This settles it without a model and without a 27B load.
+# VERBHALF is the same class as VERBMP but is claimed NOT bit-exact (denormal +
+# default FTZ), so it is REPORTED, not gated: a difference is information.
 # ---- THE MARKER PREDICATE, AS A FUNCTION, so it can be twin-tested -------------
 # Rule 6: a check needs a case where the thing MUST appear AND a case where it must
 # stay quiet, or "0 findings" and "found nothing" are the same claim. Both directions
@@ -145,7 +153,15 @@ gate_require_build rowpair_equiv || exit 1
 
 run_order() {  # $1 = order tag
   local tag="$1" f="$2"
-  env -u INTFER_DECODE1_ROWPAIR -u INTFER_DECODE1_VERBHALF -u INTFER_DECODE1_VERBMP \
+  # *** WHICH ARMS ARE UNSET HERE, AND WHY IT CHANGED. *** Until 2026-10-07 every
+  # arm was default-OFF, so unsetting every arm's enable var left the reference
+  # path running by default -- correct, and the base order needed no env at all.
+  # VERBHALF and VERBMP are now default-ON kill switches, so unsetting their enable
+  # vars is a NO-OP (they have none) and the reference still runs the default path.
+  # Only the four remaining opt-in arms (ROWPAIR / VERBDEAD / VERBSEL / VERBVEC) are
+  # unset here, which is all that is needed to keep the reference free of them.
+  env -u INTFER_DECODE1_ROWPAIR -u INTFER_DECODE1_VERBDEAD \
+    -u INTFER_DECODE1_VERBSEL -u INTFER_DECODE1_VERBVEC \
     DECODE1_EQUIV_ORDER="$tag" \
     "$SCRIPT_DIR/with_oneapi.sh" "$BIN" >"$f" \
     2>"$BUILD_DIR/rowpair_equiv.$tag.err"
@@ -230,30 +246,70 @@ for pair in "rowpair:$RP" "verbhalf:$VH" "verbmp:$VM" \
   fi
 done
 
+# *** THE SUBJECT IS INT2, AND ONLY INT2 IS CERTIFIABLE HERE. ***
+# Every arm in this gate is guarded on `bits == 2` and therefore cannot touch the
+# FP16 fast path (`gemm_usm_decode1_f16`, the `bits == 16` branch). Measured on
+# this box, tight-interleaved: `vm` is self-consistent (vm1==vm2==vm3) and vm1 is
+# BYTE-IDENTICAL to b1 (0 diff lines, all shapes), while `base` itself flickers
+# (b1==b2==b4, b1!=b3) -- the flicker lands entirely on the FP16 shapes. So:
+#   * the INT2 portion of the reference is deterministic, and an arm's diff
+#     against it is a real measurement;
+#   * the FP16 portion is NOT, and comparing an arm against it would report a box
+#     glitch as a code fault -- the exact verdict this gate exists to refuse.
+# The comparisons below are therefore filtered to INT2 shapes. FP16 shapes are
+# WITHHELD, named, and the reason stated, rather than quietly dropped.
+BASE2="$BUILD_DIR/rowpair_equiv.base2.txt"
+r=0; run_order base "$BASE2" || r=$?
+if ! marker_verdict base "$BUILD_DIR/rowpair_equiv.base.err"; then
+  echo "FAIL: the reference base order failed its own marker contract" >&2
+  exit 1
+fi
+int2filt() { grep -E '\(INT2\)' "$1"; }
+int2filt "$BASE"  | sed 's/|base$//; s/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//' >"$BASE.int2.norm"
+int2filt "$BASE2" | sed 's/|base$//; s/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//' >"$BASE2.int2.norm"
+n_int2="$(grep -c '|0x' "$BASE.int2.norm" || true)"
+if ! cmp -s "$BASE.int2.norm" "$BASE2.int2.norm"; then
+  echo "FAIL: the INT2 reference is NONDETERMINISTIC on this box -- base ran twice" >&2
+  echo "      and the INT2 payloads differ, so no arm's diff can be believed here." >&2
+  /usr/bin/diff "$BASE.int2.norm" "$BASE2.int2.norm" | grep -E '^[<>]' \
+    | grep -oE '\|[A-Za-z0-9]+\([A-Za-z0-9]*\)\|[A-Za-z0-9]+\|[0-9]+\|[a-z-]+\|' \
+    | sort | uniq -c | sort -rn | sed 's/^/        /' >&2
+  exit 1
+fi
+if ! cmp -s "$BASE" "$BASE2"; then
+  echo "  ..   reference nondeterministic on the FP16 shapes (base ran twice and" >&2
+  echo "        differed); FP16 certification is WITHHELD on this box. The INT2" >&2
+  echo "        portion above is stable, so the INT2 comparisons below are real." >&2
+  echo "        Remedy for FP16: scripts/gpu_recover.sh rebind (sudo) on a" >&2
+  echo "        contended box, then re-run this gate." >&2
+else
+  echo "  ok    reference stable (base ran twice, identical payloads, all shapes)"
+fi
+
 # Strip the order marker and compare VALUES only. The order tag differs by design,
 # so diffing the raw text would always differ.
 sed 's/|base$//' "$BASE" >"$BASE.norm"
 
-# One comparison function, three callers. The EXPECTATION DIFFERS PER ARM and that
-# difference is the point:
-#   rowpair   was claimed bit-exact  -> must be IDENTICAL, or the claim is wrong.
-#   verbmp    is claimed bit-exact  -> must be IDENTICAL, same reason.
-#   verbhalf  is claimed NOT exact  -> may differ; it is STREAM-IDENTITY-ONLY on the
-#             real model, and the question here is whether the denormal/FTZ concern
-#             is REAL on these datasets or merely theoretical. A difference is
-#             information, not a failure, and is reported as such.
+# *** THE COMPARISON IS INT2-ONLY. *** Both operands are filtered to INT2 shapes
+# before the diff, so the FP16 nondeterminism on this box (measured: base itself
+# flickers across runs while `vm` is byte-identical to base on INT2) cannot turn a
+# box glitch into a code fault. FP16 shapes are withheld and named above; they are
+# not silently dropped. `n_int2` is the count the ok-line quotes.
 check_identical() {  # $1 = label, $2 = file
   local lbl="$1" f="$2"
-  sed 's/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//' "$f" >"$f.norm"
-  if cmp -s "$BASE.norm" "$f.norm"; then
-    echo "  ok    $lbl is BITWISE IDENTICAL to base ($n_base element values)"
+  # Both sides stripped of their trailing order tag: `base` carries `|base`, every
+  # arm carries its own (`|rp`, `|vm`, ...), and `int2filt` above leaves the tag on
+  # the base file. Stripping it from BOTH is what makes the diff a value diff.
+  int2filt "$f" | sed 's/|base$//; s/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//' >"$f.int2.norm"
+  if cmp -s "$BASE.int2.norm" "$f.int2.norm"; then
+    echo "  ok    $lbl is BITWISE IDENTICAL to base on INT2 ($n_int2 element values)"
   else
-    echo "FAIL: $lbl is NOT bitwise identical to base -- and it was CLAIMED to be." >&2
+    echo "FAIL: $lbl is NOT bitwise identical to base on INT2 -- and it was CLAIMED to be." >&2
     echo "      (A bit-exactness ARGUMENT is what shipped the ROWPAIR double" >&2
     echo "       offset and lost the device. This is the measurement saying the" >&2
     echo "       argument is wrong.)" >&2
     echo "      first differing lines:" >&2
-    diff "$BASE.norm" "$f.norm" | head -20 >&2
+    /usr/bin/diff "$BASE.int2.norm" "$f.int2.norm" | head -20 >&2
     return 1
   fi
 }
@@ -266,38 +322,43 @@ check_identical "INTFER_DECODE1_VERBDEAD" "$VD" || rc=1
 check_identical "INTFER_DECODE1_VERBSEL " "$VS" || rc=1
 check_identical "INTFER_DECODE1_VERBVEC " "$VV" || rc=1
 # VERBHALF: report, do not gate.
-sed 's/|verbhalf$//' "$VH" >"$VH.norm"
-if cmp -s "$BASE.norm" "$VH.norm"; then
-  echo "  ok    INTFER_DECODE1_VERBHALF is bitwise identical to base on THESE datasets"
+int2filt "$VH" | sed 's/|base$//; s/|verbhalf$//' >"$VH.int2.norm"
+if cmp -s "$BASE.int2.norm" "$VH.int2.norm"; then
+  echo "  ok    INTFER_DECODE1_VERBHALF is bitwise identical to base on INT2 datasets"
   echo "        -- which does NOT prove the FTZ/denormal concern away, only that"
   echo "        these synthetic scales never reach it."
 else
-  nd="$(diff "$BASE.norm" "$VH.norm" | grep -c '^<' || true)"
-  echo "  ..   INTFER_DECODE1_VERBHALF DIFFERS from base in ~${nd} of ${n_base}"
+  nd="$(/usr/bin/diff "$BASE.int2.norm" "$VH.int2.norm" | grep -c '^<' || true)"
+  echo "  ..   INTFER_DECODE1_VERBHALF DIFFERS from base on INT2 in ~${nd} of ${n_int2}"
   echo "        values. EXPECTED IN PRINCIPLE and not a gate failure: this arm is"
   echo "        claimed NOT bit-exact (denormal + default FTZ). It is reported so"
   echo "        the magnitude is on the record rather than assumed."
 fi
-[ "$rc" -eq 0 ] || { [ "$KEEP" -eq 1 ] || rm -f "$BASE" "$RP" "$VH" "$VM" "$BASE.norm"; exit 1; }
+[ "$rc" -eq 0 ] || { [ "$KEEP" -eq 1 ] || rm -f "$BASE" "$RP" "$VH" "$VM" "$VD" "$VS" "$VV" "$BASE.norm" "$RP.norm" "$VH.norm" "$VM.norm" "$VD.norm" "$VS.norm" "$VV.norm" "$BASE.int2" "$BASE.int2.norm" "$BASE2.int2" "$BASE2"; exit 1; }
 
 # Per-dataset coverage, so a green verdict says WHICH cases passed rather than only
 # that they agreed. Derived from the payload, not from a remembered list.
 # The header line of each case is "<shape>|<scheme>|<d>|<dataset>|base"; the
 # per-element lines carry an index too, so both counters must anchor on the
 # header form specifically. Counting element lines gave "40 shapes" for 8.
-n_runs="$(grep -cE '^[^|]+\|[A-Z0-9]+\|[0-9]+\|[a-z-]+\|base$' "$BASE" || true)"
-n_shapes="$(grep -oE '^[^|]+\|' "$BASE" | sort -u | grep -c . || true)"
-n_ds="$(grep -oE '\|[a-z-]+\|base$' "$BASE" | sort -u | grep -c . || true)"
-echo "ROWPAIR-EQUIV: $n_base element values bitwise identical across:"
-grep -oE '^(MLP_GATE\(INT2\)|MLP_DOWN\(INT2\)|LA_QKV\(FP16\)|LA_OUT\(FP16\)|MLP_UP\(INT4\)|ATTN_K\(FP16\)|MLP_GATE-ODD\(INT2\))\|[A-Z0-9]+\|[0-9]+\|[a-z-]+' "$BASE" \
+n_runs="$(grep -cE '^[^|]+\|[A-Z0-9]+\|[0-9]+\|[a-z-]+\|base$' "$BASE.int2" || true)"
+n_shapes="$(grep -oE '^[^|]+\|' "$BASE.int2" | sort -u | grep -c . || true)"
+n_ds="$(grep -oE '\|[a-z-]+\|base$' "$BASE.int2" | sort -u | grep -c . || true)"
+echo "ROWPAIR-EQUIV: $n_int2 element values bitwise identical across:"
+grep -oE '^(MLP_GATE\(INT2\)|MLP_DOWN\(INT2\)|MLP_GATE-ODD\(INT2\))\|[A-Z0-9]+\|[0-9]+\|[a-z-]+' "$BASE.int2" \
   | sort -u | awk -F'|' '{printf "  %-20s %-5s %s\n", $1, $2, $5}' | head -50
 echo "  ... (the ODD-N shape must take the BASE path; it is included so a silent"
 echo "   fallback to a different kernel is visible rather than assumed)"
+echo "  *** WITHHELD: the FP16 shapes (LA_QKV / LA_OUT / ATTN_K) are NOT certified"
+echo "      here -- the FP16 decode kernel is nondeterministic on this box (base"
+echo "      itself flickers across runs), so no arm's diff against them is a real"
+echo "      measurement. The INT2 arms cannot reach that path anyway (guarded on"
+echo "      `bits == 2`); a stable FP16 reference is the remedy."
 
 [ "$KEEP" -eq 1 ] || rm -f "$BASE" "$RP" "$BASE.norm" "$RP.norm"
 echo
 echo "DECODE1-EQUIV TEST: PASS"
-echo "RESULT: on $n_base element values over $n_runs (shape,dataset) runs,"
+echo "RESULT: on $n_int2 element values over $n_runs (shape,dataset) runs,"
 echo "        $n_shapes distinct shapes x $n_ds distinct datasets:"
 echo "          INTFER_DECODE1_ROWPAIR  BITWISE IDENTICAL  -- claim MEASURED"
 echo "          INTFER_DECODE1_VERBMP   BITWISE IDENTICAL  -- claim MEASURED"
@@ -306,6 +367,10 @@ echo "          INTFER_DECODE1_VERBSEL  BITWISE IDENTICAL  -- codebook by select
 echo "          INTFER_DECODE1_VERBVEC  BITWISE IDENTICAL  -- activation ptr type"
 echo "        INTFER_DECODE1_VERBHALF reported above: it is claimed NOT bit-exact"
 echo "        (denormal + default FTZ), so a difference is information, not a failure."
-echo "        PERFORMANCE IS STILL UNMEASURED for all three; see AGENTS.md under"
-echo "        the M=1 INT2 GEMV bisect section."
+echo "        *** DEFAULTS AS OF 2026-10-07: VERBHALF and VERBMP are the DEFAULT"
+echo "        decode path (kill switches INTFER_NO_DECODE1_VERBHALF=1 / =1 restore"
+echo "        the old forms). ROWPAIR / VERBDEAD / VERBSEL / VERBVEC are still"
+echo "        opt-in. PERFORMANCE of the two defaults is measured on the clone"
+echo "        (roofline_probe_bisect: +14% / +17% MLP_GATE for VERBHALF, neutral"
+echo "        for VERBMP); the ENGINE arms are UNMEASURED on real 27B weights."
 exit 0

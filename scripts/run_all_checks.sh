@@ -594,6 +594,16 @@ dispatch() { # $1 = label -> runs it
       # gates). That is also why this matrix is cheap enough to be an ordinary
       # step rather than the excluded POST-STACK class.
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_tp2_selfcheck.sh"; return $? ;;
+    mutate_rowpair_equiv.sh)
+      # AUDIT #21 direction for the test_rowpair_equiv.sh REWRITE (2026-10-07):
+      # that rewrite added the base-order kill-switch restoration, the reference-
+      # stability guard, and INT2-only comparison. A rewritten checker is a
+      # rewritten artifact, so the matrix mutates the ARTIFACT -- a bit-exact
+      # codebook-index bug planted on VERBMP and on VERBSEL -- and requires the
+      # gate to REFUSE each. Baseline (pristine) must PASS first, or every state is
+      # void. Each state copies the whole tree under build/ and configures its own
+      # build dir, so the tracked tree is never touched.
+      timeout -k 60 1800 bash "$SCRIPT_DIR/mutate_rowpair_equiv.sh"; return $? ;;
     mutate_checker_matrix_coverage.sh)
       # Each state BOTH poisons the tree with an unmated checker AND removes the
       # requirement that would catch it -- weakening alone is unobservable while
@@ -842,7 +852,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------

@@ -665,7 +665,17 @@ fi
 # 27B stack. scripts/test_rowpair_equiv.sh is the shape of that tooling and it is
 # what found the ROWPAIR device-loss; it does not exist for SUBGROUP yet.
 
-# --- INTFER_DECODE1_VERBHALF / VERBMP: the two bisect arms, default OFF --------
+# --- INTFER_DECODE1_VERBHALF / VERBMP: DEFAULT-ON as of 2026-10-07 ---------------
+# *** THE DEFAULTS CHANGED, AND THE BASE RUN CARRIES THEM. *** Both arms are now
+# default-ON kill switches (feature runs unless INTFER_NO_DECODE1_VERBHALF=1 /
+# =1 is set), so the BASE run at line 488 -- which sets no env -- runs THIS path by
+# default. That is correct and intended: the base run IS the default decode path,
+# and the fixed oracle `13 198 760` is measured against it. The arms below set the
+# flag explicitly to PROVE the arm fires (a default-ON arm with no env set would
+# still run, and a gate that only compared tokens would certify it vacuously).
+# The MR / SPLITK / ROWPAIR / VERBDEAD / VERBSEL / VERBVEC arms still compare
+# their stream against this base run, which is the reference by construction.
+#
 # *** SAME REACHABILITY CONSTRAINT AS EVERY OTHER DECODE1 ARM, AND IT IS BINDING:
 # both branches are guarded on `bits == 2`, and the 0.8B gate model has ZERO INT2
 # tensors, so an arm in test_gpu_optin.sh would be green because the path never ran.
@@ -684,14 +694,16 @@ fi
 #   VERBMP  is bit-exact BY CONSTRUCTION. The arithmetic expressions and the index
 #           VALUES are unchanged; only the pointer TYPE the compiler folds them
 #           through differs. So stream identity is the whole claim and no numerics
-#           contract applies. Clone measurement: neutral.
+#           contract applies. Clone measurement: neutral. scripts/test_rowpair_equiv
+#           measures it model-free (227 835 element values, 8 shapes x 5 datasets).
 #   VERBHALF is NOT bit-exact by construction: from_half_bits returns 0 for a zero
 #           or subnormal exponent and Inf/NaN when saturated, while bit_cast<half>
 #           hands a denormal to the FP32 convert, which flushes to zero under the
 #           default FTZ. A zero group scale is the differing case and should not
 #           arise from `to_half_bits` of a positive host float -- but "should not" is
 #           an argument, so this arm is stream-identity only and NOT an arithmetic
-#           claim, in the same class as INTFER_DECODE1_SPLITK.
+#           claim, in the same class as INTFER_DECODE1_SPLITK. scripts/test_rowpair
+#           _equiv.sh reports it, does not gate it.
 for spec in "VERBHALF:vh:decode1-verbhalf" "VERBMP:vm:decode1-verbmp"; do
   NAME="${spec%%:*}"; rest="${spec#*:}"; abbr="${rest%%:*}"; tag="${rest#*:}"
   OUT="$LOG.${abbr}.out"; ERR="$LOG.${abbr}.err"

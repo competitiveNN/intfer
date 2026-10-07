@@ -317,9 +317,19 @@ int main(int argc, char** argv) {
         // BASE kernel against itself and printed "BITWISE IDENTICAL" for arms that
         // had never run. An empty string is not absence; see scripts/test_gpu_optin.sh's
         // note that a presence-only flag is enabled by `X=0` for the same reason.
+        // *** DEFAULT-ON ARMS NEED A BASE THAT EXPLICITLY RESTORES THEM. ***
+        // Until 2026-10-07 every arm was default-OFF, so `base` (slot 0, no env set)
+        // ran the reference path by default and the loop above skipped it correctly.
+        // VERBHALF and VERBMP are now default-ON kill switches, so `base` with no env
+        // set runs THOSE arms and its payload is the thing being tested, not the
+        // reference -- the differential would diff verbhalf against verbhalf and
+        // report "BITWISE IDENTICAL" for an order that never ran the reference path.
+        // The reference is restored by setting the two kill switches for the base
+        // order, which is what the old default-OFF guard expressed.
         for (const auto& od : kOrders) {
           if (od.slot == 0 || *od.set == '\0') continue;
           if (slot == od.slot) { setenv(od.set, "1", 1); unsetenv(od.kill); }
+          else if (slot == 0) { unsetenv(od.set); setenv(od.kill, "1", 1); }
           else { unsetenv(od.set); setenv(od.kill, "1", 1); }
         }
         sycl::event e = intfer::gemm::quant_gemm_forward_usm(

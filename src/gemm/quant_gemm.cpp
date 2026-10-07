@@ -709,8 +709,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // This changes only WHICH work-item computes an output and how many loads
       // it shares, never the order of any accumulation.
       // --------------------------------------------------------------------
-      // INTFER_DECODE1_VERBHALF -- default OFF, kill switch
-      // INTFER_NO_DECODE1_VERBHALF=1. EXPERIMENTAL, UNMEASURED.
+      // INTFER_DECODE1_VERBHALF -- default ON 2026-10-07, kill switch
+// INTFER_NO_DECODE1_VERBHALF=1 restores the old branchy scale twiddle.
       //
       // WHAT IT IS. EXACTLY ONE change to this kernel: the per-group scale is read
       // with `sycl::bit_cast<sycl::half>` (one hardware convert) instead of
@@ -750,8 +750,31 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // 231114 ms with arithmetic a normalized diff proved identical, and the
       // generalised cause is that the SYCL device compiler failed to optimise an
       // extracted body. So this is a SEPARATE parallel_for, not a helper.
+      // PROMOTED TO DEFAULT-ON 2026-10-07 (was default OFF). The single change is
+      // measured on a faithful clone at +14% MLP_GATE / +17% MLP_DOWN vs VERBATIM
+      // (examples/roofline_probe_bisect, device event timestamps, medians over 12
+      // interleaved reps). Kill switch INTFER_NO_DECODE1_VERBHALF=1 restores the
+      // old branchy form.
+      //
+      // *** THIS IS THE DEFAULT DECODE PATH NOW. *** The guard is inverted:
+      // the feature is ON unless the kill switch is set, so the 3-branch scalar
+      // `from_half_bits` twiddle no longer runs on the hot path. It was called
+      // once per GROUP = K/Gw = 320 times per work-item at MLP_GATE, and the
+      // branchy form is what the clone measured.
+      //
+      // NUMERICS, AND THE CAVEAT STAYS. NOT bit-exact by construction, and the two
+      // forms are not interchangeable: `from_half_bits` returns 0 for a subnormal
+      // or zero exponent and Inf/NaN when saturated, while `bit_cast<half>` hands
+      // the denormal to the FP32 convert, which flushes to zero under the default
+      // FTZ. A zero-group scale is the case that differs, and FP16 scale values
+      // come from `to_half_bits` of a positive host float, so it should not arise
+      // -- but "should not" is an argument, not a measurement. This arm is therefore
+      // in the SAME CLASS AS INTFER_DECODE1_SPLITK: default-ON with a kill switch,
+      // a gate arm that asserts STREAM IDENTITY (not arithmetic equality), and no
+      // bit-exactness claim. scripts/test_rowpair_equiv.sh measures it model-free:
+      // on the synthetic datasets it is bitwise identical to base, which does NOT
+      // prove the FTZ concern away -- only that these scales never reach it.
       const bool use_verbhalf =
-          (std::getenv("INTFER_DECODE1_VERBHALF") != nullptr) &&
           (std::getenv("INTFER_NO_DECODE1_VERBHALF") == nullptr);
       if (use_verbhalf && bits == 2 && use_int2_tab && num_groups > 0) {
         // *** THE ANNOUNCEMENT WAS MISSING HERE AT FIRST. *** Round 1 added
@@ -840,8 +863,24 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // IS bit-exact by construction -- the arithmetic expressions and the index
       // VALUES are unchanged, only the pointer type the compiler folds them
       // through. So it needs a stream-identity gate and no numerics contract.
+      // PROMOTED TO DEFAULT-ON 2026-10-07 (was default OFF). The single change is
+      // measured on a faithful clone at 1.01x MLP_GATE / 1.01x MLP_DOWN vs VERBATIM
+      // (examples/roofline_probe_bisect, device event timestamps, medians over 12
+      // interleaved reps) -- neutral on throughput, a register-pressure win with
+      // zero numerics risk. Kill switch INTFER_NO_DECODE1_VERBMP=1 restores the
+      // absolute-index form.
+      //
+      // *** THIS IS THE DEFAULT DECODE PATH NOW. *** The guard is inverted: the
+      // feature is ON unless the kill switch is set, so the weight side is read
+      // through a row-base multi_ptr on the hot path and the compiler keeps the
+      // base in a register instead of re-materialising `code_u8 + b0` per chunk.
+      //
+      // NUMERICS: this one IS bit-exact by construction -- the arithmetic
+      // expressions and the index VALUES are unchanged, only the pointer TYPE the
+      // compiler folds them through. scripts/test_rowpair_equiv.sh measures it
+      // model-free: 227 835 element values bitwise identical to base over 8 shapes
+      // x 5 datasets, so the claim is MEASURED, not argued.
       const bool use_verbmp =
-          (std::getenv("INTFER_DECODE1_VERBMP") != nullptr) &&
           (std::getenv("INTFER_NO_DECODE1_VERBMP") == nullptr);
       if (use_verbmp && bits == 2 && use_int2_tab && num_groups > 0) {
         // *** THE ANNOUNCEMENT WAS MISSING HERE AT FIRST. *** Round 1 added

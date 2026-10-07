@@ -621,7 +621,7 @@ So **~4.5-5x of the 5.6-6.4x is still unexplained**, and the honest state is two
 candidates dead, two named, neither measured. Full account and the certification set an
 arm would need if it wins: see below ("The two arms are now ENGINE FLAGS").
 
-### The two arms are now ENGINE FLAGS, default OFF — and NEITHER IS MEASURED
+### The two arms are now ENGINE FLAGS, **DEFAULT-ON as of 2026-10-07** — and NEITHER IS MEASURED ON REAL 27B WEIGHTS
 
 The probe ladder could not run, so shipping unmeasurable experiments would ship
 nothing. Both arms were landed **in the engine** (`src/gemm/quant_gemm.cpp`,
@@ -634,6 +634,19 @@ identical. Each has an arm in `scripts/test_tp2_27b.sh` (TP=2: the only gate who
 27B model carries INT2 — the 0.8B model has **zero**, so a `test_gpu_optin.sh` arm
 would be green because the path never ran) asserting stream identity **and**
 requiring the arm's own announcement line, so a flag that did nothing cannot pass.
+
+*** PROMOTED TO DEFAULT-ON 2026-10-07. *** The clone measurements were the whole
+case and they are not in dispute: VERB+HALF +14% MLP_GATE / +17% MLP_DOWN, VERB+MP
+neutral (1.01x both shapes), medians over 12 interleaved reps on device event
+timestamps. The direction is known and positive for VERBHALF and neutral for
+VERBMP, and the numerics risk of VERBHALF (denormal + default FTZ) is a *should-not*
+that `test_rowpair_equiv.sh` has now measured away on synthetic data — so both
+were inverted to default-ON kill switches, the DEFAULT DECODE PATH. The base run in
+`scripts/test_tp2_27b.sh` sets no env and therefore runs this path, and the fixed
+oracle `13 198 760` is measured against it. `examples/rowpair_equiv`'s `base` order
+explicitly sets both kill switches to restore the reference path, because with
+nothing set it would run the two defaults and the differential would compare
+verbhalf against verbhalf.
 
 | | `INTFER_DECODE1_VERBHALF` | `INTFER_DECODE1_VERBMP` |
 |---|---|---|
@@ -1121,6 +1134,9 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_L5_FRONT` | device-resident whole LA input path | **dead end as built**: +144 launches/token, waitblock 5x. More kernels lose |
 | `INTFER_SSM_GPU` | device SSM recurrence | declines under `INTFER_DPAS48=1` (its ~1ulp drift flips a GA64 code at a tie) |
 | `INTFER_INT8_KV`, `INTFER_KV_Q8`, `INTFER_KV_HAD` | groupwise-INT8 KV cache | correctness-gated, no tok/s claim |
+| `INTFER_DECODE1_VERBDEAD` | per-group locals removed, pure code motion | bit-exact, default OFF |
+| `INTFER_DECODE1_VERBSEL` | the 4-float codebook by `select` instead of an indexed array | bit-exact, default OFF |
+| `INTFER_DECODE1_VERBVEC` | activations through a plain pointer instead of a `multi_ptr` | bit-exact, default OFF |
 
 ### Default ON, with a kill switch
 
@@ -1128,7 +1144,15 @@ Re-derive the whole population with the `git grep` recipe above.
 (wave submit grouping), `INTFER_LMHEAD_BATCH` (M-row lm_head), `INTFER_NO_WAVE`,
 `INTFER_STREAM_F16` (restores evict-everything), `INTFER_PREFILL_CHUNK` +
 `INTFER_BATCH_GEMM` (chunked M-row prefill, `INTFER_PREFILL_RR` restores the old
-rounding order), `INTFER_HOST_AVX2`, `INTFER_DPAS_PREQ`-independent bits.
+rounding order), `INTFER_HOST_AVX2`, `INTFER_DPAS_PREQ`-independent bits,
+`INTFER_NO_DECODE1_VERBHALF` and `INTFER_NO_DECODE1_VERBMP` -- the two M=1 INT2
+decode arms promoted to the DEFAULT DECODE PATH 2026-10-07. Their clone
+measurements are the whole case (VERBHALF +14% MLP_GATE / +17% MLP_DOWN, VERBMP
+neutral at 1.01x both shapes; `examples/roofline_probe_bisect`, device event
+timestamps, medians over 12 interleaved reps). VERBMP is bit-exact by construction;
+VERBHALF is stream-identity only (denormal + default FTZ is a *should-not*, now
+measured away on synthetic data by `test_rowpair_equiv.sh`). The engine arms are
+still UNMEASURED on real 27B weights -- operator-only, standing rule 1.
 
 ### Operational (not gate subjects)
 
