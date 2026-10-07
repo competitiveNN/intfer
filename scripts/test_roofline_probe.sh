@@ -82,11 +82,47 @@ echo
 # that printed a plausible table and returned 0. What must hold is that the
 # discriminating ARMS RAN and that the twin held -- the twin is what makes the
 # GB/s figures readable at all.
+#
+# *** AND THE EXIT CODE IS READ, NOT IGNORED. *** MEASURED 2026-10-07: this gate
+# captured RC and never checked it, so a probe that exited 1 while still printing
+# `RESULT: PASS` would have passed the gate on the string alone. The probe now
+# exits 1 on a vacuous run (its own ceiling floor), so the two agree -- but the
+# rc is asserted here so a future probe that relaxes its own guard cannot pass
+# this one by printing a banner.
+if [ "$RC" -ne 0 ]; then
+  echo "FAIL: the probe exited rc=$RC (see the FAIL VACUOUS line above, if any)" >&2
+  exit 1
+fi
 need() { grep -qE "$1" "$LOG" || {
           echo "FAIL: expected '$2' in the probe output, and it is absent." >&2
           echo "      A missing arm is not a neutral result: it means the run did" >&2
           echo "      not measure what the gate claims to measure." >&2
           exit 1; }; }
+# *** VALUE-AWARE, not name-aware. *** MEASURED 2026-10-07: on this box every arm
+# prints `0.000 ms  inf GB/s` and the gate passed it, because `need 'stream/shared'`
+# matches the NAME on a line that measured nothing. The ceiling arm's median is
+# asserted as a NUMBER so a vacuous run fails here even if the probe's own guard
+# is ever weakened. A real ceiling on this card is ~0.120 ms (52.43 MB / 436.8
+# GB/s, same allocator, same access pattern); the floor is a tenth of that, so a
+# profiling zero cannot satisfy it while a real run can.
+need_ceiling() {
+  local v
+  # ANCHORED ON THE PROBE'S OWN PREFIX. `stream/shared` is a substring of
+  # `unstream/shared`, so a bare grep -oE 'stream/shared +[0-9.]+' matches
+  # BOTH lines and the value collector returns two numbers; awk then sees
+  # `0.120\n0.070 < 0.012` and errors. The probe prints `[roofline] stream/shared`
+  # for the ceiling arm and `[roofline] unstream/shared` for the hostile twin,
+  # so the `] stream/shared` anchor (with the bracket) matches only the ceiling
+  # line -- `] unstream/shared` does not contain `] stream/shared`.
+  v="$(grep -oE '\] stream/shared +[0-9.]+ ms' "$LOG" | grep -oE '[0-9.]+' | head -1)"
+  [ -n "$v" ] || { echo "FAIL: no stream/shared timing in the probe output" >&2; exit 1; }
+  if [ "$(awk "BEGIN {print ($v < 0.012 ? 1 : 0)}")" = 1 ]; then
+    echo "FAIL: the shared ceiling arm measured ${v} ms -- below the 0.012 ms floor," >&2
+    echo "      so the run measured nothing (a real ceiling is ~0.120 ms)." >&2
+    exit 1
+  fi
+}
+need_ceiling
 
 need 'stream/shared'        "the malloc_shared ceiling arm"
 need 'stream/device'        "the malloc_device ceiling arm (E3.1's discriminator)"
