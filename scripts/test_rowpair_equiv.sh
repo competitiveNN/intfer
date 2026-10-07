@@ -193,7 +193,10 @@ for t in $ORDERS; do
   rcs="$rcs $t=$r"
 done
 for t in $ORDERS; do
-  case "$rcs" in *"$t=0") ;; *)
+  # Word-boundary match: `*"$t=0"` is a SUBSTRING test, so `base=0` also matches
+  # `rp=0` and every later order is reported "did not complete" while rcs says
+  # all-zero. Anchor on the space that precedes each `tag=rc` field.
+  case " $rcs " in *" $t=0 "*) ;; *)
     echo "FAIL: decode1 equiv order $t did not complete ($rcs)" >&2
     for u in $ORDERS; do
       echo "--- $u stderr ---" >&2
