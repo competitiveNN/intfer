@@ -601,8 +601,10 @@ dispatch() { # $1 = label -> runs it
       # rewritten artifact, so the matrix mutates the ARTIFACT -- a bit-exact
       # codebook-index bug planted on VERBMP and on VERBSEL -- and requires the
       # gate to REFUSE each. Baseline (pristine) must PASS first, or every state is
-      # void. Each state copies the whole tree under build/ and configures its own
-      # build dir, so the tracked tree is never touched.
+      # void. Each state copies src/ include/ examples/ scripts/ + CMakeLists
+      # (NOT the whole tree -- the test/ model weights are ~2.2 GB and a whole-tree
+      # copy OOM-killed this matrix) and configures its own build dir, so the
+      # tracked tree is never touched.
       timeout -k 60 1800 bash "$SCRIPT_DIR/mutate_rowpair_equiv.sh"; return $? ;;
     mutate_checker_matrix_coverage.sh)
       # Each state BOTH poisons the tree with an unmated checker AND removes the
