@@ -18,21 +18,32 @@ is still a true record of when it was written.
 
 ## 1. Backlog, biggest performance gain first
 
-Order is by expected gain on the measured deficit (INT2 GEMV at
-5.6-6.4x below a clone of its own algorithm — see HISTORY.md,
-"THE M=1 INT2 GEMV IS 5.6-6.4x SLOWER"). Estimates are hypotheses
-with a kill criterion each, not claims; every row must be decided on
-load-insensitive counters (`kernel` bucket) and clear the spread floor.
+Order is by expected gain on the measured deficit. **The 5.6-6.4x
+"clone-vs-shipped" deficit is RETRACTED 2026-10-08 and does not exist**
+(see HISTORY.md, "THE 6.39x ITSELF IS NOT REPRODUCIBLE"): a fresh run of
+`examples/roofline_probe` returns VACUOUS, and a saved bisect4 log from
+10-06 measured the same clone algorithm at 55.1 GB/s while the shipped
+arm stayed at ~40-49 GB/s in both. The clone number moved 4.7x between
+two saved logs of the same kernel; the shipped number did not. The
+honest ratio is **1.12x**, and it is a *cosmetic* win (`bit_cast<half>`
+for the group scale, `av * wtab[code]` for the tail) that
+`INTFER_DECODE1_VERBHALF` already lands in the engine — not a 6x.
+
+What remains is the reproducible finding: the shipped INT2 decode runs at
+~49 GB/s on MLP_GATE against a 456 GB/s ceiling, i.e. ~10.7% of peak.
+That is the real deficit, and every row below is judged against it on
+load-insensitive counters (`kernel` bucket), clearing the spread floor.
 
 ### 1.1 `block_load<uint8_t,128>` on the INT2 weight stream
 
 * **Why it is first:** INT2 is 20.2% of decode traffic
-  (1.837 GiB/device/token) and the entire 5.6-6.4x deficit sits in
-  the shared text of the two functions, not the module and not the
-  runtime branch (HISTORY.md, E-NEXT-1). This is the one genuinely
-  new idea the deleted draft had (`src/gemm/quant_gemm.cpp:457-465`):
-  8 B/lane at the queried sg=16, one `block_load` per 32 codes.
+  (1.837 GiB/device/token). The old rationale ("the entire 5.6-6.4x
+  deficit sits in the shared text") is void; this is now a plain
+  load-forming experiment on a ~10% utilisation kernel, and the
+  wider-chunk probe already measured `block_load<uint8_t,256>` at
+  0.25-0.35x — a 3-4x regression from register pressure.
 * **Where:** `src/gemm/quant_gemm.cpp`, M=1 INT2 decode lambda.
+  (`src/gemm/quant_gemm.cpp:457-465`.)
 * **Kill criterion (pre-committed):** < 2x closes the experiment —
   that also closes llama.cpp's `block_load` direction for INT2, which
   the wider-chunk probe already measured at 0.25-0.35x.
@@ -50,7 +61,30 @@ load-insensitive counters (`kernel` bucket) and clear the spread floor.
 * **Gain:** removes one submit + one wait per MLP per token. The
   fused-MLP-down precedent is +13% decode for exactly that.
 * **Where:** `src/engine/engine.cpp`, the TP=2 MLP path.
-* **Gate:** stream-identity at TP=2, arm in `test_tp2_27b.sh`.
+* **Gate:** stream-identity at TP=2, arm in `test_tp2_27b.sh`. **GATED,**
+  not REPORTED: the engine prints `[mlp-gateup] fused gate+up GEMM ACTIVE`
+  once on acceptance, and the arm asserts that line is present AND the
+  streams agree. The first version of this arm was REPORTED only, because
+  the engine printed nothing on success and the two streams alone cannot
+  separate a real fusion from the wave fallback they replace (bit-identical
+  by construction). See `scripts/test_tp2_27b.sh` for the arm's own
+  self-check, which exercises the ACTIVE-line predicate in both directions.
+
+**AUDIT 2026-10-08 — two defects found and fixed in the 1.2 implementation:**
+
+1. **M>1 prefill arms would read zeroed wave slots as mg/mu.** The fused
+   kernel has no tiled M>1 body; it returns a NULL event for M>1. The
+   engine now declines explicitly (`if (M > 1) return false;`) instead of
+   letting the caller memcpy out of an unwritten buffer. The M>1 prefill
+   arms take `run_linear_wave_batch`, which is M-row aware. Without the
+   guard the prefill arms were a silent correctness bug, not a
+   performance miss.
+
+2. **`nk` was short by one per device on every fused token.** The gateup
+   kernel is not a `quant_gemm_forward_usm` call, so it never hit
+   `profile_note_launch` — the same blind spot SSM/norm kernels had. It now
+   calls `profile_note_launch()` once per launch and records the device
+   event timestamps, so the load-insensitive launch counter is honest.
 
 ### 1.3 SLM work-stealing tile scheduler for prefill tiles
 

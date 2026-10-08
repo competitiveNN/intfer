@@ -94,6 +94,26 @@ class Engine {
                      const std::vector<float>& rin,
                      std::vector<float>& md, uint32_t M);
 
+  // Fused gate+up GEMM, TP=2 (the only fusion that survives column sharding).
+  // Gate and up are both column-parallel over the SAME split and device-local,
+  // so one parallel_for over Ng+Nu outputs is bit-exact vs two separate
+  // quant_gemm_forward_usm calls: each output keeps its own accumulator,
+  // ascending kg, ascending j, its own group scale and wtab. Saves one submit
+  // + one wait + one D2H readback per device per token vs the wave path.
+  // Returns false (caller keeps the wave) on TP=1, DPAS48 items, mismatched
+  // K/group/scheme, or M>1. mg/mu are filled; md is NOT (the caller's down
+  // path consumes mg/mu via silu-mul, same contract as run_mlp_fused's host
+  // fallback).
+  //
+  // M>1 IS A DECLINE, NOT A FALLBACK TO A TILED FUSION. The kernel has no
+  // tiled body; it returns a NULL event for M>1, and without the guard here
+  // the caller would memcpy out of zeroed wave slots as mg/mu. The M>1
+  // prefill arms therefore take run_linear_wave_batch, which is M-row aware.
+  bool run_mlp_gateup(int gate_ti, int up_ti,
+                      const std::vector<float>& rin,
+                      std::vector<float>& mg, std::vector<float>& mu,
+                      uint32_t M);
+
   // Device-act GEMM seam (L4 la_out fusion): run tensor ti reading M*K FP16
   // activation bits from a caller-owned device buffer (no host convert, no
   // H2D), dep-chained after the producer kernel; waits once and reads back

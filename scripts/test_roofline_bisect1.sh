@@ -58,6 +58,12 @@ EOF
   exit 2
 fi
 
+if [ "$RC" -ne 0 ]; then
+  echo "FAIL: the bisect-1 probe exited rc=$RC -- it refused to run (the probe's" >&2
+  echo "      own vacuity floor fired, so no arm line exists to be 'missing')." >&2
+  exit 1
+fi
+
 need() { grep -qE "$1" "$LOG" || {
           echo "FAIL: expected '$2' in the output, and it is absent." >&2
           echo "      A missing arm is not a neutral result: the run did not measure" >&2
@@ -74,10 +80,28 @@ need 'VERBATIM'              "the shipped-source transcription arm"
 need 'vs VERBATIM'           "the interleaved ratio column"
 need 'WHAT THIS RUN DOES'    "the what-this-establishes banner"
 
-if [ "$RC" -ne 0 ]; then
-  echo "FAIL: the bisect-1 probe exited rc=$RC (the twin is the likely reason)" >&2
+# *** THE VACUITY FLOOR. *** `need()` asserts that the arm strings EXIST, and on
+# this box bisect-1 prints every arm at `0.000 ms / inf GB/s / -nanx vs VERBATIM`
+# -- including the 52 MB ceiling -- and still prints RESULT: PASS. A string
+# assertion cannot see that the numbers are NaN: it certifies that the probe
+# RAN, not that it MEASURED. This floor reads the actual numeric columns and
+# refuses any run whose VERBATIM median is not a finite positive millisecond,
+# which is the one number every ratio in the table is divided by. Without it the
+# gate reports PASS for a probe that produced no measurement.
+if grep -qE 'VERBATIM +0\.000 ms' "$LOG"; then
+  echo "FAIL: the bisect-1 probe printed a ZERO VERBATIM median -- the device" >&2
+  echo "      timer reported command_start == command_end, so every GB/s and" >&2
+  echo "      ratio in the table is inf/-nan and the run measured nothing. The" >&2
+  echo "      probe itself now refuses this (zero is a failure, not a result);" >&2
+  echo "      this floor catches the case where it does not." >&2
   exit 1
 fi
+if ! grep -qE 'VERBATIM +[1-9][0-9]*\.[0-9]+ ms' "$LOG"; then
+  echo "FAIL: no finite positive VERBATIM median in the bisect-1 output -- the" >&2
+  echo "      ratios are not anchored to a real measurement." >&2
+  exit 1
+fi
+
 grep -q 'RESULT: PASS' "$LOG" || { echo "FAIL: no RESULT: PASS in the output" >&2; exit 1; }
 
 echo "ROOFLINE-BISECT1 TEST: PASS"

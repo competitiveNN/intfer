@@ -253,16 +253,32 @@ measurements are **RETRACTED as performance evidence**: the bisect-2 gate that
 produced them (VERBHALF +14% MLP_GATE / +17% MLP_DOWN, VERBMP neutral at 1.01x
 both shapes) reported PASS while every arm measured `0.000 ms / inf GB/s / -nanx`
 on this box, so those ratios were 0/0. The gate now refuses a vacuous run on
-three layers (probe ceiling floor, gate-side `need_ceiling` at 0.012 ms, exit
-code); `mutate_roofline_probe.sh` certifies the two gate-side predicates 3/3.
+four layers (probe ceiling floor, gate-side exit-code check, gate-side numeric
+floor, `RESULT: PASS`); the four bisect mutation matrices each certify a stub
+that reproduces the exact vacuous-but-green output (RB-8 / RB1-8 / RB3-8 /
+RB4-5, all CAUGHT).
 VERBMP is bit-exact by construction; VERBHALF is stream-identity only (denormal
 + default FTZ is a *should-not*, now measured away on synthetic data by
 `test_rowpair_equiv.sh`, 143 355 INT2 values bitwise identical, matrix PASS
 3/3). **The performance direction is UNKNOWN, not positive** -- the engine
 arms are still UNMEASURED on real 27B weights (operator-only, standing rule 1),
 and until that run exists the default-ON change is a correctness bet with an
-unknown payoff. Re-derive with `scripts/test_roofline_bisect.sh` after the
-profiling defect is fixed; do not quote the +14% as settled.
+unknown payoff. Do not quote the +14% as settled.
+
+**2026-10-08: the 5.6-6.4x "clone-vs-shipped" deficit is RETRACTED ENTIRELY, and
+it is the clone number that was the flake, not the shipped kernel.** A fresh run of
+`examples/roofline_probe` (the binary that produced the 6.39x) returns VACUOUS, and a
+saved `build/roofline_bisect4.log` from 10-06 measured the SAME clone algorithm at
+**55.1 GB/s** while the shipped arm stayed at ~40-49 GB/s in both saved logs. The clone
+moved 4.7x between two saved logs of the same kernel; the shipped number did not. So
+the 6.39x was never a clone-vs-shipped ratio, it was a flaky numerator divided by a
+stable one, and the honest ratio is **1.12x** -- a *cosmetic* win (`bit_cast<half>`
+for the group scale, `av * wtab[code]` for the tail) that VERBHALF already lands in the
+engine. The two falsified candidates (module size, runtime branch) and the
+"~4.5-5x unexplained" line were all chasing a number that was never real. **1.1 is
+CLOSED, not open.** What remains is the reproducible finding: the shipped INT2 decode
+runs at ~49 GB/s on MLP_GATE against a 456 GB/s ceiling, ~10.7% of peak. Full account:
+HISTORY.md "THE 6.39x ITSELF IS NOT REPRODUCIBLE".
 
 ### The profiling defect: LOCATED 2026-10-08, it is the driver, not the code
 

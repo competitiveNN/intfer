@@ -426,9 +426,29 @@ bool check_reader_contract(sycl::queue& q, std::uint64_t& pairs,
 
 }  // namespace
 
+// Select a device exactly as the engine does (src/device/device_manager.cpp:37
+// `sycl::device::get_devices(gpu)` then `dev.get_backend() != ext_oneapi_level_zero`
+// `continue`). `sycl::gpu_selector_v` is NOT a safe choice here: on this box it
+// spans backends and returns 4 GPU devices (2 Level-Zero + 2 OpenCL), and the
+// SYCL runtime then throws "The program was built for 2 devices" when it tries
+// to compile a program against the multi-device queue -- which is exactly the
+// death-by-signal-6 this gate was reporting on a healthy box. The engine never
+// saw it because it filters backends before constructing any queue.
+static sycl::device pick_l0_gpu() {
+  auto all = sycl::device::get_devices(sycl::info::device_type::gpu);
+  sycl::device chosen;
+  for (const auto& d : all) {
+    if (d.get_backend() != sycl::backend::ext_oneapi_level_zero) continue;
+    chosen = d; break;
+  }
+  return chosen;
+}
+
 int main() {
-  sycl::queue q{sycl::gpu_selector_v};
-  std::printf("[dpas-fold-probe] device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
+  sycl::device dev = pick_l0_gpu();
+  std::fprintf(stderr, "[dpas-fold-probe] chosen device: %s\n", dev.get_info<sycl::info::device::name>().c_str());
+  sycl::queue q{dev};
+  std::printf("[dpas-fold-probe] device: %s\n", dev.get_info<sycl::info::device::name>().c_str());
 
   const Case cases[] = {
       {"M=1 tight",      1,  1024, 1024, 0,  false, 0},

@@ -13,6 +13,19 @@
 # single-change arms (VERB+HALF / VERB+TAIL / VERB+MP) vs `VERBATIM`. Each is a
 # small enough TU to run on this box; neither links the engine.
 #
+# *** THE DEFICIT THIS LADDER WAS BUILT TO TRACE DOES NOT EXIST. RETRACTED
+# *** 2026-10-08. *** The 261 GB/s clone figure is not reproducible: a fresh run
+# of examples/roofline_probe returns VACUOUS, and a saved bisect4 log from 10-06
+# measured the SAME clone algorithm at 55.1 GB/s while the shipped arm stayed at
+# ~40-49 GB/s in both. The clone number moved 4.7x between two saved logs of the
+# same kernel; the shipped number did not. So the 5.6-6.4x was never a
+# clone-vs-shipped ratio, it was a flaky numerator divided by a stable one, and the
+# honest ratio is 1.12x. The two falsified candidates (module, runtime branch) were
+# chasing a number that was never real. The arms are still a valid differential
+# probe of the shipped source's cosmetic variants and the gate is live; what they
+# can no longer claim is that they are tracing a deficit. See HISTORY.md
+# "THE 6.39x ITSELF IS NOT REPRODUCIBLE".
+#
 # WHAT IT MAY AND MAY NOT CLAIM, enforced by the gate rather than by prose:
 #   * It reports RATIOS, medians over interleaved reps. Run separately, the
 #     shipped arm read 17.2 / 39.3 and 41.3 GB/s on three consecutive runs of the
@@ -80,6 +93,12 @@ EOF
   exit 2
 fi
 
+if [ "$RC" -ne 0 ]; then
+  echo "FAIL: the bisect-2 probe exited rc=$RC -- it refused to run (the probe's" >&2
+  echo "      own vacuity floor fired, so no arm line exists to be 'missing')." >&2
+  exit 1
+fi
+
 need() { grep -qE "$1" "$LOG" || {
           echo "FAIL: expected '$2' in the output, and it is absent." >&2
           echo "      A missing arm is not a neutral result: the run did not measure" >&2
@@ -98,12 +117,6 @@ need 'VERB\+MP'             "the multi_ptr weight-side arm"
 need 'vs VERBATIM'           "the interleaved ratio column"
 need 'WHAT THIS RUN DOES'    "the what-this-establishes banner"
 
-if [ "$RC" -ne 0 ]; then
-  echo "FAIL: the bisect-2 probe exited rc=$RC (the twin is the likely reason)" >&2
-  exit 1
-fi
-grep -q 'RESULT: PASS' "$LOG" || { echo "FAIL: no RESULT: PASS in the output" >&2; exit 1; }
-
 # *** THE VACUITY FLOOR. *** `need()` asserts that the arm strings EXIST, and on
 # this box bisect-2 prints every arm at `0.000 ms / inf GB/s / -nanx vs VERBATIM`
 # -- including the 52 MB ceiling -- and still prints RESULT: PASS. A string
@@ -120,9 +133,10 @@ if grep -qE 'VERBATIM +0\.000 ms' "$LOG"; then
   echo "      probe itself now refuses this (zero is a failure, not a result);" >&2
   echo "      this floor catches the case where it does not. MEASURED on this" >&2
   echo "      box: bisect-2 prints all-zero for all four arms including the" >&2
-  echo "      ceiling, while examples/roofline_probe measures the same kernel" >&2
-  echo "      at 0.120 ms / 436.8 GB/s. Do not quote the +14% MLP_GATE figure" >&2
-  echo "      until this gate prints a real median." >&2
+  echo "      ceiling. A real VERBATIM median here is ~0.225 ms / 49.4 GB/s" >&2
+  echo "      (build/roofline_bisect4.log, 10-06); the clone-vs-shipped 5.6-6.4x" >&2
+  echo "      this ladder was built to chase is RETRACTED, so a zero run proves" >&2
+  echo "      nothing about it either way." >&2
   exit 1
 fi
 if ! grep -qE 'VERBATIM +[1-9][0-9]*\.[0-9]+ ms' "$LOG"; then
@@ -131,9 +145,13 @@ if ! grep -qE 'VERBATIM +[1-9][0-9]*\.[0-9]+ ms' "$LOG"; then
   exit 1
 fi
 
+grep -q 'RESULT: PASS' "$LOG" || { echo "FAIL: no RESULT: PASS in the output" >&2; exit 1; }
+
 echo "ROOFLINE-BISECT TEST: PASS"
 echo "RESULT: bisect-2 ran with its twin holding; the VERB+HALF / VERB+TAIL /"
-echo "        VERB+MP ratios above are the first measurements of those arms, all"
-echo "        measured against the VERBATIM control on the same buffers, interleaved"
-echo "        per rep (SHIPPED anchored from examples/roofline_probe)."
+echo "        VERB+MP ratios above are measured against the VERBATIM control on"
+echo "        the same buffers, interleaved per rep. They trace the shipped"
+echo "        source's cosmetic variants, NOT a deficit: the 5.6-6.4x this ladder"
+echo "        was built to chase is RETRACTED (the clone number moved 4.7x between"
+echo "        two saved logs of the same kernel). See HISTORY.md."
 exit 0

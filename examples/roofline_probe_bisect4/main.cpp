@@ -15,6 +15,19 @@
 // vs 2-byte code loads, the probe's 3-ternary bv selector) actually closes the
 // gap. No claim about a mechanism is made; this is a map of where the ~7x sits.
 //
+// *** THE GAP THIS WAS MAPS DOES NOT EXIST. RETRACTED 2026-10-08. *** The 262 GB/s
+// clone figure is not reproducible: a fresh run of examples/roofline_probe returns
+// VACUOUS, and a saved bisect4 log from 10-06 measured the SAME clone algorithm at
+// 55.1 GB/s while the shipped arm stayed at ~40-49 GB/s in both. The clone number
+// moved 4.7x between two saved logs of the same kernel; the shipped number did not.
+// So the 6.39x was never a clone-vs-shipped ratio, it was a flaky numerator divided
+// by a stable one, and the honest ratio is 1.12x (VERBATIM 49.4, CLONE 55.1, MLP_GATE,
+// build/roofline_bisect4.log 10-06). The ladder's purpose -- "isolate which single
+// change closes the gap" -- is moot: there is no gap left to close. The arms below are
+// still a valid differential probe of the shipped source's cosmetic variants, and the
+// gate that certifies them is live; what they can no longer claim is that they are
+// tracing a deficit. See HISTORY.md "THE 6.39x ITSELF IS NOT REPRODUCIBLE".
+//
 // ARMS:
 //   VERBATIM       bisect-2 VERBATIM control.
 //   VERB+bitcast   VERBATIM with group scale + tail activation converted by

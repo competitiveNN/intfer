@@ -16,6 +16,17 @@
 # move (1.26x) and the runtime branch (1.007x) sits between VERBATIM and SHIPPED, and
 # this run measures it in one TU, interleaved, on the same buffers.
 #
+# *** THE GAP THIS WAS BUILT TO CLOSE DOES NOT EXIST. RETRACTED 2026-10-08. *** The
+# 244 GB/s clone figure is not reproducible: a fresh run of examples/roofline_probe
+# returns VACUOUS, and a saved bisect4 log from 10-06 measured the SAME clone
+# algorithm at 55.1 GB/s while the shipped arm stayed at ~40-49 GB/s in both. The
+# clone number moved 4.7x between two saved logs of the same kernel; the shipped
+# number did not. So the 5.6-6.4x was never a clone-vs-shipped ratio, it was a flaky
+# numerator divided by a stable one, and the honest ratio is 1.12x. The "~4.5-5x
+# that survives the module move" line above is void: there is no residue to measure,
+# and this binary's SHIPPED arm is now just an in-TU control, not an anchor for a
+# deficit. See HISTORY.md "THE 6.39x ITSELF IS NOT REPRODUCIBLE".
+#
 # EXIT SEMANTICS:
 #   0 = twin held and every arm ran (ROOFLINE-BISECT3 TEST: PASS)
 #   1 = twin failed, an arm did not run, or profiling lost
@@ -66,6 +77,12 @@ EOF
   exit 2
 fi
 
+if [ "$RC" -ne 0 ]; then
+  echo "FAIL: the bisect-3 probe exited rc=$RC -- it refused to run (the probe's" >&2
+  echo "      own vacuity floor fired, so no arm line exists to be 'missing')." >&2
+  exit 1
+fi
+
 need() { grep -qE "$1" "$LOG" || {
           echo "FAIL: expected '$2' in the output, and it is absent." >&2
           echo "      A missing arm is not a neutral result: the run did not measure" >&2
@@ -84,17 +101,35 @@ need 'SHIPPED'               "the shipped-source anchor (in-TU, same buffers)"
 need 'vs VERBATIM'           "the interleaved ratio column"
 need 'WHAT THIS RUN DOES'    "the what-this-establishes banner"
 
-if [ "$RC" -ne 0 ]; then
-  echo "FAIL: the bisect-3 probe exited rc=$RC (the twin is the likely reason)" >&2
+# *** THE VACUITY FLOOR. *** `need()` asserts that the arm strings EXIST, and on
+# this box bisect-3 prints every arm at `0.000 ms / inf GB/s / -nanx vs VERBATIM`
+# -- including the 52 MB ceiling -- and still prints RESULT: PASS. A string
+# assertion cannot see that the numbers are NaN: it certifies that the probe
+# RAN, not that it MEASURED. This floor reads the actual numeric columns and
+# refuses any run whose VERBATIM median is not a finite positive millisecond,
+# which is the one number every ratio in the table is divided by. Without it the
+# gate reports PASS for a probe that produced no measurement.
+if grep -qE 'VERBATIM +0\.000 ms' "$LOG"; then
+  echo "FAIL: the bisect-3 probe printed a ZERO VERBATIM median -- the device" >&2
+  echo "      timer reported command_start == command_end, so every GB/s and" >&2
+  echo "      ratio in the table is inf/-nan and the run measured nothing. The" >&2
+  echo "      probe itself now refuses this (zero is a failure, not a result);" >&2
+  echo "      this floor catches the case where it does not." >&2
   exit 1
 fi
+if ! grep -qE 'VERBATIM +[1-9][0-9]*\.[0-9]+ ms' "$LOG"; then
+  echo "FAIL: no finite positive VERBATIM median in the bisect-3 output -- the" >&2
+  echo "      ratios are not anchored to a real measurement." >&2
+  exit 1
+fi
+
 grep -q 'RESULT: PASS' "$LOG" || { echo "FAIL: no RESULT: PASS in the output" >&2; exit 1; }
 
 echo "ROOFLINE-BISECT3 TEST: PASS"
 echo "RESULT: bisect-3 ran with its twin holding; the VERB+TAIL / VERB+MP /"
-echo "        SHIPPED ratios above are the first measurements of those arms, all"
-echo "        measured against the VERBATIM control on the SAME buffers, in the"
-echo "        SAME TU, interleaved per rep (SHIPPED is the in-TU anchor, so the"
-echo "        ~4.5-5x of the 5.6-6.4x deficit is measured here rather than by"
-echo "        assumption)."
+echo "        SHIPPED ratios above are measured against the VERBATIM control on"
+echo "        the SAME buffers, in the SAME TU, interleaved per rep. SHIPPED is an"
+echo "        in-TU control, NOT an anchor for a deficit: the 5.6-6.4x this ladder"
+echo "        was built to trace is RETRACTED (the clone number moved 4.7x between"
+echo "        two saved logs of the same kernel). See HISTORY.md."
 exit 0

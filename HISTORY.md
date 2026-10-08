@@ -380,6 +380,54 @@ looks positive and is not currently re-derivable. Re-derive it with
 `scripts/test_roofline_bisect.sh` after the profiling defect is fixed; do not quote
 the +14% as settled until it prints a real median.
 
+### ==> 2026-10-08: THE 6.39x ITSELF IS NOT REPRODUCIBLE. THE CLONE NUMBER IS THE FLAKE. <==
+
+Re-derived today, not remembered. `examples/roofline_probe` (the binary that produced
+the 6.39x) returns **VACUOUS** on a fresh run -- the probe refuses and exits 1, exactly
+as `examples/roofline_probe_bisect4` does. So the 6.39x cannot be re-derived from this
+tree at all, and the investigation that followed found something worse than that.
+
+**`build/roofline_bisect4.log` (10-06, a saved artifact, NOT re-derivable today) measured
+the SAME clone algorithm at 55.1 GB/s, not 260.9.** Same shape (MLP_GATE 8704x5120
+g16), same instrument, same allocator, interleaved in one TU:
+
+```
+MLP_GATE(INT2)/VERBATIM     0.225 ms     49.4 GB/s   1.00x vs VERBATIM
+MLP_GATE(INT2)/VERB+bitcast 0.203 ms     54.8 GB/s   1.11x vs VERBATIM
+MLP_GATE(INT2)/CLONE        0.202 ms     55.1 GB/s   1.12x vs VERBATIM
+```
+
+**The clone is 4.7x different between the two saved logs (260.9 vs 55.1) while the
+shipped arm is stable in both (~40-49 GB/s).** That is the finding. The 6.39x was never
+a clone-vs-shipped measurement; it was a clone number that happened to be 6.4x larger
+than a shipped number that is itself stable. The clone is the flake, not the shipped
+kernel. The honest ratio is **~1.1x**, and it was already on disk on 10-06 under a
+different binary's name.
+
+* **What this does NOT mean.** The shipped kernel is still ~10% of the card's
+bandwidth ceiling (49.4 GB/s vs 456 GB/s), which is the real, reproducible finding
+and the one worth acting on. The 1.12x clone/VERBATIM ratio is a *cosmetic* win --
+`bit_cast<half>` for the group scale and `av * wtab[code]` for the tail, both of which
+`INTFER_DECODE1_VERBHALF` already lands in the engine. It is not the 6x.
+* **What this means for the investigation.** "~4.5-5x of the 5.6-6.4x is unexplained"
+was measuring a numerator that does not exist. There is no unexplained gap to locate;
+the two falsified candidates (module, runtime branch) and the three arms that landed
+were all chasing a number that was never real. **1.1 is CLOSED, not open.**
+* **The mechanism that produced the 260.9 is not located and is not worth locating.**
+It is a profiling-path flake on a contended box -- the same class as the zero-duration
+defect -- and it produced a number that pointed at the wrong thing for three days.
+The lesson is the one this repo keeps re-learning: a ratio is only as good as its
+numerator, and a numerator that moves 4.7x between two saved logs of the same kernel
+is not a numerator.
+
+**The bisect gates now refuse a vacuous run on FOUR layers** (probe ceiling floor, gate
+RC check, gate numeric floor, gate `RESULT: PASS`), and all four mutation matrices
+certify a state that reproduces the exact vacuous-but-green output the old gate passed
+(RB-8 / RB1-8 / RB3-8 / RB4-5, all CAUGHT). The 6.39x is retracted here alongside the
++14%, as performance evidence, and the bisect ladder's stated purpose is now wrong in
+its own header comments -- those say it isolates "which single change closes the gap",
+and there is no gap left to close.
+
 | | `INTFER_DECODE1_VERBHALF` | `INTFER_DECODE1_VERBMP` |
 |---|---|---|
 | the ONE change | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` (the engine's branchy **scalar** FP16->FP32 twiddle, 3 branches per call, **320 calls per work-item** at MLP_GATE) | weight side through a row-base `multi_ptr` instead of an absolute index into raw `code_u8` |
@@ -810,6 +858,7 @@ hand-picked checks all reported as fine:
 | SYCL command graphs for decode | **NOT DONE, MEASURED DEAD END** — 19.7 us vs 11.9 us |
 | Tiled 2D DPAS kernels for prefill (E4) | **DONE** — `INTFER_DPAS48_TILED`, bit-exact, accepted on counters, not promoted |
 | Fused activation pipeline (silu-mul + RNE FP16 -> down GEMM) | **DONE** — `run_mlp_fused`, default ON at TP=1 |
+| Gate+up in a single launch (PLAN.md 1.2) | **DONE 2026-10-08** — `quant_gemm_forward_usm_gateup` + `Engine::run_mlp_gateup`, the one TP=2-valid fusion. GATED, not REPORTED: the engine prints `[mlp-gateup] ... ACTIVE` on acceptance and `test_tp2_27b.sh` asserts it. **AUDIT 2026-10-08 found and fixed two defects in the first version:** (a) M>1 prefill arms read zeroed wave slots as mg/mu — the kernel has no tiled body, so the engine now declines with `if (M > 1) return false;` and the prefill arms take `run_linear_wave_batch`; (b) `nk` was short by one per device per fused token because the gateup kernel is not a `quant_gemm_forward_usm` call and never hit `profile_note_launch` — same blind spot SSM/norm kernels had; it now notes the launch and records the device event timestamps. The gateup arm's own self-check (cases a/b/c, exercising the ACTIVE-line predicate in both directions) is in `test_tp2_27b.sh`; `mutate_tp2_selfcheck.sh` records GU-14/15/16 as EXCLUDED because the stubbed self-check never calls the gateup predicate — only a real 27B run can see them. |
 | SSM recurrence chaining | **DONE** — `ssm_forward_chain` |
 | Build flags `-O3 -DINTFER_HAS_L0=1` | **DONE** (`INTFER_HAS_L0=1` in `src/CMakeLists.txt`). `INTFER_PRELOAD` is a runtime env var, not a compile flag — PLAN.md's `-DINTFER_PRELOAD=1` is wrong |
 

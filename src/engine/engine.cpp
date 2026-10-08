@@ -1581,6 +1581,133 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
   return true;
 }
 
+// Fused gate+up GEMM, TP=2 (see engine.hpp). Gate and up are both
+// column-parallel over the SAME split and device-local, so one parallel_for
+// over Ng+Nu outputs is bit-exact vs two separate quant_gemm_forward_usm
+// calls: each output keeps its own accumulator, ascending kg, ascending j,
+// its own group scale and wtab. Saves one submit + one wait + one D2H
+// readback per device per token vs the wave path. Returns false (caller
+// keeps the wave) on TP=1, DPAS48 items, mismatched K/group/scheme, or M>1.
+bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
+                            const std::vector<float>& rin,
+                            std::vector<float>& mg, std::vector<float>& mu,
+                            uint32_t M) {
+  if (devices_.size() != 2) return false;
+  if (M == 0) M = 1;
+  for (int ti : {gate_ti, up_ti}) {
+    if (ti < 0 || (size_t)ti >= model_.tensors.size()) return false;
+    if (!shard_cache_[(size_t)ti].built && !ensure_shard_built(ti))
+      return false;
+    if (shard_cache_[(size_t)ti].dpas48) return false;
+  }
+  const auto& tg = model_.tensors[(size_t)gate_ti];
+  const auto& tu = model_.tensors[(size_t)up_ti];
+  if (tu.K != tg.K) return false;
+  if (tg.qcfg.group_size != tu.qcfg.group_size) return false;
+  if (tg.qcfg.scheme != tu.qcfg.scheme) return false;
+  if (rin.size() != (size_t)M * tg.K) return false;
+  // The fused kernel is an M=1 single-output-per-work-item launch; it has no
+  // tiled M>1 body and returns a NULL event for M>1. Returning false here
+  // (rather than letting the caller memcpy out of an unwritten buffer) sends
+  // the call back to run_linear_wave_batch, which IS M-row aware. Without
+  // this the M>1 prefill arms would read zeroed wave slots as mg/mu.
+  if (M > 1) return false;
+  const auto& scg = shard_cache_[(size_t)gate_ti];
+  const auto& scu = shard_cache_[(size_t)up_ti];
+  if (scg.code_usm.size() != 2 || scu.code_usm.size() != 2) return false;
+  for (size_t d = 0; d < 2; ++d) {
+    if (!scg.code_usm[d] || !scg.scale_usm[d] ||
+        !scu.code_usm[d] || !scu.scale_usm[d]) return false;
+  }
+  const uint32_t Ng = tg.N, Nu = tu.N;
+  if (mg.size() != (size_t)M * Ng) mg.resize((size_t)M * Ng);
+  if (mu.size() != (size_t)M * Nu) mu.resize((size_t)M * Nu);
+
+  // Shared FP32->FP16 staging (gate and up read the SAME rin).
+  const size_t need = (size_t)M * tg.K;
+  if (act_staging_.size() != need) act_staging_.resize(need);
+  ++act_staging_gen_;
+  dashq::float_to_half_batch(rin.data(), act_staging_.data(), need);
+
+  // Per-device: one act buffer shared by both outputs, two out buffers
+  // (gate's slice, up's slice). The wave workspace gives us one slot per
+  // device; reuse slot 0 for the shared act and slot 1 for the gate out,
+  // slot 2 for the up out. Grow the wave workspace to W=3 if needed.
+  ensure_wave_workspace(M, 3, tg.K, std::max(Ng, Nu));
+  std::vector<sycl::event> kernel_events;
+  kernel_events.reserve(2);
+  for (size_t d = 0; d < 2; ++d) {
+    auto& dev = devices_[d];
+    sycl::queue& q = dev.queue;
+    std::uint16_t* act_ptr = wv_[d * wv_W_ + 0].act;
+    std::memcpy(act_ptr, act_staging_.data(), need * sizeof(std::uint16_t));
+    const float ag = scg.has_global_divisor ? scg.global_host : 1.0f;
+    const float au = scu.has_global_divisor ? scu.global_host : 1.0f;
+    sycl::event e = gemm::quant_gemm_forward_usm_gateup(
+        q, act_ptr,
+        scg.code_usm[d], scg.scale_usm[d], ag,
+        wv_[d * wv_W_ + 1].out,
+        scu.code_usm[d], scu.scale_usm[d], au,
+        wv_[d * wv_W_ + 2].out,
+        M, Ng, Nu, tg.K, scg.group_size, scg.scheme, scu.scheme,
+        sycl::event{});
+    kernel_events.push_back(e);
+    // The gateup kernel is NOT a quant_gemm_forward_usm call, so it does not
+    // hit profile_note_launch. Without this the [GPU profile] nk counter is
+    // SHORT BY ONE PER DEVICE on every fused token -- the same blind spot
+    // SSM/norm kernels had, and the reason that class of counter is a
+    // launch-count invariant rather than a wall clock. One launch, one note.
+    // Guarded: profile_note_launch is declared only under INTFER_PROFILE_GPU.
+#ifdef INTFER_PROFILE_GPU
+    gemm::profile_note_launch();
+#endif
+  }
+  for (auto& e : kernel_events) e.wait();
+#ifdef INTFER_PROFILE_GPU
+  for (auto& e : kernel_events) {
+    try {
+      auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
+      auto t1 = e.get_profiling_info<sycl::info::event_profiling::command_end>();
+      g_gpu_profile.total_kernel_us += (double)(t1 - t0) / 1000.0;
+      g_gpu_profile.kernel_count++;
+    } catch (...) {}
+  }
+#endif
+  for (size_t d = 0; d < 2; ++d) {
+    auto [start, end] = shards_[gate_ti].ranges[d];
+    const uint32_t Nl_g = static_cast<uint32_t>(end - start);
+    const std::uint16_t* g_out = wv_[d * wv_W_ + 1].out;
+    for (uint32_t m = 0; m < M; ++m)
+      dashq::half_to_float_batch(g_out + (size_t)m * Nl_g,
+                                 mg.data() + (size_t)m * tg.N + start,
+                                 Nl_g);
+    auto [s2, e2] = shards_[up_ti].ranges[d];
+    const uint32_t Nl_u = static_cast<uint32_t>(e2 - s2);
+    const std::uint16_t* u_out = wv_[d * wv_W_ + 2].out;
+    for (uint32_t m = 0; m < M; ++m)
+      dashq::half_to_float_batch(u_out + (size_t)m * Nl_u,
+                                 mu.data() + (size_t)m * tu.N + s2,
+                                 Nl_u);
+  }
+  // THE PATH ANNOUNCES ITSELF, ONCE. Same shape as the decode1 arms and the
+  // L4 la_out seam: without it, a gate that compares this run's token stream
+  // against the base run's cannot tell whether the fused path ran -- the two
+  // streams are bit-identical by construction, so a vacuous arm (the wave
+  // fallback, which produces the same bytes) passes every stream check and
+  // the arm certifies nothing. This one line is what turns "the runs
+  // matched" into "the fusion ran". It is host-side, one per process, so it
+  // does not flood a 794-launches-per-token log.
+  static bool announced_gu = false;
+  if (!announced_gu) {
+    announced_gu = true;
+    std::fprintf(stderr,
+                 "[mlp-gateup] fused gate+up GEMM ACTIVE "
+                 "(Ng=%u Nu=%u K=%u group=%u scheme=%d, one launch for both)\n",
+                 Ng, Nu, tg.K, scg.group_size, (int)scg.scheme);
+  }
+  return true;
+}
+
 // Device-act GEMM seam (see engine.hpp): same FP16-act kernel as
 // run_linear_tp but the M*K activation bits come from a caller-owned device
 // buffer. Skips host FP32->FP16 convert + H2D; the dep chains after the

@@ -8,6 +8,18 @@
 # (ceil + always-red twin + interleaved ratios), so the within-run ratios are
 # trustworthy on this contended box.
 #
+# *** THE GAP THIS WAS MAPS DOES NOT EXIST. RETRACTED 2026-10-08. *** The 262 GB/s
+# clone figure is not reproducible: a fresh run of examples/roofline_probe returns
+# VACUOUS, and a saved bisect4 log from 10-06 measured the SAME clone algorithm at
+# 55.1 GB/s while the shipped arm stayed at ~40-49 GB/s in both. The clone number
+# moved 4.7x between two saved logs of the same kernel; the shipped number did not.
+# So the 6.39x was never a clone-vs-shipped ratio, it was a flaky numerator divided
+# by a stable one, and the honest ratio is 1.12x (VERBATIM 49.4, CLONE 55.1, MLP_GATE,
+# build/roofline_bisect4.log 10-06). The ladder's purpose is moot: there is no gap
+# left to close. The arms are still a valid differential probe of the shipped source's
+# cosmetic variants and the gate is live; what they can no longer claim is that they
+# are tracing a deficit. See HISTORY.md "THE 6.39x ITSELF IS NOT REPRODUCIBLE".
+#
 # WHAT IT MAY AND MAY NOT CLAIM, enforced by the gate rather than by prose:
 #   * It reports RATIOS, medians over interleaved reps. Absolute GB/s moves
 #     with box load; the interleaved ratio does not.
@@ -71,6 +83,12 @@ EOF
   exit 2
 fi
 
+if [ "$RC" -ne 0 ]; then
+  echo "FAIL: the bisect-4 probe exited rc=$RC -- it refused to run (the probe's" >&2
+  echo "      own vacuity floor fired, so no arm line exists to be 'missing')." >&2
+  exit 1
+fi
+
 need() { grep -qE "$1" "$LOG" || {
           echo "FAIL: expected '$2' in the output, and it is absent." >&2
           echo "      A missing arm is not a neutral result: the run did not measure" >&2
@@ -90,10 +108,28 @@ need 'CLONE'                 "the full int2_variant<0> transcription arm"
 need 'vs VERBATIM'           "the interleaved ratio column"
 need 'WHAT THIS RUN DOES'    "the what-this-establishes banner"
 
-if [ "$RC" -ne 0 ]; then
-  echo "FAIL: the bisect-4 probe exited rc=$RC (the twin is the likely reason)" >&2
+# *** THE VACUITY FLOOR. *** `need()` asserts that the arm strings EXIST, and on
+# this box bisect-4 prints every arm at `0.000 ms / inf GB/s / -nanx vs VERBATIM`
+# -- including the 52 MB ceiling -- and still prints RESULT: PASS. A string
+# assertion cannot see that the numbers are NaN: it certifies that the probe
+# RAN, not that it MEASURED. This floor reads the actual numeric columns and
+# refuses any run whose VERBATIM median is not a finite positive millisecond,
+# which is the one number every ratio in the table is divided by. Without it the
+# gate reports PASS for a probe that produced no measurement.
+if grep -qE 'VERBATIM +0\.000 ms' "$LOG"; then
+  echo "FAIL: the bisect-4 probe printed a ZERO VERBATIM median -- the device" >&2
+  echo "      timer reported command_start == command_end, so every GB/s and" >&2
+  echo "      ratio in the table is inf/-nan and the run measured nothing. The" >&2
+  echo "      probe itself now refuses this (zero is a failure, not a result);" >&2
+  echo "      this floor catches the case where it does not." >&2
   exit 1
 fi
+if ! grep -qE 'VERBATIM +[1-9][0-9]*\.[0-9]+ ms' "$LOG"; then
+  echo "FAIL: no finite positive VERBATIM median in the bisect-4 output -- the" >&2
+  echo "      ratios are not anchored to a real measurement." >&2
+  exit 1
+fi
+
 grep -q 'RESULT: PASS' "$LOG" || { echo "FAIL: no RESULT: PASS in the output" >&2; exit 1; }
 
 echo "ROOFLINE-BISECT4 TEST: PASS"

@@ -53,6 +53,29 @@ sleep 3600
 STUB
 chmod +x "$SB/bin/roofline_probe_bisect"
 
+# A SECOND stub: the vacuous-but-green run this box actually produces. It returns
+# rc=0, prints RESULT: PASS, and prints every arm at 0.000 ms -- the exact
+# output the old gate certified with PASS. RB-8 needs this one, because a hanging
+# probe exits UNPROVEN before any `need` is reached and so cannot test the arm
+# list or the vacuity floor.
+cat >"$SB/bin/roofline_probe_bisect_vacuous" <<'STUB'
+#!/usr/bin/env bash
+cat <<EOF
+[bisect-bisect2] device 0: Intel(R) Arc(TM) B580 Graphics  (max_compute_units=160)
+[bisect-bisect2] ceiling    0.000 ms      inf GB/s     inf% of peak
+[bisect-bisect2] twin        0.000 ms  ratio to full = -nan (linear would be 0.25)
+[bisect-bisect2] -- MLP_GATE(INT2) (N_local=8704 K=5120 g16) --
+[bisect-bisect2]   MLP_GATE(INT2)/VERBATIM     0.000 ms      inf GB/s   1.00x vs VERBATIM
+[bisect-bisect2]   MLP_GATE(INT2)/VERB+HALF    0.000 ms      inf GB/s   1.14x vs VERBATIM
+[bisect-bisect2]   MLP_GATE(INT2)/VERB+TAIL    0.000 ms      inf GB/s   1.00x vs VERBATIM
+[bisect-bisect2]   MLP_GATE(INT2)/VERB+MP      0.000 ms      inf GB/s   1.01x vs VERBATIM
+== WHAT THIS RUN DOES AND DOES NOT ESTABLISH ==
+RESULT: PASS
+EOF
+exit 0
+STUB
+chmod +x "$SB/bin/roofline_probe_bisect_vacuous"
+
 restore_gate() { cp "$GATE_PRISTINE" "$SB/gate_under_test.sh"; }
 # The gate resolves SCRIPT_DIR from its own location, so it must live beside a
 # scripts/ dir containing with_oneapi.sh and _gate_build.sh for the stub path.
@@ -67,6 +90,13 @@ setup_tree() {
   # to sit exactly where the real binary would. The first version put it at the tree
   # root and every state died on "binary missing", which reads as a gate failure.
   cp "$SB/bin/roofline_probe_bisect" \
+     "$SB/root/build/examples/roofline_probe_bisect/roofline_probe_bisect"
+}
+# Same as setup_tree, but the probe under test is the VACUOUS stub (rc=0,
+# RESULT: PASS, all arms 0.000 ms) rather than the hanging one.
+setup_vacuous_tree() {
+  setup_tree
+  cp "$SB/bin/roofline_probe_bisect_vacuous" \
      "$SB/root/build/examples/roofline_probe_bisect/roofline_probe_bisect"
 }
 patch_gate() { python3 - "$SB/root/scripts/test_roofline_bisect.sh" "$1" "$2" <<'PYX'
@@ -132,6 +162,7 @@ if [ "${1:-}" = "--list" ]; then
   echo "  RB-5  a \`need\` for an arm deleted                [must REFUSE]"
   echo "  RB-6  a \`need\` renamed to the wrong arm         [must REFUSE]"
   echo "  RB-7  pristine                                   [must hold]"
+  echo "  RB-8  a vacuous-but-green probe stub            [must REFUSE]"
   exit 0
 fi
 
@@ -207,6 +238,21 @@ state RB-5 'UNPROVEN' \
 # which is the honest finding, and is recorded rather than papered over.
 state RB-6 'UNPROVEN' \
   "need 'VERB\\+MP'" "need 'VERB\\+MP_NOT_A_REAL_ARM'"
+
+# RB-8: the vacuity floor, which the hanging stub cannot reach. This is the state
+# the whole matrix was missing and the one that matters most: a probe that RETURNS
+# rc=0 and prints RESULT: PASS while every arm is 0.000 ms. The old gate
+# certified exactly that with PASS, because `need` (string existence) and
+# `RESULT: PASS` both match vacuous output -- and that PASS is what the
+# default-ON promotion of INTFER_DECODE1_VERBHALF rests on. The stub mimics the
+# real box's vacuous run (ceiling 0.000 ms, all four arms 0.000 ms, RESULT: PASS,
+# exit 0); the gate must REFUSE it.
+total=$((total+1))
+setup_vacuous_tree
+cp "$GATE_PRISTINE" "$SB/root/scripts/test_roofline_bisect.sh"
+run_gate
+verdict RB-8 'ZERO VERBATIM median' "$GATE_OUT" $?
+restore_gate
 
 echo
 for r in "${RESULTS[@]}"; do printf '  %s\n' "$r"; done

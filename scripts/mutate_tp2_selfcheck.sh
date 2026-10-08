@@ -90,7 +90,7 @@ trap 'rm -rf "$SB"; exit 130' INT
 trap 'rm -rf "$SB"; exit 143' TERM
 SB_DIGEST_BEFORE="$(cat "$TARGET" | cksum)"
 
-total=0; caught=0; bad=0; baselines=0
+total=0; caught=0; bad=0; baselines=0; excluded=0
 declare -a RESULTS
 
 # patch_literal: exact-literal replacement, EXACTLY THREE ARGS, refuses unless
@@ -184,6 +184,14 @@ run_state() {
 }
 
 record() { total=$((total+1)); RESULTS+=("$1 $2 $3"); }
+  # EXCLUDED states are recorded separately so they do not count against the
+  # caught/total condition: an unobservable state is not a MISS, it is a state
+  # this harness cannot see, and counting it as a miss would make the matrix
+  # FAIL on a healthy tree (AUDIT #21). The population is split in the verdict
+  # so "caught == scored" is the honest condition and the excluded set is named.
+  # NOTE: record_excluded does NOT call record(), so `total` counts SCORED
+  # states only -- otherwise caught could never equal total on a healthy tree.
+  record_excluded() { excluded=$((excluded+1)); RESULTS+=("$1 EXCLUDED $2"); }
 
 if [ "${1:-}" = "--list" ]; then
   echo "states:"
@@ -200,6 +208,9 @@ if [ "${1:-}" = "--list" ]; then
   echo "  MR-11 cli_prefill returns nothing"
   echo "  SK-12  decode1_path_fired tag is ignored (matches EITHER announcement)"
   echo "  SK-13  sk_path_fired aliases the MR tag instead of its own"
+  echo "  [EXCLUDED] GU-14 gu_path_fired aliases the MR tag instead of its own -- reason at its site"
+  echo "  [EXCLUDED] GU-15 gu_arm_assert always certifies -- reason at its site"
+  echo "  [EXCLUDED] GU-16 gu_arm_assert call deleted from the arm -- reason at its site"
   exit 0
 fi
 
@@ -209,12 +220,44 @@ anchor PRED_PREFILL '  [ "$1" = "11751" ]'
 anchor PRED_TP '  grep -aq "TP=sharded" "$1"'
 anchor ARM_RETURN '  return "$ok"'
 anchor PATH_FIRED '  grep -aq "\[$2\].*ACTIVE" "$1"'
+anchor GU_PATH 'gu_path_fired() { decode1_path_fired "$1" '"'"'mlp-gateup'"'"'; }'
+anchor GU_ARM '  gu_arm_assert "$CLI_ERR" "$GATEUP_ERR" "GATE FAIL: " || PASS=0'
 preflight || exit 1
 
 echo "== baseline =="
 baseline
 
 echo "== states =="
+
+# *** GU-14..GU-16 ARE EXCLUDED, NOT SCORED, AND THIS IS THE INTERESTING ONE. ***
+# They target the gateup arm's own predicate (gu_path_fired / gu_arm_assert),
+# which lives in the half of test_tp2_27b.sh that only runs on a real 27B
+# decode. --self-check (the stubbed half) does NOT exercise it: it drives the
+# DECODE1 predicates on synthetic fixtures, and the gateup arm's self-check
+# block is gated behind the real run's rc. MEASURED: deleting gu_arm_assert's
+# call from the arm leaves --self-check at rc=0 PASS, because the stubbed half
+# never calls it. This is MR-1's shape a fourth time, and the reason is the
+# same: the only sound detector runs the arm, which needs 2 GPUs and an 18 GiB
+# 27B load, and the operator runs that (standing rule: no full-27B gate is
+# ever driven from an agent session). Per AUDIT #21 an unobservable state is
+# EXCLUDED WITH ITS REASON rather than counted, so "12/12" below is honest:
+# MR-2..MR-11 and SK-12/SK-13 are the states whose defect the stubbed
+# self-check can actually see. The gateup arm's predicate is exercised in
+# BOTH directions by its own self-check block (cases a/b/c), which is the
+# evidence this repo has for it -- it is not the same as a mutation matrix.
+# A structural grep cannot close it honestly either: gu_arm_assert's name
+# appears in this file's own comments, so a "the arm still calls it" check
+# written as a grep over this file would match its own source -- the
+# self-proving state of AUDIT #19.
+m_gu14() { patch_literal "$1" \
+  'gu_path_fired() { decode1_path_fired "$1" '"'"'mlp-gateup'"'"'; }' \
+  'gu_path_fired() { decode1_path_fired "$1" '"'"'decode1-mr'"'"'; } #GU14 wrong tag'; }
+m_gu15() { patch_literal "$1" \
+  '  return "$ok"' \
+  '  return 0 #GU15 always certifies'; }
+m_gu16() { patch_literal "$1" \
+  '  gu_arm_assert "$CLI_ERR" "$GATEUP_ERR" "GATE FAIL: " || PASS=0' \
+  '  : #GU16 arm assertion deleted'; }
 
 m_mr2() { patch_literal "$1" "$(cat "$SB/anchor_PRED_STREAMS_FULL.txt")" \
   '  [ "$1" = "$2" ] #MR2 non-empty half deleted'; }
@@ -277,6 +320,12 @@ run_state MR-10 'SELF-CHECK FAIL \(1\)' m_mr10
 run_state MR-11 'SELF-CHECK FAIL \(2\).*prefill' m_mr11
 run_state SK-12 'SELF-CHECK FAIL \(7\)' m_sk12
 run_state SK-13 'SELF-CHECK FAIL \(7\)' m_sk13
+# GU-14/15/16 are EXCLUDED, NOT SCORED -- see the note above the state list.
+# They are recorded here so the matrix's own accounting is honest about the
+# population it could not test, rather than silently omitting them.
+record_excluded GU-14 "gu_path_fired aliases the MR tag; the stubbed self-check never calls it"
+record_excluded GU-15 "gu_arm_assert always certifies; the stubbed self-check never calls it"
+record_excluded GU-16 "gu_arm_assert call deleted from the arm; the stubbed self-check never calls it"
 
 # --- residue: the tracked file must be byte-identical to HEAD ----------------
 if [ "$SB_DIGEST_BEFORE" != "$(cat "$TARGET" | cksum)" ]; then

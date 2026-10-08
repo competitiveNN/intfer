@@ -8,6 +8,20 @@
 // pushing past that trips `UR_RESULT_ERROR_OUT_OF_RESOURCES` on submit, wedging the
 // driver's xe_page_fault_work_queue (rebind required).
 //
+// *** THE GAP THIS WAS MAPS DOES NOT EXIST. RETRACTED 2026-10-08. *** The 244 GB/s
+// clone figure is not reproducible: a fresh run of examples/roofline_probe returns
+// VACUOUS, and a saved bisect4 log from 10-06 measured the SAME clone algorithm at
+// 55.1 GB/s while the shipped arm stayed at ~40-49 GB/s in both. The clone number
+// moved 4.7x between two saved logs of the same kernel; the shipped number did not.
+// So the 5.6-6.4x was never a clone-vs-shipped ratio, it was a flaky numerator
+// divided by a stable one, and the honest ratio is 1.12x. The two falsified
+// candidates above were chasing a number that was never real. This binary's
+// purpose -- closing the last cross-binary dependency by putting SHIPPED in the
+// same TU -- is moot, because the ~4.5-5x it was built to measure does not exist.
+// The arms are still a valid differential probe of the shipped source's cosmetic
+// variants and the gate is live; what they can no longer claim is that they are
+// tracing a deficit. See HISTORY.md "THE 6.39x ITSELF IS NOT REPRODUCIBLE".
+//
 // `bisect1` holds ladder-1 (`table` vs `VERBATIM`). `bisect2` holds the two arms
 // with ENGINE FLAGS (`VERB+HALF` matches `INTFER_DECODE1_VERBHALF`).
 //

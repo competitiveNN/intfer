@@ -17,6 +17,19 @@
 // the TU stays small enough to run on this box and there is no engine link that
 // can trip the level-zero resource limit.
 //
+// *** THE GAP THIS WAS MAPS DOES NOT EXIST. RETRACTED 2026-10-08. *** The 261 GB/s
+// clone figure is not reproducible: a fresh run of examples/roofline_probe returns
+// VACUOUS, and a saved bisect4 log from 10-06 measured the SAME clone algorithm at
+// 55.1 GB/s while the shipped arm stayed at ~40-49 GB/s in both. The clone number
+// moved 4.7x between two saved logs of the same kernel; the shipped number did not.
+// So the 5.6-6.4x was never a clone-vs-shipped ratio, it was a flaky numerator
+// divided by a stable one, and the honest ratio is 1.12x. The two falsified
+// candidates above were chasing a number that was never real, and the "~4.5-5x
+// remains" line below is likewise void. The arms are still a valid differential
+// probe of the shipped source's cosmetic variants and the gate is live; what they
+// can no longer claim is that they are tracing a deficit. See HISTORY.md
+// "THE 6.39x ITSELF IS NOT REPRODUCIBLE".
+//
 // THE ARMS, each differing from `VERBATIM` in EXACTLY ONE PLACE:
 //
 //   VERBATIM    the SHIPPED source text, transcribed. Baseline for all arms here.

@@ -516,6 +516,16 @@ struct LinearBackend {
     (void)mg; (void)mu; (void)md; (void)M;
     return false;
   }
+  // Fused gate+up GEMM, TP=2: one launch carries both GEMMs sharing the
+  // activation vector; bit-exact vs two separate calls. Default returns
+  // false (caller keeps the wave); GPU overrides when legal.
+  virtual bool run_mlp_gateup(const std::string& gate, const std::string& up,
+                             const std::vector<float>& rin,
+                             std::vector<float>& mg, std::vector<float>& mu,
+                             uint32_t M) {
+    (void)gate; (void)up; (void)rin; (void)mg; (void)mu; (void)M;
+    return false;
+  }
   // SpinQuant rotation for this tensor (right-site for q/k/v/gate/up;
   // left-site for o/down; nullptr if no rotation).
   virtual const Rotation* rot_for(const std::string& tensor_name) = 0;
@@ -1187,8 +1197,24 @@ struct GpuBackend : public LinearBackend {
     // Fused path ran: mg/mu host vectors intentionally NOT filled (their
     // only consumers are the silu-mul folded into the device chain and
     // trace-gated ckpts, which route to the host path above).
-    (void)mg; (void)mu;
     return true;
+  }
+  // Fused gate+up GEMM, TP=2: one launch carries both GEMMs sharing the
+  // activation vector; bit-exact vs two separate calls. Returns true when
+  // the fused path ran (mg/mu filled). Trace runs always take the host
+  // path so ckpts see real mg/mu.
+  bool run_mlp_gateup(const std::string& gate, const std::string& up,
+                      const std::vector<float>& rin,
+                      std::vector<float>& mg, std::vector<float>& mu,
+                      uint32_t M) override {
+    if (!eng) return false;
+    build_index();
+    auto itg = ti_cache.find(gate);
+    auto itu = ti_cache.find(up);
+    if (itg == ti_cache.end() || itu == ti_cache.end()) return false;
+    int L = Engine::layer_of_name(gate);
+    if (L >= 0 && L != cur_layer_) { eng->begin_layer(L); cur_layer_ = L; }
+    return eng->run_mlp_gateup(itg->second, itu->second, rin, mg, mu, M);
   }
 
   // Cached lm_head INT8 upload + per-row-symmetric INT8 GEMM on device.
@@ -5093,14 +5119,18 @@ static StepOut step(Request& req, int token, int pos,
     // filled). Fused path leaves mg/mu unfilled — their only consumers
     // below are trace-gated (which force the host path).
     if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, rin, mg, mu, md, 1)){
-      // Wave: gate/up share the rin input and are independent — one engine
-      // call, one host round-trip. Bit-identical to two run_linear_into.
-      {
-        LinearBackend::LinearWaveItem items[2] = {
-          {ln.gate, &rin, &mg},
-          {ln.up, &rin, &mu},
-        };
-        backend->run_linear_wave(items, 2);
+      // Fused gate+up (TP=2): one launch carries both GEMMs, each output's
+      // K accumulation untouched, so bit-exact vs two separate calls.
+      if(!backend->run_mlp_gateup(ln.gate, ln.up, rin, mg, mu, 1)){
+        // Wave: gate/up share the rin input and are independent — one engine
+        // call, one host round-trip. Bit-identical to two run_linear_into.
+        {
+          LinearBackend::LinearWaveItem items[2] = {
+            {ln.gate, &rin, &mg},
+            {ln.up, &rin, &mu},
+          };
+          backend->run_linear_wave(items, 2);
+        }
       }
       ckpt("mlp.gate", L, mg);
       ckpt("mlp.up", L, mu);
@@ -5584,13 +5614,16 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       std::vector<float>& md = req.scratch.md;
       // Fused MLP (device chain on TP=1, else host path below).
       if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, rin, mg, mu, md, 1)){
-      // Wave: gate/up share rin and are independent — one host round-trip.
-      {
-        LinearBackend::LinearWaveItem items[2] = {
-          {ln.gate, &rin, &mg},
-          {ln.up, &rin, &mu},
-        };
-        backend->run_linear_wave(items, 2);
+      // Fused gate+up (TP=2): one launch, bit-exact vs two calls.
+      if(!backend->run_mlp_gateup(ln.gate, ln.up, rin, mg, mu, 1)){
+        // Wave: gate/up share rin and are independent — one host round-trip.
+        {
+          LinearBackend::LinearWaveItem items[2] = {
+            {ln.gate, &rin, &mg},
+            {ln.up, &rin, &mu},
+          };
+          backend->run_linear_wave(items, 2);
+        }
       }
       for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
       backend->run_linear_into(ln.down, mg, md);
@@ -5800,12 +5833,15 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       // run_linear_batch.
       // Fused MLP (device chain on TP=1, else host path below).
       if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, c_rin, c_mg, c_mu, c_md, (uint32_t)M)){
-      {
-        LinearBackend::LinearWaveBatchItem items[2] = {
-          {ln.gate, &c_rin, &c_mg},
-          {ln.up,   &c_rin, &c_mu},
-        };
-        backend->run_linear_wave_batch(items, 2, (uint32_t)M);
+      // Fused gate+up (TP=2): one launch, bit-exact vs two calls.
+      if(!backend->run_mlp_gateup(ln.gate, ln.up, c_rin, c_mg, c_mu, (uint32_t)M)){
+        {
+          LinearBackend::LinearWaveBatchItem items[2] = {
+            {ln.gate, &c_rin, &c_mg},
+            {ln.up,   &c_rin, &c_mu},
+          };
+          backend->run_linear_wave_batch(items, 2, (uint32_t)M);
+        }
       }
       for(int m=0; m<M; m++){
         float* mgr = &c_mg[(size_t)m*cfg.inter];
@@ -6135,15 +6171,18 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       }
       // Fused MLP (device chain on TP=1, else host path below).
       if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, c_rin_la, c_mg, c_mu, c_md_la, (uint32_t)M)){
-      // Wave-batch: gate/up share c_rin_la and are independent — one
-      // engine call, one host round-trip. Bit-identical to two
-      // run_linear_batch.
-      {
-        LinearBackend::LinearWaveBatchItem items[2] = {
-          {ln.gate, &c_rin_la, &c_mg},
-          {ln.up,   &c_rin_la, &c_mu},
-        };
-        backend->run_linear_wave_batch(items, 2, (uint32_t)M);
+      // Fused gate+up (TP=2): one launch, bit-exact vs two calls.
+      if(!backend->run_mlp_gateup(ln.gate, ln.up, c_rin_la, c_mg, c_mu, (uint32_t)M)){
+        // Wave-batch: gate/up share c_rin_la and are independent — one
+        // engine call, one host round-trip. Bit-identical to two
+        // run_linear_batch.
+        {
+          LinearBackend::LinearWaveBatchItem items[2] = {
+            {ln.gate, &c_rin_la, &c_mg},
+            {ln.up,   &c_rin_la, &c_mu},
+          };
+          backend->run_linear_wave_batch(items, 2, (uint32_t)M);
+        }
       }
       for(int m=0; m<M; m++){
         float* mgr = &c_mg[(size_t)m*cfg.inter];

@@ -101,6 +101,15 @@ mr_path_fired() { decode1_path_fired "$1" 'decode1-mr'; }
 # to drift untested. Both flags go through decode1_path_fired; both arms go
 # through the same assertion function below.
 sk_path_fired()  { decode1_path_fired "$1" 'decode1-splitk'; }
+# *** FOURTH FLAG, SAME TWO HOMES. *** INTFER_FUSED_GATE_UP is not a flag the
+# operator sets -- it is the DEFAULT TP=2 MLP path -- but it is exactly the
+# same audit-#3 shape: a fusion whose output is bit-identical to the wave
+# fallback it replaces, so "the two runs matched" certifies nothing unless
+# something proves the fusion RAN. It goes through the same two homes
+# (decode1_path_fired for the predicate, decode1_arm_assert for the arm) so
+# it cannot drift from the rule the other three flags are held to.
+gu_path_fired() { decode1_path_fired "$1" 'mlp-gateup'; }
+gu_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'mlp-gateup' 'FUSED_GATE_UP'; }
 # Third flag through the SAME two homes. INTFER_DECODE1_SUBGROUP is a
 # reassociation of the same block-cyclic body, so its arm must be held to
 # the identical rule -- prefill, ids, TP=sharded and a path that announces
@@ -764,3 +773,97 @@ done
 
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
 if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi
+
+# --- INTFER_FUSED_GATE_UP: gate+up in a single launch (TP=2 fusion) ------
+# 1.2 of PLAN.md. Gate and up are both column-parallel over the SAME split and
+# device-local, so one parallel_for over Ng+Nu outputs is bit-exact vs two
+# separate quant_gemm_forward_usm calls: each output keeps its own accumulator,
+# ascending kg, ascending j, its own group scale and wtab. Saves one submit +
+# one wait + one D2H readback per device per token vs the wave path. The
+# engine declines (returns false) on TP=1, DPAS48 items, mismatched K/group/
+# scheme, or M>1, and the caller falls back to the wave -- so this arm is
+# reachable only on the 27B TP=2 model, which is the gate that carries INT2.
+GATEUP_OUT="$LOG.gateup.out"; GATEUP_ERR="$LOG.gateup.err"
+"$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$GATEUP_OUT" 2>"$GATEUP_ERR"; GATEUP_RC=$?
+if [ "$GATEUP_RC" -ne 0 ]; then
+  echo "GATE FAIL: fused gate+up run exited rc=$GATEUP_RC" >&2
+  tail -20 "$GATEUP_ERR" >&2
+  PASS=0
+else
+  echo "FUSED_GATE_UP prefill: $(cli_prefill "$GATEUP_ERR") (expect 11751)"
+  echo "FUSED_GATE_UP ids:      $(cli_ids "$GATEUP_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  # The fused path is NOT a flag the operator sets; it is the default TP=2 MLP
+  # path. The arm's value is the token stream, which must equal the base run's
+  # stream -- that is what rp_arm_assert checks. A vacuous arm would also pass
+  # that, so the DISARMAMENT is structural: run_linear_wave_batch is the
+  # fallback, and this arm only certifies that the fallback was NOT taken.
+  # Asserting that explicitly is what turns "the two runs matched" into "the
+  # fused path ran". The engine prints [mlp-gateup] ... ACTIVE exactly once
+  # when it accepts the fusion, so the arm asserts that line is present AND
+  # the streams agree -- which is what makes this arm GATED rather than
+  # REPORTED. (It was REPORTED in the first version because the engine printed
+  # nothing on success and the two streams alone could not separate a real
+  # fusion from the wave fallback.)
+  if ! grep -aFq '[mlp-gateup] fused gate+up GEMM ACTIVE' "$GATEUP_ERR" 2>/dev/null; then
+    echo "GATE FAIL: the fused gate+up path never ran (no [mlp-gateup] ACTIVE" >&2
+    echo "         line in the stderr log); the run fell back to the wave and" >&2
+    echo "         this arm is vacuous." >&2
+    PASS=0
+  fi
+  gu_arm_assert "$CLI_ERR" "$GATEUP_ERR" "GATE FAIL: " || PASS=0
+  # *** SELF-CHECK FOR THIS ARM. *** The same shape as the decode1 self-check
+  # block above, and for the same reason: this arm's predicate (the ACTIVE line)
+  # is the ONLY thing standing between a vacuous wave-fallback run and a PASS,
+  # and a predicate must be exercised in BOTH directions. Three cases:
+  #   (a) the healthy direction -- a log that carries the line must certify;
+  #   (b) the refusal direction -- a healthy stream with the line removed must
+  #       be refused, and ONLY for that reason (so a refusal can be isolated);
+  #   (c) the empty log must be refused (vacuity).
+  # The fixtures are built from the REAL log by deleting exactly one line,
+  # so (b) cannot accidentally fail for a different reason -- same lesson as
+  # the decode1 fixtures, which were rewritten when a hand-written negative
+  # drifted into being a valid log and the refusal case passed for the wrong
+  # reason. The healthy stream for (b) is the real run's own ids, so (b) also
+  # pins the stream half of the arm against a known-good oracle.
+  GU_ANNOUNCE='[mlp-gateup] fused gate+up GEMM ACTIVE'
+  # The self-check temp dir is cleaned by the EXIT trap below, NOT by its own
+  # trap: bash replaces traps rather than stacking them, so a second
+  # `trap 'rm -rf "$SB2"' EXIT` would WIPE the trap that keeps *_OUT/*_ERR
+  # around on failure. The EXIT trap is rewritten here to name both dirs.
+  SB2="$(mktemp -d)"
+  cp "$GATEUP_OUT" "$SB2/gu_good.out"; cp "$GATEUP_ERR" "$SB2/gu_good.err"
+  cp "$GATEUP_OUT" "$SB2/gu_not.out"; cp "$GATEUP_ERR" "$SB2/gu_not.err"
+  sed -i '/\[mlp-gateup\]/d' "$SB2/gu_not.err"
+  : >"$SB2/gu_empty.out"; : >"$SB2/gu_empty.err"
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR"; fi' EXIT
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR"; fi; exit 130' INT
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR"; fi; exit 143' TERM
+  gu_ids() { cli_ids "$1" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//'; }
+  gu_good_ids="$(gu_ids "$SB2/gu_good.out")"
+  gu_not_ids="$(gu_ids "$SB2/gu_not.out")"
+  [ "$gu_good_ids" = "$gu_not_ids" ] || { echo "GATE FAIL: self-check (b) fixture builder changed the stream" >&2; PASS=0; }
+  [ -n "$gu_good_ids" ] || { echo "GATE FAIL: self-check (b) fixture has no ids" >&2; PASS=0; }
+  grep -aFq "$GU_ANNOUNCE" "$SB2/gu_good.err" \
+    || { echo "GATE FAIL: self-check (a) healthy fixture has no ACTIVE line" >&2; PASS=0; }
+  grep -aFq "$GU_ANNOUNCE" "$SB2/gu_not.err" \
+    && { echo "GATE FAIL: self-check (b) the line survived the sed deletion" >&2; PASS=0; }
+  # (a) healthy direction: the real run's own pair must certify.
+  gu_arm_assert "$SB2/gu_good.out" "$SB2/gu_good.err" "SELFTEST (a) arm-refusal: " \
+    || { echo "GATE FAIL: self-check (a) the arm REFUSED its own healthy run" >&2; PASS=0; }
+  # (b) refusal direction: a healthy stream with the line removed must be
+  # refused, and the refusal must be about the line -- so drive the ACTIVE
+  # grep directly rather than through the arm, which would also refuse on
+  # the stream half and mask which predicate fired.
+  if grep -aq "$GU_ANNOUNCE" "$SB2/gu_not.err"; then
+    echo "GATE FAIL: self-check (b) the arm ACCEPTED a run whose gateup path never fired" >&2; PASS=0
+  fi
+  gu_arm_assert "$SB2/gu_not.out" "$SB2/gu_not.err" "SELFTEST (b) arm-refusal: " \
+    && { echo "GATE FAIL: self-check (b) the arm ACCEPTED a vacuous run" >&2; PASS=0; }
+  # (c) empty log must be refused.
+  if grep -aq "$GU_ANNOUNCE" "$SB2/gu_empty.err"; then
+    echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log" >&2; PASS=0
+  fi
+  gu_arm_assert "$SB2/gu_empty.out" "$SB2/gu_empty.err" "SELFTEST (c) arm-refusal: " \
+    && { echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty pair (vacuity)" >&2; PASS=0; }
+fi

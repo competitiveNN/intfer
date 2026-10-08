@@ -162,9 +162,53 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                       gemm::WeightScheme scheme,
                                       const sycl::event& copy_dep);
 
-// ---------------------------------------------------------------------------
-// FUSED INDEPENDENT-GEMM LAUNCH (INTFER_FUSED_DECODE1) -- REMOVED 2026-10-04.
-// ---------------------------------------------------------------------------
+                                      // ---------------------------------------------------------------------------
+                                      // FUSED GATE+UP GEMM (INTFER_FUSED_GATE_UP). TP=2-only fusion.
+                                      // ---------------------------------------------------------------------------
+                                      // One launch computes TWO independent GEMMs that share the SAME activation
+                                      // vector (the MLP gate and up projections both read `rin`). In the current
+                                      // TP=2 MLP path each is a separate wave item, so the host pays 2 submits +
+                                      // 2 waits + 2 D2H readbacks per device per token just to run them. This
+                                      // fuses them into ONE parallel_for over N = Ng + Nu output elements: the
+                                      // activation is loaded once per work-item and two independent FMA chains
+                                      // (one per output) run against it, so the work-item count is the UNION of
+                                      // the two GEMMs' Ns rather than their sum and the launch count halves.
+                                      //
+                                      // WHY THIS IS THE ONLY FUSION THAT SURVIVES TP=2. The two existing fusion
+                                      // seams (run_mlp_fused engine.cpp:1451, run_linear_tp_devact engine.cpp:1588)
+                                      // are TP=1 ONLY, and at the target they are dead code. TP slices the OUTPUT
+                                      // dim N, so gate/up produce only device d's slice of `inter` while `down` has
+                                      // K = the FULL inter and needs the other device's slice; the intermediate
+                                      // must cross the host and there is no P2P. Gate and up are BOTH
+                                      // column-parallel over the SAME split, both device-local, and each output's
+                                      // K accumulation is untouched, so this is bit-exact -- the one TP=2-valid
+                                      // fusion in the tree.
+                                      //
+                                      // NUMERICS. Bit-exact by construction: each output keeps its own accumulator,
+                                      // ascending kg, ascending j, its own group scale, its own wtab. The two
+                                      // chains are interleaved in the INSTRUCTION STREAM, never summed together,
+                                      // which is the same argument ROWPAIR uses (and ROWPAIR is measured, not
+                                      // argued: scripts/test_rowpair_equiv.sh, 227 835 INT2 values bitwise).
+                                      // No reassociation, no tolerance contract.
+                                      //
+                                      // CONTRACT. out_g and out_u are separate buffers (M*Ng and M*Nu FP16 bits);
+                                      // the caller assembles them into the host vectors. gate/up MUST share K and
+                                      // group_size; Ng and Nu may differ. Returns the event; caller waits once.
+                                      sycl::event quant_gemm_forward_usm_gateup(
+                                          sycl::queue& q,
+                                          std::uint16_t* act_usm,                 // shared M*K FP16 activation
+                                          const void* code_g, const std::uint16_t* scale_g, float alpha_g,
+                                          std::uint16_t* out_g,                   // M*Ng FP16 output (gate)
+                                          const void* code_u, const std::uint16_t* scale_u, float alpha_u,
+                                          std::uint16_t* out_u,                   // M*Nu FP16 output (up)
+                                          uint32_t M, uint32_t Ng, uint32_t Nu, uint32_t K,
+                                          uint32_t group_size,
+                                          gemm::WeightScheme scheme_g, gemm::WeightScheme scheme_u,
+                                          const sycl::event& copy_dep);
+
+                                      // ---------------------------------------------------------------------------
+                                      // FUSED INDEPENDENT-GEMM LAUNCH (INTFER_FUSED_DECODE1) -- REMOVED 2026-10-04.
+                                      // ---------------------------------------------------------------------------
 // THERE IS NO SUCH API HERE, AND THE HEADER PREVIOUSLY ADVERTISED ONE. The
 // fused decode launch shipped in 0961035 and was reverted in 776ef33 because it
 // broke 27B decode catastrophically (1284 ms -> 231,114 ms per token), isolated
