@@ -113,29 +113,50 @@ struct Arm {
 // DIAG line prints med/min/max of the difference and cannot separate them,
 // so the raw values are needed. Not a gate subject -- a diagnostic only, and
 // it exits after the ceiling arm so it never writes a reportable table.
+//
+// *** RESOLVED 2026-10-08: THE PROFILING IS DISABLED, NOT THE KERNEL. ***
+// The raw dump now prints submit/start/end and the two deltas. Measured on
+// this box, for the 52 MB shared-allocator ceiling arm:
+//
+//   RAW submit=184192938721938 start=184192938721938 end=184192938721938
+//       start-submit=0 end-start=0 ns
+//   RAW rep 1 sink=16655032
+//
+// Three facts together, and each was isolated before it was believed:
+//   * submit == start == end for EVERY rep, so the driver records three
+//     identical timestamps per command -- it is not a sub-microsecond
+//     kernel and it is not clock wrap (the values are monotonic across
+//     reps, ~60 ms apart, i.e. real device up time);
+//   * the sink reads 16655032 after q.wait(), so the kernel EXECUTED and
+//     wrote 52 MB of non-constant data to device memory;
+//   * three wait orderings were tried (read-then-wait, e.wait()-then-read,
+//     q.wait()-then-read) and all returned the same 0 ns, so it is not an
+//     ordering artifact.
+//
+// So the queue's enable_profiling property is accepted (timestamps are
+// recorded) but the driver records no duration for these commands. The
+// probe cannot measure a kernel it cannot time, and the vacuity guard is
+// the correct behaviour -- it refuses rather than substituting a host
+// timer, which is load-sensitive and would have produced a "ceiling" that
+// is really a CPU number.
+//
+// *** AND A CAVEAT ON WHAT THIS PROVES. *** The engine's own counter
+// (engine.cpp:1206, same get_profiling_info spelling, same enable_profiling
+// queue) is reported as real in a log that is NOT in this repo (perf_base.err,
+// archived). AGENTS.md's standing rule is to re-derive, not to remember, and
+// that number cannot be re-derived from this tree -- so the claim that "the
+// engine's instrument ticks on this box" is UNVERIFIED HERE, and this probe's
+// zero is NOT evidence that the engine's is also zero. The two could differ
+// on a launch shape the probe never exercises. Recorded rather than quietly
+// dropped, because a diagnostic that cites an artifact it cannot open is the
+// same failure as a gate that cites a tally it did not re-derive.
 static bool g_raw = false;
 double timed_ms(sycl::queue& q, std::vector<sycl::event> evs) {
-  // *** WAIT FIRST. *** MEASURED 2026-10-08: reading profiling info before the
-  // event completed returned command_start == command_end for every rep --
-  // the raw timestamps were real and monotonic (device up time) but each
-  // command's duration was exactly 0 ns. The engine's own counter
-  // (engine.cpp:1206) waits on kernel_events and THEN reads profiling; this
-  // probe read first and then waited. Same queue, same allocator, same
-  // get_profiling_info spelling -- the ordering was the only difference, and
-  // on this driver an uncompleted event reports its start as its end.
-  // The engine waits on each event and THEN reads profiling (engine.cpp:1197
-  // `for (auto& e : kernel_events) e.wait()` then :1206 get_profiling_info),
-  // and its kernel buckets are real on this box. The probe's original ordering
-  // read first and then waited, and that is the only structural difference.
-  // A first attempt to swap it used a COPY of the event vector and the kernel
-  // then failed to write the sink -- so the ordering was not the only variable
-  // and the test was inconclusive. This version waits on the ORIGINAL events,
-  // exactly as the engine does, and reports whether the sink was written and
-  // whether the durations are non-zero in the same run.
-  // Pass by value: the caller always passes a one-element temporary ({e}), and
-  // this SYCL's event::wait() is not const-qualified, so a const reference
-  // cannot call it.
-  for (auto& e : evs) e.wait();
+  // q.wait() BEFORE the read. Three orderings were tried (read-then-wait,
+  // e.wait()-then-read, q.wait()-then-read) and all returned the same 0 ns
+  // for every rep, so the zero is not an ordering artifact -- see the header
+  // note above for the full isolation.
+  q.wait_and_throw();
   std::uint64_t t0 = 0, t1 = 0;
   for (const auto& e : evs) {
     try {
@@ -145,8 +166,14 @@ double timed_ms(sycl::queue& q, std::vector<sycl::event> evs) {
       return -1.0;   // profiling unavailable: the caller must not report a number
     }
     if (g_raw) {
-      std::printf("[roofline] RAW command_start=%llu command_end=%llu diff=%llu ns\n",
-                  (unsigned long long)t0, (unsigned long long)t1,
+      std::uint64_t ts = 0;
+      try { ts = e.get_profiling_info<sycl::info::event_profiling::command_submit>(); }
+      catch (...) { ts = static_cast<std::uint64_t>(-1); }
+      std::printf("[roofline] RAW submit=%llu start=%llu end=%llu "
+                  "start-submit=%llu end-start=%llu ns\n",
+                  (unsigned long long)ts, (unsigned long long)t0,
+                  (unsigned long long)t1,
+                  (unsigned long long)(t0 - ts),
                   (unsigned long long)(t1 - t0));
     }
   }
@@ -573,7 +600,29 @@ int main(int argc, char** argv) {
                                           K, N, sink)
                        : stream_kernel<64>(q, static_cast<const std::uint16_t*>(p),
                                            K, N, sink);
+          // *** ISOLATE THE TWO HYPOTHESES. *** MEASURED 2026-10-08: with
+          // `timed_ms` reading profiling BEFORE waiting, the sink came back 0
+          // and the durations came back 0 ns. Those two facts have DIFFERENT
+          // explanations and the vacuity guard conflates them: "sink == 0" is
+          // "the launch never ran" and "diff == 0" is "profiling is disabled".
+          // Reading the sink immediately after an explicit wait, before any
+          // profiling call, separates them -- if the sink is non-zero here the
+          // kernel executed and the zero duration is a profiling problem; if
+          // it is still zero the kernel never reached the device.
+          // *** THE SINK IS A RED HERRING. *** MEASURED 2026-10-08: after e.wait()
+          // alone the sink read 0, and the vacuity guard refused the run on
+          // that basis. Adding q.wait() before the read made the sink
+          // 16655032 -- the kernel HAD executed -- while the command
+          // duration stayed exactly 0 ns. So the sink was never the defect:
+          // e.wait() and q.wait() are not equivalent on this driver, and the
+          // zero was always a profiling problem, not a launch problem.
+          // timed_ms() does its own q.wait() before reading, so the sink is
+          // read AFTER that wait and the kernel runs once per rep.
           double ms = timed_ms(q, {e});
+          q.wait();
+          sink0 = sink[N / 2];
+          if (g_raw)
+            std::printf("[roofline] RAW rep %d sink=%u\n", r, sink0);
           if (ms < 0) {
             std::fprintf(stderr,
                          "[roofline] FAIL: device event profiling unavailable, so no\n"
