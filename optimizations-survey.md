@@ -1,6 +1,6 @@
 # Intel Arc GPU Optimizations Survey (llama.cpp SYCL, vllm-xpu-kernels, sgl-kernel-xpu)
 
-Date: 2026-10-07
+Date: 2026-10-07, reframed 2026-10-08 against this C++ SYCL tree (2x B580, TP=2 target)
 Source: cloned HEAD of all three repos, surveyed source tree
 
 ---
@@ -85,62 +85,98 @@ Source: cloned HEAD of all three repos, surveyed source tree
 
 ---
 
-## 5. What cannot be done in pure Julia (oneAPI.jl v2.6.2 + KernelAbstractions v0.9.43)
+## 5. What this means for intfer (C++ SYCL, 2x B580, TP=2 target)
 
-### Cannot (no Julia binding / KA feature)
+This tree is C++ SYCL, so unlike the Julia framing this section replaces,
+almost everything surveyed is the SAME language -- the question is never
+"is there a binding" but "does it have a consumer at TP=2 and does it survive
+the measured dead ends in AGENTS.md".
 
-1. **DPAS/XMX matrix-core intrinsics** (`XE_DPAS_TT`, `XE_BDPAS_TT`, `XE_8x16x16_*`)
-   - Exposed only via `sycl::ext::intel::esimd::matrix` / `sycl_ext_oneapi_matrix`
-   - KA emits SPIR-V scalars/vectors; **no `@mma` concept**
-   - This is the entire throughput bottleneck for matmul-bound LLM inference
+### 5.1 Already in the tree (same technique, own implementation)
 
-2. **CUTLASS infrastructure** (`TiledMMA`, `block_2d_copy`, `xe_split_barrier`, fused epilogues)
-   - C++ template library; no Julia binding exists
-   - Replicating in KA would require rewriting tens of thousands of lines of tiled-GEMM machinery
-
-3. **oneDNN primitives** (`dnnl_matmul_w4a4_fp4`, `dnnl_matmul_w8a16_fp8`, etc.)
-   - Verified: `isdefined(oneAPI, :oneDNN)` is `false` in oneAPI.jl v2.6.2
-   - Only oneMKL is bound (`oneAPI.oneMKL.gemm` ✅)
-
-4. **SLM async-block-prefetch K-pipeline**
-   - `make_block_2d_prefetch` + `barrier_arrive/wait` overlap is CUTLASS-specific
-   - KA has `@localmem`/`SharedMemory` and `@synchronize`, but no async copy + split-barrier primitive
-
-5. **Portable sub-group shuffle inside `@kernel`**
-   - oneAPI.jl exports `sub_group_shuffle_xor` / `sub_group_barrier` at the host level
-   - KA has **no `@subgroup`** intrinsic; cannot write shuffle-based reductions in portable KA kernels
-
-6. **FP4/MXFP4 4-bit XMX matmul**
-   - Hardware-only path (`XE_BDPAS_TT` on MXFP4); no Julia package has a 4-bit matmul path
-
-7. **GRF pressure tuning** (`sycl::ext::intel::experimental::grf_size_properties`)
-   - No Julia hook; C++ repos tune per-thread register allocation explicitly
-
-8. **Async USM + SYCL graphs** (`ext_oneapi_async_memory_alloc`)
-   - llama.cpp's async-alloc path; not surfaced by oneAPI.jl
-
-### Already doable (or done in Inferno.jl)
-
-| # | Optimization | Status in Inferno |
+| External technique | intfer equivalent | Where |
 |---|---|---|
-| 1 | Element-wise kernels (activation, norm, RoPE) | `FusedKernels.jl` `@kernel` ✅ |
-| 2 | Chunked reductions + host fold | `FusedKernels.jl` (per-thread ≤ 32, host reduce) ✅ |
-| 3 | `oneMKL.gemm` for BF16/FP16/FP32 matmul | `oneAPI.oneMKL.gemm` available; **NOTE:** carries known matmul precision-divergence issue (AGENTS.md: 24-layer forward diverged on matmul precision, Apr 2026) |
-| 4 | Shared-mem scratch (SLM) for small tiles | KA `@localmem` / `Scratchpad` ✅ |
-| 5 | BF16/FP16 bit reinterpret | Pure Julia (`UInt16 → UInt32<<16 → Float32`) ✅ |
-| 6 | CPU quantized matvec | `QuantsCPU.jl`/`QuantMV.jl` ✅ |
+| Hand-written XMX/DPAS GEMM (vllm/sgl `XE_DPAS_TT`) | ESIMD `xmx` DPAS kernels (`dpas48`, `dpas48_2d`/`tiled` E4, `dpas4_row`, `dpas_s8w` lm_head, `dpas_int8`) | `src/gemm/quant_gemm.cpp:1971-2597`, `include/intfer/gemm/quant_gemm.hpp:376-512` |
+| Quantized matvec, dequant-on-the-fly, sg=16 (llama `dmmv`/`mmq`) | M=1 INT2/INT4 decode GEMV (`gemm_usm_decode1_vec` family + VERBHALF/VERBMP/VERBSEL/VERBVEC arms) | `src/gemm/quant_gemm.cpp` (`INTFER_DECODE1_*`) |
+| Sub-group xor warp reduction (llama `permute_sub_group_by_xor`) | Tried as `INTFER_DECODE1_SUBGROUP` (`reduce_over_group` xor butterfly, no `local_accessor`/barrier) -- QUARANTINED, numerically wrong, cause unlocated | AGENTS.md "QUARANTINED, not fixed" |
+| SLM staging for tiled GEMM | Prefill tiled kernels stage `sA`/`sW` in `local_accessor<uint16_t>` (`kBM x kBK`) | `src/gemm/quant_gemm.cpp:1737-1911` |
+| Flash attention, FP16 + quantized KV | `flash_attention_forward_f16`, `flash_attention_forward_int8_kv` (groupwise INT8 KV) | `src/attention/flash_attention.cpp`, `include/intfer/attention/flash_attention.hpp` |
+| Sub-group width 16 on Intel | `kThr=16`, queried `SUB_GROUP_SIZE==16` inside a kernel | `src/gemm/quant_gemm.cpp:64`, `examples/roofline_probe` |
+| BF16/FP16 bit reinterpret | `from_half_bits` scalar twiddle vs `bit_cast<half>` (VERBHALF arm) | `src/gemm/quant_gemm.cpp` (`INTFER_DECODE1_VERBHALF`) |
+| Quantized weight family | INT2 G=16/32, INT4 G=64, INT8 G=32, FP16 escape via SpinQuant -> DASH-Q -> RCO | `src/quant/{spinquant,dashq,rco,quant_spec}.cpp` |
+| Fused producer->consumer (epilogue fusion spirit) | `run_mlp_fused`, `la_out_fused` via `run_linear_tp_devact` -- **TP=1 ONLY**, dead code at TP=2 | `src/engine/engine.cpp:1352,1484` |
+
+### 5.2 Directly portable (same language, no new dependency)
+
+* **`block_load<uint8_t,128>` for the INT2 weight stream** (llama `ggml-sycl/esimd.hpp`
+  `mac_pair`, copied in-tree as the comment at `quant_gemm.cpp:396`). The one genuinely
+  new idea from the deleted draft (`quant_gemm.cpp:457-465`): 8 B/lane at sg=16, one
+  block load per 32 codes. Named next experiment with a pre-committed kill criterion
+  (< 2x closes it, because it also closes llama's `block_load` direction for INT2).
+* **SLM work-stealing tile scheduler** (vllm/sgl `TileScheduler`, one `atomicAdd` per
+  tile-chunk). Per-device, so TP-compatible; applies to the prefill tiled kernels where
+  the device is saturated, NOT to M=1 decode (one output per work-item, nothing to steal).
+* **Split-barrier / barrier-free reduction shape.** SYCL here has no `xe_split_barrier`
+  without CUTLASS, but the SUBGROUP direction is exactly this shape (xor butterfly, no
+  `local_accessor`, no `it.barrier`) -- quarantined, not refuted as a shape. Any retry
+  inherits its numerics contract (stream-identity on 27B TP=2) and its cause-unlocated
+  status.
+* **Multi-split decode attention tiles** (vllm/sgl paged/FMHA decode). Applicable to the
+  attention tail only -- layer GEMMs are 99% of launches, so this is low priority at target.
+* **oneMKL `gemm` fallback for large contiguous FP16** (llama `ggml-sycl.cpp:3115` shape).
+  Zero oneMKL linkage in the tree today (verified: no `dnnl`/`onemkl`/`mkl::` ref in
+  `src`/`include`/`examples`), so this is a link-only change, testable on the host side.
+  Needs the same stream-identity contract every GEMM change needs.
+
+### 5.3 Portable only with a new dependency or a new quant tier (major work)
+
+* **oneDNN matmul** (llama's ACTUAL XMX path -- `DnnlGemmWrapper`, ref-impl rejection).
+  New dependency, new dispatch layer, and a precision contract: this repo has a measured
+  matmul-precision divergence history, so a tolerance-based numerics gate comes BEFORE code.
+* **CUTLASS `TiledMMA` / `block_2d_copy` / `xe_split_barrier` / fused epilogues**
+  (the vllm/sgl substrate under `XE_DPAS_TT`/`XE_BDPAS_TT`). No CUTLASS in tree; porting
+  means importing tens of kLOC of tiled-GEMM machinery, not cherry-picking one kernel.
+* **FP8 / MXFP8 / FP4 / MXFP4 activation+weight paths** (`quantization/`, `moe/*`, Xe3
+  `XE_BDPAS_TT`). No consumer: `quant_spec.cpp` tops out at INT8/FP16 and no gate model
+  carries FP8/FP4 tensors. Needs quant + RCO + kernels + a numerics contract, in that order.
+* **MoE / MLA / GDN / HiSparse / LoRA / MQA-logits / HC-prefill** (sgl `kernels/` tree).
+  No model in any gate uses them; out of scope for the 27B target.
+* **Xe2/Xe3 dispatch trees.** Single-arch target (2x B580, Xe2); the Xe3 half has no device
+  here. Skip.
+* **Async USM alloc** (llama `ext_oneapi_async_memory_alloc`). Alloc-path, NOT launch-path:
+  distinct from the retired SYCL-command-graph direction (19.7 us vs 11.9 us, dead).
+
+### 5.4 Surveyed but already measured dead HERE -- do not retry as-is
+
+| Technique (external name) | Local verdict |
+|---|---|
+| Command-graph capture of decode step (`engine.hpp:12-28` still describes it) | 19.7 us vs 11.9 us plain submit. Dead |
+| Enforced XMX/DPAS for all linears | `INTFER_DPAS48` net loss at M=1/128/361. Default OFF is the verdict |
+| More outputs per work-item at M=1 | `INTFER_DECODE1_MR`, 2.3x slower. Closed |
+| Split-K with `local_accessor` + barrier | `INTFER_DECODE1_SPLITK`, +43.8% kernel. Closed; the barrier is the named cause |
+| Fused multi-GEMM via extracted device function | 231 114 ms catastrophe on identical arithmetic. Keep bodies INLINE |
+| `block_load`-wider chunks (16 codes/chunk) | 0.25-0.35x. Retired with the llama `block_load` direction for INT2 |
+| Native L0 immediate / host-private staging / staged readback / `q.prefetch()` | Same floor / neutral / no-op. Dead |
 
 ---
 
 ## 6. Conclusion
 
-**The entire performance gap is the GEMM/matmul tier.** Element-wise, reduction, norm, RoPE, and sampling kernels are either already implemented in `FusedKernels.jl` or trivially portable to KA. The matmul tier — which is where all three repos get their actual token/s throughput — requires either:
+**The entire performance gap is the GEMM tier, and it is THIS tree's GEMM tier.**
+At 27B `--tp 2` decode M=1 the box runs at 9.0% of the 456 GB/s roof
+(`scripts/model_byte_roofline.sh`); the FP16 path is saturated (98-123%) and the
+INT2 path is the deficit (SHIPPED anchor 39.9 GB/s GATE / 13.9 GB/s DOWN). Nothing
+from these three repos fixes that for free:
 
-- **oneDNN** (llama.cpp's preferred path; not bound in Julia), or
-- **CUTLASS + `XE_DPAS_TT`/`XE_BDPAS_TT`** (vllm + sgl; no Julia binding), or
-- **`sycl_ext_oneapi_matrix`** (no KA support)
+* llama.cpp's real XMX path is oneDNN -- a new dependency plus a precision contract;
+  its hand-written kernels are EU-only, exactly where this tree already is.
+* vllm/sgl's XMX path is CUTLASS -- tens of kLOC of tiled-GEMM machinery, not one kernel.
+* The in-tree ESIMD DPAS kernels already cover what the tree can reach without either.
 
-Until a Julia binding to oneDNN/ESIMD-matrix appears, or the NEO/compute-runtime issue on B580 is resolved, the GPU path cannot reach the target throughputs (40 tok/s decode, 4000 tok/s prefill). CPU (BLAS F32) remains the reference backend.
+So the ordering this survey implies: `block_load<uint8_t,128>` first (same language,
+named experiment, kill criterion already written at `quant_gemm.cpp:465`), tile
+scheduling and the oneMKL fallback next, oneDNN/CUTLASS/FP8 only with a numerics
+contract agreed first. Anything in section 5.4 is not an idea, it is a measurement.
 
 ---
 
