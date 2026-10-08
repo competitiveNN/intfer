@@ -199,15 +199,6 @@ trustworthy: if the streams are identical, a kernel delta is attributable to the
 kernel.
 
 
-# *** SPLIT 2026-10-08 *** Sections below this line in the original
-# AGENTS.md -- the superseded parallelism-bound model, the fused-GEMM
-# revert, the M=1 INT2 GEMV bisect, the default-ON arms and their
-# retraction, the retired directions, the SUBGROUP quarantine, the
-# box/stack state records -- are ALREADY-TRIED OPTIMIZATIONS and their
-# measurements. They moved verbatim to HISTORY.md. This file keeps the
-# live directives only. If you are looking for why a flag is OFF or a
-# direction is closed, read HISTORY.md.
-
 ### A default-OFF flag with no gate that can reach it
 
 **Rule: a gate arm certifies a path only if the gate NAMES the flag.** "I exported
@@ -483,37 +474,6 @@ still UNMEASURED on real 27B weights -- operator-only, standing rule 1.
   RCO returns the least-cost one rather than failing. The 20.5 GiB figure in PLAN.md
   is stale (see below).
 
-## Stage 1 — quantization (DONE, do not rebuild)
-
-`SpinQuant` (orthogonal rotation, outlier suppression) -> `DASH-Q` (diagonal
-Hessian + ILS, no off-diagonal error propagation) -> `RCO` (exact-VRAM-budget
-multiple-choice knapsack: Lagrangian bisection + coordinate-descent polish) ->
-`.intifer`.
-
-Implemented in `src/quant/{pipeline,dashq,rco,quant_spec}.cpp`. The candidate set
-is in `quant_spec.cpp` and already matches PLAN.md's alignment requirement:
-INT2 G=16/32, INT4 G=64, INT8 G=32, FP16 escape for embed/lm_head and
-norm/rope. Per-role min-bit floors are in `rco.cpp`.
-
-## Dead ends — measured, do NOT retry as-is
-
-| dead end | measurement |
-|---|---|
-| SYCL command graphs on B580 | 19.7 us vs 11.9 us plain submit |
-| native L0 immediate submit | 27.6 us vs 25.2 us UR submit+wait — same floor, not a UR artifact |
-| host-private staging of DPAS writes | neutral |
-| staged readback | neutral |
-| `q.prefetch()` over all shards | device counters unchanged |
-| device-side act-quant folded INTO the DPAS kernel | one-WI-per-16-N-tile layout replicates O(K) quant work nT times |
-| device-side SSM recurrence alone | -9% decode, but the blocking D2H+wait (~150-550 us/LA-layer) is structural |
-| LA-branch run-parallel OMP in `step_batch` | parity-clean incl. a TLS segfault fix, **zero gain** |
-| OpenVINO | 2026.3 sees both B580s but M=361 2.6 ms vs our 1.0 ms and M=1 1.2 ms vs our ~50 us |
-| `INTFER_DPAS_ROW` | ~460x slower |
-| L5 LA-front chain | +144 launches/token, waitblock 5x |
-| `INTFER_DPAS_PREQ` | +30720 launches to recover 52.7 ms |
-| retired throughput claims | the `8.16/15.33/17.98` sweep and the `0.8B` 8.16 numbers are **WITHDRAWN** |
-
-Revisit a dead end only if a profile shows the thing it removed is now >10% of a step.
 
 ## Verification — the tooling, and the rules that keep it honest
 
@@ -640,7 +600,7 @@ Closing the remaining opt-in gaps is scoped work, not copy-paste: read each flag
 semantics, decide whether identity is *claimed or disclaimed*, and pick the gate
 whose model can actually reach the branch.
 
-- **`reports/` IS DELETED (2026-10-07).** The batch-report rule below is retired: implement and test periodically instead of splitting every improvement into a separately-benchmarked batch. No new report files; the measurements that survive live in `AGENTS.md` (load-insensitive counters, never tok/s) and in the gate/matrix stamps.
+- **`reports/` IS DELETED (2026-10-07).** The batch-report rule is retired: implement and test periodically instead of splitting every improvement into a separately-benchmarked batch. No new report files; the measurements that survive live in `AGENTS.md` (load-insensitive counters, never tok/s) and in the gate/matrix stamps. See also `HISTORY.md` for the record of the retired wall-time claims.
 
 # *** SPLIT 2026-10-08 ***
 # * PLAN.md    -- the forward backlog, biggest gain first.

@@ -819,3 +819,38 @@ enforcement (a measured loss). The open engineering item is the M=1 decode
 parallelism problem above, and its only remaining lever needs a numerics contract
 agreed before code.
 
+
+----- (original AGENTS.md "Stage 1 — quantization" and "Dead ends"
+-----  tables, moved here 2026-10-08; both are records, not tasks)
+
+## Stage 1 — quantization (DONE, do not rebuild)
+
+`SpinQuant` (orthogonal rotation, outlier suppression) -> `DASH-Q` (diagonal
+Hessian + ILS, no off-diagonal error propagation) -> `RCO` (exact-VRAM-budget
+multiple-choice knapsack: Lagrangian bisection + coordinate-descent polish) ->
+`.intifer`.
+
+Implemented in `src/quant/{pipeline,dashq,rco,quant_spec}.cpp`. The candidate set
+is in `quant_spec.cpp` and already matches PLAN.md's alignment requirement:
+INT2 G=16/32, INT4 G=64, INT8 G=32, FP16 escape for embed/lm_head and
+norm/rope. Per-role min-bit floors are in `rco.cpp`.
+
+## Dead ends — measured, do NOT retry as-is
+
+| dead end | measurement |
+|---|---|
+| SYCL command graphs on B580 | 19.7 us vs 11.9 us plain submit |
+| native L0 immediate submit | 27.6 us vs 25.2 us UR submit+wait — same floor, not a UR artifact |
+| host-private staging of DPAS writes | neutral |
+| staged readback | neutral |
+| `q.prefetch()` over all shards | device counters unchanged |
+| device-side act-quant folded INTO the DPAS kernel | one-WI-per-16-N-tile layout replicates O(K) quant work nT times |
+| device-side SSM recurrence alone | -9% decode, but the blocking D2H+wait (~150-550 us/LA-layer) is structural |
+| LA-branch run-parallel OMP in `step_batch` | parity-clean incl. a TLS segfault fix, **zero gain** |
+| OpenVINO | 2026.3 sees both B580s but M=361 2.6 ms vs our 1.0 ms and M=1 1.2 ms vs our ~50 us |
+| `INTFER_DPAS_ROW` | ~460x slower |
+| L5 LA-front chain | +144 launches/token, waitblock 5x |
+| `INTFER_DPAS_PREQ` | +30720 launches to recover 52.7 ms |
+| retired throughput claims | the `8.16/15.33/17.98` sweep and the `0.8B` 8.16 numbers are **WITHDRAWN** |
+
+Revisit a dead end only if a profile shows the thing it removed is now >10% of a step.
