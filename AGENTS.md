@@ -249,12 +249,20 @@ Re-derive the whole population with the `git grep` recipe above.
 rounding order), `INTFER_HOST_AVX2`, `INTFER_DPAS_PREQ`-independent bits,
 `INTFER_NO_DECODE1_VERBHALF` and `INTFER_NO_DECODE1_VERBMP` -- the two M=1 INT2
 decode arms promoted to the DEFAULT DECODE PATH 2026-10-07. Their clone
-measurements are the whole case (VERBHALF +14% MLP_GATE / +17% MLP_DOWN, VERBMP
-neutral at 1.01x both shapes; `examples/roofline_probe_bisect`, device event
-timestamps, medians over 12 interleaved reps). VERBMP is bit-exact by construction;
-VERBHALF is stream-identity only (denormal + default FTZ is a *should-not*, now
-measured away on synthetic data by `test_rowpair_equiv.sh`). The engine arms are
-still UNMEASURED on real 27B weights -- operator-only, standing rule 1.
+measurements are **RETRACTED as performance evidence**: the bisect-2 gate that
+produced them (VERBHALF +14% MLP_GATE / +17% MLP_DOWN, VERBMP neutral at 1.01x
+both shapes) reported PASS while every arm measured `0.000 ms / inf GB/s / -nanx`
+on this box, so those ratios were 0/0. The gate now refuses a vacuous run on
+three layers (probe ceiling floor, gate-side `need_ceiling` at 0.012 ms, exit
+code); `mutate_roofline_probe.sh` certifies the two gate-side predicates 3/3.
+VERBMP is bit-exact by construction; VERBHALF is stream-identity only (denormal
++ default FTZ is a *should-not*, now measured away on synthetic data by
+`test_rowpair_equiv.sh`, 143 355 INT2 values bitwise identical, matrix PASS
+3/3). **The performance direction is UNKNOWN, not positive** -- the engine
+arms are still UNMEASURED on real 27B weights (operator-only, standing rule 1),
+and until that run exists the default-ON change is a correctness bet with an
+unknown payoff. Re-derive with `scripts/test_roofline_bisect.sh` after the
+profiling defect is fixed; do not quote the +14% as settled.
 
 ### Operational (not gate subjects)
 
