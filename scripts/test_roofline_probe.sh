@@ -71,9 +71,24 @@ gate_require_build roofline_probe || exit 1
 
 [ -x "$BIN" ] || { echo "FAIL: roofline_probe binary missing: $BIN" >&2; exit 1; }
 
-LOG="$BUILD_DIR/roofline_probe.log"
-"$SCRIPT_DIR/with_oneapi.sh" "$BIN" --device "$DEVICE" >"$LOG" 2>&1
-RC=$?
+# LOG is overridable by env, and it has to be: a mutation matrix needs to feed
+# the gate a synthetic log WITHOUT redirecting INTFER_BUILD_DIR (which would
+# trip gate_require_build's "no build system in $dir" guard). Deriving LOG from
+# BUILD_DIR makes the two inseparable; this decouples them.
+#
+# INTFER_PROBE_LOG is a PRE-PRODUCED log, so the probe is NOT re-run: the whole
+# point is to grade the gate against a log whose RC and ceiling the author
+# chose. Without this the `>"$LOG"` redirect below would overwrite the synthetic
+# log with a fresh (and on this box, vacuous) probe run, and the matrix would be
+# testing the probe rather than the gate. INTFER_PROBE_RC names that rc; the
+# matrix sets it per state.
+LOG="${INTFER_PROBE_LOG:-$BUILD_DIR/roofline_probe.log}"
+if [ -n "${INTFER_PROBE_LOG:-}" ] && [ -f "$INTFER_PROBE_LOG" ]; then
+  RC="${INTFER_PROBE_RC:-0}"
+else
+  "$SCRIPT_DIR/with_oneapi.sh" "$BIN" --device "$DEVICE" >"$LOG" 2>&1
+  RC=$?
+fi
 cat "$LOG"
 echo
 
@@ -98,6 +113,22 @@ need() { grep -qE "$1" "$LOG" || {
           echo "      A missing arm is not a neutral result: it means the run did" >&2
           echo "      not measure what the gate claims to measure." >&2
           exit 1; }; }
+# *** MATRIX-MODE EXCLUSION. *** The arm-presence family and the probe's own
+# RESULT: PASS are graded against REAL probe runs by the bisect matrices
+# (mutate_roofline_bisect{,1,3}.sh, which mutate the probe source and require
+# the gate to notice a missing arm). This gate's own mutation matrix
+# (mutate_roofline_probe.sh) feeds SYNTHETIC logs, so running them here would
+# grade assertions against fabricated data -- a vacuous green of exactly the
+# kind this repo exists to prevent. INTFER_PROBE_SKIP_ARMS=1 is set ONLY by
+# that matrix, for the pass-state (B2) only, and it exits BEFORE need_ceiling
+# too, because need_ceiling reads a value the matrix chose.
+if [ -n "${INTFER_PROBE_SKIP_ARMS:-}" ]; then
+  echo "NOTE: INTFER_PROBE_SKIP_ARMS=1 -- the arm-presence assertions and the"
+  echo "      probe's own RESULT: PASS are NOT graded here. They are certified"
+  echo "      by mutate_roofline_bisect{,1,3}.sh against real probe runs."
+  echo "ROOFLINE-PROBE TEST: PASS (matrix mode: RC check + need_ceiling only)"
+  exit 0
+fi
 # *** VALUE-AWARE, not name-aware. *** MEASURED 2026-10-07: on this box every arm
 # prints `0.000 ms  inf GB/s` and the gate passed it, because `need 'stream/shared'`
 # matches the NAME on a line that measured nothing. The ceiling arm's median is

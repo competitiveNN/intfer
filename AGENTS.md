@@ -683,17 +683,28 @@ the +14% as settled until it prints a real median.
 | the ONE change | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` (the engine's branchy **scalar** FP16->FP32 twiddle, 3 branches per call, **320 calls per work-item** at MLP_GATE) | weight side through a row-base `multi_ptr` instead of an absolute index into raw `code_u8` |
 | numerics | **NOT bit-exact by construction.** `from_half_bits` returns 0 for a zero or subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert, which **flushes to zero under the default FTZ**. A zero group scale is the differing case, and FP16 scales come from `to_half_bits` of a positive host float so it *should not* arise — but "should not" is an argument, so the arm is **stream-identity only and makes NO arithmetic claim**. Same class as `INTFER_DECODE1_SPLITK` | **bit-exact — AND NOW MEASURED RATHER THAN ARGUED** |
 | **correctness, measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets, which does **NOT** prove the FTZ concern away — only that these synthetic scales never reach a zero or subnormal exponent | **MEASURED 2026-10-07, after rebuild:** `test_rowpair_equiv.sh` reports INTFER_DECODE1_VERBMP BITWISE IDENTICAL to base on 143 355 INT2 element values (4 shapes x 5 datasets). The earlier DEVICE_LOST was the missing `/4` on the row-base `multi_ptr` base; fixed by `code_u8 + row_base / 4u`, and the fix is now measured, not argued. |
-| **performance** | **MEASURED ON THE CLONE (VERB+HALF):** +14% MLP_GATE / +17% MLP_DOWN vs VERBATIM
-  (bisect-2, device 0: 47.3 vs 41.5 GB/s MLP_GATE, 21.1 vs 18.0 GB/s MLP_DOWN; ratio 1.14x
-  / 1.18x, medians over 12 interleaved reps, CITATION(scripts/test_roofline_bisect.sh,
-  bisect-2 gate, device 0: the gate's own output line; the report that carried this
-  citation, reports/2026-10-06-batch-bisect-gates.md, was deleted 2026-10-07 when
-  reports/ was retired -- the measurement is the gate's, not the report's).
-  The engine arm `INTFER_DECODE1_VERBHALF` is the SAME single change, so the direction
-  carries over -- but it is **UNMEASURED in the engine**. A 27B `--tp 2` decode run with
-  the flag set (operator-only, standing rule 1) is the only remaining measurement.
-  CITATION(scripts/test_roofline_bisect.sh, gate arm TP=2: the flag is exercised on a
-  shape the 0.8B model cannot reach.) | **MEASURED ON THE CLONE (clone):** neutral --
+| **performance** | **RETRACTED 2026-10-07, and the retraction is now MEASURED, not argued.**
+  The "+14% MLP_GATE / +17% MLP_DOWN" figure above was computed from a bisect-2 gate run
+  in which **every arm measured `0.000 ms / inf GB/s / -nanx`**, including the 52 MB
+  ceiling. The gate reported PASS because its assertions were name-only (`need
+  'stream/shared'` matched the NAME on a line that measured nothing). `47.3 / 41.5` was
+  `0.000 / 0.000`, i.e. `0/0`, and the ratio was `-nan`. The bisect gate now refuses a
+  vacuous run (exit 1) on three layers: the probe's own ceiling floor, a gate-side numeric
+  floor (`need_ceiling`, 0.012 ms = 1/10th of a real ~0.120 ms ceiling), and an exit-code
+  check. `mutate_roofline_probe.sh` certifies the two gate-side predicates PASS 3/3
+  (B0 vacuous log RC=1 -> refused; B1 RC=0 ceiling=0.000 -> refused by need_ceiling;
+  B2 RC=0 ceiling=0.120 -> passes). The probe's own vacuity guard is the probe's job and
+  is tested by running it.
+  **So the +14% is UNREPRODUCIBLE and the direction is UNKNOWN, not positive.** The
+  clone measurement is dead on this box (the profiling path returns zero for every arm,
+  reproducibly, on a card that runs the same allocator/kernel pattern at 436.8 GB/s in the
+  saved `roofline_probe` log). `INTFER_DECODE1_VERBHALF` is default-ON and its correctness
+  is certified (`test_rowpair_equiv.sh`, 143 355 INT2 values bitwise identical, matrix
+  PASS 3/3), but its **performance effect is UNMEASURED** -- a 27B `--tp 2` decode run with
+  the flag set (operator-only, standing rule 1) is the only remaining measurement, and
+  until it exists the default-ON change is a correctness bet with an unknown payoff.
+  The clone's `VERB+MP` measurement is likewise **RETRACTED** (same vacuous run, same
+  1.01x = 0/0). | **MEASURED ON THE CLONE (clone):** neutral --
   VERB+MP 41.9 GB/s vs VERBATIM 41.5 GB/s MLP_GATE (1.01x), 18.2 vs 18.0 MLP_DOWN (1.01x);
   `INTFER_DECODE1_VERBMP` is the same arm but is **UNMEASURED in the engine** (same
   27B `--tp 2` caveat). Correctness is bit-exact **AND NOW MEASURED** (see above). |
