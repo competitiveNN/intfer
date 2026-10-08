@@ -392,11 +392,11 @@ the tooling, and the rules that keep it honest"):
 14. **`bash -n` every edited script, and trust it only as a syntax check.**
 15. **No backticks in `git -m`** — the shell runs them as command
     substitution.
-16. **COMMIT BEFORE ANY DESTRUCTIVE GIT, and prefer a probe that never
-    touches the tracked tree.** `. scripts/guard.sh` shadows `git` as a
+16. **commit before any destructive git operation** -- prefer a probe that
+    never touches the tracked tree. `. scripts/guard.sh` shadows `git` as a
     function, so `reset --hard` / `checkout` / `clean -f` / `stash
-    drop|clear` REFUSE on a dirty tree and name the two non-destructive
-    routes out. Bypass: `INTFER_ALLOW_DESTRUCTIVE=1`.
+    drop|clear` REFUSE on a dirty tree with uncommitted work and name the
+    two non-destructive routes out. Bypass: `INTFER_ALLOW_DESTRUCTIVE=1`.
 
 
 ## Flag certification status

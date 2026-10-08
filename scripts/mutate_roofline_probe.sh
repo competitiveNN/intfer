@@ -24,7 +24,16 @@ VAC_LOG="build/roofline_probe.log"
 [ -f "$VAC_LOG" ] || { echo "MUTATE: no vacuous log at $VAC_LOG (run the probe once)" >&2; exit 1; }
 
 TMPD="$(mktemp -d "${TMPDIR:-/dev/shm}/rp_mat.XXXXXX")"
-trap 'rm -rf "$TMPD"' EXIT
+# *** CLEANUP TRAP, ALL THREE SIGNALS. *** AUDIT #31: an EXIT-only trap does
+# not run on SIGTERM, so `timeout`-killing this matrix would leave the temp
+# tree behind -- and a verifier whose cleanup IS the restore would leave
+# TRACKED SOURCE MUTATED. The INT/TERM bodies clean up AND terminate, so the
+# handler fires on every path (bash defers it across a foreground command,
+# which is why the matrix's per-state runs are short and synchronous).
+cleanup() { rm -rf "$TMPD"; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 patch_ceiling() { # $1 = file, $2 = new ms value
   python3 - "$1" "$2" <<'PY'
@@ -111,11 +120,13 @@ echo "  B0: vacuous log (RC=1) -> gate refuses via the RC check"
 echo "  B1: RC=0 but ceiling=0.000 -> gate refuses via need_ceiling"
 echo "  B2: RC=0 and ceiling=0.120 -> gate passes"
 echo
-echo "EXCLUSION: B2 is a synthetic log, not a real probe run. The probe itself"
-echo "is currently broken on this box (returns 0.000 ms for every arm, caught by"
-echo "its own vacuity guard), so a real B2 cannot be obtained without fixing the"
-echo "profiling path. The matrix certifies the gate's two predicates"
-echo "independently; the probe's vacuity guard is the probe's own job and is"
-echo "tested separately by running it."
+echo "EXCLUSION: B2 is a synthetic log, not a real probe run. On this box the"
+echo "probe returns 0.000 ms for every arm -- MEASURED 2026-10-08 that is a"
+echo "driver-level profiling defect (the kernel executes and writes the sink,"
+echo "command_submit is real and monotonic, but command_start == command_end,"
+echo "so every duration is exactly 0 ns; see the LOCATED block in AGENTS.md),"
+echo "so a real B2 cannot be obtained without a driver fix. The matrix"
+echo "certifies the gate's two predicates independently; the probe's vacuity"
+echo "guard is the probe's own job and is tested separately by running it."
 rm -rf "$TMPD"
 exit 0
