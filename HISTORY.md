@@ -854,3 +854,218 @@ norm/rope. Per-role min-bit floors are in `rco.cpp`.
 | retired throughput claims | the `8.16/15.33/17.98` sweep and the `0.8B` 8.16 numbers are **WITHDRAWN** |
 
 Revisit a dead end only if a profile shows the thing it removed is now >10% of a step.
+
+----- (original AGENTS.md "A default-OFF flag with no gate that can reach it"
+-----  and the 16 verification rules, moved here 2026-10-08)
+
+### A default-OFF flag with no gate that can reach it
+
+**Rule: a gate arm certifies a path only if the gate NAMES the flag.** "I exported
+the variable and ran the gate" certifies something, but nothing re-runs it. The
+converse trap is just as bad — an arm in the *wrong* gate goes green because the
+path never runs. Re-derive the ungated population (never a number from prose):
+
+```
+git grep -hoE '[a-z_]*\("INTFER_[A-Z0-9_]+"' -- src examples \
+  | sed -E 's/^([a-z_]*)\("(INTFER_[A-Z0-9_]+)"$/\2/' | sort -u > /tmp/f_src
+git grep -hoE 'INTFER_[A-Z0-9_]+' -- 'scripts/test_*.sh' | sort -u > /tmp/f_gate
+comm -23 /tmp/f_src /tmp/f_gate      # read by the engine, named by NO gate
+```
+
+**Do not read the residue as one class — it is four, and only one is a gap.**
+`scripts/check_flag_gate_coverage.sh` derives the classification and prints it:
+
+```
+opt-in        default OFF, changes arithmetic, no gate names it -> A REAL GAP
+kill switch   feature ON by default, env var turns it OFF (INTFER_NO_*)
+disabler      the VALUE turns it off (`X=0`), no NO_ prefix -- ALSO a kill
+              switch: INTFER_HOST_AVX2, INTFER_PREFILL_RR
+diagnostic    _DBG/_TRACE/_WHY/_TIME/_SNAP/_CHECK: print paths, not arithmetic
+operational   PRELOAD*/SCHED/SERVE_MAX/PCACHE*/KV_CAP/...: runtime knobs
+```
+
+**There are three spellings of "this flag changes behaviour", and only one of
+them is a certification gap.** The `X=0` disabler form was the one initially
+missed. Its signal is derivable — the flag's OWN value is compared to `0` — but
+two things bite, and both failed silently:
+
+* **two spellings of zero** (`== "0"` and `== '0'`) and **two ways of joining the
+  two reads** (`!= nullptr &&` vs a bare `&&`). A pattern written for one form
+  found 2 of 4, and the class simply came out short — which reads as *correct*
+  unless you already know the answer. Only a query that finds nothing announces
+  itself.
+* **the harvest is a `python3 -c` inside a shell single-quoted string**, so an
+  `r'...'` literal inside it terminates the shell string and writes an EMPTY file.
+  That is the worst shape a query failure can take here: an empty class reads as
+  an absence in the world rather than as a broken question. Every class expected
+  to be populated is floored.
+
+The signal is now matched with a backreference on the flag name, so no flag can be
+captured by another flag's `== 0`.
+
+**One residual is NOT derivable and needs reading:** `INTFER_STREAM_F16` is named
+like an opt-in but its effect is "restore the old evict-everything behaviour" — a
+kill switch with no `NO_` prefix and no `=0`. No mechanical rule separates it from
+a genuine opt-in; only reading the code does. That is the honest limit of the
+classifier, stated rather than implied away.
+
+A kill switch in the residue says **nothing** about whether the default is
+certified: the gates already exercise the default path. Only the opt-in class is
+a certification gap. Quoting the whole residue as "UNCERTIFIED" overstates it,
+and someone will eventually write a stream-identity arm for a flag whose default
+is already tested.
+
+**A measured trap in deriving the class from source:** the getenv comparison
+operator does **not** determine feature polarity. `INTFER_NO_WAVE` is read as
+`getenv("INTFER_NO_WAVE") != nullptr`, which looks like presence-enables/opt-in,
+but `no_wave` *disables* the wave submit grouping. The getenv test says what the
+PROCESS reads, not what the FEATURE does. The class above therefore rests on the
+`INTFER_NO_*` naming convention plus suffix rules, and only reading the code
+settles an individual flag.
+
+Adding arms is NOT copy-paste: read each flag's semantics first. Some are
+deliberately approximate and asserting identity would ship a gate that fails for
+a legitimate reason. `INTFER_PREFILL_RR` is a good example of why reading
+matters — it is a *scheduling* knob (round-robin vs head-of-line), not a
+rounding-order flag, so an arm would be testing the wrong thing entirely.
+
+**`INTFER_LMHEAD_FP16` is DISCLAIMED, and here is why — do not add an arm for
+it.** It is read only at `M > 1` (the `M == 1` early return precedes it), so an
+arm must exercise prefill, not decode. And it swaps an **INT8-DPAS** lm_head for
+an **FP16** one, which is lossy *by construction* — the two paths are not
+expected to produce the same logits, and asserting they do would ship a gate that
+fails for a legitimate reason. Certifying it needs a tolerance-based numerics
+contract like the one in `examples/ksplit_contract`, calibrated against real
+activations, which cannot be done from an agent session. Recorded as
+**UNCERTIFIED-BY-DISCLAIM** rather than left to look like an oversight.
+
+**`INTFER_DECODE1_SPLITK` is the worked example of doing this right**, and the
+opposite of MR — including how a kernel is caught. It shipped with
+`(bv >> (j * 2)) & 3` instead of `(bv >> ((j & 3) * 2)) & 3`; INT2 packs four
+codes per byte, so `j=4..7` must re-read bit 0 of the second byte, and a
+`uint8_t` shifted by 8..14 promotes to 0. It was localised by three facts
+together: the stream diverged, the kill switch stayed clean, and the contract
+said the order was safe — which pointed at the implementation, not the
+arithmetic. `scripts/check_decode1_copies.sh` now pins the two inline copies
+against each other (mutual agreement, NOT against remembered literals — the
+first version failed its own "both copies changed together" state for exactly
+that reason), with `mutate_decode1_copies.sh` mutating the ARTIFACT.
+
+Also recorded, because it is the shape of mistake this repo keeps auditing: an
+earlier revision of that work attributed a "no GPU visible" report to the
+container/host driver mismatch. **It was a missing `setvars.sh` in my own shell.**
+`gate_gpu_count` had printed `SKIP: sycl-ls not available` and I read that as box
+state. Attribute a measurement to the thing measured, or re-derive it.
+
+**`INTFER_DECODE1_SPLITK` is the worked example of doing this right**, and the
+opposite of MR: the numerics contract was measured *before* the kernel existed
+(`examples/ksplit_contract`, gated by `test_ksplit_contract.sh`), and the arm
+lives in the one gate whose model can reach the branch. Its claim is deliberately
+weaker than MR's — stream-identical on the gate models, not bit-exact — and an
+arm must never be stronger than the contract it enforces.
+
+**`INTFER_DECODE1_MR` illustrates both halves.** MR is guarded by `bits == 2`, and
+only the 27B gate model has INT2 tensors (`Qwen3.8-27B-int2.intifer`: INT2 x110;
+the 0.8B model has **zero** INT2). So **every gate whose model is the 0.8B one is
+structurally incapable of reaching that branch** — run the census above for the
+current count — and an arm there would be green *because the path never runs*. Its
+arm therefore lives in `scripts/test_tp2_27b.sh` and asserts against the same fixed
+oracle the base run uses, not a self-comparison.
+
+## Performance targets (2x Arc Pro B580)
+
+* Token generation (decode): **40 tok/s** (per-stream, 27B model)
+* Prefill: **4000 tok/s** (27B model)
+
+Scope: **27B is the optimization target.** 0.8B numbers in this file are legacy
+reference only; do not port 0.8B conclusions across (at 27B the device is the
+wall — `kernel` ~66% of decode, `waitblock` 520.6 ms vs `kernel` 1031.7 ms — which
+**reverses** the 0.8B picture where submit dominates).
+
+**The rules this repo learned by breaking them** (each cost a full run; the full
+narrative with the measurements is in `docs/audit-log-tooling.md`):
+
+1. **Enumerate, never remember.** A family is closed by deriving its instances from
+   the source of truth, not from the names a previous fix happened to touch.
+   `ls scripts/test_*.sh` DEFINES the gate population; `ls scripts/check_*.sh`
+   defines the checker population; `scripts/check_scripts_live.sh` closes the
+   *retirement* family, which is the one that needs closing most because a
+   **`docs/` citation is not a call site** — that misreading is what
+   let sixteen dead scripts (superseded 27B quantize/merge drivers, retired
+   wall-time A/B harnesses, one-GPU probes) sit in `scripts/` looking like tooling.
+   Retire by `git mv` into `scripts/archive/`, which `maxdepth 1` keeps out of
+   every family, and say why in `scripts/archive/README.md`.
+2. **"0 findings" and "found nothing to look at" are different claims.** A checker
+   must assert it harvested something BEFORE reporting a verdict on it. A `WARN ...
+   skip` path in a correctness checker is a defect.
+3. **Never write a numeric test a non-numeric value can satisfy.** `[ "" -gt 0 ]`
+   is FALSE. A count cannot tell a failed query from an empty answer; only the rc
+   can.
+4. **A hand-written total is a citation, not a claim.** Derive it, or mark it
+   `HISTORICAL`/`CITATION`/`re-derive`. `gate_inventory.sh` enforces this.
+5. **A guard whose stated rationale does not apply is worse than none** — it blocks
+   legitimate work. A guard sourced inside a conditional is a guard that is usually
+   absent. A helper that records its verdict in a global silently loses it inside
+   `$(...)`.
+6. **The always-red twin is the vacuous green.** Every predicate needs a case where
+   it MUST fire *and* a case where it must stay quiet, and the quiet case is the one
+   that gets forgotten.
+7. **Name the polarity.** `scripts/_gate_pred.sh`'s `pred_expect_absent` /
+   `pred_expect_present` print `verdict-polarity=` so a state written for the wrong
+   side fails loudly instead of silently scoring MISSED. A bare `grep -q "$expect"`
+   is a convention nobody can read.
+8. **When a state reports MISSED, read the state log and write the predicate from
+   what is ACTUALLY THERE**, before touching the mechanism. Most "unobservable
+   mutation" conclusions were a predicate aimed at the wrong file.
+9. **A matrix with no dispatch arm NEVER RUNS**, and its stamp then reads STALE —
+   which looks like missing evidence with a remedy that cannot help. Every new
+   `check_*`/`mutate_*` needs BOTH a `dispatch()` arm and a `STEPS` entry;
+   sections 0b/0c enforce the first and the second.
+10. **Patch by exact literal, never `sed` with a delimiter.** `patch_literal`
+    requires EXACTLY ONE match: drifted (0) and ambiguous (2) anchors both fail
+    loudly. A stale anchor that silently stops matching converts a state into a
+    no-op that reports "not load-bearing" — a verdict about the harness.
+    `patch_literal` takes **exactly three args**; a multi-line block must have the
+    newline inside ONE quoted argument.
+11. **If the artifact under test is correct by construction, weakening the CHECKER
+    is unobservable — mutate the ARTIFACT and require the checker to REJECT it.**
+    (The reverse holds when the artifact is itself defective.)
+12. **Do not edit a running shell script in place** — bash re-reads by byte offset.
+    Write then `mv`.
+13. **Prove a failure mode by hand before trusting a state that proves it itself.**
+    A self-proving mutation state validates the state; a self-cleaning one will
+    happily "prove" a check that cannot fail. Plant the negative direction and run.
+14. **`bash -n` every edited script, and trust it only as a syntax check.** It
+    cannot catch semantic no-ops (a literal backslash in a trap), and a script that
+    was clean at HEAD and dirty after an edit means the edit.
+15. **No backticks in `git -m`** — the shell runs them as command substitution. A
+    distinct heredoc delimiter when nesting `python3 - <<'PY'` inside another.
+16. **COMMIT BEFORE ANY DESTRUCTIVE GIT, and prefer a probe that never touches the
+    tracked tree.** Measured, expensively: a throwaway probe was reverted with
+    `git reset --hard HEAD~1` from a shell carrying ~40 minutes of unrelated
+    uncommitted work. The command succeeded, the work was gone, and nothing said
+    so. *No script did that — the hazard was a command typed at a prompt, which is
+    why this rule lives here and not only in the tooling.*
+    * Commit first. A `reset --hard` with uncommitted work on top is the single
+      most expensive command available, and it is indistinguishable from a safe one.
+    * Prefer a **non-destructive probe**: copy the file under `build/`, mutate the
+      copy, run the same function against it. Same evidence, zero risk. That is how
+      the `patch_literal` 0-match / 1-match / 2-match directions were proven.
+    * `. scripts/guard.sh` makes this a BEHAVIOUR rather than a note. Rule 16 and
+      the memory note both said "commit first" and both demonstrably failed to
+      change anything: `git checkout -- scripts/` destroyed uncommitted work
+      TWICE in the session that wrote them, the second time with the note already
+      in place. Sourcing the guard shadows `git` as a function, so `reset --hard`,
+      `checkout`, `clean -f` and `stash drop|clear` REFUSE on a dirty tree and name
+      the two non-destructive routes out. It refuses rather than prompts, because a
+      prompt is a decision point and the wrong decision was made at one twice.
+      Non-destructive git is untouched. Bypass: `INTFER_ALLOW_DESTRUCTIVE=1`.
+      *Limit, stated because it is the point:* it only covers shells that sourced
+      it. It is a seatbelt, not an interlock, and this rule remains the backstop.
+    * `scripts/check_destructive_git.sh` enforces the script half: any script
+      performing a destructive git op must refuse to run on a dirty tree. Its
+      harvest strips **comments first** — `mutate_tp2_selfcheck.sh` mentions
+      `git checkout --` exactly once, inside a comment explaining that it
+      deliberately needs no guard, so a naive grep flags a script that is correct.
+      That is the same lesson as deleting the hand-written flag census: derive from
+      the executable text, never from prose.
