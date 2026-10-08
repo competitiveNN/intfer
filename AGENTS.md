@@ -1,19 +1,10 @@
 Port ninfer (https://github.com/Neroued/ninfer) to our local setup: 2x intel arc pro b580.
 
-<!--
-  CLEANED 2026-10-04 (was 4684 lines). What moved where:
-    docs/audit-log-tooling.md   AUDIT #7..#31, VERBATIM. Tooling/gate-hygiene
-                                history. Split there because #7 is where the
-                                subject changes from the ENGINE to the CHECKERS.
-    (inline, kept)              AUDIT #1..#6 -- numerics/quantization findings
-                                about code that is still in the tree.
-  Nothing was reworded or "corrected". A historical record that disagrees with
-  today's tree is still a true record of when it was written; moving it intact is
-  the only way to shrink this file without laundering it. See
-  docs/audit-log-tooling.md for the ~40 tooling failure modes (vacuous gates,
-  inverted predicates, stale artifacts, ...) that the current tooling exists to
-  prevent. READ IT before adding a checker or a mutation matrix.
--->
+**Read `docs/audit-log-tooling.md` before adding a checker or a mutation
+matrix** — it carries the ~40 tooling failure modes (vacuous gates,
+inverted predicates, stale artifacts, ...) that the current tooling
+exists to prevent. The 2026-10-04 cleanup that split the original
+4684-line file is recorded in `HISTORY.md`.
 
 ## READ FIRST — box state, gate state, and what is live
 
