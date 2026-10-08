@@ -105,7 +105,37 @@ struct Arm {
 // Same profiling type src/engine/engine.cpp uses, so this probe's "ms" and the
 // engine's `[GPU profile] kernel` bucket are the same instrument. SYCL 2024 dropped
 // the old sycl::info::event_profiling_command spelling.
-double timed_ms(sycl::queue& q, const std::vector<sycl::event>& evs) {
+// *** --raw: dump the RAW timestamps, not the difference. *** MEASURED
+// 2026-10-08: this box returns 0.000000 ms for all 12 reps of every arm,
+// which the vacuity guard catches. A zero DIFFERENCE is ambiguous: it is
+// either a profiling-disabled event (t0 == t1 == 0) or two equal non-zero
+// timestamps (a kernel that ran in <1 us, or a clock that wrapped). The
+// DIAG line prints med/min/max of the difference and cannot separate them,
+// so the raw values are needed. Not a gate subject -- a diagnostic only, and
+// it exits after the ceiling arm so it never writes a reportable table.
+static bool g_raw = false;
+double timed_ms(sycl::queue& q, std::vector<sycl::event> evs) {
+  // *** WAIT FIRST. *** MEASURED 2026-10-08: reading profiling info before the
+  // event completed returned command_start == command_end for every rep --
+  // the raw timestamps were real and monotonic (device up time) but each
+  // command's duration was exactly 0 ns. The engine's own counter
+  // (engine.cpp:1206) waits on kernel_events and THEN reads profiling; this
+  // probe read first and then waited. Same queue, same allocator, same
+  // get_profiling_info spelling -- the ordering was the only difference, and
+  // on this driver an uncompleted event reports its start as its end.
+  // The engine waits on each event and THEN reads profiling (engine.cpp:1197
+  // `for (auto& e : kernel_events) e.wait()` then :1206 get_profiling_info),
+  // and its kernel buckets are real on this box. The probe's original ordering
+  // read first and then waited, and that is the only structural difference.
+  // A first attempt to swap it used a COPY of the event vector and the kernel
+  // then failed to write the sink -- so the ordering was not the only variable
+  // and the test was inconclusive. This version waits on the ORIGINAL events,
+  // exactly as the engine does, and reports whether the sink was written and
+  // whether the durations are non-zero in the same run.
+  // Pass by value: the caller always passes a one-element temporary ({e}), and
+  // this SYCL's event::wait() is not const-qualified, so a const reference
+  // cannot call it.
+  for (auto& e : evs) e.wait();
   std::uint64_t t0 = 0, t1 = 0;
   for (const auto& e : evs) {
     try {
@@ -114,8 +144,12 @@ double timed_ms(sycl::queue& q, const std::vector<sycl::event>& evs) {
     } catch (...) {
       return -1.0;   // profiling unavailable: the caller must not report a number
     }
+    if (g_raw) {
+      std::printf("[roofline] RAW command_start=%llu command_end=%llu diff=%llu ns\n",
+                  (unsigned long long)t0, (unsigned long long)t1,
+                  (unsigned long long)(t1 - t0));
+    }
   }
-  q.wait_and_throw();
   return static_cast<double>(t1 - t0) / 1e6;
 }
 
@@ -380,6 +414,8 @@ int main(int argc, char** argv) {
       dev_idx = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--json"))
       as_json = true;
+    else if (!std::strcmp(argv[i], "--raw"))
+      g_raw = true;
   }
 
   auto mgr = intfer::device::DeviceManager::discover("Arc");
