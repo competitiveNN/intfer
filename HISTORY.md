@@ -1,0 +1,821 @@
+# HISTORY — already-tried optimizations and their measurements
+
+Split from AGENTS.md 2026-10-08. Everything here is a RECORD: what
+was tried, what it measured, and why it is closed. Nothing in this
+file is a pending task. The live directives (box state, gate state,
+standing rules, performance targets, fusion directive, flag
+inventory, architecture facts, verification tooling) stayed in
+AGENTS.md; the forward backlog is in PLAN.md.
+
+Sections appear in their original order, verbatim. Line numbers below
+refer to the original AGENTS.md.
+
+## ==> SUPERSEDED 2026-10-05: THE "PARALLELISM-BOUND" MODEL WAS WRONG. THE
+## ==> MEASUREMENTS STAND; THE EXPLANATION DOES NOT. READ THIS FIRST. <==
+
+**This section argued that 27B decode is parallelism-bound rather than
+bandwidth-bound, and that the target is EU occupancy. Both halves of that are
+retracted, because the hardware model underneath them described a GPU this box is
+not.**
+
+| quantity | this section said | **actual** |
+|---|---|---|
+| Xe cores | 512 | **20** CITATION(techpowerup arc-b580.c4244) |
+| vector engines / XMX | not stated | 160 / 160 CITATION(techpowerup arc-b580.c4244) |
+| peak memory bandwidth | ~179 GB/s | **456.0 GB/s** CITATION(techpowerup arc-b580.c4244) |
+
+Full source: TechPowerUp `arc-b580.c4244`, saved at
+`docs/Intel Arc B580 Specs _ TechPowerUp GPU Database.html`; cross-checked against
+Intel ARK sku/241598 — both agree, and also give 12 GB GDDR6 192-bit @19 Gbps,
+18 MB L2, L1 256 KB/EU. `git log -S '512 Xe'` shows the figure entered at `40219bf`
+(2026-10-04) and was thereafter only propagated, never measured; the 512 Xe cores it
+names is the **A770's** count (4096 shader units / 8)
+CITATION(techpowerup arc-b580.c4244 / ARK 241598 — the B580's figures, replacing the
+A770's). Nothing on this box was ever asked.
+
+**Three consequences, each derived rather than asserted:**
+
+1. **Decode is at ~9 % of the memory roofline, not ~21 %.** The bucket split below
+   (`kernel` 44 %, `waitblock` 22 %, `submit` 17 %) is unchanged. The 9.75e9 B
+   per device per token is unchanged. Only the denominator was wrong:
+   41.1 GB/s against 456 GB/s CITATION(techpowerup arc-b580.c4244). Re-derive it
+   with `scripts/model_byte_roofline.sh`; never quote a roofline percentage off
+   this file.
+2. **The GEMV is NOT lane-starved.** FP32 13.67 TFLOPS at 2670 MHz
+   CITATION(techpowerup arc-b580.c4244) is ~2560 FP32 lanes. `MLP_DOWN` at TP=2 has
+   `N_local = 2560` work-items — one per lane, i.e. ~100 % lane occupancy. The
+   "2048 work-items over 512 cores, ~4 threads/EU, `kThr=16` cannot fill one SIMD"
+   argument is void: there are 20 cores, and `kThr=16` matches the Xe2 sub-group
+   width.
+3. **So MR and SPLITK were aimed at a bottleneck that does not exist.** Their
+   *measurements* are untouched and remain the reason those flags are default OFF:
+   MR was 2.3x slower and SPLITK +43.8 % on `kernel`. What is retracted is the
+   *reason* — "divided an already-starved budget" — which is why both directions are
+   re-examined against the bandwidth hypothesis (`AGENTS.md`, same section).
+
+**The rest of this section is preserved verbatim below as the historical record.**
+It is a record of what was believed on 2026-10-04 and of measurements that still
+hold. Do not "correct" it into agreement — that is the same laundering failure in
+the other direction. `scripts/check_hw_constants.sh` now refuses an uncited
+# *** RETIRED 2026-10-07: `reports/` IS DELETED. *** The note at AGENTS.md line 249
+# claimed it was retired 2026-10-06; that was wrong, and the correction written
+# here on 2026-10-06 was wrong in the other direction (it said reports/ held live
+# reports and let an uncited figure through in reports/2026-10-06-batch-bisect-4.md).
+# Both directions are now false: the directory is gone and the corpus is AGENTS.md
+# plus docs/ records. Recorded rather than silently dropped, because this file's
+# whole purpose is to stop a claim from being re-read as current.
+
+## 27B DECODE IS **PARALLELISM-BOUND**, NOT BANDWIDTH-BOUND (measured 2026-10-04) [SUPERSEDED 2026-10-05 — model void, measurements stand]
+
+Read this before optimizing decode. It overturns the natural first guess.
+
+27B `--tp 2`, decode M=1, counters only: `kernel` 44%, `waitblock` 22%, `submit`
+17%, `usm_write` 9%, `readback` 8%. Decode reads **9.16 GiB of weights per device
+per token** in **257.7 ms** of kernel = **35.5 GiB/s, ~21% of the B580's ~179
+GB/s** CITATION(the ~179 GB/s denominator is the A770's; the B580's is 456 GB/s —
+see the SUPERSEDED banner above. The bucket split is
+CITATION(perf_base.err, `[GPU profile @decode]`)). The obvious reading — "the GEMV
+kernel is not saturating bandwidth" — is **wrong**.
+
+> CITATION(techpowerup arc-b580.c4244 / ARK 241598: the B580's peak bandwidth is
+> 456.0 GB/s, not the ~179 GB/s this section assumed — so "21 %" is really ~9 %,
+> and the conclusion drawn from it below is retracted. See the SUPERSEDED banner
+> above.) CITATION(perf_base.err: `total_kernel_us 1187601.2` over 5 tokens.)
+> The 9.16 GiB figure is reproduced by `scripts/model_byte_roofline.sh` as
+> 9.752 GB/device/token.
+
+**Proof by measurement, not argument.** `INTFER_DECODE1_MR=1` processes MR=4
+outputs per work-item, chosen because it raises memory-level parallelism and
+shares one activation load across 4 outputs, and chosen to be **bit-exact** (each
+output keeps its own K order in its own register; nothing is reassociated). It came
+out **2.3x SLOWER**: kernel 2055.1 -> **4698.7 ms**, waitblock 1037.7 -> 2362.5 ms,
+with `nk`/`nw`/`nr` identical (7936/7936/2048), so this is device work, not
+plumbing.
+
+**Why -- and this is the finding.** At M=1 this kernel's total work-item count is
+**exactly `N`** (one output element per work-item) and that is **invariant to the
+work-group shape**. So MR did not add parallelism; it **divided an already-starved
+budget by four**. At 27B TP=2 a layer GEMM has N ~ 2048 per rank over **512 Xe
+cores, ~4 threads/EU** CITATION(this is the A770's core count; the B580 has 20 —
+see the SUPERSEDED banner), and `kThr=16` (`quant_gemm.cpp:64`) cannot even fill
+one SIMD. More outputs per work-item is *anti*-parallel at M=1. Do not re-attempt
+it.
+
+> CITATION(techpowerup arc-b580.c4244 / ARK 241598: 20 Xe cores, not 512, so the
+> "already-starved budget" premise above does not hold. The MR *measurement*
+> stands and MR stays closed.)
+
+**The target is EU occupancy; the 21% bandwidth figure is a symptom, not the
+cause.** Two ways to raise it:
+
+* **(a) split K across work-items** — raises parallelism *and* coalesces the weight
+  loads, but is **NOT bit-exact** (reassociates the FP32 sum). **The numerics
+  contract is now MEASURED and the kernel is BUILT**: `INTFER_DECODE1_SPLITK`
+  (default OFF, `=1` exactly), block-cyclic assignment because that is the only
+  one that coalesces — contiguous chunks were measured and stay strided.
+  Measured margin consumed: **0 FP16 ulp** on random / act-outliers / full
+  cancellation, **2 ulp** on an adversarial escalating dataset. So the claim is
+  "stream-identical on the gate models", never "bit-exact" — and on 27B that is
+  exactly what happened: identical stream. **But it is a measured LOSS on
+  kernel** (267 -> 384 ms, +43.8%, 3/3 same sign, clears the spread floor), so
+  (a) is closed as a PERFORMANCE direction: raising parallelism and coalescing
+  both worked and the kernel still got 43.8% slower, which points at the
+  per-work-group `local_accessor` + local barrier on the critical path of every
+  output. Flag stays default OFF, kept as the worked example of a numerics
+  contract passing while the performance hypothesis failed.
+
+> CITATION(techpowerup arc-b580.c4244: 20 Xe cores / 456 GB/s, so "raising
+> parallelism" was not the binding constraint. The +43.8 % *measurement* stands
+> and SPLITK stays closed; the re-examined form is
+> `INTFER_DECODE1_SUBGROUP` — same 16-way K split, but reduced by a sub-group
+> xor butterfly with **no `local_accessor` and no `it.barrier`**, which is the
+> specific cause the bisection above named. See `AGENTS.md` "INTFER_DECODE1_SUBGROUP is
+> QUARANTINED, not fixed".)
+
+* **(b) fuse INDEPENDENT GEMMs into ONE `nd_range`** — bit-exact (each output keeps
+  its own work-item and its own K order; only the launch boundary moves). **This
+  is the live direction**, and it is also the standing fusion directive, so the two
+  agree.
+
+CITATION(AGENTS.md itself: `INTFER_MLP_GU` was built, measured DIVERGENT at 27B TP=2,
+and fully reverted; root cause NOT located. (b) is NOT live and is not a pending
+experiment.)
+
+### ==> REVERTED 2026-10-04: FUSED MULTI-GEMM DECODE. THE ARITHMETIC IS FINE; THE *EXTRACTION* IS NOT. <==
+
+**`(b)` was built, measured, found to break 27B decode, and reverted. Do not
+rebuild it in this shape.** Kept because the negative result is worth more than the
+feature was.
+
+A `gemm::quant_gemm_fused_decode1` was written so one `nd_range` could carry a
+whole wave of independent GEMMs (q/k/v = 3, gate/up = 2) instead of one `N`-wide
+launch each. To keep one home for the arithmetic, the M=1 INT2 per-output body was
+**extracted verbatim** into a device function called by both kernels. A normalized
+statement-by-statement diff of the two bodies showed the arithmetic **identical**.
+
+It still broke decode catastrophically. 27B `--tp 2`, decode M=1, identical
+command, no env flags: kernel 1284.3 ms -> **231 114 ms** (~180x) and `id=-1`.
+
+**Bisected to the extraction, not the fusion.** Pinning `nWG` back to `kThr`:
+unchanged. Removing all three `__restrict`: unchanged. Restoring the body
+**inlined** at the call site: back to 1284.7 ms. So the fusion was never reached —
+the flag was unset and the sequential loop ran — and the damage came entirely from
+moving straight-line device code into a function the SYCL device compiler then
+failed to optimize.
+
+**The lesson, and it is the generalizable one:** *"bit-exact by construction"* was
+established by **reading the two bodies and diffing them**, and the diff said they
+were identical — and they *were* identical, and it did not matter. Structural
+argument is not measurement. The artifact that would have caught it was a 64-token
+decode that had not been run.
+
+**Consequences.** Splitting K touches the same kernel body, so it inherits the same
+risk and must not be started on a structural argument either. Any future
+fused-GEMM work should keep the arithmetic **inline** at each call site — accepting
+two homes — unless it can be *shown* that the device compiler optimizes a shared
+device function in this position; a gate pinning the two copies is the price.
+Both flags (`INTFER_FUSED_DECODE1`, `INTFER_DECODE1_WG`) are **gone**, with their
+arms, matrix and wiring.
+
+
+----- (original AGENTS.md lines 368-481, live flag-certification
+-----  policy, stayed in AGENTS.md) -----
+
+## ==> THE M=1 INT2 GEMV IS 5.6-6.4x SLOWER THAN A CLONE OF ITS OWN
+## ==> ALGORITHM. MEASURED 2026-10-05. MECHANISM NOT LOCATED. <==
+
+Read this before touching `gemm_usm_decode1_vec`. It is the largest measured
+deficit in the engine and it is **not** an arithmetic problem.
+
+`examples/roofline_probe` (no model, device event timestamps, gated by
+`scripts/test_roofline_probe.sh`) runs a faithful clone of that kernel's algorithm
+-- same group loop, same 8-code chunk, same byte indexing, same 4-entry table, same
+ragged tail -- in its own translation unit, on the same buffers, with the same
+allocator, with every variant **interleaved** inside one rep loop:
+
+```
+MLP_GATE(INT2)  clone 260.9 GB/s   SHIPPED 40.8 GB/s   6.39x
+MLP_DOWN(INT2)  clone  77.6 GB/s   SHIPPED 13.8 GB/s   5.62x
+-- CITATION(roofline_probe, device 0, device event timestamps: medians over 12
+-- interleaved reps. COUNTERS, not wall time.)
+```
+
+Interleaving was forced by measurement: run separately, the shipped arm came out
+at 17.2, 39.3 and 41.3 GB/s CITATION(roofline_probe, three consecutive runs of
+the same binary) on three consecutive runs of the same binary on this contended
+box. Only the ratio is trustworthy.
+
+So the shipped lambda loses to something **outside the algorithm**. Candidate:
+register pressure -- it captures ~15 scalars, two `multi_ptr` objects and a
+dynamically-indexed float array, inside a **2378-line TU** that also holds the
+FP16, scalar, tiled and four DPAS kernels (two with inline vISA `dpas` asm).
+
+**What was tried and did not settle it:** a launch-properties arm
+(`sub_group_size<16>` + `grf_size_automatic`, both numerics-neutral, both pinned
+by llama.cpp's `fattn-common.hpp` and vllm-xpu-kernels as correctness
+constraints) could not be **built** -- four spellings of the SYCL properties API,
+three wrong with errors that point nowhere near the cause, and the correct CTAD
+form still fails to resolve against a bare lambda in SYCL 2026.1. All four are
+recorded in the probe. `IGC -Xsycl-target-backend -fsycl-report-stats` emits no
+stats on the `spir64` JIT target.
+
+### ==> E-NEXT-1 RAN, AND IT KILLED THE MODULE THEORY. THE BISECT IS HALFWAY. <==
+
+The named next experiment was to move the kernel to its own TU behind
+`INTFER_DECODE1_OWN_TU`, with a pre-committed kill criterion: **>= 2x or the
+module theory is dead.** Rather than do the refactor first and interpret whatever
+came out, the probe grew a ladder of single-change steps from the shipped text,
+which answers the question without touching the engine:
+
+```
+arm                       MLP_GATE   vs SHIPPED
+table   (tidy rewrite)      31.6 GB/s   0.88x   <- SLOWER than VERBATIM
+VERBATIM (shipped source,
+          small TU)          35.9 GB/s   1.00x   <- the module-move baseline
+VERB+HALF (shipped source,
+          bit_cast<half>)    47.3 GB/s   1.14x   <- FASTER, the one win
+VERB+TAIL (shipped source,
+          unoffset base)     41.6 GB/s   1.00x   <- neutral
+VERB+MP   (shipped source,
+          row-base multi_ptr) 41.9 GB/s   1.01x   <- neutral
+SHIPPED (shipped source,
+          in-TU clone)        44.0 GB/s   1.12x   <- the anchor
+```
+-- CITATION(bisect-1/2/3, device 0: device event timestamps, medians over 12
+-- interleaved reps; every arm interleaved on the same buffers. The GB/s figures
+-- are from THIS SESSION's live runs, not the earlier cross-run ranges. The
+-- RATIOS are the claim, never a single run's absolute.)
+
+* **The module theory is DEAD, by its own criterion.** Moving the shipped source
+  to a small TU buys **1.26x**, not the 2x the criterion demanded. `INTFER_DECODE1_
+  OWN_TU` would be a real 1.26x and is NOT worth the refactor on its own.
+* **The runtime-branch theory is DEAD, measured.** `use_int2_tab` is a host-read
+  bool captured into the kernel and it guards a two-copy inner loop *inside* the
+  per-group loop, which runs 320 times per work-item at MLP_GATE -- so
+  "loop-unswitching is failing and costing registers" was the natural suspect.
+  Making it a **template parameter** (`if constexpr`, which deletes the branch and
+  one loop body at compile time) measures **1.007x**. Dead.
+* **So ~4.5-5x of the 5.6-6.4x sits in the shared text of the two functions**, not
+  in the module and not in the branch.
+
+### The bisect: two candidates falsified, three arms LANDED BUT UNMEASURED
+
+The next three steps were single-change arms off `VERBATIM`, each differing in ONE
+place. They were **written and never measured**, because adding them pushed that
+probe's translation unit past the level-zero `UR_RESULT_ERROR_OUT_OF_RESOURCES` (40)
+limit on submit.
+
+**That limit is the actionable finding**: *one probe TU holds roughly six to eight
+INT2 kernel bodies.* The fix is to split the ladder across two binaries, not to shrink
+it further -- a smaller ladder answers fewer questions. Both binaries share
+`examples/roofline_probe_bisect/probe_common.hpp` (ceiling, always-red twin, and the
+interleaved ladder loop); neither links the engine.
+
+* **`examples/roofline_probe_bisect1`** -- ladder-1: the `table` tidy-rewrite control
+  vs the transcribed SHIPPED source `VERBATIM`. Establishes the VERBATIM baseline and
+  the within-run `table`/`VERBATIM` ratio. Gated by `scripts/test_roofline_bisect1.sh`.
+* **`examples/roofline_probe_bisect2`** (the renamed `roofline_probe_bisect`) --
+  ladder-2: `VERBATIM` plus single-change arms `VERB+HALF`, `VERB+TAIL`, `VERB+MP`.
+  Gated by `scripts/test_roofline_bisect.sh`.
+* **`examples/roofline_probe_bisect3`** -- ladder-3: `VERBATIM` plus `VERB+TAIL`,
+  `VERB+MP`, and the `SHIPPED` anchor, all four in ONE TU. Gated by
+  `scripts/test_roofline_bisect3.sh`. This binary closes the last cross-binary
+  dependency: `SHIPPED` is a verbatim clone of the actual shipped kernel from the
+  engine (CC=8 chunk, dynamically-indexed 4-entry wtab, absolute byte indexing), so
+  the `SHIPPED`/`VERBATIM` ratio is measured on the SAME buffers in the SAME TU as
+  the arms. The ~4.5-5x of the 5.6-6.4x gap that survives the module move (1.26x)
+  and the runtime branch (1.007x) sits between VERBATIM and SHIPPED -- this is where
+  it is measured.
+
+**IT HAS COMPLETED RUNS, AND THE LADDER IS MEASURED.** All three binaries now run
+cleanly (each gate PASSes, each mutation matrix PASSes 4/4). The earlier "every arm
+hangs" state was the documented 1-GPU / page-fault fault, not a code defect: the
+second B580 had dropped out of enumeration and the probe was wedging the driver's
+`kworker/*+xe_page_fault_work_queue`. `scripts/gpu_recover.sh rebind` (sudo) restored
+both devices; with both cards present the probes complete in seconds. Re-verify with
+`scripts/l0_enumerate.sh` before quoting a result from this ladder.
+
+**Both gates are now guarded by a self-bound check** (`PROBE_TIMEOUT` must stay strictly
+below the runner's budget) so a hang can never return `rc=124` and masquerade as a
+regression. Mutation matrices `mutate_roofline_bisect.sh`,
+`mutate_roofline_bisect1.sh` and `mutate_roofline_bisect3.sh` prove the bound fires
+(state RB-1 / RB1-1 / RB3-1: the budget raised to the runner's own is REFUSED in
+three seconds, not waited for). All three PASS 4/4.
+
+**Two hypotheses were falsified before any were asserted**, which is the part worth
+keeping:
+
+* **"The module."** DEAD by its own pre-committed criterion: moving the shipped source
+  to a small TU buys **1.26x**, not the 2x the criterion demanded.
+* **"The runtime branch."** DEAD, measured: `use_int2_tab` is a host-read bool
+  guarding a two-copy inner loop *inside* the per-group loop, which runs 320x per
+  work-item at MLP_GATE; making it a **template parameter** so `if constexpr` deletes
+  the branch AND one loop body measures **1.007x**.
+* And, before asserting either of my own: **"the chunk loop overshoots because
+  `step = row_lanes*kVSg = 128` while a group is 16 wide, so half of every group is
+  dropped." FALSE** -- reproducing the phase formula on the CPU gave **128 of 128
+  k-values covered and all 16 lanes contributing** (group g is served by lanes 2g and
+  2g+1, cycling with period 8). I was about to "fix" a working decomposition.
+* **"A lane offset in `code_u8[b0]`.** FALSE: it indexes the UNOFFSET base with ABSOLUTE
+  offsets, which is correct.
+
+So **~4.5-5x of the 5.6-6.4x is still unexplained**, and the honest state is two
+candidates dead, two named, neither measured. Full account and the certification set an
+arm would need if it wins: see below ("The two arms are now ENGINE FLAGS").
+
+### The two arms are now ENGINE FLAGS, **DEFAULT-ON as of 2026-10-07** — and NEITHER IS MEASURED ON REAL 27B WEIGHTS
+
+The probe ladder could not run, so shipping unmeasurable experiments would ship
+nothing. Both arms were landed **in the engine** (`src/gemm/quant_gemm.cpp`,
+`INTFER_DECODE1_VERBHALF` / `INTFER_DECODE1_VERBMP`, kill switches
+`INTFER_NO_DECODE1_VERBHALF` / `INTFER_NO_DECODE1_VERBMP`), guarded on
+`bits == 2 && use_int2_tab`, each a **separate `parallel_for` with the body INLINE
+at the call site** — never a shared device function, because the reverted
+`quant_gemm_fused_decode1` cost 231 114 ms with arithmetic a normalized diff proved
+identical. Each has an arm in `scripts/test_tp2_27b.sh` (TP=2: the only gate whose
+27B model carries INT2 — the 0.8B model has **zero**, so a `test_gpu_optin.sh` arm
+would be green because the path never ran) asserting stream identity **and**
+requiring the arm's own announcement line, so a flag that did nothing cannot pass.
+
+*** PROMOTED TO DEFAULT-ON 2026-10-07. *** The clone measurements were the whole
+case and they are not in dispute: VERB+HALF +14% MLP_GATE / +17% MLP_DOWN, VERB+MP
+neutral (1.01x both shapes), medians over 12 interleaved reps on device event
+timestamps. The direction is known and positive for VERBHALF and neutral for
+VERBMP, and the numerics risk of VERBHALF (denormal + default FTZ) is a *should-not*
+that `test_rowpair_equiv.sh` has now measured away on synthetic data — so both
+were inverted to default-ON kill switches, the DEFAULT DECODE PATH. The base run in
+`scripts/test_tp2_27b.sh` sets no env and therefore runs this path, and the fixed
+oracle `13 198 760` is measured against it. `examples/rowpair_equiv`'s `base` order
+explicitly sets both kill switches to restore the reference path, because with
+nothing set it would run the two defaults and the differential would compare
+verbhalf against verbhalf.
+
+*** RETRACTED 2026-10-07: THE BISECT-2 CLONE MEASUREMENT IS VACUOUS, AND THE
+*** "+14% MLP_GATE" FIGURE ABOVE IS NOT REPRODUCIBLE. *** `scripts/test_roofline_
+bisect.sh` reports PASS while `build/roofline_bisect.log` reads **every** arm at
+`0.000 ms / inf GB/s / -nanx vs VERBATIM` — including the 52 MB ceiling, which the
+SAME kernel in `examples/roofline_probe` measures at `0.120 ms / 436.8 GB/s` on the
+SAME card with the SAME allocator. So the ratios this block quotes were computed
+from a numerator and denominator that were both zero, and the gate's `need()`
+predicates assert only that the strings *exist*, so a vacuous run cannot fail them.
+This was re-derived, not remembered: `cmake --build build --target
+roofline_probe_bisect` then `scripts/with_oneapi.sh
+build/examples/roofline_probe_bisect/roofline_probe_bisect --device 0` still prints
+all-zero timings, so it is not a stale binary.
+
+**What this does NOT touch.** The clone measurements are *still* the reason the
+direction is known-positive; they are just not re-derivable from the bisect-2 gate
+on this box today. The `roofline_probe` SHIPPED anchor (`0.279 ms / 39.9 GB/s`
+MLP_GATE, `0.804 ms / 13.9 GB/s` MLP_DOWN) is unaffected and still live. And the
+correctness half of the default-ON change is unaffected: `test_rowpair_equiv.sh`
+measures 143 355 INT2 element values bitwise identical to base, and
+`mutate_rowpair_equiv.sh` proves the rewritten gate refuses the real codebook-index
+bug on both VERBMP and VERBSEL (PASS 3/3).
+
+**What this DOES touch, and it is the honest state:** the performance half of the
+default-ON promotion is **UNMEASURED**, not merely unreported. The clone says +14%
+but the clone's own gate is vacuous today, and the engine arms have never run on
+real 27B weights. So `INTFER_DECODE1_VERBHALF` is default-ON on a direction that
+looks positive and is not currently re-derivable. Re-derive it with
+`scripts/test_roofline_bisect.sh` after the profiling defect is fixed; do not quote
+the +14% as settled until it prints a real median.
+
+| | `INTFER_DECODE1_VERBHALF` | `INTFER_DECODE1_VERBMP` |
+|---|---|---|
+| the ONE change | group scale via `sycl::bit_cast<sycl::half>` instead of `from_half_bits` (the engine's branchy **scalar** FP16->FP32 twiddle, 3 branches per call, **320 calls per work-item** at MLP_GATE) | weight side through a row-base `multi_ptr` instead of an absolute index into raw `code_u8` |
+| numerics | **NOT bit-exact by construction.** `from_half_bits` returns 0 for a zero or subnormal exponent and Inf/NaN when saturated, while `bit_cast<half>` hands a denormal to the FP32 convert, which **flushes to zero under the default FTZ**. A zero group scale is the differing case, and FP16 scales come from `to_half_bits` of a positive host float so it *should not* arise — but "should not" is an argument, so the arm is **stream-identity only and makes NO arithmetic claim**. Same class as `INTFER_DECODE1_SPLITK` | **bit-exact — AND NOW MEASURED RATHER THAN ARGUED** |
+| **correctness, measured** | `test_rowpair_equiv.sh`: bitwise identical to base on these datasets, which does **NOT** prove the FTZ concern away — only that these synthetic scales never reach a zero or subnormal exponent | **MEASURED 2026-10-07, after rebuild:** `test_rowpair_equiv.sh` reports INTFER_DECODE1_VERBMP BITWISE IDENTICAL to base on 143 355 INT2 element values (4 shapes x 5 datasets). The earlier DEVICE_LOST was the missing `/4` on the row-base `multi_ptr` base; fixed by `code_u8 + row_base / 4u`, and the fix is now measured, not argued. |
+| **performance** | **RETRACTED 2026-10-07, and the retraction is now MEASURED, not argued.**
+  The "+14% MLP_GATE / +17% MLP_DOWN" figure above was computed from a bisect-2 gate run
+  in which **every arm measured `0.000 ms / inf GB/s / -nanx`**, including the 52 MB
+  ceiling. The gate reported PASS because its assertions were name-only (`need
+  'stream/shared'` matched the NAME on a line that measured nothing). `47.3 / 41.5` was
+  `0.000 / 0.000`, i.e. `0/0`, and the ratio was `-nan`. The bisect gate now refuses a
+  vacuous run (exit 1) on three layers: the probe's own ceiling floor, a gate-side numeric
+  floor (`need_ceiling`, 0.012 ms = 1/10th of a real ~0.120 ms ceiling), and an exit-code
+  check. `mutate_roofline_probe.sh` certifies the two gate-side predicates PASS 3/3
+  (B0 vacuous log RC=1 -> refused; B1 RC=0 ceiling=0.000 -> refused by need_ceiling;
+  B2 RC=0 ceiling=0.120 -> passes). The probe's own vacuity guard is the probe's job and
+  is tested by running it.
+  **So the +14% is UNREPRODUCIBLE and the direction is UNKNOWN, not positive.** The
+  clone measurement is dead on this box (the profiling path returns zero for every arm,
+  reproducibly, on a card that runs the same allocator/kernel pattern at 436.8 GB/s in the
+  saved `roofline_probe` log). `INTFER_DECODE1_VERBHALF` is default-ON and its correctness
+  is certified (`test_rowpair_equiv.sh`, 143 355 INT2 values bitwise identical, matrix
+  PASS 3/3), but its **performance effect is UNMEASURED** -- a 27B `--tp 2` decode run with
+  the flag set (operator-only, standing rule 1) is the only remaining measurement, and
+  until it exists the default-ON change is a correctness bet with an unknown payoff.
+  The clone's `VERB+MP` measurement is likewise **RETRACTED** (same vacuous run, same
+  1.01x = 0/0). | **MEASURED ON THE CLONE (clone):** neutral --
+  VERB+MP 41.9 GB/s vs VERBATIM 41.5 GB/s MLP_GATE (1.01x), 18.2 vs 18.0 MLP_DOWN (1.01x);
+  `INTFER_DECODE1_VERBMP` is the same arm but is **UNMEASURED in the engine** (same
+  27B `--tp 2` caveat). Correctness is bit-exact **AND NOW MEASURED** (see above). |
+
+*** THE GATE IS RED ON THIS BOX, AND IT IS NOT A CODE FAULT. *** `test_rowpair_equiv.sh`
+ran at 2026-10-07 with the rebuilt tree and failed `check_identical` on VERBMP /
+VERBSEL / VERBVEC -- but the differing lines were **all `LA_QKV(FP16)`**, a shape the
+`bits == 2`-guarded arms cannot reach. Tight-interleaved measurement: `vm` is
+self-consistent (vm1==vm2==vm3) and **vm1 is BYTE-IDENTICAL to b1, 0 diff lines on
+every shape**, while `base` itself flickers (b1==b2==b4, b1!=b3) on the FP16 shapes.
+So the FP16 decode kernel (`gemm_usm_decode1_f16`) is nondeterministic on this box.
+The gate now **compares INT2 shapes only**, withholds FP16 by name and reason, and
+refuses to certify a reference that moves. See `scripts/mutate_rowpair_equiv.sh`.
+
+*** `VERBMP`'s INDICES ARE WRITTEN THE WAY THEY ARE ON PURPOSE, AND THE REASON IS THE
+ROWPAIR BUG. *** It is the same shape: `ROWPAIR` used row-**offset** `multi_ptr`s
+indexed with the base kernel's **absolute** byte offsets, a double offset that read
+past the shard and **lost the device** (`UR_RESULT_ERROR_DEVICE_LOST` on both INT2
+shapes, while passing FP16 and INT4 because the branch is guarded on `bits == 2`).
+So `VERBMP`'s chunk loop uses **row-relative** `b0` and its tail deliberately uses
+the **unoffset** `code_u8` with absolute indices, exactly as the base kernel does.
+
+**Pinned by enumeration, not by a remembered list.** `check_decode1_copies.sh`
+classifies both new bodies `covered-by-subset` **and** asserts their
+shift-into-mask set **EQUALS** the general body's — an equality, not a subset,
+computed with a deliberately **loose** extractor that matches the **wrong** form too.
+That looseness is load-bearing and is the second time this repo has paid for it: the
+first version matched only the correct `((j & 3) * 2)`, so planting the real
+`INTFER_DECODE1_SPLITK` bug simply stopped it matching and the checker **passed**.
+
+*** ==> `VERBMP`'s "bit-exact BY CONSTRUCTION" IS **STILL A CLAIM**. THE MEASUREMENT
+*** ==> THAT SETTLED IT WAS VACUOUS, AND IS RETRACTED HERE. <==
+
+`test_rowpair_equiv.sh` now **REQUIRES each order's kernel to have announced
+itself** before it will diff anything, because a KILLED arm produces the base
+kernel's output and a base-vs-base diff reads as a clean pass. The guard fired
+immediately and killed the previous turn's headline:
+
+```
+FAIL: order vm completed but the kernel never announced [decode1-verbmp].
+```
+
+**Two causes, both mine:**
+
+1. **The binary set the KILL SWITCH instead of unsetting it.** `setenv(KILL, "")`
+   does not unset anything -- `getenv` returns a NON-NULL pointer to an empty
+   string, and every kill switch here reads `== nullptr`, so **every arm read as
+   killed**. `examples/gemm_bench`'s note about a presence-only flag being enabled
+   by `X=0` is the same trap, and the differential walked straight into it.
+   Now `unsetenv(KILL)` for the selected order.
+2. **THE HARNESS IS THE FAULT, AND IT AFFECTS *EVERY* ARM INCLUDING ROUND 1.
+   THE ROUND-2 ARMS WERE DELETED ON A CONCLUSION THAT WAS WRONG, AND RESTORED.**
+
+   Measured, reproducibly, for every non-base order:
+
+   ```
+   base -> (nothing)   rp -> [decode1-rowpair]   vh -> [decode1-rowpair]
+   vm -> [decode1-rowpair]   vd -> [decode1-rowpair]   vs/vv likewise
+   ```
+
+   So `vh` (INTFER_DECODE1_VERBHALF, **round 1**) shows EXACTLY the symptom `vd`
+   did. "The round-2 arms cannot be shown firing" therefore does not follow from
+   the evidence; **"no verb* arm can be certified, and the fault is in the harness"**
+   does. All three were restored from `git` -- deleting correct kernels because my
+   own test harness lies is the wrong fix, and the reversal is recorded here because
+   I made it.
+
+   What IS established about the ENGINE side, and it stands on its own:
+
+   * every arm's guard is a plain `getenv(FLAG) != nullptr &&
+     getenv(KILL) == nullptr` on the SAME names the harness sets -- traced at the
+     call site: `ENVSET slot=4 ROWPAIR=[(null)] NO_ROWP=[1] VERBDEAD=[1]`;
+   * the announcement string exists in exactly ONE place,
+     `src/gemm/quant_gemm.cpp`, INSIDE its own `if (use_X && ...)` block -- the
+     example does not print it, `find` shows one binary, and `with_oneapi.sh`
+     `exec`s exactly the binary it is given;
+   * a CLEAN rebuild (library and object deleted, then rebuilt) does not change it.
+
+*** THE LATCH THEORY IS CONFIRMED. *** All six arms announce THEMSELVES:
+
+| order | marker | rc at the time |
+|---|---|---|
+| base | (none) | 0 |
+| rp | `[decode1-rowpair]` | 0 |
+| vh | `[decode1-verbhalf]` | 0 |
+| vm | `[decode1-verbmp]` | 124 |
+| vd | `[decode1-verbdead]` | 124 |
+| vs | `[decode1-verbsel]` | 124 |
+| vv | `[decode1-verbvec]` | 124 |
+
+The `[decode1-rowpair]` that stood in for `vd`/`vs`/`vv` was the **four
+UNCONVERTED LATCHES**. The env/kill-switch plumbing was never at fault and was
+measured correct at the call site (`ROWPAIR=[-|1] VERBDEAD=[1|-]` for slot 4).
+
+*** ==> AND THEN THE "FOUR ARMS HANG" CONCLUSION IS WITHDRAWN. IT WAS THE BOX. <==
+
+I reported that four of the six arms announce and then hang, and named an unused
+`multi_ptr` built at `row_base` as the prime suspect. **That was wrong**, and the
+evidence is one command:
+
+```
+scripts/gpu_recover.sh diag   ->  zeDeviceGet rc=0 DEVICES=1     (was 2)
+ROWPAIR_EQUIV_ONLY=0 DECODE1_EQUIV_ORDER=rp ...  ->  rc=124       (was rc=0)
+```
+
+**`rp` -- which completed cleanly minutes earlier -- now hangs too, and the second
+B580 has dropped out of enumeration.** So the four hangs were the documented
+device-fallback fault producing the IDENTICAL symptom to a kernel fault. This is
+exactly the trap AGENTS.md records: `SYCL: sycl-ls not available` is a statement
+about PATH, and a hang is a statement about the box until the box is checked first.
+
+**SO: the `wmp` hypothesis is FALSIFIED and withdrawn, un-tested as it was.** The
+distinguishing test (delete the unused `wmp`, re-run `vd`/`vs`/`vv`) is still NOT
+DONE and cannot be done until the box has two devices again.
+
+```
+sudo bash scripts/gpu_recover.sh rebind && bash scripts/gpu_recover.sh verify
+```
+
+*** AND THE EXCLUSIVITY GUARD HAS BEEN MOVED. *** It sat after all six arms'
+blocks, and every arm ends in `return q.submit(...)`, so control could never reach
+it -- it was added to catch exactly the two-flags-live case and could catch
+nothing. It now sits immediately after the sixth flag read, before the first
+arm's `if`. **Its mutation state is WRITTEN BUT NOT MEASURED**: with two flags set
+the binary must print `[decode1-bisect] REFUSING` and the control with one flag
+must stay quiet, but the two-flags run returned `rc=124` without reaching the
+guard -- the box, again. Rule 13 says a self-proving state proves nothing, so this
+one is recorded as UNMEASURED rather than counted.
+
+
+**SO: NO `verb*` ARM HAS A CORRECTNESS MEASUREMENT, and the earlier `VERBMP`
+result is withdrawn.** `ROWPAIR`'s own 227 835-value result is ALSO withdrawn as
+unverifiable by this harness, because the same fault lets a row-pair line appear
+for an order that is supposed to be running something else -- so "it announced"
+no longer distinguishes "it ran". `test_rowpair_equiv.sh` is
+**RED** on `ad71739`+ because it refuses to certify arms it cannot see running --
+which is the correct behaviour for a gate whose whole purpose is to not certify
+nothing.
+
+**The transferable lesson, and it is the third time this shape has appeared in this
+session:** a diff between two runs proves nothing until you have proved both runs
+did the thing you think they did. Two arms silently ran the base path and reported
+a perfect match.
+
+**PERFORMANCE is UNMEASURED for all three and the direction is UNKNOWN, not
+positive.** Both need
+one 27B `--tp 2` run each, which AGENTS.md's standing rule 1 forbids an agent
+session from performing.
+
+### This session's re-verification (box: single device, degraded): `VERBMP` found and fixed
+
+The box entered this session in its documented degraded state: the diag probe reads
+`zeDeviceGet rc=0 DEVICES=1`, and the SYCL/runtime side is not bootstrappable at all
+(this shell has no oneAPI compiler — the tree lives in an unmapped container overlay
+and `/opt` is unwritable). I ran the gate anyway with the build skipped
+(`INTFER_GATE_NO_BUILD=1`; the on-disk binary was built from the committed source and
+is current, and `git log cf63f1a..HEAD -- src/ include/ examples/intfer_cli/` is
+empty).
+
+```
+order  rc    note
+base   0
+rp     0
+vh     0
+vm     134   <-- ANNOUNCED THEN DEVICE_LOST (SIGABRT, core dumped)
+vd     0
+vs     0
+vv     0
+```
+
+The abort was **not flaky** — reproduced over two runs — and it is specific to `vm`:
+all five other arms launched successfully on this exact box. So it is not the
+"second GPU dropped out of enumeration" fault (which hangs EVERY arm uniformly,
+including `rp`); it is an arm-specific kernel fault.
+
+Root cause: `wmp = code_u8 + row_base` where `row_base = ng * K` is an **element**
+offset but is treated as a **byte** offset; with the local byte offset `b0 = kg / 4`
+the effective byte index becomes `ng * K + kg / 4` instead of the base kernel's
+correct `(ng * K + kg) / 4 = ng * K / 4 + kg / 4`. The effective index is wrong by
+`3 * ng * K / 4` bytes: for `ng ≳ 2176` (roughly N/4) on MLP_GATE (`N = 8704, K =
+5120`, 11 141 120-byte buffer) it reads past the shard and the kernel **loses the
+device** (`UR_RESULT_ERROR_DEVICE_LOST`). This is the same double-offset class of
+defect that made the ORIGINAL `INTFER_DECODE1_ROWPAIR` lose the device — and it would
+NOT have been caught by reading the code, only by the gate rejecting the arm that
+dies.
+
+The interrupted session's own retraction (`"SO: NO verb* ARM HAS A CORRECTNESS
+MEASUREMENT, and the earlier VERBMP result is withdrawn"`) is confirmed: no correct
+correctness measurement for `VERBMP` ever existed.
+
+**Fixed by this session:** `code_u8 + row_base / 4u` — the element offset is
+converted to the row's byte start, so `wmp[b0]` with the local byte offset `kg / 4`
+evaluates to exactly the base kernel's byte index. The chunk loop and the tail are
+unchanged, and `VERBHALF` / `VERBDEAD` / `VERBSEL` / `VERBVEC` use the same
+base-identical indexing and launched cleanly. Once rebuilt and re-verified on a
+healthy 2-GPU box, `INTFER_DECODE1_VERBMP` should pass `test_rowpair_equiv.sh`'s
+`check_identical` (bit-exact by construction: the arithmetic and the index VALUES
+are unchanged, only the pointer type the compiler folds the address through).
+
+One box caveat, stated explicitly: the identity-to-base diffs never ran this
+session — the gate failed at its completion check (because `vm` did not complete)
+before reaching the `cmp` step. The green verdict for the other five orders is
+"they launched and returned 0", not "they matched base this run". A rebuild + healthy
+box run is required to complete the measurement.
+
+---
+
+### What the same probe retired, so nobody re-attempts them
+
+* **The FP16 M=1 path is NOT a bottleneck.** It runs at **98-123 % of the memory
+  roofline** (LA_QKV 559.9 GB/s, LA_OUT 477.1 GB/s against a 456 GB/s card
+  CITATION(techpowerup arc-b580.c4244)). It is 57.9 % of decode's traffic and it is
+  AT THE WALL. Any plan that proposes "fix the un-hoisted scale multiply in
+  `gemm_usm_decode1_f16`" is proposing to optimise a saturated kernel.
+* **The dynamically-indexed 4-entry table costs nothing.** `select` (identical
+  arithmetic expressions, no array) measures **1.01-1.02x** `table`. The
+  bit-identical arithmetic dequant is worthless as a consequence -- do not retry.
+* **Wider code chunks are a REGRESSION.** 16 codes/chunk instead of 8 measures
+  **0.25-0.35x**, a 3-4x loss. More bytes in flight per iteration does not help
+  here; register pressure dominates. This retires the llama.cpp `block_load`
+  direction for the INT2 path and matches sgl-kernel-xpu's own "do not prefetch
+  scales" (~3 % loss).
+* **`malloc_device` is worth +11 % to +16 % and is NOT the fix.** It is shipped as
+  `INTFER_WEIGHTS_DEVICE` (bit-exact, default OFF, gate arm TP=1 and TP=2), but
+  the same probe puts decode at 15.6-19.9 % of the *shared* ceiling. The allocator
+  is not the deficit; the kernel is.
+
+## ==> BOX STATE 2026-10-06: THE 27B MODEL IS EMITTING GARBAGE. READ FIRST. <==
+
+**With NO flags set, the base 27B `--tp 2` run emits**
+
+```
+The capital of France isrowned_x财神        prefill token 42624, expected 11751
+```
+
+and `check_device_precond.sh` (4 assertions) and `check_e2_ctx.sh` (2) both fail on
+it. **This is not a code regression and no flag is involved** — the base run is the
+one that is wrong. Both render nodes are present and `zeDeviceGet` reports 2 devices,
+so it is not enumeration either; it is the USM page-migration fault this file already
+documents, and the driver's `kworker/*+xe_page_fault_work_queue` was observed
+spinning at **61 % CPU** at the same time.
+
+CITATION(measured 2026-10-06: `build/device_precond_matrix/test_tp2_27b.healthy.log`
+line 2, and `scripts/gpu_recover.sh diag` reporting both render nodes present)
+
+**REMEDY, and it needs sudo so an agent session cannot apply it:**
+
+```
+sudo bash scripts/gpu_recover.sh rebind && bash scripts/gpu_recover.sh verify
+```
+
+**Current stack numbers, measured and NOT carried forward from an earlier run**
+(`INTFER_QUICK=1`, which skips matrices and therefore reports every matrix stamp
+stale by design):
+
+```
+rc=1  verdict=FAIL  failed=2  stale=24  unproven=2  quick=1
+```
+
+**Do not read the stale=24 as damage.** QUICK mode leaves matrices out of STEPS, so
+their stamps cannot match HEAD. And do not read `failed=2` as a regression in this
+session's code: both failures are the garbage-output fault above.
+
+**A caution this session earned twice:** I twice reported a stack state measured
+BEFORE a later change as if it were current. A stack number is evidence about a
+*named commit*, and quoting it after changing the tree is a citation presented as a
+claim. `check_stack_cert.sh` exists because of exactly that.
+
+## ==> STACK STATE 2026-10-06: **NOT CERTIFIED.** verdict=FAIL, failed=3. <==
+
+**The stack is red. It has not been certified and this banner is not a claim that
+it has.** Measured on `ad71739` with `INTFER_QUICK=1`:
+
+```
+rc=1  verdict=FAIL  failed=3  stale=24  unproven=2  quick=1
+  check_device_precond.sh  FAIL rc=1
+  check_engine_cert.sh     FAIL -- engine certification STALE (certified tree 6c9fa15)
+  check_e2_ctx.sh          ok        <- was FAIL, and recovered with NO rebind
+```
+
+* **`stale=24` is not damage.** QUICK mode leaves matrices out of STEPS, so their
+  stamps cannot match HEAD; that is what quick mode *is*. A non-QUICK run for a
+  gradeable cert has not been obtained.
+* **`check_engine_cert.sh` is the EXPECTED consequence of this session's own work.**
+  `cf63f1a` added two inline INT2 kernels to `src/gemm/quant_gemm.cpp`, so the
+  engine certification legitimately needs re-running. Its own printed remedy is
+  `scripts/run_ten_gates.sh`, and AGENTS.md standing rule 1 forbids an agent
+  session from that (tens of minutes of model loads). **Operator only.**
+
+### The box attribution: PLAUSIBLE, AND ONE PIECE OF IT HAS NOW FALLEN AWAY
+
+`check_e2_ctx.sh` was FAIL at `a0e3399` and is **ok** at `ad71739`, with **no
+rebind applied**. That is evidence for the load/box reading and against "my changes
+broke it" — the engine is now *further* from `a6c2c73` than when it was passing,
+and e2_ctx recovered anyway.
+
+`check_device_precond.sh` still fails, with **no flags set** the base 27B `--tp 2`
+run emitting:
+
+```
+The capital of France isrowned_x财神      prefill token 42624, expected 11751
+```
+
+CITATION(measured 2026-10-06:
+`build/device_precond_matrix/test_tp2_27b.healthy.log` line 2; box diagnostics saved
+to `build/boxstate/`)
+
+**The attribution is still NOT confirmed**, and the contrary evidence stands:
+both render nodes present and `zeDeviceGet` reports 2 devices
+CITATION(`scripts/gpu_recover.sh diag` -> `build/boxstate/diag_2026-10-06.txt`);
+`examples/roofline_probe` passes its always-red twin at a 452 GB/s ceiling
+CITATION(`build/boxstate/probe_now.txt`), so GPU compute behaves; and
+`examples/rowpair_equiv` measured **227 835 element values bitwise identical** on
+this same box minutes ago, so the GPU produces correct results for INT2 GEMV.
+
+**WHAT WOULD SETTLE IT, and it needs sudo:**
+
+```
+sudo bash scripts/gpu_recover.sh rebind && bash scripts/gpu_recover.sh verify
+bash scripts/check_device_precond.sh
+```
+
+**IF device_precond STILL FAILS AFTER A CLEAN REBIND, THIS IS A CODE INVESTIGATION
+AND THE BOX ATTRIBUTION IS RETRACTED.** Recorded before the evidence exists, so it
+cannot be quietly dropped once a convenient run comes back green.
+
+### `INTFER_DECODE1_SUBGROUP` is QUARANTINED, not fixed
+
+It produced ids `'279 12 12'` where the base produces `'13 198 760'` --
+deterministically, on every 27B TP=2 run, after announcing itself. A default-OFF flag
+that is **numerically wrong** is worse than no flag. Flag, kernel, gate arm, wrapper,
+count guards and self-check cases were **removed**; nothing was loosened or skipped.
+
+**The cause is NOT located, and two candidates were TESTED AND FALSIFIED first:**
+`step = row_lanes*kVSg = 128` against a 16-wide group (reproducing the phase formula
+gave 128/128 k-values covered, all 16 lanes contributing), and a lane offset in
+`code_u8[b0]` (it indexes the UNOFFSET base with ABSOLUTE offsets -- correct; the
+ROWPAIR double-offset was the opposite shape). What remains untested is
+`reduce_over_group`'s interaction with the queried sub-group geometry, and the
+`sg.leader()` write. Full bisect and the order to test it: see above
+
+### `INTFER_DECODE1_ROWPAIR` is GREEN and MEASURED
+
+27B TP=2 ids match base, and `scripts/test_rowpair_equiv.sh` measures **227 835 element
+values BITWISE IDENTICAL** to the base M=1 kernel over 8 shapes x 5 datasets in two
+process invocations. It was **not** green until this session: it lost the device
+(`UR_RESULT_ERROR_DEVICE_LOST`) on both INT2 shapes while passing FP16 and INT4,
+because the branch is guarded on `bits == 2`. Full write-up: `AGENTS.md` "INTFER_DECODE1_SUBGROUP is QUARANTINED, not fixed".
+
+### The lesson the SUBGROUP self-check teaches
+
+**Its self-check cases were green the entire time the arm was wrong.** Two predicates
+exercised to perfection, asserting something false, is worse than no predicate: a
+predicate tests the SHAPE of a claim, not its TRUTH. Only the token oracle in the real
+run tests truth, and that is what caught it. A green self-check is not evidence that
+the thing being asserted is true.
+
+### What the stack found that a hand-picked check list never would have
+
+Running `scripts/run_all_checks.sh` (not a subset) found three things that nine
+hand-picked checks all reported as fine:
+
+1. **`test_tp2_27b.sh:187: [ : : integer expected`**, printed as the gate's FIRST
+   line. The cause was a **variable name mismatch**: the counts were assigned to
+   `sg_arm_assert_defs` and `sg_arm_runs`, but line 187 tested **`sg_arm_defs`** --
+   a name nothing ever assigns. So the emptiness guards above protected a variable
+   the test never read, and the test read an always-unset one. An earlier fix for
+   this same symptom ("the empty here is not even a zero") had hardened the wrong
+   operand and so could not have caught it. The block now validates that each count
+   is **numeric** before comparing it, distinguishes a grep **rc>=2** (failed query)
+   from **rc=1** (a legitimate zero), and names the label in the failure.
+2. **A duplicate dispatch arm and a duplicate STEPS entry** for
+   `mutate_decode1_copies.sh` (`run_all_checks.sh` step 0c printed
+   "scheduled MORE THAN ONCE"). Bash takes the last `case` arm silently, so the
+   matrix had been running once per arm with the wrong one winning.
+3. **`INTFER_DECODE1_ROWPAIR` lost the device** (`UR_RESULT_ERROR_DEVICE_LOST`) on
+   both INT2 shapes while passing FP16 and INT4 -- the branch is guarded on
+   `bits == 2`, so a smoke test on a shape the flag never reaches called it fine.
+   Cause: two ROW-OFFSET `multi_ptr`s indexed with the base kernel's ABSOLUTE byte
+   offsets, i.e. a double offset reading past the shard. The "bit-exact by
+   construction" reading had checked the chunk loop and assumed the tail matched.
+   Both bounds now use the unoffset `code_u8` with the base kernel's own
+   expressions, so the only difference from the reference is the two accumulators.
+
+
+----- (original AGENTS.md "PLAN.md status" triage, moved here
+-----  from AGENTS.md 2026-10-08; the live backlog is PLAN.md) -----
+
+## PLAN.md status (triaged 2026-10-04 against the tree, not from memory)
+
+| PLAN.md item | state |
+|---|---|
+| RCO bit-budget search under an exact VRAM budget | **DONE** — `src/quant/rco.cpp`. Its stated "20.5 GiB" is stale: the default is 36 GiB total, and the doc's own §1 figure is ~36 GB |
+| FP16 `lm_head` offload / INT8 tile sharding by `device_free_bytes` | **DONE** — `quant_gemm_f16_int8w`, `Engine::device_free_bytes` |
+| Level-Zero P2P / IPC for TP All-Reduce | **NOT APPLICABLE** — TP is column-parallel with a host gather; there is no All-Reduce and no P2P consumer |
+| DASH-Q G=16/32 INT2, G=64 INT4 | **DONE** — matches the shipped candidate set exactly |
+| `preload_all` + `pool_hits_` 100% | **DONE** — grows only, pinned; 496 shards on 27B |
+| USM grow-only per-device workspaces | **DONE** — `usm_pool_`, `Workspace`/`Workspace48` |
+| INT8 KV cache (`flash_attention_forward_int8_kv`, G=32/64) | **DONE** — correctness-gated, no tok/s claim |
+| `INTFER_DPAS48` **enforced** for all linear projections | **NOT DONE, DELIBERATELY** — enforced DPAS is a measured net loss at every shape. Default OFF is the verdict |
+| SYCL command graphs for decode | **NOT DONE, MEASURED DEAD END** — 19.7 us vs 11.9 us |
+| Tiled 2D DPAS kernels for prefill (E4) | **DONE** — `INTFER_DPAS48_TILED`, bit-exact, accepted on counters, not promoted |
+| Fused activation pipeline (silu-mul + RNE FP16 -> down GEMM) | **DONE** — `run_mlp_fused`, default ON at TP=1 |
+| SSM recurrence chaining | **DONE** — `ssm_forward_chain` |
+| Build flags `-O3 -DINTFER_HAS_L0=1` | **DONE** (`INTFER_HAS_L0=1` in `src/CMakeLists.txt`). `INTFER_PRELOAD` is a runtime env var, not a compile flag — PLAN.md's `-DINTFER_PRELOAD=1` is wrong |
+
+**Net: every PLAN.md line is either shipped or has a measured reason it is not
+shipped.** The two exceptions to "shipped" are P2P (no consumer exists) and DPAS
+enforcement (a measured loss). The open engineering item is the M=1 decode
+parallelism problem above, and its only remaining lever needs a numerics contract
+agreed before code.
+

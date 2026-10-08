@@ -174,6 +174,6 @@ scripts/             build.sh / run.sh / run_bin.sh / with_oneapi.sh
   the SYCL FlashAttention kernel.
 - Launch-count reduction (fusion) for the decode loop — SYCL command
   graphs were measured *slower* than plain submit on B580 (19.7µs vs
-  11.9µs) and the scaffold was removed; see `REMAINING_TODOS.md`.
+  11.9µs) and the scaffold was removed; see HISTORY.md.
 
 See `AGENTS.md` for the full staged task breakdown.

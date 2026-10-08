@@ -1,38 +1,177 @@
-To maximize both token decode and prefill performance on a dual Intel Arc B580 setup (2×12GB VRAM), optimizations must target hardware-native XMX DPAS execution, PCIe multi-GPU interconnect overhead, and SYCL graph execution.
+# PLAN — intfer optimization backlog (2x Intel Arc Pro B580, TP=2)
+
+Merged 2026-10-08 from `PLAN.md` (original upstream-port plan),
+`REMAINING_TODOS.md` (CLI-era TODOs, now deleted) and
+`optimizations-survey.md` (llama.cpp SYCL / vllm-xpu-kernels /
+sgl-kernel-xpu survey). The three sources were one file each; this is
+the single plan file. Section 1 is the backlog, sorted biggest
+performance gain first; sections 2-5 are records, kept verbatim from
+their sources because a measurement that disagrees with today's tree
+is still a true record of when it was written.
+
+**Objective (standing):** 27B `--tp 2` decode 40 tok/s, prefill
+4000 tok/s. Measured state (derive, never quote from prose):
+`scripts/model_byte_roofline.sh` — 9.752 GB/device/token against
+456.0 GB/s peak; `kernel 237.5 ms/tok -> 41.1 GB/s = 9.0%`.
 
 ---
 
-### 1. VRAM Budget & Multi-GPU Topology (2×12GB)
+## 1. Backlog, biggest performance gain first
 
-To eliminate runtime layer-streaming overhead during generation, all model weights and workspaces must fit permanently in GPU VRAM (`preload_all()`).
+Order is by expected gain on the measured deficit (INT2 GEMV at
+5.6-6.4x below a clone of its own algorithm — see HISTORY.md,
+"THE M=1 INT2 GEMV IS 5.6-6.4x SLOWER"). Estimates are hypotheses
+with a kill criterion each, not claims; every row must be decided on
+load-insensitive counters (`kernel` bucket) and clear the spread floor.
 
-* **RCO Bit-Budget Target**: Set RCO budget to **20.5 GiB total (~10.25 GiB per GPU)**. This guarantees full weight residency while reserving ~1.75 GiB per GPU for workspace buffers, activation state, and the KV cache.
-* **FP16 `lm_head` Offload/Sharding**: Ensure `lm_head` is sharded as asymmetric per-row INT8 (`quant_gemm_f16_int8w`) or distributed unevenly based on device free memory (`device_free_bytes`).
-* **Level-Zero P2P Direct Copy**: Use native Level-Zero IPC handles (`ze_driver`, `ze_device`) to establish direct peer-to-peer (P2P) transfers over PCIe for Tensor-Parallel (TP=2) All-Reduce operations, avoiding CPU-mediated staging.
+### 1.1 `block_load<uint8_t,128>` on the INT2 weight stream
 
----
+* **Why it is first:** INT2 is 20.2% of decode traffic
+  (1.837 GiB/device/token) and the entire 5.6-6.4x deficit sits in
+  the shared text of the two functions, not the module and not the
+  runtime branch (HISTORY.md, E-NEXT-1). This is the one genuinely
+  new idea the deleted draft had (`src/gemm/quant_gemm.cpp:457-465`):
+  8 B/lane at the queried sg=16, one `block_load` per 32 codes.
+* **Where:** `src/gemm/quant_gemm.cpp`, M=1 INT2 decode lambda.
+* **Kill criterion (pre-committed):** < 2x closes the experiment —
+  that also closes llama.cpp's `block_load` direction for INT2, which
+  the wider-chunk probe already measured at 0.25-0.35x.
+* **Gate:** arm in `test_tp2_27b.sh` (TP=2 is the only gate whose
+  27B model carries INT2), stream-identity asserted.
 
-### 2. Token Decode Phase (Latency & Bandwidth Bound)
+### 1.2 gate+up in a single launch (the one TP=2-valid fusion)
 
-| Optimization Vector | Implementation Strategy |
-| --- | --- |
-| **DPAS Hardware Fast-Path** | Enforce `quant_gemm_dpas48` (W4A8/W2A8 sub-byte DPAS) for all linear projections over `quant_gemm_forward_usm` (FP16 dequant fallback). |
-| **SYCL Command Graphs** | Capture the full multi-layer decode forward pass into a `sycl::ext::oneapi::experimental::graph` to eliminate per-token CPU-side submission latency. |
-| **INT8 KV Cache** | Use `flash_attention_forward_int8_kv` with $G=32/64$ groupwise symmetric scales. This cuts KV memory bandwidth by 50% during decode. |
-| **USM Memory Pooling** | Pre-allocate grow-only per-device workspaces (`Workspace` / `Workspace48`) and route all device memory acquisitions through `usm_pool_` to ensure zero Level-Zero allocations in steady state. |
+* **Why:** fusion is the standing directive; both `gate` and `up` are
+  column-parallel over the same split and device-local, and each
+  output's K accumulation is untouched, so it is bit-exact. The two
+  existing fusion seams (`run_mlp_fused` `engine.cpp:1352`,
+  `run_linear_tp_devact` `engine.cpp:1484`) are **TP=1 ONLY** and
+  are dead code at the target — do not route through them.
+* **Gain:** removes one submit + one wait per MLP per token. The
+  fused-MLP-down precedent is +13% decode for exactly that.
+* **Where:** `src/engine/engine.cpp`, the TP=2 MLP path.
+* **Gate:** stream-identity at TP=2, arm in `test_tp2_27b.sh`.
 
----
+### 1.3 SLM work-stealing tile scheduler for prefill tiles
 
-### 3. Token Prefill Phase (XMX Compute Bound)
+* **Why:** vllm/sgl `TileScheduler` (one `atomicAdd` per tile-chunk)
+  keeps the device busy under saturation; submit inflates ~84 us/launch
+  at M=1 to ~600 us at M=128, so fewer, better-filled launches are
+  the prefill lever. Per-device, so TP-compatible.
+* **Does NOT apply to M=1 decode:** one output per work-item, nothing
+  to steal. Do not attempt it there.
+* **Where:** the prefill tiled DPAS kernels (`quant_gemm_dpas48_2d`).
+* **Kill criterion:** if tile occupancy is already saturated at the
+  current launch shape (probe with the device's own event timestamps),
+  close it.
 
-* **Tiled 2D DPAS Kernels**: For $M \ge 32$, launch 2D tiled DPAS GEMM kernels ($64\times 64\times 64$ tile sizes) with Xe-core Sub-Group size 16/32 to maximize XMX systolic tensor engine utilization.
-* **Fused Activation Pipeline**: Chain Gate/Up GEMMs directly into `silumul_to_half` on-device kernels before launching Down GEMM. This reduces memory traffic by avoiding host round-trips or intermediate FP32 activation dumps.
-* **SSM Recurrence Chaining**: For hybrid linear-attention blocks (e.g., Qwen3.5), dispatch prefill chunks using `ssm_forward_chain` to perform multi-row sequential state updates in shared local memory (SLM) without host synchronization.
+### 1.4 oneMKL `gemm` fallback for large contiguous FP16
 
----
+* **Why:** llama.cpp `ggml-sycl.cpp:3115` shape — a link-only change
+  today (verified: zero `dnnl`/`onemkl`/`mkl::` reference in
+  `src`/`include`/`examples`).
+* **Why it is fourth:** FP16 is 57.9% of decode traffic but already
+  runs at 98-123% of the memory roofline (LA_QKV 559.9 GB/s, LA_OUT
+  477.1 GB/s) — at the wall. This cannot pay on decode; it is a
+  prefill/large-M item only.
+* **Contract:** stream-identity, same as every GEMM change.
 
-### 4. Codebase Tuning Execution Checklist
+### 1.5 Barrier-free subgroup reduction (SUBGROUP retry)
 
-1. **Build Config**: Compile with `-O3 -DINTFER_HAS_L0=1 -DINTFER_PRELOAD=1`.
-2. **Quantization Candidates**: Run DASH-Q with $G=16/32$ for INT2 and $G=64$ for INT4 to match Xe2 DPAS vector alignments ($K \% 32 == 0$).
-3. **Execution**: Invoke `Engine::preload_all()` at startup to lock weights into USM, and verify via logs that `pool_hits_` is 100% during execution.
+* **Why:** the SHAPE is still open even though the first attempt was
+  wrong — xor butterfly, no `local_accessor`, no `it.barrier`, which
+  is the specific cause SPLITK named (+43.8% kernel).
+* **Blocker:** `INTFER_DECODE1_SUBGROUP` was numerically wrong
+  (ids '279 12 12' vs base '13 198 760') and the cause is NOT
+  located (HISTORY.md, "QUARANTINED, not fixed"). Do not start on a
+  structural argument — the reverted fused-GEMM work proved reading
+  two identical bodies proves nothing.
+* **Precondition:** the numerics contract (stream-identity on 27B
+  TP=2) agreed before code, and a gate that reaches the branch.
+
+### 1.6 Multi-split decode attention tiles
+
+* **Why:** vllm/sgl paged/FMHA decode multi-split.
+* **Why last:** layer GEMMs are 99% of launches. The attention tail
+  is not the deficit. Only after 1.1-1.3 are settled.
+
+## 2. Not a backlog item (measured, closed)
+
+Every row here has a measurement in HISTORY.md or the dead-ends table
+in AGENTS.md. Do not re-attempt as-is.
+
+* `INTFER_DECODE1_MR` — 2.3x slower at M=1.
+* `INTFER_DECODE1_SPLITK` — +43.8% kernel, stream-identical.
+* `INTFER_DECODE1_SUBGROUP` — numerically wrong, quarantined.
+* Fused multi-GEMM via extracted device function — 231 114 ms;
+  keep arithmetic INLINE at each call site.
+* 16-code chunks — 0.25-0.35x.
+* `INTFER_DPAS48` enforced for all linears — net loss at every
+  tested shape; default OFF is the verdict.
+* SYCL command graphs for decode — 19.7 us vs 11.9 us plain submit.
+* Native L0 immediate submit, host-private DPAS staging, staged
+  readback, `q.prefetch()` over all shards — same floor / neutral /
+  no-op.
+* XMX at M=1 — the shapes are memory-bound; do not re-attempt.
+
+## 3. Dependencies required by the big items
+
+| Item | Dependency | Status |
+|---|---|---|
+| oneDNN matmul (llama's actual XMX path) | link oneDNN + a tolerance-based numerics contract agreed before code | NOT in tree; the repo has a measured matmul-precision divergence history, so the contract comes first |
+| CUTLASS `TiledMMA` / `block_2d_copy` / `xe_split_barrier` | import tens of kLOC of tiled-GEMM machinery | NOT in tree; not cherry-pickable as one kernel |
+| FP8 / MXFP8 / FP4 / MXFP4 | quant + RCO + kernels + contract | no consumer: `quant_spec.cpp` tops out at INT8/FP16 and no gate model carries FP8/FP4 tensors |
+| Xe2/Xe3 dispatch | none needed | single-arch target (2x B580, Xe2); the Xe3 half has no device here |
+
+## 4. What the three repos do (reference inventory)
+
+**llama.cpp SYCL** (`ggml/src/ggml-sycl/`) — leans on oneDNN/oneMKL
+for matmul; hand-written subgroup tile kernels for the quant path.
+`DnnlGemmWrapper::row_gemm` probes `dnnl::matmul` and rejects the
+`"ref"` impl (`ggml-sycl.cpp:123`); `oneapi::mkl::blas::column_major::gemm`
+fallback (`:3115`); quantized matvec in `dmmv.cpp`/`mmq.cpp` with
+`reqd_sub_group_size(WARP_SIZE)`, dequant-on-the-fly and
+`permute_sub_group_by_xor` warp reduction — **no DPAS/XMX**, EU vector
+ALUs only. Its XMX hand-written path is `#if 0`'d (`:177`). Bottom
+line: llama.cpp's matmul throughput is oneDNN's internal XMX dispatch.
+
+**vllm-xpu-kernels** (`csrc/xpu/`) — CUTLASS-first with per-arch trees.
+`XE_DPAS_TT`/`XE_BDPAS_TT`, `MainloopIntelXeXMX16*` dispatch policies,
+`onednn/onednn_matmul.cpp` (w4a4_fp4, w8a16_int4, w8a8_fp8),
+`kernel/xe_tile_scheduler.hpp` (persistent + non-persistent,
+work-stealing), `make_block_2d_prefetch` + `barrier_arrive/wait`
+K-pipeline, `cute::xe_split_barrier`, sub-group 16, paged FMHA
+decode, FP8/MXFP8 quantization.
+
+**sgl-kernel-xpu** (`src/sycl/`) — same CUTLASS base, no oneDNN,
+broader kernel surface. `XE_8x16x16_F32F16F16F32_TT` XMX MAC,
+separate `xe20/` vs `xe35/` trees selected at
+`torch_extension_sycl.cc:256`, SLM-backed atomic counter tile
+scheduling, block-2D prefetch + split barriers, and flash-attention
+v2 / MLA (dense + sparse 2-stage) / GDN / HiSparse / MoE / LoRA /
+MQA-logits / HC-prefill.
+
+**Comparison matrix** (external feature -> present where):
+
+| Feature | llama.cpp | vllm-xpu | sgl-xpu |
+|---|---|---|---|
+| DPAS/XMX hand-written | detect-only, unused | CUTLASS `XE_DPAS_TT`/`BDPAS` | CUTLASS `XE_DPAS_TT`/`BDPAS` |
+| XMX-backed matmul | oneDNN probe | CUTLASS `MainloopIntelXeXMX16*` | same + `XE_8x16x16_*` |
+| oneDNN | gemm, attention | w4a4/w8a8/fp4/fp8 | none |
+| oneMKL BLAS | column_major::gemm | via oneDNN | via oneDNN |
+| Sub-group width | 16 | 16 | 16 (some 32) |
+| SLM work-stealing scheduler | no | TileScheduler | SLM counter |
+| K-pipeline prefetch+barrier | no | yes | yes |
+| Split barriers | no | yes | yes |
+| Async USM | `ext_oneapi_async_memory_alloc` | no | no |
+| MoE / FP4-MXFP4 | no / no | yes / no | yes / yes |
+
+## 5. Prerequisite measurement (blocking 1.1's verdict)
+
+The `roofline_probe` profiling path currently returns `0.000 ms` for
+every arm on this box (`build/roofline_probe.log`: `FAIL VACUOUS`).
+The gate correctly refuses it (`mutate_roofline_probe.sh` PASS 3/3),
+so no new INT2 number can be produced until the device-event
+profiling path is fixed. This is a measurement fix, not an
+optimization, and it is the reason the `INTFER_DECODE1_VERBHALF`
+default-ON promotion is a correctness bet with an unknown payoff.

@@ -84,7 +84,7 @@ fi
 
 # Throughput floor: 0.8B CPU greedy must sustain >= 1 tok/s (far below the
 # ~3-8 tok/s single-stream rate; this guards against scheduler stalls,
-# not for records — see REMAINING_TODOS for headroom notes).
+# not for records — see HISTORY.md for the measurement record).
 echo "$TPS" | awk '{exit ($1 >= 1.0) ? 0 : 1}' \
   || { echo "BENCH FAIL: tok/s=$TPS < floor 1.0" >&2; exit 1; }
 echo "SERVE-BENCH: PASS"
