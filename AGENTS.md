@@ -264,6 +264,41 @@ and until that run exists the default-ON change is a correctness bet with an
 unknown payoff. Re-derive with `scripts/test_roofline_bisect.sh` after the
 profiling defect is fixed; do not quote the +14% as settled.
 
+### The profiling defect: LOCATED 2026-10-08, it is the driver, not the code
+
+`examples/roofline_probe` (and the bisect binaries that share its allocator and
+instrument) returns `0.000 ms` for every arm on this box. Bisected to the
+timestamp, not to the kernel:
+
+```
+[roofline] RAW submit=184192938721938 start=184192938721938 end=184192938721938
+        start-submit=0 end-start=0 ns
+[roofline] RAW rep 1 sink=16655032
+```
+
+`submit == start == end` for every rep, monotonic across reps (~60 ms apart, real
+device up time), and the sink reads 16655032 after `q.wait()` -- so the kernel
+**executed** and wrote 52 MB of non-constant data, and the driver records **no
+duration** for these commands. Three wait orderings were tried (read-then-wait,
+`e.wait()`-then-read, `q.wait()`-then-read) and all returned the same 0 ns, so it
+is not an ordering artifact; `enable_profiling()` is accepted (timestamps are
+recorded) but the durations are not.
+
+The probe's vacuity guard is the correct behaviour and stays: it refuses rather
+than substituting a host timer, which is load-sensitive and would have produced a
+"ceiling" that is really a CPU number. `--raw` is a diagnostic only (it exits after
+the ceiling arm and never writes a reportable table).
+
+**Caveat, recorded rather than dropped:** the engine's own counter
+(`engine.cpp:1206`, same `get_profiling_info` spelling, same `enable_profiling`
+queue) is reported as real in a log that is **not in this repo** (`perf_base.err`,
+archived). AGENTS.md's standing rule is to re-derive, not to remember, and that
+number cannot be re-derived from this tree -- so "the engine's instrument ticks
+on this box" is **UNVERIFIED HERE**, and this probe's zero is NOT evidence that
+the engine's is also zero. The two could differ on a launch shape the probe never
+exercises. The remedy is the same as for any box-state question: a rebind, not a
+code change (`scripts/gpu_recover.sh`).
+
 ### Operational (not gate subjects)
 
 `INTFER_PRELOAD` (`=0` restores layer streaming), `INTFER_SCHED`, `INTFER_SERVE_MAX`,
