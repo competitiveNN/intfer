@@ -1597,6 +1597,18 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
 // gate/up are column-parallel and device d owns only its slice of Ng/Nu.
 // M>1 IS supported: the kernel's outer m loop iterates the rows, so the
 // same launch covers prefill and decode.
+//
+// NK ACCOUNTING, and it is the whole point of the counter. The gateup
+// kernel is ONE launch per device, so on TP=2 a fused token contributes
+// nk=2 -- the same as the wave path's two quant_gemm_forward_usm calls.
+// The delta the fusion buys is therefore visible ONLY in submit_count
+// (2 -> 1 per device) and usm_write_count; nk is flat and MUST stay flat,
+// because both paths count launches through the same post-wait
+// get_profiling_info loop. An earlier revision also called
+// gemm::profile_note_launch() in the submit loop, which double-counted
+// the same two launches (nk=4) and made the "saves a submit" claim
+// unfalsifiable -- a double-counted numerator against a single-counted
+// one. Removed; see the submit block for the reason.
 bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
                             const std::vector<float>& rin,
                             std::vector<float>& mg, std::vector<float>& mu,
@@ -1647,9 +1659,6 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
   ensure_wave_workspace(M, 3, tg.K, std::max(Ng, Nu));
   std::vector<sycl::event> kernel_events;
   kernel_events.reserve(2);
-#ifdef INTFER_PROFILE_GPU
-  auto t_w0_all = std::chrono::high_resolution_clock::now();
-#endif
   for (size_t d = 0; d < 2; ++d) {
     auto& dev = devices_[d];
     sycl::queue& q = dev.queue;
@@ -1680,14 +1689,19 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
         M, Ng, Nu, tg.K, scg.group_size, scg.scheme, scu.scheme,
         sycl::event{});
     kernel_events.push_back(e);
-    // The gateup kernel is NOT a quant_gemm_forward_usm call, so it does not
-    // hit profile_note_launch. Without this the [GPU profile] nk counter is
-    // SHORT BY ONE PER DEVICE on every fused token -- the same blind spot
-    // SSM/norm kernels had, and the reason that class of counter is a
-    // launch-count invariant rather than a wall clock. One launch, one note.
-    // Guarded: profile_note_launch is declared only under INTFER_PROFILE_GPU.
+    // nk accounting: ONE increment per launch, and it comes from the SAME
+    // mechanism every other engine path uses -- the post-wait
+    // get_profiling_info loop below (lines 1700-1707), which reads the
+    // device's own event timestamps. An earlier version also called
+    // gemm::profile_note_launch() here, which bumped kernel_count a SECOND
+    // time for the same two launches: on TP=2 the fused token reported nk=4
+    // where the wave path reports nk=2, so "the fusion saves a submit" was
+    // comparing a double-counted numerator against a single-counted one and
+    // was unfalsifiable. profile_note_launch exists for the free-function
+    // SSM/norm kernels (silumul_to_half, fwht_rot_to_half, ...) which have
+    // no post-wait profiling loop in their caller; the gateup kernel has one
+    // here, so it must not also take the launch-note path.
 #ifdef INTFER_PROFILE_GPU
-    gemm::profile_note_launch();
     {
       auto t1 = std::chrono::high_resolution_clock::now();
       g_gpu_profile.total_submit_us +=
@@ -1705,8 +1719,17 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
     auto t1 = std::chrono::high_resolution_clock::now();
     g_gpu_profile.total_waitblock_us +=
         std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
+    // wait_count is the number of HOST WAITS, and this path does one per
+    // device -- the same as the wave path's two quant_gemm_forward_usm
+    // events. It is NOT a saving of the fusion: the gateup kernel writes
+    // gate and up into two separate out buffers, so the readback cannot be
+    // fused the way run_mlp_fused (TP=1) does, and the wait is already one
+    // per wave. Counting it keeps this counter consistent with every other
+    // engine path; dropping it would make a fused token report wait_count=0
+    // and read as "the fusion removed the wait", which is not true.
     g_gpu_profile.wait_count += (int)kernel_events.size();
   }
+#endif
   for (auto& e : kernel_events) {
     try {
       auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
@@ -1715,7 +1738,6 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
       g_gpu_profile.kernel_count++;
     } catch (...) {}
   }
-#endif
   for (size_t d = 0; d < 2; ++d) {
     auto [start, end] = shards_[gate_ti].ranges[d];
     const uint32_t Nl_g = static_cast<uint32_t>(end - start);
@@ -1754,9 +1776,6 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
     }
 #endif
   }
-#ifdef INTFER_PROFILE_GPU
-  (void)t_w0_all;
-#endif
   // THE PATH ANNOUNCES ITSELF, ONCE. Same shape as the decode1 arms and the
   // L4 la_out seam: without it, a gate that compares this run's token stream
   // against the base run's cannot tell whether the fused path ran -- the two
