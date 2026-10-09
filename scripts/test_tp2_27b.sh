@@ -834,9 +834,9 @@ else
   cp "$GATEUP_OUT" "$SB2/gu_not.out"; cp "$GATEUP_ERR" "$SB2/gu_not.err"
   sed -i '/\[mlp-gateup\]/d' "$SB2/gu_not.err"
   : >"$SB2/gu_empty.out"; : >"$SB2/gu_empty.err"
-  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR"; fi' EXIT
-  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR"; fi; exit 130' INT
-  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR"; fi; exit 143' TERM
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR" "$WG_OUT" "$WG_ERR"; fi' EXIT
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR" "$WG_OUT" "$WG_ERR"; fi; exit 130' INT
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR" "$WG_OUT" "$WG_ERR"; fi; exit 143' TERM
   gu_ids() { cli_ids "$1" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//'; }
   gu_good_ids="$(gu_ids "$SB2/gu_good.out")"
   gu_not_ids="$(gu_ids "$SB2/gu_not.out")"
@@ -922,5 +922,107 @@ else
     || { echo "GATE FAIL: lmhead-tiles ids '$LT_GOT' != base '$LT_BASE'" >&2; PASS=0; }
 fi
 
+# --- INTFER_DPAS48_WG certification (PLAN item 1.3, prefill lever) ----------
+  # The tiled DPAS kernel is one WI per (row-group of R, 16-N tile), and each
+  # output element (m,n) is written by EXACTLY ONE block (t = n/16, mg = m/R),
+  # so the work-group width is a pure PARTITION: widening it reschedules WIs
+  # without changing who writes what. That is why this is bit-exact by
+  # construction and needs no numerics contract -- the same shape as the lm_head
+  # tile split and the gate+up fusion. The shipped value is 16, hardcoded, while
+  # the B580 has 160 compute units; the prefill lever is to widen the group to
+  # fill them.
+  #
+  # Like the lm_head flags, a base-vs-flagged stream comparison is VACUOUS:
+  # the partition is exact, so the two streams are identical and a flag that
+  # never reached the kernel would pass every stream check while certifying
+  # nothing. The subject is the WIDTH, and the engine announces the width the
+  # kernel actually used ([dpas48-wg] work-group=... geometry=... M=... N=...
+  # K=...), once per process. The arm asserts the run hit the oracle AND the
+  # announcement names the width the operator asked for.
+  WG_OUT="$LOG.wg.out"; WG_ERR="$LOG.wg.err"
+  WG_WG="${INTFER_DPAS48_WG:-160}"
+  env INTFER_DPAS48_WG="$WG_WG" \
+  "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$WG_OUT" 2>"$WG_ERR"; WG_RC=$?
+  if [ "$WG_RC" -ne 0 ]; then
+  echo "GATE FAIL: INTFER_DPAS48_WG=$WG_WG run exited rc=$WG_RC" >&2
+  tail -20 "$WG_ERR" >&2
+  PASS=0
+  else
+  echo "DPAS48-WG prefill: $(cli_prefill "$WG_ERR") (expect 11751)"
+  echo "DPAS48-WG ids:      $(cli_ids "$WG_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  WG_LINE="$(grep -a "\[dpas48-wg\]" "$WG_ERR" | head -1)"
+  if [ -z "$WG_LINE" ]; then
+    echo "GATE FAIL: the dpas48 work-group path never announced itself" >&2
+    echo "         (no [dpas48-wg] line); the flag did not reach the kernel" >&2
+    echo "         and this arm is vacuous." >&2
+    PASS=0
+  else
+    echo "DPAS48-WG layout: $WG_LINE"
+  fi
+  # The width the operator asked for, as the announcement must print it.
+  WG_EXPECT_ANN="work-group=$WG_WG (INTFER_DPAS48_WG=$WG_WG)"
+  echo "$WG_LINE" | grep -aq "$WG_EXPECT_ANN" \
+    || { echo "GATE FAIL: the announcement does not name the requested width" >&2
+         echo "         wanted '$WG_EXPECT_ANN', got '$WG_LINE'" >&2; PASS=0; }
+  # The stream half, against the SAME FIXED ORACLE the base run uses -- not a
+  # self-comparison, so "both runs broke the same way" cannot pass. The base
+  # ids are re-derived here from the base run's own log rather than borrowed
+  # from the lm_head arm: that arm sets its copy only inside its own success
+  # branch, so borrowing it would make this arm's stream check depend on a
+  # different arm's control flow.
+  mr_prefill_ok "$(cli_prefill "$WG_ERR")" \
+    || { echo "GATE FAIL: dpas48-wg prefill != 11751" >&2; PASS=0; }
+  WG_GOT="$(cli_ids "$WG_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  WG_BASE="$(cli_ids "$CLI_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+[ "$WG_GOT" = "$WG_BASE" ] \
+    || { echo "GATE FAIL: dpas48-wg ids '$WG_GOT' != base '$WG_BASE'" >&2; PASS=0; }
+# *** SELF-CHECK FOR THIS ARM. *** Same shape as the gateup self-check: the
+  # announcement line is the ONLY thing standing between a run where the flag
+  # was ignored (default width 16 ran, stream still matched) and a PASS. The
+  # partition is exact by construction -- read it, do not assert it: block=gid,
+  # t = block % nT, mg = block / nT, m0 = mg*R, and the write is
+  # out_usm + m*N + t*TN (quant_gemm.cpp:2397-2404, 2553-2561). For any (m,n),
+  # t = n/16 is unique (nT = N/16) and mg = floor(m/R) is unique, so the map
+  # (m,n) -> block = mg*nT + t is a bijection onto [0, n_blocks) and nWG only
+  # decides WHICH WI schedules WHICH block. A base-vs-flagged stream comparison
+  # is therefore satisfiable by a flag that did nothing -- so the arm asserts
+  # the width the kernel actually used, and this self-check exercises that
+  # predicate in BOTH directions.
+  #
+  # (b) is NOT "the deleted fixture still contains the width string": that
+  # would be vacuous, because the announcement is ONE line carrying both the
+  # tag and the width, so deleting it removes both and the grep could never
+  # match. The honest refusal direction is the OTHER one: a log whose
+  # announcement says 16 (the default -- i.e. the flag was ignored and the
+  # shipped width ran) must be REFUSED, because the arm demands it name 160.
+  # That fixture carries a real width string, so the predicate can actually
+  # fire -- which is what separates this from a vacuous always-false guard.
+  WG_ANN_FULL="work-group=$WG_WG (INTFER_DPAS48_WG=$WG_WG)"
+  WG_DEFAULT_ANN="work-group=16 (INTFER_DPAS48_WG=$WG_WG)"
+  # (a) healthy: the real run's own announcement must exist and name the width.
+  [ -n "$WG_LINE" ] || { echo "GATE FAIL: self-check (a) healthy fixture has no [dpas48-wg] line" >&2; PASS=0; }
+  echo "$WG_LINE" | grep -aq "$WG_ANN_FULL" \
+    || { echo "GATE FAIL: self-check (a) the announcement does not name the requested width" >&2; PASS=0; }
+  # (b) refusal: a log where the flag was IGNORED (default width 16 ran, stream
+  # still matched) must be refused. Built by rewriting the real announcement's
+  # width to 16 -- the exact shape of "the flag did not reach the kernel".
+  WG_NOT_ERR="$SB2/wg_not.err"
+  sed "s/work-group=[0-9]*/work-group=16/" "$WG_ERR" >"$WG_NOT_ERR"
+  if ! grep -aq "\[dpas48-wg\]" "$WG_NOT_ERR"; then
+    echo "GATE FAIL: self-check (b) fixture builder removed the announcement" >&2; PASS=0
+  fi
+  WG_NOT_LINE="$(grep -a "\[dpas48-wg\]" "$WG_NOT_ERR" | head -1)"
+  if [ -n "$WG_NOT_LINE" ] && echo "$WG_NOT_LINE" | grep -aq "$WG_DEFAULT_ANN"; then
+    echo "GATE FAIL: self-check (b) the arm ACCEPTED a run whose width path never fired" >&2; PASS=0
+  fi
+  # (c) vacuity: an empty log must fail the predicate.
+  WG_EMPTY_ERR="$SB2/wg_empty.err"
+  : >"$WG_EMPTY_ERR"
+  WG_EMPTY_LINE="$(grep -a "\[dpas48-wg\]" "$WG_EMPTY_ERR" | head -1)"
+  if [ -n "$WG_EMPTY_LINE" ]; then
+    echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log (vacuity)" >&2; PASS=0
+  fi
+fi
+
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
-if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi

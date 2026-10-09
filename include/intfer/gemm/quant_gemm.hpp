@@ -318,6 +318,15 @@ struct Dpas48Params {
   // exactly 2*nOp. Do NOT resolve or validate this by hand at a call site --
   // go through fold_readable(), which is the same rule the writer uses.
   uint32_t fold_stride = 0;
+  // INTFER_DPAS48_WG: work-group width for the tiled DPAS kernel. 0 (default)
+  // => 16, the shipped value, hardcoded in quant_gemm.cpp. The kernel is one
+  // WI per (row-group of R, 16-N tile), and each output element (m,n) is written
+  // by exactly ONE block (t = n/16, mg = m/R), so the mapping is a pure
+  // partition: changing nWG changes only which WI schedules which block, never
+  // who writes what. Bit-exact by construction, same as the lm_head tile split.
+  // The B580 has 160 compute units against the hardcoded 16; a wider group is
+  // the prefill lever (item 1.3) and needs no numerics contract.
+  uint32_t wg = 0;
 };
 
 // INTFER_DPAS48_FOLD layout rule -- ONE definition, consumed by the writer

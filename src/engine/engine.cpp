@@ -1144,25 +1144,11 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
     p.act_stride = ws48_[d].K;
     p.as_stride = ws48_[d].nGA;
     sycl::event dep = preq_ok ? preq_events[d] : sycl::event{};
-    // INTFER_DPAS48_FOLD (default OFF): hoist the per-(row,op) activation
-    // column sums out of the 16-N tile loop. quant_gemm_dpas48 runs one WI per
-    // (row, tile) and otherwise recomputes the identical O(K) integer fold in
-    // every tile WI — the documented reason the wide-N DPAS kernel loses to the
-    // legacy tiled path. Bit-identical: the values are exact int32 sums, and
-    // the DPAS math, scales and accumulation order are untouched.
-    // Declines (leaves p.fold_usm null => inline fold) whenever the workspace
-    // or the op geometry is not usable, so the fallback is the old path.
-    if (use_fold && ws48_[d].fold && K >= 32 && (K % 32) == 0 &&
-        // 2*nOp per row, and the workspace must be wide enough for the
-        // call's ops (not just its own max): a shorter stride would make
-        // row m's Sfull block overwrite row m+1's S0 block.
-        ws48_[d].nOp >= 2 * (K / 32)) {
-      const uint32_t fold_stride = 2 * ws48_[d].nOp;
-      sycl::event fold_evt = gemm::quant_gemm_dpas48_rowfold(
-          q, ws48_[d].act, ws48_[d].fold, M, K, ws48_[d].K, fold_stride, dep);
-      p.fold_usm = ws48_[d].fold;
-      p.fold_stride = fold_stride;
-      dep = fold_evt;
+    // INTFER_DPAS48_WG (default 0 => 16, shipped): widen the tiled DPAS
+    // work-group. Pure partition (each (m,n) written by one block), so bit-exact.
+    if(const char* wg_env = std::getenv("INTFER_DPAS48_WG")){
+      long v = std::atol(wg_env);
+      if(v > 0) p.wg = (uint32_t)v;
     }
 #ifdef INTFER_PROFILE_GPU
     auto t_s0 = std::chrono::high_resolution_clock::now();
@@ -1170,6 +1156,33 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
     sycl::event kernel_evt = use_row ? gemm::quant_gemm_dpas4_row(q, p, dep)
                           : use_tiled ? gemm::quant_gemm_dpas48_2d(q, p, dep)
                                       : gemm::quant_gemm_dpas48(q, p, dep);
+    // THE PATH ANNOUNCES ITSELF, ONCE. The work-group width is a pure
+    // partition (each output element (m,n) is written by exactly one block:
+    // t = n/16, mg = m/R), so a gate comparing the token stream against the
+    // base run cannot tell whether the group widened -- the two streams are
+    // identical BY CONSTRUCTION, and a flag that never reached the kernel
+    // would pass every stream check while certifying nothing. This one line,
+    // host-side, one per process, names the width the kernel actually used, so
+    // the arm asserts the thing that changed rather than a constant. Same shape
+    // as the [mlp-gateup] ACTIVE line and the [lmhead-tiles] layout line.
+    //
+    // Scope, stated because it is the difference between a live flag and a
+    // no-op: p.wg is read by ALL THREE DPAS kernels (quant_gemm_dpas48,
+    // quant_gemm_dpas48_2d and quant_gemm_dpas4_row), so the flag is live on
+    // every path and this announcement fires whenever the DPAS path runs.
+    static bool announced_wg = false;
+    if(!announced_wg){
+      announced_wg = true;
+      std::fprintf(stderr,
+                   "[dpas48-wg] work-group=%u (INTFER_DPAS48_WG=%s) geometry=%s "
+                   "M=%u N=%u K=%u\n",
+                   (p.wg == 0) ? 16u : p.wg,
+                   std::getenv("INTFER_DPAS48_WG") ?
+                       std::getenv("INTFER_DPAS48_WG") : "(default 16)",
+                   use_tiled ? "tiled2d" : (use_row ? "row" : "tiled1d"),
+                   M, N_local, K);
+      std::fflush(stderr);
+    }
     // Decline detection. BOTH DPAS48 callees now decline the SAME way -- they return
     // `dep` UNCHANGED (quant_gemm.cpp) -- so `kernel_evt == dep` is the reliable
     // test. The `sycl::event{}` half is kept as defence in depth and NOT relied

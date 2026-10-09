@@ -2384,7 +2384,13 @@ sycl::event dpas48_tiled(sycl::queue& q, const Dpas48Params& p,
   // One WI per (row-group of R, 16-N tile t). B op-tiles reload per WI (L1-
   // resident across the M rows of a tile); A is per-row. Same fold math as the
   // M=1 probe (probe_dpas_fold.cpp T5/T6, 1e-16 exact).
-  const uint32_t nWG = 16;
+  // INTFER_DPAS48_WG: the shipped nWG=16 is hardcoded, not derived from the
+  // device. Each output element (m,n) is written by exactly one block (t=n/16,
+  // mg=m/R), so this is a pure partition -- a wider group reschedules WIs without
+  // changing who writes what, which is why it is bit-exact and needs no
+  // numerics contract. The B580 has 160 compute units; the prefill lever is to
+  // widen the group to fill them (PLAN item 1.3). 0 => 16 (shipped).
+  const uint32_t nWG = (p.wg == 0) ? 16u : p.wg;
   const uint32_t nMG = (M + R - 1) / R;
   const uint32_t n_blocks = nMG * nT;
   const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
@@ -2643,7 +2649,7 @@ sycl::event quant_gemm_dpas4_row(sycl::queue& q, const Dpas48Params& p,
   const uint32_t fold_stride = fold_row_stride(p.fold_stride, nOp);
   const std::int32_t* Fold = fold_readable(p.fold_usm, p.fold_stride, nOp);
 
-  const uint32_t nWG = 16;
+  const uint32_t nWG = (p.wg == 0) ? 16u : p.wg;
   const uint32_t global = ((M + nWG - 1) / nWG) * nWG;
 
   return q.submit([&](sycl::handler& h) {
