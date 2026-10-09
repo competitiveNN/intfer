@@ -1234,3 +1234,42 @@ documentation session that concludes "nothing left to do" is the exact
 opposite of the standing directive ("less testing, more performance"). The
 backlog was not exhausted; it was misread. The item was there, in the
 opt-in residue, and the only thing blocking it was not having looked.
+
+## Stack run at `f757b3c` (2026-10-09): 10 FAIL / 3 UNPROVEN, NO REGRESSION
+
+Re-ran `scripts/run_all_checks.sh` after the three lm_head commits, with the
+tree clean (the prior run's two extra FAILs were dirtiness from an uncommitted
+`HISTORY.md`, now committed). Same verdict set as the `e28f092` baseline —
+**no regression from the optimization.**
+
+| verdict | step | cause |
+|---|---|---|
+| FAIL | `check_e2_ctx.sh` | box-state: `lm_head GEMM submit failed on device 0 tile 0 (VRAM p...)`, exit 139. **Script is byte-identical to baseline** (`git show e28f092:scripts/check_e2_ctx.sh | diff -` clean); the long-ctx arms hit the same VRAM pressure as everything else on this box. |
+| FAIL | `test_roofline_probe.sh` / `bisect` / `bisect1` / `bisect3` / `bisect4` | the probe's vacuity guard fires (all arms `0.000 ms / inf GB/s / -nan`), rc=1. This is the recorded driver defect, not a code fault. |
+| FAIL | `mutate_fold_matrix.sh` / `mutate_device_precond.sh` / `mutate_gate_enum.sh` / `mutate_stack_cert.sh` | mutation-matrix fixture artifacts, classified at baseline. |
+| UNPROVEN | `check_engine_cert.sh` / `mutate_engine_cert.sh` / `mutate_rowpair_equiv.sh` | rc=2, stale evidence, not a regression. |
+
+The only script changed since `e28f092` is `scripts/test_tp2_27b.sh` (+63/−7,
+the new lm_head-tiles arm). The gate population is unchanged, so
+`gate_inventory.sh` still reports the same tally.
+
+## Backlog audit against the tree (2026-10-09)
+
+PLAN.md's "every ranked item is closed" was wrong (`f757b3c`). Re-derived
+against the source, not the prose:
+
+| item | status | evidence |
+|---|---|---|
+| **1.2** gate+up single launch | **CLOSED — shipped and gated** | `run_mlp_gateup` `engine.cpp:1831` prints `[mlp-gateup] fused gate+up GEMM ACTIVE`; arm at `scripts/test_tp2_27b.sh:787+`. No `INTFER_MLP_*` flag exists — the path is default-ON, which is what the gate names. |
+| **1.1** `block_load<uint8_t,128>` INT2 stream | **BLOCKED by the probe, not by code** | the arm is written (`examples/roofline_probe/main.cpp:516-522` documents it; the INT2 decode1 body is at `quant_gemm.cpp:457-465`), but `test_roofline_probe.sh` exits rc=1 on this box: every arm returns `0.000 ms`, so the probe's vacuity guard refuses to emit a number. The kill criterion (< 2x closes the direction) cannot be evaluated. Remedy is a rebind, not a code change. |
+| **1.3** SLM work-stealing tile scheduler | **open, unattempted** | no code in tree. |
+| **1.4** oneMKL `gemm` fallback | **blocked** | no `dnnl`/`onemkl`/`mkl::` reference anywhere in `src`/`include`/`examples`; link-only change today, but a tolerance contract is required first and the repo has a measured matmul-precision divergence history. |
+| **1.5** barrier-free subgroup reduction | **QUARANTINED** | `INTFER_DECODE1_SUBGROUP` numerically wrong, cause not located. |
+| **1.6** multi-split decode attention | **open, low priority** | attention tail is not the deficit; 1.1-1.3 first. |
+
+**So the backlog is NOT exhausted.** Item 1.2 was the misread (it was already
+shipped — the audit's own `f757b3c` correction said so, and PLAN.md still
+carries it as open). The remaining live work is 1.3 (prefill tile scheduling,
+the prefill lever the standing directive names) and, once the probe's vacuity
+is cleared by a rebind, 1.1. Everything else is blocked by an absent
+dependency or a quarantined numerics fault.
