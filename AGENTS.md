@@ -279,6 +279,8 @@ engine. The two falsified candidates (module size, runtime branch) and the
 CLOSED, not open.** What remains is the reproducible finding: the shipped INT2 decode
 runs at ~49 GB/s on MLP_GATE against a 456 GB/s ceiling, ~10.7% of peak. Full account:
 HISTORY.md "THE 6.39x ITSELF IS NOT REPRODUCIBLE".
+CITATION(build/roofline_bisect4.log 2026-10-06, clone arm 55.1 GB/s vs shipped ~40-49 GB/s;
+         scripts/test_roofline_bisect4.sh)
 
 ### The profiling defect: LOCATED 2026-10-08, it is the driver, not the code
 

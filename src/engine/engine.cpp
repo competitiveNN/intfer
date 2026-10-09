@@ -1587,7 +1587,9 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
 // calls: each output keeps its own accumulator, ascending kg, ascending j,
 // its own group scale and wtab. Saves one submit + one wait + one D2H
 // readback per device per token vs the wave path. Returns false (caller
-// keeps the wave) on TP=1, DPAS48 items, mismatched K/group/scheme, or M>1.
+// keeps the wave) on TP=1, DPAS48 items, or mismatched K/group/scheme.
+// M>1 IS supported: the kernel's outer m loop iterates the rows, so the
+// same launch covers prefill and decode.
 bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
                             const std::vector<float>& rin,
                             std::vector<float>& mg, std::vector<float>& mu,
@@ -1606,12 +1608,10 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
   if (tg.qcfg.group_size != tu.qcfg.group_size) return false;
   if (tg.qcfg.scheme != tu.qcfg.scheme) return false;
   if (rin.size() != (size_t)M * tg.K) return false;
-  // The fused kernel is an M=1 single-output-per-work-item launch; it has no
-  // tiled M>1 body and returns a NULL event for M>1. Returning false here
-  // (rather than letting the caller memcpy out of an unwritten buffer) sends
-  // the call back to run_linear_wave_batch, which IS M-row aware. Without
-  // this the M>1 prefill arms would read zeroed wave slots as mg/mu.
-  if (M > 1) return false;
+  // M>1 IS supported: the kernel's outer m loop iterates the rows, so the
+  // same launch covers prefill and decode. (The M=1-only version of this
+  // kernel returned a NULL event for M>1 and this guard sent the prefill
+  // arms back to run_linear_wave_batch; that is gone now.)
   const auto& scg = shard_cache_[(size_t)gate_ti];
   const auto& scu = shard_cache_[(size_t)up_ti];
   if (scg.code_usm.size() != 2 || scu.code_usm.size() != 2) return false;

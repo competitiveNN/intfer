@@ -1835,7 +1835,6 @@ sycl::event quant_gemm_forward_usm_gateup(
     gemm::WeightScheme scheme_g, gemm::WeightScheme scheme_u,
     const sycl::event& copy_dep) {
   if (M == 0 || K == 0 || (Ng == 0 && Nu == 0)) return sycl::event();
-  if (M > 1) return sycl::event();   // M>1 tiled path not implemented; caller waves
   if (group_size == 0) group_size = K;
   const int Gw = static_cast<int>(group_size);
   const int num_groups = (static_cast<int>(K) + Gw - 1) / Gw;
@@ -1847,6 +1846,10 @@ sycl::event quant_gemm_forward_usm_gateup(
   const int global = nBlocks * nWG;
 
   // INT2 + INT2 with the INT2-tab fast path: the 27B MLP gate/up are INT2.
+  // ONE WI per (row m, output ng), each with its own accumulator ascending
+  // kg then ascending j -- so the fused launch is bit-exact vs two separate
+  // quant_gemm_forward_usm calls at ANY M, not just M=1. The M dimension is
+  // the outer index: act_usm is M*K row-major, out_g/out_u are M*Ng/M*Nu.
   if (scheme_g == WeightScheme::INT2 && scheme_u == WeightScheme::INT2) {
     const int bits = 2;
     const int pack = 8 / bits;   // 4 codes per byte
@@ -1864,51 +1867,65 @@ sycl::event quant_gemm_forward_usm_gateup(
             const std::uint16_t* sptr =
                 is_up ? (scale_u + (std::size_t)out_ng * num_groups)
                       : (scale_g + (std::size_t)out_ng * num_groups);
-            const std::uint8_t* wrow =
-                is_up ? (code_u8 + (std::size_t)out_ng * K)
-                      : (code_g8 + (std::size_t)out_ng * K);
+            const std::uint8_t* wbase =
+                is_up ? code_u8 : code_g8;
             const float alpha_f = is_up ? alpha_u : alpha_g;
             std::uint16_t* outp = is_up ? out_u : out_g;
-            float acc = 0.0f;
-            const std::size_t row_base = (std::size_t)out_ng * K;
-            sycl::multi_ptr<const std::uint16_t,
-                sycl::access::address_space::global_space> act_mp(act_usm);
-            for (int g = 0; g < num_groups; ++g) {
-              const float scale = from_half_bits(sptr[g]) * alpha_f;
-              const int kg0 = g * Gw;
-              int kg1 = kg0 + Gw;
-              if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
-              const float wtab[4] = {scale * -1.0f, scale * (-1.0f / 3.0f),
-                                     scale * (1.0f / 3.0f), scale * 1.0f};
-              constexpr int CC = 8;
-              int kg = kg0;
-              std::size_t b0 = (row_base + (std::size_t)kg) /
-                               (std::size_t)pack;
-              for (; kg + CC <= kg1; kg += CC) {
-                sycl::vec<std::uint16_t, 8> a16;
-                a16.load(0, act_mp + kg);
-                const std::uint8_t b0v = wrow[b0];
-                const std::uint8_t b1v = wrow[b0 + 1];
-                b0 += 2;
-                for (int j = 0; j < CC; ++j) {
-                  const float av =
-                      static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
-                  const std::uint8_t bv = (j < 4) ? b0v : b1v;
-                  const int code = (bv >> ((j & 3) * 2)) & 3;
-                  acc += av * wtab[code];
+            // ONE WI owns ONE (m, out_ng) pair, so it owns the whole K
+            // accumulation for that pair -- no cross-lane reduction, no
+            // reassociation, same op order as the M=1 body below. The M
+            // dimension is the outer index: act_usm is M*K row-major
+            // (act_usm[m*K + k]) and the weight row for out_ng is at
+            // wbase + out_ng*K, so the two offsets are computed separately
+            // and never combined (combining them was the M>1 bug: it read
+            // the next output row's weights).
+            for (int m = 0; m < static_cast<int>(M); ++m) {
+              float acc = 0.0f;
+              const std::size_t act_off = (std::size_t)m * K;
+              const std::uint8_t* wrow = wbase + (std::size_t)out_ng * K;
+              sycl::multi_ptr<const std::uint16_t,
+                  sycl::access::address_space::global_space> act_mp(act_usm);
+              for (int g = 0; g < num_groups; ++g) {
+                const float scale = from_half_bits(sptr[g]) * alpha_f;
+                const int kg0 = g * Gw;
+                int kg1 = kg0 + Gw;
+                if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+                const float wtab[4] = {scale * -1.0f, scale * (-1.0f / 3.0f),
+                                       scale * (1.0f / 3.0f), scale * 1.0f};
+                constexpr int CC = 8;
+                int kg = kg0;
+                std::size_t b0 = ((std::size_t)out_ng * K +
+                                  (std::size_t)kg) /
+                                 (std::size_t)pack;
+                for (; kg + CC <= kg1; kg += CC) {
+                  sycl::vec<std::uint16_t, 8> a16;
+                  a16.load(0, act_mp + act_off + kg);
+                  const std::uint8_t b0v = wrow[b0];
+                  const std::uint8_t b1v = wrow[b0 + 1];
+                  b0 += 2;
+                  for (int j = 0; j < CC; ++j) {
+                    const float av =
+                        static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                    const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                    const int code = (bv >> ((j & 3) * 2)) & 3;
+                    acc += av * wtab[code];
+                  }
+                }
+                for (; kg < kg1; ++kg) {
+                  const float av = from_half_bits(
+                      act_usm[act_off + (std::size_t)kg]);
+                  const std::size_t idx =
+                      (std::size_t)out_ng * K + (std::size_t)kg;
+                  const std::uint8_t byte = wrow[idx / pack];
+                  const int within = static_cast<int>(idx % pack);
+                  const int code = (byte >> (within * bits)) &
+                                   ((1 << bits) - 1);
+                  acc += av * scale * canon_value(bits, code);
                 }
               }
-              for (; kg < kg1; ++kg) {
-                const float av = from_half_bits(act_usm[kg]);
-                const std::size_t idx = row_base + kg;
-                const std::uint8_t byte = wrow[idx / pack];
-                const int within = static_cast<int>(idx % pack);
-                const int code = (byte >> (within * bits)) &
-                                 ((1 << bits) - 1);
-                acc += av * scale * canon_value(bits, code);
-              }
+              outp[(std::size_t)m * (is_up ? Nu : Ng) + out_ng] =
+                  to_half_bits(acc);
             }
-            outp[out_ng] = to_half_bits(acc);
           });
     });
   }

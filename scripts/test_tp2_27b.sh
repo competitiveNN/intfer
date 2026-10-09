@@ -780,8 +780,9 @@ if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAI
 # separate quant_gemm_forward_usm calls: each output keeps its own accumulator,
 # ascending kg, ascending j, its own group scale and wtab. Saves one submit +
 # one wait + one D2H readback per device per token vs the wave path. The
-# engine declines (returns false) on TP=1, DPAS48 items, mismatched K/group/
-# scheme, or M>1, and the caller falls back to the wave -- so this arm is
+# engine declines (returns false) on TP=1, DPAS48 items, or mismatched
+# K/group/scheme. M>1 IS supported: the kernel's outer m loop iterates the
+# rows, so the same launch covers prefill and decode -- this arm is
 # reachable only on the 27B TP=2 model, which is the gate that carries INT2.
 GATEUP_OUT="$LOG.gateup.out"; GATEUP_ERR="$LOG.gateup.err"
 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
