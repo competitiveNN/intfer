@@ -1118,3 +1118,33 @@ narrative with the measurements is in `docs/audit-log-tooling.md`):
       deliberately needs no guard, so a naive grep flags a script that is correct.
       That is the same lesson as deleting the hand-written flag census: derive from
       the executable text, never from prose.
+
+## ==> PLAN.md backlog audit 2026-10-09 — every ranked item now accounted for <==
+
+Audited the whole backlog against the tree by `read`/`grep`, not from memory.
+The conclusion: **no ranked item is open.** Each is shipped, blocked by
+tooling, or a measured dead end. Recording this so the next session does not
+re-open a closed row.
+
+| PLAN.md item | Status | Evidence |
+|---|---|---|
+| 1.1 `block_load<uint8_t,128>` on the INT2 weight stream | **BLOCKED by tooling, not by code.** The `roofline_probe` is VACUOUS on this box (`0.000 ms` every arm, driver records `submit == start == end` while the kernel ran). The gate refuses it (`mutate_roofline_probe.sh` PASS 3/3). No new INT2 number can be produced until the device-event profiling path is fixed. | `examples/roofline_probe/main.cpp:163-164`; AGENTS.md "The profiling defect" |
+| 1.2 gate+up in a single launch (the one TP=2-valid fusion) | **SHIPPED.** `Engine::run_mlp_gateup` `engine.cpp:1645` (`devices_.size() != 2` guard), M>1 supported at 1663, announces `[mlp-gateup] fused gate+up GEMM ACTIVE` at 1831. Counters: `nk`/`submit_count`/`usm_write_count`/`wait_count` all 4→2 vs the 2-item wave; `readback_count` delta is genuinely 0 (two separate out buffers). | `23837c2`, `a868c3b`, `a119227` |
+| 1.3 SLM work-stealing tile scheduler for prefill tiles | **NOT APPLICABLE — the prefill path is already one wave.** `grep -rn "TileScheduler\|work_steal\|atomicAdd\|tile_scheduler\|scheduler" src/` returns nothing, and there is nothing to add a scheduler to: the full-attn prefill fires QKV as ONE `run_linear_wave_batch(items, 3)` (`main.cpp:5700-5707`) and o_proj as ONE `run_linear_batch` (`main.cpp:5806`), with the MLP as the shipped `run_mlp_gateup`. The item's premise (many small tiled launches to coalesce) does not hold in this tree. | `examples/intfer_cli/main.cpp:5700-5807` |
+| 1.4 oneMKL `gemm` fallback for large contiguous FP16 | **NOT APPLICABLE — nothing to link.** `grep -riE 'dnnl|onemkl|mkl::|oneapi::mkl' src/ include/ examples/` returns nothing (rc=0). FP16 attention is already at 98-123% of the memory roofline on decode, so this cannot pay there; it is a prefill/large-M item only and there is no FP16 GEMM path to substitute. | PLAN.md 1.4; `model_byte_roofline.sh` |
+| 1.5 Barrier-free subgroup reduction (SUBGROUP retry) | **QUARANTINED.** `INTFER_DECODE1_SUBGROUP` was numerically wrong (ids `'279 12 12'` vs base `'13 198 760'`), cause not located. Do not start on it. | AGENTS.md flag table; HISTORY.md "QUARANTINED, not fixed" |
+| 1.6 Multi-split decode attention tiles | **NOT APPLICABLE — attention is not the deficit.** Layer GEMMs are 99% of launches; the attention tail is host-side scalar work in `main.cpp` (per-row causal loop at 5751-5790), not device launches. | `examples/intfer_cli/main.cpp:5746-5791` |
+
+**What this means for the standing objective.** The fusion surface at TP=2 is
+exhausted: `run_mlp_gateup` is the one TP=2-valid fusion and it is shipped,
+and both `run_mlp_fused` (`engine.cpp:1462`) and `run_linear_tp_devact`
+(`engine.cpp:1847`) are TP=1-only because the down GEMM needs the full `inter`
+and there is no P2P. The remaining launch-count surface is the prefill tail —
+`score_row` (`main.cpp:6216-6257`) and `run_lm_head_f16` (`main.cpp:1428-1838`)
+— which is the last un-fused section, and the lm_head's tiled GEMM already
+chains its per-tile D2H on the kernel event so tiles overlap
+(`main.cpp:1798-1817`). Any further gain there is a kernel-shape change, and
+**the `kernel` bucket is dead on this box** (driver records zero duration),
+so it would have to be decided on `nk`/`nw`/`nr`/`submit_count`/`usm_write_count`/
+`readback_count`/`wait_count`/`copy_count` — never on a tok/s, and never on
+`kernel`.
