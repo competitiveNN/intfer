@@ -1276,6 +1276,76 @@ dependency; 1.5 is quarantined. `ca85d91` decoupled the 1.3 arm's self-check
 fixtures from the gateup arm's `$SB2` (own `mktemp -d`, `bash -n` clean, no
 stack re-run — fixture-only change, verdict set unchanged by construction).
 
+## Flag census at `d1a099a` (2026-10-10): 7 opt-in ungated, one of them misfiled
+
+`bash scripts/check_flag_gate_coverage.sh` → PASS, **81 flags read, 57
+gate-named, 7 opt-in ungated** (population unchanged from `2a72b67`). The
+opt-in residue:
+
+| flag | site | what it actually is |
+|---|---|---|
+| `INTFER_DECODE1_ANNOUNCE_EVERY` | `quant_gemm.cpp:67` | diagnostic latch override for the decode1 announcement |
+| `INTFER_INT8_KV_G` | `main.cpp:3821` | group size for the INT8 KV quantiser (default 32) |
+| `INTFER_L4_FUSE` | `main.cpp:945, 5074, 6692` | L4 la_out fusion, TP=1 only |
+| `INTFER_L4_ROWS` | `main.cpp:3461-3513` | **print-only FNV row-fidelity hash — see below** |
+| `INTFER_L5_FRONT` | `main.cpp:968, 5043` | L5 device-resident LA input path, TP=1 only |
+| `INTFER_LMHEAD_FP16` | `main.cpp:1246, 1433, 2020, 2221` | bisection-only FP16 lm_head variant |
+| `INTFER_STREAM_F16` | `engine.cpp:781` | restores evict-everything shard streaming |
+
+**`INTFER_L4_ROWS` is misfiled.** `is_diag` matches suffixes
+`_(DBG|TRACE|WHY|TIME|SNAP|CHECK)`, and `_ROWS` is not among them, so the
+mechanical classifier puts it under "REAL GAP". Reading the code
+(`main.cpp:3461-3513`) shows it memcpy's data that is already present,
+FNV-hashes it, and `fprintf`s hex to stderr — no state is mutated (the S
+read is in `try/catch` and discarded). Under the header's own definition
+("print paths, not arithmetic") it is a **diagnostic**.
+
+Recorded as a QUALIFIED NOTE in the checker's header (`d1a099a`), **not
+fixed**: the header's standing instruction is "do not widen
+is_diag/is_oper to make this go away", and widening the suffix list to
+absorb `_ROWS` would read the classifier's intent instead of its pattern —
+the "hand-written total is a citation" failure in a different hat. The
+classifier is correct as a mechanical query; what it cannot do is read a
+flag's semantics, and that is stated so the "REAL GAP" label is not quoted
+as settled for this one flag.
+
+**The six genuinely ungated flags are ungated for a substantive reason,
+not an oversight:** every engine gate is operator-only (the stack runs
+only `run_ten_gates.sh --self-check`, `run_all_checks.sh:408`), and rule 9
+says a matrix with no dispatch arm never runs — so an arm written here
+would read STALE, not certified. Writing one to make the number go down
+would be the vacuous-green failure the floor exists to prevent. The honest
+outcome is the qualified note plus the standing instruction to the operator.
+
+## Stack run at `d1a099a` (2026-10-10): INCOMPLETE — stopped at `check_e2_ctx.sh`, NOT a verdict
+
+`INTFER_SKIP_HEALTHY=1 bash scripts/run_all_checks.sh` was started at
+`d1a099a` (clean tree) and **stopped itself** after two checkers. Recorded
+as incomplete, not as a pass or a regression.
+
+* The first launch (background, `CfsZYzhpWoQKHoMnGH7aY`) started against a
+  **dirty** tree — `check_flag_gate_coverage.sh` was committed between the
+  launch and the run — and its own guard refused: "FAIL: the tracked tree
+  has uncommitted changes. The mutation matrices restore with `git checkout
+  --` and would destroy that work." That is the guard working, not a defect.
+* The second launch ran on the clean tree. It reached
+  `check_e2_ctx.sh` (`run_all_checks.sh:195`, `timeout -k 30 3600`) and did
+  not return before the session ended. `/tmp/checksS.log` has 15 lines:
+  classifier self-check ok, dispatch coverage ok (68 items / 60 scripts),
+  `gate_inventory.sh` ok, `check_device_precond.sh` ok, then
+  `check_e2_ctx.sh` with no verdict.
+* **`check_e2_ctx.sh` is the known VRAM-panic box-state step** — it exits 139
+  in the baseline runs and carries a 3600 s timeout. It was running, not
+  hung, and nothing in the tree changed to affect it: `d1a099a` adds only a
+  **header comment** to `check_flag_gate_coverage.sh`, which is not reached
+  by any other step and cannot alter a verdict. So this is box state, not a
+  regression, and the run was stopped rather than waited out.
+
+The verdict set is therefore **not** re-derived here. The baseline at
+`2a72b67` (10 FAIL / 3 UNPROVEN, no regression) stands as the last complete
+stack run; the operator can re-run `scripts/run_all_checks.sh` at any clean
+HEAD to refresh it.
+
 ## Stack run at `2a72b67` (2026-10-10): 10 FAIL / 3 UNPROVEN, NO REGRESSION
 
 `INTFER_SKIP_HEALTHY=1 bash scripts/run_all_checks.sh` after the `2a72b67`
