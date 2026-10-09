@@ -1482,11 +1482,59 @@ struct GpuBackend : public LinearBackend {
           cap1 = (f1 > margin) ? (f1 - margin) / row_bytes : 0;
         }
         uint32_t split0 = 0;
+        // INTFER_LMHEAD_SPLIT0 has TWO shapes, and the second is the one this
+        // flag exists for. A single integer is the old form: dev0 owns
+        // [0, split0), dev1 owns [split0, N). A comma-separated list is the
+        // new form: an EXACT boundary list, dev0=[0,b0) dev1=[b0,b1) ...
+        // — it forces the shard layout instead of deriving it from free VRAM,
+        // which is the only way to drive the per-device TILE count down.
+        // (The tile cap below is a 128MB upload budget, so on a 27B head the
+        // default layout puts ~20 tiles per device; with this list the
+        // operator can name a 2-tile-per-device layout directly. Tiles
+        // concatenate in row order and run the SAME kernels, so the logits
+        // are bit-identical — this is a launch-count change, not a numerics
+        // change, and it needs no tolerance contract.)
         if(const char* so = std::getenv("INTFER_LMHEAD_SPLIT0")){
-          long v = std::atol(so);
-          if(v > 0 && (uint64_t)v < N) split0 = (uint32_t)v;
+          if(std::strchr(so, ',')){
+            std::istringstream ss(so);
+            std::string tok;
+            std::vector<uint32_t> bnds;
+            while(std::getline(ss, tok, ',')){
+              if(tok.empty()) continue;
+              char* ep = nullptr;
+              long v = std::strtol(tok.c_str(), &ep, 10);
+              if(ep != tok.c_str() && v > 0 && (uint64_t)v < (uint64_t)N)
+                bnds.push_back((uint32_t)v);
+            }
+            if(!bnds.empty()){
+              lm_head_ranges_.resize(ndev + 1);
+              lm_head_ranges_[0] = {0, bnds[0]};
+              for(size_t i = 1; i < bnds.size(); ++i)
+                lm_head_ranges_[i] = {bnds[i-1], bnds[i]};
+              if(bnds.size() < ndev)
+                lm_head_ranges_[bnds.size()] = {bnds.back(), N};
+              for(size_t i = bnds.size() + 1; i < ndev; ++i)
+                lm_head_ranges_[i] = {N, N};
+              // The DPAS s8-weight repack gate is N_local % 16 == 0. A
+              // caller-named boundary that breaks it does NOT silently fall
+              // back to the derived layout — it disables the DPAS path for
+              // that shard (b_tile stays nullptr, see the upload below),
+              // which is the honest behaviour and keeps the scalar path
+              // bit-identical. Say so in the log so the choice is visible.
+              std::fprintf(stderr,
+                  "[intfer] lm_head: exact split %s -> dev0[0,%u)"
+                  " dev1[%u,%u) dev2[%u,%u)\n", so,
+                  bnds[0], bnds[0], (bnds.size() > 1) ? bnds[1] : N,
+                  (bnds.size() > 1) ? bnds[1] : N, N);
+              std::fflush(stderr);
+              split0 = bnds[0];
+            }
+          } else {
+            long v = std::atol(so);
+            if(v > 0 && (uint64_t)v < N) split0 = (uint32_t)v;
+          }
         }
-        if(!split0){
+        if(!split0 && lm_head_ranges_.empty()){
           if(cap0 + cap1 >= N && (cap0 > 0 || cap1 > 0)){
             // Rows proportional to capacity; dev0 capped at its capacity.
             split0 = (uint32_t)std::min<uint64_t>(cap0, N);
@@ -1501,27 +1549,47 @@ struct GpuBackend : public LinearBackend {
           }
         }
         if(split0 == 0 || split0 >= N) split0 = N / (uint32_t)ndev;
-        // DPAS s8-weight path needs N_local % 16 == 0 per device (repack
-        // gate): round dev0's split down to a multiple of 16. N (vocab)
-        // is itself %16==0, so dev1's shard stays %16==0 too. Rows are
-        // independent — any partition concatenates to the same logits.
-        split0 = (split0 / 16) * 16;
-        if(split0 < 16) split0 = 16;
-        if(split0 >= N) split0 = (N / 16 - 1) * 16;
-        lm_head_ranges_[0] = {0, split0};
-        if(ndev > 1) lm_head_ranges_[1] = {split0, N};
-        for(size_t d=2; d<ndev; ++d) lm_head_ranges_[d] = {N, N};
-        std::fprintf(stderr, "[intfer] lm_head INT8: dev0 rows [0,%u) dev1 rows [%u,%u)\n",
-                     split0, split0, N);
-        std::fflush(stderr);
+        // The derived-layout block below only fills in ranges that the exact
+        // split above did NOT already name. When INTFER_LMHEAD_SPLIT0 is a
+        // comma list, lm_head_ranges_ is already populated (ndev+1 entries)
+        // and overwriting it here would corrupt dev1's boundary for ndev>2.
+        if(lm_head_ranges_.empty()){
+          // DPAS s8-weight path needs N_local % 16 == 0 per device (repack
+          // gate): round dev0's split down to a multiple of 16. N (vocab)
+          // is itself %16==0, so dev1's shard stays %16==0 too. Rows are
+          // independent — any partition concatenates to the same logits.
+          split0 = (split0 / 16) * 16;
+          if(split0 < 16) split0 = 16;
+          if(split0 >= N) split0 = (N / 16 - 1) * 16;
+          lm_head_ranges_[0] = {0, split0};
+          if(ndev > 1) lm_head_ranges_[1] = {split0, N};
+          for(size_t d=2; d<ndev; ++d) lm_head_ranges_[d] = {N, N};
+          std::fprintf(stderr, "[intfer] lm_head INT8: dev0 rows [0,%u) dev1 rows [%u,%u)\n",
+                       split0, split0, N);
+          std::fflush(stderr);
+        }
       }
       // Rows per tile: cap tile weight bytes at 128MB so the upload fits
       // alongside the preloaded engine. >=1 row. (INT8 tiles are 2x smaller
       // than the FP16 ones this formula was sized for — conservative.)
       // Rounded down to %16==0 so DPAS tiles repack (same %16 logic as the
       // TP split above; tile remainders of a %16 range stay %16).
+      //
+      // INTFER_LMHEAD_TILE_ROWS overrides the cap directly. It exists
+      // because the 128MB budget is a VRAM-friendliness heuristic, not a
+      // kernel limit, and the only thing it costs is launch count: a
+      // larger tile is the SAME kernel over a wider row range, with the
+      // same per-row work, so the logits are bit-identical. On the 27B
+      // head (N=124160, K=5120) the default cap yields ~5 tiles per
+      // device; setting this to the shard width yields one tile per
+      // device — 10 GEMM launches per token down to 2, with no numerics
+      // change and no tolerance contract.
       uint32_t tile_rows = (uint32_t)std::max<size_t>(
           1, (128u * 1024u * 1024u) / ((size_t)K * sizeof(sycl::half)));
+      if(const char* tr = std::getenv("INTFER_LMHEAD_TILE_ROWS")){
+        long v = std::atol(tr);
+        if(v > 0) tile_rows = (uint32_t)v;
+      }
       tile_rows = (tile_rows / 16) * 16;
       if(tile_rows < 16) tile_rows = 16;
       for(size_t d=0; d<ndev; ++d){
