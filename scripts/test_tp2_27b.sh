@@ -771,9 +771,6 @@ for spec in "VERBDEAD:vd:decode1-verbdead" "VERBSEL:vs:decode1-verbsel" \
   fi
 done
 
-rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
-if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi
-
 # --- INTFER_FUSED_GATE_UP: gate+up in a single launch (TP=2 fusion) ------
 # 1.2 of PLAN.md. Gate and up are both column-parallel over the SAME split and
 # device-local, so one parallel_for over Ng+Nu outputs is bit-exact vs two
@@ -837,9 +834,9 @@ else
   cp "$GATEUP_OUT" "$SB2/gu_not.out"; cp "$GATEUP_ERR" "$SB2/gu_not.err"
   sed -i '/\[mlp-gateup\]/d' "$SB2/gu_not.err"
   : >"$SB2/gu_empty.out"; : >"$SB2/gu_empty.err"
-  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR"; fi' EXIT
-  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR"; fi; exit 130' INT
-  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR"; fi; exit 143' TERM
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR"; fi' EXIT
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR"; fi; exit 130' INT
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR"; fi; exit 143' TERM
   gu_ids() { cli_ids "$1" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//'; }
   gu_good_ids="$(gu_ids "$SB2/gu_good.out")"
   gu_not_ids="$(gu_ids "$SB2/gu_not.out")"
@@ -866,5 +863,64 @@ else
     echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log" >&2; PASS=0
   fi
   gu_arm_assert "$SB2/gu_empty.out" "$SB2/gu_empty.err" "SELFTEST (c) arm-refusal: " \
-    && { echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty pair (vacuity)" >&2; PASS=0; }
+    && { echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log pair (vacuity)" >&2; PASS=0; }
+  fi
+
+  # --- INTFER_LMHEAD_SPLIT0 / INTFER_LMHEAD_TILE_ROWS certification -------
+  # PLAN.md prefill tail. The lm_head is the last un-fused section and its
+  # launch count was never exercised: the 128MB upload cap put ~20 GEMM tiles
+  # per device per token on the 27B head (N=124160, K=5120), and the only knob
+  # for the shard layout was a single dev0 boundary derived from free VRAM.
+  # Both flags are bit-exact by construction -- tiles concatenate in row order
+  # and run the SAME kernels, so the logits are identical -- which is why this
+  # arm is a SINGLE flagged run against the fixed oracle, NOT a base-vs-flagged
+  # stream comparison: a stream comparison would be vacuous here, because the
+  # two streams are identical BY CONSTRUCTION and a flag that never reached the
+  # upload would pass every stream check while certifying nothing (the same
+  # nested-flag vacuity the gateup arm's ACTIVE line exists to defeat).
+  #
+  # The subject is the LAYOUT, not the stream, and the engine announces the
+  # layout it actually built ([lmhead-tiles] ... dev0=N tiles dev1=M tiles ...).
+  # So the arm asserts: the run hit the oracle AND the announcement names the
+  # layout the operator asked for. That is what separates "the tile count fell"
+  # from "the flag was ignored and the default layout ran".
+  LT_OUT="$LOG.lt.out"; LT_ERR="$LOG.lt.err"
+  LT_SPLIT="${INTFER_LMHEAD_SPLIT0:-62080,124160}"
+  LT_TILE="${INTFER_LMHEAD_TILE_ROWS:-62080}"
+  env INTFER_LMHEAD_SPLIT0="$LT_SPLIT" INTFER_LMHEAD_TILE_ROWS="$LT_TILE" \
+  "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$LT_OUT" 2>"$LT_ERR"; LT_RC=$?
+  if [ "$LT_RC" -ne 0 ]; then
+  echo "GATE FAIL: INTFER_LMHEAD_SPLIT0=$LT_SPLIT TILE_ROWS=$LT_TILE run exited rc=$LT_RC" >&2
+  tail -20 "$LT_ERR" >&2
+  PASS=0
+  else
+  echo "LMHEAD-TILES prefill: $(cli_prefill "$LT_ERR") (expect 11751)"
+  echo "LMHEAD-TILES ids:      $(cli_ids "$LT_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  LT_LINE="$(grep -a "\[lmhead-tiles\]" "$LT_ERR" | head -1)"
+  if [ -z "$LT_LINE" ]; then
+    echo "GATE FAIL: the lm_head tile-layout path never announced itself" >&2
+    echo "         (no [lmhead-tiles] line); the flags did not reach the upload" >&2
+    echo "         and this arm is vacuous." >&2
+    PASS=0
+  else
+    echo "LMHEAD-TILES layout: $LT_LINE"
+  fi
+  # The layout the operator asked for, as the announcement must print it.
+  LT_EXPECT_ANN="exact-split=$LT_SPLIT tile-rows=$LT_TILE"
+  echo "$LT_LINE" | grep -aq "$LT_EXPECT_ANN" \
+    || { echo "GATE FAIL: the announcement does not name the requested layout" >&2
+         echo "         wanted '$LT_EXPECT_ANN', got '$LT_LINE'" >&2; PASS=0; }
+  # The stream half, against the SAME FIXED ORACLE the base run uses -- not a
+  # self-comparison, so "both runs broke the same way" cannot pass.
+  mr_prefill_ok "$(cli_prefill "$LT_ERR")" \
+    || { echo "GATE FAIL: lmhead-tiles prefill != 11751" >&2; PASS=0; }
+  LT_GOT="$(cli_ids "$LT_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  LT_BASE="$(cli_ids "$CLI_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  [ -n "$LT_GOT" ] || { echo "GATE FAIL: lmhead-tiles stream is EMPTY" >&2; PASS=0; }
+  [ "$LT_GOT" = "$LT_BASE" ] \
+    || { echo "GATE FAIL: lmhead-tiles ids '$LT_GOT' != base '$LT_BASE'" >&2; PASS=0; }
 fi
+
+rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
+if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi
