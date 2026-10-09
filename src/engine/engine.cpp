@@ -1228,7 +1228,11 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
   {
     auto t1 = std::chrono::high_resolution_clock::now();
     g_gpu_profile.total_readback_us += std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
-    g_gpu_profile.readback_count++;
+    // Per (item, device), matching run_linear_wave and run_mlp_gateup: this
+    // path does devices_.size() separate D2H readbacks (one per rank's
+    // shard) and counted them as 1, which made the counter non-comparable
+    // with the wave path it feeds into.
+    g_gpu_profile.readback_count += (int)devices_.size();
   }
 #endif
 }
@@ -1750,17 +1754,20 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
     auto t1 = std::chrono::high_resolution_clock::now();
     g_gpu_profile.total_waitblock_us +=
         std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
-    // wait_count is the number of HOST WAITS, and this path does one per
-    // device (kernel_events.size() == 2). The wave fallback does the same:
-    // run_linear_wave waits once for its whole event vector, and its
-    // wait_count += kernel_events.size() is 4 there (2 items x 2 devices).
-    // So the fusion does NOT save a wait -- it is already one per wave.
-    // It is NOT a saving of the fusion: the gateup kernel writes gate and
-    // up into two separate out buffers, so the readback cannot be fused
-    // the way run_mlp_fused (TP=1) does. Counting it keeps this counter
+    // wait_count is the number of HOST .wait() CALLS. This path loops over
+    // kernel_events (2, one per device) and calls e.wait() on each, so it
+    // contributes 2. The wave fallback loops over 4 events (2 items x 2
+    // devices) and contributes 4. So the fusion DOES halve wait_count
+    // (4 -> 2), exactly like nk, submit_count and usm_write_count -- it
+    // is not flat and must not be written off as "already one per wave".
+    // The one thing it does NOT do is cut the number of HOST WAITS below
+    // one per device: gate and up go into two separate out buffers, so
+    // the readback cannot be fused the way run_mlp_fused (TP=1) does,
+    // and the host still has to wait for each device's launch to finish
+    // before reading. Counting it per event keeps this counter
     // consistent with every other engine path; dropping it would make a
-    // fused token report wait_count=0 and read as "the fusion removed the
-    // wait", which is not true.
+    // fused token report wait_count=0 and read as "the fusion removed
+    // every wait", which is not true.
     g_gpu_profile.wait_count += (int)kernel_events.size();
   }
 #endif
@@ -2103,6 +2110,14 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
 #endif
 
   // Phase 4: per item — read back from that item's wave slot.
+  // readback_count is per (item, device), matching run_mlp_gateup's
+  // granularity (two outputs x two devices = 4). Counting it once per
+  // call made the counter non-comparable between the two paths the same
+  // way submit_count and usm_write_count were: a fused token would have
+  // reported readback_count=4 against a wave token reporting 1, and the
+  // "the readback is unchanged" claim would have been a ratio of 4:1
+  // rather than a delta of 0.
+  uint32_t rb_items = 0;
   for (size_t i = 0; i < nl; ++i) {
     const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
     std::vector<float>& out = *live[i]->out;
@@ -2115,13 +2130,14 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
         dashq::half_to_float_batch(out_ptr + (size_t)m * N_local_rb,
                                    out.data() + (size_t)m * t.N + start,
                                    N_local_rb);
+      ++rb_items;
     }
   }
 #ifdef INTFER_PROFILE_GPU
   {
     auto t1 = std::chrono::high_resolution_clock::now();
     g_gpu_profile.total_readback_us += std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
-    g_gpu_profile.readback_count++;
+    g_gpu_profile.readback_count += rb_items;
   }
 #endif
 }
