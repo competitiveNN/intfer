@@ -1,453 +1,560 @@
-Port ninfer (https://github.com/Neroued/ninfer) to our local setup: 2x intel arc pro b580.
-
-**Read `docs/audit-log-tooling.md` before adding a checker or a mutation
-matrix** — it carries the ~40 tooling failure modes (vacuous gates,
-inverted predicates, stale artifacts, ...) that the current tooling
-exists to prevent. The 2026-10-04 cleanup that split the original
-4684-line file is recorded in `HISTORY.md`.
-
-## READ FIRST — box state, gate state, and what is live
-
-### Box: both B580s enumerate (verified 2026-10-04 at the driver API)
-
-`scripts/l0_enumerate.sh` -> `zeDeviceGet rc=0 DEVICES=2`, UUIDs `...-0400-...`
-(= 04:00.0) and `...-8600-...` (= 86:00.0); `sycl-ls` prints 2 `[level_zero:gpu]`
-lines.
-
-**This has dropped and come back four times with nothing in this repo changing.**
-It is HOST-SIDE driver enumeration state, not a code fault. Three consequences:
-
-* The 1-GPU investigation is a record of ONE of those windows. It is true history
-  and it stays, but **do not read it as the current box state and do not "fix"
-  anything in it.**
-* **NEVER report "no GPU visible" from an agent session without sourcing
-  `setvars.sh` first.** MEASURED TWICE IN ONE SESSION, WRONG BOTH TIMES: a missing
-  `source /opt/intel/oneapi/setvars.sh` was reported as "the documented
-  container/host driver mismatch" and the operator was told a 27B handoff could
-  not run; the second time the same omission hung `check_device_precond.sh` to a
-  timeout. `SYCL: sycl-ls not available` is a statement about **PATH**, not about
-  the machine. The preconditions now print an `ENVIRONMENT, NOT BOX STATE` banner
-  with the remedy, pinned by `scripts/check_env_not_box_state.sh` (whose last
-  assertion is a live probe, so the banner is proved to print).
-* Any tally that depends on visible device count (PARTIAL / SKIPPED) is only
-  meaningful together with the count it was measured at. **Re-derive it with
-  `scripts/gate_inventory.sh`; never read one off this file.**
-* **IF THE SECOND GPU VANISHES:** `scripts/gpu_recover.sh diag` (read-only) ->
-  `sudo scripts/gpu_recover.sh rebind` -> `verify`. A plain rebind is what fixed
-  it last time; nothing about the hardware, driver-library version, cgroup, NUMA,
-  power or BAR sizes had to change.
-  * `verify`: **0** = 2 devices, **1** = MEASURED 1 device, **2** = UNMEASURABLE.
-    A box that cannot count its devices is not a box with one device.
-  * **NEVER lead with the BAR/small-BAR theory.** It was refuted when a rebind
-    fixed the fault with no BAR change. Investigate BARs only if a rebind stops
-    working.
-  * **Derive a card from `/dev/dri/by-path/pci-<slot>-render`, never from
-    `/dev/dri/renderD<n>`.** The DRM minor has flipped `card1`->`card2` /
-    `renderD129`->`renderD130`->`renderD129` across sessions. `renderD128` is the
-    stable liveness probe; two or more distinct minors in one script is the defect
-    `scripts/check_dri_probe.sh` refuses.
-  * **IF A REBIND STOPS WORKING, the deeper investigation kit is in
-    `scripts/archive/`**, one rung below the remedy above: `gpu_health_check.sh`
-    (diffs the two cards at the kernel/sysfs layer), `l0_enum_trace.sh` (runs the
-    driver's own discovery code with its debug keys on, to see WHICH of its five
-    silent skips fires) and `gpu_driver_lib_ab.sh` (proves a driver-library swap
-    actually happened). They were archived as retired, not deleted, precisely
-    because this fault has recurred; `scripts/archive/README.md` says so.
-
-### Gates: all PASS, nothing PARTIAL, nothing SKIPPED
-
-**Do not read a gate count off this file.** `scripts/gate_inventory.sh` derives
-the population from `scripts/test_*.sh` and reconciles any tally it finds
-against that derivation, so adding a gate makes every hand-written count stale
-*by design* — that is the mechanism working, not a defect to silence. Run it:
-
-```
-scripts/gate_inventory.sh        # population, preconditions, and doc tally
-```
-
-Every gate's precondition is met with both B580s enumerating, so nothing is
-PARTIAL and nothing is SKIPPED. `test_tp2_27b` runs for real (**TP2-27B TEST:
-PASS**, `GPU backend: 2 device(s) (TP=sharded)`), and `test_gpu_optin` /
-`test_device_argmax` execute their `--tp 2` arms instead of skipping them.
-TP=2 coverage is live.
-
-The line below is the ONE live tally in this file, kept so `gate_inventory.sh`
-has a non-historical site to reconcile against -- its own `sites_found=0`
-vacuity guard refuses to certify a corpus with no live site, which is the
-correct behaviour and not something to work around. Rewrite it when the gate
-population changes; the checker fails if you do not.
-
-```
-gate tally: 17 PASS, 0 PARTIAL, 0 SKIPPED
-```
-
-* Historical lines recording the 1-GPU-era tally are **records of that era**.
-  Do not "correct" them — rewriting a true historical record to match today's
-  box is the same laundering failure in the other direction. They carry an
-  explicit `[SUPERSEDED ...]` annotation instead.
-* Present tense: *"all gates PASS; both B580s enumerate and TP=2 coverage is
-  live."*
-* The historical `+N on ...` annotations of how the count grew are recorded in
-  `HISTORY.md` ("Gates: all PASS, nothing PARTIAL, nothing SKIPPED"), not here.
-
-`gate_inventory.sh` also fails the build if any tally it finds in `AGENTS.md`,
-`docs/*.md` disagrees with what the source classification predicts for the
-box's GPU count — so "the docs said 8 instead of 7" is a refusal, not
-something a reviewer has to notice.
-
-## ==> PARAMOUNT DIRECTIVE (2026-10-04): OPTIMIZE FIRST. WALL-TIME BENCHMARKING IS RETIRED. <==
-
-**The single objective is to make 27B (`--tp 2`) prefill and inference as fast as
-possible.** Everything else is subordinate. This supersedes any instruction below
-that says to go measure a tok/s.
-
-### What is retired, and it is a real retirement
-
-The **wall-time benchmark queue is closed.** The blank `RESULT:` lines in the
-retired wall-time backlog are **ABANDONED, not pending** — do not fill them, do
-not re-run arms to fill them, do not move them to archive. Measured reasons,
-
-* a tok/s needs `load1 < 2` for the WHOLE of every arm; this box has not held that
-  window (load1 runs 3-18) and the cause is **not ours** (desktop + sibling agent
-  sessions; the standing rule is not to kill them);
-* this project has already **retracted three separate wall-time claims** because a
-  number reached a report without an artifact behind it;
-* the queue produced **zero decisions** while consuming the sessions it was meant
-  to inform.
-
-### What is explicitly NOT retired
-
-**The load-insensitive counters stay, and they are how every optimization gets
-decided.** `kernel` / `submit` / `waitblock` / `copy` / `usm_write` / `readback`
-and the exact integers `nk` / `nw` / `nr` are read from the **device's own event
-timestamps**, so they are immune to `load1`. This is the mechanism, not a hedge:
-
-* **four** optimizations were killed *by counters* and would have survived a tok/s:
-  L5 LA-front, DPAS48 at M=1, host-private DPAS staging, SYCL command graphs;
-* **two** were adopted *by counters*: fused MLP down-proj (+13% decode, one host
-  wait and one D2H removed) and E3 `INTFER_DPAS48_FOLD`;
-* **E4 `INTFER_DPAS48_TILED`** was accepted on a counter verdict alone (-1851.9 ms
-  prefill kernel, -9.95%, 3/3 same sign, clears the spread, zero added launches)
-  with **no tok/s at all** — which is the proof the instrument is sufficient.
-
-**Decide on counters, report counters, never wait for a quiet box.** `kernel` is
-the only load-insensitive bucket; `submit` / `waitblock` / `copy` / `readback` /
-`usm_write` are host wall-clock accumulators, reported as `median(spread)` and
-read as *relative*, never as a figure.
-
-**A delta must CLEAR the spread floor, not merely be non-zero.** The floor is
-`max(spread of the two arms compared)` and it needs >= 2 paired rounds — a
-single-round delta has no noise floor to clear and must not be reported as a
-result. `scripts/_bench_summary.py` enforces this and refuses a batch in which any
-arm died (`FAILED=` records, empty `BUCKETS`, incomplete `nk`/`nw`/`nr`).
-
-### The correctness gates are unchanged and still binding
-
-Retiring benchmarking does **not** retire `scripts/run_ten_gates.sh` or the ten
-gates. Every optimization ships behind a flag and must be **stream-identical** to
-its base at TP=1 and TP=2, plus a mutation matrix before its checker is believed.
-A speedup that changes a token is not a speedup. This is what makes the counters
-trustworthy: if the streams are identical, a kernel delta is attributable to the
-kernel.
-
-Report results in **load-insensitive buckets** (`kernel`/`submit`/`waitblock`/
-`copy`/`usm_write`/`readback`, `nk`/`nw`/`nr`) and never quote a tok/s that was not
-measured on a quiet box.
-
-### ALWAYS AIM FOR KERNEL FUSION to reduce CPU-GPU communication overhead
-
-**Standing directive.** Fusion is the DEFAULT direction for a GPU optimization
-here, not a fallback. Every host<->device round trip costs a submit, a wait and a
-transfer, and on Arc B580 those dominate far more often than the arithmetic does.
-
-Three questions to ask of **any** new optimization before believing it will pay:
-
-1. **Which round trips does it remove** — submit / wait / D2H / H2D — **and what is
-   its launch delta?** No round-trip removal and no launch reduction is unlikely
-   to pay on this box.
-2. **Prefer fusing the CONSUMER of a device buffer with the PRODUCER**, so the
-   intermediate never reaches the host. `run_mlp_fused` and `la_out_fused` are the
-   two shipped examples; `run_linear_tp_devact` is the seam they use.
-3. **A fusion that changes FP32 accumulation ORDER is NOT bit-exact** and needs a
-   tolerance-based numerics contract agreed **before** any code. Prefer fusions
-   whose intermediate is an **exact integer fold** (the FOLD hoist is bit-exact
-   because integer addition is associative) or a **bit-exact converter** (the RNE
-   FP16 convert was verified exhaustively).
-
-**Why, from this repo's own measurements — do not re-derive these:**
-
-* **More device work in fewer host phases wins; more kernels lose.** Fused MLP
-  down-projection was **+13% decode** by cutting one host wait + one D2H per MLP.
-  By contrast the L5 LA-front chain **added** kernels and ~8 submits per LA layer
-  and is a recorded dead end despite identical device work.
-* **A fusion that ADDS launches can lose even while removing waits** — at M=3 under
-  device saturation the L4 M-row save nets ~-1.5%, because submit savings land on
-  an already-saturated queue.
-* **Prefill and decode want different fusions.** Prefill needs XMX on the
-  arithmetic; decode needs launch-count and transfer reduction.
-
-### XMX verdict — the matrix engines are idle on the hot path
-
-**Layer GEMMs (99% of launches) are pure EU/ALU dot-products** (dequant-on-the-fly
-+ FP32 FMA): decode M=1 (`gemm_usm_decode1_vec`) and prefill M>1 tiled. xmxmon
-reads all-zero `XVE_INST_EXECUTED_XMX_*` there. **Correction to the original
-"zero DPAS" claim: `lm_head` DOES run INT8 DPAS** (`quant_gemm_dpas_s8w`,
-default-ON whenever the repack exists, no env gate) — measured 180M INT8 slots on
-a 361-token prefill, 5.5M on an M=1 decode.
-
-Implication: prefill 4000 tok/s needs XMX (EU pipes are the whole prefill story);
-decode 40 tok/s needs launch-count/transfer reduction — XMX at M=1 barely helps
-because the shapes are memory-bound. **Do not re-attempt XMX for M=1.**
-
-DPAS-issuing kernels in the tree: `quant_gemm_dpas48` (`INTFER_DPAS48=1`,
-default **OFF** — a net loss at every tested shape), `quant_gemm_dpas_s8w`
-(lm_head only), and E4's `quant_gemm_dpas48_tiled` (`INTFER_DPAS48_TILED`,
-default **OFF**). Per xmxmon docs, mixed-precision DPAS counts under the WIDER
-operand (W2A8 -> INT8 counter). Harness `scripts/xmx_profile.sh` joins xmxmon
-capture with internal buckets and degrades gracefully when the streamer is blocked
-(this box: `dev.xe.observation_paranoid=1`, no sudo).
-
-## Flag inventory — DERIVED, do not hand-maintain
-
-Read the defaults off the code, not off this table; this table is a map, not a
-source. Two spellings exist and they are not interchangeable:
-
-* `getenv("X") != nullptr` -> **presence** enables (`X=1`, `X=0`, `X=anything` all
-  enable it). These flags need `X=` unset to disable.
-* `env[0]=='1' && env[1]=='\0'` -> **exactly `X=1`** enables.
-* `INTFER_NO_*` / `INTFER_LMHEAD_BATCH` are **kill switches**: the feature is ON by
-  default and `=1` turns it OFF.
-
-Re-derive the whole population with the `git grep` recipe above.
-
-### Perf-relevant, default OFF (opt-in experiments)
-
-| flag | what it changes | verdict |
-|---|---|---|
-| `INTFER_DPAS48` | W4A8/W2A8 DPAS for layer GEMMs | net loss at M=1/128/361; host GA64 act-quant dominated. OFF |
-| `INTFER_DPAS48_FOLD` | hoists exact int32 activation column sums out of the 16-N tile loop | -1.8% kernel at 27B, replicated at 0.8B. **KEEP (E3)**, not promoted |
-| `INTFER_DPAS48_TILED` | E4 cooperative-2D-block DPAS, bit-exact | **-1851.9 ms prefill kernel, -9.95%, 3/3 same sign. KEEP (E4)**, not promoted; declines at M=1 by design |
-| `INTFER_DPAS_PREQ` | device-side GA64 act-quant pre-pass | recovers 52.7 ms of 2559.2 ms host act-quant but pays +30720 launches. **DO NOT PROMOTE** |
-| `INTFER_DPAS_ROW` | one WI owns many tiles | ~460x slower. Historical dead end, mutually exclusive with E4 |
-| `INTFER_DECODE1_MR` | 4 outputs per WI at M=1 INT2 | **2.3x slower.** Do not use |
-| `INTFER_DECODE1_SPLITK` | split-K block-cyclic M=1 INT2 decode: `N*S` work-items + coalesced weight loads. Exactly `=1`; kill switch `INTFER_NO_DECODE1_SPLITK` | **MEASURED LOSS.** Stream-identical to base on 27B (so the numerics contract held), but kernel 267 -> 384 ms (+43.8%, 3/3 same sign, clears the 6 ms spread floor; `nk/nw/nr` identical). Both halves of the hypothesis delivered and it still lost. **Do not promote.** |
-| `INTFER_DECODE1_SUBGROUP` | llama.cpp mmvq shape: one SUB-GROUP per output row, lanes split K, reduced by `sycl::reduce_over_group` -- no `local_accessor`, no barrier. **REMOVED 2026-10-05**: numerically wrong (ids `'279 12 12'` vs base `'13 198 760'`) and the cause is not located. See `AGENTS.md` "INTFER_DECODE1_SUBGROUP is QUARANTINED, not fixed". |
-| `INTFER_L4_FUSE` | fused ssm+norm+FP16 -> la_out GEMM (TP=1) | stream-identical, but M>1 nets ~-1.5% and scalar A/B was a variance wash. **Decline re-checked 2026-10-09:** the verdict stands and is *independent* of the gate+up fusion -- L4_FUSE fuses a different seam (the LA input path, `run_linear_wave`'s fwht_rot+4 GEMMs at main.cpp:4260-4289) and its TP=1-only guard (`run_mlp_fused`-style `if (devices_.size() != 1) return false`) is unrelated to the gate+up seam. The M>1 ~-1.5% is a device-saturation submit effect (the fusion ADDS launches to an already-saturated queue), not a numerics divergence; the stream-identity arm in `test_gpu_optin.sh` is unchanged and still the right certification for this flag. |
-| `INTFER_L5_FRONT` | device-resident whole LA input path | **dead end as built**: +144 launches/token, waitblock 5x. More kernels lose |
-| `INTFER_SSM_GPU` | device SSM recurrence | declines under `INTFER_DPAS48=1` (its ~1ulp drift flips a GA64 code at a tie) |
-| `INTFER_INT8_KV`, `INTFER_KV_Q8`, `INTFER_KV_HAD` | groupwise-INT8 KV cache | correctness-gated, no tok/s claim |
-| `INTFER_DECODE1_VERBDEAD` | per-group locals removed, pure code motion | bit-exact, default OFF |
-| `INTFER_DECODE1_VERBSEL` | the 4-float codebook by `select` instead of an indexed array | bit-exact, default OFF |
-| `INTFER_DECODE1_VERBVEC` | activations through a plain pointer instead of a `multi_ptr` | bit-exact, default OFF |
-
-### Default ON, with a kill switch
-
-`INTFER_NO_FUSE_SILUMUL` (fused MLP, TP=1 only — the shipped +13%), `INTFER_NO_WAVE`
-(wave submit grouping), `INTFER_LMHEAD_BATCH` (M-row lm_head), `INTFER_NO_WAVE`,
-`INTFER_STREAM_F16` (**default-OFF opt-in, NOT a kill switch** -- presence
-enables; restores the old evict-everything FP16 cache policy. Bit-exact by
-construction: `shard_weight` for FP16 scheme is a memcpy, so evict+rebuild
-reproduces the same bytes; the flag only moves *when* a buffer is allocated,
-never *what* goes in it. **No stream-identity gate is warranted** -- see
-`intfer_stream_f16_policy.md`; the census files it as an opt-in gap, which is a
-certification gap, not a correctness one), `INTFER_PREFILL_CHUNK` +
-`INTFER_BATCH_GEMM` (chunked M-row prefill, `INTFER_PREFILL_RR` restores the old
-rounding order), `INTFER_HOST_AVX2`, `INTFER_DPAS_PREQ`-independent bits,
-`INTFER_NO_DECODE1_VERBHALF` and `INTFER_NO_DECODE1_VERBMP` -- the two M=1 INT2
-decode arms promoted to the DEFAULT DECODE PATH 2026-10-07. Their clone
-measurements are **RETRACTED as performance evidence**: the bisect-2 gate that
-produced them (VERBHALF +14% MLP_GATE / +17% MLP_DOWN, VERBMP neutral at 1.01x
-both shapes) reported PASS while every arm measured `0.000 ms / inf GB/s / -nanx`
-on this box, so those ratios were 0/0. The gate now refuses a vacuous run on
-four layers (probe ceiling floor, gate-side exit-code check, gate-side numeric
-floor, `RESULT: PASS`); the four bisect mutation matrices each certify a stub
-that reproduces the exact vacuous-but-green output (RB-8 / RB1-8 / RB3-8 /
-RB4-5, all CAUGHT).
-VERBMP is bit-exact by construction; VERBHALF is stream-identity only (denormal
-+ default FTZ is a *should-not*, now measured away on synthetic data by
-`test_rowpair_equiv.sh`, 143 355 INT2 values bitwise identical, matrix PASS
-3/3). **The performance direction is UNKNOWN, not positive** -- the engine
-arms are still UNMEASURED on real 27B weights (operator-only, standing rule 1),
-and until that run exists the default-ON change is a correctness bet with an
-unknown payoff. Do not quote the +14% as settled.
-
-**2026-10-08: the 5.6-6.4x "clone-vs-shipped" deficit is RETRACTED ENTIRELY, and
-it is the clone number that was the flake, not the shipped kernel.** A fresh run of
-`examples/roofline_probe` (the binary that produced the 6.39x) returns VACUOUS, and a
-saved `build/roofline_bisect4.log` from 10-06 measured the SAME clone algorithm at
-**55.1 GB/s** while the shipped arm stayed at ~40-49 GB/s in both saved logs. The clone
-moved 4.7x between two saved logs of the same kernel; the shipped number did not. So
-the 6.39x was never a clone-vs-shipped ratio, it was a flaky numerator divided by a
-stable one, and the honest ratio is **1.12x** -- a *cosmetic* win (`bit_cast<half>`
-for the group scale, `av * wtab[code]` for the tail) that VERBHALF already lands in the
-engine. The two falsified candidates (module size, runtime branch) and the
-"~4.5-5x unexplained" line were all chasing a number that was never real. **1.1 is
-CLOSED, not open.** What remains is the reproducible finding: the shipped INT2 decode
-runs at ~49 GB/s on MLP_GATE against a 456 GB/s ceiling, ~10.7% of peak. Full account:
-HISTORY.md "THE 6.39x ITSELF IS NOT REPRODUCIBLE".
-CITATION(build/roofline_bisect4.log 2026-10-06, clone arm 55.1 GB/s vs shipped ~40-49 GB/s;
-         scripts/test_roofline_bisect4.sh)
-
-### The profiling defect: LOCATED 2026-10-08, it is the driver, not the code
-
-`examples/roofline_probe` (and the bisect binaries that share its allocator and
-instrument) returns `0.000 ms` for every arm on this box. Bisected to the
-timestamp, not to the kernel:
-
-```
-[roofline] RAW submit=184192938721938 start=184192938721938 end=184192938721938
-        start-submit=0 end-start=0 ns
-[roofline] RAW rep 1 sink=16655032
-```
-
-`submit == start == end` for every rep, monotonic across reps (~60 ms apart, real
-device up time), and the sink reads 16655032 after `q.wait()` -- so the kernel
-**executed** and wrote 52 MB of non-constant data, and the driver records **no
-duration** for these commands. Three wait orderings were tried (read-then-wait,
-`e.wait()`-then-read, `q.wait()`-then-read) and all returned the same 0 ns, so it
-is not an ordering artifact; `enable_profiling()` is accepted (timestamps are
-recorded) but the durations are not.
-
-The probe's vacuity guard is the correct behaviour and stays: it refuses rather
-than substituting a host timer, which is load-sensitive and would have produced a
-"ceiling" that is really a CPU number. `--raw` is a diagnostic only (it exits after
-the ceiling arm and never writes a reportable table).
-
-**Caveat, recorded rather than dropped:** the engine's own counter
-(`engine.cpp:1206`, same `get_profiling_info` spelling, same `enable_profiling`
-queue) is reported as real in a log that is **not in this repo** (`perf_base.err`,
-archived). AGENTS.md's standing rule is to re-derive, not to remember, and that
-number cannot be re-derived from this tree -- so "the engine's instrument ticks
-on this box" is **UNVERIFIED HERE**, and this probe's zero is NOT evidence that
-the engine's is also zero. The two could differ on a launch shape the probe never
-exercises. The remedy is the same as for any box-state question: a rebind, not a
-code change (`scripts/gpu_recover.sh`).
-
-### Operational (not gate subjects)
-
-`INTFER_PRELOAD` (`=0` restores layer streaming), `INTFER_SCHED`, `INTFER_SERVE_MAX`,
-`INTFER_SPEC_K`, `INTFER_SPLIT_ITER`, `INTFER_PCACHE_*` / `INTFER_NO_PREFIX_CACHE`,
-`INTFER_KV_CAP`, `INTFER_HTTP_SERIAL`, `INTFER_ARGMAX_*`, and the `_DBG`/`_TRACE`/
-`_WHY`/`_TIME` diagnostics.
-
-## Architecture facts worth knowing before you edit
-
-* **BOTH FUSION SEAMS ARE TP=1 ONLY, so there is no local fusion at the target.**
-  `Engine::run_mlp_fused` (`engine.cpp:1352`) and `Engine::run_linear_tp_devact`
-  (`engine.cpp:1484`) both open with `if (devices_.size() != 1) return false;`.
-  **Read this before designing an E5.** Routing a fusion through
-  `run_linear_tp_devact` would make it dead code at 27B `--tp 2` — the exact
-  "default-OFF flag no gate can reach" class the flag census exists to kill.
-  The reason is structural, not an omission: TP slices N, so `gate`/`up` produce
-  only device *d*'s slice of `inter`, while `down` has K = the **full** `inter`
-  and therefore needs the other device's slice ⇒ the intermediate must cross the
-  host, and there is no P2P. The one TP=2-valid fusion is **gate+up in a single
-  launch** (both column-parallel over the same split, both device-local, and
-  bit-exact because each output's K accumulation is untouched). Spec and the
-  numerics argument: `AGENTS.md` "The TP=2 fusion surface".
-* **TP is COLUMN-parallel with a HOST gather — there is no All-Reduce.** `shard_weight`
-  slices the output dim N; `run_linear_tp` waits all ranks, then each rank's D2H is
-  `half_to_float_batch`-ed into `out.data() + m*t.N + start`. `grep -riE
-  'allreduce|p2p|peer'` returns **nothing**. So P2P/IPC has no consumer to optimise;
-  a "TP All-Reduce" optimization has nothing to attach to.
-* **First-touch migration is real and one-shot.** `preload_all` builds and pins all
-  shards (496 on 27B, ~49 s), but shard USM is `malloc_shared`, so pages stay
-  host-resident until first kernel touch: device-local goes 791 MB -> 11.27 GB only
-  after the first request. Same prompt back-to-back measured 9.28 s then 2.75 s,
-  2.75 s. `q.prefetch()` was built and **reverted — a no-op hint for shared USM on
-  this driver**; do not retry. Mitigation is one warmup request after `/health`
-  (`scripts/serve_27b.sh`, `INTFER_NO_WARMUP=1` skips).
-* **Submit inflates under device saturation**: ~84 us/launch at M=1 to ~600 us at
-  M=128. Fewer host phases only convert to throughput where the device has idle gaps.
-* **SSM/norm kernels submit through `quant_gemm` free functions**, so their launches
-  bypass the `[GPU profile]` `nk` counter unless they call
-  `gemm::profile_note_launch`. This was a real blind spot; verify `nk` moves when you
-  add a kernel.
-* **RCO budget is `36 GiB` by default** (`include/intfer/rco.hpp`), a *total*
-  across both cards, and it is a soft objective: if no feasible assignment exists
-  RCO returns the least-cost one rather than failing. The 20.5 GiB figure in PLAN.md
-  is stale (see below).
-## Verification — the tooling, and the rules that keep it honest
-
-**Entry points:**
-
-| command | what it does |
-|---|---|
-| `scripts/run_all_checks.sh` | the whole tooling stack; writes `build/stack_cert/cert`. Prefix `INTFER_QUICK=1` to run checkers only, skipping the matrices |
-| `scripts/run_ten_gates.sh` | the 10 engine gates; writes `build/ten_gates/{gates.log,HEAD}` |
-| `scripts/check_stack_cert.sh` | grades the stack certificate (POST-STACK, not a step) |
-| `scripts/check_engine_cert.sh` | does the engine certification still carry to HEAD? |
-| `scripts/gate_inventory.sh` | derives the gate population, preconditions, render-node guards, and reconciles the doc tallies |
-| `scripts/check_scripts_live.sh` | every `scripts/` entry is reachable: NAMED by a live source, or matched by the gate runner's own `GATE_GLOB` parsed out of `run_ten_gates.sh`. `docs/` and `scripts/archive/` are records, not call sites |
-**The rules this repo learned by breaking them** (each cost a full run; the
-full narrative with the measurements is in `HISTORY.md`, "Verification —
-the tooling, and the rules that keep it honest"):
-
-1. **Enumerate, never remember.** `ls scripts/test_*.sh` DEFINES the gate
-   population; `ls scripts/check_*.sh` defines the checker population.
-   Retire by `git mv` into `scripts/archive/`, which `maxdepth 1` keeps out
-   of every family.
-2. **"0 findings" and "found nothing to look at" are different claims.** A
-   checker must assert it harvested something BEFORE reporting a verdict.
-3. **Never write a numeric test a non-numeric value can satisfy.** A count
-   cannot tell a failed query from an empty answer; only the rc can.
-4. **A hand-written total is a citation, not a claim.** Derive it, or mark it
-   `HISTORICAL`/`CITATION`/`re-derive`. `gate_inventory.sh` enforces this.
-5. **A guard whose stated rationale does not apply is worse than none.**
-6. **The always-red twin is the vacuous green.** Every predicate needs a
-   case where it MUST fire *and* a case where it must stay quiet.
-7. **Name the polarity.** `scripts/_gate_pred.sh`'s `pred_expect_absent` /
-   `pred_expect_present` print `verdict-polarity=`.
-8. **When a state reports MISSED, read the state log and write the predicate
-   from what is ACTUALLY THERE.**
-9. **A matrix with no dispatch arm NEVER RUNS**, and its stamp then reads
-   STALE. Every new `check_*`/`mutate_*` needs BOTH a `dispatch()` arm and a
-   `STEPS` entry.
-10. **Patch by exact literal, never `sed` with a delimiter.** `patch_literal`
-    requires EXACTLY ONE match; drifted (0) and ambiguous (2) anchors both fail
-    loudly.
-11. **If the artifact under test is correct by construction, weakening the
-    CHECKER is unobservable — mutate the ARTIFACT and require the checker to
-    REJECT it.**
-12. **Do not edit a running shell script in place** — bash re-reads by byte
-    offset. Write then `mv`.
-13. **Prove a failure mode by hand before trusting a state that proves it
-    itself.** Plant the negative direction and run.
-14. **`bash -n` every edited script, and trust it only as a syntax check.**
-15. **No backticks in `git -m`** — the shell runs them as command
-    substitution.
-16. **commit before any destructive git operation** -- prefer a probe that
-    never touches the tracked tree. `. scripts/guard.sh` shadows `git` as a
-    function, so `reset --hard` / `checkout` / `clean -f` / `stash
-    drop|clear` REFUSE on a dirty tree with uncommitted work and name the
-    two non-destructive routes out. Bypass: `INTFER_ALLOW_DESTRUCTIVE=1`.
-
-
-## Flag certification status
-
-Every optimization ships behind a flag, and **a flag is only certified once a gate
-NAMES it.**
-
-**Do not read a flag list off this file — derive it.** This section used to carry
-a hand-written list of seven "UNCERTIFIED" flags, and measured against the derived
-census it was wrong in BOTH directions: it named three that are kill switches
-(`INTFER_HOST_AVX2`, `INTFER_PREFILL_RR`, `INTFER_NO_WAVE` — the gates already
-test their defaults) and omitted five that are genuine opt-in gaps. A hand-kept
-list is a citation that decays into a guess:
-
-```
-scripts/check_flag_gate_coverage.sh     # classifies and prints every class
-```
-
-**`INTFER_LMHEAD_FP16` is UNCERTIFIED-BY-DISCLAIM** — see the census section above
-for why no arm is warranted. That is a *decision record*, not a census entry, which
-is precisely why it lives in prose while the census does not.
-
-Closing the remaining opt-in gaps is scoped work, not copy-paste: read each flag's
-semantics, decide whether identity is *claimed or disclaimed*, and pick the gate
-whose model can actually reach the branch.
-
-# *** SPLIT 2026-10-08 ***
-# * PLAN.md    -- the forward backlog, biggest gain first.
-# * HISTORY.md -- every already-tried optimization and its measurement.
-# This file keeps the live directives only.
+Port ninfer (https://github.com/Neroued/ninfer) to our local setup made of intel arc pro b580 (2x gpus)
+
+Stage 1.
+- choose specific model quantization analyze what makes the quantization format chosen by ninfer really fast
+- Construct our own int2 quantization based on this schema:
+[ FP16 Model ] 
+      │
+      ▼
+[ 1. SpinQuant Preprocessing ]  ──► Rotate W & A to eliminate outliers
+      │
+      ▼
+[ 2. DASH-Q Solver ]            ──► Generate ultra-low error quantized tensor variants
+      │
+      ▼
+[ 3. RCO Bit-Budget Search ]    ──► Allocate DASH-Q variants per tensor under exact VRAM budget
+      │
+      ▼
+[ Standard GGUF / Native SYCL ]
+
+SpinQuant (Orthogonal Rotation Preprocessing): A spatial transformation step. By multiplying weight matrices and activations by learned/randomized orthogonal rotation matrices ($W' = W \cdot R$), activation/weight outliers are suppressed and spread evenly across dimensions.
+DASH-Q (Diagonal Hessian & Iterative Least Squares): A non-heuristic PTQ solver. Instead of relying on off-diagonal Hessian error propagation (like GPTQ, which suffers from sampling noise at extremely low bits), DASH-Q uses diagonal Hessian approximations to solve independent weighted least-squares problems for weight assignments.
+
+Stage 2. (tensor parallel since we have 2x gpus)
+- Implement the engine (based on oneapi level zero and sycl)
+1. Low-Level Native C++/SYCL Kernels (Direct Engine Port)
+
+If you were to adapt ninfer's exact philosophy—bypassing heavy frameworks for lean C++ execution—you would target Intel's hardware primitives directly via oneAPI SYCL and Level Zero:
+
+XMX MMA Intrinsics: Replace NVIDIA mma.sync / wmma PTX calls with Intel DPAS (Dot Product Accumulate Systolic) or XeTile SYCL primitives for INT8/INT4 matrix multiplications.
+
+Kernel Fusion & Memory Layout: Port the fused FlashAttention and quantized GEMM kernels directly to SYCL. Xe matrix engines rely on specific register layouts (e.g., 2D block loads), so layout transposition must match Arc's L1/L2 cache and subgroup sizes (typically 16 or 32 threads per SIMD lane).
+
+SYCL Command Graphs: Replace CUDA Graphs with sycl::ext::oneapi::experimental::command_graph to record token execution sequences and submission queues, keeping CPU launch overhead near zero during generation loops.
+
+| ninfer Technique | Intel Arc Hardware / API Equivalent | Implementation Feasibility |
+| :--- | :--- | :--- |
+| **Low-Bit Quantization (NVFP4 / W4A4 / INT8)** | **Intel XMX (Xe Matrix Extensions)** & DPAS instructions via SYCL / oneAPI | **Fully Possible:** Intel Arc Alchemist and Battlemage GPUs feature XMX AI engines that natively support INT8, INT4, FP16, and BF16 matrix multiply operations with high throughput. |
+| **CUDA Graphs** | **SYCL Graph Extensions** | **Fully Possible:** SYCL supports workload graph recording and submission, eliminating host CPU-to-GPU queue submission overhead during decode loops. |
+| **Fused FlashAttention / W4A4 MMA Kernels** | **Intel XeTile / Intel Extension for PyTorch (IPEX)** custom SYCL kernels | **Possible:** Hand-tuned SYCL / Intel Xe-Assembly kernels can match low-level memory layout optimizations for fused operations. |
+| **Multi-Token Prediction (MTP) / Speculative Decoding** | **SYCL / Level Zero C++ Runtime** | **Fully Possible:** MTP is an algorithmic framework (running speculative draft tokens parallel to main heads). It is vendor-agnostic and relies purely on batch memory bandwidth. |
+| **Groupwise-INT8 KV Cache** | **Custom SYCL Quantization Kernels** | **Fully Possible:** Groupwise INT8 KV cache management reduces VRAM footprint and memory bandwidth usage on Intel Arc GPUs. |
+
+Stage 3.
+Implement features for maximizing throughput for concurrent requests, starting from continuous batching.
+
+## Performance targets (2x Arc Pro B580)
+
+- Token generation (decode): **40 tok/s** (per-stream, 0.8B model)
+- Prefill: **4000 tok/s**
+- Current (2026-09-18, scripts/bench_gpu_ab.sh, DPAS48 default OFF,
+  fused MLP default-ON, quiet box loadavg ~1.9):
+  0.8B GPU decode TP=1 27.24 tok/s (-n 64), TP=2 14.14 tok/s.
+  Pre-fusion quiet baseline was TP=1 ~24.4 (3x 24.37/24.41/24.45)
+  / TP=2 ~14.3: quiet-box fused gain = +11.6% TP1, TP=2 unchanged
+  as designed (fused path is TP=1 only). TP=1 still wins ~1.9x:
+  2x submits/transfers/readbacks outweigh halved kernel
+  time at tiny shapes. DPAS48 fast path defaulted OFF (was default
+  ON): host GA64 act-quant ~6ms/token dominated, XMX kernel no faster
+  than tiled legacy at M=1/128; greedy streams bit-identical either
+  way (opt back in with INTFER_DPAS48=1). Decode +16-18%, prefill
+  +5% vs DPAS-on (pre-fusion baselines). Prefill TP=1 (361-tok,
+  2026-09-18 quiet box, fused default-ON):
+  chunk8 54.7, chunk32 111.8, chunk128 149.2, chunk361 156.6 tok/s;
+  TP=2: 42.3 / 89.0 / 122.4 / 134.0 tok/s. Chunk 361 (whole prompt,
+  one pass) still best (fewer layer passes → fewer submits).
+  Steady-state chunk128 TP=1 ~= 176 tok/s excluding the one-time 466ms
+  rebuild (186 shards); recorded ~195 was lower-load.
+  Prefill
+  attribution (2026-09-18, chunk128 TP=1, 361 tok in 2800ms): rebuild
+  924ms = preload_all one-time (186 shards, amortized to zero in
+  serving); steady-state ~195 tok/s = kernel 475 + waitblock 504 +
+  submit 303 + transfers ~214 + host ~380ms. Submit inflates
+  84us/launch (M=1) to ~600us/launch (M=128): UR submit blocks when
+  the device is saturated — same serialization wall as decode, only
+  L0 immediate lists or cross-call fusion move it. 27B GPU decode ~2.8 tok/s pinned TP=2
+  (kernel 66% of decode — TP tradeoff reverses vs 0.8B); TP=1 OOMs on 27B
+  (lm_head INT8 tile alloc fails: ~19GB on one ~12GB B580).
+  Per-token profile (0.8B TP=2): submit ~34%, host act/copy ~33%,
+  kernel ~20%, wait ~11%; run-to-run variance is +/-10%.
+- XMX verdict (2026-09-18, source-level + xmxmon runbook): **zero DPAS
+  instructions execute in the default path** — decode M=1
+  (gemm_usm_decode1_vec, quant_gemm.cpp:388) and prefill M>1 tiled
+  (quant_gemm.cpp:526) are pure EU/ALU dot-products (dequant-on-the-fly
+  + FP32 FMA); xmxmon would read all-zero XVE_INST_EXECUTED_XMX_* on
+  every workload. Matrix engines 100% idle. Only DPAS-issuing kernels
+  in the tree: quant_gemm_dpas48 (u4/u2/u8, opt-in INTFER_DPAS48=1,
+  default OFF — host GA64 act-quant dominated) and quant_gemm_dpas_s8w
+  (lm_head-only). Per xmxmon docs, mixed-precision DPAS counts under
+  the WIDER operand (W2A8 -> INT8 counter, not INT2). Blocker:
+  metric streamer needs `sudo sysctl -w dev.xe.observation_paranoid=0`
+  (this box: paranoid=1, no sudo — zetMetricStreamerOpen 0x7ffffffe on
+  both GPUs; counters verified present via --list-metrics).
+  Harness: scripts/xmx_profile.sh joins xmxmon capture + internal
+  [GPU profile] buckets, degrades gracefully to buckets-only when the
+  streamer is blocked. Implication: prefill 4000 tok/s needs XMX (EU
+  pipes are the whole prefill story today); decode 40 tok/s needs
+  launch-count/transfer reduction (XMX at M=1 barely helps — shapes
+  are memory-bound).
+- XMX CORRECTION (2026-09-18, empirical via xmxmon after sysctl unlock):
+  the "zero DPAS" verdict above is WRONG for lm_head — lm_head runs
+  INT8 DPAS (quant_gemm_dpas_s8w, main.cpp:1231 use_dpas, default-ON
+  whenever the repack exists, no env gate). Measured: prefill-only
+  361tok capture = 180M INT8 slots; decode-only M=1 = 5.5M INT8 slots
+  (~0.8M/token, consistent with vocab/16 tiles x K/32 ops). Layer GEMMs
+  (99% of launches) remain EU/ALU, XMX idle there — that half stands.
+  DPAS48 re-exam at M=361 (interleaved A/B, contended box, 2/2 rounds):
+  OFF wins prefill 147.8/146.3 vs 132.7/131.0 (~11%) AND decode
+  6.70/6.87 vs 5.13/5.06 (~30%); kernel 318->496ms (one-WI-per-16N-tile
+  replicates O(K) fold work nT x), rebuild 500->964ms (DPAS repack),
+  copy 12.6->48.4ms (host act-quant). Streams bit-identical. Default-OFF
+  stands at ALL shapes (M=1/128/361).
+  DPAS48 M=1 device-side breakdown (2026-09-19, -n8 TP1 decode buckets —
+  kernel_us is device event time, LOAD-IMMUNE, box load ~7): legacy
+  kernel 138.0 / submit 136.4 / waitblock 154.9 / copy 0.1 / readback 65.6
+  nk=1680 vs DPAS48 kernel 203.5 (+48% DEVICE-SIDE — the M=1 DPAS kernel
+  itself is slower, not just its host quant) / submit 235.6 (+73% at LOWER
+  nk=1488: UR submit blocks when the device is saturated by the longer
+  kernels) / copy 91.8 (host GA64) / readback 100.2 (nr 1056 vs 576, ~2x
+  readbacks). DPAS48 loses on EVERY bucket at M=1. Consequence: a
+  standalone device-side GA64 act-quant kernel (row-parallel pre-pass —
+  feasible, no replication, HalfAway rounding verifiable like the RNE
+  convert) canNOT save DPAS48 alone (would fix only the 92ms copy of a
+  path already +65ms kernel / +100ms submit underwater). XMX prefill
+  needs FIRST a rewritten 2D-tiled DPAS kernel (proper subgroup DPAS, no
+  one-WI-per-16N-tile K-fold replication); device act-quant is the
+  complement AFTER, not the lever. Neither is a session-scale build —
+  scoped, not started. Do NOT retry device-quant-into-DPAS (dead end
+  stands) and do NOT build standalone device-quant expecting a DPAS48
+  win without the kernel rewrite.
+- Prefill defaults flipped (2026-09-18, a52715f): chunked M-row prefill
+  is now default-ON (chunk_M 8->128, batch_gemm default-ON; opt-outs
+  INTFER_PREFILL_CHUNK=0 / INTFER_BATCH_GEMM=0 reproduce old path
+  bit-identically). Defaults previously ran the token-by-token step loop
+  (20-25 tok/s on 361tok); new defaults 148.2 tok/s (6x, contended box).
+  chunk128 ~= 95% of chunk361 gain (quiet-box 149.2 vs 156.6).
+  Decode -n64 unchanged (26.90->26.14, run variance). 27B/GPU joint-batch
+  wide-chunk guard synced to default-ON semantics (would have disarmed).
+  Gates: cpu parity + http batch PASS, GPU streams identical.
+  Serve re-baseline on new defaults (2026-09-18, contended load ~9):
+  sweep PASS (C=1 2.46 / C=4 3.59 / C=8 2.27 tok/s MT=8; parity held);
+  MT=64 probe 7.66 tok/s over 338 ctoks — same-run pair with MT=8 C=8
+  2.27 (short requests prefill-dominated, batch drains).
+- 40 tok/s recipe (2026-09-18, per-token arithmetic @25.9 tok/s =
+  38.6ms: kernel 9.6 / submit 11.7 / waitblock 9.5 / transfers 10.4ms,
+  194 launches): device-act seams kill transfers (->35 tok/s), batched
+  L0 multi-launch halves submit (->31), both = 22.2ms = 45 tok/s.
+  Engine-invasive; needs quiet box (load<2) + gates. Not attempted
+  under load. (memory: path_to_target_40_4000.md)
+- OpenVINO evaluated, NOT adopted (2026-09-18 spike): OV 2026.3 sees
+  both B580s, but FP16 matmul M=361 2.6ms (~our EU kernel, 1.0 TFLOPS
+  vs 100+ peak — no XMX unlock) and M=1 1.2ms vs our ~50us (20x worse,
+  framework overhead). Native SYCL stays; XMX win must come from our
+  own DPAS kernels with device-resident act-quant.
+- Wave shared-input convert-once (2026-09-18, f12f76b): run_linear_wave
+  Phase 1 converts each distinct (pointer, bytes) input once, reuses
+  staging bytes for duplicates (gate/up share rin; M-row batch gate/up
+  share c_rin). Bit-identical, slots stay per-item, call-local scope.
+  Dormant for distinct inputs (k/v, z/b/a) and fused path. Measured
+  load-immune copy counts (NO_FUSE -n 6): 1116->972 converts (-13%);
+  fused TP=1 unchanged (276=276). Streams identical TP1/NO_FUSE/TP2.
+  Gates: cpu parity + http batch PASS. Attribution CLOSED (2026-09-19,
+  INTFER_WAVE_DBG probe, since reverted): the "6 full-attn skip" note was
+  wrong — layers 3,7,11,15,19,23 fire the gate/up dedup-hit like every
+  other layer (168 hits = 24 prefill + 144 decode = 24 layers x 7 passes).
+  Dedup fires only on 2-item shared-input gate/up waves; never on z/b/a
+  (3 distinct rotated inputs) or k/v (2 distinct). -n6 wall +2.8% (run
+  variance — convert is not the wall, submit is).
+- Dead ends (measured, do not retry as-is): device-side act-quant
+  (bit-exact probe passed but fused kernel slower: one-WI-per-16N-tile
+  layout replicates O(K) quant work nT x), host-private staging of DPAS
+  writes (neutral), staged readback (neutral), SYCL graphs on B580
+  (19.7us vs 11.9us plain submit), LA-branch run-parallel OMP in
+  step_batch (2026-09-16, parity-clean incl. segfault fix for TLS reads
+  inside OMP workers, but zero gain: CPU C=8 batch WIP 10.5s vs HEAD
+  10.8s @20T, 16.18s vs 16.34s @1T; GPU serve-load C=8 3.86 vs 3.89
+  tok/s. LA host recurrence is a negligible share — GEMMs dominate.
+  Revisit only if profiling shows recurrence >10% of a step. NOTE
+  2026-09-18: the 8.16/15.33/17.98 (C=1/4/8) + 36.3 (MT=64 probe)
+  numbers claimed 2026-09-17 are WITHDRAWN as unreproducible. Four
+  independent C=1/MT=8 sweeps (incl. quiet-box start-load 0.69 and
+  1.57) all land 3.27-3.53 tok/s; only docs commits separate the
+  3.89 (09-16) and 8.16 (09-17) readings, i.e. same code. Bisect
+  (single warm req, quiet box): fused ON 1.78s vs OFF 1.77s (neutral),
+  joint 1.78s vs split 2.01s (joint helps, active), dispatcher 1.78s
+  vs serial 2.07s (dispatcher active), chunk361 1.68s (chunking minor).
+  The MT=64 batch-full probe (9.02 tok/s over 338 ctoks) proves the
+  path batches — MT=8 is prefill-dominated, not contention. C=8
+  scaling inversions under rising box load are a sweep-harness
+  artifact (load 2.5→10+ mid-run). Quoting rule retired (C=1>=7 never
+  fires): quote the MT=8 sweep AND the MT=64 probe from the same run.
+  Dead-end verdict on OMP stands),
+  device-side SSM recurrence M=1
+  (2026-09-16, INTFER_SSM_GPU=1, parity-clean incl. step_batch +
+  spec-rollback resync: -9% decode, 7.4->6.7 tok/s pinned 3x3
+  interleaved. Per-LA-layer attribution: prep ~4us, H2D ~15-130us,
+  kernel-submit ~25us, D2H+wait ~150-550us vs replaced host loop
+  ~0.1-0.2ms — the blocking wait is structural: host norm needs
+  core on-host same-layer. Revisit only with fused device-side
+  SSM+norm feeding la_out GEMM from device buffers, or M>>1 where
+  the single wait/layer amortizes; M=8 estimate still loses),
+  native L0 immediate submit (2026-09-18, examples/l0_submit_probe spike,
+  since removed: native immediate append+host-sync 27.6us vs UR
+  submit+event.wait 25.2us per launch on a trivial kernel, correctness
+  PASS — same floor, not a UR-adapter artifact. Revisit only with a batched
+  multi-launch list amortizing one sync over many kernels),
+  INTFER_NO_PROF queue without enable_profiling (2026-09-18: 19.21 vs
+  18.75 tok/s TP1 decode under box contention — within run variance;
+  per-event L0 timestamping is not the submit tax).
+- PLAN.md triage (2026-09-19, grounded vs tree): preload_all/USM-pool /
+  fused-MLP already DONE (preload log: 186 shards pinned, 534MiB dev0,
+  no evict; pool_acquire routed, pool holds 0 bufs post-preload as
+  designed — grow-only workspaces). DPAS-enforce + SYCL-graphs + L0-P2P
+  are measured dead-ends above (do not retry as-is). INT8-KV
+  (INTFER_INT8_KV / INTFER_KV_Q8) + SSM-chain (ssm_forward_chain via
+  INTFER_SSM_GPU) exist as opt-in paths, certified stream-identical on
+  GPU by scripts/test_gpu_optin.sh (10/10: base/KV/Q8/Q8+HAD/SSM_GPU x
+  TP1/TP2, .intifer stream 279/6511/314/279) — wall-time comparison
+  still needs quiet box (load<2).
+- First-touch migration (2026-09-21, measured on 27B TP=2 serve):
+  preload_all builds 496 shards in ~49s and pins them (zero rebuilds on
+  first request), but shard USM is malloc_shared so pages stay host-resident
+  until first kernel touch: xpu-smi device-local at startup dev0 791MB /
+  dev1 51MB, jumping to 11.27GB / 10.94GB only after the first request.
+  Same-prompt back-to-back (contended box, load ~6): req1 9.28s vs req2/req3
+  2.75s/2.75s — first request pays ~6.5s of migration stalls, steady state
+  reached after exactly one request (streams identical). q.prefetch() over
+  all shards was built, measured (18.7GB "migrated" in 59ms), and REVERTED:
+  device counters unchanged, first-request jump identical — prefetch is a
+  no-op hint for shared USM on this Level Zero driver (do not retry as-is;
+  note in engine.cpp preload_all). Mitigation: one warmup request after
+  /health goes live (scripts/serve_27b.sh does this, INTFER_NO_WARMUP=1
+  skips). A startup touch-kernel over all 496 shards would only move the
+  cost, not eliminate it — unscoped.
+- Wave-submit + vectorized host math (2026-09-18, wave 7d7ca72, AVX2
+  5285b47, extended a78e99f, quantified on quiet box loadavg<2): z/b/a +
+  gate/up + full-attn k/v GEMMs convert+submit back-to-back, one wait
+  per wave (scalar + M-row paths; INTFER_NO_WAVE=1 restores sequential).
+  a78e99f adds: scalar full-attn k/v wave-2 (q stays sequential — its
+  split/norm/rope consumers precede k/v input prep), M-row wave-batch
+  for full-attn k/v + gate/up at all three batch sites. 8bce85c
+  (2026-09-19) joins q into the k/v wave-3 and qkv into the z/b/a
+  wave-4 in step() decode: both GEMMs' consumers (q split/norm/rope,
+  qkv conv) run after, so the joins are pure regrouping, bit-identical
+  by the wave contract. CORRECTION: the joins do NOT reduce kernel-wait
+  count (nw 828 = 828 — wait_count increments per kernel event, and
+  grouping changes no event count). What they halve is host round-trip
+  phases: one wait-loop + one readback pass per wave instead of per
+  GEMM (decode nr 828->432). M-row joins (2026-09-19, this session):
+  the same q/qkv joins applied to the M-row paths — prefill-chunk
+  full-attn q+k/v wave-3 and qkv+z/b/a wave-4, plus step_batch (serve)
+  full-attn wave-3 and LA wave-4 (4 sites; q/qkv inputs staged into
+  c_q_in/c_qkv_in/b_q_in/b_qkv_in copies since c_x is reused for k/v/z/b/a
+  staging). INTFER_NO_WAVE=1 still restores sequential at all sites.
+  Verified load-immune: prefill nr 138->72 (25-tok prompt), decode
+  streams identical TP1/TP2/NOWAVE (279 6511 314 279 ...); cpu parity +
+  http batch + gpu-optin PASS. Wall-time A/B deferred (box load >2).
+  Each saved phase removes a blocking
+  event-wait loop + host readback-loop setup (~24/layer-pass pairs per
+  token). Measured load-immune (TP1 fused -n 6),
+  streams identical TP1/TP2/NOWAVE; cpu parity + http batch + gpu-optin
+  PASS. A/B CLOSED (2026-09-19, quiet box load~1.6, -n64 TP1 interleaved
+  2 rounds + 3 JOIN-only): JOIN 25.97/25.99, PARENT 26.09/25.97 = NEUTRAL
+  (-0.2%, run variance). Buckets: kernel/submit/waitblock/usm_write
+  identical; readback +8-12ms (bigger wave-3/4 readback loops cost what
+  the saved loop setups save); nr 4608 vs 6144 confirms grouping.
+  Keep (fewer phases, same streams) but quote NO tok/s gain — submit
+  (~745ms) + kernel (~645ms) dominate unchanged. Precision:
+  wave does NOT reduce kernel-launch count (nk identical 1674/10tok
+  both ways — engine still issues one kernel per item); it groups
+  convert+submit back-to-back for queue depth and one wait per wave.
+  AVX2/FMA rmsnorm/l2norm (INTFER_HOST_AVX2=0 restores scalar). Both oracle-certified: CPU
+  parity + HTTP batch PASS, scalar-vs-AVX2 streams identical on CPU
+  AND GPU paths. Wave: +0.6-0.7% decode, 3/3 interleaved rounds
+  (TP1 24.61->24.78, 25.03->25.17, 24.94->25.09) — real but small:
+  wave saves waits, submit (~830ms/65tok) is the wall. AVX2 norms:
+  NEUTRAL (+0.7/-1.3/+0.4%, mean ~0) — host rmsnorm/l2norm is not on
+  the decode critical path (the ~33% host share is GEMM act
+  convert+memcpy, not norms). Keep both (correct, default-on, free),
+  but quote no big win; remaining gap needs submit-side work.
+- L4 design verdict (2026-09-18, investigated; MLP half IMPLEMENTED):
+  PART A (done, fused MLP): the device-act GEMM seam now EXISTS —
+  run_mlp_fused feeds the down GEMM straight from a device buffer
+  (fused silu-mul output), skipping host convert + ws memcpy.
+  PART B (not done): fused device-side SSM+norm feeding la_out GEMM.
+  Data flow per LA layer today (18/24 layers on 0.8B): ssm_rows kernel
+  -> D2H core (2048 floats) + blocking wait -> host ssm-norm+silu(z)
+  -> H2D normed_core via run_linear_into -> la_out GEMM (engine.cpp
+  converts FP32->FP16 host-side, memcpy to ws act, submit, wait, D2H).
+  Fusion would kill per-LA-layer: 1 D2H + 1 wait + 1 H2D + 1 FP32->FP16
+  host convert (la_out act 1024 FP32 = 4KB). BUT the old -9% stands and
+  the reason is now precise: ssm_rows itself already pays H2D inputs
+  (~15-130us/layer) + kernel-submit (~25us) + D2H+wait (~150-550us);
+  fused norm+FP16-convert on device saves only the core round-trip and
+  the host norm (~0.05ms), while the la_out engine seam
+  (run_linear_tp: host FP32 in -> FP16 convert -> ws memcpy -> submit)
+  has NO device-pointer entry — feeding it from a device buffer needs
+  a new Engine method (device-act GEMM: skip convert+ws-write, submit
+  with USM dep on the fused event). Net estimate: saves ~0.2-0.3ms of
+  ~1.7ms/LA-layer (submit+waitblock dominate) over 18 layers =
+  ~4-5ms/token of ~41ms = ~+10% IF the new seam costs zero extra
+  submits. Verdict: viable but engine-invasive (new device-act GEMM
+  entry + fused ssm_forward_norm_convert kernel + oracle gate on the
+  fused FP16-convert rounding); do it only together with batched
+  multi-launch L0 lists (same seam work amortizes both). Standalone
+  INTFER_SSM_GPU=1 stays default-off. NOTE: the SAME device-act seam
+  pattern was just proven by the fused MLP below (+13% decode) — the
+  L4 SSM fusion is now a second application of a working technique,
+  not a new invention; the remaining L4-specific risk is only the
+  fused norm+silu(z) numerics.
+  Data flow per LA layer today (18/24 layers on 0.8B): ssm_rows kernel
+  -> D2H core (2048 floats) + blocking wait -> host ssm-norm+silu(z)
+  -> H2D normed_core via run_linear_into -> la_out GEMM (engine.cpp
+  converts FP32->FP16 host-side, memcpy to ws act, submit, wait, D2H).
+  Fusion would kill per-LA-layer: 1 D2H + 1 wait + 1 H2D + 1 FP32->FP16
+  host convert (la_out act 1024 FP32 = 4KB). BUT the old -9% stands and
+  the reason is now precise: ssm_rows itself already pays H2D inputs
+  (~15-130us/layer) + kernel-submit (~25us) + D2H+wait (~150-550us);
+  fused norm+FP16-convert on device saves only the core round-trip and
+  the host norm (~0.05ms), while the la_out engine seam
+  (run_linear_tp: host FP32 in -> FP16 convert -> ws memcpy -> submit)
+  has NO device-pointer entry — feeding it from a device buffer needs
+  a new Engine method (device-act GEMM: skip convert+ws-write, submit
+  with USM dep on the fused event). Net estimate: saves ~0.2-0.3ms of
+  ~1.7ms/LA-layer (submit+waitblock dominate) over 18 layers =
+  ~4-5ms/token of ~41ms = ~+10% IF the new seam costs zero extra
+  submits. Verdict: viable but engine-invasive (new device-act GEMM
+  entry + fused ssm_forward_norm_convert kernel + oracle gate on the
+  fused FP16-convert rounding); do it only together with batched
+  multi-launch L0 lists (same seam work amortizes both). Standalone
+  INTFER_SSM_GPU=1 stays default-off.
+- Fused MLP down-projection (2026-09-18, IMPLEMENTED, TP=1 only):
+  Engine::run_mlp_fused chains gate/up wave-submit on-device through a
+  fused silu-mul + RNE FP16-convert kernel (gemm::silumul_to_half) straight
+  into the down GEMM: one host wait + one D2H per MLP instead of wave-wait
+  + 2 D2H (gate/up) + host silu-mul + convert + H2D + down-wait.
+  TP>1 / DPAS48 / trace (NaN/H) / bad shapes return false and the caller
+  keeps the host path (mg/mu consumers are trace-gated). Kill switch:
+  INTFER_NO_FUSE_SILUMUL=1 restores wave + host silu-mul (bisection).
+  Bit-contract: FP32 op order matches the host loop; sycl::exp may differ
+  ~1ulp on rare elements; dev_float_to_half is RNE bit-identical to
+  dashq::float_to_half (verified exhaustively over e in [-10,0], 2M
+  random + boundary mantissas, zero mismatches — the AGENTS.md "e == -10
+  edge" note was wrong: dashq mutates mant with the hidden bit BEFORE
+  the round test, so host and device test the same bit).
+  (box contended loadavg 5-11, interleaved A/B 2 rounds, TP=1 decode
+  -n 32): 28.06/27.81 vs 24.77/24.48 = +13.3%/+13.6% (~+3.2 tok/s);
+  prefill chunk361: 158.3 vs 154.2 = +2.7%. GPU streams bit-identical
+  ON vs OFF (279 6511 314 279 3046 13 198 760) and vs TP2; all gates
+  PASS with fused default-ON (cpu parity, http batch, serve-load).
+  Quiet-box confirmed 2026-09-18 (loadavg ~1.9, fused default-ON,
+  -n 64): TP=1 decode 27.24 tok/s (+11.6% vs 24.4 pre-fusion quiet
+  baseline — matches the +13.3/+13.6% contended A/B within run
+  variance), TP=2 14.14 (unchanged, fused is TP=1 only), prefill
+  chunk361 156.6 (+2.8% vs 152.2, matches contended +2.7%). New
+  single-stream ceiling: ~27 tok/s TP1. The +13% relative gain is the
+  durable claim (waits/round-trips removed, submit wall untouched).
+  fused device-side SSM+norm feeding la_out GEMM from device buffers.
+  Data flow per LA layer today (18/24 layers on 0.8B): ssm_rows kernel
+  -> D2H core (2048 floats) + blocking wait -> host ssm-norm+silu(z)
+  -> H2D normed_core via run_linear_into -> la_out GEMM (engine.cpp
+  converts FP32->FP16 host-side, memcpy to ws act, submit, wait, D2H).
+  Fusion would kill per-LA-layer: 1 D2H + 1 wait + 1 H2D + 1 FP32->FP16
+  host convert (la_out act 1024 FP32 = 4KB). BUT the old -9% stands and
+  the reason is now precise: ssm_rows itself already pays H2D inputs
+  (~15-130us/layer) + kernel-submit (~25us) + D2H+wait (~150-550us);
+  fused norm+FP16-convert on device saves only the core round-trip and
+  the host norm (~0.05ms), while the la_out engine seam
+  (run_linear_tp: host FP32 in -> FP16 convert -> ws memcpy -> submit)
+  has NO device-pointer entry — feeding it from a device buffer needs
+  a new Engine method (device-act GEMM: skip convert+ws-write, submit
+  with USM dep on the fused event). Net estimate: saves ~0.2-0.3ms of
+  ~1.7ms/LA-layer (submit+waitblock dominate) over 18 layers =
+  ~4-5ms/token of ~41ms = ~+10% IF the new seam costs zero extra
+  submits. Verdict: viable but engine-invasive (new device-act GEMM
+  entry + fused ssm_forward_norm_convert kernel + oracle gate on the
+  fused FP16-convert rounding); do it only together with batched
+  multi-launch L0 lists (same seam work amortizes both). Standalone
+  INTFER_SSM_GPU=1 stays default-off.
+- lm_head audit (2026-09-19): step_batch/serve scoring is ALREADY M-row
+  batched — run_lm_head_batch (main.cpp:1174, M>1) does one launch per
+  device tile instead of M scalar calls; INTFER_LMHEAD_BATCH=0 restores
+  per-row for bisection. Nothing to implement; todo item cancelled.
+  Verified on HEAD: cpu parity + http batch + gpu-optin (10/10) PASS,
+  WAVE vs NOWAVE GPU streams identical TP1/TP2 (279 6511 314 279).
+- L4-lite IMPLEMENTED, default-off (2026-09-19, INTFER_L4_FUSE=1 opt-in):
+  second application of the fused-MLP device-act pattern, scoped to TP=1
+  scalar decode (the 40 tok/s target). Per LA layer it chains solo-run
+  ssm_forward -> fused ssm_norm_silu_to_half kernel (rms-norm + silu(z) +
+  RNE FP16 convert, same loop order as host) -> la_out GEMM via the new
+  Engine::run_linear_tp_devact seam (device FP16 act, no host convert/H2D,
+  dep-chained, single wait + single D2H). New files touched:
+  quant_gemm.hpp/cpp (SsmNormParams + kernel), engine.hpp/cpp
+  (run_linear_tp_devact: TP=1-only, FP16-act-only, no-mutation-on-false,
+  ws_[0].out alias guard), main.cpp (gpu_ssm_resolve extracted from
+  gpu_ssm_rows as a shared helper — pure move; GpuBackend L4 staging
+  buffers + ti_of; gpu_la_out_fused; step() hook with trace_h forcing the
+  host path; INTFER_L4_DBG=1 debug counter). Saves vs ssm+host path: 1
+  D2H (core) + 1 H2D (normed) + host norm/convert + 1 wait per LA layer;
+  costs 1 norm submit + 2 small H2D (z, norm-w). Correctness-gated NOW
+  (load-insensitive): L4-vs-base streams IDENTICAL TP1 n=4/16/32 (279 6511
+  314 ...), TP2 flag-vs-noflag identical (L4 silent no-op TP>1), SSM_GPU x
+  L4 4-way identical, cpu parity + http batch + gpu-optin (10/10) PASS on
+  the final binary; [l4] counter proves the path fires (72 calls/run).
+  Wall-time A/B NOT run (box load 8.78, rising — quiet rule load1<2):
+  run scripts/bench_quiet_ab.sh on a quiet box before any perf claim.
+  L0 verdict stands: raw command lists measured same-floor (27.6 vs
+  25.2us), so no L0 scaffolding was built — the multi-submit-single-wait
+  chain IS the achievable amortization on in-order UR queues, and the
+  devact seam is the prep a future batched launcher needs.
+- L4 serve M==1 fast path IMPLEMENTED, default-off (2026-09-19, same
+  INTFER_L4_FUSE=1 flag): single-row step_batch serve batches route each
+  LA layer through the certified gpu_la_out_fused (conv loop advances
+  conv_state first, matching scalar order; success skips the ssm_rows +
+  host-norm + M-row la_out sections for that layer; any false falls
+  through to the standard path with eligibility cleared for the layer).
+  M>1 deliberately NOT fused: run_linear_batch(la_out) is already one
+  M-row GEMM (single submit+wait), so a thin norm offload would only trade
+  host convert for M norm submits — wash or loss; the M>1 win needs
+  device-resident cores (same precondition as the L4 verdict above).
+  Gates (all PASS, load-insensitive): serve C=1 L4-vs-base byte-identical
+  ([l4] fires on the serve path, BASE counter 0), TP2 flag/no-flag
+  identical (silent no-op), SSM_GPU x L4 4-way CLI identical, SSM_GPU+L4
+  serve stream identical to base (shared SsmDev residency consistent when
+  mixing),   cpu parity + http batch (with L4 ON: single/batch/SSE/serial
+  all PASS, oracle Paris) + gpu-optin 10/10. Wall-time A/B NOT run (box
+  load 5.58 — quiet rule load1<2): run scripts/bench_quiet_l4_ab.sh on a
+  quiet box before any perf claim (new script; covers CLI decode TP1 -n64
+  + chunk361 no-op guard).
+- Profiler blind spot FIXED (2026-09-19, profile_note_launch): SSM/norm
+  kernels submit directly through quant_gemm free functions, so their
+  launches never reached the [GPU profile] nk counter (L4-vs-base decode
+  showed nk=1680 both ways while submit dropped 91->64ms — invisible
+  work). ssm_forward/chain + ssm_norm_silu_to_half now count one launch
+  each via intfer::gemm::profile_note_launch (defined in engine.cpp,
+  zero-cost when profiling is off; intfer_gemm gets INTFER_PROFILE_GPU in
+  src/CMakeLists.txt). Re-run TP1 -n8: prefill nk=210 both (L4 no-op,
+  exact), decode BASE nk=1680 vs L4 nk=1968 = +288 = 18 LA layers x 8
+  tokens x (1 SSM + 1 norm), streams identical. The +288 proves the whole
+  decode fires the fused chain; the -n64 quiet A/B will show whether the
+  submit/usm_write savings (-30%/-12% in buckets, contention noise aside)
+  convert to tok/s.
+- nk accounting matrix VALIDATED (2026-09-19, TP1/TP2 x BASE/SSM/L4/BOTH,
+  -n8 decode, counters only — load 4-5, no wall-time read): all 8 streams
+  identical (6511 314 279 3046 13 198 760 6511). TP1: BASE 1680, SSM 1824
+  (+144 = 18 LA x 8 tok x 1 SSM), L4 1968 (+288 = x2, SSM+norm), BOTH 1968
+  (L4 subsumes the SSM launch — no double-SSM, shared SsmDev residency
+  confirmed in counters). TP2: BASE 2976 (= 2 x 1488? — per-device GEMM
+  launches counted per shard while SSM stays single-queue; do NOT read
+  TP2 nk as 2x work), SSM 3120 (+144, same single-queue SSM delta),
+  L4/BOTH 2976/3120 (L4 silent no-op TP>1 — zero fused launches, the
+  TP=1-only guard proven in the counter, not just in streams). The
+  counters now decompose every launch source on the decode path.
+- L4 M-row serve fusion IMPLEMENTED, default-off (2026-09-19, fcbade9,
+  same INTFER_L4_FUSE=1 flag, TP1 only): supersedes the "M>1 deliberately
+  NOT fused" note above — step_batch LA layers with M>1 now route through
+  gpu_la_out_fused_batch (one cross-key ssm_forward over M distinct
+  (req,layer) states via a gathered pointer table + one M-row
+  ssm_norm_silu_to_half_m kernel + one M-row devact la_out GEMM) instead
+  of ssm_rows + host norm + M-row la_out. Shared-state rows (same-request
+  prefill runs in joint batches) and TP>1/DPAS48/bad shapes decline
+  inside the callee to the standard path. The M>1 precondition that made
+  the old verdict ("needs device-resident cores") is met by staging a
+  contiguous M-row core block + pointer table in GpuBackend L4 buffers
+  (grow-only, freed in dtor). Cost per LA layer: 1 SSM submit + 1 norm
+  submit + seam GEMM submits (vs ssm_rows solos + host norm/convert +
+  H2D + la_out-wait); host work unchanged (M x O(kd) q/k prep + 2 small
+  H2D). Gates (all PASS, load-insensitive): 3-way concurrent serve batch
+  L4-vs-base byte-identical (M=2/M=3 fused-batch fired in [l4] counters),
+  scalar streams identical TP1/TP2 (279 6511 314 279 3046 13 198 760),
+  cpu parity + http batch (4.12 tok/s) + gpu-optin 10/10 on the final
+  binary. Debug: INTFER_L4_DBG=1 prints per-path counters ([l4] fused
+  la_out / fused batch la_out M=%u). Wall-time A/B NOT run (box load
+  ~6 — quiet rule load1<2): scripts/bench_quiet_l4_ab.sh running in
+  background, gated on quiet.
+- L4 M>1 measured on M=3 sched batch (2026-09-19, 3/3 BASE/L4 pairs,
+  near-quiet load 2-3.8, 27 toks/3 reqs, -n8): submit −24% systematic
+  (110.8/112.6/112.0 -> 84.4/84.7/85.2ms, variance <2ms — real), nk
+  1536->1824 (+288, fused chain fires), usm_write −5ms, BUT waitblock
+  +21ms (597->618ms) eats nearly all of it: net wall −1.5% (946-948 ->
+  929-935ms, consistent sign 3/3). Mechanism: at M=3 the device is
+  saturated (kernel 597ms dominates the 940ms wall), so fewer host gaps
+  just deepen the device queue — submit savings only convert to tok/s
+  where the device has idle gaps (scalar M=1, kernel ~26% of decode).
+  Implication for 40 tok/s: the M>1 L4 batch is correctness-certified
+  infrastructure (streams identical, fewer host round-trips), NOT a
+  wall-time lever under saturation. UPDATE 2026-09-19 (bench_quiet_l4_ab.sh
+  3 rounds DONE, box never quiet — load 1.91/2.24/2.55/2.78/3.04/3.17):
+  scalar A/B is a VARIANCE WASH, no promotion. -n64 TP1 decode L4 vs BASE
+  = 17.19/19.52, 19.63/16.28, 15.32/26.45 (round-3 BASE 26.45 at load 3.17
+  beats round-1 L4 17.19 at load 1.91 — the box, not the code, decides).
+  Buckets: submit L4 wins 2/3 (716/955, 665/1186, 845/726) but
+  kernel/waitblock flip randomly with load; nk=15744 vs 13440 every round
+  (+2304 = 18 LA x 64 x 2, chain fires). Prefill guard clean (152-155 both,
+  L4 no-op confirmed). L4 STAYS default-OFF opt-in (certified infra, no
+  tok/s claim either way). Do NOT re-run hoping for a better number —
+  re-run ONLY on a sustained-quiet box (load1<2). Both A/Bs point the same
+  way: submit-side savings convert only where the device has idle gaps.
+- L5 LA-front chain (2026-09-19 hooked 6c31136, stream-identical; 2026-09-20
+  op-cut 7a6cee3): extends the device-act pattern FORWARD from la_out to the
+  whole LA input path. Per LA layer scalar path today = host wave-4 (4 GEMM
+  round-trips) + host conv + host prep + L4 tail. L5 replaces with: H2D
+  normed (1x) -> fwht_rot_to_half kernel (4x FWHT rot + RNE convert)
+  -> 4x devact GEMM (existing seam) -> la_conv_prep kernel (conv FIR+silu +
+  qk-prep pack into sd->in) -> certified L4 tail (ssm_forward + norm +
+  devact la_out). conv_state goes device-resident in SsmDev (dirty-tracked,
+  host resyncs). Bit-contracts: FWHT/conv-FIR/packs exact host order;
+  silu/exp/log1p ~1ulp (oracle arbitrates). Kill switch: INTFER_L5_FRONT=1
+  (default OFF); any false keeps the L4/host path. Stream-gated TP1 -n 6:
+  base == L5 == L5+HOSTPREP == L5-TP2-decline (279 6511 314 279 3046 13).
+  SUBMIT-WALL VERDICT (2026-09-20, structural, load-immune): L5-front scalar
+  decode is a DEAD END as built — do not chase wall-time on it. Buckets
+  (TP1 -n 6): base nk=1260/nw=828/kernel=63.7ms vs L5 nk=2124/nw=828/
+  kernel=61.3ms, waitblock 318 vs 62ms. Same device work, same wait COUNT
+  (the single-wait seam works — devact + dep chains, no extra waits), but
+  +144 launches/token = +8/LA layer (fwht, 4x half_to_float, prep, tail
+  ssm+norm the host path never launches) and ~150 extra UR submits/token
+  serialize the in-order queue: the device starves between host submits and
+  the final wait per layer drains idle time, inflating waitblock 5x. 7a6cee3
+  cut the resend fat (per-layer cw/dtb/alog/kinds const cache l5c_ +
+  dropped the provably-redundant conv-writeback wait, which returned
+  immediately) — nk/nw confirm the remainder is kernel-launch count, not
+  waits or H2Ds. Fusing 4x h2f into 1 kernel would save only ~3 launches/
+  layer (~4ms) for real risk — not worth it. L5 stays default-OFF; the
+  kernels + stream-identity proof are retained for a future fused
+  fwht->GEMM->prep kernel or M-row/serve amortization, where launch count
+  amortizes. FIX 2026-09-21: L4 divergence was a scoping bug from the 6c31136
+  L5-hook restructure, NOT a numeric issue — the final la_out dispatch guard
+  was renamed if(!l4_done)->if(!l5_done) when the outer scope was added, but
+  l4_done (init =l5_done) is the flag recording L4 success. L4-on/L5-off:
+  fused path filled o_la on-device, then the host GEMM re-ran over stale
+  normed_core and clobbered it (step-1 divergence). Fixed by hoisting l4_done
+  to l5_done scope and guarding if(!l5_done && !l4_done) (conjunction needed:
+  L5 success skips the block where l4_done=l5_done is assigned). Root cause
+  excluded the RNE-converter changes (shared converters verified neutral —
+  all 8 combos identical). Stream-gated TP1 -n6: base==L4==L5==HOSTPREP==
+  SSM==SSMxL4==TP2-base==TP2-L4 (279 6511 314 279 3046 13); cpu parity +
+  gpu-optin + http batch PASS.
+- Path to target: single-stream is ~27 tok/s TP1 (fused MLP, was ~24.4
+  pre-fusion, was ~26 ceiling pre-DPAS-off):
+  ~169 launches/token (~80us submit each: submit ~30%, waitblock +
+  transfers most of the rest). 40 tok/s must come from aggregate
+  batching (--serve scheduler already M-row batches; cross-request HTTP
+  batching is the highest-value lever, C=8/MT=64 probe 9.02 tok/s
+  aggregate on quiet box 2026-09-18 (338 ctoks, proves batching; the
+  old 36.3 figure is withdrawn with the 8.16 line above). Gate
+  re-verified PASS on HEAD (wave+AVX2+fused serving-certified) — the
+  C=1 3.27-3.53 tok/s across four independent sweeps is structural
+  (MT=8 prefill-dominated), not contention; quoting rule retired.
+  Structural options: batched
+  multi-launch L0 lists amortizing one sync over many kernels (single
+  immediate append+sync measured no faster than UR submit+wait, so the
+  win must come from fewer syncs, not a faster submit),
+  device-side SSM/attention (host O(pos) attention dominates long ctx).
+
+
+# guidelines
+
+- remember to commit any meaningful change made such that in case of regressions everything can be bisected.
+- remember to not litter /tmp with large tmp files, RAM is precious
+- if you are the main agent, use tasks (subagents) as much as possible, don't execute code editing tasks yourself unless very small quick fixes. The main agent is for planning and code review. Make sure to use smart/work/fast/large models for subagents, don't use the same model as main agent. Also don't just use a single task, try to parallelize multiple work paths as much as possible making agents operate on different worktrees.
