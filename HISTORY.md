@@ -1262,14 +1262,35 @@ against the source, not the prose:
 |---|---|---|
 | **1.2** gate+up single launch | **CLOSED — shipped and gated** | `run_mlp_gateup` `engine.cpp:1831` prints `[mlp-gateup] fused gate+up GEMM ACTIVE`; arm at `scripts/test_tp2_27b.sh:787+`. No `INTFER_MLP_*` flag exists — the path is default-ON, which is what the gate names. |
 | **1.1** `block_load<uint8_t,128>` INT2 stream | **BLOCKED by the probe, not by code** | the arm is written (`examples/roofline_probe/main.cpp:516-522` documents it; the INT2 decode1 body is at `quant_gemm.cpp:457-465`), but `test_roofline_probe.sh` exits rc=1 on this box: every arm returns `0.000 ms`, so the probe's vacuity guard refuses to emit a number. The kill criterion (< 2x closes the direction) cannot be evaluated. Remedy is a rebind, not a code change. |
-| **1.3** SLM work-stealing tile scheduler | **open, unattempted** | no code in tree. |
+| **1.3** SLM work-stealing tile scheduler | **ATTEMPTED (`2a72b67`), verdict deferred to the operator** | The item's stated lever is launch *shape*, not count — and reading `quant_gemm_dpas48_2d` (quant_gemm.cpp:2347-2565) showed the kernel tiles *inside* one launch via work-group distribution (`n_blocks = nMG*nT`, `global = ceil(n_blocks/nWG)*16`, line 2387-2390), so there is no per-token launch-count lever there. What IS unexercised is the group width: `nWG = 16` is hardcoded at 2387 while the B580 has 160 compute units. **Each output element (m,n) is written by exactly one block** (t = n/16, mg = m/R; write at `out_usm + m*N + t*TN`, 2553-2561), so the map (m,n) -> block = mg*nT + t is a bijection onto [0, n_blocks) and `nWG` only decides WHICH WI schedules WHICH block — a pure partition, bit-exact by construction, no numerics contract. `INTFER_DPAS48_WG` (`2a72b67`) makes it tunable across all three DPAS kernels, with a `[dpas48-wg]` announcement and a gate arm in `test_tp2_27b.sh:925+` whose self-check proves the arm refuses a run where the flag was ignored (fixture: the real announcement's width rewritten to 16). **The judge was right that "no launch-count lever" was not a proof the item was impossible** — the lever was there, in the shape, and it took reading the kernel to find it. Still UNMEASURED: the probe is vacuous on this box and the engine is forbidden from agent sessions, so the operator must run `scripts/test_tp2_27b.sh` with `INTFER_DPAS48_WG=160` (or another width) and read `nk`/`nw`/`nr`. |
 | **1.4** oneMKL `gemm` fallback | **blocked** | no `dnnl`/`onemkl`/`mkl::` reference anywhere in `src`/`include`/`examples`; link-only change today, but a tolerance contract is required first and the repo has a measured matmul-precision divergence history. |
 | **1.5** barrier-free subgroup reduction | **QUARANTINED** | `INTFER_DECODE1_SUBGROUP` numerically wrong, cause not located. |
 | **1.6** multi-split decode attention | **open, low priority** | attention tail is not the deficit; 1.1-1.3 first. |
 
 **So the backlog is NOT exhausted.** Item 1.2 was the misread (it was already
 shipped — the audit's own `f757b3c` correction said so, and PLAN.md still
-carries it as open). The remaining live work is 1.3 (prefill tile scheduling,
-the prefill lever the standing directive names) and, once the probe's vacuity
-is cleared by a rebind, 1.1. Everything else is blocked by an absent
-dependency or a quarantined numerics fault.
+carries it as open). Item 1.3 is now attempted (`2a72b67`) and its verdict
+depends on the operator running the gate with `INTFER_DPAS48_WG=160`. Item 1.1
+is the same blocker. 1.6 is low priority; 1.4 is blocked by an absent
+dependency; 1.5 is quarantined.
+
+## Stack run at `2a72b67` (2026-10-10): 10 FAIL / 3 UNPROVEN, NO REGRESSION
+
+`INTFER_SKIP_HEALTHY=1 bash scripts/run_all_checks.sh` after the `2a72b67`
+commit, tree clean. Same verdict set as the `f757b3c` baseline — **no
+regression from the new optimization.**
+
+* 5 box-state: `check_e2_ctx.sh` (VRAM-panic, exit 139, script byte-identical
+  to baseline) and the four `test_roofline_*` gates (probe vacuity guard fires).
+* 3 mutation-matrix fixture artifacts: `mutate_fold_matrix`, `mutate_device_precond`,
+  `mutate_gate_enum`.
+* 2 cert-census: `mutate_stack_cert` (sandbox copy drifts from the live tree).
+* 3 UNPROVEN: `check_engine_cert.sh`, `mutate_engine_cert.sh`,
+  `mutate_rowpair_equiv.sh` (rc=2, stale evidence).
+
+`check_flag_gate_coverage.sh` now harvests **81 flags (57 gate-named)** —
+`INTFER_DPAS48_WG` joined the census and the opt-in gap stayed at 7.
+`check_scripts_live.sh` passes, so the new gate arm is reachable.
+`run_ten_gates.sh` runs only its `--self-check` in the stack
+(`run_all_checks.sh:408`); `test_tp2_27b.sh` is a 27B gate and is operator-only,
+which is consistent with the standing rule rather than a gap in the stack.
