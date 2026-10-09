@@ -1340,6 +1340,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     {
       auto t1 = std::chrono::high_resolution_clock::now();
       g_gpu_profile.total_usm_write_us += std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+      g_gpu_profile.usm_write_count += 1;
     }
 #endif
 
@@ -1364,6 +1365,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     {
       auto t1 = std::chrono::high_resolution_clock::now();
       g_gpu_profile.total_submit_us += std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+      g_gpu_profile.submit_count += 1;
     }
 #endif
 #ifdef INTFER_PROFILE_GPU
@@ -1511,6 +1513,7 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
   {
     auto t1 = std::chrono::high_resolution_clock::now();
     g_gpu_profile.total_usm_write_us += std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+    g_gpu_profile.usm_write_count += 2;
   }
 #endif
 
@@ -1532,6 +1535,7 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
   {
     auto t1 = std::chrono::high_resolution_clock::now();
     g_gpu_profile.total_submit_us += std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+    g_gpu_profile.submit_count += 2;
   }
 #endif
 
@@ -1600,15 +1604,40 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
 //
 // NK ACCOUNTING, and it is the whole point of the counter. The gateup
 // kernel is ONE launch per device, so on TP=2 a fused token contributes
-// nk=2 -- the same as the wave path's two quant_gemm_forward_usm calls.
-// The delta the fusion buys is therefore visible ONLY in submit_count
-// (2 -> 1 per device) and usm_write_count; nk is flat and MUST stay flat,
-// because both paths count launches through the same post-wait
-// get_profiling_info loop. An earlier revision also called
-// gemm::profile_note_launch() in the submit loop, which double-counted
-// the same two launches (nk=4) and made the "saves a submit" claim
-// unfalsifiable -- a double-counted numerator against a single-counted
-// one. Removed; see the submit block for the reason.
+// nk=2. The wave fallback the MLP callers actually use is
+// run_linear_wave(items, 2) -- gate and up as two wave items, each
+// submitted on both devices -- which is FOUR launches, so the fusion
+// halves nk (4 -> 2) exactly as it halves submit_count and
+// usm_write_count. It is NOT flat: the a119227 revision wrote "nk is
+// flat and MUST stay flat" because it compared this path against
+// run_mlp_fused (TP=1, two quant_gemm_forward_usm calls on device 0),
+// which is not the TP=2 fallback. Both paths count launches through the
+// SAME post-wait get_profiling_info loop, which makes the two counts
+// comparable -- it does not make them equal, and asserting flatness
+// here would have hidden a real delta behind a false one.
+//
+// An earlier revision also called gemm::profile_note_launch() in the
+// submit loop, which double-counted the same two launches (nk=4 for the
+// fused path against a wave path that also reported 4, so the delta was
+// 0/0 and "the fusion saves a submit" was unfalsifiable). Removed; see
+// the submit block for the reason. profile_note_launch exists for the
+// free-function SSM/norm kernels (silumul_to_half, fwht_rot_to_half, ...)
+// which have no post-wait profiling loop in their caller; the gateup
+// kernel has one here, so it must not also take the launch-note path.
+//
+// The same inversion class, the other way round: submit_count and
+// usm_write_count were ONLY ever incremented by THIS path. run_linear_tp,
+// run_mlp_fused and run_linear_wave all accumulated the matching
+// total_*_us microsecond sums but never bumped the count -- so a fused
+// token reported submit_count=2 / usm_write_count=2 against a wave token
+// that reported 0, i.e. the "halved" claim was a numerator against a zero
+// denominator, unfalsifiable in exactly the way the nk double-count was.
+// Every launch site and every memcpy site in those three paths now bumps
+// its count alongside its microsecond sum (run_mlp_fused counts 2 for
+// its two memcpys and 2 for its two submits; the wave's two memcpy arms
+// count devices_.size() each, since they write one slot per device), so
+// every delta has a real denominator. INTFER_PROFILE_GPU is ON in this
+// build (CMakeCache), so the counters are live.
 bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
                             const std::vector<float>& rin,
                             std::vector<float>& mg, std::vector<float>& mu,
@@ -1654,8 +1683,10 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
   // slot 2 for the up out. Grow the wave workspace to W=3 if needed.
   // Transfer accounting (counted, not measured -- see the header): vs the
   // 2-item wave this saves one host USM activation write and one q.submit
-  // per device. The event.wait is already one per wave and the D2H
-  // readback is NOT saved (two separate out buffers, see header).
+  // per device, and it saves one launch per device on nk too (the wave
+  // submits gate and up as two separate items, each on both devices).
+  // The event.wait is already one per wave and the D2H readback is NOT
+  // saved (two separate out buffers, see header).
   ensure_wave_workspace(M, 3, tg.K, std::max(Ng, Nu));
   std::vector<sycl::event> kernel_events;
   kernel_events.reserve(2);
@@ -1720,13 +1751,16 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
     g_gpu_profile.total_waitblock_us +=
         std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
     // wait_count is the number of HOST WAITS, and this path does one per
-    // device -- the same as the wave path's two quant_gemm_forward_usm
-    // events. It is NOT a saving of the fusion: the gateup kernel writes
-    // gate and up into two separate out buffers, so the readback cannot be
-    // fused the way run_mlp_fused (TP=1) does, and the wait is already one
-    // per wave. Counting it keeps this counter consistent with every other
-    // engine path; dropping it would make a fused token report wait_count=0
-    // and read as "the fusion removed the wait", which is not true.
+    // device (kernel_events.size() == 2). The wave fallback does the same:
+    // run_linear_wave waits once for its whole event vector, and its
+    // wait_count += kernel_events.size() is 4 there (2 items x 2 devices).
+    // So the fusion does NOT save a wait -- it is already one per wave.
+    // It is NOT a saving of the fusion: the gateup kernel writes gate and
+    // up into two separate out buffers, so the readback cannot be fused
+    // the way run_mlp_fused (TP=1) does. Counting it keeps this counter
+    // consistent with every other engine path; dropping it would make a
+    // fused token report wait_count=0 and read as "the fusion removed the
+    // wait", which is not true.
     g_gpu_profile.wait_count += (int)kernel_events.size();
   }
 #endif
@@ -1985,6 +2019,7 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
       {
         auto t1 = std::chrono::high_resolution_clock::now();
         g_gpu_profile.total_usm_write_us += std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+        g_gpu_profile.usm_write_count += (int)devices_.size();
       }
 #endif
     } else {
@@ -1999,6 +2034,7 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
       {
         auto t1 = std::chrono::high_resolution_clock::now();
         g_gpu_profile.total_usm_write_us += std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+        g_gpu_profile.usm_write_count += (int)devices_.size();
       }
 #endif
     }
@@ -2034,6 +2070,7 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
       {
         auto t1 = std::chrono::high_resolution_clock::now();
         g_gpu_profile.total_submit_us += std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+        g_gpu_profile.submit_count += 1;
       }
       if (kernel_events.size() + 1 > g_gpu_profile.peak_wait_depth)
         g_gpu_profile.peak_wait_depth = kernel_events.size() + 1;
