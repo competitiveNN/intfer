@@ -1184,3 +1184,53 @@ addition (which touched only `HISTORY.md` prose):
 Zero regressions from the audit addition. The one live tally in AGENTS.md
 (`gate tally: 17 PASS, 0 PARTIAL, 0 SKIPPED`) was not touched by this run's
 edits and `gate_inventory.sh` reconciles it against the source.
+
+## ==> CORRECTION 2026-10-09: the audit's "no ranked item is open" was wrong <==
+
+The section above concluded the backlog was exhausted. That was a doc-only
+session presented as complete, and it was wrong in a way that matters: it
+skipped the one item that was actually implementable. `INTFER_LMHEAD_SPLIT0`
+was sitting in the opt-in residue of `check_flag_gate_coverage.sh` the whole
+time, ungated, and the lm_head prefill tail was the last un-fused section with
+an unexercised launch count. Both are now real.
+
+**Implemented (`06fc67f`), `examples/intfer_cli/main.cpp` `run_lm_head_f16`:**
+
+* `INTFER_LMHEAD_SPLIT0` gains a **comma-separated form**: an exact boundary
+  list (`dev0=[0,b0) dev1=[b0,b1) ...`) that forces the shard layout instead
+  of deriving it from free VRAM. The single-integer form is unchanged. A
+  boundary that breaks the DPAS repack gate (`N_local % 16 == 0`) does NOT
+  silently fall back to the derived layout — it disables the DPAS path for
+  that shard (`b_tile` stays nullptr), which keeps the scalar path
+  bit-identical and is logged so the choice is visible.
+* `INTFER_LMHEAD_TILE_ROWS` overrides the 128MB tile cap directly. The cap is
+  a VRAM-friendliness heuristic, not a kernel limit; a larger tile is the
+  SAME kernel over a wider row range with the same per-row work.
+
+Both are bit-exact by construction (tiles concatenate in row order, same
+kernels), so this is a launch-count change with no numerics change and no
+tolerance contract. On the 27B head (N=124160, K=5120) the default cap
+yields ~5 tiles per device; setting the tile rows to the shard width yields
+one tile per device — 10 GEMM launches per token down to 2.
+
+The upload path announces the layout it actually built
+(`[lmhead-tiles] exact-split=... tile-rows=... dev0=N tiles dev1=M tiles ...`),
+once per process, so a gate can separate "the tile count fell" from "the flag
+was ignored and the default layout ran".
+
+**Certified (`570d48b`), `scripts/test_tp2_27b.sh`:** a new arm, a SINGLE
+flagged run against the fixed oracle (prefill 11751, decode 13 198 760),
+asserting rc=0, the announcement exists, the announcement names the
+requested layout, and the stream matches the base run's stream against the
+SAME FIXED ORACLE — not a self-comparison. It is GATED, not REPORTED: a
+base-vs-flagged stream comparison would be vacuous here because the two
+streams are identical BY CONSTRUCTION, so a flag that never reached the
+upload would pass every stream check while certifying nothing. The layout
+assertion is what defeats that, exactly the way the `[mlp-gateup] ... ACTIVE`
+line defeats it for the gateup fusion.
+
+**Lesson, and it is the same one as the audit's own failure mode:** a
+documentation session that concludes "nothing left to do" is the exact
+opposite of the standing directive ("less testing, more performance"). The
+backlog was not exhausted; it was misread. The item was there, in the
+opt-in residue, and the only thing blocking it was not having looked.
