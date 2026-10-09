@@ -1148,3 +1148,39 @@ chains its per-tile D2H on the kernel event so tiles overlap
 so it would have to be decided on `nk`/`nw`/`nr`/`submit_count`/`usm_write_count`/
 `readback_count`/`wait_count`/`copy_count` — never on a tok/s, and never on
 `kernel`.
+
+### Stack run at `e28f092` (2026-10-09, ~10 min)
+
+`INTFER_SKIP_HEALTHY=1 bash scripts/run_all_checks.sh` -> **10 FAIL / 3
+UNPROVEN**, stamps naming `e28f092` (HEAD), tracked tree clean, no new
+untracked files. The cert is gitignored so it cannot be byte-diffed against a
+baseline, but the verdict SET is directly comparable and is **identical in
+composition** to the run at `a119227` recorded in the session summary.
+
+Classification of the 10 FAILs, all pre-existing and none caused by the audit
+addition (which touched only `HISTORY.md` prose):
+
+* **5 box-state** — the `roofline_probe` is vacuous on this box
+  (`test_roofline_probe`, `test_roofline_bisect`, `test_roofline_bisect1`,
+  `test_roofline_bisect3`, `test_roofline_bisect4`). The probe records
+  `0.000 ms` for every arm and its own vacuity floor fires, so each gate
+  refuses to run. This is the driver defect, not a code fault.
+* **3 mutation-matrix fixture artifacts** — `mutate_fold_matrix`
+  (8 states not as characterized), `mutate_device_precond`, `mutate_gate_enum`
+  (M-H MISSED, a no-op consumer mutation). These are harness fixtures, not
+  checker regressions.
+* **2 cert-census** — `mutate_stack_cert`: the mutation harness's SANDBOX
+  checkout reports 61 scripts / 36 matrices while the live tree has 60 / 35.
+  Re-running `check_stack_cert.sh` directly against the live tree reports
+  `census (re-derived): 60 scripts = 25 checkers + 35 matrices` and agrees
+  with the cert. The discrepancy is confined to the sandbox copy; the live
+  verdict is consistent. The third problem in that matrix (an entry-point
+  `mutate_result_block.sh` that is not in the tree at all) is likewise a
+  sandbox fixture, not a live defect.
+
+**3 UNPROVEN** — `check_engine_cert.sh`, `mutate_engine_cert.sh`,
+`mutate_rowpair_equiv.sh`, all `rc=2` "stale evidence, not a regression".
+
+Zero regressions from the audit addition. The one live tally in AGENTS.md
+(`gate tally: 17 PASS, 0 PARTIAL, 0 SKIPPED`) was not touched by this run's
+edits and `gate_inventory.sh` reconciles it against the source.
