@@ -1587,9 +1587,14 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
 // column-parallel over the SAME split and device-local, so one parallel_for
 // over Ng+Nu outputs is bit-exact vs two separate quant_gemm_forward_usm
 // calls: each output keeps its own accumulator, ascending kg, ascending j,
-// its own group scale and wtab. Saves one submit + one wait + one D2H
-// readback per device per token vs the wave path. Returns false (caller
-// keeps the wave) on TP=1, DPAS48 items, or mismatched K/group/scheme.
+// its own group scale and wtab. Saves one host USM activation write and
+// one q.submit per device per token vs the wave path. It does NOT save
+// the event.wait (the wave already waits once) or the D2H readback: the
+// kernel writes gate and up into TWO separate out buffers (wv_[d*wv_W_+1]
+// and +2), so the host still does two half_to_float_batch loops. TP=2
+// cannot fuse the readback the way run_mlp_fused (TP=1) does -- it writes
+// into ONE ws_[0].out through the silu-mul->down device chain -- because
+// gate/up are column-parallel and device d owns only its slice of Ng/Nu.
 // M>1 IS supported: the kernel's outer m loop iterates the rows, so the
 // same launch covers prefill and decode.
 bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
@@ -1635,6 +1640,10 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
   // (gate's slice, up's slice). The wave workspace gives us one slot per
   // device; reuse slot 0 for the shared act and slot 1 for the gate out,
   // slot 2 for the up out. Grow the wave workspace to W=3 if needed.
+  // Transfer accounting (counted, not measured -- see the header): vs the
+  // 2-item wave this saves one host USM activation write and one q.submit
+  // per device. The event.wait is already one per wave and the D2H
+  // readback is NOT saved (two separate out buffers, see header).
   ensure_wave_workspace(M, 3, tg.K, std::max(Ng, Nu));
   std::vector<sycl::event> kernel_events;
   kernel_events.reserve(2);

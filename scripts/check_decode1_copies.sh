@@ -142,6 +142,26 @@ for k in "${ALL_D1[@]}"; do
       # quarantine into a red stack.
       echo "     quarantined        $k  (kernel removed 2026-10-05; see" \
            "AGENTS.md)" ;;
+    gemm_usm_decode1_gateup_int2tab)
+      # FUSED gate+up (INTFER_FUSED_GATE_UP, TP=2). This is NOT a copy of the
+      # scalar per-output decode arithmetic and the subset/atom/shift-into-mask
+      # relations do not describe it:
+      #   * it is a FUSION of two GEMMs, not one -- each WI dispatches on `is_up`
+      #     to read gate OR up weights and write to out_g OR out_u;
+      #   * it carries an OUTER m loop (M>1 prefill), so it is not an M=1 body;
+      #   * its weight row is computed as `wbase + out_ng*K` INSIDE the m loop
+      #     (the M>1 index fix, 783e56f), so the byte-index expression is
+      #     `((size_t)out_ng * K + kg) / pack` -- structurally different from the
+      #     decode bodies' `code_u8[idx / pack]` with idx = row_base + kg.
+      # The relation that DOES hold is bit-exactness against two separate
+      # quant_gemm_forward_usm calls, and that is certified by the
+      # FUSED_GATE_UP arm in scripts/test_tp2_27b.sh (the only gate whose model
+      # carries INT2), which asserts the stream against the fixed oracle -- not
+      # by this checker, which is about drift BETWEEN copies, and this body has
+      # no sibling copy to drift from.
+      echo "     exempt-by-reason  $k  (TP=2 gate+up FUSION, not a per-output" \
+           "decode copy; bit-exactness is certified by the test_tp2_27b.sh" \
+           "FUSED_GATE_UP arm, see the case header)" ;;
     *) echo "     UNCOVERED           $k  <-- no pin and no stated reason" ;;
   esac
 done
@@ -153,7 +173,7 @@ if printf '%s\n' "${ALL_D1[@]}" | grep -qx 'gemm_usm_decode1_rowpair' && [ "$rp_
 fi
 # An UNCOVERED entry is drift in the POPULATION, not a style note.
 if printf '%s\n' "${ALL_D1[@]}" | grep -qvE \
-     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp|gemm_usm_decode1_verbdead|gemm_usm_decode1_verbsel|gemm_usm_decode1_verbvec)$'; then
+     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp|gemm_usm_decode1_verbdead|gemm_usm_decode1_verbsel|gemm_usm_decode1_verbvec|gemm_usm_decode1_gateup_int2tab)$'; then
   echo "  FAIL  a decode1 body is neither pinned nor exempted -- enumerate it" >&2
   printf '%s\n' "${ALL_D1[@]}" | sed 's/^/        /' >&2
   exit 1
