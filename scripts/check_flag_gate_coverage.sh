@@ -22,6 +22,28 @@
 #                     arithmetic. Derivable by suffix.
 #   operational       PRELOAD*/SCHED/SERVE_MAX/PCACHE*/KV_CAP/...: runtime knobs.
 #
+# *** ONE FLAG IN THE OPT-IN RESERVE IS PRINT-ONLY BY READING THE CODE, AND
+# THE SUFFIX RULE CANNOT SEE IT. *** `INTFER_L4_ROWS` (examples/intfer_cli/
+# main.cpp:3461-3513) is an FNV row-fidelity hash: it memcpy's data that is
+# already there, hashes it, and fprintf's the hex to stderr. No state is
+# mutated (the S read is wrapped in try/catch and the result is discarded),
+# so under the header's own definition ("print paths, not arithmetic") it is
+# a DIAGNOSTIC. Its suffix `_ROWS` is not in the is_diag list, so the
+# mechanical classifier files it under opt-in and prints "REAL GAP".
+#
+# This is recorded as a QUALIFIED NOTE, not fixed. The header's standing
+# instruction is "do not widen is_diag/is_oper to make this go away", and
+# widening the suffix list to absorb `_ROWS` would be exactly that -- it
+# would shorten the residue by reading the classifier's intent instead of
+# its pattern, which is the "hand-written total is a citation" failure in a
+# different hat. The classifier is correct as a MECHANICAL query; what it
+# cannot do is read a flag's semantics, and that is stated here so the
+# "REAL GAP" label is not quoted as settled for this one flag. The six
+# remaining opt-in flags are ungated for the substantive reason: every
+# engine gate is operator-only (the stack runs only
+# run_ten_gates.sh --self-check), and rule 9 says a matrix with no dispatch
+# arm never runs -- so an arm written here would be STALE, not certified.
+#
 # *** HOW POLARITY IS AND IS NOT DETERMINED, AND WHAT I GOT WRONG FIRST. ***
 # The first version derived the class from the getenv comparison (`== nullptr` ->
 # kill switch, `!= nullptr` -> opt-in) and asserted that as if it were settled.
