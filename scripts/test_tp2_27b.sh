@@ -998,6 +998,12 @@ fi
   # shipped width ran) must be REFUSED, because the arm demands it name 160.
   # That fixture carries a real width string, so the predicate can actually
   # fire -- which is what separates this from a vacuous always-false guard.
+  # Own temp dir: the gateup arm's $SB2 is created only on ITS success path,
+  # so borrowing it would couple this self-check to a different arm's control
+  # flow -- and leave the fixtures' dir unset if gateup failed while this arm
+  # succeeded. Built and torn down inside this block rather than by trap
+  # surgery: the EXIT trap already names the log files this block does not own.
+  WGSB2="$(mktemp -d)"
   WG_ANN_FULL="work-group=$WG_WG (INTFER_DPAS48_WG=$WG_WG)"
   WG_DEFAULT_ANN="work-group=16 (INTFER_DPAS48_WG=$WG_WG)"
   # (a) healthy: the real run's own announcement must exist and name the width.
@@ -1007,7 +1013,7 @@ fi
   # (b) refusal: a log where the flag was IGNORED (default width 16 ran, stream
   # still matched) must be refused. Built by rewriting the real announcement's
   # width to 16 -- the exact shape of "the flag did not reach the kernel".
-  WG_NOT_ERR="$SB2/wg_not.err"
+  WG_NOT_ERR="$WGSB2/wg_not.err"
   sed "s/work-group=[0-9]*/work-group=16/" "$WG_ERR" >"$WG_NOT_ERR"
   if ! grep -aq "\[dpas48-wg\]" "$WG_NOT_ERR"; then
     echo "GATE FAIL: self-check (b) fixture builder removed the announcement" >&2; PASS=0
@@ -1017,12 +1023,13 @@ fi
     echo "GATE FAIL: self-check (b) the arm ACCEPTED a run whose width path never fired" >&2; PASS=0
   fi
   # (c) vacuity: an empty log must fail the predicate.
-  WG_EMPTY_ERR="$SB2/wg_empty.err"
+  WG_EMPTY_ERR="$WGSB2/wg_empty.err"
   : >"$WG_EMPTY_ERR"
   WG_EMPTY_LINE="$(grep -a "\[dpas48-wg\]" "$WG_EMPTY_ERR" | head -1)"
   if [ -n "$WG_EMPTY_LINE" ]; then
     echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log (vacuity)" >&2; PASS=0
   fi
-fi
+  rm -rf "$WGSB2"
+  fi
 
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
