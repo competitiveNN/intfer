@@ -141,7 +141,7 @@ struct Arm {
 // is really a CPU number.
 //
 // *** AND A CAVEAT ON WHAT THIS PROVES. *** The engine's own counter
-// (engine.cpp:1206, same get_profiling_info spelling, same enable_profiling
+// (engine.cpp:1208, same get_profiling_info spelling, same enable_profiling
 // queue) is reported as real in a log that is NOT in this repo (perf_base.err,
 // archived). AGENTS.md's standing rule is to re-derive, not to remember, and
 // that number cannot be re-derived from this tree -- so the claim that "the

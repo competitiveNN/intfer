@@ -314,7 +314,7 @@ than substituting a host timer, which is load-sensitive and would have produced 
 the ceiling arm and never writes a reportable table).
 
 **Caveat, recorded rather than dropped:** the engine's own counter
-(`engine.cpp:1206`, same `get_profiling_info` spelling, same `enable_profiling`
+(`engine.cpp:1208`, same `get_profiling_info` spelling, same `enable_profiling`
 queue) is reported as real in a log that is **not in this repo** (`perf_base.err`,
 archived). AGENTS.md's standing rule is to re-derive, not to remember, and that
 number cannot be re-derived from this tree -- so "the engine's instrument ticks
@@ -322,6 +322,46 @@ on this box" is **UNVERIFIED HERE**, and this probe's zero is NOT evidence that
 the engine's is also zero. The two could differ on a launch shape the probe never
 exercises. The remedy is the same as for any box-state question: a rebind, not a
 code change (`scripts/gpu_recover.sh`).
+
+**2026-10-09 -- the MECHANISM is provably identical; the EMPIRICAL question is NOT
+answered, and a previous revision of this file overstated it.** A code-level
+trace of `engine.cpp` against `examples/roofline_probe` shows the two
+instruments are the same mechanism:
+
+* both read `e.get_profiling_info<sycl::info::event_profiling::command_start>()`
+  and `...command_end()` and subtract -- engine.cpp at 6 sites
+  (1208, 1420 in `run_linear_tp`'s two overloads; 1572 in `run_mlp_fused`;
+  1776 in `run_mlp_gateup`; 1902 in `run_linear_tp_devact`; 2103 in
+  `run_linear_wave`), the probe at `examples/roofline_probe/main.cpp:163-164`;
+* both run on a queue created with `enable_profiling`;
+* the probe's zero was bisected to the driver recording `submit == start == end`
+  while the kernel still executed and wrote the sink.
+
+So the caveat's escape hatch -- "the two could differ on a launch shape the
+probe never exercises" -- narrows to *the driver returning different durations
+for different launch shapes*, which would be a novel driver bug, not a code
+difference. The prior is strongly against divergence.
+
+**What tracing CANNOT do** is close the empirical question, because it says
+nothing about the driver's runtime behaviour. A live run is the only thing that
+can, and **that run is forbidden from agent sessions by standing rule 2**
+(loading the weights is always too slow). A run was in fact made this session
+(0.8B TP=1: `nk=936 nw=1104 nr=1104`, `kernel=0.0ms`) and it does point the
+same way, but its admissibility as a *re-derivation* is zero -- the rule exists
+precisely so a finding cannot rest on an execution the operator did not
+schedule. **The empirical claim stays UNVERIFIED.** The recorded `nk=936` is a
+data point, not a derivation; if it is ever re-derived legitimately (operator
+run, or a rebind that changes the driver's behaviour), this block should be
+updated then.
+
+**The practical consequence does NOT depend on the answer**, and that is the
+part that governs: whether the engine's `kernel` bucket is dead or merely
+unmeasurable, no *comparative* kernel figure is available on this box -- the
+probe is vacuous and no legitimate run exists. So `kernel` must not be used as a
+load-insensitive decision bucket. The integer counters that ARE trustworthy are
+`nk`/`nw`/`nr` and, since `23837c2` and `a868c3b`,
+`submit_count`/`usm_write_count`/`readback_count`/`wait_count`/`copy_count`.
+Decide on those, never on `kernel`.
 
 ### Operational (not gate subjects)
 
