@@ -1731,6 +1731,30 @@ struct GpuBackend : public LinearBackend {
           }
         }
       }
+      // THE PATH ANNOUNCES ITSELF, ONCE. Same shape as the [mlp-gateup]
+      // ACTIVE line and the decode1 arms: this flag is bit-exact by
+      // construction (tiles concatenate in row order, same kernels), so a
+      // gate that compares the token stream against the base run cannot
+      // tell whether the tile layout changed -- the two streams are
+      // identical. Without this line the arm would be vacuous: it would
+      // pass while the default ~20-tile layout ran and certified nothing.
+      // One line, host-side, one per process, so it does not flood a log.
+      // It names the layout the upload actually built, so the arm asserts
+      // the thing that changed rather than a constant.
+      static bool announced_lm = false;
+      if(!announced_lm){
+        announced_lm = true;
+        uint32_t nt0 = 0, nt1 = 0;
+        if(lm_head_tiles_.size() > 0) nt0 = (uint32_t)lm_head_tiles_[0].size();
+        if(lm_head_tiles_.size() > 1) nt1 = (uint32_t)lm_head_tiles_[1].size();
+        std::fprintf(stderr,
+                     "[lmhead-tiles] exact-split=%s tile-rows=%u dev0=%u tiles "
+                     "dev1=%u tiles (N=%u K=%u)\n",
+                     std::getenv("INTFER_LMHEAD_SPLIT0") ?
+                         std::getenv("INTFER_LMHEAD_SPLIT0") : "(derived)",
+                     tile_rows, nt0, nt1, N, K);
+        std::fflush(stderr);
+      }
       for(size_t d=0; d<ndev; ++d)
         eng->device_queue((int)d).wait();
     }
