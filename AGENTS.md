@@ -232,7 +232,7 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_DECODE1_MR` | 4 outputs per WI at M=1 INT2 | **2.3x slower.** Do not use |
 | `INTFER_DECODE1_SPLITK` | split-K block-cyclic M=1 INT2 decode: `N*S` work-items + coalesced weight loads. Exactly `=1`; kill switch `INTFER_NO_DECODE1_SPLITK` | **MEASURED LOSS.** Stream-identical to base on 27B (so the numerics contract held), but kernel 267 -> 384 ms (+43.8%, 3/3 same sign, clears the 6 ms spread floor; `nk/nw/nr` identical). Both halves of the hypothesis delivered and it still lost. **Do not promote.** |
 | `INTFER_DECODE1_SUBGROUP` | llama.cpp mmvq shape: one SUB-GROUP per output row, lanes split K, reduced by `sycl::reduce_over_group` -- no `local_accessor`, no barrier. **REMOVED 2026-10-05**: numerically wrong (ids `'279 12 12'` vs base `'13 198 760'`) and the cause is not located. See `AGENTS.md` "INTFER_DECODE1_SUBGROUP is QUARANTINED, not fixed". |
-| `INTFER_L4_FUSE` | fused ssm+norm+FP16 -> la_out GEMM (TP=1) | stream-identical, but M>1 nets ~-1.5% and scalar A/B was a variance wash |
+| `INTFER_L4_FUSE` | fused ssm+norm+FP16 -> la_out GEMM (TP=1) | stream-identical, but M>1 nets ~-1.5% and scalar A/B was a variance wash. **Decline re-checked 2026-10-09:** the verdict stands and is *independent* of the gate+up fusion -- L4_FUSE fuses a different seam (the LA input path, `run_linear_wave`'s fwht_rot+4 GEMMs at main.cpp:4260-4289) and its TP=1-only guard (`run_mlp_fused`-style `if (devices_.size() != 1) return false`) is unrelated to the gate+up seam. The M>1 ~-1.5% is a device-saturation submit effect (the fusion ADDS launches to an already-saturated queue), not a numerics divergence; the stream-identity arm in `test_gpu_optin.sh` is unchanged and still the right certification for this flag. |
 | `INTFER_L5_FRONT` | device-resident whole LA input path | **dead end as built**: +144 launches/token, waitblock 5x. More kernels lose |
 | `INTFER_SSM_GPU` | device SSM recurrence | declines under `INTFER_DPAS48=1` (its ~1ulp drift flips a GA64 code at a tie) |
 | `INTFER_INT8_KV`, `INTFER_KV_Q8`, `INTFER_KV_HAD` | groupwise-INT8 KV cache | correctness-gated, no tok/s claim |
@@ -244,7 +244,13 @@ Re-derive the whole population with the `git grep` recipe above.
 
 `INTFER_NO_FUSE_SILUMUL` (fused MLP, TP=1 only — the shipped +13%), `INTFER_NO_WAVE`
 (wave submit grouping), `INTFER_LMHEAD_BATCH` (M-row lm_head), `INTFER_NO_WAVE`,
-`INTFER_STREAM_F16` (restores evict-everything), `INTFER_PREFILL_CHUNK` +
+`INTFER_STREAM_F16` (**default-OFF opt-in, NOT a kill switch** -- presence
+enables; restores the old evict-everything FP16 cache policy. Bit-exact by
+construction: `shard_weight` for FP16 scheme is a memcpy, so evict+rebuild
+reproduces the same bytes; the flag only moves *when* a buffer is allocated,
+never *what* goes in it. **No stream-identity gate is warranted** -- see
+`intfer_stream_f16_policy.md`; the census files it as an opt-in gap, which is a
+certification gap, not a correctness one), `INTFER_PREFILL_CHUNK` +
 `INTFER_BATCH_GEMM` (chunked M-row prefill, `INTFER_PREFILL_RR` restores the old
 rounding order), `INTFER_HOST_AVX2`, `INTFER_DPAS_PREQ`-independent bits,
 `INTFER_NO_DECODE1_VERBHALF` and `INTFER_NO_DECODE1_VERBMP` -- the two M=1 INT2
