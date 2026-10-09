@@ -119,9 +119,17 @@ dg1() { patchN scripts/mutate_device_precond.sh 'git diff --quiet' '# DG1 remove
 dg2() { patch1 "$CHECK" 'strip_comments() { sed -e' 'strip_comments() { cat "$1"; } #DG2'; }
 
 # DG-3 the checker regex accepts EITHER "commit...before...destructive" OR
-# "reset --hard...uncommitted", and rule 16 satisfies BOTH -- so deleting only the
-# heading left the rule matching on its own body and the state scored MISSED.
-dg3() { patchN "$DOC" 'COMMIT BEFORE ANY DESTRUCTIVE GIT' '[DELETED BY DG-3]'
+# "reset --hard...uncommitted", and rule 16 satisfies BOTH -- so deleting only
+# the heading left the rule matching on its own body and the state scored MISSED.
+#
+# ANCHOR DRIFT, AND IT IS THE STATE THAT DECAYED. Rule 16 was rewritten to
+# lowercase ("commit before any destructive git operation") in a later commit,
+# while this state still carried the OLD UPPERCASE heading. `patchN` then failed
+# its own pre-flight ("anchor absent in AGENTS.md") and the matrix aborted before
+# running DG-3, scoring it MISSED for a reason unrelated to the checker. The
+# anchor below is derived from the current text; a rewording of rule 16 makes
+# THIS line stale, not the checker's regex.
+dg3() { patchN "$DOC" '**commit before any destructive git operation**' '[DELETED BY DG-3]'
         patchN "$DOC" 'reset --hard' 'a destructive command'; }
 
 # DG-4 neuter the harvest REGEX -- the direct anti-vacuity test. The first attempt
