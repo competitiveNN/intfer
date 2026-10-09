@@ -1272,7 +1272,9 @@ shipped — the audit's own `f757b3c` correction said so, and PLAN.md still
 carries it as open). Item 1.3 is now attempted (`2a72b67`) and its verdict
 depends on the operator running the gate with `INTFER_DPAS48_WG=160`. Item 1.1
 is the same blocker. 1.6 is low priority; 1.4 is blocked by an absent
-dependency; 1.5 is quarantined.
+dependency; 1.5 is quarantined. `ca85d91` decoupled the 1.3 arm's self-check
+fixtures from the gateup arm's `$SB2` (own `mktemp -d`, `bash -n` clean, no
+stack re-run — fixture-only change, verdict set unchanged by construction).
 
 ## Stack run at `2a72b67` (2026-10-10): 10 FAIL / 3 UNPROVEN, NO REGRESSION
 
@@ -1294,3 +1296,24 @@ regression from the new optimization.**
 `run_ten_gates.sh` runs only its `--self-check` in the stack
 (`run_all_checks.sh:408`); `test_tp2_27b.sh` is a 27B gate and is operator-only,
 which is consistent with the standing rule rather than a gap in the stack.
+
+## `ca85d91` (2026-10-10): WG self-check decoupled from the gateup arm's `$SB2`
+
+The WG arm's self-check fixtures were written under the gateup arm's `$SB2`
+(`scripts/test_tp2_27b.sh:1010, 1020`), which is created only on the gateup
+arm's **success** path. Two defects in that coupling:
+
+1. **Control-flow coupling across arms.** If gateup failed while the WG arm
+   succeeded, the self-check block would reference an unset `$SB2` and the
+   fixtures would be built in an unset variable — a hard error in a path that
+   is supposed to be reachable on its own.
+2. **Trap surgery.** The gateup arm rewrites the EXIT trap to name `$SB2` for
+   cleanup, because bash replaces traps rather than stacking them. Borrowing
+   that dir meant the WG self-check lived on another arm's trap lifetime.
+
+Fix: the block owns `WGSB2="$(mktemp -d)"`, torn down by `rm -rf` inside the
+block at `scripts/test_tp2_27b.sh:1006, 1032` — **not** by trap surgery. The
+EXIT trap already names the log files this block does not own, so it needs no
+edit. `bash -n` → SYNTAX OK; 23 `fi` unchanged; tree clean. No stack re-run:
+the change is to gate *fixtures*, not to the engine, the kernel, or any
+checker — the verdict set is unchanged by construction.
