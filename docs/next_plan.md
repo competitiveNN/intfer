@@ -1,12 +1,22 @@
-# Next plan: from ~27 tok/s TP1 toward 40 tok/s (0.8B decode)
+# Next plan: 27B decode on 2x B580 TP=2 (was: 0.8B TP1)
 
-Date: 2026-09-21. HEAD `ca3118a` (27B warmup timeouts hardened).
-Box contended (load ~5.5) — wall-time A/B gated on quiet box (load1<2).
+Date: 2026-09-26. HEAD `34d3c54` (argmax 27B no-op check; prefix-cache
+quiet-box complete; argmax scalar wall-time = measured loss).
+UPDATE 2026-09-28: focus is 27B TP=2 decode (ceiling ~2.8 tok/s, TAB
+promoted e0e6e84). 0.8B TP1 ~27 tok/s numbers below are legacy reference.
+Box contended (load ~19) — wall-time A/B gated on quiet box (load1<2).
 Load-insensitive work (stream-identity + code) can proceed now.
 
 ## 1. Current ceiling (measured)
 
 - Single-stream ceiling TP1: ~27 tok/s (fused MLP, quiet box).
+- INT2 table-hoist PROMOTED 2026-09-28 (default-ON, kill switch
+  INTFER_NO_INT2_TAB=1): quiet-box 27B TP=2 decode 3 rounds BASE vs TAB =
+  2.63->2.78 (+5.7%), 2.67->2.83 (+6.0%), 2.68->2.82 (+5.2%) tok/s;
+  kernel bucket (load-immune) 18856->16444ms (-12.8% R1); submit/transfer
+  buckets unchanged; nk/nw/nr identical; streams identical TP1/TP2 +
+  opt-out; cpu parity + http batch + gpu-optin 10/10 PASS. [SUPERSEDED 2026-10-04: an 11th gate, test_ksplit_contract, was added; re-derive with scripts/gate_inventory.sh]
+  New 27B TP=2 decode ceiling: ~2.8 tok/s (was ~2.6).
 - This session, contended box TP1 -n8: 29.79 tok/s => 33.6 ms/token.
   Per-token buckets: submit 9.6 / kernel 9.0 / waitblock 8.8 /
   usm_write 4.8 / readback 4.5 ms. nk=1680, nw=1104, nr=576 over 9 toks
@@ -38,6 +48,20 @@ fused MLP (gate/up -> down) and L4 (norm -> la_out) both use it.
   la_conv_prep kernels retained for future fused kernels).
 - DPAS48 default-ON at any shape; device-side act-quant alone;
   standalone INTFER_SSM_GPU=1 (still -9%, default-off).
+- FP16 joint_matrix DPAS without weight repack (2026-09-29, compile+JIT
+  gated, tree reverted clean — do not retry as-is): probe-verified legal
+  combo m=1 n=64 k=32 fp16->fp32 exists on B580, and B=W^T as col_major
+  stride-K is offset-identical to the row-major shard (zero-copy in
+  theory). But the compiler lowers col_major fp16 B loads to the PACKED-VNNI
+  builtin (__builtin_spriv_OpJointMatrixLoadINTEL_PackedB_ColumnMajor_*),
+  which the BE does not implement (JIT link error, TK=32 AND TK=16).
+  Plain col_major fp16 has no legal load builtin — B MUST be VNNI-packed,
+  i.e. the same shard-build repack the 2026-09-08 ESIMD FP16-DPAS needed
+  (measured 1.1x, reverted: bandwidth-bound). joint_matrix without repack
+  is impossible on this BE, and with repack it re-proves the same ~1%
+  ceiling with more machinery. Second independent confirmation of the
+  FP16-leave-alone verdict. XMX work belongs on ALU-bound INT2/INT4
+  (2D-tiled DPAS rewrite + device act-quant, AGENTS.md recipe).
 - OpenVINO evaluated, NOT adopted (2026-09-18 spike): OV 2026.3 sees both
   B580s, but FP16 matmul M=361 2.6ms (~our EU kernel, no XMX unlock) and
   M=1 1.2ms vs our ~50us (20x worse, framework overhead). Native SYCL stays;
@@ -46,15 +70,55 @@ fused MLP (gate/up -> down) and L4 (norm -> la_out) both use it.
 ## 4. Ranked next steps
 
 ### Step 1 — Extend the device-act seam to remaining GEMM round-trips
-Highest value, load-insensitive (stream-gated). For each GEMM whose output
-feeds only the next GEMM's input with no host math between, keep it
-device-resident via the existing `run_linear_tp_devact` seam (no new
-launches added — unlike L5). Candidates to audit: qkv/z/b/a GEMM outputs
-on the LA path, gate/up outputs on the non-fused (TP2/DPAS48) paths,
-lm_head input (final-norm out -> head GEMM).
-Deliverable: ranked seam-extension list with per-seam launch-count deltas
-(nk/nw/nr), then implement top seam behind a default-off env flag,
-stream-gated base==flag on TP1/TP2.
+AUDIT DONE 2026-09-28 (this box, 27B TP=2 decode, TAB-on ceiling 2.82
+tok/s = 354ms/token: kernel 253 / submit 93 / waitblock 128 /
+transfers ~92ms; nk/nw/nr 63488/63488/16384 per 65 toks = 977/977/252
+per token). Per-token GEMM inventory: 16 full layers x (qkv-wave-3 as
+1 wave + k/v + q seq + o) + 48 LA layers x (qkv/z/b/a wave-4 + la_out)
++ 64 MLP x (gate/up wave + down) + 1 batched lm_head. TP split is
+N-sharded (engine.cpp:420 `split(t.N)`), so gate/up/down outputs are
+N/2 per device and all existing fusion (run_mlp_fused, L4, L5) is
+TP=1-only — every one DECLINES on 27B (TP=2-only viable).
+Ranked TP=2-viable candidates:
+1. TP=2 fused MLP (OVERTURNED 2026-09-28 — DECLINE, measured VRAM
+arithmetic, load-insensitive): full-N gate/up replication needs the peer
+N/2 halves resident per device: gate half 14.45MB (INT2, code 22.28MB
+full) + up half 16.9MB (INT4, code 44.56MB full) = ~31MB/layer x64 =
+~2.0GB extra per device (parsed from Qwen3.8-27B-int2.intifer JSON
+metadata: gate N=17408 K=5120 INT2 g16, up N=17408 K=5120 INT4 g64,
+down N=5120 K=17408 INT2 g16; total weights 19.504GB = 9.75GB/dev
+N-split). Steady-state occupancy is ALREADY 11.27/10.94GB of 12GB
+(AGENTS.md first-touch note) — 9.75+2.0 = 11.75GB = 98% before
+workspaces/KV/transients. Variants also dead: on-demand peer staging =
+~31MB H2D x64 = 2GB/token transfers vs ~92ms budget; down K-split
+needs P2P partial-sum machinery (new invention, not a seam extension).
+The down row-split N/2 needs no cross-talk, but the gate/up weights to
+feed it do not fit. Do NOT implement as scoped.
+2. lm_head input seam: 1 convert+H2D saved of 977 launches — negligible
+alone; bundle only if #1 needs a second seam for its wait collapse.
+3. LA wave-4 -> conv FIR: conv stays host scalar (10240x4 taps); a device
+prep kernel saves 1 D2H of 48 (qkv only; z/b/a stay host) — weak, skip.
+4. Cross-layer wait collapsing: blocked behind #1 (needs device-resident
+chains first).
+Deliverable: Step 1 has NO implementable seam on 27B TP=2 (all four
+candidates declined by measurement: #1 VRAM above, #2 negligible, #3
+weak, #4 blocked behind #1). The device-act seam family is EXHAUSTED on
+this hardware for the 27B — remaining paths are session-scale new
+machinery (XMX DPAS kernel rewrite + device act-quant; P2P reduction)
+or serve batching (Step 3, the documented 40 tok/s path, quiet box).
+Per-role 27B VRAM table: **[SUPERSEDED 2026-10-05 — hand table removed, use the
+derivation]**. The hand table above said QKV 5.03 / Z 3.02 / OUT 3.02 / DOWN 2.10 /
+UP 2.16 / GATE 1.85 / ATTN_Q 0.50 / O 0.25 / K 0.17 / V 0.08 / EMBED+LM_HEAD 0.64
+each GB, which **sums to 25.5 GB while the same paragraph states 19.5 GB** — an
+internally inconsistent hand total, i.e. exactly the AGENTS.md rule-4 defect
+("a hand-written total is a citation, not a claim"). It is replaced by:
+
+```
+scripts/model_byte_roofline.sh            # reads code_bytes from the .intifer
+```
+
+which derives GB total, N_local at TP=2, and the per-token per-device share per
+role, and cannot drift from the model. Run it; never retype the table.
 
 ### Step 2 — Reduce sync count (not submit cost)
 Wave grouping (convert+submit back-to-back, one wait per wave) is done.
@@ -73,6 +137,24 @@ probe 9.02 tok/s aggregate). Requires quiet box for any wall-time claim.
 
 - A: Implement — scope + build the next device-act seam (Step 1 top item),
   stream-gated, default-off, bisectable commit. Do now (load-insensitive).
+  NOTE 2026-09-23: device-argmax v1 (audit B lever (a)) is implemented,
+  d460eb7, default-off INTFER_DEVICE_ARGMAX=1 — bit-contract proven on CPU
+  (65536-pattern convert + adversarial/fuzz tiles + multi-tile reduce, ALL
+  PASS), GPU stream-gates gated + fixed on THIS box 2026-09-24 (TP1-only
+  guard, serve-poison decode_only fence, gate §3b PARTS 32->40; full suite
+  + serve-load PASS). WALL-TIME CLOSED 2026-09-26 (e1e669b, quiet box):
+  M=1 scalar is a MEASURED LOSS (OFF 26.5 vs ON 15.1 tok/s, -43%, buckets
+  identical — GEMM re-run + 4 waits/tile + serial 62K scan). 27B serve is
+  a silent no-op by guard (34d3c54: paired 4.9s vs 4.9s, zero [argmax]
+  lines). Keep default-off; never promote v1. Only redemption path: fused
+  GEMM+argmax single kernel (session-scale; TP2/poison fences stand).
+  Full story: docs/seam_audit_b.md tail.
+  UPDATE 2026-09-24 (v2): spec-verify rows ride the scalar hook
+  (prefill_layer_outer all_greedy param, spec site only; serve untouched):
+  gate §3b PASS (repetitive prompt, PARTS 32->40 deterministic, TP2-silent),
+  full suite + serve-load PASS. Mixed-temp batch v2 analyzed + REJECTED
+  (wash: +12 submits vs ~1MB D2H at T=4 tiles; expands fenced poison
+  surface — see seam_audit_b.md tail).
 - B: Audit only — ranked seam-extension list with nk/nw/nr deltas, no code.
 - C: Serve-side — batching/scheduler work (wall-time gated on quiet box).
 
@@ -83,24 +165,3 @@ probe 9.02 tok/s aggregate). Requires quiet box for any wall-time claim.
   plus cpu parity + gpu-optin + http batch.
 - Quiet rule: no tok/s quotes unless box load1<2 sustained.
 - Bisectable commits; no /tmp litter (RAM is precious).
-
-## 7. Quiet-box queue (gated on load1<2 sustained — do NOT run under load)
-
-1. 27B serve prefill verification for `c0355c9` (HTTP dispatcher chunk
-   8→128): measure the 267-token prompt prefill that took 74s at chunk 8;
-   expect ~3 passes at chunk 128 instead of ~34. Serve script:
-   `scripts/serve_27b.sh --bg [--port P]`.
-2. Per-row conditional device-argmax, lever (a) (sampler contract scoped in
-   docs/seam_audit_b.md §5): greedy rows consume a device int, sampling
-   rows keep full D2H; first-max-wins + NaN-ignore bit-contract.
-3. `scripts/bench_quiet_ab.sh` / `scripts/bench_quiet_l4_ab.sh` A/Bs still
-   owed (L4 scalar decode; fused-MLP ceiling re-baseline).
-
-## 8. Serve warmup env knobs (scripts/serve_27b.sh --bg only)
-
-- `INTFER_NO_WARMUP=1`: skip the post-/health warmup request.
-- `INTFER_WARMUP_TIMEOUT=<s>`: --max-time override (default 600; measured
-  warmup ~9s). `--connect-timeout 10` fixed. All warmup failures fail open
-  (server still up; first real request pays the ~6.5s migration).
-- Foreground mode (`exec` path) and the already-up early exit never warm
-  up, by design.
