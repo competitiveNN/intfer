@@ -9926,11 +9926,13 @@ int main(int argc, char** argv){
       auto p = get_gpu_profile();
       std::fprintf(stderr,
         "[GPU profile @prefill] kernel=%.1fms submit=%.1fms waitblock=%.1fms "
-        "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms "
-        "nk=%lu nw=%lu nr=%lu\n",
+        "rebuild=%.1fms(%lu) usm_write=%.1fms(%lu) readback=%.1fms(%lu) "
+        "copy=%.1fms(%lu) nk=%lu nw=%lu nr=%lu\n",
         p.kernel_us/1000.0, p.submit_us/1000.0, p.waitblock_us/1000.0,
         p.rebuild_us/1000.0, p.rebuild_count,
-        p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0,
+        p.usm_write_us/1000.0, p.usm_write_count,
+        p.readback_us/1000.0, p.readback_count,
+        p.copy_us/1000.0, p.copy_count,
         p.kernel_count, p.wait_count, p.readback_count);
       reset_gpu_profile();
     }
@@ -9966,11 +9968,13 @@ int main(int argc, char** argv){
       auto p = get_gpu_profile();
       std::fprintf(stderr,
         "[GPU profile @decode] kernel=%.1fms submit=%.1fms waitblock=%.1fms "
-        "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms "
-        "nk=%lu nw=%lu nr=%lu\n",
+        "rebuild=%.1fms(%lu) usm_write=%.1fms(%lu) readback=%.1fms(%lu) "
+        "copy=%.1fms(%lu) nk=%lu nw=%lu nr=%lu\n",
         p.kernel_us/1000.0, p.submit_us/1000.0, p.waitblock_us/1000.0,
         p.rebuild_us/1000.0, p.rebuild_count,
-        p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0,
+        p.usm_write_us/1000.0, p.usm_write_count,
+        p.readback_us/1000.0, p.readback_count,
+        p.copy_us/1000.0, p.copy_count,
         p.kernel_count, p.wait_count, p.readback_count);
     }
 #endif
@@ -10221,11 +10225,13 @@ int main(int argc, char** argv){
     auto p = get_gpu_profile();
     std::fprintf(stderr,
       "[GPU profile @decode] kernel=%.1fms submit=%.1fms waitblock=%.1fms "
-      "rebuild=%.1fms(%lu) usm_write=%.1fms readback=%.1fms copy=%.1fms "
-      "nk=%lu nw=%lu nr=%lu\n",
+      "rebuild=%.1fms(%lu) usm_write=%.1fms(%lu) readback=%.1fms(%lu) "
+      "copy=%.1fms(%lu) nk=%lu nw=%lu nr=%lu\n",
       p.kernel_us/1000.0, p.submit_us/1000.0, p.waitblock_us/1000.0,
       p.rebuild_us/1000.0, p.rebuild_count,
-      p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0,
+      p.usm_write_us/1000.0, p.usm_write_count,
+      p.readback_us/1000.0, p.readback_count,
+      p.copy_us/1000.0, p.copy_count,
       p.kernel_count, p.wait_count, p.readback_count);
   }
 #endif

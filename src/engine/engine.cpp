@@ -168,6 +168,8 @@ void Engine::pool_release(size_t device, void* ptr, size_t bytes) {
     uint64_t wait_count     = 0;
     uint64_t copy_count     = 0;
     uint64_t readback_count = 0;
+    uint64_t submit_count   = 0;   // q.submit host overhead calls
+    uint64_t usm_write_count = 0;   // host USM activation write memcpy calls
   };
   static GpuProfile g_gpu_profile;
 #endif
@@ -1636,13 +1638,30 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
   ensure_wave_workspace(M, 3, tg.K, std::max(Ng, Nu));
   std::vector<sycl::event> kernel_events;
   kernel_events.reserve(2);
+#ifdef INTFER_PROFILE_GPU
+  auto t_w0_all = std::chrono::high_resolution_clock::now();
+#endif
   for (size_t d = 0; d < 2; ++d) {
     auto& dev = devices_[d];
     sycl::queue& q = dev.queue;
     std::uint16_t* act_ptr = wv_[d * wv_W_ + 0].act;
+#ifdef INTFER_PROFILE_GPU
+    auto t_w0 = std::chrono::high_resolution_clock::now();
+#endif
     std::memcpy(act_ptr, act_staging_.data(), need * sizeof(std::uint16_t));
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_usm_write_us +=
+          std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+      g_gpu_profile.usm_write_count += 1;
+    }
+#endif
     const float ag = scg.has_global_divisor ? scg.global_host : 1.0f;
     const float au = scu.has_global_divisor ? scu.global_host : 1.0f;
+#ifdef INTFER_PROFILE_GPU
+    auto t_s0 = std::chrono::high_resolution_clock::now();
+#endif
     sycl::event e = gemm::quant_gemm_forward_usm_gateup(
         q, act_ptr,
         scg.code_usm[d], scg.scale_usm[d], ag,
@@ -1660,10 +1679,25 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
     // Guarded: profile_note_launch is declared only under INTFER_PROFILE_GPU.
 #ifdef INTFER_PROFILE_GPU
     gemm::profile_note_launch();
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_submit_us +=
+          std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+      g_gpu_profile.submit_count += 1;
+    }
 #endif
   }
+#ifdef INTFER_PROFILE_GPU
+  auto t_wb0 = std::chrono::high_resolution_clock::now();
+#endif
   for (auto& e : kernel_events) e.wait();
 #ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_waitblock_us +=
+        std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
+    g_gpu_profile.wait_count += (int)kernel_events.size();
+  }
   for (auto& e : kernel_events) {
     try {
       auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
@@ -1677,18 +1711,43 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
     auto [start, end] = shards_[gate_ti].ranges[d];
     const uint32_t Nl_g = static_cast<uint32_t>(end - start);
     const std::uint16_t* g_out = wv_[d * wv_W_ + 1].out;
+#ifdef INTFER_PROFILE_GPU
+    auto t_rb0 = std::chrono::high_resolution_clock::now();
+#endif
     for (uint32_t m = 0; m < M; ++m)
       dashq::half_to_float_batch(g_out + (size_t)m * Nl_g,
                                  mg.data() + (size_t)m * tg.N + start,
                                  Nl_g);
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_readback_us +=
+          std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
+      g_gpu_profile.readback_count += 1;
+    }
+#endif
     auto [s2, e2] = shards_[up_ti].ranges[d];
     const uint32_t Nl_u = static_cast<uint32_t>(e2 - s2);
     const std::uint16_t* u_out = wv_[d * wv_W_ + 2].out;
+#ifdef INTFER_PROFILE_GPU
+    t_rb0 = std::chrono::high_resolution_clock::now();
+#endif
     for (uint32_t m = 0; m < M; ++m)
       dashq::half_to_float_batch(u_out + (size_t)m * Nl_u,
                                  mu.data() + (size_t)m * tu.N + s2,
                                  Nl_u);
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_readback_us +=
+          std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
+      g_gpu_profile.readback_count += 1;
+    }
+#endif
   }
+#ifdef INTFER_PROFILE_GPU
+  (void)t_w0_all;
+#endif
   // THE PATH ANNOUNCES ITSELF, ONCE. Same shape as the decode1 arms and the
   // L4 la_out seam: without it, a gate that compares this run's token stream
   // against the base run's cannot tell whether the fused path ran -- the two
@@ -2012,7 +2071,8 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
             g_gpu_profile.total_rebuild_us, g_gpu_profile.rebuild_count,
             g_gpu_profile.peak_wait_depth,
             g_gpu_profile.kernel_count, g_gpu_profile.wait_count,
-            g_gpu_profile.copy_count, g_gpu_profile.readback_count};
+            g_gpu_profile.copy_count, g_gpu_profile.readback_count,
+            g_gpu_profile.submit_count, g_gpu_profile.usm_write_count};
   }
   void reset_gpu_profile() { g_gpu_profile = GpuProfile{}; }
   namespace gemm {

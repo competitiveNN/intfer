@@ -449,6 +449,12 @@ struct GpuProfileSnapshot {
   uint64_t peak_wait_depth;
   // Counters.
   uint64_t kernel_count, wait_count, copy_count, readback_count;
+  // Per-phase launch/transfer counts (host USM activation writes, q.submit
+  // host overhead calls). These are what make the fusion's "one submit +
+  // one wait + one D2H readback saved" claim MEASURABLE rather than prose:
+  // the wave path emits one usm_write + one submit + one readback PER
+  // GEMM, the fused path emits them once for both.
+  uint64_t submit_count, usm_write_count;
 };
 namespace intfer {
   GpuProfileSnapshot get_gpu_profile();
