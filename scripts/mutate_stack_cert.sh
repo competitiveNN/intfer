@@ -151,9 +151,20 @@ run_state "S-A" "the census stops counting check_*.sh" 'the census is stale' \
 #   (2) guard removed + DIRTY    -> rc=0 and it says PASS. The defect reproduced.
 # The planting is the ROOT seam's only use: without it this branch judges the REAL
 # tree and can never be exercised at all.
+#
+# *** THE PLANT TARGET WAS STALE (2026-10-10). *** It hardcoded
+# `scripts/mutate_result_block.sh`, which was DELETED with its whole family at
+# 38c44b8. So the plant was a no-op, the tree was never made dirty, the case
+# half ran against a clean tree, and the matrix reported "S-B MISSED (case)"
+# with the checker correctly refusing nothing -- a state that could not be
+# exercised at all, which is the exact failure this matrix exists to prevent.
+# The target is now DERIVED: any tracked file in the sandbox will do, so the
+# state survives any further deletion the way S-A's census already does.
 total=$((total + 1))
 reset_tree
-printf 'dirty\n' >> "$REPO/scripts/mutate_result_block.sh"
+DIRTY_TARGET="$(git -C "$REPO" ls-files -- scripts/ | head -1)"
+[ -n "$DIRTY_TARGET" ] || { echo "FAIL: no tracked file to dirty for S-B"; exit 2; }
+printf 'dirty\n' >> "$REPO/$DIRTY_TARGET"
 run_check; s_b_base=$?
 if [ "$s_b_base" -ne 1 ] || ! grep -q 'DIRTY' "$WORK_OUT"; then
   echo "  S-B MISSED (case) -- a DIRTY tree was not refused (rc=$s_b_base). The" >&2

@@ -248,9 +248,29 @@ consumer_state() { # $1 id, $2 consumer-copy, $3 sed-on-consumer, $4 expect, $5 
 }
 
 # The consumers must be PRESENT in the sandbox to be mutated. Copy them in.
-for c in check_build_dir_consumers.sh check_doc_counts.sh; do
-  cp "$SCRIPT_DIR/$c" "$SB/$c"
+# *** THE POPULATION IS DERIVED, NOT LISTED (2026-10-10). *** check_doc_counts.sh
+# was DELETED at 38c44b8 (its whole family -- bench_reports_batch, bench_when_quiet,
+# check_bench_load_gate, check_fold_report_class, check_result_block,
+# fold_report_counts, and both mutation matrices -- went with it), so this
+# hand-written `for c in check_build_dir_consumers.sh check_doc_counts.sh`
+# hardcoded a file that no longer exists. That is the retirement-family defect
+# in a matrix: a checker reference left behind after the thing it described was
+# removed. It did NOT fail the run -- it surfaced as M-H MISSED with a `cp:
+# cannot stat`, silently dropping a state and the matrix reporting 8/9. Enumerate
+# from scripts/, so the next deletion is caught the same way the next addition
+# is. FLOORED like check_build_dir_consumers.sh's own harvest: a matrix that
+# copies zero consumers and still runs M-G/M-I would be certifying nothing.
+N_CONS=0
+for c in "$SCRIPT_DIR"/check_*.sh; do
+  case "$(basename "$c")" in
+    check_gate_enum.sh) continue ;;   # the checker under test, not a consumer
+  esac
+  cp "$c" "$SB/$(basename "$c")" && N_CONS=$((N_CONS + 1))
 done
+echo "-- consumer population: $N_CONS check_*.sh copied into the sandbox"
+[ "$N_CONS" -ge 1 ] || {
+  echo "FAIL: no consumer scripts found in $SCRIPT_DIR -- the population did not" >&2
+  echo "      enumerate, so M-G/M-I would be vacuous"; exit 2; }
 
 # M-G: widen check_build_dir_consumers.sh's self-exclusion until it skips
 # everything -- the exact mutation that produced AUDIT #20(b).
@@ -270,11 +290,55 @@ consumer_state "M-I" "$SB/check_build_dir_consumers.sh" \
   'BUILD-DIR CONSUMER CHECK: PASS' \
   "a non-numeric harvest must not report success"
 
-# M-H: make check_doc_counts.sh's index harvest return 0 without the guard
-# noticing -- its "sites_found=0" twin.
-consumer_state "M-H" "$SB/check_doc_counts.sh" \
-  's|^idx_rows=.*|idx_rows=0|' \
-  'harvested 0 items' \
+# M-H: a consumer's harvest goes EMPTY and its guard must then make it FAIL --
+# AUDIT #14's "sites_found=0" class, for a consumer shape (enum_require_nonempty
+# + a PASS marker) that check_build_dir_consumers.sh's M-G/M-I do not cover.
+# The original M-H hardcoded the consumer NAME (`check_doc_counts.sh`) AND its
+# variable (`idx_rows`); when that whole family was deleted at 38c44b8 both
+# went stale at once, the state silently no-op'd, and the matrix reported 8/9
+# instead of failing. Two fixes, both derived:
+#   * the consumer is a SELF-CONTAINED FIXTURE, not a named live checker. The
+#     live checkers cannot run in this matrix's bare sandbox anyway (they need
+#     the repo: CMakeLists, the gate population, git), and a fixture is the
+#     right home for a state about a checker that no longer exists -- it keeps
+#     the state runnable after any further deletion, which is the whole point
+#     after this one already died from exactly that.
+#   * the mutation is on the HARVEST VARIABLE (`idx_rows`), matching the
+#     archived state's shape. The marker passed to consumer_state is the
+#     MUTATION'S OWN marker (`MUT_H`), which by construction appears in the
+#     SOURCE and never in either run's OUTPUT -- so it is absent in both the
+#     baseline and the mutation, as consumer_state's pred_expect_absent
+#     requires. The CATCH is the exit code: the baseline's guard is satisfied
+#     (rc=0) and the mutation's is not (rc=1). Trying to use the consumer's
+#     own PASS sentence as the marker cannot work under this harness: a
+#     sentence the baseline prints is PRESENT in the baseline and reads as
+#     "marker survived", and a sentence only the mutation prints is the wrong
+#     polarity. The exit code is the real signal here, and the marker is a
+#     polarity placeholder that cannot fire either way.
+M_H_CONS="$SB/mh_consumer.sh"
+cat >"$M_H_CONS" <<'EOF'
+#!/usr/bin/env bash
+# M-H fixture: a checker whose guard is wired and whose PASS marker is printed
+# ONLY while the guard is satisfied. This is the archived check_doc_counts.sh
+# shape (AUDIT #14's sites_found=0 class), reproduced self-contained so the
+# state survives the deletion of every checker it once described.
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/_gate_enum.sh"
+echo "== M-H CONSUMER =="
+idx_rows=5
+echo "-- harvest: $idx_rows row(s)"
+enum_require_nonempty "commit-index rows" "$idx_rows" "index rows"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "RESULT: M-H consumer PASSED"
+fi
+exit $rc
+EOF
+chmod +x "$M_H_CONS"
+consumer_state "M-H" "$M_H_CONS" \
+  's@^idx_rows=.*@idx_rows=0@' \
+  'MUT_H' \
   "the consumer's own harvest is empty"
 
 # ---- residue + verdict ---------------------------------------------------

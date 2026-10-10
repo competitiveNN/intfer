@@ -173,6 +173,31 @@ for k in "${ALL_D1[@]}"; do
       echo "     exempt-by-reason  $k  (TP=2 gate+up FUSION, not a per-output" \
            "decode copy; bit-exactness is certified by the test_tp2_27b.sh" \
            "FUSED_GATE_UP arm, see the case header)" ;;
+    gemm_usm_decode1_wave_fuse)
+      # INTFER_WAVE_LAUNCH_FUSE: ONE parallel_for over the UNION of a wave's
+      # independent GEMM outputs, instead of N separate launches. This is NOT a
+      # copy of the scalar per-output decode arithmetic and the subset /
+      # shift-into-mask relations do not describe it, for the same structural
+      # reasons as gateup_int2tab -- and one more:
+      #   * it is a FUSION of N_items GEMMs, not one -- each WI is located into
+      #     its item by a prefix-sum linear search over start[i], then reads
+      #     THAT item's M/N/K/scheme/act/scale/code/out pointers;
+      #   * it carries NO shift-into-mask atom at all: the weight byte is read
+      #     as `wrow[idx / pack]` with `within = idx % pack` and
+      #     `code = (byte >> (within * bits)) & ((1 << bits) - 1)` -- the
+      #     GENERAL packed form, valid for any bits, not the INT2-specific
+      #     `bv >> ((j & 3) * 2) & 3`. So it has nothing for the verb|wvec
+      #     EQUALITY loop to compare, and adding it there would be a red stack
+      #     on a body that is correct by construction.
+      # The relation that DOES hold is stream-identity against N separate
+      # quant_gemm_forward_usm calls, and that is certified by the
+      # WAVE_LAUNCH_FUSE arm in scripts/test_tp2_27b.sh (the only gate whose
+      # model carries INT2), which asserts the stream against the fixed
+      # oracle -- not by this checker, which is about drift BETWEEN copies,
+      # and this body has no sibling copy to drift from.
+      echo "     exempt-by-reason  $k  (wave-launch FUSION, not a per-output" \
+           "decode copy; stream identity is certified by the test_tp2_27b.sh" \
+           "WAVE_LAUNCH_FUSE arm, see the case header)" ;;
     *) echo "     UNCOVERED           $k  <-- no pin and no stated reason" ;;
   esac
 done
@@ -184,7 +209,7 @@ if printf '%s\n' "${ALL_D1[@]}" | grep -qx 'gemm_usm_decode1_rowpair' && [ "$rp_
 fi
 # An UNCOVERED entry is drift in the POPULATION, not a style note.
 if printf '%s\n' "${ALL_D1[@]}" | grep -qvE \
-     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp|gemm_usm_decode1_verbdead|gemm_usm_decode1_verbsel|gemm_usm_decode1_verbvec|gemm_usm_decode1_wvec|gemm_usm_decode1_gateup_int2tab)$'; then
+     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp|gemm_usm_decode1_verbdead|gemm_usm_decode1_verbsel|gemm_usm_decode1_verbvec|gemm_usm_decode1_wvec|gemm_usm_decode1_gateup_int2tab|gemm_usm_decode1_wave_fuse)$'; then
   echo "  FAIL  a decode1 body is neither pinned nor exempted -- enumerate it" >&2
   printf '%s\n' "${ALL_D1[@]}" | sed 's/^/        /' >&2
   exit 1
