@@ -187,6 +187,13 @@ for tp in $TPS; do
   l4_fused_announced() { grep -aq '\[l4-fused\] la_out fusion ACTIVE' "$1"; }
   l4_fused_batch_announced() { grep -aq '\[l4-fused-batch\] M-row la_out fusion ACTIVE' "$1"; }
   {
+    # L4_OUT/L4_ERR are assigned here, mirroring the FUSE_ACT block above --
+    # they were missing, so under `set -u` the first reference at line 191
+    # was an unbound-variable error and the arm died before running anything
+    # (measured: test_gpu_optin.sh [healthy] rc=1 with "L4_OUT: unbound
+    # variable"). Same shape as FUSE_OUT/FUSE_ERR, which is why the pattern
+    # is copied rather than invented.
+    L4_OUT="$(mktemp)"; L4_ERR="$(mktemp)"
     env INTFER_L4_FUSE=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
       -n "${N:-4}" --no-stream --ids $TOK >"$L4_OUT" 2>"$L4_ERR"; L4_RC=$?
     if [ "$L4_RC" -ne 0 ]; then
@@ -259,6 +266,10 @@ for tp in $TPS; do
   # ABSENCE on TP=2.
   l5_front_announced() { grep -aq '\[l5-front\] device front chain ACTIVE' "$1"; }
   {
+    # L5_OUT/L5_ERR are assigned here, same as L4 above -- they were missing,
+    # so under `set -u` this arm died with an unbound-variable error before
+    # running anything. Same shape as FUSE_OUT/FUSE_ERR and the L4 fix.
+    L5_OUT="$(mktemp)"; L5_ERR="$(mktemp)"
     env INTFER_L5_FRONT=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
       -n "${N:-4}" --no-stream --ids $TOK >"$L5_OUT" 2>"$L5_ERR"; L5_RC=$?
     if [ "$L5_RC" -ne 0 ]; then
