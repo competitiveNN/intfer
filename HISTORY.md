@@ -1831,3 +1831,73 @@ or it measures VERBHALF and certifies nothing. The arm's
 announcement assertion is what catches a violation — a green arm
 without the announcement line is vacuous. The guard cannot see
 default-shadowing by construction.
+
+---
+
+## 2026-10-10 (later): Fix 1 was itself structurally dead code — the guard could not see six of its nine subjects
+
+**Fix 1 (30f3840) got the PREDICATE right and the POSITION wrong.**
+It moved the guard to "immediately after the seventh flag read" —
+which is still *after* the ROWPAIR, VERBHALF, VERBMP, VERBDEAD and
+VERBSEL blocks, and every one of those ends in `return q.submit(...)`.
+So:
+
+* its `use_rowpair`, `use_verbdead` and `use_verbsel` entries were
+  **unreachable** — a dead-code smell a reader could not miss, because
+  the names were right there and the block was right there;
+* it never counted `use_splitk`, which dispatches *after* it and
+  **is** reachable — so `INTFER_DECODE1_SPLITK=1` plus any later arm
+  was a state it could not see at all;
+* it could only ever police pairs among `{verbvec, wvec, mr}`, the
+  three arms that dispatch after it.
+
+A guard that cannot see its subjects certifies nothing, and this one
+had been certifying exactly one pair out of thirty-six.
+
+**Fixed by moving the guard to the TOP of the `M == 1` block and
+hoisting all nine opt-in flags there with it** (plus `num_groups`,
+`is_int8`, `pack`, `use_int2_tab`, which the arms already read and
+which were previously declared inside `if (bits < 16)`). The first
+attempt at this failed on declaration order — the flags are declared
+later in the block, exactly the failure mode the earlier revert
+recorded — so the hoist is the fix, not the relocation: every
+declaration moves up, nothing is re-declared in place, and a new arm
+adds exactly one line to the hoist block. `use_int2_tab` was the
+tricky one: it is nested inside `if (bits < 16)` and the guard needs
+it, so it moves out of that nest along with everything else.
+
+**The predicate is unchanged and now actually exercisable:**
+count only **opt-in** arms (VERBHALF/VERBMP are default-ON and are
+excluded, which is what makes production pass), and count an arm only
+if its dispatch condition holds on this call. The guard now covers
+all nine: ROWPAIR, VERBDEAD, VERBSEL, VERBVEC, WVEC, MR, SPLITK
+(plus the two defaults, deliberately not counted).
+
+**PROVEN ON REAL HARDWARE, not just a build.** `rowpair_equiv`'s
+harness sets the kill switch of every non-selected arm
+(`main.cpp:332-337`), so exactly one opt-in arm is live per process
+and that binary *cannot* trigger the guard by construction — the
+opposite of a proof. A temporary probe build neutralised that loop
+(set the selected arm, left every other presence flag alone) and
+then, on a live B580 with a synthetic INT2 buffer:
+
+| state | result |
+|---|---|
+| production (no opt-in set) | **silent** — correct |
+| ROWPAIR + MR both live | **REFUSED** — `INTFER_DECODE1_ROWPAIR and INTFER_DECODE1_MR` |
+| VERBDEAD + VERBSEL both live | **REFUSED** — `INTFER_DECODE1_VERBDEAD and INTFER_DECODE1_VERBSEL` |
+| SPLITK + WVEC both live | **REFUSED** — `INTFER_DECODE1_WVEC and INTFER_DECODE1_SPLITK` |
+| VERBVEC + WVEC both live | **REFUSED** — `INTFER_DECODE1_VERBVEC and INTFER_DECODE1_WVEC` |
+
+All four pairs were unreachable from the old position; all four now
+fire. The harness was restored from git immediately after (no tracked
+change), and the WVEC differential still reads **BITWISE IDENTICAL**
+against the restored base on the same run (87052 diff lines, head
+empty) — the hoist did not touch any kernel body.
+
+**Re-verified after the fix:** build clean (100%, `intfer_cli` +
+`rowpair_equiv` rebuilt), `bash -n` on all scripts, `gate_inventory.sh`
+17 PASS / 0 PARTIAL / 0 SKIPPED, `rowpair_equiv --self-check` PASS
+(2 must-appear / 1 must-stay-quiet / 4 must-be-refused),
+`check_decode1_copies.sh` PASS (7/7 split-K atoms). The probe build
+was temporary and is not in the tree.

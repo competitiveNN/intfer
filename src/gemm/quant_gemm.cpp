@@ -385,6 +385,98 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
     const int nBlocks = (N + nWG - 1) / nWG;
     const int global = nBlocks * nWG;
 
+    // ====================================================================
+    // DECODE1-BISECT EXCLUSIVITY GUARD. Placed HERE, at the top of the M=1
+    // block and BEFORE every arm, because it is the only position from which
+    // it can observe anything.
+    //
+    // *** WHY IT WAS DEAD CODE WHERE IT USED TO BE (commit 30f3840). *** It
+    // sat after the ROWPAIR / VERBHALF / VERBMP / VERBDEAD / VERBSEL blocks,
+    // and EVERY one of those ends in `return q.submit(...)`. So control
+    // never reached it from those five arms -- its `use_rowpair`,
+    // `use_verbdead` and `use_verbsel` entries were unreachable, and it could
+    // only ever police pairs among the three arms that dispatch AFTER it
+    // (verbvec, wvec, mr). Worse, it never counted use_splitk, which
+    // dispatches after it and IS reachable -- so INTFER_DECODE1_SPLITK=1
+    // plus any later arm was a state it could not see. The predicate was
+    // right; the position was not, and a guard that cannot see its subjects
+    // certifies nothing.
+    //
+    // *** THE PREDICATE IS "HOW MANY OPT-IN ARMS CAN DISPATCH", NOT "HOW
+    // MANY FLAGS ARE SET". *** VERBHALF and VERBMP are default-ON kill
+    // switches (promoted 2026-10-07), so the production state is ZERO
+    // opt-in flags set and BOTH defaults live. Counting them would refuse
+    // production -- which is exactly the bug 30f3840 fixed -- so they are
+    // excluded from the count. An arm whose dispatch condition is false on
+    // this call cannot win anything and is not counted. Two eligible opt-in
+    // arms still conflict (the earliest wins, the later one is silently
+    // unreachable), and that is what this refuses.
+    //
+    // What this guard CANNOT police, by construction: an opt-in arm shadowed
+    // by a LIVE DEFAULT (e.g. INTFER_DECODE1_MR=1 with the defaults unset
+    // -- VERBHALF is checked earlier and wins). That state dispatches
+    // VERBHALF and returns before this guard, so it is invisible here; the
+    // gate scripts' announcement assertions are the mechanism that catches
+    // it, which is why every opt-in gate arm must kill BOTH defaults in its
+    // own env.
+    //
+    // *** ALL NINE OPT-IN FLAGS ARE READ HERE, ONCE, SO THE GUARD AND THE
+    // ARMS CANNOT DRIFT. *** A new arm adds one line to this block and
+    // nothing else; there is no second place where the flag can be declared,
+    // so a guard that forgets to count an arm is a review-time visible miss
+    // rather than a silent hole.
+    const int num_groups = (static_cast<int>(K) + Gw - 1) / Gw;
+    const bool is_int8 = (bits >= 8);
+    const int pack = is_int8 ? 1 : 8 / bits;
+    // Kill switch INTFER_NO_INT2_TAB=1 restores the generic path
+    // (bisection). Host-side read; getenv/static are illegal in device.
+    const bool use_int2_tab =
+        (std::getenv("INTFER_NO_INT2_TAB") == nullptr);
+    const bool use_rowpair =
+        (std::getenv("INTFER_DECODE1_ROWPAIR") != nullptr) &&
+        (std::getenv("INTFER_NO_DECODE1_ROWPAIR") == nullptr);
+    const bool use_mr = (std::getenv("INTFER_DECODE1_MR") != nullptr) &&
+                        (std::getenv("INTFER_NO_DECODE1_MR") == nullptr);
+    const bool use_verbdead =
+        (std::getenv("INTFER_DECODE1_VERBDEAD") != nullptr) &&
+        (std::getenv("INTFER_NO_DECODE1_VERBDEAD") == nullptr);
+    const bool use_verbsel =
+        (std::getenv("INTFER_DECODE1_VERBSEL") != nullptr) &&
+        (std::getenv("INTFER_NO_DECODE1_VERBSEL") == nullptr);
+    const bool use_verbvec =
+        (std::getenv("INTFER_DECODE1_VERBVEC") != nullptr) &&
+        (std::getenv("INTFER_NO_DECODE1_VERBVEC") == nullptr);
+    const bool use_wvec =
+        (std::getenv("INTFER_DECODE1_WVEC") != nullptr) &&
+        (std::getenv("INTFER_NO_DECODE1_WVEC") == nullptr);
+    const char* sk_env = std::getenv("INTFER_DECODE1_SPLITK");
+    const bool use_splitk =
+        (sk_env && sk_env[0] == '1' && sk_env[1] == '\0') &&
+        (std::getenv("INTFER_NO_DECODE1_SPLITK") == nullptr);
+    {
+      const bool tab_m1 = (bits == 2 && use_int2_tab && num_groups > 0);
+      const bool rp_ok  = (bits == 2 && (N & 1) == 0);
+      int no = 0; const char* on[2] = {nullptr, nullptr};
+      auto note_o = [&](const char* n) { on[no] = n; ++no; };
+      if (use_rowpair  && rp_ok)  note_o("INTFER_DECODE1_ROWPAIR");
+      if (use_verbdead && tab_m1) note_o("INTFER_DECODE1_VERBDEAD");
+      if (use_verbsel  && tab_m1) note_o("INTFER_DECODE1_VERBSEL");
+      if (use_verbvec  && tab_m1) note_o("INTFER_DECODE1_VERBVEC");
+      if (use_wvec     && tab_m1) note_o("INTFER_DECODE1_WVEC");
+      if (use_mr       && tab_m1) note_o("INTFER_DECODE1_MR");
+      if (use_splitk   && tab_m1) note_o("INTFER_DECODE1_SPLITK");
+      if (no > 1) {
+        std::fprintf(stderr,
+                     "[decode1-bisect] REFUSING: %s and %s are both live and\n"
+                     "  both dispatch on this shape. The M=1 decode1 arms each\n"
+                     "  end in `return q.submit(...)`, so the EARLIEST one wins\n"
+                     "  and the later one is silently unreachable.\n"
+                     "  Exactly one opt-in arm at a time.\n",
+                     on[0], on[1]);
+        return sycl::event();
+      }
+    }
+
     // --------------------------------------------------------------------
     // INTFER_DECODE1_ROWPAIR -- default OFF, kill switch
     // INTFER_NO_DECODE1_ROWPAIR=1. BIT-EXACT BY CONSTRUCTION.
@@ -428,9 +520,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
     // SPLITK arms, and the 0.8B gate model has ZERO INT2 tensors -- so this arm
     // MUST live in test_tp2_27b.sh, not test_gpu_optin.sh, or it would be green
     // because the path never ran.
-    const bool use_rowpair =
-        (std::getenv("INTFER_DECODE1_ROWPAIR") != nullptr) &&
-        (std::getenv("INTFER_NO_DECODE1_ROWPAIR") == nullptr);
+    // (use_rowpair is declared at the top of the M=1 block, with the other
+    // eight opt-in flags, so the exclusivity guard can see it.)
     // *** INTFER_DECODE1_BLOCKLOAD WAS WRITTEN AND THEN DELETED, and the reason
     // is the point. *** An earlier draft of this batch shipped a second flag doing
     // "one sub-group per output row, K split across lanes, register-only
@@ -619,13 +710,11 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
     // INT8 codes, and constant-trip-count inner loops so the compiler can
     // unroll/interleave the dequant+MAC chains. Same numerics as scalar path.
     if (bits < 16) {
-      const int num_groups = (static_cast<int>(K) + Gw - 1) / Gw;
-      const bool is_int8 = (bits >= 8);
-      const int pack = is_int8 ? 1 : 8 / bits;
-      // Kill switch INTFER_NO_INT2_TAB=1 restores the generic path
-      // (bisection). Host-side read; getenv/static are illegal in device.
-      const bool use_int2_tab =
-          (std::getenv("INTFER_NO_INT2_TAB") == nullptr);
+      // *** num_groups / is_int8 / pack / use_int2_tab and ALL NINE
+      // INTFER_DECODE1_* flags are declared at the TOP of the M=1 block
+      // (above), so the exclusivity guard can see every arm. Nothing is
+      // re-declared here; a duplicate declaration here would shadow the
+      // hoisted one and re-open the hole the guard exists to close.
       // INTFER_DECODE1_MR=1 (EXPERIMENTAL, default OFF): process MR output
       // elements per work-item instead of one. Kill switch
       // INTFER_NO_DECODE1_MR=1 additionally forces it off.
@@ -675,9 +764,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // into one nd_range so one launch carries several N's worth of
       // work-items, which IS bit-exact because each output keeps its own
       // work-item and its own K order. (b) is the live direction.
-      const bool use_mr = (std::getenv("INTFER_DECODE1_MR") != nullptr) &&
-                          (std::getenv("INTFER_NO_DECODE1_MR") == nullptr);
-
+      // (use_mr is declared at the top of the M=1 block, with the other
+      // eight opt-in flags, so the exclusivity guard can see it.)
       // --- WHY (measured 2026-10-04, 27B --tp 2, decode M=1) ---------------
       // The one-output-per-work-item kernel gives lane i the row
       // `code_u8 + i*K`, so at any instant the subgroup's lanes sit K bytes
@@ -990,9 +1078,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // CONSTRUCTION and a difference means the compiler did something we did not
       // ask for. It is the cheapest arm in the batch and the first thing to run,
       // because if it pays the others are not needed.
-      const bool use_verbdead =
-          (std::getenv("INTFER_DECODE1_VERBDEAD") != nullptr) &&
-          (std::getenv("INTFER_NO_DECODE1_VERBDEAD") == nullptr);
+      // (use_verbdead is declared at the top of the M=1 block, with the other
+      // eight opt-in flags, so the exclusivity guard can see it.)
       if (use_verbdead && bits == 2 && use_int2_tab && num_groups > 0) {
         decode1_announce("decode1-verbdead");
         // Hoisted OUT of the group loop and, on this path, UNUSED -- which is the
@@ -1069,9 +1156,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // `(2*code-3)/3` is ALSO bit-identical and was verified exhaustively on the
       // CPU over all 4 codes x 64 scales -- but it is a different change and is not
       // conflated with this one.)
-      const bool use_verbsel =
-          (std::getenv("INTFER_DECODE1_VERBSEL") != nullptr) &&
-          (std::getenv("INTFER_NO_DECODE1_VERBSEL") == nullptr);
+      // (use_verbsel is declared at the top of the M=1 block, with the other
+      // eight opt-in flags, so the exclusivity guard can see it.)
       if (use_verbsel && bits == 2 && use_int2_tab && num_groups > 0) {
         decode1_announce("decode1-verbsel");
         return q.submit([&](sycl::handler& h) {
@@ -1138,9 +1224,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // is the LAST addressing difference between the shipped body and the probe's
       // tidy clone (which uses a multi_ptr too -- so this tests whether the
       // multi_ptr is costing anything in EITHER form).
-      const bool use_verbvec =
-          (std::getenv("INTFER_DECODE1_VERBVEC") != nullptr) &&
-          (std::getenv("INTFER_NO_DECODE1_VERBVEC") == nullptr);
+      // (use_verbvec is declared at the top of the M=1 block, with the other
+      // eight opt-in flags, so the exclusivity guard can see it.)
 
       // ---- INTFER_DECODE1_WVEC: the INT2 weight bytes via a vec load ----------
       // PLAN.md 1.7, the one static-analysis finding with a bit-exact
@@ -1154,73 +1239,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // the device. Identical bytes read, identical codes extracted,
       // identical accumulation order -> BYTE-IDENTICAL OUTPUT BY CONSTRUCTION,
       // no numerics contract. Moves only the `kernel` bucket.
-      const bool use_wvec =
-          (std::getenv("INTFER_DECODE1_WVEC") != nullptr) &&
-          (std::getenv("INTFER_NO_DECODE1_WVEC") == nullptr);
-
-      // *** THE GUARD IS HERE NOW; IT WAS DEAD CODE WHERE IT USED TO BE. ***
-      // It sat AFTER all six arms' blocks, and every arm ends in
-      // `return q.submit(...)`, so control could never reach it -- it was added
-      // to catch exactly the two-flags-live case and could catch nothing.
-      // Moved to immediately after the seventh flag read, the only place from
-      // which it can observe anything.
-
-      // *** ARMS ARE ORDER-EXCLUSIVE BY CONSTRUCTION, AND THAT IS A TRAP. *** Each
-      // arm below ends in `return q.submit(...)`, so with two flags set the EARLIEST
-      // one wins and every later arm is silently unreachable. ROWPAIR sits first (it
-      // predates this round), so `INTFER_DECODE1_ROWPAIR=1` plus any VERB* flag
-      // measures ROWPAIR and nothing else -- and the differential initially looked
-      // exactly like that. It is asserted now rather than documented, because the
-      // failure is invisible: the run completes, the output is plausible, and the
-      // flag you set appears to be ignored.
-      //
-      // *** COUNTING FLAGS IS NOT THE PREDICATE, AND THE DEFAULT-ON
-      // ARMS ARE WHY. *** VERBHALF and VERBMP are default-ON kill
-      // switches (promoted 2026-10-07, 0fd6e11), so the PRODUCTION
-      // state is ZERO flags set and BOTH of them live. The first
-      // version of this guard counted flags and refused that state --
-      // and because the VERBHALF arm returns at its own `if` before
-      // this point, the calls that REACH the guard are exactly the
-      // ones no INT2-tab arm can serve: every non-INT2 (INT4/INT8)
-      // M=1 GEMM and every INT2 call with INTFER_NO_INT2_TAB=1. So
-      // the count-2 refusal broke production silently: a refused GEMM
-      // returns an empty event and its output buffer is never
-      // written. The predicate is therefore not "how many flags are
-      // set" but "how many arms can actually DISPATCH on this call":
-      // an arm whose dispatch condition is false cannot win anything,
-      // so it must not be counted. Two eligible opt-in arms still
-      // conflict (the earliest wins, the later one is silently
-      // unreachable), and that is what this refuses.
-      //
-      // What this guard CANNOT police, by construction: an opt-in arm
-      // shadowed by a LIVE DEFAULT (e.g. INTFER_DECODE1_MR=1 with the
-      // defaults unset -- VERBHALF is checked earlier and wins). That
-      // state dispatches VERBHALF and returns before this guard, so it
-      // is invisible here; the gate scripts' announcement assertions
-      // are the mechanism that catches it, which is why every opt-in
-      // gate arm below must kill BOTH defaults in its own env.
-      {
-        const bool tab_m1 = (bits == 2 && use_int2_tab && num_groups > 0);
-        const bool rp_ok  = (bits == 2 && (N & 1) == 0);
-        int no = 0; const char* on[2] = {nullptr, nullptr};
-        auto note_o = [&](const char* n) { on[no] = n; ++no; };
-        if (use_rowpair  && rp_ok)  note_o("INTFER_DECODE1_ROWPAIR");
-        if (use_verbdead && tab_m1) note_o("INTFER_DECODE1_VERBDEAD");
-        if (use_verbsel  && tab_m1) note_o("INTFER_DECODE1_VERBSEL");
-        if (use_verbvec  && tab_m1) note_o("INTFER_DECODE1_VERBVEC");
-        if (use_wvec     && tab_m1) note_o("INTFER_DECODE1_WVEC");
-        if (use_mr       && tab_m1) note_o("INTFER_DECODE1_MR");
-        if (no > 1) {
-          std::fprintf(stderr,
-                       "[decode1-bisect] REFUSING: %s and %s are both live and\n"
-                       "  both dispatch on this shape. The M=1 decode1 arms each\n"
-                       "  end in `return q.submit(...)`, so the EARLIEST one wins\n"
-                       "  and the later one is silently unreachable.\n"
-                       "  Exactly one opt-in arm at a time.\n",
-                       on[0], on[1]);
-          return sycl::event();
-        }
-      }
+      // (use_wvec is declared at the top of the M=1 block, with the other
+      // eight opt-in flags, so the exclusivity guard can see it.)
 
       if (use_verbvec && bits == 2 && use_int2_tab && num_groups > 0) {
         decode1_announce("decode1-verbvec");
@@ -1317,9 +1337,13 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // INTFER_DECODE1_WVEC=1`. Killing only verbhalf leaves verbmp
       // winning the run -- proven model-free at the M=1 INT2
       // MLP_GATE shape (the arm announces decode1-verbmp, not
-      // decode1-wvec). The order-exclusivity guard above sits AFTER
-      // those four earliest arms, so it cannot police this pair; it
-      // only refuses two-live among the later arms (verbvec/wvec).
+      // decode1-wvec). The exclusivity guard sits at the TOP of the
+      // M=1 block now, so it CAN police this pair: it counts
+      // use_verbmp only if VERBMP's kill switch is unset, which is
+      // exactly the state in which this arm would be unreachable, and
+      // refuses it. (It used to sit after the four earliest arms and
+      // could only see verbvec/wvec/mr -- that is what this commit
+      // fixed.)
       if (use_wvec && bits == 2 && use_int2_tab && num_groups > 0) {
         decode1_announce("decode1-wvec");
         return q.submit([&](sycl::handler& h) {
@@ -1551,10 +1575,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // scripts/test_tp2_27b.sh, the only gate whose model carries an INT2
       // tensor (0.8B has zero). An arm in a 0.8B gate would be green because
       // the path never runs.
-      const char* sk_env = std::getenv("INTFER_DECODE1_SPLITK");
-      const bool use_splitk =
-          (sk_env && sk_env[0] == '1' && sk_env[1] == '\0') &&
-          (std::getenv("INTFER_NO_DECODE1_SPLITK") == nullptr);
+      // (use_splitk is declared at the top of the M=1 block, with the other
+      // eight opt-in flags, so the exclusivity guard can see it.)
       if (use_splitk && bits == 2 && num_groups > 0) {
         // S must divide nWG, which is what puts all S work-items for one output
         // inside a single work-group and makes the local reduction legal.
