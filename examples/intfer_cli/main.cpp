@@ -1934,20 +1934,38 @@ struct GpuBackend : public LinearBackend {
     size_t ndev = eng->num_devices();
     for(size_t d=0; d<ndev; ++d){
       sycl::queue& q = eng->device_queue((int)d);
-      for(size_t t=0; t<lm_head_q_dev_[d].size(); ++t){
-        if(lm_head_q_dev_[d][t]){
+      // q/s/b are resized only in the default (INT8) build (1456-1458),
+      // w only in the force_fp16 build (1453); c is resized in BOTH
+      // (1454 and 1459). Bound the tile loop on c and guard every
+      // outer index, or fail_reset reads OOB on the path that did not
+      // resize a given vector: the M=1 default path leaves w_dev_
+      // empty and an M=1-only process leaves cM_dev_ empty, and the
+      // unguarded [d] turned every recoverable lm_head error into a
+      // SIGSEGV (main.cpp:1963 was the live crash -- a null-deref on
+      // the empty w_dev_) instead of the "degrade to {}" fallback this
+      // reset exists to provide. c's per-tile count equals q/s/b/w's
+      // (all pushed once per t_idx in the same upload loop), so
+      // bounding on c frees exactly the tiles that exist on any path.
+      const size_t nt = (d < lm_head_c_dev_.size())
+                        ? lm_head_c_dev_[d].size() : 0;
+      for(size_t t=0; t<nt; ++t){
+        if(d < lm_head_q_dev_.size() && t < lm_head_q_dev_[d].size() &&
+           lm_head_q_dev_[d][t]){
           sycl::free(lm_head_q_dev_[d][t], q);
           lm_head_q_dev_[d][t] = nullptr;
         }
-        if(t<lm_head_s_dev_[d].size() && lm_head_s_dev_[d][t]){
+        if(d < lm_head_s_dev_.size() && t < lm_head_s_dev_[d].size() &&
+           lm_head_s_dev_[d][t]){
           sycl::free(lm_head_s_dev_[d][t], q);
           lm_head_s_dev_[d][t] = nullptr;
         }
-        if(t<lm_head_b_dev_[d].size() && lm_head_b_dev_[d][t]){
+        if(d < lm_head_b_dev_.size() && t < lm_head_b_dev_[d].size() &&
+           lm_head_b_dev_[d][t]){
           sycl::free(lm_head_b_dev_[d][t], q);
           lm_head_b_dev_[d][t] = nullptr;
         }
-        if(t<lm_head_c_dev_[d].size() && lm_head_c_dev_[d][t]){
+        if(d < lm_head_c_dev_.size() && t < lm_head_c_dev_[d].size() &&
+           lm_head_c_dev_[d][t]){
           sycl::free(lm_head_c_dev_[d][t], q);
           lm_head_c_dev_[d][t] = nullptr;
         }
@@ -1960,10 +1978,12 @@ struct GpuBackend : public LinearBackend {
         sycl::free(lm_head_as_dev_[d], q);
         lm_head_as_dev_[d] = nullptr;
       }
-      for(size_t t=0; t<lm_head_w_dev_[d].size(); ++t){
-        if(lm_head_w_dev_[d][t]){
-          sycl::free(lm_head_w_dev_[d][t], q);
-          lm_head_w_dev_[d][t] = nullptr;
+      if(d < lm_head_w_dev_.size()){
+        for(size_t t=0; t<lm_head_w_dev_[d].size(); ++t){
+          if(lm_head_w_dev_[d][t]){
+            sycl::free(lm_head_w_dev_[d][t], q);
+            lm_head_w_dev_[d][t] = nullptr;
+          }
         }
       }
       if(d < lm_head_x_dev_.size() && lm_head_x_dev_[d]){
@@ -1982,8 +2002,10 @@ struct GpuBackend : public LinearBackend {
         sycl::free(lm_head_asM_dev_[d], q);
         lm_head_asM_dev_[d] = nullptr;
       }
-      for(auto cMv : lm_head_cM_dev_[d]){
-        if(cMv) sycl::free(cMv, q);
+      if(d < lm_head_cM_dev_.size()){
+        for(auto cMv : lm_head_cM_dev_[d]){
+          if(cMv) sycl::free(cMv, q);
+        }
       }
       if(d < lm_head_ax_dev_.size()){
         for(auto av : lm_head_ax_dev_[d]) if(av) sycl::free(av, q);
