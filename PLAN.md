@@ -72,19 +72,28 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
 
 **AUDIT 2026-10-08 — two defects found and fixed in the 1.2 implementation:**
 
-1. **M>1 prefill arms would read zeroed wave slots as mg/mu.** The fused
-   kernel has no tiled M>1 body; it returns a NULL event for M>1. The
-   engine now declines explicitly (`if (M > 1) return false;`) instead of
-   letting the caller memcpy out of an unwritten buffer. The M>1 prefill
-   arms take `run_linear_wave_batch`, which is M-row aware. Without the
-   guard the prefill arms were a silent correctness bug, not a
-   performance miss.
+1. **[SUPERSEDED 2026-10-09 by `783e56f`, record only — do not act on.**
+   M>1 prefill arms would read zeroed wave slots as mg/mu. The fused kernel
+   had no tiled M>1 body; it returned a NULL event for M>1. The engine
+   declined explicitly (`if (M > 1) return false;`) instead of letting the
+   caller memcpy out of an unwritten buffer, and the M>1 prefill arms took
+   `run_linear_wave_batch`, which is M-row aware. Without the guard the
+   prefill arms were a silent correctness bug, not a performance miss.
+   **The decline was the wrong fix.** `783e56f` found the kernel's M>1
+   indexing was itself broken (it read the wrong weight row and the wrong
+   activation row), so the guard was concealing a correctness bug rather
+   than preventing one. The M>1 path is fixed in the kernel and the guard
+   is removed: the SAME launch now covers prefill and decode, so the
+   fusion is live on the prefill hot path and not just at M=1. The
+   engine.hpp and HISTORY.md prose that described the old decline were
+   corrected 2026-10-10; this note keeps the decline-era record.
 
 2. **`nk` was short by one per device on every fused token.** The gateup
    kernel is not a `quant_gemm_forward_usm` call, so it never hit
    `profile_note_launch` — the same blind spot SSM/norm kernels had. It now
    calls `profile_note_launch()` once per launch and records the device
    event timestamps, so the load-insensitive launch counter is honest.
+   (This one was a genuine accounting fix and stands.)
 
 ### 1.3 SLM work-stealing tile scheduler for prefill tiles
 

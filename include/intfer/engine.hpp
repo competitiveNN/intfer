@@ -100,15 +100,19 @@ class Engine {
   // quant_gemm_forward_usm calls: each output keeps its own accumulator,
   // ascending kg, ascending j, its own group scale and wtab. Saves one submit
   // + one wait + one D2H readback per device per token vs the wave path.
-  // Returns false (caller keeps the wave) on TP=1, DPAS48 items, mismatched
-  // K/group/scheme, or M>1. mg/mu are filled; md is NOT (the caller's down
+  // Returns false (caller keeps the wave) on TP!=2, DPAS48 items, or
+  // mismatched K/group/scheme. mg/mu are filled; md is NOT (the caller's down
   // path consumes mg/mu via silu-mul, same contract as run_mlp_fused's host
   // fallback).
   //
-  // M>1 IS A DECLINE, NOT A FALLBACK TO A TILED FUSION. The kernel has no
-  // tiled body; it returns a NULL event for M>1, and without the guard here
-  // the caller would memcpy out of zeroed wave slots as mg/mu. The M>1
-  // prefill arms therefore take run_linear_wave_batch, which is M-row aware.
+  // M>1 IS SUPPORTED, not a decline. The kernel's outer m loop iterates the
+  // rows, so the SAME launch covers prefill and decode (783e56f). An earlier
+  // version had no tiled M>1 body and returned a NULL event for M>1; the
+  // engine then declined with `if (M > 1) return false;` and the M>1 prefill
+  // arms took run_linear_wave_batch. That guard and the NULL-event path are
+  // gone -- the M>1 indexing bug they papered over (reading the wrong weight
+  // row and the wrong activation row) is fixed in the kernel, so the decline
+  // would now be a live performance loss, not a safety net.
   bool run_mlp_gateup(int gate_ti, int up_ti,
                       const std::vector<float>& rin,
                       std::vector<float>& mg, std::vector<float>& mu,
