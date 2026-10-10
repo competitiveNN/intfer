@@ -2116,6 +2116,116 @@ sycl::event quant_gemm_forward_usm_gateup(
   return sycl::event();
 }
 
+// ---------------------------------------------------------------------------
+// FUSED WAVE LAUNCH (INTFER_WAVE_LAUNCH_FUSE).
+//
+// One parallel_for over the UNION of the wave's output elements. Each item's
+// accumulation is untouched (its own accumulator, ascending kg, ascending j,
+// its own group scale, its own wtab), so the launch is bit-exact vs N separate
+// quant_gemm_forward_usm calls. The M dimension is the outer index for every
+// item (act_usm[i] is M*K row-major, out_usm[i] is M*N row-major), and the two
+// offsets are computed separately and never combined -- the same guard the
+// gate+up kernel uses, which is what makes the M>1 prefill path safe here.
+// ---------------------------------------------------------------------------
+sycl::event quant_gemm_forward_usm_wave(
+    sycl::queue& q,
+    const std::uint16_t* const* act_usm,
+    const void* const* code_usm,
+    const std::uint16_t* const* scale_usm,
+    const float* alpha,
+    std::uint16_t* const* out_usm,
+    uint32_t N_items,
+    const uint32_t* M_arr, const uint32_t* N_arr, const uint32_t* K_arr,
+    uint32_t group_size,
+    const gemm::WeightScheme* scheme,
+    const sycl::event& copy_dep) {
+  if (N_items == 0) return sycl::event();
+  int total = 0;
+  for (uint32_t i = 0; i < N_items; ++i) {
+    if (M_arr[i] == 0 || N_arr[i] == 0 || K_arr[i] == 0) continue;
+    total += static_cast<int>(M_arr[i]) * static_cast<int>(N_arr[i]);
+  }
+  if (total <= 0) return sycl::event();
+  if (group_size == 0) group_size = K_arr[0];
+  const int Gw = static_cast<int>(group_size);
+  const int num_groups = (static_cast<int>(K_arr[0]) + Gw - 1) / Gw;
+  if (num_groups <= 0) return sycl::event();
+
+  constexpr int nWG = kThr;
+  const int nBlocks = (total + nWG - 1) / nWG;
+  const int global = nBlocks * nWG;
+
+  // Prefix sums over the items' output counts. N_items <= 16 (the wave
+  // contract), so a fixed-size C array is device-copyable by value -- a
+  // std::vector is not, and capturing it would fail the kernel's
+  // is_device_copyable static_assert.
+  int start[17];
+  start[0] = 0;
+  for (uint32_t i = 0; i < N_items; ++i)
+    start[i + 1] = start[i] +
+                   static_cast<int>(M_arr[i]) * static_cast<int>(N_arr[i]);
+
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(copy_dep);
+    h.parallel_for<class gemm_usm_decode1_wave_fuse>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) {
+          const int gid = static_cast<int>(it.get_global_id(0));
+          if (gid >= total) return;
+          // Linear search over the prefix sums (N_items <= 16, so this is
+          // cheap and keeps the kernel branch-free of any loop-carried
+          // dependency on the item count).
+          int item = 0;
+          while (item < static_cast<int>(N_items) - 1 &&
+                 gid >= start[item + 1])
+            ++item;
+          const int local = gid - start[item];
+          const int m = local / static_cast<int>(N_arr[item]);
+          const int n = local % static_cast<int>(N_arr[item]);
+          const int K = static_cast<int>(K_arr[item]);
+          const int Mi = static_cast<int>(M_arr[item]);
+          const int Ni = static_cast<int>(N_arr[item]);
+          const std::uint16_t* act = act_usm[item];
+          const std::uint16_t* sptr = scale_usm[item];
+          const float alpha_f = alpha[item];
+          std::uint16_t* outp = out_usm[item];
+          const int bits = (scheme[item] == WeightScheme::INT2) ? 2
+                         : (scheme[item] == WeightScheme::INT4) ? 4
+                         : (scheme[item] == WeightScheme::FP16) ? 16 : 8;
+          const int pack = (bits >= 8) ? 1 : 8 / bits;
+          const auto* code_u8 = static_cast<const std::uint8_t*>(code_usm[item]);
+          const std::size_t act_off = (std::size_t)m * K;
+          const std::uint8_t* wrow = code_u8 + (std::size_t)n * K;
+
+          float acc = 0.0f;
+          for (int g = 0; g < num_groups; ++g) {
+            const float scale = from_half_bits(sptr[g]) * alpha_f;
+            const int kg0 = g * Gw;
+            int kg1 = kg0 + Gw;
+            if (kg1 > K) kg1 = K;
+            if (bits >= 16) {
+              for (int kg = kg0; kg < kg1; ++kg) {
+                const std::uint16_t hv = code_u8[((std::size_t)n * K + kg) * 2] |
+                    (static_cast<std::uint16_t>(code_u8[((std::size_t)n * K + kg) * 2 + 1]) << 8);
+                acc += from_half_bits(act[act_off + kg]) *
+                       from_half_bits(hv);
+              }
+            } else {
+              for (int kg = kg0; kg < kg1; ++kg) {
+                const float av = from_half_bits(act[act_off + kg]);
+                const std::size_t idx = (std::size_t)n * K + kg;
+                const std::uint8_t byte = wrow[idx / pack];
+                const int within = static_cast<int>(idx % pack);
+                const int code = (byte >> (within * bits)) & ((1 << bits) - 1);
+                acc += av * scale * canon_value(bits, code);
+              }
+            }
+          }
+          outp[(std::size_t)m * Ni + n] = to_half_bits(acc);
+        });
+  });
+}
+
 // FP16 x FP16 GEMM (non-quantized path for lm_head etc.).
 // C[M,N] = A[M,K] * W[N,K]^T. All row-major. FP16 inputs, FP32 accum,
 // FP16 output. The compiler lowers this onto XMX FP16 matrix engines on Arc.

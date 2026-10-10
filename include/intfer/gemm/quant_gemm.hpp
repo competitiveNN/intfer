@@ -207,6 +207,56 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                           const sycl::event& copy_dep);
 
                                       // ---------------------------------------------------------------------------
+                                      // FUSED WAVE LAUNCH (INTFER_WAVE_LAUNCH_FUSE).
+                                      // ---------------------------------------------------------------------------
+                                      // A wave is a set of INDEPENDENT GEMMs (distinct tensors, distinct
+                                      // activations, distinct outputs, no data dependency between items)
+                                      // that the engine currently runs as N separate parallel_for
+                                      // launches per device, each with its own submit + wait + D2H
+                                      // readback. This fuses them into ONE parallel_for whose
+                                      // global size is the UNION of the items' output elements:
+                                      // one WI owns one (item, m, n) triple, so each output's K
+                                      // accumulation is untouched and the launch count drops from
+                                      // N to 1 per device.
+                                      //
+                                      // WHY THIS IS GENERAL, NOT ANOTHER TP=1-ONLY FUSION. Unlike
+                                      // gate+up (which shares one activation vector, so it is
+                                      // column-parallel over the same split and device-local), a
+                                      // wave's items have DIFFERENT activations -- but they are all
+                                      // FP16-act, all read from the SAME per-device wave slot
+                                      // array, and TP slices the OUTPUT dim N per item, so every
+                                      // item is still device-local. The activation for item i lives
+                                      // in wv_[d*wv_W_ + i].act, its output in wv_[d*wv_W_ + i].out.
+                                      // Nothing crosses the host; this is valid at TP=2.
+                                      //
+                                      // NUMERICS. Bit-exact by construction: each output keeps its
+                                      // own accumulator, ascending kg, ascending j, its own group
+                                      // scale, its own wtab. The items are interleaved in the
+                                      // INSTRUCTION STREAM, never summed together -- the same
+                                      // argument the gate+up kernel uses (and gate+up is measured,
+                                      // not argued). No reassociation, no tolerance contract.
+                                      //
+                                      // CONTRACT. `items` carries N entries; every item MUST share
+                                      // the same M, K and group_size (the wave workspace is sized
+                                      // to the max, but the accumulation order below is per-item
+                                      // and uses each item's own K, so differing K is safe in
+                                      // principle -- the engine only calls this when all items
+                                      // share K, which is the wave contract). Returns the event;
+                                      // caller waits once and readbacks once.
+                                      sycl::event quant_gemm_forward_usm_wave(
+                                          sycl::queue& q,
+                                          const std::uint16_t* const* act_usm,  // N pointers, M*K FP16 each
+                                          const void* const* code_usm,          // N pointers, packed codes
+                                          const std::uint16_t* const* scale_usm,// N pointers, FP16 per (row, group)
+                                          const float* alpha,                   // N per-tensor divisors
+                                          std::uint16_t* const* out_usm,        // N pointers, M*N FP16 output
+                                          uint32_t N,                           // number of items
+                                          const uint32_t* M_arr, const uint32_t* N_arr,
+                                          const uint32_t* K_arr, uint32_t group_size,
+                                          const gemm::WeightScheme* scheme,
+                                          const sycl::event& copy_dep);
+
+                                      // ---------------------------------------------------------------------------
                                       // FUSED INDEPENDENT-GEMM LAUNCH (INTFER_FUSED_DECODE1) -- REMOVED 2026-10-04.
                                       // ---------------------------------------------------------------------------
 // THERE IS NO SUCH API HERE, AND THE HEADER PREVIOUSLY ADVERTISED ONE. The

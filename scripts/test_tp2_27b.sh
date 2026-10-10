@@ -1213,4 +1213,74 @@ fi
     rm -rf "$E4SB2"
   fi
 
+  # --- INTFER_WAVE_LAUNCH_FUSE certification (prefill lever) ---------------
+    # The wave is the prefill hot path: a layer's independent GEMMs (q/k/v
+    # wave-3, z/b/a wave-4, gate/up wave-2) currently run as N separate
+    # parallel_for launches per device, each with its own submit + wait +
+    # D2H readback. This fuses them into ONE parallel_for over the union of
+    # the items' output elements, so the host pays one submit + one wait +
+    # one readback pass per device per wave instead of N. Bit-exact by
+    # construction (each item's accumulator is untouched), so a base-vs-
+    # flagged stream comparison is satisfiable by a flag that did nothing
+    # -- the same nested-flag vacuity the gateup and WG arms defeat with an
+    # announcement line. The subject is the LAUNCH COUNT, and the engine
+    # announces the fusion it actually ran ([wave-launch-fuse] ... ACTIVE
+    # items=N M=... K=... group=..., one launch per device), once per
+    # process. The arm asserts the run hit the oracle AND the announcement
+    # names the fusion, and the self-check exercises that predicate in both
+    # directions (a real announcement vs one whose items= field was rewritten
+    # to the default width the wave path would have produced).
+    WF_OUT="$LOG.wf.out"; WF_ERR="$LOG.wf.err"
+    env INTFER_WAVE_LAUNCH_FUSE=1 \
+    "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+    -p "$PROMPT" -n "$N" >"$WF_OUT" 2>"$WF_ERR"; WF_RC=$?
+    if [ "$WF_RC" -ne 0 ]; then
+    echo "GATE FAIL: INTFER_WAVE_LAUNCH_FUSE=1 run exited rc=$WF_RC" >&2
+    tail -20 "$WF_ERR" >&2
+    PASS=0
+    else
+    echo "WAVE-LAUNCH-FUSE prefill: $(cli_prefill "$WF_ERR") (expect 11751)"
+    echo "WAVE-LAUNCH-FUSE ids:      $(cli_ids "$WF_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    WF_LINE="$(grep -a "\[wave-launch-fuse\]" "$WF_ERR" | head -1)"
+    if [ -z "$WF_LINE" ]; then
+      echo "GATE FAIL: the fused wave-launch path never announced itself" >&2
+      echo "         (no [wave-launch-fuse] line); the flag did not reach the" >&2
+      echo "         kernel and this arm is vacuous." >&2
+      PASS=0
+    else
+      echo "WAVE-LAUNCH-FUSE layout: $WF_LINE"
+    fi
+    # The fusion the operator asked for, as the announcement must print it.
+    WF_EXPECT_ANN="ACTIVE items="
+    echo "$WF_LINE" | grep -aq "$WF_EXPECT_ANN" \
+      || { echo "GATE FAIL: the announcement does not name the fused launch" >&2
+           echo "         wanted '$WF_EXPECT_ANN', got '$WF_LINE'" >&2; PASS=0; }
+    mr_prefill_ok "$(cli_prefill "$WF_ERR")" \
+      || { echo "GATE FAIL: wave-launch-fuse prefill != 11751" >&2; PASS=0; }
+    WF_GOT="$(cli_ids "$WF_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    WF_BASE="$(cli_ids "$CLI_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    [ "$WF_GOT" = "$WF_BASE" ] \
+      || { echo "GATE FAIL: wave-launch-fuse ids '$WF_GOT' != base '$WF_BASE'" >&2; PASS=0; }
+  # *** SELF-CHECK FOR THIS ARM. *** Same shape as the WG arm: the
+    # announcement line is the ONLY thing standing between a run where the
+    # flag was ignored (the default wave path ran, stream still matched) and
+    # a PASS. The refusal direction is the OTHER half of the items= field:
+    # the announcement carries items=N, and the default wave path would
+    # have produced N SEPARATE launches, so rewriting items=N to
+    # items=1 (one launch per item, the unfused shape) is the exact shape
+    # of "the flag did not reach the kernel". That fixture carries a real
+    # items= string, so the predicate can actually fire.
+    WFSB2="$(mktemp -d)"
+    WF_NOT_ERR="$WFSB2/wf_not.err"
+    sed 's/items=[0-9]*/items=1/' "$WF_ERR" >"$WF_NOT_ERR"
+    if ! grep -aq "\[wave-launch-fuse\]" "$WF_NOT_ERR"; then
+      echo "GATE FAIL: self-check the fixture builder removed the announcement" >&2; PASS=0
+    fi
+    WF_NOT_LINE="$(grep -a "\[wave-launch-fuse\]" "$WF_NOT_ERR" | head -1)"
+    if [ -n "$WF_NOT_LINE" ] && echo "$WF_NOT_LINE" | grep -aq "items=1"; then
+      echo "GATE FAIL: self-check the arm ACCEPTED a run whose fuse never fired" >&2; PASS=0
+    fi
+    rm -rf "$WFSB2"
+    fi
+
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)

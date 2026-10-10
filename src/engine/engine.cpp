@@ -258,6 +258,13 @@ bool dpas_fold_enabled() {
   return enabled;
 }
 
+// INTFER_WAVE_LAUNCH_FUSE: fuse a wave's independent GEMMs into one launch per
+// device (see run_linear_wave). Default OFF; PRESENCE enables, matching the
+// opt-in convention.
+bool wave_launch_fuse_enabled() {
+  return std::getenv("INTFER_WAVE_LAUNCH_FUSE") != nullptr;
+}
+
 // Build a per-device GemmWeightBuffers view over rows [start,end) of a tensor's
 // packed payload (column tensor-parallel sharding of the output dim N).
 //
@@ -1965,6 +1972,84 @@ bool Engine::run_linear_tp_devact(int tensor_index,
 // DPAS48-flagged items fall back to sequential run_linear_tp (rare:
 // DPAS is default-off; the wave's shared-slot layout targets the FP16-act
 // path). Items with tensor_index < 0 are skipped.
+// INTFER_WAVE_LAUNCH_FUSE implementation. One parallel_for per device over
+// the union of the wave's output elements; each item's accumulator is
+// untouched, so the launch is bit-exact vs nl separate calls. Returns true
+// on success (the caller's Phase 3/4 wait+readback then apply to the whole
+// wave); false means the caller must fall through to the default path.
+bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
+                                   uint32_t M) {
+  std::vector<const std::uint16_t*> act(nl);
+  std::vector<const void*> code(nl);
+  std::vector<const std::uint16_t*> scale(nl);
+  std::vector<float> alpha(nl);
+  std::vector<std::uint16_t*> outp(nl);
+  std::vector<uint32_t> Mi(nl), Ni(nl), Ki(nl);
+  std::vector<gemm::WeightScheme> ws(nl);
+  for (size_t i = 0; i < nl; ++i) {
+    const auto& t = model_.tensors[(size_t)items[i]->tensor_index];
+    const auto& sc = shard_cache_[(size_t)items[i]->tensor_index];
+    act[i] = wv_[i].act;                 // slot i, per device below
+    code[i] = sc.code_usm[0];           // filled per device in the loop
+    scale[i] = sc.scale_usm[0];
+    alpha[i] = sc.has_global_divisor ? sc.global_host : 1.0f;
+    outp[i] = wv_[i].out;
+    Mi[i] = M; Ni[i] = t.N; Ki[i] = t.K;
+    ws[i] = sc.scheme;
+  }
+  std::vector<sycl::event> kernel_events;
+  kernel_events.reserve(devices_.size());
+  for (size_t d = 0; d < devices_.size(); ++d) {
+    auto& dev = devices_[d];
+    sycl::queue& q = dev.queue;
+    for (size_t i = 0; i < nl; ++i) {
+      const auto& sc = shard_cache_[(size_t)items[i]->tensor_index];
+      code[i] = sc.code_usm[d];
+      scale[i] = sc.scale_usm[d];
+      outp[i] = wv_[d * wv_W_ + i].out;
+    }
+    // act is per (item, device): slot i on device d is wv_[d*wv_W_ + i].act.
+    for (size_t i = 0; i < nl; ++i)
+      act[i] = wv_[d * wv_W_ + i].act;
+    const uint32_t gsize = shard_cache_[(size_t)items[0]->tensor_index].group_size;
+#ifdef INTFER_PROFILE_GPU
+    auto t_s0 = std::chrono::high_resolution_clock::now();
+#endif
+    sycl::event e = gemm::quant_gemm_forward_usm_wave(
+        q, act.data(), code.data(), scale.data(), alpha.data(),
+        outp.data(), (uint32_t)nl, Mi.data(), Ni.data(), Ki.data(),
+        gsize, ws.data(), sycl::event{});
+    kernel_events.push_back(e);
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_submit_us +=
+          std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+      g_gpu_profile.submit_count += 1;
+    }
+#endif
+  }
+  // THE PATH ANNOUNCES ITSELF, ONCE. Same shape as the [mlp-gateup] line:
+  // without it a gate that compares this run's token stream against the
+  // base run's cannot tell whether the fused path ran -- the two streams
+  // are bit-identical by construction, so a flag that never reached the
+  // kernel would pass every stream check while certifying nothing. The
+  // line is printed here, after the launches, so it cannot fire for a
+  // wave that fell through to the default path.
+  static bool announced_wf = false;
+  if (!announced_wf) {
+    announced_wf = true;
+    const auto& t0 = model_.tensors[(size_t)items[0]->tensor_index];
+    const auto& sc0 = shard_cache_[(size_t)items[0]->tensor_index];
+    std::fprintf(stderr,
+                 "[wave-launch-fuse] fused wave GEMM ACTIVE "
+                 "(items=%zu M=%u K=%u group=%u, one launch per device)\n",
+                 nl, M, t0.K, sc0.group_size);
+  }
+  (void)kernel_events;
+  return true;
+}
+
 void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
                              uint32_t M) {
   if (!items || n == 0) return;
@@ -1989,18 +2074,30 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
       return;
     }
   }
-  // Phase 0: the wave workspace must cover every item's (M, K, Nl) shape
-  // plus one slot per live item. Nl_max is over TP ranks AND items; K is
-  // the max over items (K varies per tensor: H vs inter vs conv_dim...).
-  uint32_t Nl_max = 0, K_max = 0;
-  for (size_t i = 0; i < nl; ++i) {
-    const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
-    K_max = std::max(K_max, t.K);
-    const auto& ranges = shards_[live[i]->tensor_index].ranges;
-    for (size_t d = 0; d < ranges.size(); ++d)
-      Nl_max = std::max(Nl_max, ranges[d].second - ranges[d].first);
+
+  // INTFER_WAVE_LAUNCH_FUSE: one parallel_for over the union of the wave's
+  // output elements, instead of nl separate launches per device. Bit-exact
+  // by construction (each item's accumulator is untouched), so the default
+  // path below is byte-for-byte the old one when the flag is unset. Decline
+  // on anything the fused kernel does not support -- a partial fuse is worse
+  // than none, because the caller's Phase 3/4 (one wait, one readback pass)
+  // already assumes every item ran. The precondition is the wave contract
+  // itself: every item shares M, K and group_size, and no item is INT8 with
+  // the host-quant DPAS path (which would need its own launch anyway).
+  if (wave_launch_fuse_enabled()) {
+    bool ok = true;
+    uint32_t M0 = M, K0 = 0, gs0 = 0;
+    for (size_t i = 0; i < nl; ++i) {
+      const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
+      const auto& sc = shard_cache_[(size_t)live[i]->tensor_index];
+      if (i == 0) { K0 = t.K; gs0 = sc.group_size; }
+      if (M != M0 || t.K != K0 || sc.group_size != gs0 ||
+          sc.scheme == gemm::WeightScheme::INT8) { ok = false; break; }
+    }
+    if (ok) {
+      if (run_linear_wave_fused(live, nl, M)) return;
+    }
   }
-  ensure_wave_workspace(M, (uint32_t)nl, K_max, Nl_max);
 
   // Phase 1: per item — convert + write each device's wave slot.
   // Shared-input fast path: wave items often share one input vector

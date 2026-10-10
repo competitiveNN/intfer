@@ -84,6 +84,18 @@ class Engine {
   };
   void run_linear_wave(const LinearWaveItem* items, size_t n, uint32_t M);
 
+  // Fused wave launch (INTFER_WAVE_LAUNCH_FUSE): one parallel_for per device
+  // over the UNION of the wave's output elements, instead of nl separate
+  // launches. Bit-exact by construction (each item's accumulator is
+  // untouched), so the default path is byte-for-byte the old one when the
+  // flag is unset. Returns true on success (the caller's Phase 3/4
+  // wait+readback then apply to the whole wave); false means the caller must
+  // fall through to the default path. Declines on a mismatched M/K/group
+  // across items, on INT8 items (which take the host-quant DPAS path), or on
+  // any item the fused kernel does not support.
+  bool run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
+                             uint32_t M);
+
   // Fused MLP down-projection (TP=1 only): gate/up wave-submit chained
   // on-device through silu-mul + FP16 convert straight into the down
   // GEMM — one host wait + one D2H per MLP instead of wave-wait +
