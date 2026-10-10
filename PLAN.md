@@ -149,15 +149,21 @@ in AGENTS.md. Do not re-attempt as-is.
 * XMX at M=1 — the shapes are memory-bound; do not re-attempt.
 * GQA-packing the head-group into the M/row dimension at M=1
   (vllm-xpu `decode_policy_qpacked_head` / `qgroup` 8/16) —
-  **NOT APPLICABLE: no consumer in this tree.** Investigated
-  2026-10-10 (HISTORY.md, "E4 double-gating resolved; GQA-packing
-  has no consumer"). This repo's decode attention is the
-  GatedDeltaNet SSM recurrence (no KV cache, no query-head grid,
-  no GQA group); the `is_full` softmax path already implements GQA
-  grouping host-side; the M=1 INT2 decode is the layer GEMM (no
-  head structure, row dim fixed at 1). `INTFER_DECODE1_GQAPACK`
-  would be dead code at the 27B target — not implemented, recorded
-  instead.
+  **DECLINED WITH EVIDENCE, 2026-10-10** (HISTORY.md, "GQA-packing
+  DECLINED with evidence"). `INTFER_DECODE1_GQAPACK` is NOT in the
+  tree and will not be added. Dispatch trace: the only device
+  attention kernels in the tree are `flash_attention_forward_f16`
+  and `flash_attention_forward_int8_kv` (`src/attention/flash_attention.cpp`),
+  and neither is reachable from the engine or the inference path —
+  their only callers are `examples/flash_attention_demo/` and
+  `examples/qwen_forward_gpu/` (both non-inference), the rest are
+  comments. `src/engine/engine.cpp` includes the header and makes
+  zero attention calls. The decode attention that runs is the
+  GatedDeltaNet SSM recurrence (no KV cache, no GQA group); the
+  `is_full` softmax decode is host-only scalar; the M=1 INT2 decode
+  is the layer GEMM. A device paged-KV softmax-decode kernel would
+  need to be written first — that is where `qgroup` packing would
+  apply.
 
 ## 3. Dependencies required by the big items
 

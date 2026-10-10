@@ -1149,8 +1149,15 @@ so it would have to be decided on `nk`/`nw`/`nr`/`submit_count`/`usm_write_count
 `readback_count`/`wait_count`/`copy_count` — never on a tok/s, and never on
 `kernel`.
 
-## ==> 2026-10-10: E4 double-gating resolved; GQA-packing has no
-consumer <==
+## ==> 2026-10-10: E4 double-gating resolved; GQA-packing DECLINED
+## with evidence (path (b), not shipped) <==
+
+Two items from the 2026-10-10 review. E4 is resolved and recorded.
+GQA-packing (item 2) was **declined, not shipped**, and this section
+is the evidence trail the repo's own rule demands: *"an optimization
+with no consumer is dead code"* and *"bit-exact by construction
+established by reading the diff is not evidence"* — so the decline is
+proved by tracing the dispatch, not asserted from `intfer_cli`.
 
 **E4 (`INTFER_DPAS48_TILED`) is double-gated, and the −9.95% is
 against the dpas48-1D baseline, not the default prefill path.**
@@ -1183,42 +1190,87 @@ sessions and `roofline_probe` is vacuous on this box). Recorded so
 the −9.95% is never quoted as if it were a default-path win.
 
 **GQA-packing (vllm-xpu `decode_policy_qpacked_head` / `qgroup`)
-was investigated and has NO consumer in this tree — not implemented.**
+— DECLINED WITH EVIDENCE, not shipped.** The flag
+`INTFER_DECODE1_GQAPACK` does not exist in the tree and will not be
+added, because the decline is proved by tracing the dispatch, not
+asserted from `intfer_cli` (the repo's own rule: *"an optimization
+with no consumer is dead code"*).
 
 The vllm-xpu-kernels concept packs `qgroup` (8/16) query heads that
 share a KV head into one CTA's M dimension, amortizing K/V loads
-across the GQA group. It is a *device paged-KV softmax-decode*
-kernel tile size. This repo has no such kernel to pack:
+across the GQA group. It is a **device paged-KV softmax-decode**
+kernel tile size. The dispatch trace (run 2026-10-10, `grep` over the
+whole tree, excluding `build/`) shows there is no such kernel to
+pack, on any path:
 
-* **The 27B target decodes through GatedDeltaNet LINEAR attention**
-  — an SSM recurrence over `n_v_heads` INDEPENDENT value heads,
-  each with its own `k_head_dim × v_head_dim` state `S`
-  (`main.cpp:5180-5210`, `kv_mem`/`delta` recurrence). No KV cache,
+**A. The only device attention kernels in the tree are two, and both
+are prefill-shaped.** `src/attention/` contains exactly one file,
+`flash_attention.cpp`, with exactly two device kernels:
+* `flash_attention_forward_f16` (`flash_attention.cpp:30`) —
+  FP16 Q/K/V, online-softmax query-tiled.
+* `flash_attention_forward_int8_kv` (`flash_attention.cpp:154`) —
+  same, with groupwise-INT8 K/V dequant on the fly.
+
+Both tile over `num_q_blocks = (Sq + kBr - 1) / kBr`
+(`flash_attention.cpp:39, 167`) — a query-SEQUENCE grid. The header
+(`flash_attention.hpp:35-36`) notes `seq_q==1` decode is *supported
+by the tile shape*, but that is not the question; see B.
+
+**B. Neither kernel is reachable from the engine or the inference
+path.** Every occurrence of either symbol in the tree is accounted
+for, and none is a call site in the inference path:
+
+| site | what it is |
+|---|---|
+| `examples/flash_attention_demo/main.cpp:117,130,174,203` | a standalone demo binary — not the inference path |
+| `examples/qwen_forward_gpu/main.cpp:227` | a reference/diagnostic forward — not the inference path |
+| `include/intfer/engine.hpp:9` | a comment ("Fused FlashAttention via ...") |
+| `examples/intfer_cli/main.cpp:3831` | a comment ("same contract as flash_attention_forward_int8_kv") |
+| `src/engine/engine.cpp:32` | a `#include` of the header — and **zero** calls to any attention symbol |
+
+`src/engine/engine.cpp` is the engine driver, the thing that runs
+inference, and `grep 'flash_attention\|attention::' src/engine/
+engine.cpp` returns exactly one line — the include at :32. The
+inference binary `examples/intfer_cli/main.cpp` references
+`flash_attention_forward` exactly once, and that occurrence is the
+comment at :3831. So the engine has **no device softmax-attention
+kernel on any path**; the two kernels are demo/reference dead weight.
+
+**C. The decode attention that *does* run is not a KV-cache GEMM.**
+* The 27B target decodes through **GatedDeltaNet linear attention**
+  — an SSM recurrence over `n_v_heads` INDEPENDENT value heads, each
+  with its own `k_head_dim × v_head_dim` state `S`
+  (`main.cpp:5180-5210`, the `kv_mem`/`delta` recurrence). No KV cache,
   no query-head grid, no softmax, no GQA group. The
   `kh = hh*n_k/n_v` sharing (commit `22431d5`) is only of the
   query/key PROJECTION vectors, not a shared KV head.
-* **The `is_full` softmax-attention path ALREADY implements GQA
-  grouping** (`main.cpp:4948-4970`): "Heads sharing a KV head
-  reuse the same K/V cache rows... each row is loaded once per group
-  and dotted/fanned-out to all group heads. Bit-identical." It is
-  HOST-side scalar work, not a device launch — PLAN.md 1.6 already
-  records "attention tail is not the deficit."
-* **The M=1 INT2 decode path (`gemm_usm_decode1_*`) is the layer
-  GEMM** — one output element per work-item, no head structure, no
-  GQA. `INTFER_DECODE1_MR` operated here and divided the N-work-item
-  budget; at M=1 the row dimension is fixed at 1, so there is no
-  "row dimension to multiply." The inverse-of-MR analogy does not
-  transfer: MR's rows are output elements of a fixed-width GEMM, not
-  attention heads.
+* The `is_full` softmax-attention decode is **host-only scalar work**
+  (`main.cpp:4948-4970`): "Heads sharing a KV head reuse the same
+  K/V cache rows... each row is loaded once per group and
+  dotted/fanned-out to all group heads. Bit-identical." It is not a
+  device launch — PLAN.md 1.6 already records "attention tail is not
+  the deficit."
+* The M=1 INT2 decode path (`gemm_usm_decode1_*`,
+  `quant_gemm.cpp:1684`) is the **layer GEMM** — one output element
+  per work-item, no head structure, no GQA. `INTFER_DECODE1_MR`
+  operated here and divided the N-work-item budget; at M=1 the row
+  dimension is fixed at 1, so there is no "row dimension to
+  multiply." The inverse-of-MR analogy does not transfer: MR's rows
+  are output elements of a fixed-width GEMM, not attention heads.
 
-Shipping `INTFER_DECODE1_GQAPACK` would be a default-OFF flag no
-reachable branch can use at the 27B target — exactly the
-"dead-code flag" class the flag census (`check_flag_gate_coverage.sh`)
-exists to kill. Per the repo's own rule (an optimization with no
-consumer is dead code), the investigation is recorded here instead of
-shipped. If a device paged-KV softmax-decode kernel is ever added to
-this tree, THAT is where `qgroup` packing would apply — not to the
-layer GEMM or the linear-attention recurrence.
+**Why this is a decline, not a rebranding.** The one place where
+`qgroup` packing would be meaningful is a device paged-KV softmax
+kernel, and path B proves no such kernel is reachable. Implementing
+`INTFER_DECODE1_GQAPACK` would therefore be either (i) dead code at
+the 27B target — the dead-code-flag class
+`check_flag_gate_coverage.sh` exists to kill — or (ii) a rebranding
+of `INTFER_DECODE1_MR` (already measured 2.3x slower), which is the
+"two flags naming one design" defect this repo has a memory tag for.
+Neither is acceptable, so the flag is not added and the
+investigation is recorded here. **If a device paged-KV softmax-decode
+kernel is ever added to this tree, THAT is where `qgroup` packing
+would apply** — not to the layer GEMM or the linear-attention
+recurrence.
 
 ### Stack run at `e28f092` (2026-10-09, ~10 min)
 
