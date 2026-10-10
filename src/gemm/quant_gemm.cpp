@@ -1162,7 +1162,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // It sat AFTER all six arms' blocks, and every arm ends in
       // `return q.submit(...)`, so control could never reach it -- it was added
       // to catch exactly the two-flags-live case and could catch nothing.
-      // Moved to immediately after the sixth flag read, the only place from
+      // Moved to immediately after the seventh flag read, the only place from
       // which it can observe anything.
 
       // *** ARMS ARE ORDER-EXCLUSIVE BY CONSTRUCTION, AND THAT IS A TRAP. *** Each
@@ -1174,29 +1174,50 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // failure is invisible: the run completes, the output is plausible, and the
       // flag you set appears to be ignored.
       //
-      // The arms are therefore ordered and the guard below refuses to let two of
-      // them be live at once, naming the pair. This is a correctness guard on the
-      // MEASUREMENT HARNESS, not on the engine: in production exactly one is set.
+      // *** COUNTING FLAGS IS NOT THE PREDICATE, AND THE DEFAULT-ON
+      // ARMS ARE WHY. *** VERBHALF and VERBMP are default-ON kill
+      // switches (promoted 2026-10-07, 0fd6e11), so the PRODUCTION
+      // state is ZERO flags set and BOTH of them live. The first
+      // version of this guard counted flags and refused that state --
+      // and because the VERBHALF arm returns at its own `if` before
+      // this point, the calls that REACH the guard are exactly the
+      // ones no INT2-tab arm can serve: every non-INT2 (INT4/INT8)
+      // M=1 GEMM and every INT2 call with INTFER_NO_INT2_TAB=1. So
+      // the count-2 refusal broke production silently: a refused GEMM
+      // returns an empty event and its output buffer is never
+      // written. The predicate is therefore not "how many flags are
+      // set" but "how many arms can actually DISPATCH on this call":
+      // an arm whose dispatch condition is false cannot win anything,
+      // so it must not be counted. Two eligible opt-in arms still
+      // conflict (the earliest wins, the later one is silently
+      // unreachable), and that is what this refuses.
+      //
+      // What this guard CANNOT police, by construction: an opt-in arm
+      // shadowed by a LIVE DEFAULT (e.g. INTFER_DECODE1_MR=1 with the
+      // defaults unset -- VERBHALF is checked earlier and wins). That
+      // state dispatches VERBHALF and returns before this guard, so it
+      // is invisible here; the gate scripts' announcement assertions
+      // are the mechanism that catches it, which is why every opt-in
+      // gate arm below must kill BOTH defaults in its own env.
       {
-        int live = 0; const char* first = nullptr; const char* second = nullptr;
-        auto note = [&](const char* n) {
-          if (first) { second = n; } else { first = n; }
-          ++live;
-        };
-        if (use_rowpair)                 note("INTFER_DECODE1_ROWPAIR");
-        if (use_verbhalf)                note("INTFER_DECODE1_VERBHALF");
-        if (use_verbmp)                  note("INTFER_DECODE1_VERBMP");
-        if (use_verbdead)                note("INTFER_DECODE1_VERBDEAD");
-        if (use_verbsel)                 note("INTFER_DECODE1_VERBSEL");
-        if (use_verbvec)                 note("INTFER_DECODE1_VERBVEC");
-        if (use_wvec)                    note("INTFER_DECODE1_WVEC");
-        if (live > 1) {
+        const bool tab_m1 = (bits == 2 && use_int2_tab && num_groups > 0);
+        const bool rp_ok  = (bits == 2 && (N & 1) == 0);
+        int no = 0; const char* on[2] = {nullptr, nullptr};
+        auto note_o = [&](const char* n) { on[no] = n; ++no; };
+        if (use_rowpair  && rp_ok)  note_o("INTFER_DECODE1_ROWPAIR");
+        if (use_verbdead && tab_m1) note_o("INTFER_DECODE1_VERBDEAD");
+        if (use_verbsel  && tab_m1) note_o("INTFER_DECODE1_VERBSEL");
+        if (use_verbvec  && tab_m1) note_o("INTFER_DECODE1_VERBVEC");
+        if (use_wvec     && tab_m1) note_o("INTFER_DECODE1_WVEC");
+        if (use_mr       && tab_m1) note_o("INTFER_DECODE1_MR");
+        if (no > 1) {
           std::fprintf(stderr,
-                       "[decode1-bisect] REFUSING: %s and %s are both live. The\n"
-                       "  M=1 decode1 arms each end in `return q.submit(...)`, so the\n"
-                       "  EARLIEST one wins and the later one is silently unreachable.\n"
-                       "  Exactly one arm at a time.\n",
-                       first, second);
+                       "[decode1-bisect] REFUSING: %s and %s are both live and\n"
+                       "  both dispatch on this shape. The M=1 decode1 arms each\n"
+                       "  end in `return q.submit(...)`, so the EARLIEST one wins\n"
+                       "  and the later one is silently unreachable.\n"
+                       "  Exactly one opt-in arm at a time.\n",
+                       on[0], on[1]);
           return sycl::event();
         }
       }
