@@ -1049,11 +1049,20 @@ fi
   # announcement names the width the operator asked for.
   WG_OUT="$LOG.wg.out"; WG_ERR="$LOG.wg.err"
   WG_WG="${INTFER_DPAS48_WG:-160}"
-  env INTFER_DPAS48_WG="$WG_WG" \
+  # *** INTFER_DPAS48=1 IS NOT OPTIONAL. *** The width flag alone is inert:
+  # sc.dpas48 is set by dpas48_eligible (engine.cpp:203), which reads
+  # INTFER_DPAS48 and returns false without it -- so without =1 the shard
+  # builds the row-major path, run_linear_tp takes the legacy branch, and
+  # this arm's own "never announced itself" check fires on EVERY live run.
+  # The width flag is a knob ON the DPAS path, not a path selector; it needs
+  # the path selector present for the announcement to exist at all. (The
+  # operator's pending 27B run was written this way and would have hit a
+  # vacuous GATE FAIL; fixed here so the run measures something real.)
+  env INTFER_DPAS48=1 INTFER_DPAS48_WG="$WG_WG" \
   "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
   -p "$PROMPT" -n "$N" >"$WG_OUT" 2>"$WG_ERR"; WG_RC=$?
   if [ "$WG_RC" -ne 0 ]; then
-  echo "GATE FAIL: INTFER_DPAS48_WG=$WG_WG run exited rc=$WG_RC" >&2
+  echo "GATE FAIL: INTFER_DPAS48=1 INTFER_DPAS48_WG=$WG_WG run exited rc=$WG_RC" >&2
   tail -20 "$WG_ERR" >&2
   PASS=0
   else
@@ -1138,6 +1147,70 @@ fi
     echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log (vacuity)" >&2; PASS=0
   fi
   rm -rf "$WGSB2"
+  fi
+
+# --- E4 PAIR-PROMOTION: INTFER_DPAS48=1 + INTFER_DPAS48_TILED=1 ----------------
+  # The pending operator todo (PLAN.md 1.4): E4's cooperative 2D row-block DPAS
+  # is bit-exact by construction (no partial sums -- one accumulator per (row,
+  # tile), same op order as the shipped R==1 geometry), so a base-vs-flagged
+  # stream comparison is satisfiable by a flag that did nothing, exactly as the
+  # WG arm above. The subject is the GEOMETRY, and the same [dpas48-wg]
+  # announcement carries it: geometry=tiled2d vs tiled1d vs row. This arm
+  # asserts the run hit the tiled geometry AND the stream matches the base
+  # oracle, and it is reachable ONLY on the 27B (E4 requires M >= 2, which is
+  # prefill -- decode is M==1 and E4 declines by construction, so this arm
+  # cannot be certified on a 0.8B decode model).
+  E4_OUT="$LOG.e4.out"; E4_ERR="$LOG.e4.err"
+  env INTFER_DPAS48=1 INTFER_DPAS48_TILED=1 \
+  "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$E4_OUT" 2>"$E4_ERR"; E4_RC=$?
+  if [ "$E4_RC" -ne 0 ]; then
+    echo "GATE FAIL: INTFER_DPAS48=1 INTFER_DPAS48_TILED=1 run exited rc=$E4_RC" >&2
+    tail -20 "$E4_ERR" >&2
+    PASS=0
+  else
+    echo "E4 prefill: $(cli_prefill "$E4_ERR") (expect 11751)"
+    echo "E4 ids:      $(cli_ids "$E4_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    E4_LINE="$(grep -a "\[dpas48-wg\]" "$E4_ERR" | head -1)"
+    if [ -z "$E4_LINE" ]; then
+      echo "GATE FAIL: the E4 tiled path never announced itself" >&2
+      echo "         (no [dpas48-wg] line); the flag did not reach the kernel" >&2
+      echo "         and this arm is vacuous." >&2
+      PASS=0
+    else
+      echo "E4 layout: $E4_LINE"
+    fi
+    # The geometry the operator asked for, as the announcement must print it.
+    if ! echo "$E4_LINE" | grep -aq "geometry=tiled2d"; then
+      echo "GATE FAIL: the announcement does not name geometry=tiled2d" >&2
+      echo "         wanted 'geometry=tiled2d', got '$E4_LINE'" >&2; PASS=0
+    fi
+    mr_prefill_ok "$(cli_prefill "$E4_ERR")" \
+      || { echo "GATE FAIL: E4 prefill != 11751" >&2; PASS=0; }
+    # The base ids are re-derived here from the base run's own log, NOT borrowed
+    # from the WG arm: that arm sets its copy only inside its own success
+    # branch, so borrowing it would couple this arm's stream check to a
+    # different arm's control flow (and leave it empty if the WG arm failed).
+    E4_GOT="$(cli_ids "$E4_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    E4_BASE="$(cli_ids "$CLI_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    [ "$E4_GOT" = "$E4_BASE" ] \
+      || { echo "GATE FAIL: E4 ids '$E4_GOT' != base '$E4_BASE'" >&2; PASS=0; }
+  # *** SELF-CHECK FOR THIS ARM. *** Same shape as the WG arm: the geometry
+  # field is the ONLY thing standing between a run where the flag was ignored
+  # (tiled1d ran, stream still matched) and a PASS. Built by rewriting the
+  # real announcement's geometry to tiled1d -- the exact shape of "the flag
+  # did not reach the kernel".
+    E4SB2="$(mktemp -d)"
+    E4_NOT_ERR="$E4SB2/e4_not.err"
+    sed "s/geometry=tiled2d/geometry=tiled1d/" "$E4_ERR" >"$E4_NOT_ERR"
+    if ! grep -aq "\[dpas48-wg\]" "$E4_NOT_ERR"; then
+      echo "GATE FAIL: self-check the fixture builder removed the announcement" >&2; PASS=0
+    fi
+    E4_NOT_LINE="$(grep -a "\[dpas48-wg\]" "$E4_NOT_ERR" | head -1)"
+    if [ -n "$E4_NOT_LINE" ] && echo "$E4_NOT_LINE" | grep -aq "geometry=tiled1d"; then
+      echo "GATE FAIL: self-check the arm ACCEPTED a run whose tiled path never fired" >&2; PASS=0
+    fi
+    rm -rf "$E4SB2"
   fi
 
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
