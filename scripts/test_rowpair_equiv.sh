@@ -370,7 +370,9 @@ echo "        (denormal + default FTZ), so a difference is information, not a fa
 echo "        *** DEFAULTS AS OF 2026-10-07: VERBHALF and VERBMP are the DEFAULT"
 echo "        decode path (kill switches INTFER_NO_DECODE1_VERBHALF=1 / =1 restore"
 echo "        the old forms). ROWPAIR / VERBDEAD / VERBSEL / VERBVEC are still"
-echo "        opt-in. PERFORMANCE of the two defaults is measured on the clone"
-echo "        (roofline_probe_bisect: +14% / +17% MLP_GATE for VERBHALF, neutral"
-echo "        for VERBMP); the ENGINE arms are UNMEASURED on real 27B weights."
+echo "        opt-in. PERFORMANCE of the two defaults is UNMEASURED: the"
+echo "        clone figures (+14% / +17% MLP_GATE VERBHALF, 1.01x VERBMP)"
+echo "        were RETRACTED (5bfd8dd: every bisect arm read 0.000 ms /"
+echo "        inf GB/s, so the ratios were 0/0). The ENGINE arms in"
+echo "        test_tp2_27b.sh are the only way to measure it on real 27B weights."
 exit 0

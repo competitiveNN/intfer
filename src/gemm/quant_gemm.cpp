@@ -841,8 +841,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       }
 
       // --------------------------------------------------------------------
-      // INTFER_DECODE1_VERBMP -- default OFF, kill switch
-      // INTFER_NO_DECODE1_VERBMP=1. EXPERIMENTAL, UNMEASURED.
+      // INTFER_DECODE1_VERBMP -- default ON 2026-10-07, kill switch
+      // INTFER_NO_DECODE1_VERBMP=1 restores the absolute-index form.
       //
       // WHAT IT IS. EXACTLY ONE change to this kernel: the weight side is read
       // through a `multi_ptr` built on the row base, instead of indexing the raw

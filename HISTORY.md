@@ -1686,3 +1686,26 @@ verify` EXIT=0, both B580s enumerate): re-run `scripts/
 run_ten_gates.sh` and `scripts/test_tp2_27b.sh`, and measure
 verbhalf vs verbmp on real 27B weights to decide which kernel is
 the default decode path (and whether a composed arm is wanted).
+
+Audit addendum (post-compaction audit, same day): the fix commit
+had missed three residual sites, all corrected now —
+(a) the VERBMP kernel header's first line in `src/gemm/quant_gemm.cpp`
+still read "default OFF, kill switch / EXPERIMENTAL, UNMEASURED",
+contradicting the promoted body 25 lines below it (the VERBHALF
+header had been corrected, this one was not);
+(b) the live result banner of `scripts/test_rowpair_equiv.sh` still
+printed the retracted clone figures ("PERFORMANCE ... is measured on
+the clone (roofline_probe_bisect: +14% / +17% ... neutral for
+VERBMP)") as measured fact — it now states the direction is
+UNMEASURED and the figures were RETRACTED (5bfd8dd);
+(c) the `test_tp2_27b.sh` rc-fail message named
+`INTFER_DECODE1_VERBMP=1` for an arm that now runs under
+`INTFER_NO_DECODE1_VERBHALF=1`; the arm launch was collapsed onto a
+single `RUNENV` variable (same behavior, accurate message).
+`bash -n` → SYNTAX OK on both scripts; engine rebuild rc=0.
+The model-free proof was re-run against a freshly compiled binary at
+the corrected HEAD (project 2025.3 toolchain): control →
+`[decode1-verbhalf]`; `INTFER_DECODE1_VERBMP=1` → `[decode1-
+verbhalf]` (the presence flag is dead, as documented);
+`INTFER_NO_DECODE1_VERBHALF=1` → `[decode1-verbmp]`. The gate fix
+holds.

@@ -737,15 +737,11 @@ for spec in "VERBHALF:vh:decode1-verbhalf:" \
   # so the arm runs because it IS the default and the announcement check is
   # what proves it fired. VERBMP: arm_env kills verbhalf so THIS arm is the
   # one that runs (and the dead presence flag is deliberately NOT set).
-  if [ -n "$arm_env" ]; then
-    env "$arm_env" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
-      -p "$PROMPT" -n "$N" >"$OUT" 2>"$ERR"; RC=$?
-  else
-    env "INTFER_DECODE1_${NAME}=1" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
-      -p "$PROMPT" -n "$N" >"$OUT" 2>"$ERR"; RC=$?
-  fi
+  RUNENV="${arm_env:-INTFER_DECODE1_${NAME}=1}"
+  env "$RUNENV" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+    -p "$PROMPT" -n "$N" >"$OUT" 2>"$ERR"; RC=$?
   if [ "$RC" -ne 0 ]; then
-    echo "GATE FAIL: INTFER_DECODE1_${NAME}=1 run exited rc=$RC" >&2
+    echo "GATE FAIL: $RUNENV run exited rc=$RC" >&2
     tail -20 "$ERR" >&2
     PASS=0
   else
