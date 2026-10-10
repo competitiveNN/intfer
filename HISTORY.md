@@ -1388,6 +1388,34 @@ armed, three with a stated reason verified against source, one
 reclassified. The class is still non-empty and the checker still refuses
 an empty class; that is by design, not a remaining defect.
 
+## Stack run at `c87b2a9` (2026-10-10): 10 FAIL / 3 UNPROVEN, NO REGRESSION
+
+`INTFER_SKIP_HEALTHY=1 bash scripts/run_all_checks.sh` at `c87b2a9`
+(clean tree), `STACK_RC=1`, certified in `build/stack_cert/cert`.
+**Verdict set is IDENTICAL to the `2a72b67` baseline -- no regression from
+the two new gate arms, the three announcements, or the checker-header
+disposition table.**
+
+FAIL (10), same names as baseline:
+* `check_e2_ctx.sh` -- box state (VRAM panic; the engine dies signal 11 in
+  `libze_intel_gpu.so.1`; see `intfer_gpu_runtime_state_2026-10-08.md`).
+* `test_roofline_probe.sh`, `test_roofline_bisect.sh`,
+  `test_roofline_bisect1.sh`, `test_roofline_bisect3.sh`,
+  `test_roofline_bisect4.sh` -- the five roofline gates; the probe is
+  vacuous on this box (all arms `0.000 ms`) and its vacuity guard fires.
+* `mutate_fold_matrix.sh`, `mutate_device_precond.sh`,
+  `mutate_gate_enum.sh` -- mutation-matrix fixture artifacts.
+* `mutate_stack_cert.sh` -- cert-census sandbox drift.
+
+UNPROVEN (3), same names as baseline, all `rc=2` stale evidence:
+`check_engine_cert.sh`, `mutate_engine_cert.sh`,
+`mutate_rowpair_equiv.sh`.
+
+`check_flag_gate_coverage.sh` PASS, **81 flags / 59 gate-named / 5 opt-in**
+(`INTFER_L4_FUSE` and `INTFER_L5_FRONT` joined the census). `gate_inventory`
+reconciles the live tally; the tree-hygiene step reports the tracked tree
+clean and no new untracked files.
+
 ## Stack run at `d1a099a` (2026-10-10): INCOMPLETE -- stopped at `check_e2_ctx.sh`, NOT a verdict
 `INTFER_SKIP_HEALTHY=1 bash scripts/run_all_checks.sh` was started at
 `d1a099a` (clean tree) and **stopped itself** after two checkers. Recorded
