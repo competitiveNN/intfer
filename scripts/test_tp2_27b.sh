@@ -1270,15 +1270,43 @@ fi
     # items=1 (one launch per item, the unfused shape) is the exact shape
     # of "the flag did not reach the kernel". That fixture carries a real
     # items= string, so the predicate can actually fire.
+    #
+    # Own temp dir: the gateup arm's $SB2 is created only on ITS success
+    # path, so borrowing it would couple this self-check to a different
+    # arm's control flow -- and leave the fixtures' dir unset if gateup
+    # failed while this arm succeeded. Built and torn down inside this
+    # block rather than by trap surgery: the EXIT trap already names the
+    # log files this block does not own.
     WFSB2="$(mktemp -d)"
+    WF_ANN_FULL="ACTIVE items="
+    # (a) healthy: the real run's own announcement must exist and name the
+    # fused launch.
+    [ -n "$WF_LINE" ] || { echo "GATE FAIL: self-check (a) healthy fixture has no [wave-launch-fuse] line" >&2; PASS=0; }
+    echo "$WF_LINE" | grep -aq "$WF_ANN_FULL" \
+      || { echo "GATE FAIL: self-check (a) the announcement does not name the fused launch" >&2; PASS=0; }
+    # (b) refusal: a log where the flag was IGNORED (the default wave path
+    # ran, one launch per item, stream still matched) must be refused.
+    # Built by rewriting the real announcement's items= field to 1 -- the
+    # exact shape of "the flag did not reach the kernel".
     WF_NOT_ERR="$WFSB2/wf_not.err"
     sed 's/items=[0-9]*/items=1/' "$WF_ERR" >"$WF_NOT_ERR"
     if ! grep -aq "\[wave-launch-fuse\]" "$WF_NOT_ERR"; then
-      echo "GATE FAIL: self-check the fixture builder removed the announcement" >&2; PASS=0
+      echo "GATE FAIL: self-check (b) the fixture builder removed the announcement" >&2; PASS=0
     fi
     WF_NOT_LINE="$(grep -a "\[wave-launch-fuse\]" "$WF_NOT_ERR" | head -1)"
     if [ -n "$WF_NOT_LINE" ] && echo "$WF_NOT_LINE" | grep -aq "items=1"; then
-      echo "GATE FAIL: self-check the arm ACCEPTED a run whose fuse never fired" >&2; PASS=0
+      echo "GATE FAIL: self-check (b) the arm ACCEPTED a run whose fuse never fired" >&2; PASS=0
+    fi
+    # (c) vacuity: an empty log must fail the predicate. Without this the
+    # two cases above are the only thing standing between a vacuous arm
+    # and a PASS -- an arm whose announcement grep is itself broken would
+    # still refuse (b) (no line -> the grep finds nothing) but would have
+    # nothing left to refuse an empty log.
+    WF_EMPTY_ERR="$WFSB2/wf_empty.err"
+    : >"$WF_EMPTY_ERR"
+    WF_EMPTY_LINE="$(grep -a "\[wave-launch-fuse\]" "$WF_EMPTY_ERR" | head -1)"
+    if [ -n "$WF_EMPTY_LINE" ]; then
+      echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log (vacuity)" >&2; PASS=0
     fi
     rm -rf "$WFSB2"
     fi

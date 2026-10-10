@@ -2196,10 +2196,24 @@ sycl::event quant_gemm_forward_usm_wave(
           const auto* code_u8 = static_cast<const std::uint8_t*>(code_usm[item]);
           const std::size_t act_off = (std::size_t)m * K;
           const std::uint8_t* wrow = code_u8 + (std::size_t)n * K;
+          // *** SCALE IS PER ROW, NOT PER TENSOR. *** shard_weight emits
+          // scale[(row * n_groups + g)] (engine.cpp:306-316), so the base
+          // kernel reads `scale_usm + ng * num_groups_w` (quant_gemm.cpp:886)
+          // and loops g over THAT ROW's n_groups. This fused kernel used the
+          // item's OWN scale pointer with a shared num_groups -- which is
+          // right only for item 0 and silently reads item i's scale table
+          // through item 0's group count on every item after the first: a
+          // row-0 group count on a table strided by item i's n_groups.
+          // Derive each item's group count from its OWN K (all items share K
+          // under the wave contract, so the counts are equal -- but deriving
+          // them per item is what makes the indexing match the base kernel
+          // rather than depending on that equality holding).
+          const int ngroups_i = (K + Gw - 1) / Gw;
+          const std::uint16_t* sptr_row = sptr + (std::size_t)n * ngroups_i;
 
           float acc = 0.0f;
-          for (int g = 0; g < num_groups; ++g) {
-            const float scale = from_half_bits(sptr[g]) * alpha_f;
+          for (int g = 0; g < ngroups_i; ++g) {
+            const float scale = from_half_bits(sptr_row[g]) * alpha_f;
             const int kg0 = g * Gw;
             int kg1 = kg0 + Gw;
             if (kg1 > K) kg1 = K;

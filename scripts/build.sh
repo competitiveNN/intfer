@@ -44,7 +44,7 @@ mkdir -p "$BUILD_DIR"
 # stale tree cannot be read.
 _LZ_INC="$BUILD_DIR/include"
 mkdir -p "$_LZ_INC"
-_LZ_SRC="$(find / -maxdepth 8 -path "*/include/level_zero/ze_api.h" 2>/dev/null | head -1)"
+_LZ_SRC="$(find / -maxdepth 8 -path "*/include/level_zero/ze_api.h" 2>/dev/null | head -1 || true)"
 if [ -n "$_LZ_SRC" ]; then
   _LZ_SRC="$(dirname "$(dirname "$_LZ_SRC")")"
   cp -a "$_LZ_SRC"/. "$_LZ_INC"/

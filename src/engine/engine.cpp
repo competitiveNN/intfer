@@ -1989,11 +1989,11 @@ bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
   for (size_t i = 0; i < nl; ++i) {
     const auto& t = model_.tensors[(size_t)items[i]->tensor_index];
     const auto& sc = shard_cache_[(size_t)items[i]->tensor_index];
-    act[i] = wv_[i].act;                 // slot i, per device below
-    code[i] = sc.code_usm[0];           // filled per device in the loop
+    // Per-device pointers are filled in the device loop below; the first
+    // pass seeds them with device 0 so the vectors are never empty.
+    code[i] = sc.code_usm[0];
     scale[i] = sc.scale_usm[0];
     alpha[i] = sc.has_global_divisor ? sc.global_host : 1.0f;
-    outp[i] = wv_[i].out;
     Mi[i] = M; Ni[i] = t.N; Ki[i] = t.K;
     ws[i] = sc.scheme;
   }
@@ -2006,11 +2006,13 @@ bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
       const auto& sc = shard_cache_[(size_t)items[i]->tensor_index];
       code[i] = sc.code_usm[d];
       scale[i] = sc.scale_usm[d];
+      // act AND out are per (item, device): slot i on device d is
+      // wv_[d*wv_W_ + i]. The default path below writes the same slots in
+      // Phase 1/2 and reads them back in Phase 4, so the workspace is
+      // shared and the indexing is identical.
+      act[i] = wv_[d * wv_W_ + i].act;
       outp[i] = wv_[d * wv_W_ + i].out;
     }
-    // act is per (item, device): slot i on device d is wv_[d*wv_W_ + i].act.
-    for (size_t i = 0; i < nl; ++i)
-      act[i] = wv_[d * wv_W_ + i].act;
     const uint32_t gsize = shard_cache_[(size_t)items[0]->tensor_index].group_size;
 #ifdef INTFER_PROFILE_GPU
     auto t_s0 = std::chrono::high_resolution_clock::now();
@@ -2075,6 +2077,23 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
     }
   }
 
+  // Phase 0: the wave workspace must cover every item's (M, K, Nl) shape
+  // plus one slot per live item. Nl_max is over TP ranks AND items; K is
+  // the max over items (K varies per tensor: H vs inter vs conv_dim...).
+  // Sized BEFORE the fuse check: the fused path writes item i's output into
+  // slot i on each device (wv_[d*wv_W_ + i].out) and the default path's
+  // Phase 1/2 writes the SAME slots it reads back in Phase 4, so the
+  // workspace must exist for either. Sizing it here, once, covers both.
+  uint32_t Nl_max = 0, K_max = 0;
+  for (size_t i = 0; i < nl; ++i) {
+    const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
+    K_max = std::max(K_max, t.K);
+    const auto& ranges = shards_[live[i]->tensor_index].ranges;
+    for (size_t d = 0; d < ranges.size(); ++d)
+      Nl_max = std::max(Nl_max, ranges[d].second - ranges[d].first);
+  }
+  ensure_wave_workspace(M, (uint32_t)nl, K_max, Nl_max);
+
   // INTFER_WAVE_LAUNCH_FUSE: one parallel_for over the union of the wave's
   // output elements, instead of nl separate launches per device. Bit-exact
   // by construction (each item's accumulator is untouched), so the default
@@ -2094,9 +2113,7 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
       if (M != M0 || t.K != K0 || sc.group_size != gs0 ||
           sc.scheme == gemm::WeightScheme::INT8) { ok = false; break; }
     }
-    if (ok) {
-      if (run_linear_wave_fused(live, nl, M)) return;
-    }
+    if (ok && run_linear_wave_fused(live, nl, M)) return;
   }
 
   // Phase 1: per item — convert + write each device's wave slot.
