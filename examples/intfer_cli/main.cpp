@@ -4846,21 +4846,56 @@ static inline bool wave_alias_env() {
   static const bool on = (std::getenv("INTFER_WAVE_ALIAS") != nullptr);
   return on;
 }
-// $1..$4 = the four Rotation* (qkv/z/b/a); $n = how many were null (aliased).
-// Once per process: the first wave group that calls it. `wave_alias_armed_`
-// is set before the gate on `wave_alias_env()` so this only ever prints when
-// the flag is ON, and only once, so the gate can assert exactly one line.
-static inline void wave_alias_announce(const Rotation* Rqkv, const Rotation* Rz,
-                                       const Rotation* Rb, const Rotation* Ra,
+// $1..$4 = up to four Rotation*, one per wave item; $n = how many were null
+// (aliased). Once per process: the first wave group that calls it. It only
+// ever prints when the flag is ON -- every call site is already inside
+// `wave_alias_env()` -- and only once, so the gate can assert exactly one line.
+// r0..r3 are named generically rather than qkv/z/b/a because the same helper
+// serves the LA wave-4, the attention wave-3 and the batch mirrors; the
+// gate greps for `[wave-alias]` only, so the field names are diagnostic.
+static inline void wave_alias_announce(const Rotation* r0, const Rotation* r1,
+                                       const Rotation* r2, const Rotation* r3,
                                        int n, const char* where) {
   static bool announced = false;
   if (announced) return;
   announced = true;
   std::fprintf(stderr,
-               "[wave-alias] %s: aliased=%d rotated=%d qkv=%d z=%d b=%d a=%d\n",
-               where, n, 4 - n, Rqkv ? 1 : 0, Rz ? 1 : 0, Rb ? 1 : 0,
-               Ra ? 1 : 0);
+               "[wave-alias] %s: aliased=%d rotated=%d r0=%d r1=%d r2=%d r3=%d\n",
+               where, n, 4 - n, r0 ? 1 : 0, r1 ? 1 : 0, r2 ? 1 : 0,
+               r3 ? 1 : 0);
   std::fflush(stderr);
+}
+
+// Stages one M-row wave input from `c_normed` and returns the pointer to pass
+// as the wave item's x: `buf` always for a rotated tensor (rot_apply fully
+// overwrites its target) and for an un-rotated one when the alias is OFF;
+// `c_normed` itself when the tensor is un-rotated and the alias is ON.
+//
+// BIT-EXACT BY CONSTRUCTION. An un-rotated tensor's staging buffer held a
+// byte-for-byte copy of c_normed, so the GEMM reads identical bytes either
+// way and every output's K accumulation is untouched. What it buys is the
+// engine's shared-input dedup (src/engine/engine.cpp:2025, pointer IDENTITY
+// plus an equal M*K): with all aliased items pointing at one vector the
+// FP32->FP16 convert runs ONCE instead of once per item, plus the M*H host
+// memcpys here disappear. Host-side only -- same kernels, same buffers, same
+// output assembly -- so nk/nw/nr are provably unchanged and the effect is
+// confined to the copy/usm_write buckets.
+//
+// `buf` must already be sized (need_rows) before this call, because a rotated
+// item writes into it; when the alias wins it is deliberately left untouched.
+static inline const std::vector<float>* alias_stage(
+    const std::vector<float>& c_normed, const Rotation* R,
+    std::vector<float>& buf, bool alias_on, int M, int Hdim) {
+  if (R) {
+    for (int m = 0; m < M; m++)
+      rot_apply(&c_normed[(size_t)m*Hdim], *R, &buf[(size_t)m*Hdim]);
+    return &buf;
+  }
+  if (alias_on) return &c_normed;
+  for (int m = 0; m < M; m++)
+    memcpy(&buf[(size_t)m*Hdim], &c_normed[(size_t)m*Hdim],
+           (size_t)Hdim*sizeof(float));
+  return &buf;
 }
 
 struct StepOut { int best; std::vector<float> logits; };
@@ -4921,21 +4956,42 @@ static StepOut step(Request& req, int token, int pos,
    ckpt_h(L, normed, "post_in_ln");
   if(ly.is_full){
       // ---- Attention path (q/k/v right-site; o left-site) ----
+      // *** FUSION 2026-10-10: alias the UN-ROTATED q/k/v wave inputs to
+      // `normed` (same rule as the LA wave-4 sites). rot_apply fully
+      // overwrites its target, so a rotated tensor keeps its own buffer; an
+      // un-rotated one held a byte-for-byte copy of normed, so the alias
+      // changes nothing the GEMM reads. All three share K=H, so the wave's
+      // shared-input dedup (src/engine/engine.cpp:2025) converts normed
+      // ONCE instead of three times and drops two H host memcpys. Host-side
+      // only -- same kernels, same buffers, same output assembly -- so
+      // nk/nw/nr are unchanged and the effect is confined to the
+      // copy/usm_write buckets. xq/xk/xv are consumed ONLY by the wave
+      // below (no other reader in step()), so skipping their fill when the
+      // alias wins is a saving, not a stale-buffer bug.
       const Rotation* Rq = backend->rot_for(ln.q);
       std::vector<float>& xq = req.scratch.xq;
-      // Fusion: rot_apply fully overwrites xq, so the pre-copy is dead
-      // when Rq is present (else-branch preserves the no-rotation path).
-      if(Rq) rot_apply(normed.data(), *Rq, xq.data());
-      else for(int i=0;i<cfg.H;i++) xq[i] = normed[i];
       const Rotation* Rk = backend->rot_for(ln.k);
       const Rotation* Rv = backend->rot_for(ln.v);
       std::vector<float>& xk = req.scratch.xk;
       std::vector<float>& xv = req.scratch.xv;
-      // Fusion: rot_apply fully overwrites; pre-copy only for !R path.
-      if(Rk) rot_apply(normed.data(), *Rk, xk.data());
-      else for(int i=0;i<cfg.H;i++) xk[i] = normed[i];
-      if(Rv) rot_apply(normed.data(), *Rv, xv.data());
-      else for(int i=0;i<cfg.H;i++) xv[i] = normed[i];
+      const bool alias_on_attn = wave_alias_env() && !trace_h;
+      if (alias_on_attn) {
+        const int n_alias = (!Rq) + (!Rk) + (!Rv);
+        wave_alias_announce(Rq, Rk, Rv, nullptr, n_alias, "step attn wave-3");
+      }
+      if (trace_h) {
+        // Debug path: the trace_h block below re-reads xq/xk/xv directly,
+        // so every scratch buffer must hold its value here.
+        if(Rq) rot_apply(normed.data(), *Rq, xq.data());
+        else for(int i=0;i<cfg.H;i++) xq[i] = normed[i];
+        if(Rk) rot_apply(normed.data(), *Rk, xk.data());
+        else for(int i=0;i<cfg.H;i++) xk[i] = normed[i];
+        if(Rv) rot_apply(normed.data(), *Rv, xv.data());
+        else for(int i=0;i<cfg.H;i++) xv[i] = normed[i];
+      }
+      const std::vector<float>* xq_p = alias_stage(normed, Rq, xq, alias_on_attn, 1, cfg.H);
+      const std::vector<float>* xk_p = alias_stage(normed, Rk, xk, alias_on_attn, 1, cfg.H);
+      const std::vector<float>* xv_p = alias_stage(normed, Rv, xv, alias_on_attn, 1, cfg.H);
       std::vector<float>& qp = req.scratch.qp;
       std::vector<float>& k = req.scratch.k;
       std::vector<float>& v = req.scratch.v;
@@ -4949,9 +5005,9 @@ static StepOut step(Request& req, int token, int pos,
       // (one wait-loop + readback pass instead of two).
       {
         LinearBackend::LinearWaveItem items[3] = {
-          {ln.q, &xq, &qp},
-          {ln.k, &xk, &k},
-          {ln.v, &xv, &v},
+          {ln.q, xq_p, &qp},
+          {ln.k, xk_p, &k},
+          {ln.v, xv_p, &v},
         };
         backend->run_linear_wave(items, 3);
       }
@@ -5121,8 +5177,8 @@ static StepOut step(Request& req, int token, int pos,
         // block, and run_linear_wave only READS *item.x (never writes it).
         //
         // WHAT IT BUYS. run_linear_wave's shared-input dedup
-        // (engine.cpp:2195) fires on POINTER IDENTITY plus an equal M*K, and
-        // all four LA tensors share K=H. Previously four distinct scratch
+        // (src/engine/engine.cpp:2025) fires on POINTER IDENTITY plus an
+        // equal M*K, and all four LA tensors share K=H. Previously four distinct scratch
         // pointers defeated it, so every un-rotated group paid four
         // FP32->FP16 converts of M*H values plus three M*H host memcpys.
         // Aliased, the first item converts and the other three reuse the
@@ -5925,34 +5981,35 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       const Rotation* Rq = backend->rot_for(ln.q);
       const Rotation* Rk = backend->rot_for(ln.k);
       const Rotation* Rv = backend->rot_for(ln.v);
-      need_rows(c_x, Hdim);
-      // Rotate directly into each wave input (no staging copy: c_x was
-      // only a scratch relay and rot_apply fully overwrites its target).
+      // *** FUSION 2026-10-10: alias the UN-ROTATED q/k/v wave inputs to
+      // `c_normed` (same rule as the LA wave-4 sites). rot_apply fully
+      // overwrites its target, so a rotated tensor keeps its own buffer; an
+      // un-rotated one held a copy of c_normed, so the alias changes nothing
+      // the GEMM reads. All three share K=H, so the wave's shared-input dedup
+      // (src/engine/engine.cpp:2025) converts c_normed ONCE instead of three
+      // times and drops two M*H host memcpys. Host-side only -- same kernels,
+      // same buffers, same output assembly -- so nk/nw/nr are unchanged and
+      // the effect is confined to the copy/usm_write buckets.
       std::vector<float> c_q_in, c_kv_in, c_v_in;
       need_rows(c_q_in, Hdim); need_rows(c_kv_in, Hdim); need_rows(c_v_in, Hdim);
-      for(int m=0; m<M; m++){
-        const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_q_in[(size_t)m*Hdim];
-        if(Rq) rot_apply(nr, *Rq, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
+      const bool alias_on_attn = wave_alias_env();
+      if (alias_on_attn) {
+        const int n_alias = (!Rq) + (!Rk) + (!Rv);
+        wave_alias_announce(Rq, Rk, Rv, nullptr, n_alias, "attn wave-3");
       }
-      need_rows(c_qp, qrows2);
+      const std::vector<float>* c_q_ip =
+          alias_stage(c_normed, Rq, c_q_in, alias_on_attn, M, Hdim);
       // (q joins the k/v wave below (wave-3); packed_gate is resolved
-      // after the wave fills c_qp.
+      // after the wave fills c_qp).
       // Per-row q/gate split + q_norm + rope, staged into c_qpart rows.
       need_rows(c_k, kvrows); need_rows(c_v, kvrows);
       static thread_local std::vector<float> c_qpart, c_gate;
       need_rows(c_qpart, qrows); need_rows(c_gate, qrows);
+      const std::vector<float>* c_kv_ip =
+          alias_stage(c_normed, Rk, c_kv_in, alias_on_attn, M, Hdim);
+      const std::vector<float>* c_v_ip =
+          alias_stage(c_normed, Rv, c_v_in, alias_on_attn, M, Hdim);
       // k/v rotated inputs share one staging buffer (consumed per GEMM).
-      for(int m=0; m<M; m++){
-        const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_kv_in[(size_t)m*Hdim];
-        if(Rk) rot_apply(nr, *Rk, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
-      }
-      for(int m=0; m<M; m++){
-        const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_v_in[(size_t)m*Hdim];
-        if(Rv) rot_apply(nr, *Rv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
-      }
       // Wave-3 batch: q/k/v are independent (all derive from normed;
       // q's split/norm/rope consumers run below, after the wave) — one
       // engine call converts + submits all three back-to-back with one
@@ -5961,9 +6018,9 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       // changes).
       {
         LinearBackend::LinearWaveBatchItem items[3] = {
-          {ln.q, &c_q_in, &c_qp},
-          {ln.k, &c_kv_in, &c_k},
-          {ln.v, &c_v_in, &c_v},
+          {ln.q, c_q_ip, &c_qp},
+          {ln.k, c_kv_ip, &c_k},
+          {ln.v, c_v_ip, &c_v},
         };
         backend->run_linear_wave_batch(items, 3, (uint32_t)M);
       }
@@ -6153,51 +6210,31 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       // its own buffer; an un-rotated one held a byte-for-byte copy of
       // c_normed, so the alias changes nothing the GEMM reads. All four LA
       // tensors share K=H, so run_linear_wave_batch -> run_linear_wave's
-      // shared-input dedup (engine.cpp:2195, pointer identity + equal M*K)
-      // now converts c_normed ONCE instead of four times and drops three
-      // M*H host memcpys. `a` keeps its documented c_x relay (the (a)
-      // rotation stays in c_x and feeds the wave directly).
+      // shared-input dedup (src/engine/engine.cpp:2025, pointer identity +
+      // equal M*K) now converts c_normed ONCE instead of four times and
+      // drops three M*H host memcpys. `a` keeps its documented c_x relay
+      // (the (a) rotation stays in c_x and feeds the wave directly).
       std::vector<float> c_qkv_in, c_z_in, c_b_in;
       need_rows(c_qkv_in, Hdim); need_rows(c_z_in, Hdim); need_rows(c_b_in, Hdim);
       // Gated twin of the scalar site: OFF keeps the per-item scratch buffers
       // (the behaviour this was measured against), ON aliases the un-rotated
       // ones to c_normed. Bit-exact by construction either way.
       const bool alias_on_mrow = wave_alias_env();
-      // Fill each scratch buffer only when something will READ it. A rotated
-      // tensor's rot_apply always writes its buffer; an UN-rotated one needs
-      // its memcpy only when the alias is OFF (that is the pointer the GEMM
-      // then gets). Dropping a memcpy that is still consumed would hand the
-      // GEMM a stale buffer, so the guard below is load-bearing.
-      if(Rqkv) for(int m=0; m<M; m++)
-        rot_apply(&c_normed[(size_t)m*Hdim], *Rqkv, &c_qkv_in[(size_t)m*Hdim]);
-      else if(!alias_on_mrow) for(int m=0; m<M; m++)
-        memcpy(&c_qkv_in[(size_t)m*Hdim], &c_normed[(size_t)m*Hdim],
-               (size_t)Hdim*sizeof(float));
+      if (alias_on_mrow) {
+        const int n_alias = (!Rqkv) + (!Rz) + (!Rb);
+        wave_alias_announce(Rqkv, Rz, Rb, nullptr, n_alias, "prefill wave-4");
+      }
+      const std::vector<float>* c_qkv_ip =
+          alias_stage(c_normed, Rqkv, c_qkv_in, alias_on_mrow, M, Hdim);
       need_rows(c_mqkv, cfg.conv_dim);   // (qkv joins the z/b/a wave below (wave-4).
-      if(Rz) for(int m=0; m<M; m++)
-        rot_apply(&c_normed[(size_t)m*Hdim], *Rz, &c_z_in[(size_t)m*Hdim]);
-      else if(!alias_on_mrow) for(int m=0; m<M; m++)
-        memcpy(&c_z_in[(size_t)m*Hdim], &c_normed[(size_t)m*Hdim],
-               (size_t)Hdim*sizeof(float));
-      if(Rb) for(int m=0; m<M; m++)
-        rot_apply(&c_normed[(size_t)m*Hdim], *Rb, &c_b_in[(size_t)m*Hdim]);
-      else if(!alias_on_mrow) for(int m=0; m<M; m++)
-        memcpy(&c_b_in[(size_t)m*Hdim], &c_normed[(size_t)m*Hdim],
-               (size_t)Hdim*sizeof(float));
+      const std::vector<float>* c_z_ip =
+          alias_stage(c_normed, Rz, c_z_in, alias_on_mrow, M, Hdim);
+      const std::vector<float>* c_b_ip =
+          alias_stage(c_normed, Rb, c_b_in, alias_on_mrow, M, Hdim);
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
         float* xr = &c_x[(size_t)m*Hdim];
         if(Ra) rot_apply(nr, *Ra, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
-      }
-      const std::vector<float>* c_qkv_ip = &c_qkv_in;
-      const std::vector<float>* c_z_ip   = &c_z_in;
-      const std::vector<float>* c_b_ip   = &c_b_in;
-      if (alias_on_mrow) {
-        const int n_alias = (!Rqkv) + (!Rz) + (!Rb) + (Ra ? 0 : 1);
-        wave_alias_announce(Rqkv, Rz, Rb, Ra, n_alias, "prefill wave-4");
-        if (!Rqkv) c_qkv_ip = &c_normed;
-        if (!Rz)   c_z_ip   = &c_normed;
-        if (!Rb)   c_b_ip   = &c_normed;
       }
       size_t zvw = (size_t)cfg.n_v_heads * cfg.v_head_dim;
       need_rows(c_z, zvw);
@@ -6646,41 +6683,43 @@ static std::vector<StepOut> step_batch(
       const Rotation* Rq = backend->rot_for(ln.q);
       const Rotation* Rk = backend->rot_for(ln.k);
       const Rotation* Rv = backend->rot_for(ln.v);
-      need_rows(c_x, Hdim);
-      // Rotate directly into each wave input (no staging copy: c_x was
-      // only a scratch relay and rot_apply fully overwrites its target).
+      // *** FUSION 2026-10-10: alias the UN-ROTATED q/k/v wave inputs to
+      // `c_normed` (same rule as the prefill Phase C site). rot_apply fully
+      // overwrites its target, so a rotated tensor keeps its own buffer; an
+      // un-rotated one held a copy of c_normed, so the alias changes nothing
+      // the GEMM reads. All three share K=H, so the wave's shared-input dedup
+      // (src/engine/engine.cpp:2025) converts c_normed ONCE instead of three
+      // times and drops two M*H host memcpys. Host-side only -- same kernels,
+      // same buffers, same output assembly -- so nk/nw/nr are unchanged and
+      // the effect is confined to the copy/usm_write buckets.
       std::vector<float> b_q_in, c_kv_in, c_v_in;
       need_rows(b_q_in, Hdim); need_rows(c_kv_in, Hdim); need_rows(c_v_in, Hdim);
-      for(int m=0; m<M; m++){
-        const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &b_q_in[(size_t)m*Hdim];
-        if(Rq) rot_apply(nr, *Rq, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
+      const bool alias_on_attn = wave_alias_env();
+      if (alias_on_attn) {
+        const int n_alias = (!Rq) + (!Rk) + (!Rv);
+        wave_alias_announce(Rq, Rk, Rv, nullptr, n_alias, "batch attn wave-3");
       }
+      const std::vector<float>* b_q_ip =
+          alias_stage(c_normed, Rq, b_q_in, alias_on_attn, M, Hdim);
       need_rows(c_qp, qrows2);
       // (q joins the k/v wave below (wave-3); packed_gate is resolved
-      // after the wave fills c_qp.
+      // after the wave fills c_qp).
       need_rows(c_k, kvrows); need_rows(c_v, kvrows);
       static thread_local std::vector<float> b_qpart, b_gate;
       need_rows(b_qpart, qrows); need_rows(b_gate, qrows);
-      for(int m=0; m<M; m++){
-        const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_kv_in[(size_t)m*Hdim];
-        if(Rk) rot_apply(nr, *Rk, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
-      }
-      for(int m=0; m<M; m++){
-        const float* nr = &c_normed[(size_t)m*Hdim];
-        float* xr = &c_v_in[(size_t)m*Hdim];
-        if(Rv) rot_apply(nr, *Rv, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
-      }
+      const std::vector<float>* c_kv_ip =
+          alias_stage(c_normed, Rk, c_kv_in, alias_on_attn, M, Hdim);
+      const std::vector<float>* c_v_ip =
+          alias_stage(c_normed, Rv, c_v_in, alias_on_attn, M, Hdim);
       // Wave-3 batch: q/k/v are independent (all derive from normed;
       // q's split/norm/rope consumers run below, after the wave) — one
       // engine call, one host round-trip. Bit-identical to three
       // sequential run_linear_batch calls.
       {
         LinearBackend::LinearWaveBatchItem items[3] = {
-          {ln.q, &b_q_in, &c_qp},
-          {ln.k, &c_kv_in, &c_k},
-          {ln.v, &c_v_in, &c_v},
+          {ln.q, b_q_ip, &c_qp},
+          {ln.k, c_kv_ip, &c_k},
+          {ln.v, c_v_ip, &c_v},
         };
         backend->run_linear_wave_batch(items, 3, (uint32_t)M);
       }
@@ -6850,45 +6889,31 @@ static std::vector<StepOut> step_batch(
       // fully overwrites, so a rotated tensor keeps its own buffer; an
       // un-rotated one held a copy of c_normed, so the alias changes nothing
       // the GEMM reads. All four share K=H, so the wave's shared-input dedup
-      // (engine.cpp:2195) converts c_normed ONCE instead of four times and
-      // drops three M*H host memcpys. `a` keeps its documented c_x relay.
+      // (src/engine/engine.cpp:2025) converts c_normed ONCE instead of four
+      // times and drops three M*H host memcpys. `a` keeps its documented
+      // c_x relay.
       std::vector<float> b_qkv_in, c_z_in, c_b_in;
       need_rows(b_qkv_in, Hdim); need_rows(c_z_in, Hdim); need_rows(c_b_in, Hdim);
-      // Same gated rule as the other two wave-4 sites (see the scalar one for
-      // the full argument). `alias_on` OFF keeps the per-item buffers filled
-      // and consumed; ON aliases the un-rotated ones to c_normed and drops
-      // the now-dead memcpys. Bit-exact by construction either way.
+      // Same gated rule as the other wave-4 site (see alias_stage for the
+      // full argument). OFF keeps the per-item buffers filled and consumed;
+      // ON aliases the un-rotated ones to c_normed and drops the now-dead
+      // memcpys. Bit-exact by construction either way.
       const bool alias_on_mirror = wave_alias_env();
-      if(Rqkv) for(int m=0; m<M; m++)
-        rot_apply(&c_normed[(size_t)m*Hdim], *Rqkv, &b_qkv_in[(size_t)m*Hdim]);
-      else if(!alias_on_mirror) for(int m=0; m<M; m++)
-        memcpy(&b_qkv_in[(size_t)m*Hdim], &c_normed[(size_t)m*Hdim],
-               (size_t)Hdim*sizeof(float));
+      if (alias_on_mirror) {
+        const int n_alias = (!Rqkv) + (!Rz) + (!Rb);
+        wave_alias_announce(Rqkv, Rz, Rb, nullptr, n_alias, "batch wave-4");
+      }
+      const std::vector<float>* b_qkv_ip =
+          alias_stage(c_normed, Rqkv, b_qkv_in, alias_on_mirror, M, Hdim);
       need_rows(b_mqkv, cfg.conv_dim);   // (qkv joins the z/b/a wave below (wave-4).
-      if(Rz) for(int m=0; m<M; m++)
-        rot_apply(&c_normed[(size_t)m*Hdim], *Rz, &c_z_in[(size_t)m*Hdim]);
-      else if(!alias_on_mirror) for(int m=0; m<M; m++)
-        memcpy(&c_z_in[(size_t)m*Hdim], &c_normed[(size_t)m*Hdim],
-               (size_t)Hdim*sizeof(float));
-      if(Rb) for(int m=0; m<M; m++)
-        rot_apply(&c_normed[(size_t)m*Hdim], *Rb, &c_b_in[(size_t)m*Hdim]);
-      else if(!alias_on_mirror) for(int m=0; m<M; m++)
-        memcpy(&c_b_in[(size_t)m*Hdim], &c_normed[(size_t)m*Hdim],
-               (size_t)Hdim*sizeof(float));
+      const std::vector<float>* c_z_ip2 =
+          alias_stage(c_normed, Rz, c_z_in, alias_on_mirror, M, Hdim);
+      const std::vector<float>* c_b_ip2 =
+          alias_stage(c_normed, Rb, c_b_in, alias_on_mirror, M, Hdim);
       for(int m=0; m<M; m++){
         const float* nr = &c_normed[(size_t)m*Hdim];
         float* xr = &c_x[(size_t)m*Hdim];
         if(Ra) rot_apply(nr, *Ra, xr); else memcpy(xr, nr, (size_t)Hdim*sizeof(float));
-      }
-      const std::vector<float>* b_qkv_ip = &b_qkv_in;
-      const std::vector<float>* c_z_ip2  = &c_z_in;
-      const std::vector<float>* c_b_ip2  = &c_b_in;
-      if (alias_on_mirror) {
-        const int n_alias = (!Rqkv) + (!Rz) + (!Rb) + (Ra ? 0 : 1);
-        wave_alias_announce(Rqkv, Rz, Rb, Ra, n_alias, "prefill wave-4 (mirror)");
-        if (!Rqkv) b_qkv_ip = &c_normed;
-        if (!Rz)   c_z_ip2  = &c_normed;
-        if (!Rb)   c_b_ip2  = &c_normed;
       }
       size_t zvw = (size_t)cfg.n_v_heads * cfg.v_head_dim;
       need_rows(b_z, zvw);
