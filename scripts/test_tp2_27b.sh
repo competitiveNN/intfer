@@ -539,7 +539,16 @@ echo "$TP_LINE" | grep -q "TP=sharded" || { echo "GATE FAIL: TP not sharded (nee
 # was asserted by code reading, which is an argument, not evidence. Here it is
 # checked against the SAME FIXED ORACLE the base run already uses -- not a
 # self-comparison, so "both runs broke the same way" cannot pass.
-env INTFER_DECODE1_MR=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+#
+# *** BOTH DEFAULTS MUST BE KILLED, OR THE ARM NEVER RUNS. *** VERBHALF
+# and VERBMP are default-ON (promoted 2026-10-07) and are checked
+# EARLIER in quant_gemm_forward_usm than the MR branch, so with the
+# defaults live VERBHALF wins the run and `[decode1-mr]` never announces
+# -- the arm fails its own path-fired assertion while comparing two runs
+# that both ran verbhalf. Killing both defaults is what selects MR,
+# exactly as it selects VERBMP and WVEC below.
+env INTFER_NO_DECODE1_VERBHALF=1 INTFER_NO_DECODE1_VERBMP=1 \
+  INTFER_DECODE1_MR=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
   -p "$PROMPT" -n "$N" >"$MR_OUT" 2>"$MR_ERR"; MR_RC=$?
 if [ "$MR_RC" -ne 0 ]; then
   echo "GATE FAIL: INTFER_DECODE1_MR=1 run exited rc=$MR_RC" >&2
@@ -591,7 +600,14 @@ fi
 # for all inputs, which is false and which the source comment refuses to claim.
 # An arm cannot be stronger than the contract it enforces; a green arm here means
 # the contract holds for the gate model, not that the kernel is exact.
-env INTFER_DECODE1_SPLITK=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+#
+# *** BOTH DEFAULTS MUST BE KILLED, OR THE ARM NEVER RUNS *** -- same
+# shadowing as the MR arm above: VERBHALF/VERBMP are default-ON and
+# checked earlier than the SPLITK branch, so the defaults must die to
+# select split-K, or `[decode1-splitk]` never announces and the arm
+# fails its own path-fired assertion.
+env INTFER_NO_DECODE1_VERBHALF=1 INTFER_NO_DECODE1_VERBMP=1 \
+  INTFER_DECODE1_SPLITK=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
   -p "$PROMPT" -n "$N" >"$SK_OUT" 2>"$SK_ERR"; SK_RC=$?
 if [ "$SK_RC" -ne 0 ]; then
   echo "GATE FAIL: INTFER_DECODE1_SPLITK=1 run exited rc=$SK_RC" >&2
@@ -799,7 +815,17 @@ for spec in "VERBDEAD:vd:decode1-verbdead" "VERBSEL:vs:decode1-verbsel" \
             "VERBVEC:vv:decode1-verbvec"; do
   NAME="${spec%%:*}"; rest="${spec#*:}"; abbr="${rest%%:*}"; tag="${rest#*:}"
   OUT="$LOG.${abbr}.out"; ERR="$LOG.${abbr}.err"
-  env "INTFER_DECODE1_${NAME}=1" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  # *** BOTH DEFAULT-ON ARMS MUST BE KILLED, OR THESE NEVER RUN. ***
+  # VERBHALF and VERBMP are default-ON (promoted 2026-10-07) and are
+  # checked EARLIER in quant_gemm_forward_usm than these three opt-in
+  # arms, so with the defaults live VERBHALF wins the run and
+  # `[decode1-verbdead]`/`[decode1-verbsel]`/`[decode1-verbvec]` never
+  # announce -- the arm fails its own path-fired assertion while
+  # comparing two runs that both ran verbhalf. Same shadowing the MR,
+  # SPLITK and WVEC arms already handle; killing both defaults is what
+  # selects the opt-in arm.
+  env INTFER_NO_DECODE1_VERBHALF=1 INTFER_NO_DECODE1_VERBMP=1 \
+    "INTFER_DECODE1_${NAME}=1" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
     -p "$PROMPT" -n "$N" >"$OUT" 2>"$ERR"; RC=$?
   if [ "$RC" -ne 0 ]; then
     echo "GATE FAIL: INTFER_DECODE1_${NAME}=1 run exited rc=$RC" >&2
