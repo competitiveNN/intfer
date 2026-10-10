@@ -1317,8 +1317,78 @@ would read STALE, not certified. Writing one to make the number go down
 would be the vacuous-green failure the floor exists to prevent. The honest
 outcome is the qualified note plus the standing instruction to the operator.
 
-## Stack run at `d1a099a` (2026-10-10): INCOMPLETE — stopped at `check_e2_ctx.sh`, NOT a verdict
+## Flag census at `419cc8e` (2026-10-10): 7 -> 5 opt-in, two armed
 
+`bash scripts/check_flag_gate_coverage.sh` -> PASS, **81 flags read, 59
+gate-named, 5 opt-in ungated** (was 81 / 57 / 7 at `d1a099a`). Two of the
+seven were genuinely certifiable and are now armed in
+`scripts/test_gpu_optin.sh`; the other five carry a stated reason, each
+verified by reading the code rather than assumed from the census.
+
+### ARMED -- `INTFER_L4_FUSE` (`test_gpu_optin.sh:186+`)
+
+L4 la_out fusion: device SSM -> fused norm+silu(z)+FP16 convert -> la_out
+GEMM, one host wait + one D2H. **Bit-identical to the host path it
+replaces** (same SSM recurrence, same l2norm, same silu, same FP16
+convert, same la_out GEMM shard and kernel), so a base-vs-flagged stream
+comparison is satisfiable by a flag that did nothing -- the arm would be
+stream-only and vacuous. That is exactly the class the gate's own
+self-check exists to catch.
+
+Added acceptance announcements at `examples/intfer_cli/main.cpp:3253`
+(`[l4-fused] la_out fusion ACTIVE`, solo scalar decode) and `:3706`
+(`[l4-fused-batch] M-row la_out fusion ACTIVE`, M-row serve), following
+`INTFER_FUSE_ACT`'s `[fuse-act]` contract (`engine.cpp:1406-1408`): once
+per process, keyed by tag, so two arms cannot suppress each other's line
+(see `decode1_announce`'s latch contract, `quant_gemm.cpp:62-79`).
+
+**TP polarity.** The arm asserts the line on TP=1 and its ABSENCE on
+TP=2. `gpu_la_out_fused` (`main.cpp:3148`) and the batch variant
+(`main.cpp:3290`) both open with `if(be.num_devices_ != 1) return false;`
+-- device acts are not cross-visible. Asserting the announcement on TP=2
+would be a false failure; asserting its absence there proves the guard.
+
+**Reachability.** Verified by `strings`, not assumed: `linear_attn` appears
+in both `Qwen3.5-0.8B.intifer` and `Qwen3.8-27B-int2.intifer`, so the
+0.8B model reaches the branch. An arm in a gate whose model could not
+reach it would be green because the path never ran (audit #3).
+
+**Self-check** (a) healthy / (b) refusal / (c) vacuity, on a **tp=1**
+fixture -- not the arm above's log, because on a 2-GPU box the arm's tp=2
+run declines and carries no announcement, so a self-check built from it
+would have no line to delete and (a) would fail on a box where the arm is
+correct. On this box the engine does not run at all (signal 11 in
+`libze_intel_gpu.so.1` on the 0.8B model, base and L4_FUSE alike), so the
+self-check prints SKIPPED rather than passing vacuously.
+
+### ARMED -- `INTFER_L5_FRONT` (`test_gpu_optin.sh:245+`)
+
+Device front chain: FWHT acts -> qkv GEMMs -> conv prep -> L4 tail,
+replacing the host wave-4 + conv FIR + prep. **Bit-identical to the host
+path** (same kernels, same order, same bytes; the L5-vs-base A/B note at
+`main.cpp:4165` records ~1ulp oracle-arbitrated drift on the SSM side, not
+a stream divergence). Announcement `[l5-front] device front chain ACTIVE`
+added at `main.cpp:4771`; same TP=1/TP=2 polarity (`L5_DECLINE("tp")` at
+`main.cpp:4199`) and same self-check shape.
+
+### NOT ARMED -- three with a stated reason
+
+| flag | reason (verified by reading the code) |
+|---|---|
+| `INTFER_LMHEAD_FP16` | **Decision record stands** (AGENTS.md:482). Restores the old FP16 tiled lm_head path, a bisect-only variant, and the repo has retracted every performance claim made for it. Gating a flag whose only purpose is to reproduce a discredited measurement would certify nothing. |
+| `INTFER_INT8_KV_G` | **Derivative knob**, not a separate path. `main.cpp:3821`: group size for the INT8 KV quantiser (default 32). `INTFER_INT8_KV` is already named by `test_gpu_optin.sh:117` and `test_cpu_parity.sh:106`. Changing the group size changes the quant error profile, which those arms assert against the base stream -- so the knob's effect is covered by arms that already run at the default. A standalone arm would assert a stream identity they already exercise at one point on the knob's range. |
+| `INTFER_DECODE1_ANNOUNCE_EVERY` | **Harness-only.** `quant_gemm.cpp:67` states its own purpose: "this is how the harness can PROVE the latch is not what decides which arm appear". It is a diagnostic aid FOR the gates, not an engine feature; the gates that depend on the latch already exercise it when they run. Arming it would be certifying the test harness against itself. |
+
+`INTFER_L4_ROWS` remains misfiled and recorded as the qualified note at the
+top of this section.
+
+**The floor's purpose is met.** The opt-in class existed so a residue could
+not be left sitting unexamined; it is now examined flag by flag -- two
+armed, three with a stated reason verified against source, one
+reclassified. The class is still non-empty and the checker still refuses
+an empty class; that is by design, not a remaining defect.
+
+## Stack run at `d1a099a` (2026-10-10): INCOMPLETE -- stopped at `check_e2_ctx.sh`, NOT a verdict
 `INTFER_SKIP_HEALTHY=1 bash scripts/run_all_checks.sh` was started at
 `d1a099a` (clean tree) and **stopped itself** after two checkers. Recorded
 as incomplete, not as a pass or a regression.
