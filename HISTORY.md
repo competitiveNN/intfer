@@ -1775,3 +1775,59 @@ demands:
   (2 must-appear / 1 must-stay-quiet / 4 must-be-refused);
   the `wv` order's model-free differential vs the
   restored reference ran clean (INT2 shapes, bitwise).
+
+## The 2026-10-07 promotion's shadowing fallout (2026-10-10): three fixes
+
+The VERBHALF/VERBMP default-ON promotion (0fd6e11) left three
+defects, all the same root cause: the M=1 INT2 decode dispatch
+chain is order-exclusive (each arm ends in `return q.submit(...)`,
+earliest wins), and the promotion made TWO arms default-ON without
+re-auditing what that means for everything behind them.
+
+**Fix 1 — the exclusivity guard refused production (30f3840).**
+The guard in `quant_gemm_forward_usm` counted FLAGS: with both
+defaults live and no opt-in set — the production state — it
+counted 2 and returned `sycl::event()`, a refused GEMM whose
+output buffer is never written (silent corruption, not a crash).
+Because VERBHALF returns at its own `if` before the guard, the
+calls that REACH the guard are exactly the ones no INT2-tab arm
+can serve: every non-INT2 (INT4/INT8) M=1 GEMM and every INT2
+call with `INTFER_NO_INT2_TAB=1`. The predicate is now "how many
+arms can actually DISPATCH on this call": an arm whose dispatch
+condition is false cannot win anything and is not counted. Two
+eligible opt-in arms still conflict and that is what the guard
+refuses. Production (no opt-in set) passes. The guard cannot
+police shadowing by a LIVE DEFAULT (that state dispatches VERBHALF
+and returns before the guard) — the gate scripts' announcement
+assertions are the mechanism that catches it.
+
+**Fix 2 — five gate arms never ran (dfa9faa).** MR, SPLITK,
+VERBDEAD, VERBSEL and VERBVEC all dispatch AFTER VERBHALF, so
+with the defaults live VERBHALF won the run and the opt-in arm's
+announcement never fired — the arm failed its own path-fired
+assertion while comparing two runs that both ran verbhalf. Broken
+since 2026-10-07, masked on this box by the driver SIGSEGV that
+failed every arm earlier at rc!=0. Each arm's env now kills both
+defaults (`INTFER_NO_DECODE1_VERBHALF=1 INTFER_NO_DECODE1_VERBMP=1`),
+exactly as the VERBMP and WVEC arms already did. ROWPAIR (checked
+first, before the defaults) legitimately needs no kill switches.
+
+**Fix 3 — `lm_head_fail_reset()` OOB/SIGSEGV (2475f6e).** The
+error path — documented to "degrade to {} instead of SIGABRT" —
+instead SIGSEGV'd at main.cpp:1963 (`lm_head_w_dev_[d]` null-deref)
+because `lm_head_w_dev_` is resized ONLY in the `force_fp16`
+branch (1453), empty on the default INT8/DPAS path; and
+`lm_head_cM_dev_` (resized only in M>1 paths) is empty in an
+M=1-only process and would crash next at line 1985. Fixed with
+guarded outer-index bounds on `c_dev_` (the one vector resized in
+both build branches) and the tile loop bounded on it; c's per-tile
+count equals q/s/b/w's (all pushed once per t_idx in the same
+upload loop), so bounding on c frees exactly the tiles that exist
+on any path.
+
+**The standing rule for any new decode1 arm:** an opt-in arm that
+dispatches after VERBHALF must kill BOTH defaults in its gate env,
+or it measures VERBHALF and certifies nothing. The arm's
+announcement assertion is what catches a violation — a green arm
+without the announcement line is vacuous. The guard cannot see
+default-shadowing by construction.
