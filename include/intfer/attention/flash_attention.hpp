@@ -6,6 +6,24 @@
 
 // Fused FlashAttention SYCL kernels for Intel Arc (Xe-core / XMX).
 //
+// *** REACHABILITY (traced 2026-10-10, HISTORY.md "GQA-packing
+// DECLINED with evidence"): these two kernels are DEMO/REFERENCE-
+// ONLY. They are compiled into the intfer_attention static library
+// (src/CMakeLists.txt:30) and linked into intfer_gemm, but they are
+// NOT reachable from the inference path. Their only call sites are
+// examples/flash_attention_demo/ and examples/qwen_forward_gpu/ (a
+// reference/diagnostic forward). src/engine/engine.cpp:32 is a bare
+// #include with ZERO calls to either symbol, and examples/intfer_cli/
+// main.cpp references flash_attention_forward exactly once -- in a
+// comment (:3831). The engine that runs inference therefore has NO
+// device softmax-attention kernel on any path: the 27B decodes
+// through the GatedDeltaNet SSM recurrence (host fallback,
+// main.cpp:5180-5210) and the is_full softmax decode is host-only
+// scalar (main.cpp:4948-4970). Do not mistake these kernels for a
+// reachable decode path -- a device paged-KV softmax-decode kernel
+// does not exist in this tree, so GQA head-group packing (vllm-xpu
+// decode_policy_qpacked_head) has nothing to attach to.
+//
 // Two forward-pass variants are provided:
 //   1. flash_attention_forward_f16  - FP16 Q/K/V with online-softmax tiling
 //                                     (classic FlashAttention-2).

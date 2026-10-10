@@ -1189,6 +1189,38 @@ taken** — it is operator-only (the engine is forbidden from agent
 sessions and `roofline_probe` is vacuous on this box). Recorded so
 the −9.95% is never quoted as if it were a default-path win.
 
+**E4 pair-promotion measurement spec (operator-ready, run
+post-rebind).** Decide ONLY on the load-insensitive `kernel`
+bucket (`[GPU profile]`), never on a tok/s and never on the host
+`submit`/`waitblock`/`copy`/`readback`/`usm_write` accumulators
+(they read as relative, not as figures). Two arms, >= 2 paired
+rounds, >= 3 same sign, delta must CLEAR the spread floor
+(`max(spread of the two arms)`), not merely be non-zero:
+
+```
+# ARM A — the candidate pair (the only promotable unit)
+INTFER_DPAS48=1 INTFER_DPAS48_TILED=1 \
+  <intfer_cli> -m <27B-sc> --gpu --tp 2 --ids -p "<prefill prompt>" -n <N>
+
+# ARM B — the DEFAULT prefill path (both flags unset)
+<intfer_cli> -m <27B-sc> --gpu --tp 2 --ids -p "<same prompt>" -n <same N>
+```
+
+* **M must be > 2** (a real prefill, not an M=1 decode). E4
+  DECLINES at M<2 (`engine.cpp:1023`, `use_tiled = ... && M >= 2`),
+  so an M=1 arm certifies nothing about promotion.
+* **Verdict rule:** promote the pair to default-ON ONLY if
+  `kernel_us(A) < kernel_us(B)` by more than the spread floor,
+  3/3 same sign. If the pair does not beat the DEFAULT path,
+  E4 stays default-OFF (its −9.95% is a within-DPAS48
+  improvement, not a default-path win) and the two flags stay
+  opt-in.
+* **Precondition:** the box must be healthy (rebind first —
+  `sudo scripts/gpu_recover.sh rebind` -> `verify`), because the
+  `kernel` bucket's liveness for the engine is UNVERIFIED on the
+  degraded box and the stream-identity gate cannot run while
+  every 0.8B engine run crashes signal 11.
+
 **GQA-packing (vllm-xpu `decode_policy_qpacked_head` / `qgroup`)
 — DECLINED WITH EVIDENCE, not shipped.** The flag
 `INTFER_DECODE1_GQAPACK` does not exist in the tree and will not be
