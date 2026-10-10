@@ -445,6 +445,72 @@ for tp in $TPS; do
   TILDA="$(N=24 ids_of "$tp" INTFER_DPAS48_TILED=1)"
   echo "TP=$tp [INTFER_DPAS48_TILED=1 alone]: '$TILDA'"
   [ "$TILDA" = "$B24" ] || fail "TP=$tp [INTFER_DPAS48_TILED=1 alone] '$TILDA' != base '$B24'"
+
+  # --- INTFER_WAVE_ALIAS: alias an UN-ROTATED LA wave input to `normed` -----
+  # Host-side only: the alias skips a per-item FP32->FP16 convert and a
+  # memcpy for every un-rotated LA tensor, by pointing the wave item at the
+  # caller's own `normed` buffer. Bit-exact by construction (an un-rotated
+  # tensor's staging buffer held a byte-for-byte copy of `normed`, so the
+  # GEMM reads identical bytes and every output's K accumulation is
+  # untouched). Same kernels, same buffers, same output assembly -- so
+  # nk/nw/nr are PROVABLY unchanged and the effect is confined to the host
+  # copy/usm_write buckets, never a kernel delta.
+  #
+  # *** WHY A STREAM COMPARISON ALONE IS VACUOUS HERE, AND WHAT DEFEATS IT. ***
+  # The base and this arm are bit-identical BY CONSTRUCTION (that is the
+  # claim), so "the two streams matched" certifies nothing on its own: a
+  # flag that never reached the branch would also produce matching streams.
+  # The per-site decision line below is what separates them -- it prints
+  # aliased=N, and N is the count of un-rotated tensors, so the line
+  # appears (and reports aliased=0) on a model whose every LA tensor is
+  # SpinQuant-rotated. An ACTIVE-only line would be SILENT on such a model
+  # and the arm would then be unfailable rather than passing, which is the
+  # vacuous-green shape in the other direction.
+  #
+  # TP=1 AND TP=2 BOTH VALID: unlike L4/L5 this is not a device-chain fusion
+  # (no cross-device acts), it is a host-side pointer choice in the CLI, so
+  # there is no TP polarity to assert. The arm is the same on both.
+  wave_alias_announced() { grep -aq '\[wave-alias\]' "$1"; }
+  {
+    WA_OUT="$(mktemp)"; WA_ERR="$(mktemp)"
+    env INTFER_WAVE_ALIAS=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$WA_OUT" 2>"$WA_ERR"; WA_RC=$?
+    if [ "$WA_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_WAVE_ALIAS=1 run exited rc=$WA_RC"; tail -10 "$WA_ERR" >&2
+    else
+      WA_IDS="$(ids_of "$tp" INTFER_WAVE_ALIAS=1)"
+      echo "TP=$tp [INTFER_WAVE_ALIAS=1]: '$WA_IDS'"
+      [ -n "$WA_IDS" ] || fail "TP=$tp INTFER_WAVE_ALIAS=1 stream EMPTY"
+      [ "$WA_IDS" = "$BASE" ] \
+        || fail "TP=$tp [INTFER_WAVE_ALIAS=1] '$WA_IDS' != base '$BASE' (must be bit-exact)"
+      if ! wave_alias_announced "$WA_ERR"; then
+        fail "TP=$tp INTFER_WAVE_ALIAS=1: no [wave-alias] line -- the alias never took, stream match vacuous"
+      fi
+    fi
+    rm -f "$WA_OUT" "$WA_ERR"
+  }
+  {
+    WASB="$(mktemp -d)"
+    env INTFER_WAVE_ALIAS=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$WASB/good.out" 2>"$WASB/good.err" || true
+    cp "$WASB/good.err" "$WASB/not.err"
+    sed -i '/\[wave-alias\]/d' "$WASB/not.err"
+    : >"$WASB/empty.err"
+    if ! wave_alias_announced "$WASB/good.err"; then
+      echo "TP=$tp WAVE_ALIAS self-check SKIPPED: the tp=1 fixture produced no \
+            [wave-alias] line (the model's LA tensors are all SpinQuant-rotated, \
+            so aliased=0, or the engine did not run on this box), so the \
+            refusal/vacuity directions are unexercised here" >&2
+    else
+      if wave_alias_announced "$WASB/not.err"; then
+        fail "TP=$tp WAVE_ALIAS self-check (b): log with the decision line deleted was ACCEPTED -- arm is stream-only"
+      fi
+      if wave_alias_announced "$WASB/empty.err"; then
+        fail "TP=$tp WAVE_ALIAS self-check (c): arm ACCEPTED an empty log (vacuity)"
+      fi
+    fi
+    rm -rf "$WASB"
+  }
 done
 
 if [ "$PASS" != 1 ]; then
