@@ -1,6 +1,9 @@
-# Build artifacts
-build/
-build_*/
+# Build artifacts. Directory-only glob (trailing slash) so a *file* named
+# build*.sh is never swallowed. 2026-10-10: build-dbg/ and build2/ slipped past
+# build/ and build_*/ for days -- build-dbg's engine.cpp.o was 4h older than
+# its source, so a never-compiled tree sat beside the working tree and read as
+# a live build. A stale artifact must not be mistakeable for a live one.
+build*/
 .cache/
 compile_commands.json
 
