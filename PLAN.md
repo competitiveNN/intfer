@@ -147,6 +147,17 @@ in AGENTS.md. Do not re-attempt as-is.
   readback, `q.prefetch()` over all shards — same floor / neutral /
   no-op.
 * XMX at M=1 — the shapes are memory-bound; do not re-attempt.
+* GQA-packing the head-group into the M/row dimension at M=1
+  (vllm-xpu `decode_policy_qpacked_head` / `qgroup` 8/16) —
+  **NOT APPLICABLE: no consumer in this tree.** Investigated
+  2026-10-10 (HISTORY.md, "E4 double-gating resolved; GQA-packing
+  has no consumer"). This repo's decode attention is the
+  GatedDeltaNet SSM recurrence (no KV cache, no query-head grid,
+  no GQA group); the `is_full` softmax path already implements GQA
+  grouping host-side; the M=1 INT2 decode is the layer GEMM (no
+  head structure, row dim fixed at 1). `INTFER_DECODE1_GQAPACK`
+  would be dead code at the 27B target — not implemented, recorded
+  instead.
 
 ## 3. Dependencies required by the big items
 

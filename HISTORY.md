@@ -1149,6 +1149,77 @@ so it would have to be decided on `nk`/`nw`/`nr`/`submit_count`/`usm_write_count
 `readback_count`/`wait_count`/`copy_count` — never on a tok/s, and never on
 `kernel`.
 
+## ==> 2026-10-10: E4 double-gating resolved; GQA-packing has no
+consumer <==
+
+**E4 (`INTFER_DPAS48_TILED`) is double-gated, and the −9.95% is
+against the dpas48-1D baseline, not the default prefill path.**
+
+The code is unambiguous:
+
+* `engine.cpp:1023` — `const bool use_tiled = dpas_tiled_enabled()
+  && M >= 2 && !use_row;` lives INSIDE `run_linear_tp_dpas48`.
+* `engine.cpp:1280` — `run_linear_tp_dpas48` is reached only via
+  `if (sc.dpas48) { run_linear_tp_dpas48(...); return; }`, and
+  `sc.dpas48` is true only when `INTFER_DPAS48=1` (default OFF,
+  itself a net loss at M=1/128/361).
+* `dpas_tiled_enabled()` is read at EXACTLY ONE site
+  (`engine.cpp:1023`, `git grep` confirms) — nowhere on the
+  default (INTFER_DPAS48=0) prefill path. So `INTFER_DPAS48_TILED=1`
+  alone is inert; the `TILDA` arm in `test_gpu_optin.sh:445`
+  asserts exactly that inertness (it is a nested-flag guard, not a
+  promotion path).
+
+Consequence: the measured `-1851.9 ms / -9.95%` is
+`DPAS48+TILED` vs `DPAS48` — E4 improving a path that is itself a
+net loss vs the default. It does NOT establish that E4 improves the
+default prefill path (which never runs the DPAS48 kernel at all).
+Promotion to default-ON is only meaningful for the PAIR
+(`INTFER_DPAS48=1 INTFER_DPAS48_TILED=1`), and that pair must beat
+the DEFAULT prefill path at M>2 on the `kernel` bucket, 3/3 same
+sign, clearing the spread floor. **That measurement has never been
+taken** — it is operator-only (the engine is forbidden from agent
+sessions and `roofline_probe` is vacuous on this box). Recorded so
+the −9.95% is never quoted as if it were a default-path win.
+
+**GQA-packing (vllm-xpu `decode_policy_qpacked_head` / `qgroup`)
+was investigated and has NO consumer in this tree — not implemented.**
+
+The vllm-xpu-kernels concept packs `qgroup` (8/16) query heads that
+share a KV head into one CTA's M dimension, amortizing K/V loads
+across the GQA group. It is a *device paged-KV softmax-decode*
+kernel tile size. This repo has no such kernel to pack:
+
+* **The 27B target decodes through GatedDeltaNet LINEAR attention**
+  — an SSM recurrence over `n_v_heads` INDEPENDENT value heads,
+  each with its own `k_head_dim × v_head_dim` state `S`
+  (`main.cpp:5180-5210`, `kv_mem`/`delta` recurrence). No KV cache,
+  no query-head grid, no softmax, no GQA group. The
+  `kh = hh*n_k/n_v` sharing (commit `22431d5`) is only of the
+  query/key PROJECTION vectors, not a shared KV head.
+* **The `is_full` softmax-attention path ALREADY implements GQA
+  grouping** (`main.cpp:4948-4970`): "Heads sharing a KV head
+  reuse the same K/V cache rows... each row is loaded once per group
+  and dotted/fanned-out to all group heads. Bit-identical." It is
+  HOST-side scalar work, not a device launch — PLAN.md 1.6 already
+  records "attention tail is not the deficit."
+* **The M=1 INT2 decode path (`gemm_usm_decode1_*`) is the layer
+  GEMM** — one output element per work-item, no head structure, no
+  GQA. `INTFER_DECODE1_MR` operated here and divided the N-work-item
+  budget; at M=1 the row dimension is fixed at 1, so there is no
+  "row dimension to multiply." The inverse-of-MR analogy does not
+  transfer: MR's rows are output elements of a fixed-width GEMM, not
+  attention heads.
+
+Shipping `INTFER_DECODE1_GQAPACK` would be a default-OFF flag no
+reachable branch can use at the 27B target — exactly the
+"dead-code flag" class the flag census (`check_flag_gate_coverage.sh`)
+exists to kill. Per the repo's own rule (an optimization with no
+consumer is dead code), the investigation is recorded here instead of
+shipped. If a device paged-KV softmax-decode kernel is ever added to
+this tree, THAT is where `qgroup` packing would apply — not to the
+layer GEMM or the linear-attention recurrence.
+
 ### Stack run at `e28f092` (2026-10-09, ~10 min)
 
 `INTFER_SKIP_HEALTHY=1 bash scripts/run_all_checks.sh` -> **10 FAIL / 3
