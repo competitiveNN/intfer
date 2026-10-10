@@ -55,9 +55,10 @@ RP="$BUILD_DIR/rowpair_equiv.rp.txt"
 # and its payload would be the thing under test, not the reference. The BINARY
 # restores the reference for the base order by setting both kill switches; the gate
 # does not have to, and must not (it would be a no-op on the two opt-in arms).
-# FOUR ORDERS, ONE PROCESS EACH. quant_gemm_forward_usm reads each arm's flag into a
+# ONE ORDER PER PROCESS. quant_gemm_forward_usm reads each arm's flag into a
 # function-local `static const bool`, so a flag is set ONCE PER PROCESS; one binary
-# cannot hold two orders. Hence six invocations and five diffs.
+# cannot hold two orders. Hence one invocation per order (base plus every
+# arm) and one diff per arm.
 #
 # The two extra orders are INTFER_DECODE1_VERBHALF and INTFER_DECODE1_VERBMP, and
 # they are here for a REASON beyond symmetry: VERBMP's "bit-exact BY CONSTRUCTION"
@@ -77,6 +78,7 @@ marker_for() {  # $1 = order tag -> the marker that order MUST print
     rp) echo decode1-rowpair ;; vh) echo decode1-verbhalf ;;
     vm) echo decode1-verbmp ;;  vd) echo decode1-verbdead ;;
     vs) echo decode1-verbsel ;; vv) echo decode1-verbvec ;;
+    wv) echo decode1-wvec ;;
     *)   echo "" ;;
   esac
 }
@@ -130,6 +132,8 @@ if [ "${1:-}" = "--self-check" ]; then
   printf 'x\n[decode1-rowpair] 2 rows/work-item ACTIVE\ny\n'    >"$SC/vh.wrong"
   printf 'x\n[decode1-verbhalf] a\n[decode1-rowpair] b\ny\n'    >"$SC/vh.two"
   printf 'x\ny\n'                                              >"$SC/rp.silent"
+  printf 'x\n[decode1-wvec] weight bytes via vec load ACTIVE\ny\n' >"$SC/wv.good"
+  printf 'x\n[decode1-verbhalf] scale via bit_cast ACTIVE\ny\n' >"$SC/wv.wrong"
   # tc <expected-rc> <label> <order> <fixture>
   tc() { local want_rc=$1 lbl=$2 ord=$3 f=$4 rc=0
          marker_verdict "$ord" "$f" >/dev/null 2>&1 || rc=1
@@ -141,9 +145,11 @@ if [ "${1:-}" = "--self-check" ]; then
   tc 1 "vh carrying ROWPAIR's marker instead         -> REFUSED"  vh    "$SC/vh.wrong"
   tc 1 "vh carrying TWO markers                      -> REFUSED"  vh    "$SC/vh.two"
   tc 1 "rp silent (the MUST-appear direction)        -> REFUSED"  rp    "$SC/rp.silent"
+  tc 0 "wv + its own marker                          -> ACCEPTED" wv    "$SC/wv.good"
+  tc 1 "wv carrying VERBHALF's marker instead        -> REFUSED"  wv    "$SC/wv.wrong"
   if [ "$bad" -ne 0 ]; then echo "DECODE1-EQUIV SELF-CHECK: FAIL" >&2; exit 1; fi
-  echo "DECODE1-EQUIV SELF-CHECK: PASS (1 must-appear, 1 must-stay-quiet,"
-  echo "  3 must-be-refused -- synthetic logs, no GPU, no launch)"
+  echo "DECODE1-EQUIV SELF-CHECK: PASS (2 must-appear, 1 must-stay-quiet,"
+  echo "  4 must-be-refused -- synthetic logs, no GPU, no launch)"
   exit 0
 fi
 
@@ -156,12 +162,16 @@ run_order() {  # $1 = order tag
   # *** WHICH ARMS ARE UNSET HERE, AND WHY IT CHANGED. *** Until 2026-10-07 every
   # arm was default-OFF, so unsetting every arm's enable var left the reference
   # path running by default -- correct, and the base order needed no env at all.
-  # VERBHALF and VERBMP are now default-ON kill switches, so unsetting their enable
-  # vars is a NO-OP (they have none) and the reference still runs the default path.
-  # Only the four remaining opt-in arms (ROWPAIR / VERBDEAD / VERBSEL / VERBVEC) are
-  # unset here, which is all that is needed to keep the reference free of them.
+  # VERBHALF and VERBMP are now default-ON kill switches, so unsetting their
+  # enable vars is a NO-OP (they have none) and the reference still runs the
+  # default path. Only the five remaining opt-in arms (ROWPAIR / VERBDEAD /
+  # VERBSEL / VERBVEC / WVEC) are unset here, which is all that is needed to
+  # keep the reference free of them. (The binary also unsets and kills every
+  # arm in its own order table, so this is belt-and-braces against a stray
+  # INTFER_DECODE1_*=1 inherited from the operator's shell.)
   env -u INTFER_DECODE1_ROWPAIR -u INTFER_DECODE1_VERBDEAD \
     -u INTFER_DECODE1_VERBSEL -u INTFER_DECODE1_VERBVEC \
+    -u INTFER_DECODE1_WVEC \
     DECODE1_EQUIV_ORDER="$tag" \
     "$SCRIPT_DIR/with_oneapi.sh" "$BIN" >"$f" \
     2>"$BUILD_DIR/rowpair_equiv.$tag.err"
@@ -177,7 +187,7 @@ run_order() {  # $1 = order tag
 # failed with "unknown DECODE1_EQUIV_ORDER", which is exactly the "added to one place,
 # forgotten in the other" failure this table exists to prevent. The long names are the
 # FLAG names, not the ORDER names; keep the two vocabularies distinct.
-ARMS="rp vh vm vd vs vv"
+ARMS="rp vh vm vd vs vv wv"
 ORDERS="base $ARMS"
 # The per-order payload paths, in ONE place, BEFORE the loop that reads them --
 # bash expands an unset variable to the empty string, and `run_order t ""` would
@@ -188,6 +198,7 @@ VM="$BUILD_DIR/rowpair_equiv.verbmp.txt"
 VD="$BUILD_DIR/rowpair_equiv.verbdead.txt"
 VS="$BUILD_DIR/rowpair_equiv.verbsel.txt"
 VV="$BUILD_DIR/rowpair_equiv.verbvec.txt"
+WV="$BUILD_DIR/rowpair_equiv.wvec.txt"
 
 rcs=""
 for t in $ORDERS; do
@@ -200,6 +211,7 @@ for t in $ORDERS; do
     vd)   f="$VD" ;;
     vs)   f="$VS" ;;
     vv)   f="$VV" ;;
+    wv)   f="$WV" ;;
   esac
   r=0; run_order "$t" "$f" || r=$?
   if ! marker_verdict "$t" "$BUILD_DIR/rowpair_equiv.$t.err"; then
@@ -230,7 +242,7 @@ done
 # own checker for, in miniature.
 n_base="$(grep -c '|0x' "$BASE" || true)"
 for pair in "rowpair:$RP" "verbhalf:$VH" "verbmp:$VM" \
-            "verbdead:$VD" "verbsel:$VS" "verbvec:$VV"; do
+            "verbdead:$VD" "verbsel:$VS" "verbvec:$VV" "wvec:$WV"; do
   lbl="${pair%%:*}"; f="${pair#*:}"
   n="$(grep -c '|0x' "$f" || true)"
   if [ "${n_base:-0}" -lt 1000 ] || [ "${n:-0}" -lt 1000 ]; then
@@ -265,8 +277,8 @@ if ! marker_verdict base "$BUILD_DIR/rowpair_equiv.base.err"; then
   exit 1
 fi
 int2filt() { grep -E '\(INT2\)' "$1"; }
-int2filt "$BASE"  | sed 's/|base$//; s/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//' >"$BASE.int2.norm"
-int2filt "$BASE2" | sed 's/|base$//; s/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//' >"$BASE2.int2.norm"
+int2filt "$BASE"  | sed 's/|base$//; s/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//; s/|wv$//; s/|wvec$//' >"$BASE.int2.norm"
+int2filt "$BASE2" | sed 's/|base$//; s/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//; s/|wv$//; s/|wvec$//' >"$BASE2.int2.norm"
 n_int2="$(grep -c '|0x' "$BASE.int2.norm" || true)"
 if ! cmp -s "$BASE.int2.norm" "$BASE2.int2.norm"; then
   echo "FAIL: the INT2 reference is NONDETERMINISTIC on this box -- base ran twice" >&2
@@ -300,7 +312,7 @@ check_identical() {  # $1 = label, $2 = file
   # Both sides stripped of their trailing order tag: `base` carries `|base`, every
   # arm carries its own (`|rp`, `|vm`, ...), and `int2filt` above leaves the tag on
   # the base file. Stripping it from BOTH is what makes the diff a value diff.
-  int2filt "$f" | sed 's/|base$//; s/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//' >"$f.int2.norm"
+  int2filt "$f" | sed 's/|base$//; s/|rp$//; s/|vh$//; s/|vm$//; s/|vd$//; s/|vs$//; s/|vv$//; s/|rowpair$//; s/|verbhalf$//; s/|verbmp$//; s/|verbdead$//; s/|verbsel$//; s/|verbvec$//; s/|wv$//; s/|wvec$//' >"$f.int2.norm"
   if cmp -s "$BASE.int2.norm" "$f.int2.norm"; then
     echo "  ok    $lbl is BITWISE IDENTICAL to base on INT2 ($n_int2 element values)"
   else
@@ -321,6 +333,7 @@ check_identical "INTFER_DECODE1_VERBMP  " "$VM" || rc=1
 check_identical "INTFER_DECODE1_VERBDEAD" "$VD" || rc=1
 check_identical "INTFER_DECODE1_VERBSEL " "$VS" || rc=1
 check_identical "INTFER_DECODE1_VERBVEC " "$VV" || rc=1
+check_identical "INTFER_DECODE1_WVEC   " "$WV" || rc=1
 # VERBHALF: report, do not gate.
 int2filt "$VH" | sed 's/|base$//; s/|verbhalf$//' >"$VH.int2.norm"
 if cmp -s "$BASE.int2.norm" "$VH.int2.norm"; then
@@ -334,7 +347,7 @@ else
   echo "        claimed NOT bit-exact (denormal + default FTZ). It is reported so"
   echo "        the magnitude is on the record rather than assumed."
 fi
-[ "$rc" -eq 0 ] || { [ "$KEEP" -eq 1 ] || rm -f "$BASE" "$RP" "$VH" "$VM" "$VD" "$VS" "$VV" "$BASE.norm" "$RP.norm" "$VH.norm" "$VM.norm" "$VD.norm" "$VS.norm" "$VV.norm" "$BASE.int2" "$BASE.int2.norm" "$BASE2.int2" "$BASE2"; exit 1; }
+[ "$rc" -eq 0 ] || { [ "$KEEP" -eq 1 ] || rm -f "$BASE" "$RP" "$VH" "$VM" "$VD" "$VS" "$VV" "$WV" "$BASE.norm" "$RP.norm" "$VH.norm" "$VM.norm" "$VD.norm" "$VS.norm" "$VV.norm" "$WV.norm" "$BASE.int2" "$BASE.int2.norm" "$BASE2.int2" "$BASE2"; exit 1; }
 
 # Per-dataset coverage, so a green verdict says WHICH cases passed rather than only
 # that they agreed. Derived from the payload, not from a remembered list.
@@ -365,6 +378,7 @@ echo "          INTFER_DECODE1_VERBMP   BITWISE IDENTICAL  -- claim MEASURED"
 echo "          INTFER_DECODE1_VERBDEAD BITWISE IDENTICAL  -- pure code motion"
 echo "          INTFER_DECODE1_VERBSEL  BITWISE IDENTICAL  -- codebook by select"
 echo "          INTFER_DECODE1_VERBVEC  BITWISE IDENTICAL  -- activation ptr type"
+echo "          INTFER_DECODE1_WVEC     BITWISE IDENTICAL  -- weight load forming"
 echo "        INTFER_DECODE1_VERBHALF reported above: it is claimed NOT bit-exact"
 echo "        (denormal + default FTZ), so a difference is information, not a failure."
 echo "        *** DEFAULTS AS OF 2026-10-07: VERBHALF and VERBMP are the DEFAULT"

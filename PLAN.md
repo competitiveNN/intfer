@@ -129,45 +129,58 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
 * **Why last:** layer GEMMs are 99% of launches. The attention tail
   is not the deficit. Only after 1.1-1.3 are settled.
 
-### 1.7 Bit-exact weight-load forming in `gemm_usm_decode1_vec`
-  (BLOCKED by tooling, not by code — static analysis only)
+### 1.7 Bit-exact weight-load forming in the M=1 INT2 decode
+  (IMPLEMENTED 2026-10-10 as `INTFER_DECODE1_WVEC`, default
+  OFF — the candidate below is now code, gated and model-free
+  measured; only the performance verdict is still open)
 
-* **The finding (static, `quant_gemm.cpp:1546-1681`).** The
-  default-ON INT2-tab path (:1613-1644) loads the weight
-  through **scalar** `code_u8[b0]` / `code_u8[b0+1]` byte
-  reads, while the sibling INT8 path (:1573-1574) loads its
-  weight through a vectorized `sycl::vec<std::uint8_t,8>::load`
-  via the `w_mp` multi_ptr (:1560-1561). The `w_mp` multi_ptr
-  is constructed for the INT2 path too but is **never used** in
-  it — the path reads the raw `code_u8` pointer instead. So the
-  two paths use different load idioms for the same kind of
-  operand, and the INT2 path (the shipped +5.7-6.0% default)
-  takes the scalar one.
+* **The finding (static).** The default-ON INT2-tab branch of
+  `gemm_usm_decode1_vec` loads the weight through **scalar**
+  `code_u8[b0]` / `code_u8[b0+1]` byte reads, while the sibling
+  INT8 path loads its weight through a vectorized
+  `sycl::vec<std::uint8_t,8>::load` via a `w_mp` multi_ptr. The
+  multi_ptr is constructed for the INT2 path too but is **never
+  used** in it — the path reads the raw `code_u8` pointer
+  instead. So the two paths use different load idioms for the
+  same kind of operand, and the INT2 path (the shipped
+  +5.7-6.0% default) takes the scalar one.
 * **The candidate (bit-exact by construction).** Load the two
-  INT2 weight bytes through `w_mp` as a
-  `sycl::vec<std::uint8_t,2>` (or fold them into the existing
-  vectorized load), matching the INT8 idiom. Identical bytes
-  read, identical codes extracted, identical accumulation
-  order -> byte-identical output.
-* **Why it is BLOCKED, not implemented.** A bit-exact
-  load-forming change moves **only** the `kernel` bucket
-  (`engine.cpp:1223,1435`, the sole device-event-timestamp
-  bucket). Every other counter — `nk`/`nw`/`nr` and the host
-  `submit`/`waitblock`/`copy`/`readback`/`usm_write` buckets
-  (all host `std::chrono`, `engine.cpp:156-163`) — is
-  provably unchanged: same launch count, same wait, same
-  transfer sizes. So the verdict can come **only** from
-  `kernel_us`, whose liveness on this box is **UNVERIFIED for
-  the engine** (verified dead only for `roofline_probe`;
-  AGENTS.md "The profiling defect"). And the stream-identity
-  gate that must precede any kernel change cannot run on a
-  degraded box (every 0.8B engine run crashes signal 11 in
-  `libze_intel_gpu.so.1`). Same class as 1.1: record the
-  candidate, do not ship unverified kernel code into the hot
-  decode path.
-* **Gate (when unblocked):** arm in `test_tp2_27b.sh`,
-  stream-identity asserted at TP=1 and TP=2, `kernel_us` delta
-  3/3 same sign clearing the spread floor. Operator-only.
+  INT2 weight bytes through the multi_ptr as a
+  `sycl::vec<std::uint8_t,2>`, matching the INT8 idiom.
+  Identical bytes read, identical codes extracted, identical
+  accumulation order -> byte-identical output.
+* **Status 2026-10-10: shipped behind the flag.**
+  `INTFER_DECODE1_WVEC=1` runs `gemm_usm_decode1_wvec` — the
+  base INT2-tab body with the chunk's two weight bytes read as
+  one `sycl::vec<std::uint8_t,2>::load` from a row-base
+  multi_ptr (the VERBMP idiom: `b0` is RELATIVE to that base
+  and the tail keeps the UNOFFSET absolute `code_u8` indices, so
+  the ROWPAIR double-offset class has no room to exist).
+  Reaching it needs BOTH default-ON arms killed —
+  `INTFER_NO_DECODE1_VERBHALF=1 INTFER_NO_DECODE1_VERBMP=1`
+  (verbhalf is checked first, verbmp second, and each ends in
+  `return q.submit(...)`; killing only verbhalf leaves verbmp
+  winning the run, proven model-free at the M=1 INT2
+  MLP_GATE shape) — plus the presence flag
+  `INTFER_DECODE1_WVEC=1`. That is exactly what the
+  `test_tp2_27b.sh` WVEC arm sets, and the rowpair_equiv
+  `wv` order reaches it the same way (its env kills every
+  non-selected arm, both defaults included). **Bit-exactness
+  is MEASURED, not argued:** the `wv` order diffs it against
+  the restored reference, INT2 shapes only, bitwise,
+  model-free.
+* **What is still open (operator-only):** the performance
+  direction. A bit-exact load-forming change moves **only** the
+  `kernel` bucket (the sole device-event-timestamp bucket);
+  every other counter — `nk`/`nw`/`nr` and the host
+  `submit`/`waitblock`/`copy`/`readback`/`usm_write` buckets —
+  is provably unchanged: same launch count, same wait, same
+  transfer sizes. The verdict can come **only** from `kernel_us`
+  (3/3 same sign, clearing the spread floor), whose liveness on
+  this box is **UNVERIFIED for the engine** (verified dead only
+  for `roofline_probe`; AGENTS.md "The profiling defect"). The
+  27B engine arm in `test_tp2_27b.sh` asserts the stream
+  identity on real weights; the operator measures the delta.
 
 ## 2. Not a backlog item (measured, closed)
 

@@ -1709,3 +1709,69 @@ the corrected HEAD (project 2025.3 toolchain): control →
 verbhalf]` (the presence flag is dead, as documented);
 `INTFER_NO_DECODE1_VERBHALF=1` → `[decode1-verbmp]`. The gate fix
 holds.
+
+## `INTFER_DECODE1_WVEC` (2026-10-10): PLAN.md 1.7 implemented
+
+The one static-analysis finding in PLAN.md with a
+bit-exact candidate is now code, behind a default-OFF
+opt-in flag, gated at every layer the repo's tooling
+demands:
+
+* **The change (one, load-forming only).** The M=1
+  INT2-tab decode body read each 8-code chunk's two
+  weight bytes through two scalar `code_u8[b0]` /
+  `code_u8[b0+1]` reads while the sibling INT8 path
+  vectorizes its weight load through a multi_ptr.
+  `gemm_usm_decode1_wvec` (new arm,
+  `quant_gemm_forward_usm`, `INTFER_DECODE1_WVEC=1`)
+  reads the same two bytes as ONE
+  `sycl::vec<std::uint8_t,2>::load` from a row-base
+  multi_ptr — the VERBMP idiom: the multi_ptr is built
+  on `code_u8 + row_base / 4u` (the ELEMENT row base
+  converted to the BYTE base the packed weights live
+  at), `b0` is RELATIVE to it, and the tail keeps the
+  UNOFFSET absolute `code_u8` indices exactly as the
+  base kernel does. Identical bytes, identical codes,
+  identical accumulation order → BYTE-IDENTICAL BY
+  CONSTRUCTION, no numerics contract.
+* **Reachability.** The arm sits NINTH in the dispatch chain,
+  behind TWO default-ON arms (verbhalf first, verbmp second),
+  each ending in `return q.submit(...)`, so it runs only under
+  `INTFER_NO_DECODE1_VERBHALF=1 INTFER_NO_DECODE1_VERBMP=1
+  INTFER_DECODE1_WVEC=1` — killing only verbhalf leaves verbmp
+  winning the run (proven model-free at the M=1 INT2 MLP_GATE
+  shape: that env announces `decode1-verbmp`, not
+  `decode1-wvec`). The order-exclusivity guard in
+  `quant_gemm_forward_usm` was extended with the new arm (it
+  refuses a run with two arms live), but it sits AFTER the four
+  earliest arms, so it cannot police this pair. The
+  `test_tp2_27b.sh` WVEC arm sets exactly that env (the RUNENV
+  launch was extended to word-split a three-assignment
+  arm_env); its bit-exactness is settled model-free by a NEW
+  `wv` order in
+  `examples/rowpair_equiv` + `scripts/test_rowpair_equiv.sh`
+  (order table, payload buffer, slot/tag chains, marker
+  predicate, harvest, INT2-only diff, banner, and two
+  new self-check cases), and the stream identity on real
+  27B weights is asserted by the gate arm.
+* **Tooling wired in the same commit, not after.**
+  `scripts/check_decode1_copies.sh` covers the new body
+  by DERIVATION: its case entry, the population regex,
+  and the shift-into-mask equality derivation (now
+  `verb|wvec`) all name it, so the arm is pinned the day
+  it exists. PLAN.md 1.7 re-headlined IMPLEMENTED;
+  AGENTS.md flag table row added.
+* **What is NOT claimed:** performance. A bit-exact
+  load-forming change moves only the `kernel` bucket,
+  whose liveness on this box is UNVERIFIED for the
+  engine (AGENTS.md "The profiling defect"). Direction
+  UNKNOWN until the operator measures `kernel_us` 3/3
+  same sign clearing the spread floor on 27B `--tp 2`.
+* **Verified in-session (agent-runnable, model-free):**
+  engine + rowpair_equiv rebuild rc=0; `bash -n` on all
+  three edited scripts; `check_decode1_copies.sh` PASS
+  with the new body enumerated and shift-into-mask
+  equality holding; rowpair_equiv `--self-check` PASS
+  (2 must-appear / 1 must-stay-quiet / 4 must-be-refused);
+  the `wv` order's model-free differential vs the
+  restored reference ran clean (INT2 shapes, bitwise).

@@ -127,6 +127,17 @@ for k in "${ALL_D1[@]}"; do
       # below rather than asserted here.
       echo "     covered-by-subset  $k  (one-change bisect arm; see the" \
            "shift-into-mask equality below)" ;;
+     gemm_usm_decode1_wvec)
+      # PLAN.md 1.7: the vectorized-weight-load arm. A one-change
+      # variant of the base INT2-tab body -- the chunk's two INT2
+      # weight bytes as ONE sycl::vec<std::uint8_t,2> load from a
+      # row-base multi_ptr instead of two scalar code_u8[b0] /
+      # code_u8[b0+1] reads -- so it re-implements the same
+      # per-output arithmetic with the same shift-into-mask. It is
+      # pinned by the equality below BY DERIVATION (the population
+      # grep is verb|wvec), not by this label.
+      echo "     covered-by-subset  $k  (one-change bisect arm; see the" \
+           "shift-into-mask equality below)" ;;
     gemm_usm_decode1_rowpair)
       rp_found=1; echo "     COVERED-BY-ATOM-PIN  $k" ;;
     # Bodies with a STATED reason for not sharing the scalar per-output arithmetic.
@@ -173,7 +184,7 @@ if printf '%s\n' "${ALL_D1[@]}" | grep -qx 'gemm_usm_decode1_rowpair' && [ "$rp_
 fi
 # An UNCOVERED entry is drift in the POPULATION, not a style note.
 if printf '%s\n' "${ALL_D1[@]}" | grep -qvE \
-     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp|gemm_usm_decode1_verbdead|gemm_usm_decode1_verbsel|gemm_usm_decode1_verbvec|gemm_usm_decode1_gateup_int2tab)$'; then
+     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp|gemm_usm_decode1_verbdead|gemm_usm_decode1_verbsel|gemm_usm_decode1_verbvec|gemm_usm_decode1_wvec|gemm_usm_decode1_gateup_int2tab)$'; then
   echo "  FAIL  a decode1 body is neither pinned nor exempted -- enumerate it" >&2
   printf '%s\n' "${ALL_D1[@]}" | sed 's/^/        /' >&2
   exit 1
@@ -347,14 +358,15 @@ echo "  ok    the row-pair shift-into-mask set EQUALS the general body's"
 # WRONG form too), because an extractor that only recognises the right answer cannot
 # detect a wrong one -- which is how the first version of this check passed a planted
 # bug.
-# Every `verb*` body is checked, DERIVED from the parallel_for names rather than
-# listed -- so an arm added today is pinned today, which is the whole point after
-# three separate incidents of a checker enumerating fewer bodies than existed.
+# Every `verb*` body (and the WVEC one-change variant, whose name does
+# not start with `verb` -- the derivation is `verb|wvec` so an arm is
+# pinned the day it is added, which is the whole point after three
+# separate incidents of a checker enumerating fewer bodies than existed).
 # The relation is EQUALITY of the shift-into-mask set against the general body, and
-# the extractor is deliberately LOOSE (it matches the WRONG form too), because an
-# extractor that only recognises the right answer cannot detect a wrong one -- which
-# is how the first version of this check passed a planted INTFER_DECODE1_SPLITK bug.
-verb_bodies="$(printf '%s\n' "${ALL_D1[@]}" | grep '^gemm_usm_decode1_verb' || true)"
+# the extractor is deliberately LOOSE (it matches the WRONG form too), because
+# an extractor that only recognises the right answer cannot detect a wrong one --
+# which is how the first version of this check passed a planted INTFER_DECODE1_SPLITK bug.
+verb_bodies="$(printf '%s\n' "${ALL_D1[@]}" | grep -E '^gemm_usm_decode1_(verb|wvec)' || true)"
 if [ -z "$verb_bodies" ]; then
   echo "  FAIL  no verb* body was enumerated -- the enumeration drifted" >&2
   exit 1

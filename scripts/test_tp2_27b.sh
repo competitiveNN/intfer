@@ -172,6 +172,7 @@ vm_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbmp' 'DECODE
 vd_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbdead' 'DECODE1_VERBDEAD'; }
 vs_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbsel' 'DECODE1_VERBSEL'; }
 vv_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-verbvec' 'DECODE1_VERBVEC'; }
+wv_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'decode1-wvec' 'DECODE1_WVEC'; }
 # The change that added the SUBGROUP arm DEFINED THIS TWICE -- once here and
 # once above beside rp_arm_assert -- and RAN the arm twice, so the gate paid
 # two full 27B decode runs of one flag in its most expensive operation. Bash
@@ -728,8 +729,27 @@ fi
 # `decode1-verbmp`. The same shadowing examples/rowpair_equiv handles
 # inside the binary (its order loop sets INTFER_NO_DECODE1_VERBHALF=1
 # for the vm order), which is why only this gate was wrong.
+# *** THE WVEC ARM IS THE SAME SHAPE, PLUS ITS OWN PRESENCE FLAG --
+# AND IT MUST KILL BOTH DEFAULT-ON ARMS, NOT JUST VERBHALF. ***
+# INTFER_DECODE1_WVEC is a default-OFF opt-in (PLAN.md 1.7, the
+# bit-exact INT2 weight-load forming), and it sits NINTH in the
+# dispatch chain. Two default-ON arms precede it -- verbhalf
+# (checked first) and verbmp (checked second) -- and each ends in
+# `return q.submit(...)`, so killing only verbhalf leaves verbmp
+# winning the run (proven model-free: `INTFER_NO_DECODE1_VERBHALF=1
+# INTFER_DECODE1_WVEC=1` announces `decode1-verbmp`, not
+# `decode1-wvec`). The arm env therefore kills BOTH defaults and
+# sets the presence flag. The order-exclusivity guard in
+# quant_gemm_forward_usm refuses a run with two arms live, but it
+# sits AFTER the four earliest arms, so it can only police the
+# later arms among themselves -- it cannot rescue this arm. Its
+# bit-exactness is settled model-free by scripts/test_rowpair_
+# equiv.sh's `wv` order (whose env kills every non-selected arm,
+# both defaults included); this arm asserts the stream identity on
+# real 27B weights.
 for spec in "VERBHALF:vh:decode1-verbhalf:" \
-            "VERBMP:vm:decode1-verbmp:INTFER_NO_DECODE1_VERBHALF=1"; do
+            "VERBMP:vm:decode1-verbmp:INTFER_NO_DECODE1_VERBHALF=1" \
+            "WVEC:wv:decode1-wvec:INTFER_NO_DECODE1_VERBHALF=1 INTFER_NO_DECODE1_VERBMP=1 INTFER_DECODE1_WVEC=1"; do
   NAME="${spec%%:*}"; rest="${spec#*:}"; abbr="${rest%%:*}"
   rest="${rest#*:}"; tag="${rest%%:*}"; arm_env="${rest#*:}"
   OUT="$LOG.${abbr}.out"; ERR="$LOG.${abbr}.err"
@@ -737,8 +757,13 @@ for spec in "VERBHALF:vh:decode1-verbhalf:" \
   # so the arm runs because it IS the default and the announcement check is
   # what proves it fired. VERBMP: arm_env kills verbhalf so THIS arm is the
   # one that runs (and the dead presence flag is deliberately NOT set).
+  # WVEC: the same kill switch PLUS its own presence flag -- it is default
+  # OFF, unlike VERBMP -- so arm_env carries TWO assignments.
   RUNENV="${arm_env:-INTFER_DECODE1_${NAME}=1}"
-  env "$RUNENV" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  # RUNENV may hold more than one assignment (WVEC); word-splitting is safe
+  # because every element is a controlled NAME=VALUE constant -- no spaces,
+  # no glob characters -- inside it.
+  env $RUNENV "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
     -p "$PROMPT" -n "$N" >"$OUT" 2>"$ERR"; RC=$?
   if [ "$RC" -ne 0 ]; then
     echo "GATE FAIL: $RUNENV run exited rc=$RC" >&2

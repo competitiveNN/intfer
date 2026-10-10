@@ -220,8 +220,9 @@ int main(int argc, char** argv) {
     void* out_vd = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
     void* out_vs = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
     void* out_vv = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
+    void* out_wv = sycl::malloc_shared(std::uint64_t(sh.N) * 2, dev.sycl_device, dev.sycl_context);
     if (!code || !sc || !act || !out_base || !out_rp || !out_vh || !out_vm ||
-        !out_vd || !out_vs || !out_vv) {
+        !out_vd || !out_vs || !out_vv || !out_wv) {
       std::fprintf(stderr, "FAIL: allocation for %s\n", sh.name);
       return 1;
     }
@@ -287,6 +288,7 @@ int main(int argc, char** argv) {
         {"vd", "INTFER_DECODE1_VERBDEAD", "INTFER_NO_DECODE1_VERBDEAD", 4},
         {"vs", "INTFER_DECODE1_VERBSEL", "INTFER_NO_DECODE1_VERBSEL", 5},
         {"vv", "INTFER_DECODE1_VERBVEC", "INTFER_NO_DECODE1_VERBVEC", 6},
+        {"wv", "INTFER_DECODE1_WVEC", "INTFER_NO_DECODE1_WVEC", 7},
       };
       int slot = -1;
       for (const auto& od : kOrders)
@@ -304,7 +306,8 @@ int main(int argc, char** argv) {
                   : (slot == 2) ? out_vh
                   : (slot == 3) ? out_vm
                   : (slot == 4) ? out_vd
-                  : (slot == 5) ? out_vs : out_vv;
+                  : (slot == 5) ? out_vs
+                  : (slot == 6) ? out_vv : out_wv;
         // The arm is a HOST env var read by quant_gemm_forward_usm into a
         // function-local `static const bool`, so it is set ONCE PER PROCESS and the
         // order therefore has to be a separate process -- which is why the gate runs
@@ -345,7 +348,7 @@ int main(int argc, char** argv) {
       const char* tag = (slot == 0) ? "base" : (slot == 1) ? "rowpair"
                         : (slot == 2) ? "verbhalf" : (slot == 3) ? "verbmp"
                         : (slot == 4) ? "verbdead" : (slot == 5) ? "verbsel"
-                        : "verbvec";
+                        : (slot == 6) ? "verbvec" : "wvec";
       std::printf("%s|%s|%d|%s|%s\n", sh.name, sh.scheme_name, d, dataset_name(d), tag);
       for (std::uint32_t i = 0; i < sh.N; ++i) {
         std::printf("%s|%s|%d|%s|%u|0x%04x\n", sh.name, sh.scheme_name, d,
@@ -357,7 +360,7 @@ int main(int argc, char** argv) {
                      std::getenv("DECODE1_EQUIV_ORDER") ? std::getenv("DECODE1_EQUIV_ORDER")
                                                          : "base");
     }
-    sycl::free(out_vv, q); sycl::free(out_vs, q); sycl::free(out_vd, q);
+    sycl::free(out_wv, q); sycl::free(out_vv, q); sycl::free(out_vs, q); sycl::free(out_vd, q);
     sycl::free(out_vm, q); sycl::free(out_vh, q);
     sycl::free(out_rp, q); sycl::free(out_base, q);
     sycl::free(act, q); sycl::free(sc, q); sycl::free(code, q);

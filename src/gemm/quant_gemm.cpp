@@ -1142,6 +1142,22 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
           (std::getenv("INTFER_DECODE1_VERBVEC") != nullptr) &&
           (std::getenv("INTFER_NO_DECODE1_VERBVEC") == nullptr);
 
+      // ---- INTFER_DECODE1_WVEC: the INT2 weight bytes via a vec load ----------
+      // PLAN.md 1.7, the one static-analysis finding with a bit-exact
+      // candidate. ONE change to the shipped INT2-tab body: the two weight
+      // bytes are read through `sycl::vec<std::uint8_t,2>::load` from the
+      // `w_mp` multi_ptr instead of two scalar `code_u8[b0]` / `code_u8[b0+1]`
+      // reads. The multi_ptr is built RELATIVE to the row base (the VERBMP
+      // idiom), so `b0` stays RELATIVE too -- and the tail deliberately keeps
+      // the UNOFFSET `code_u8` with ABSOLUTE indices, exactly as the base
+      // kernel does, because that is the ROWPAIR double-offset class that lost
+      // the device. Identical bytes read, identical codes extracted,
+      // identical accumulation order -> BYTE-IDENTICAL OUTPUT BY CONSTRUCTION,
+      // no numerics contract. Moves only the `kernel` bucket.
+      const bool use_wvec =
+          (std::getenv("INTFER_DECODE1_WVEC") != nullptr) &&
+          (std::getenv("INTFER_NO_DECODE1_WVEC") == nullptr);
+
       // *** THE GUARD IS HERE NOW; IT WAS DEAD CODE WHERE IT USED TO BE. ***
       // It sat AFTER all six arms' blocks, and every arm ends in
       // `return q.submit(...)`, so control could never reach it -- it was added
@@ -1173,6 +1189,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
         if (use_verbdead)                note("INTFER_DECODE1_VERBDEAD");
         if (use_verbsel)                 note("INTFER_DECODE1_VERBSEL");
         if (use_verbvec)                 note("INTFER_DECODE1_VERBVEC");
+        if (use_wvec)                    note("INTFER_DECODE1_WVEC");
         if (live > 1) {
           std::fprintf(stderr,
                        "[decode1-bisect] REFUSING: %s and %s are both live. The\n"
@@ -1225,6 +1242,119 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                   }
                   for (; kg < kg1; ++kg) {
                     const float av = from_half_bits(act_usm[kg]);
+                    const std::size_t idx = row_base + static_cast<std::size_t>(kg);
+                    const int code =
+                        static_cast<int>((code_u8[idx / 4] >> ((idx % 4) * 2)) & 3);
+                    acc += av * scale * canon_value(2, code);
+                  }
+                }
+                out_usm[ng] = to_half_bits(acc);
+              });
+        });
+      }
+
+      // ----------------------------------------------------------------
+      // INTFER_DECODE1_WVEC -- bit-exact INT2 weight-load forming
+      // (PLAN.md 1.7). EXACTLY ONE change to the shipped INT2-tab
+      // body, and it is a LOAD FORMING change: the two INT2 weight
+      // bytes of each 8-code chunk are read through
+      // `sycl::vec<std::uint8_t,2>::load` from a row-base multi_ptr
+      // (the VERBMP idiom) instead of the two scalar
+      // `code_u8[b0]` / `code_u8[b0 + 1]` byte reads. The multi_ptr
+      // is built on `code_u8 + row_base / 4u` -- row_base is an
+      // ELEMENT offset (ng * K) and four INT2 codes pack per byte,
+      // so the /4 is the same conversion VERBMP carries; get it
+      // wrong and this is the ROWPAIR double-offset that lost the
+      // device. `b0` is therefore RELATIVE to that base, and the
+      // tail deliberately keeps the UNOFFSET `code_u8` with
+      // ABSOLUTE indices, exactly as the base kernel does.
+      //
+      // *** WHY THIS IS BIT-EXACT BY CONSTRUCTION, AND ONLY THIS. ***
+      // Identical bytes are read (the same two byte addresses the
+      // scalar reads touch), the same 4 codes are extracted from each
+      // byte with the same `(bv >> ((j & 3) * 2)) & 3`, the same
+      // `wtab` is consulted, and the accumulation order is untouched
+      // -- only the LOAD IDIOM differs. So the output is
+      // BYTE-IDENTICAL to the base body, no numerics contract applies,
+      // and `scripts/test_rowpair_equiv.sh` measures it model-free
+      // (its `wv` order) while `scripts/test_tp2_27b.sh` asserts the
+      // stream identity on real 27B weights.
+      //
+      // *** MEASURED CLAIMS, SEPARATED FROM THE ARGUMENT. *** The
+      // bit-exactness is what the differential below can decide
+      // today; the PERFORMANCE direction is UNKNOWN -- a
+      // load-forming change moves only the `kernel` bucket, and that
+      // bucket's liveness on this box is UNVERIFIED for the engine
+      // (AGENTS.md "The profiling defect"). The 27B engine arm is
+      // the only way to measure it on real weights (operator-only).
+      //
+      // *** REACHABILITY. *** This arm sits NINTH in the dispatch
+      // chain, behind TWO default-ON arms (verbhalf first, verbmp
+      // second), each ending in `return q.submit(...)`. It therefore
+      // runs only with BOTH kill switches set AND the presence flag:
+      // `INTFER_NO_DECODE1_VERBHALF=1 INTFER_NO_DECODE1_VERBMP=1
+      // INTFER_DECODE1_WVEC=1`. Killing only verbhalf leaves verbmp
+      // winning the run -- proven model-free at the M=1 INT2
+      // MLP_GATE shape (the arm announces decode1-verbmp, not
+      // decode1-wvec). The order-exclusivity guard above sits AFTER
+      // those four earliest arms, so it cannot police this pair; it
+      // only refuses two-live among the later arms (verbvec/wvec).
+      if (use_wvec && bits == 2 && use_int2_tab && num_groups > 0) {
+        decode1_announce("decode1-wvec");
+        return q.submit([&](sycl::handler& h) {
+          h.depends_on(copy_dep);
+          h.parallel_for<class gemm_usm_decode1_wvec>(
+              sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+              [=](sycl::nd_item<1> it) {
+                const int ng = static_cast<int>(it.get_global_id(0));
+                if (ng >= N) return;
+                float acc = 0.0f;
+                const std::uint16_t* sptr = scale_usm + ng * num_groups_w;
+                const std::size_t row_base = static_cast<std::size_t>(ng) * K;
+                sycl::multi_ptr<const std::uint16_t,
+                    sycl::access::address_space::global_space> act_mp(act_usm);
+                // Row-base multi_ptr, the VERBMP idiom: /4 converts the
+                // ELEMENT row base to the BYTE base the packed weights
+                // live at. RELATIVE byte indices from here on.
+                sycl::multi_ptr<const std::uint8_t,
+                    sycl::access::address_space::global_space> wmp(
+                    code_u8 + row_base / 4u);
+                for (int g = 0; g < num_groups; ++g) {
+                  const float scale = from_half_bits(sptr[g]) * alpha;
+                  const int kg0 = g * Gw;
+                  int kg1 = kg0 + Gw;
+                  if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+                  const float wtab[4] = {scale * -1.0f, scale * (-1.0f / 3.0f),
+                                         scale * (1.0f / 3.0f), scale * 1.0f};
+                  constexpr int CC = 8;
+                  int kg = kg0;
+                  std::size_t b0 = static_cast<std::size_t>(kg) / 4u;
+                  for (; kg + CC <= kg1; kg += CC) {
+                    sycl::vec<std::uint16_t, 8> a16;
+                    a16.load(0, act_mp + kg);
+                    // *** THE ONE CHANGE: the two INT2 weight bytes of
+                    // the 8-code chunk as ONE vec load from the
+                    // multi_ptr, replacing the two scalar
+                    // `code_u8[b0]` / `code_u8[b0 + 1]` reads. ***
+                    sycl::vec<std::uint8_t, 2> wv;
+                    wv.load(0, wmp + b0);
+                    const std::uint8_t b0v = wv[0];
+                    const std::uint8_t b1v = wv[1];
+                    b0 += 2;
+                    for (int j = 0; j < CC; ++j) {
+                      const float av =
+                          static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                      const std::uint8_t bv = (j < 4) ? b0v : b1v;
+                      const int code = (bv >> ((j & 3) * 2)) & 3;
+                      acc += av * wtab[code];
+                    }
+                  }
+                  for (; kg < kg1; ++kg) {
+                    const float av = from_half_bits(act_usm[kg]);
+                    // UNOFFSET base with ABSOLUTE indices, exactly as
+                    // the base kernel's tail -- NOT `wmp[idx / 4]`,
+                    // which is the ROWPAIR double-offset that lost the
+                    // device.
                     const std::size_t idx = row_base + static_cast<std::size_t>(kg);
                     const int code =
                         static_cast<int>((code_u8[idx / 4] >> ((idx % 4) * 2)) & 3);

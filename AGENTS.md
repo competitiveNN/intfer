@@ -239,6 +239,7 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_DECODE1_VERBDEAD` | per-group locals removed, pure code motion | bit-exact, default OFF |
 | `INTFER_DECODE1_VERBSEL` | the 4-float codebook by `select` instead of an indexed array | bit-exact, default OFF |
 | `INTFER_DECODE1_VERBVEC` | activations through a plain pointer instead of a `multi_ptr` | bit-exact, default OFF |
+| `INTFER_DECODE1_WVEC` | INT2 weight bytes via one `sycl::vec<uint8_t,2>` load from the row-base multi_ptr (PLAN.md 1.7) | bit-exact by construction, model-free MEASURED (rowpair_equiv `wv` order); performance UNKNOWN — kernel bucket only, liveness unverified for the engine. default OFF |
 
 ### Default ON, with a kill switch
 
