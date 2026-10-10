@@ -3236,6 +3236,24 @@ static bool gpu_la_out_fused(GpuBackend& be, const Request* req,
       if((++n % 24) == 1)
         std::fprintf(stderr, "[l4] fused la_out x%d\n", n);
     }
+    // *** INTFER_L4_FUSE acceptance announcement. *** Same contract as
+    // INTFER_FUSE_ACT's [fuse-act] line (engine.cpp:1406-1408): the fusion
+    // is bit-exact by construction, so a base-vs-flagged stream comparison
+    // is satisfiable by a flag that did nothing, and the ONLY thing that
+    // turns "the two runs matched" into "the fused path ran" is a line the
+    // kernel prints on acceptance. Without it the arm below is stream-only
+    // and vacuous -- exactly the class the gate's own self-check exists to
+    // catch. Once-per-process, keyed by tag, so two arms cannot suppress
+    // each other's line (see decode1_announce's latch contract,
+    // quant_gemm.cpp:62-79).
+    static bool announced_l4 = false;
+    if(!announced_l4) {
+      announced_l4 = true;
+      std::fprintf(stderr,
+                   "[l4-fused] la_out fusion ACTIVE "
+                   "(SSM -> norm+silu(z)+FP16 -> la_out GEMM on-device, "
+                   "one wait + one D2H; INTFER_L4_FUSE=1)\n");
+    }
     return true;
   } catch (...) {
     return false;
@@ -3677,6 +3695,18 @@ static bool gpu_la_out_fused_batch(GpuBackend& be, const SsmRow* rows,
       }
     }
     for(auto* sd : sds) sd->dirty = true;  // residents newer than mirrors
+    // Same acceptance-announcement contract as the solo path above. This
+    // one carries M so the arm can tell which of the two L4 fusion shapes
+    // fired (solo scalar decode vs M-row serve); both are bit-exact with
+    // the host path they replace, so either needs the line to be certified.
+    static bool announced_l4b = false;
+    if(!announced_l4b) {
+      announced_l4b = true;
+      std::fprintf(stderr,
+                   "[l4-fused-batch] M-row la_out fusion ACTIVE "
+                   "(M=%u cross-key SSM -> M-row norm+silu(z)+FP16 -> "
+                   "devact la_out GEMM; INTFER_L4_FUSE=1)\n", M);
+    }
     static const bool l4_dbg = (std::getenv("INTFER_L4_DBG") != nullptr);
     if(l4_dbg) {
       static thread_local int n = 0;
@@ -4737,6 +4767,21 @@ static bool gpu_l5_front(GpuBackend& be, const Request* req, int L,
       static thread_local int n = 0;
       if((++n % 18) == 1)
         std::fprintf(stderr, "[l5] front chain x%d\n", n);
+    }
+    // *** INTFER_L5_FRONT acceptance announcement. *** Same contract as the
+    // L4 [l4-fused] line: the front chain is bit-exact with the host wave-4 +
+    // conv FIR + prep + SSM + norm + la_out it replaces (the same kernels,
+    // same order, same bytes -- see the L5-vs-base A/B note at
+    // main.cpp:4165), so a base-vs-flagged stream comparison is satisfiable
+    // by a flag that did nothing. The line is what turns "the two runs
+    // matched" into "the front chain ran". Once-per-process, keyed by tag.
+    static bool announced_l5 = false;
+    if(!announced_l5) {
+      announced_l5 = true;
+      std::fprintf(stderr,
+                   "[l5-front] device front chain ACTIVE "
+                   "(FWHT acts -> qkv GEMMs -> conv prep -> L4 tail on-device; "
+                   "INTFER_L5_FRONT=1)\n");
     }
     return true;
   } catch (...) {

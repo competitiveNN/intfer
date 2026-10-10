@@ -38,11 +38,61 @@
 # its pattern, which is the "hand-written total is a citation" failure in a
 # different hat. The classifier is correct as a MECHANICAL query; what it
 # cannot do is read a flag's semantics, and that is stated here so the
-# "REAL GAP" label is not quoted as settled for this one flag. The six
-# remaining opt-in flags are ungated for the substantive reason: every
-# engine gate is operator-only (the stack runs only
-# run_ten_gates.sh --self-check), and rule 9 says a matrix with no dispatch
-# arm never runs -- so an arm written here would be STALE, not certified.
+# "REAL GAP" label is not quoted as settled for this one flag.
+#
+# *** DISPOSITION OF THE REMAINING FIVE, 2026-10-10. *** Two were armed in
+# scripts/test_gpu_optin.sh and three carry a stated reason they are not.
+# Each was verified by reading the code, not assumed from the census:
+#
+#   INTFER_L4_FUSE   ARMED (test_gpu_optin.sh:186+). L4 la_out fusion,
+#                    bit-exact vs the host path. Announcement
+#                    [l4-fused] / [l4-fused-batch] added at
+#                    examples/intfer_cli/main.cpp:3253, 3706; the arm
+#                    asserts the line on TP=1 and its ABSENCE on TP=2
+#                    (the fusion declines when num_devices_ != 1,
+#                    main.cpp:3148, 3290). Self-check (a)/(b)/(c) on a
+#                    tp=1 fixture, skipped explicitly when the engine
+#                    does not run on this box.
+#   INTFER_L5_FRONT  ARMED (test_gpu_optin.sh:245+). device front chain,
+#                    bit-exact vs the host wave-4 + conv FIR + prep.
+#                    Announcement [l5-front] at main.cpp:4771; same
+#                    TP=1/TP=2 polarity (L5_DECLINE("tp") at
+#                    main.cpp:4199) and same self-check shape.
+#   INTFER_LMHEAD_FP16 NOT ARMED -- decision record stands. AGENTS.md:482
+#                    records it as UNCERTIFIED-BY-DISCLAIM: it restores
+#                    the old FP16 tiled lm_head path, a bisect-only
+#                    variant, and the repo has retracted every performance
+#                    claim made for it. Gating a flag whose only purpose
+#                    is to reproduce a discredited measurement would
+#                    certify nothing.
+#   INTFER_INT8_KV_G NOT ARMED -- derivative knob. main.cpp:3821: group
+#                    size for the INT8 KV quantiser (default 32). It is a
+#                    tuning parameter of an ALREADY-GATED feature
+#                    (INTFER_INT8_KV is named by test_gpu_optin.sh:117
+#                    and test_cpu_parity.sh:106), not a separate arithmetic
+#                    path. Changing the group size changes the
+#                    quantisation error profile, which the existing KV
+#                    arms assert against the base stream -- so the knob's
+#                    effect is covered by arms that already run at the
+#                    default. A standalone arm would assert a stream
+#                    identity those arms already exercise at one point on
+#                    the knob's range.
+#   INTFER_DECODE1_ANNOUNCE_EVERY NOT ARMED -- harness-only. quant_gemm.
+#                    cpp:67: disables the once-only latch and prints
+#                    every launch. Its own comment states its purpose --
+#                    "this is how the harness can PROVE the latch is not
+#                    what decides which arm appear". It is a diagnostic
+#                    aid FOR the gates, not an engine feature; the gates
+#                    that depend on the latch already exercise it when
+#                    they run, and arming it would be certifying the
+#                    test harness against itself.
+#
+# The floor's purpose is met. The opt-in class existed so a residue could
+# not be left sitting unexamined; it is now examined flag by flag -- two
+# armed, three with a stated reason verified against source, one
+# reclassified as a diagnostic. The class is still non-empty and the
+# checker still refuses an empty class; that is by design, not a remaining
+# defect.
 #
 # *** HOW POLARITY IS AND IS NOT DETERMINED, AND WHAT I GOT WRONG FIRST. ***
 # The first version derived the class from the getenv comparison (`== nullptr` ->

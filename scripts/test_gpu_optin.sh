@@ -183,6 +183,126 @@ for tp in $TPS; do
     rm -f "$FUSE_OUT" "$FUSE_ERR"
   }
 
+  # --- INTFER_L4_FUSE: L4 la_out fusion, TP=1 only --------------------------
+  l4_fused_announced() { grep -aq '\[l4-fused\] la_out fusion ACTIVE' "$1"; }
+  l4_fused_batch_announced() { grep -aq '\[l4-fused-batch\] M-row la_out fusion ACTIVE' "$1"; }
+  {
+    env INTFER_L4_FUSE=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$L4_OUT" 2>"$L4_ERR"; L4_RC=$?
+    if [ "$L4_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_L4_FUSE=1 run exited rc=$L4_RC"; tail -10 "$L4_ERR" >&2
+    else
+      L4_IDS="$(ids_of "$tp" INTFER_L4_FUSE=1)"
+      echo "TP=$tp [INTFER_L4_FUSE=1]: '$L4_IDS'"
+      [ -n "$L4_IDS" ] || fail "TP=$tp INTFER_L4_FUSE=1 stream EMPTY"
+      [ "$L4_IDS" = "$BASE" ] \
+        || fail "TP=$tp [INTFER_L4_FUSE=1] '$L4_IDS' != base '$BASE' (must be bit-exact)"
+      if [ "$tp" = "1" ]; then
+        if ! l4_fused_announced "$L4_ERR" && ! l4_fused_batch_announced "$L4_ERR"; then
+          fail "TP=$tp INTFER_L4_FUSE=1: no announcement -- the fusion never took, stream match vacuous"
+        fi
+      else
+        if l4_fused_announced "$L4_ERR" || l4_fused_batch_announced "$L4_ERR"; then
+          fail "TP=$tp INTFER_L4_FUSE=1: fusion announced on TP=2 where it must decline"
+        fi
+      fi
+    fi
+    rm -f "$L4_OUT" "$L4_ERR"
+  }
+  {
+    L4SB="$(mktemp -d)"
+    env INTFER_L4_FUSE=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$L4SB/good.out" 2>"$L4SB/good.err" || true
+    cp "$L4SB/good.err" "$L4SB/not.err"
+    sed -i '/\[l4-fused\]/d' "$L4SB/not.err"
+    : >"$L4SB/empty.err"
+    # The self-check needs a real announcement to delete. On a box where the
+    # engine does not run at all (this one: signal 11 in
+    # libze_intel_gpu.so.1 on the 0.8B model, base and L4_FUSE alike) the
+    # tp=1 fixture produces no announcement and NONE of the three cases can
+    # be exercised. That is a BOX-STATE skip, not a pass: the predicate is
+    # unproven here, and saying so explicitly is the difference between a
+    # self-check that cannot fire and one that fires vacuously.
+    if ! l4_fused_announced "$L4SB/good.err" && ! l4_fused_batch_announced "$L4SB/good.err"; then
+      echo "TP=$tp L4_FUSE self-check SKIPPED: the tp=1 fixture produced no \
+            [l4-fused] line (engine did not run on this box), so the \
+            refusal/vacuity directions are unexercised here" >&2
+    else
+      # (a) healthy direction: a log that carries the line must certify.
+      # (b) refusal direction: a healthy stream with the announcement line
+      #   deleted must be refused, and ONLY for that reason.
+      if l4_fused_announced "$L4SB/not.err" || l4_fused_batch_announced "$L4SB/not.err"; then
+        fail "TP=$tp L4_FUSE self-check (b): log with announcement deleted was ACCEPTED -- arm is stream-only"
+      fi
+      # (c) vacuity: an empty log must be refused.
+      if l4_fused_announced "$L4SB/empty.err" || l4_fused_batch_announced "$L4SB/empty.err"; then
+        fail "TP=$tp L4_FUSE self-check (c): arm ACCEPTED an empty log (vacuity)"
+      fi
+    fi
+    rm -rf "$L4SB"
+  }
+
+  # --- INTFER_L5_FRONT: device front chain, TP=1 only -----------------------
+  # Same shape as the L4_FUSE arm. The front chain replaces the host wave-4
+  # (qkv/z/b/a) + conv FIR + prep + the L4 tail with one device chain
+  # (FWHT acts -> qkv GEMMs -> conv prep -> L4 tail) and is BIT-IDENTICAL to
+  # the host path: same kernels, same order, same bytes (the L5-vs-base A/B
+  # note at main.cpp:4165 records the ~1ulp oracle-arbitrated drift, which is
+  # the SSM-side tolerance, not a stream divergence). So a base-vs-flagged
+  # stream comparison is satisfiable by a flag that did nothing, and the
+  # kernel's [l5-front] acceptance line is what turns the match into
+  # certification.
+  #
+  # TP=1 ONLY: gpu_l5_front (main.cpp:4199) declines with L5_DECLINE("tp")
+  # when be.num_devices_ != 1, for the same reason as L4 -- device acts are
+  # not cross-visible. The arm therefore asserts the line on TP=1 and its
+  # ABSENCE on TP=2.
+  l5_front_announced() { grep -aq '\[l5-front\] device front chain ACTIVE' "$1"; }
+  {
+    env INTFER_L5_FRONT=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$L5_OUT" 2>"$L5_ERR"; L5_RC=$?
+    if [ "$L5_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_L5_FRONT=1 run exited rc=$L5_RC"; tail -10 "$L5_ERR" >&2
+    else
+      L5_IDS="$(ids_of "$tp" INTFER_L5_FRONT=1)"
+      echo "TP=$tp [INTFER_L5_FRONT=1]: '$L5_IDS'"
+      [ -n "$L5_IDS" ] || fail "TP=$tp INTFER_L5_FRONT=1 stream EMPTY"
+      [ "$L5_IDS" = "$BASE" ] \
+        || fail "TP=$tp [INTFER_L5_FRONT=1] '$L5_IDS' != base '$BASE' (must be bit-exact)"
+      if [ "$tp" = "1" ]; then
+        if ! l5_front_announced "$L5_ERR"; then
+          fail "TP=$tp INTFER_L5_FRONT=1: no [l5-front] line -- the front chain never took, stream match vacuous"
+        fi
+      else
+        if l5_front_announced "$L5_ERR"; then
+          fail "TP=$tp INTFER_L5_FRONT=1: front chain announced on TP=2 where it must decline"
+        fi
+      fi
+    fi
+    rm -f "$L5_OUT" "$L5_ERR"
+  }
+  {
+    L5SB="$(mktemp -d)"
+    env INTFER_L5_FRONT=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$L5SB/good.out" 2>"$L5SB/good.err" || true
+    cp "$L5SB/good.err" "$L5SB/not.err"
+    sed -i '/\[l5-front\]/d' "$L5SB/not.err"
+    : >"$L5SB/empty.err"
+    if ! l5_front_announced "$L5SB/good.err"; then
+      echo "TP=$tp L5_FRONT self-check SKIPPED: the tp=1 fixture produced no \
+            [l5-front] line (engine did not run on this box), so the \
+            refusal/vacuity directions are unexercised here" >&2
+    else
+      if l5_front_announced "$L5SB/not.err"; then
+        fail "TP=$tp L5_FRONT self-check (b): log with announcement deleted was ACCEPTED -- arm is stream-only"
+      fi
+      if l5_front_announced "$L5SB/empty.err"; then
+        fail "TP=$tp L5_FRONT self-check (c): arm ACCEPTED an empty log (vacuity)"
+      fi
+    fi
+    rm -rf "$L5SB"
+  }
+
   # --- DPAS48 family --------------------------------------------------------
   # INTFER_DPAS48=1 switches the GEMM to the INT8/GA64 act-quant DPAS path,
   # which is a DIFFERENT numerics from the FP16-act base above — DPAS48 is
