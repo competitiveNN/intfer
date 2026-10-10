@@ -1677,6 +1677,20 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
   // same launch covers prefill and decode. (The M=1-only version of this
   // kernel returned a NULL event for M>1 and this guard sent the prefill
   // arms back to run_linear_wave_batch; that is gone now.)
+  // *** SCHEME TWIN OF THE M>1 DECLINE, FOUND 2026-10-10 ON A LIVE 27B RUN.
+  // The fused kernel quant_gemm_forward_usm_gateup has a body ONLY for
+  // INT2+INT2 (quant_gemm.cpp:2036); every other same-scheme pair falls
+  // through to `return sycl::event();` -- a NULL event. A same-scheme
+  // INT4+INT4 pair passes every guard above (same K, same group, same
+  // scheme) and then runs NO kernel, while this function returns true and
+  // the caller reads mg/mu back out of unwritten wave slots -- the exact
+  // "memcpy out of an unwritten buffer" failure e497325 guarded against for
+  // M>1, reached through the scheme dimension instead. On the 27B that is
+  // 18 of 64 layers (L3, L6, L7, L10, ...); the operator's run died at
+  // L3 with UR_RESULT_ERROR_OUT_OF_RESOURCES inside a submit whose kernel
+  // body never existed. The guard must mirror the kernel's body condition,
+  // not the weaker "schemes match" one.
+  if (tg.qcfg.scheme != QuantScheme::INT2) return false;
   const auto& scg = shard_cache_[(size_t)gate_ti];
   const auto& scu = shard_cache_[(size_t)up_ti];
   if (scg.code_usm.size() != 2 || scu.code_usm.size() != 2) return false;
@@ -1838,6 +1852,13 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
   // the arm certifies nothing. This one line is what turns "the runs
   // matched" into "the fusion ran". It is host-side, one per process, so it
   // does not flood a 794-launches-per-token log.
+  //
+  // This point is reached ONLY for INT2+INT2 pairs (the scheme guard above
+  // returns false for everything else), so the line cannot be printed by a
+  // layer that ran no kernel. The operator's 2026-10-10 run printed it with
+  // scheme=2 (INT4) -- that was the bug, not the announcement: the guard let
+  // a NULL-event layer through and the fprintf still fired. The line is now
+  // a true statement of "a real fused launch ran".
   static bool announced_gu = false;
   if (!announced_gu) {
     announced_gu = true;

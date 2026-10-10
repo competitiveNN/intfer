@@ -882,6 +882,21 @@ else
     echo "         this arm is vacuous." >&2
     PASS=0
   fi
+  # *** SCHEME SCOPE. The ACTIVE line alone is NOT enough. The operator's
+  # 2026-10-10 run printed it with scheme=2 (INT4), group=64 -- that was a
+  # LAYER THAT RAN NO KERNEL. The fused kernel quant_gemm_forward_usm_gateup
+  # has a body only for INT2+INT2 (quant_gemm.cpp:2036); a same-scheme
+  # INT4+INT4 pair passes every guard, returns a NULL event, and the caller
+  # reads mg/mu back out of unwritten wave slots. On the 27B that is 18 of
+  # 64 layers. The line's own scheme= field is the witness: the arm must
+  # require it to read INT2, or it certifies a crash. (This is the gate-side
+  # twin of the engine.cpp:1693 scheme guard added the same day.)
+  if ! grep -aq 'scheme=3[^0-9]' "$GATEUP_ERR" 2>/dev/null; then
+    echo "GATE FAIL: no [mlp-gateup] ACTIVE line carried scheme=3 (INT2)" >&2
+    echo "         -- every fused launch must be an INT2+INT2 pair; a scheme=2" >&2
+    echo "         (INT4) line means a layer ran the null-event path" >&2
+    PASS=0
+  fi
   gu_arm_assert "$CLI_ERR" "$GATEUP_ERR" "GATE FAIL: " || PASS=0
   # *** SELF-CHECK FOR THIS ARM. *** The same shape as the decode1 self-check
   # block above, and for the same reason: this arm's predicate (the ACTIVE line)
@@ -919,6 +934,26 @@ else
     || { echo "GATE FAIL: self-check (a) healthy fixture has no ACTIVE line" >&2; PASS=0; }
   grep -aFq "$GU_ANNOUNCE" "$SB2/gu_not.err" \
     && { echo "GATE FAIL: self-check (b) the line survived the sed deletion" >&2; PASS=0; }
+  # (d) SCHEME-SCOPE NEGATIVE. The real run's ACTIVE line carries
+  # scheme=3 (INT2) post-fix. Rewrite exactly that field to scheme=2
+  # (INT4) in a copy whose stream is untouched: that is the
+  # operator's crashing run, reproduced as a fixture. The scheme
+  # predicate above MUST refuse it -- otherwise the arm would
+  # certify the null-event layer it was built to catch. Driving the
+  # grep directly (not through gu_arm_assert, which knows nothing
+  # about scheme) isolates which predicate fired.
+  sed 's/scheme=3\([^0-9]\)/scheme=2\1/' "$SB2/gu_good.err" >"$SB2/gu_int4.err"
+  if grep -aq 'scheme=3[^0-9]' "$SB2/gu_int4.err" 2>/dev/null; then
+    echo "GATE FAIL: self-check (d) the scheme rewrite left a scheme=3 line" >&2; PASS=0
+  fi
+  if ! grep -aq 'scheme=2[^0-9]' "$SB2/gu_int4.err" 2>/dev/null; then
+    echo "GATE FAIL: self-check (d) the INT4 fixture carries no scheme=2 line" >&2; PASS=0
+  fi
+  if grep -aq 'scheme=3[^0-9]' "$SB2/gu_int4.err" 2>/dev/null; then
+    :
+  else
+    echo "SELFTEST (d) INT4-fixture direction verified (scheme predicate must fire)" >&2
+  fi
   # (a) healthy direction: the real run's own pair must certify.
   gu_arm_assert "$SB2/gu_good.out" "$SB2/gu_good.err" "SELFTEST (a) arm-refusal: " \
     || { echo "GATE FAIL: self-check (a) the arm REFUSED its own healthy run" >&2; PASS=0; }
