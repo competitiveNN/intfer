@@ -2136,7 +2136,7 @@ sycl::event quant_gemm_forward_usm_wave(
     std::uint16_t* const* out_usm,
     uint32_t N_items,
     const uint32_t* M_arr, const uint32_t* N_arr, const uint32_t* K_arr,
-    uint32_t group_size,
+    const uint32_t* group_arr,
     const gemm::WeightScheme* scheme,
     const sycl::event& copy_dep) {
   if (N_items == 0) return sycl::event();
@@ -2146,14 +2146,6 @@ sycl::event quant_gemm_forward_usm_wave(
     total += static_cast<int>(M_arr[i]) * static_cast<int>(N_arr[i]);
   }
   if (total <= 0) return sycl::event();
-  if (group_size == 0) group_size = K_arr[0];
-  const int Gw = static_cast<int>(group_size);
-  const int num_groups = (static_cast<int>(K_arr[0]) + Gw - 1) / Gw;
-  if (num_groups <= 0) return sycl::event();
-
-  constexpr int nWG = kThr;
-  const int nBlocks = (total + nWG - 1) / nWG;
-  const int global = nBlocks * nWG;
 
   // Prefix sums over the items' output counts. N_items <= 16 (the wave
   // contract), so a fixed-size C array is device-copyable by value -- a
@@ -2168,7 +2160,7 @@ sycl::event quant_gemm_forward_usm_wave(
   return q.submit([&](sycl::handler& h) {
     h.depends_on(copy_dep);
     h.parallel_for<class gemm_usm_decode1_wave_fuse>(
-        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        sycl::nd_range<1>(sycl::range<1>(total), sycl::range<1>(kThr)),
         [=](sycl::nd_item<1> it) {
           const int gid = static_cast<int>(it.get_global_id(0));
           if (gid >= total) return;
@@ -2196,26 +2188,23 @@ sycl::event quant_gemm_forward_usm_wave(
           const auto* code_u8 = static_cast<const std::uint8_t*>(code_usm[item]);
           const std::size_t act_off = (std::size_t)m * K;
           const std::uint8_t* wrow = code_u8 + (std::size_t)n * K;
-          // *** SCALE IS PER ROW, NOT PER TENSOR. *** shard_weight emits
-          // scale[(row * n_groups + g)] (engine.cpp:306-316), so the base
-          // kernel reads `scale_usm + ng * num_groups_w` (quant_gemm.cpp:886)
-          // and loops g over THAT ROW's n_groups. This fused kernel used the
-          // item's OWN scale pointer with a shared num_groups -- which is
-          // right only for item 0 and silently reads item i's scale table
-          // through item 0's group count on every item after the first: a
-          // row-0 group count on a table strided by item i's n_groups.
-          // Derive each item's group count from its OWN K (all items share K
-          // under the wave contract, so the counts are equal -- but deriving
-          // them per item is what makes the indexing match the base kernel
-          // rather than depending on that equality holding).
-          const int ngroups_i = (K + Gw - 1) / Gw;
+          // *** SCALE IS PER ROW, AND THE GROUP WIDTH IS PER ITEM. ***
+          // shard_weight emits scale[(row * n_groups + g)] (engine.cpp:306-316),
+          // so the base kernel reads `scale_usm + ng * num_groups_w`
+          // (quant_gemm.cpp:886) and loops g over THAT ROW's n_groups. The
+          // group width is per item (t.qcfg.group_size), so derive both from
+          // this item's own K and group width -- the wave contract does NOT
+          // require them to be equal across items, and requiring it made the
+          // engine refuse perfectly fusible waves.
+          const int Gw_i = (group_arr[item] == 0) ? K : static_cast<int>(group_arr[item]);
+          const int ngroups_i = (K + Gw_i - 1) / Gw_i;
           const std::uint16_t* sptr_row = sptr + (std::size_t)n * ngroups_i;
 
           float acc = 0.0f;
           for (int g = 0; g < ngroups_i; ++g) {
             const float scale = from_half_bits(sptr_row[g]) * alpha_f;
-            const int kg0 = g * Gw;
-            int kg1 = kg0 + Gw;
+            const int kg0 = g * Gw_i;
+            int kg1 = kg0 + Gw_i;
             if (kg1 > K) kg1 = K;
             if (bits >= 16) {
               for (int kg = kg0; kg < kg1; ++kg) {

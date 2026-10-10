@@ -1984,7 +1984,7 @@ bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
   std::vector<const std::uint16_t*> scale(nl);
   std::vector<float> alpha(nl);
   std::vector<std::uint16_t*> outp(nl);
-  std::vector<uint32_t> Mi(nl), Ni(nl), Ki(nl);
+  std::vector<uint32_t> Mi(nl), Ni(nl), Ki(nl), Gi(nl);
   std::vector<gemm::WeightScheme> ws(nl);
   for (size_t i = 0; i < nl; ++i) {
     const auto& t = model_.tensors[(size_t)items[i]->tensor_index];
@@ -1994,7 +1994,7 @@ bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
     code[i] = sc.code_usm[0];
     scale[i] = sc.scale_usm[0];
     alpha[i] = sc.has_global_divisor ? sc.global_host : 1.0f;
-    Mi[i] = M; Ni[i] = t.N; Ki[i] = t.K;
+    Mi[i] = M; Ni[i] = t.N; Ki[i] = t.K; Gi[i] = sc.group_size;
     ws[i] = sc.scheme;
   }
   std::vector<sycl::event> kernel_events;
@@ -2013,14 +2013,13 @@ bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
       act[i] = wv_[d * wv_W_ + i].act;
       outp[i] = wv_[d * wv_W_ + i].out;
     }
-    const uint32_t gsize = shard_cache_[(size_t)items[0]->tensor_index].group_size;
 #ifdef INTFER_PROFILE_GPU
     auto t_s0 = std::chrono::high_resolution_clock::now();
 #endif
     sycl::event e = gemm::quant_gemm_forward_usm_wave(
         q, act.data(), code.data(), scale.data(), alpha.data(),
         outp.data(), (uint32_t)nl, Mi.data(), Ni.data(), Ki.data(),
-        gsize, ws.data(), sycl::event{});
+        Gi.data(), ws.data(), sycl::event{});
     kernel_events.push_back(e);
 #ifdef INTFER_PROFILE_GPU
     {
@@ -2031,12 +2030,72 @@ bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
     }
 #endif
   }
+  // *** PHASE 3 + 4 ARE MINE, NOT THE CALLER'S. *** The caller does
+  // `if (run_linear_wave_fused(...)) return;`, which skips the default
+  // path's Phase 3 (wait) and Phase 4 (readback). If this function returned
+  // without doing them, every wave taking the fused path would leave
+  // live[i]->out stale and never drain the device work -- a silent wrong
+  // output with no crash, and exactly the defect the default path's
+  // Phase 3/4 comment ("host must not read wave outputs before the
+  // kernels run") exists to prevent. The fused path writes the SAME slots
+  // (wv_[d*wv_W_ + i].out) the default path reads back, so the wait and
+  // the half_to_float_batch pass below are byte-for-byte the same code.
+  // Phase 3: wait once for the whole wave.
+#ifdef INTFER_PROFILE_GPU
+  auto t_wb0 = std::chrono::high_resolution_clock::now();
+#endif
+  for (auto& e : kernel_events) e.wait();
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_waitblock_us +=
+        std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
+  }
+  g_gpu_profile.wait_count += (int)kernel_events.size();
+  for (auto& e : kernel_events) {
+    try {
+      auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
+      auto t1 = e.get_profiling_info<sycl::info::event_profiling::command_end>();
+      g_gpu_profile.total_kernel_us += (double)(t1 - t0) / 1000.0;
+      g_gpu_profile.kernel_count++;
+    } catch (...) {}
+  }
+  auto t_rb0 = std::chrono::high_resolution_clock::now();
+#endif
+  // Phase 4: per item — read back from that item's wave slot. Same slots and
+  // the same `out.data() + m*t.N + start` gather the default path uses, so
+  // the two paths produce byte-identical caller-visible output.
+  uint32_t rb_items = 0;
+  for (size_t i = 0; i < nl; ++i) {
+    const auto& t = model_.tensors[(size_t)items[i]->tensor_index];
+    std::vector<float>& out = *items[i]->out;
+    const auto& ranges = shards_[(size_t)items[i]->tensor_index].ranges;
+    for (size_t d = 0; d < devices_.size(); ++d) {
+      auto [start, end] = ranges[d];
+      const std::uint16_t* out_ptr = wv_[d * wv_W_ + i].out;
+      const uint32_t N_local_rb = static_cast<uint32_t>(end - start);
+      for (uint32_t m = 0; m < M; ++m)
+        dashq::half_to_float_batch(out_ptr + (size_t)m * N_local_rb,
+                                   out.data() + (size_t)m * t.N + start,
+                                   N_local_rb);
+      ++rb_items;
+    }
+  }
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_readback_us +=
+        std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
+    g_gpu_profile.readback_count += rb_items;
+  }
+#endif
+
   // THE PATH ANNOUNCES ITSELF, ONCE. Same shape as the [mlp-gateup] line:
   // without it a gate that compares this run's token stream against the
   // base run's cannot tell whether the fused path ran -- the two streams
   // are bit-identical by construction, so a flag that never reached the
   // kernel would pass every stream check while certifying nothing. The
-  // line is printed here, after the launches, so it cannot fire for a
+  // line is printed here, AFTER the wait+readback, so it cannot fire for a
   // wave that fell through to the default path.
   static bool announced_wf = false;
   if (!announced_wf) {
@@ -2048,7 +2107,6 @@ bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
                  "(items=%zu M=%u K=%u group=%u, one launch per device)\n",
                  nl, M, t0.K, sc0.group_size);
   }
-  (void)kernel_events;
   return true;
 }
 
@@ -2100,18 +2158,37 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
   // path below is byte-for-byte the old one when the flag is unset. Decline
   // on anything the fused kernel does not support -- a partial fuse is worse
   // than none, because the caller's Phase 3/4 (one wait, one readback pass)
-  // already assumes every item ran. The precondition is the wave contract
-  // itself: every item shares M, K and group_size, and no item is INT8 with
-  // the host-quant DPAS path (which would need its own launch anyway).
+  // already assumes every item ran.
+  //
+  // *** WHAT THE PRECONDITION REQUIRES, AND WHAT IT NO LONGER DOES. ***
+  // The kernel derives each item's group width and group count from its OWN
+  // K and group_size (quant_gemm.cpp:2211-2212), and reads each item's own
+  // K, N, scheme, code, scale, alpha and output pointer. So the wave does
+  // NOT need a shared K or a shared group_size -- only a shared M (the
+  // workspace slot is M*K per item, and the activation staging below is
+  // M*K per item, so differing K is safe on both sides). Requiring equal K
+  // and group_size used to refuse perfectly fusible waves where, say, the
+  // q/k/v tensors share M and scheme but differ in width; nothing in the
+  // arithmetic depends on them being equal.
+  //
+  // The one genuine refusal is the INT8 DPAS branch: the base path's
+  // quant_gemm_forward_usm takes it for exactly
+  //   scheme == INT8 && M >= 8 && (K % 32 == 0) && (N % 16 == 0) && group_size == 0
+  // (quant_gemm.cpp:337) -- a different kernel (quant_gemm_dpas_int8), so
+  // fusing an item that would take it would not be bit-exact vs the default.
+  // Refusing anything wider (e.g. "all INT8 at M >= 8") would be safe but
+  // over-broad: an INT8 item whose shape misses the DPAS conditions takes
+  // the SAME generic dequant the fused kernel replicates, so it is fusible.
+  // The check is per item, because K, N and group_size vary per tensor.
   if (wave_launch_fuse_enabled()) {
     bool ok = true;
-    uint32_t M0 = M, K0 = 0, gs0 = 0;
     for (size_t i = 0; i < nl; ++i) {
       const auto& t = model_.tensors[(size_t)live[i]->tensor_index];
       const auto& sc = shard_cache_[(size_t)live[i]->tensor_index];
-      if (i == 0) { K0 = t.K; gs0 = sc.group_size; }
-      if (M != M0 || t.K != K0 || sc.group_size != gs0 ||
-          sc.scheme == gemm::WeightScheme::INT8) { ok = false; break; }
+      if (sc.scheme == gemm::WeightScheme::INT8 &&
+          M >= 8 && (t.K % 32 == 0) && (t.N % 16 == 0) && sc.group_size == 0) {
+        ok = false; break;
+      }
     }
     if (ok && run_linear_wave_fused(live, nl, M)) return;
   }

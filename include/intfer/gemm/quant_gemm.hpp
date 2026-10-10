@@ -239,10 +239,11 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                       // CONTRACT. `items` carries N entries; every item MUST share
                                       // the same M, K and group_size (the wave workspace is sized
                                       // to the max, but the accumulation order below is per-item
-                                      // and uses each item's own K, so differing K is safe in
-                                      // principle -- the engine only calls this when all items
-                                      // share K, which is the wave contract). Returns the event;
-                                      // caller waits once and readbacks once.
+                                      // and uses each item's own K and group_size, so differing K and
+                                      // group_size are safe in principle -- the engine only calls this when
+                                      // every item is non-INT8, which is the one scheme the fused kernel does
+                                      // not support). Returns the event; the caller waits once and readbacks
+                                      // once.
                                       sycl::event quant_gemm_forward_usm_wave(
                                           sycl::queue& q,
                                           const std::uint16_t* const* act_usm,  // N pointers, M*K FP16 each
@@ -252,7 +253,7 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                           std::uint16_t* const* out_usm,        // N pointers, M*N FP16 output
                                           uint32_t N,                           // number of items
                                           const uint32_t* M_arr, const uint32_t* N_arr,
-                                          const uint32_t* K_arr, uint32_t group_size,
+                                          const uint32_t* K_arr, const uint32_t* group_arr,
                                           const gemm::WeightScheme* scheme,
                                           const sycl::event& copy_dep);
 
