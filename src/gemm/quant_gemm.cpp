@@ -750,11 +750,14 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // 231114 ms with arithmetic a normalized diff proved identical, and the
       // generalised cause is that the SYCL device compiler failed to optimise an
       // extracted body. So this is a SEPARATE parallel_for, not a helper.
-      // PROMOTED TO DEFAULT-ON 2026-10-07 (was default OFF). The single change is
-      // measured on a faithful clone at +14% MLP_GATE / +17% MLP_DOWN vs VERBATIM
-      // (examples/roofline_probe_bisect, device event timestamps, medians over 12
-      // interleaved reps). Kill switch INTFER_NO_DECODE1_VERBHALF=1 restores the
-      // old branchy form.
+      // PROMOTED TO DEFAULT-ON 2026-10-07 (was default OFF). Kill switch
+      // INTFER_NO_DECODE1_VERBHALF=1 restores the old branchy form. The
+      // clone's +14% MLP_GATE / +17% MLP_DOWN is RETRACTED (5bfd8dd:
+      // every bisect arm read 0.000 ms / inf GB/s, so the ratios were
+      // 0/0) -- the throughput direction is UNKNOWN, and the engine arm
+      // in scripts/test_tp2_27b.sh is the only way to measure it on real
+      // 27B weights. What is claimed: stream identity, NOT bit-exactness
+      // (the FTZ denormal caveat below).
       //
       // *** THIS IS THE DEFAULT DECODE PATH NOW. *** The guard is inverted:
       // the feature is ON unless the kill switch is set, so the 3-branch scalar
@@ -863,17 +866,24 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       // IS bit-exact by construction -- the arithmetic expressions and the index
       // VALUES are unchanged, only the pointer type the compiler folds them
       // through. So it needs a stream-identity gate and no numerics contract.
-      // PROMOTED TO DEFAULT-ON 2026-10-07 (was default OFF). The single change is
-      // measured on a faithful clone at 1.01x MLP_GATE / 1.01x MLP_DOWN vs VERBATIM
-      // (examples/roofline_probe_bisect, device event timestamps, medians over 12
-      // interleaved reps) -- neutral on throughput, a register-pressure win with
-      // zero numerics risk. Kill switch INTFER_NO_DECODE1_VERBMP=1 restores the
-      // absolute-index form.
+      // PROMOTED TO DEFAULT-ON 2026-10-07 (was default OFF). Kill switch
+      // INTFER_NO_DECODE1_VERBMP=1 restores the absolute-index form. The
+      // clone's 1.01x measurement is RETRACTED (5bfd8dd: every bisect arm
+      // read 0.000 ms / inf GB/s), so the throughput direction is UNKNOWN;
+      // what is MEASURED is the numerics -- bit-exact by construction,
+      // measured model-free bitwise against the restored base by
+      // scripts/test_rowpair_equiv.sh (8 shapes x 5 datasets).
       //
-      // *** THIS IS THE DEFAULT DECODE PATH NOW. *** The guard is inverted: the
-      // feature is ON unless the kill switch is set, so the weight side is read
-      // through a row-base multi_ptr on the hot path and the compiler keeps the
-      // base in a register instead of re-materialising `code_u8 + b0` per chunk.
+      // *** DEFAULT-ON, BUT NOT ON THE DEFAULT PATH -- SHADOWED BY
+      // VERBHALF. *** The guard is inverted (the feature is ON unless the
+      // kill switch is set), but the VERBHALF arm above is checked FIRST
+      // and ends in `return`, so with both kill switches unset the
+      // VERBHALF body is the hot path and this arm is unreachable. It
+      // runs only with INTFER_NO_DECODE1_VERBHALF=1, where it is the
+      // bit-exact alternative to the default. The composition of both
+      // changes (the bit_cast scale AND this multi_ptr) is unreachable
+      // by any env combination; whether it belongs on the default path
+      // is an open 27B measurement, not a code decision.
       //
       // NUMERICS: this one IS bit-exact by construction -- the arithmetic
       // expressions and the index VALUES are unchanged, only the pointer TYPE the

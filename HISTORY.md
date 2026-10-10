@@ -1640,3 +1640,49 @@ EXIT trap already names the log files this block does not own, so it needs no
 edit. `bash -n` → SYNTAX OK; 23 `fi` unchanged; tree clean. No stack re-run:
 the change is to gate *fixtures*, not to the engine, the kernel, or any
 checker — the verdict set is unchanged by construction.
+
+## The VERBMP gate arm could not pass (2026-10-10, proven model-free)
+
+The promotion `0fd6e11` inverted both M=1 INT2 decode arms to
+default-ON kill switches but did not touch the check order, and the
+arms are order-exclusive — each ends in `return q.submit(...)`, and
+`verbhalf` is checked first. Three consequences, all proven by a
+direct `quant_gemm_forward_usm` call at the M=1 INT2 MLP_GATE
+shape (N=8704, K=5120, group=16) — a diagnostic binary at
+`/tmp/repro_verb_shadow`, not a repo file:
+
+1. **The default path is `gemm_usm_decode1_verbhalf` alone.**
+   With both kill switches unset it announces `decode1-verbhalf`
+   and returns; `verbmp` never runs.
+2. **The `test_tp2_27b.sh` VERBMP arm could not pass.** It set
+   the presence spelling `INTFER_DECODE1_VERBMP=1`, which
+   post-promotion code does not read, so the arm ran verbhalf and
+   failed its own `[decode1-verbmp]` announcement check —
+   vacuously. Broken since `0fd6e11` (2026-10-07); masked on this
+   box by the driver SIGSEGV that failed every arm earlier at
+   rc!=0.
+3. **The composition of both changes is unreachable** by any env
+   combination. Whether it belongs on the default path is an open
+   27B measurement, not a code decision — left to the operator with
+   the fixed gate.
+
+The repro: `INTFER_DECODE1_VERBMP=1` announces `decode1-verbhalf`;
+`INTFER_NO_DECODE1_VERBHALF=1` announces `decode1-verbmp`. The
+same shadowing `examples/rowpair_equiv` handles inside the binary
+(its order loop sets `INTFER_NO_DECODE1_VERBHALF=1` for the `vm`
+order), which is why only the 27B gate — where the env is set from
+the shell — was wrong.
+
+Fix: the VERBMP arm now runs under `INTFER_NO_DECODE1_VERBHALF=1`
+(the dead presence flag is deliberately not set), and the stale
+claim sites are corrected to the measured record — the retracted
+clone figures (`+14%/+17%`, `1.01x`, "direction KNOWN and
+POSITIVE") in `scripts/test_tp2_27b.sh` and in both kernel
+headers in `src/gemm/quant_gemm.cpp`, and the false `*** THIS IS
+THE DEFAULT DECODE PATH NOW ***` on VERBMP. `bash -n` → SYNTAX OK.
+
+Open for the operator (box recovered 2026-10-10: `gpu_recover.sh
+verify` EXIT=0, both B580s enumerate): re-run `scripts/
+run_ten_gates.sh` and `scripts/test_tp2_27b.sh`, and measure
+verbhalf vs verbmp on real 27B weights to decide which kernel is
+the default decode path (and whether a composed arm is wanted).

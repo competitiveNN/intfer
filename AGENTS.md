@@ -254,7 +254,15 @@ certification gap, not a correctness one), `INTFER_PREFILL_CHUNK` +
 `INTFER_BATCH_GEMM` (chunked M-row prefill, `INTFER_PREFILL_RR` restores the old
 rounding order), `INTFER_HOST_AVX2`, `INTFER_DPAS_PREQ`-independent bits,
 `INTFER_NO_DECODE1_VERBHALF` and `INTFER_NO_DECODE1_VERBMP` -- the two M=1 INT2
-decode arms promoted to the DEFAULT DECODE PATH 2026-10-07. Their clone
+decode arms promoted to default-ON 2026-10-07. Only **VERBHALF is on the
+default decode path**: the arms are order-exclusive (each ends in
+`return q.submit(...)`, verbhalf is checked first), so VERBMP is
+shadowed -- it runs only with `INTFER_NO_DECODE1_VERBHALF=1`, where
+it is the bit-exact alternative, and the composition of both changes
+is unreachable by any env combination. The `test_tp2_27b.sh` VERBMP
+arm originally set the dead presence flag `INTFER_DECODE1_VERBMP=1`,
+ran verbhalf, and failed its own announcement check -- fixed to kill
+verbhalf (HISTORY.md, "The VERBMP gate arm could not pass"). Their clone
 measurements are **RETRACTED as performance evidence**: the bisect-2 gate that
 produced them (VERBHALF +14% MLP_GATE / +17% MLP_DOWN, VERBMP neutral at 1.01x
 both shapes) reported PASS while every arm measured `0.000 ms / inf GB/s / -nanx`

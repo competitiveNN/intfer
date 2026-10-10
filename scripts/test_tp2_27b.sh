@@ -679,9 +679,12 @@ fi
 # default-ON kill switches (feature runs unless INTFER_NO_DECODE1_VERBHALF=1 /
 # =1 is set), so the BASE run at line 488 -- which sets no env -- runs THIS path by
 # default. That is correct and intended: the base run IS the default decode path,
-# and the fixed oracle `13 198 760` is measured against it. The arms below set the
-# flag explicitly to PROVE the arm fires (a default-ON arm with no env set would
-# still run, and a gate that only compared tokens would certify it vacuously).
+# and the fixed oracle `13 198 760` is measured against it. The arms below
+# prove each arm fires via its ANNOUNCEMENT, not via the env spelling: the
+# promotion made both arms kill-switch governed, so the old presence flags
+# `INTFER_DECODE1_VERBHALF=1` / `INTFER_DECODE1_VERBMP=1` are DEAD -- no
+# code reads them -- and a gate that only compared tokens would certify a
+# default-ON arm vacuously. The announcement check below is the predicate.
 # The MR / SPLITK / ROWPAIR / VERBDEAD / VERBSEL / VERBVEC arms still compare
 # their stream against this base run, which is the reference by construction.
 #
@@ -689,15 +692,15 @@ fi
 # both branches are guarded on `bits == 2`, and the 0.8B gate model has ZERO INT2
 # tensors, so an arm in test_gpu_optin.sh would be green because the path never ran.
 #
-# *** MEASURED ON THE CLONE, 2026-10-06. *** examples/roofline_probe_bisect now
-# runs (the earlier "every arm hangs" state was the documented 1-GPU / page-fault
-# fault, not a code defect -- the second B580 had dropped out of enumeration). The
-# clone's VERB+HALF arm is the SAME single change as this engine arm and measures
-# +14% MLP_GATE / +17% MLP_DOWN vs VERBATIM (47.3 vs 41.5 GB/s, 21.1 vs 18.0 GB/s;
-# medians over 12 interleaved reps). VERB+MP measures neutral (1.01x both shapes).
-# So the direction is now KNOWN and POSITIVE for VERBHALF, but the ENGINE arm
-# itself is still UNMEASURED -- this gate's arms are the only way to measure it on
-# real 27B weights (operator-only, standing rule 1).
+# *** THE CLONE MEASUREMENT THIS BLOCK USED TO QUOTE IS RETRACTED. ***
+# examples/roofline_probe_bisect reported PASS while every arm measured
+# 0.000 ms / inf GB/s / -nanx (commit 5bfd8dd), so the +14% / +17% /
+# 1.01x ratios were 0/0. The performance direction of BOTH arms is
+# UNKNOWN -- the engine arms below are the only way to measure it on
+# real 27B weights (operator-only, standing rule 1), and they assert
+# stream identity, not throughput. What IS measured: VERBMP is
+# bit-exact by construction (test_rowpair_equiv.sh, model-free);
+# VERBHALF is stream-identity only (the FTZ denormal is a should-not).
 #
 # THE CLAIMS DIFFER, AND THE ARMS MUST NOT OVERSTATE:
 #   VERBMP  is bit-exact BY CONSTRUCTION. The arithmetic expressions and the index
@@ -713,11 +716,34 @@ fi
 #           an argument, so this arm is stream-identity only and NOT an arithmetic
 #           claim, in the same class as INTFER_DECODE1_SPLITK. scripts/test_rowpair
 #           _equiv.sh reports it, does not gate it.
-for spec in "VERBHALF:vh:decode1-verbhalf" "VERBMP:vm:decode1-verbmp"; do
-  NAME="${spec%%:*}"; rest="${spec#*:}"; abbr="${rest%%:*}"; tag="${rest#*:}"
+# *** THE VERBMP ARM MUST KILL VERBHALF TO REACH ITS PATH. *** The two
+# default-ON arms are order-exclusive -- each ends in `return q.submit(...)`
+# and verbhalf is checked FIRST -- so with both kill switches unset the
+# verbhalf arm wins and `[decode1-verbmp]` never prints. The arm as first
+# written could not pass: it set the dead presence flag `INTFER_DECODE1_
+# VERBMP=1`, ran verbhalf, and failed its own announcement check. Proven
+# model-free at the M=1 INT2 MLP_GATE shape (N=8704 K=5120) by a direct
+# quant_gemm_forward_usm call: `INTFER_DECODE1_VERBMP=1` announces
+# `decode1-verbhalf`; `INTFER_NO_DECODE1_VERBHALF=1` announces
+# `decode1-verbmp`. The same shadowing examples/rowpair_equiv handles
+# inside the binary (its order loop sets INTFER_NO_DECODE1_VERBHALF=1
+# for the vm order), which is why only this gate was wrong.
+for spec in "VERBHALF:vh:decode1-verbhalf:" \
+            "VERBMP:vm:decode1-verbmp:INTFER_NO_DECODE1_VERBHALF=1"; do
+  NAME="${spec%%:*}"; rest="${spec#*:}"; abbr="${rest%%:*}"
+  rest="${rest#*:}"; tag="${rest%%:*}"; arm_env="${rest#*:}"
   OUT="$LOG.${abbr}.out"; ERR="$LOG.${abbr}.err"
-  env "INTFER_DECODE1_${NAME}=1" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
-    -p "$PROMPT" -n "$N" >"$OUT" 2>"$ERR"; RC=$?
+  # VERBHALF: the DEFAULT PATH -- the presence flag is dead post-promotion,
+  # so the arm runs because it IS the default and the announcement check is
+  # what proves it fired. VERBMP: arm_env kills verbhalf so THIS arm is the
+  # one that runs (and the dead presence flag is deliberately NOT set).
+  if [ -n "$arm_env" ]; then
+    env "$arm_env" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+      -p "$PROMPT" -n "$N" >"$OUT" 2>"$ERR"; RC=$?
+  else
+    env "INTFER_DECODE1_${NAME}=1" "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+      -p "$PROMPT" -n "$N" >"$OUT" 2>"$ERR"; RC=$?
+  fi
   if [ "$RC" -ne 0 ]; then
     echo "GATE FAIL: INTFER_DECODE1_${NAME}=1 run exited rc=$RC" >&2
     tail -20 "$ERR" >&2
