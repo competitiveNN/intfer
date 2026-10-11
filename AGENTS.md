@@ -238,6 +238,8 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_L5_FRONT` | device-resident whole LA input path | **dead end as built**: +144 launches/token, waitblock 5x. More kernels lose |
 | `INTFER_SSM_GPU` | device SSM recurrence | declines under `INTFER_DPAS48=1` (its ~1ulp drift flips a GA64 code at a tie) |
 | `INTFER_INT8_KV`, `INTFER_KV_Q8`, `INTFER_KV_HAD` | groupwise-INT8 KV cache | correctness-gated, no tok/s claim |
+| `INTFER_INT8_KV_G` | group size for the INT8 KV quantiser (main.cpp:3821, default 32). `!= nullptr` spelling (PRESENCE enables). **Gated 2026-10-11 in `test_gpu_optin.sh:317+`** with a 3-part self-check. A tuning parameter of an already-gated feature, not a separate arithmetic path, so the arm is REACHABILITY-only: it asserts the group the quantiser actually used via the new `[int8-kv-g]` line (main.cpp:10004) and asserts the stream is non-empty (the knob must not move it). Self-check (b) rewrites `group=16` to `group=32`, the exact shape of "the knob was ignored". |
+| `INTFER_L4_ROWS` | FNV row-fidelity hash over q/k/v/b/a/z/S in + out per row (main.cpp:3461-3513). `!= nullptr` spelling (PRESENCE enables). **Gated 2026-10-11 in `test_gpu_optin.sh:408+`** with a 3-part self-check. A DIAGNOSTIC by the census's own definition (it memcpy's data that is already there and discards the result), but its suffix is not in `is_diag`, so the mechanical classifier files it opt-in -- the classifier is correct as a query and the gap is recorded in `check_flag_gate_coverage.sh:25-41`, not silenced by widening the suffix list. The hash runs INSIDE the L4 fused path (TP=1 only, `L4_DECLINE("tp")` at main.cpp:3330), so the arm asserts the new `[l4-rows]` line (main.cpp:3461) on TP=1 and its ABSENCE on TP=2. |
 | `INTFER_DECODE1_VERBDEAD` | per-group locals removed, pure code motion | bit-exact, default OFF |
 | `INTFER_DECODE1_VERBSEL` | the 4-float codebook by `select` instead of an indexed array | bit-exact, default OFF |
 | `INTFER_DECODE1_VERBVEC` | activations through a plain pointer instead of a `multi_ptr` | bit-exact, default OFF |
@@ -253,9 +255,15 @@ Re-derive the whole population with the `git grep` recipe above.
 enables; restores the old evict-everything FP16 cache policy. Bit-exact by
 construction: `shard_weight` for FP16 scheme is a memcpy, so evict+rebuild
 reproduces the same bytes; the flag only moves *when* a buffer is allocated,
-never *what* goes in it. **No stream-identity gate is warranted** -- see
-`intfer_stream_f16_policy.md`; the census files it as an opt-in gap, which is a
-certification gap, not a correctness one), `INTFER_PREFILL_CHUNK` +
+never *what* goes in it. **Gated 2026-10-11 in `test_gpu_optin.sh:648+`** with a
+3-part self-check -- the earlier "no stream-identity gate is warranted" line
+was right about the *numerics* (bit-exact by construction, so a stream
+comparison is satisfiable by a flag that never reached `begin_layer`) and
+wrong about the *certification*: reachability is structural (the branch is in
+`Engine::begin_layer`, engine.cpp:779, which every layer's forward pass calls),
+so an arm that asserts the policy the engine actually applied is warranted and
+is now written. Announcement `[stream-f16]` at engine.cpp:788. See
+`intfer_stream_f16_policy.md` for the policy rationale), `INTFER_PREFILL_CHUNK` +
 `INTFER_BATCH_GEMM` (chunked M-row prefill, `INTFER_PREFILL_RR` restores the old
 rounding order), `INTFER_HOST_AVX2`, `INTFER_DPAS_PREQ`-independent bits,
 `INTFER_NO_DECODE1_VERBHALF` and `INTFER_NO_DECODE1_VERBMP` -- the two M=1 INT2
@@ -492,9 +500,17 @@ list is a citation that decays into a guess:
 scripts/check_flag_gate_coverage.sh     # classifies and prints every class
 ```
 
-**`INTFER_LMHEAD_FP16` is UNCERTIFIED-BY-DISCLAIM** — see the census section above
-for why no arm is warranted. That is a *decision record*, not a census entry, which
-is precisely why it lives in prose while the census does not.
+**`INTFER_LMHEAD_FP16` is ARMED -- REACHABILITY ONLY, and the disclaimer stands.**
+The decision record below is unchanged: it restores the old FP16 tiled lm_head
+path, a bisect-only variant, and the repo has retracted every performance claim
+made for it. What changed 2026-10-11 is that a *reachability* arm now exists
+(`test_gpu_optin.sh:701+`), which asserts the run exited 0, produced tokens, and
+printed the new `[lmhead-fp16]` line (main.cpp:1433) -- and asserts **no stream
+identity and no performance figure**, saying so explicitly on every run. That is
+the honest shape for a flag whose only purpose is to reproduce a discredited
+measurement: certify that the branch is reachable, certify nothing about the
+output. It lives in prose here because it is a decision record, not a census
+entry, which is precisely why the census does not carry it.
 
 Closing the remaining opt-in gaps is scoped work, not copy-paste: read each flag's
 semantics, decide whether identity is *claimed or disclaimed*, and pick the gate

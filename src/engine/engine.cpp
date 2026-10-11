@@ -777,6 +777,29 @@ void Engine::ensure_workspace48(uint32_t M, uint32_t K) {
 }
 
 void Engine::begin_layer(int L) {
+  // *** INTFER_STREAM_F16 ACCEPTANCE ANNOUNCEMENT. *** The flag moves WHEN a
+  // shard is released, never WHAT: the eviction predicate is unchanged, so the
+  // two streams are byte-identical by construction and a stream comparison is
+  // satisfiable by a flag that never reached begin_layer. The line names the
+  // policy actually in force (evict-FP16 vs keep-FP16-resident), once per
+  // process, so the arm certifies the policy rather than a constant.
+  //
+  // It goes BEFORE the pinned_ early return on purpose: preload_all() pins
+  // every shard and begin_layer then returns without touching a single one,
+  // so the steady-state forward pass never evicts anything regardless of the
+  // flag. A line placed after the guard would only ever print on the warmup
+  // request -- and on a box where the first request is the only one that
+  // evicts, never. The policy is a property of the engine, not of the
+  // request, so it announces before the short-circuit.
+  static const bool stream_f16 = (std::getenv("INTFER_STREAM_F16") != nullptr);
+  static bool announced_stream_f16 = false;
+  if (stream_f16 && !announced_stream_f16) {
+    announced_stream_f16 = true;
+    std::fprintf(stderr,
+                 "[stream-f16] FP16 shard eviction policy ACTIVE "
+                 "(evict-everything; INTFER_STREAM_F16=1)\n");
+    std::fflush(stderr);
+  }
   if (pinned_) return;  // preload_all(): steady-state zero evict+rebuild.
   if (layer_tensors_.empty()) return;
   // Phase 1: FP16-scheme shards are memcpy-identity slices (no unpack work)
@@ -785,7 +808,6 @@ void Engine::begin_layer(int L) {
   // (plus ~2.5GB cached lm_head and the INT4 streaming working set).
   // Skipping their eviction kills ~75% of per-token evict+rebuild traffic.
   // INTFER_STREAM_F16=1 restores the old evict-everything behavior.
-  static const bool stream_f16 = (std::getenv("INTFER_STREAM_F16") != nullptr);
   for (size_t ti = 0; ti < shard_cache_.size(); ++ti) {
     if (!shard_cache_[ti].built) continue;
     if (!stream_f16 && shard_cache_[ti].scheme == gemm::WeightScheme::FP16)

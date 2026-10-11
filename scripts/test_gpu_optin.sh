@@ -333,6 +333,130 @@ for tp in $TPS; do
   D48="$(N=24 ids_of "$tp" INTFER_DPAS48=1)"
   echo "TP=$tp [INTFER_DPAS48=1 n=24]: '$D48'"
   [ -n "$D48" ] || fail "TP=$tp DPAS48 stream empty (broken run)"
+  # --- INTFER_INT8_KV_G: group size for the INT8 KV quantiser ----------------
+  # This knob is a TUNING PARAMETER of an already-gated feature (INTFER_INT8_KV,
+  # certified at line 117), not a separate arithmetic path. It re-partitions the
+  # SAME quantiser over the SAME tokens, so the quantisation error profile
+  # moves within the range the existing KV arms already assert against the
+  # base stream -- the knob's effect is covered by arms that run at the
+  # default. What was NOT covered is the knob's own reachability: a run that
+  # never called kv_group_size() would still match the base stream (the
+  # default 32 ran) and certify nothing. So this arm is a REACHABILITY arm,
+  # not a numerics arm: it asserts the group the quantiser actually used.
+  #
+  # The announcement is the group the engine read from the env, once per
+  # process, so the arm certifies the knob rather than a constant.
+  int8kvg_announced() { grep -aq '\[int8-kv-g\] INT8 KV group ACTIVE' "$1"; }
+  {
+    G_OUT="$(mktemp)"; G_ERR="$(mktemp)"
+    env INTFER_INT8_KV=1 INTFER_INT8_KV_G=16 "$BIN" --gpu --tp "$tp" -m "$MODEL" \
+      -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$G_OUT" 2>"$G_ERR"; G_RC=$?
+    if [ "$G_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_INT8_KV=1 INTFER_INT8_KV_G=16 run exited rc=$G_RC"; tail -10 "$G_ERR" >&2
+    else
+      G_IDS="$(ids_of "$tp" INTFER_INT8_KV=1 INTFER_INT8_KV_G=16)"
+      echo "TP=$tp [INTFER_INT8_KV_G=16]: '$G_IDS'"
+      [ -n "$G_IDS" ] || fail "TP=$tp INTFER_INT8_KV_G=16 stream EMPTY"
+      [ "$G_IDS" = "$BASE" ] \
+        || fail "TP=$tp [INTFER_INT8_KV_G=16] '$G_IDS' != base '$BASE' (group size is a quantiser knob, must not move the stream)"
+      if ! int8kvg_announced "$G_ERR"; then
+        fail "TP=$tp INTFER_INT8_KV_G=16: no [int8-kv-g] line -- the group size was never read, so the run above matched base because the default 32 ran, not because the knob worked"
+      fi
+      G_LINE="$(grep -a '\[int8-kv-g\] INT8 KV group ACTIVE' "$G_ERR" | head -1)"
+      echo "$G_LINE" | grep -aq "group=16 " \
+        || { echo "GATE FAIL: TP=$tp INTFER_INT8_KV_G=16: the announcement does not name group=16, got '$G_LINE'" >&2; PASS=0; }
+    fi
+    rm -f "$G_OUT" "$G_ERR"
+  }
+  {
+    GSB="$(mktemp -d)"
+    env INTFER_INT8_KV=1 INTFER_INT8_KV_G=16 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$GSB/good.out" 2>"$GSB/good.err" || true
+    cp "$GSB/good.err" "$GSB/not.err"
+    sed -i 's/group=16 /group=32 /' "$GSB/not.err"
+    : >"$GSB/empty.err"
+    if ! int8kvg_announced "$GSB/good.err"; then
+      echo "TP=$tp INT8_KV_G self-check SKIPPED: the fixture produced no \
+            [int8-kv-g] line (the INT8 KV mirror never enabled on this box), \
+            so the refusal/vacuity directions are unexercised here" >&2
+    else
+      if int8kvg_announced "$GSB/not.err"; then
+        fail "TP=$tp INT8_KV_G self-check (b): a log whose group was 32 (the default -- the knob ignored) was ACCEPTED -- arm is knob-only"
+      fi
+      if int8kvg_announced "$GSB/empty.err"; then
+        fail "TP=$tp INT8_KV_G self-check (c): arm ACCEPTED an empty log (vacuity)"
+      fi
+    fi
+    rm -rf "$GSB"
+  }
+  # --- INTFER_L4_ROWS: FNV row-fidelity hash, TP=1 only ---------------------
+  # This flag is a DIAGNOSTIC by the census's own definition (it memcpy's data
+  # that is already there, hashes it, and discards the result -- "print paths,
+  # not arithmetic"), but its suffix is not in the is_diag list, so the
+  # mechanical classifier files it under opt-in and prints "REAL GAP". The
+  # classifier is correct as a query; what it cannot do is read semantics, and
+  # that is recorded in check_flag_gate_coverage.sh:25-41 rather than by
+  # widening the suffix list. Arming it anyway is still right, for the same
+  # reason every other arm here has one: the hash runs INSIDE the L4 fused
+  # path (main.cpp:3461-3513), which is TP=1 only (L4_DECLINE("tp") at
+  # main.cpp:3330), so on TP=2 the line cannot appear and a TP=2 arm would be
+  # green because the path never ran. The arm asserts the line on TP=1 and its
+  # ABSENCE on TP=2, exactly as L4_FUSE and L5_FRONT do.
+  #
+  # It is a pure OBSERVATION -- no state is mutated (the S read is wrapped in
+  # try/catch and the result is discarded) -- so the stream is bit-identical
+  # to base and a stream comparison is satisfiable by a flag that never
+  # reached the hash. The line is what turns the match into certification.
+  l4_rows_announced() { grep -aq '\[l4-rows\] FNV row-fidelity hash ACTIVE' "$1"; }
+  {
+    R_OUT="$(mktemp)"; R_ERR="$(mktemp)"
+    env INTFER_L4_FUSE=1 INTFER_L4_ROWS=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" \
+      -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$R_OUT" 2>"$R_ERR"; R_RC=$?
+    if [ "$R_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_L4_FUSE=1 INTFER_L4_ROWS=1 run exited rc=$R_RC"; tail -10 "$R_ERR" >&2
+    else
+      R_IDS="$(ids_of "$tp" INTFER_L4_FUSE=1 INTFER_L4_ROWS=1)"
+      echo "TP=$tp [INTFER_L4_ROWS=1]: '$R_IDS'"
+      [ -n "$R_IDS" ] || fail "TP=$tp INTFER_L4_ROWS=1 stream EMPTY"
+      [ "$R_IDS" = "$BASE" ] \
+        || fail "TP=$tp [INTFER_L4_ROWS=1] '$R_IDS' != base '$BASE' (the hash mutates nothing, must be bit-exact)"
+      if [ "$tp" = "1" ]; then
+        if ! l4_rows_announced "$R_ERR"; then
+          fail "TP=$tp INTFER_L4_ROWS=1: no [l4-rows] line -- the hash never ran, so the stream match above was vacuous"
+        fi
+      else
+        if l4_rows_announced "$R_ERR"; then
+          fail "TP=$tp INTFER_L4_ROWS=1: hash announced on TP=2 where the L4 fused path must decline"
+        fi
+      fi
+    fi
+    rm -f "$R_OUT" "$R_ERR"
+  }
+  {
+    RSB="$(mktemp -d)"
+    env INTFER_L4_FUSE=1 INTFER_L4_ROWS=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$RSB/good.out" 2>"$RSB/good.err" || true
+    cp "$RSB/good.err" "$RSB/not.err"
+    sed -i '/\[l4-rows\]/d' "$RSB/not.err"
+    : >"$RSB/empty.err"
+    if ! l4_rows_announced "$RSB/good.err"; then
+      echo "TP=$tp L4_ROWS self-check SKIPPED: the tp=1 fixture produced no \
+            [l4-rows] line (the L4 fused path did not run on this box), so \
+            the refusal/vacuity directions are unexercised here" >&2
+    else
+      if l4_rows_announced "$RSB/not.err"; then
+        fail "TP=$tp L4_ROWS self-check (b): log with the hash line deleted was ACCEPTED -- arm is observation-only"
+      fi
+      if l4_rows_announced "$RSB/empty.err"; then
+        fail "TP=$tp L4_ROWS self-check (c): arm ACCEPTED an empty log (vacuity)"
+      fi
+    fi
+    rm -rf "$RSB"
+  }
+
+
+
+
 
   # MUST be bit-exact: the device pre-pass reproduces the host GA64 quant.
   GOT="$(N=24 ids_of "$tp" INTFER_DPAS48=1 INTFER_DPAS_PREQ=1)"
@@ -522,6 +646,123 @@ for tp in $TPS; do
     fi
     rm -rf "$WASB"
   }
+  # --- INTFER_STREAM_F16: FP16-shard eviction policy ------------------------
+  # This flag moves WHEN a shard is released, never WHAT: the eviction
+  # predicate is unchanged, so the two streams are byte-identical by
+  # construction and a stream comparison is satisfiable by a flag that never
+  # reached begin_layer. The line names the policy actually in force
+  # (evict-FP16 vs keep-FP16-resident), once per process, so the arm certifies
+  # the policy rather than a constant. Reachability is structural: the branch
+  # is in begin_layer (engine.cpp:779), which every layer's forward pass
+  # calls, so the 0.8B model reaches it on every token.
+  stream_f16_announced() { grep -aq '\[stream-f16\] FP16 shard eviction policy ACTIVE' "$1"; }
+  {
+    SF_OUT="$(mktemp)"; SF_ERR="$(mktemp)"
+    env INTFER_STREAM_F16=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$SF_OUT" 2>"$SF_ERR"; SF_RC=$?
+    if [ "$SF_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_STREAM_F16=1 run exited rc=$SF_RC"; tail -10 "$SF_ERR" >&2
+    else
+      SF_IDS="$(ids_of "$tp" INTFER_STREAM_F16=1)"
+      echo "TP=$tp [INTFER_STREAM_F16=1]: '$SF_IDS'"
+      [ -n "$SF_IDS" ] || fail "TP=$tp INTFER_STREAM_F16=1 stream EMPTY"
+      [ "$SF_IDS" = "$BASE" ] \
+        || fail "TP=$tp [INTFER_STREAM_F16=1] '$SF_IDS' != base '$BASE' (the policy moves when, not what -- must be bit-exact)"
+      if ! stream_f16_announced "$SF_ERR"; then
+        fail "TP=$tp INTFER_STREAM_F16=1: no [stream-f16] line -- the policy was never read, so the run above matched base because the default keep-FP16-resident ran, not because the flag worked"
+      fi
+      SF_LINE="$(grep -a '\[stream-f16\] FP16 shard eviction policy ACTIVE' "$SF_ERR" | head -1)"
+      echo "$SF_LINE" | grep -aq "evict-everything" \
+        || { echo "GATE FAIL: TP=$tp INTFER_STREAM_F16=1: the announcement does not name the evict-everything policy, got '$SF_LINE'" >&2; PASS=0; }
+    fi
+    rm -f "$SF_OUT" "$SF_ERR"
+  }
+  {
+    SFSB="$(mktemp -d)"
+    env INTFER_STREAM_F16=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$SFSB/good.out" 2>"$SFSB/good.err" || true
+    cp "$SFSB/good.err" "$SFSB/not.err"
+    sed -i 's/evict-everything/keep-FP16-resident/' "$SFSB/not.err"
+    : >"$SFSB/empty.err"
+    if ! stream_f16_announced "$SFSB/good.err"; then
+      echo "TP=$tp STREAM_F16 self-check SKIPPED: the tp=1 fixture produced no \
+            [stream-f16] line (the engine did not run on this box), so the \
+            refusal/vacuity directions are unexercised here" >&2
+    else
+      if stream_f16_announced "$SFSB/not.err"; then
+        fail "TP=$tp STREAM_F16 self-check (b): a log whose policy was keep-FP16-resident (the default -- the flag ignored) was ACCEPTED -- arm is policy-only"
+      fi
+      if stream_f16_announced "$SFSB/empty.err"; then
+        fail "TP=$tp STREAM_F16 self-check (c): arm ACCEPTED an empty log (vacuity)"
+      fi
+    fi
+    rm -rf "$SFSB"
+  }
+
+
+  # --- INTFER_LMHEAD_FP16: per-tile FP16 lm_head upload ---------------------
+  # This flag swaps the lm_head upload + GEMM from the default INT8-code path
+  # to the old per-tile FP16-weight path. It is NOT bit-exact against the
+  # default -- INT8 vs FP16 weight representation is a different quantisation
+  # by design -- so a stream comparison here is NOT a check and no identity is
+  # claimed. AGENTS.md records it as UNCERTIFIED-BY-DISCLAIM and
+  # check_flag_gate_coverage.sh:61 records why no stream arm is warranted: it
+  # restores a bisect-only variant and the repo has retracted every
+  # performance claim made for it. Gating a flag whose only purpose is to
+  # reproduce a discredited measurement would certify nothing.
+  #
+  # What an arm CAN honestly assert here is REACHABILITY, and it is still
+  # worth asserting: the branch is in run_lm_head_f16 (main.cpp:1433), which
+  # every lm_head call enters, so the 0.8B model reaches it on every token.
+  # The arm checks the run exited 0, produced tokens, and -- the only thing
+  # that separates this from a flag that never reached the upload -- that the
+  # [lmhead-fp16] line appeared. It asserts NO stream identity and NO
+  # performance figure; saying so explicitly is the difference between a
+  # reachability arm and a vacuous pass.
+  lmhead_fp16_announced() { grep -aq '\[lmhead-fp16\] lm_head upload ACTIVE' "$1"; }
+  {
+    H_OUT="$(mktemp)"; H_ERR="$(mktemp)"
+    env INTFER_LMHEAD_FP16=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$H_OUT" 2>"$H_ERR"; H_RC=$?
+    if [ "$H_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_LMHEAD_FP16=1 run exited rc=$H_RC"; tail -10 "$H_ERR" >&2
+    else
+      H_IDS="$(ids_of "$tp" INTFER_LMHEAD_FP16=1)"
+      echo "TP=$tp [INTFER_LMHEAD_FP16=1]: '$H_IDS'"
+      [ -n "$H_IDS" ] || fail "TP=$tp INTFER_LMHEAD_FP16=1 produced no tokens (see $H_ERR)"
+      if ! lmhead_fp16_announced "$H_ERR"; then
+        fail "TP=$tp INTFER_LMHEAD_FP16=1: no [lmhead-fp16] line -- the FP16 upload never ran, so the run above is the default INT8 path and this arm is vacuous"
+      fi
+      # EXPLICITLY NOT a stream comparison: INT8 vs FP16 weight representation
+      # differs by design. Recorded here so the omission is visible rather
+      # than silent.
+      echo "TP=$tp [INTFER_LMHEAD_FP16=1]: no stream identity asserted (INT8 vs FP16 by design); reachability only"
+    fi
+    rm -f "$H_OUT" "$H_ERR"
+  }
+  {
+    HSB="$(mktemp -d)"
+    env INTFER_LMHEAD_FP16=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$HSB/good.out" 2>"$HSB/good.err" || true
+    cp "$HSB/good.err" "$HSB/not.err"
+    sed -i '/\[lmhead-fp16\]/d' "$HSB/not.err"
+    : >"$HSB/empty.err"
+    if ! lmhead_fp16_announced "$HSB/good.err"; then
+      echo "TP=$tp LMHEAD_FP16 self-check SKIPPED: the tp=1 fixture produced no \
+            [lmhead-fp16] line (the lm_head upload never ran on this box), so \
+            the refusal/vacuity directions are unexercised here" >&2
+    else
+      if lmhead_fp16_announced "$HSB/not.err"; then
+        fail "TP=$tp LMHEAD_FP16 self-check (b): log with the upload line deleted was ACCEPTED -- arm is reachability-only"
+      fi
+      if lmhead_fp16_announced "$HSB/empty.err"; then
+        fail "TP=$tp LMHEAD_FP16 self-check (c): arm ACCEPTED an empty log (vacuity)"
+      fi
+    fi
+    rm -rf "$HSB"
+  }
+
+
 done
 
 if [ "$PASS" != 1 ]; then
@@ -534,4 +775,5 @@ if [ "$SKIPPED_TP2" = 1 ]; then
   echo "GPU-OPTIN TEST: PARTIAL PASS (tp=1 arms all green; tp=2 pass SKIPPED -- need 2 GPUs)" >&2
   exit 2
 fi
+# STREAM_F16
 echo "GPU-OPTIN TEST: PASS"

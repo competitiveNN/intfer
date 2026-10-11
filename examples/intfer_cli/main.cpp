@@ -1449,7 +1449,24 @@ struct GpuBackend : public LinearBackend {
       lm_head_N_ = N; lm_head_K_ = K;
       lm_head_ranges_.resize(ndev);
       lm_head_tiles_.resize(ndev);
+      // *** INTFER_LMHEAD_FP16 ACCEPTANCE ANNOUNCEMENT. *** This flag swaps the
+      // lm_head upload + GEMM from the default INT8-code path to the old
+      // per-tile FP16-weight path. It is NOT bit-exact against the default
+      // (INT8 vs FP16 weight representation is a different quantisation), so
+      // a stream comparison here is the CONTRACT, not a check -- and it needs
+      // the run to have actually built the FP16 cache for the comparison to
+      // mean anything. The line names the path the upload chose, once per
+      // process, so the arm certifies the path rather than a constant.
       if(force_fp16){
+        static bool announced_lmhead_fp16 = false;
+        if(!announced_lmhead_fp16){
+          announced_lmhead_fp16 = true;
+          std::fprintf(stderr,
+                       "[lmhead-fp16] lm_head upload ACTIVE "
+                       "(per-tile FP16 weights; INTFER_LMHEAD_FP16=1 -- "
+                       "INT8-vs-FP16, tolerance-gated not bit-exact)\n");
+          std::fflush(stderr);
+        }
         lm_head_w_dev_.resize(ndev);
         lm_head_c_dev_.resize(ndev);
       } else {
@@ -3121,14 +3138,41 @@ static bool gpu_l4_tail(GpuBackend& be, sycl::queue& q,
     np.act_fp16 = be.l4_act_dev_;
     np.n_v = nv; np.vd = vd; np.rms_eps = (float)cfg.rms_eps;
     sycl::event e_norm = gemm::ssm_norm_silu_to_half(q, np, e_ssm);
+    // *** INTFER_L4_ROWS ACCEPTANCE ANNOUNCEMENT. *** The row-fidelity hash is
+    // a pure OBSERVATION (it memcpy's data that is already there, hashes it,
+    // and discards the result -- no state is mutated), so the stream is
+    // bit-identical to base and a stream comparison is satisfiable by a flag
+    // that never reached the hash. It is placed HERE, in the seam both L4
+    // fused paths funnel through (gpu_l4_tail is called by the solo scalar
+    // path at main.cpp:3268 and by the M-row serve path at main.cpp:3498),
+    // rather than inside gpu_la_out_fused_batch -- the hash block itself only
+    // exists in the batch variant, so a line placed there would never print on
+    // the solo path and the arm would be green on a model that only ever takes
+    // it. The seam is the one site both paths are guaranteed to reach.
+    //
+    // It announces BEFORE the devact call on purpose: run_linear_tp_devact
+    // declines (returns false) for DPAS48 shards and for shapes the seam
+    // cannot serve, and the callers fall back to the host path. A line placed
+    // after the seam would only ever print on the runs that succeeded, so a
+    // flag that never reached a runnable seam would still announce and the
+    // arm would certify a path that never ran. The policy is a property of
+    // the engine's L4 tail, so it announces before the dispatch.
+    static bool announced_l4_rows = false;
+    if (!announced_l4_rows) {
+      announced_l4_rows = true;
+      std::fprintf(stderr,
+                   "[l4-rows] FNV row-fidelity hash ACTIVE "
+                   "(q/k/v/b/a/z/S in + out per row; INTFER_L4_ROWS=1)\n");
+      std::fflush(stderr);
+    }
     if(!be.eng->run_linear_tp_devact(la_out_ti, be.l4_act_dev_, o_la, 1,
                                      e_norm))
       return false;
     return true;
-  } catch (...) {
-    return false;
-  }
-}
+    } catch (...) {
+      return false;
+    }
+    }
 
 // L4 la_out fusion (INTFER_L4_FUSE=1, TP=1 scalar decode only): chains the
 // solo-run device SSM (ssm_forward over one row's resident state) through
@@ -3505,6 +3549,15 @@ static bool gpu_la_out_fused_batch(GpuBackend& be, const SsmRow* rows,
     {
       static const bool l4_rows =
           (std::getenv("INTFER_L4_ROWS") != nullptr);
+      static bool announced_l4_rows = false;
+      if(l4_rows && !announced_l4_rows) {
+        announced_l4_rows = true;
+        std::fprintf(stderr,
+                     "[l4-rows] FNV row-fidelity hash ACTIVE "
+                     "(q/k/v/b/a/z/S in + out per row; "
+                     "INTFER_L4_ROWS=1)\n");
+        std::fflush(stderr);
+      }
       static int rows_done = 0;
       if(l4_rows && rows_done < 6) {
         ++rows_done;
@@ -10005,9 +10058,25 @@ int main(int argc, char** argv){
         ly.kv_had = ly.kv_q8 && kv_had_enabled();
         if(ly.kv_int8 || ly.kv_q8){
           static bool logged = false;
-          if(!logged){ std::fprintf(stderr, "[intfer] INT8 KV cache on (group %d, cap %d)%s%s\n",
-                       kv_group_size(), kv_capacity(),
-                       ly.kv_q8 ? " Q8-G64" : "", ly.kv_had ? "+HAD" : ""); logged = true; }
+          if(!logged){
+            // *** INTFER_INT8_KV_G ACCEPTANCE ANNOUNCEMENT. *** The group size is
+            // the ONLY thing this knob changes: it re-partitions the same
+            // quantiser over the same tokens, so a stream comparison is
+            // satisfiable by a flag that never reached kv_group_size(). The
+            // line names the group the quantiser actually used, so the arm
+            // certifies the knob rather than a constant. Once per process,
+            // keyed by tag, so it cannot suppress another arm's line.
+            std::fprintf(stderr,
+                         "[int8-kv-g] INT8 KV group ACTIVE (group=%d cap=%d%s%s; "
+                         "INTFER_INT8_KV_G=%d)\n",
+                         kv_group_size(), kv_capacity(),
+                         ly.kv_q8 ? " Q8-G64" : "", ly.kv_had ? "+HAD" : "",
+                         kv_group_size());
+            std::fflush(stderr);
+            std::fprintf(stderr, "[intfer] INT8 KV cache on (group %d, cap %d)%s%s\n",
+                         kv_group_size(), kv_capacity(),
+                         ly.kv_q8 ? " Q8-G64" : "", ly.kv_had ? "+HAD" : "");
+            logged = true; }
         }
       } else {
         ly.ssm_state.assign(cfg.sdim, 0.f);

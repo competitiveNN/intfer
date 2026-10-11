@@ -40,9 +40,11 @@
 # cannot do is read a flag's semantics, and that is stated here so the
 # "REAL GAP" label is not quoted as settled for this one flag.
 #
-# *** DISPOSITION OF THE REMAINING FIVE, 2026-10-10. *** Two were armed in
-# scripts/test_gpu_optin.sh and three carry a stated reason they are not.
-# Each was verified by reading the code, not assumed from the census:
+# *** DISPOSITION OF THE REMAINING SIX, 2026-10-11. *** Five were armed in
+# scripts/test_gpu_optin.sh and one carries a stated reason it is not. Each
+# was verified by reading the code, not assumed from the census. The four
+# added 2026-10-11 all carry an acceptance announcement; see the arm headers
+# for the rationale per flag.
 #
 #   INTFER_L4_FUSE   ARMED (test_gpu_optin.sh:186+). L4 la_out fusion,
 #                    bit-exact vs the host path. Announcement
@@ -58,25 +60,50 @@
 #                    Announcement [l5-front] at main.cpp:4771; same
 #                    TP=1/TP=2 polarity (L5_DECLINE("tp") at
 #                    main.cpp:4199) and same self-check shape.
-#   INTFER_LMHEAD_FP16 NOT ARMED -- decision record stands. AGENTS.md:482
-#                    records it as UNCERTIFIED-BY-DISCLAIM: it restores
-#                    the old FP16 tiled lm_head path, a bisect-only
-#                    variant, and the repo has retracted every performance
-#                    claim made for it. Gating a flag whose only purpose
-#                    is to reproduce a discredited measurement would
-#                    certify nothing.
-#   INTFER_INT8_KV_G NOT ARMED -- derivative knob. main.cpp:3821: group
-#                    size for the INT8 KV quantiser (default 32). It is a
-#                    tuning parameter of an ALREADY-GATED feature
-#                    (INTFER_INT8_KV is named by test_gpu_optin.sh:117
-#                    and test_cpu_parity.sh:106), not a separate arithmetic
-#                    path. Changing the group size changes the
-#                    quantisation error profile, which the existing KV
-#                    arms assert against the base stream -- so the knob's
-#                    effect is covered by arms that already run at the
-#                    default. A standalone arm would assert a stream
-#                    identity those arms already exercise at one point on
-#                    the knob's range.
+#   INTFER_INT8_KV_G ARMED (test_gpu_optin.sh:317+). Group size for the
+#                    INT8 KV quantiser (main.cpp:3821, default 32). A
+#                    tuning parameter of an already-gated feature
+#                    (INTFER_INT8_KV, test_gpu_optin.sh:117), not a
+#                    separate arithmetic path -- so the arm is a
+#                    REACHABILITY arm, not a stream-identity one: it
+#                    asserts the group the quantiser actually used via
+#                    the new [int8-kv-g] line, and the stream is only
+#                    asserted non-empty (the knob must not move it).
+#                    Self-check (b) rewrites group=16 to group=32, the
+#                    exact shape of "the knob was ignored".
+#   INTFER_L4_ROWS   ARMED (test_gpu_optin.sh:408+). FNV row-fidelity
+#                    hash (main.cpp:3461-3513). A DIAGNOSTIC by the
+#                    census's own definition, but its suffix is not in
+#                    is_diag so the mechanical classifier files it
+#                    opt-in -- the classifier is correct as a query and
+#                    the gap is recorded above at line 25, not silenced
+#                    by widening the suffix list. The arm is armed
+#                    anyway because the hash runs INSIDE the L4 fused
+#                    path (TP=1 only, L4_DECLINE("tp") at
+#                    main.cpp:3330), so a TP=2 arm would be green
+#                    because the path never ran. Announcement
+#                    [l4-rows] added at main.cpp:3461; the arm asserts
+#                    the line on TP=1 and its ABSENCE on TP=2.
+#   INTFER_STREAM_F16 ARMED (test_gpu_optin.sh:648+). FP16-shard eviction
+#                    policy (engine.cpp:779, default keep-FP16-resident).
+#                    Moves WHEN a shard is released, never WHAT, so the
+#                    two streams are byte-identical by construction and
+#                    a stream comparison is satisfiable by a flag that
+#                    never reached begin_layer. Announcement
+#                    [stream-f16] added at engine.cpp:788; the arm
+#                    asserts the policy the engine actually applied.
+#   INTFER_LMHEAD_FP16 ARMED -- REACHABILITY ONLY, no stream claim.
+#                    AGENTS.md:495 records it as
+#                    UNCERTIFIED-BY-DISCLAIM: it restores the old FP16
+#                    tiled lm_head path, a bisect-only variant, and the
+#                    repo has retracted every performance claim made
+#                    for it. Gating a flag whose only purpose is to
+#                    reproduce a discredited measurement would certify
+#                    nothing -- so the arm asserts NO stream identity
+#                    (INT8 vs FP16 weight representation differs by
+#                    design) and says so explicitly on every run. What
+#                    it does assert is reachability via the new
+#                    [lmhead-fp16] line (main.cpp:1433).
 #   INTFER_DECODE1_ANNOUNCE_EVERY NOT ARMED -- harness-only. quant_gemm.
 #                    cpp:67: disables the once-only latch and prints
 #                    every launch. Its own comment states its purpose --
@@ -88,10 +115,10 @@
 #                    test harness against itself.
 #
 # The floor's purpose is met. The opt-in class existed so a residue could
-# not be left sitting unexamined; it is now examined flag by flag -- two
-# armed, three with a stated reason verified against source, one
-# reclassified as a diagnostic. The class is still non-empty and the
-# checker still refuses an empty class; that is by design, not a remaining
+# not be left sitting unexamined; it is now examined flag by flag -- five
+# armed, one with a stated reason verified against source. The class is
+# still non-empty (the harness latch) and the checker still refuses an
+# empty class; that is by design, not a remaining defect.
 # defect.
 #
 # *** HOW POLARITY IS AND IS NOT DETERMINED, AND WHAT I GOT WRONG FIRST. ***
