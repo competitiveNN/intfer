@@ -38,19 +38,39 @@ cp "$SRC" "$SB/quant_gemm.pristine"
 # claimed BIT-EXACT BY CONSTRUCTION, so the gate's value-diff is the right
 # instrument -- and the arm MUST still announce itself, so a refusal that fired
 # for a NONCE-31 marker would be testing the announcement, not the arithmetic.
-PLANT_OLD='const int code = (bv >> ((j & 3) * 2)) & 3;
-                      acc += av * wtab[code];'
-PLANT_NEW='const int code = (bv >> (j * 2)) & 3;
-                      acc += av * wtab[code];'
-[ "$(grep -c -F "$PLANT_OLD" "$SRC")" = 1 ] || {
-  echo "MUTATE: PLANT anchor not found exactly once (tree moved?)" >&2; exit 2; }
+#
+# *** THE ANCHOR IS PER-ARM, NOT A GLOBAL COUNT (stale-matrix fix). ***
+# The original guard counted the two-line idiom
+#     const int code = (bv >> ((j & 3) * 2)) & 3;
+#                         acc += av * wtab[code];
+# and required EXACTLY ONE. That was true at 81a07c6 (7 sites) and stayed true
+# through 0fd6e11, but the INTFER_WAVE_LAUNCH_FUSE audit (4458eeb) added two
+# more decode1 bodies with the same idiom, taking the count to 9 -- and the
+# matrix then refused with "PLANT anchor not found exactly once", a stale
+# reference rather than a verdict. The plant is pinned to ONE arm anyway (by
+# walking forward from that arm's `decode1_announce("…")` call, which is unique
+# per arm), so the global count was never the thing being protected: the real
+# precondition is that BOTH arms' announce tags are present and unique, and that
+# each arm carries the idiom after its tag. plant_codebook_bug() checks the
+# latter; this block checks the former, so the precondition moves with the
+# population instead of going stale when a new arm is added.
+for tag in "decode1-verbmp" "decode1-verbsel"; do
+  n=$(grep -c "decode1_announce(\"$tag\")" "$SRC")
+  [ "$n" = 1 ] || {
+    echo "MUTATE: announce($tag) found $n times (expected 1) -- the plant cannot" \
+         "pin an arm" >&2; exit 2; }
+done
 
 setup_state() { # $1 = id, $2 = mutation fn, $3 = old anchor, $4 = new text
   # Copy the WHOLE tree under build/, not just the bits the gate reads. The gate
   # sources _gate_build.sh, which runs cmake --build on $BUILD_DIR and needs the
   # CMakeLists, include/, examples/ and src/ together; a partial copy silently
   # produced "no build system in $dir" and every state read as a MISS.
-  local id="$1" fn="$2" old="$3" new="$4" mutroot="$SB/$id"
+  # mutroot is on its OWN line: bash expands `local a=1 b=$a` with $a still
+  # unset, so `local id="$1" … mutroot="$SB/$id"` aborted under `set -u`
+  # ("id: unbound variable") even when $1 was passed.
+  local id="$1" fn="$2" old="$3" new="$4"
+  local mutroot="$SB/$id"
   rm -rf "$mutroot"; mkdir -p "$mutroot"
   # Copy ONLY what the rowpair_equiv build needs, NOT the whole tree -- the `test/`
   # directory (27B model weights, ~2.2 GB) and the build dirs must not be copied,
@@ -115,6 +135,13 @@ PY
 # The anchors differ only in the tail expression, so the same defect is
 # exercised on two arms the gate claims differently.
 
+# plant_codebook_bug takes its ARMS as $2 ("decode1-verbmp" / "decode1-verbsel");
+# it pins itself by walking forward from that arm's announce call, so the
+# old/new text parameters are UNUSED and are passed empty rather than as an
+# undefined variable -- under `set -u` a bare $RPE1_OLD aborted the matrix.
+RPE1_OLD='' RPE1_NEW='' RPE_VERBMP_TAG='decode1-verbmp'
+RPE2_OLD='' RPE2_NEW='' RPE_VERBSEL_TAG='decode1-verbsel'
+
 total=0; caught=0
 record() { total=$((total+1)); case "$2" in ok) caught=$((caught+1)); echo "  ok   $1";; *) echo "  $1 $2";; esac; }
 
@@ -129,10 +156,12 @@ else
 fi
 
 echo "== RPE-1: VERBMP codebook-index bug planted -> must REFUSE =="
-total=$((total+1))
-setup_state RPE1 "plant_codebook_bug" "$RPE1_OLD" "$RPE1_NEW"
+# record() increments total itself; a second increment here double-counts it
+# (that is the 795ab55 "remove duplicate total increment" fix, which this
+# block was written on top of and had re-introduced).
+setup_state RPE1 "plant_codebook_bug" "$RPE_VERBMP_TAG" ""
 run_gate RPE1; rc=$?
-if [ "$rc" -ne 0 ] && grep -qE 'INTFER_DECODE1_VERBMP.*NOT bitwise identical' "$LOG_DIR/RPE1.log" \
+if [ "$rc" -ne 0 ] && grep -qE 'INTFER_DECODE1_VERBMP.*NOT bitwise identical' "$LOG_DIR/RPE1.err" \
   && grep -qa 'decode1-verbmp' "$SB/RPE1/build/rowpair_equiv.vm.err"; then
   record "RPE-1 REFUSED (INT2 diff + arm announced itself)" ok
 else
@@ -142,35 +171,9 @@ else
 fi
 
 echo "== RPE-2: the SAME defect planted on VERBSEL -> must ALSO REFUSE =="
-total=$((total+1))
-setup_state RPE2 "plant_codebook_bug" "$RPE2_OLD" "$RPE2_NEW"
+setup_state RPE2 "plant_codebook_bug" "$RPE_VERBSEL_TAG" ""
 run_gate RPE2; rc=$?
-if [ "$rc" -ne 0 ] && grep -qE 'INTFER_DECODE1_VERBSEL.*NOT bitwise identical' "$LOG_DIR/RPE2.log" \
-  && grep -qa 'decode1-verbsel' "$SB/RPE2/build/rowpair_equiv.vs.err"; then
-  record "RPE-2 REFUSED (same defect, different bit-exact arm -- not special-cased)" ok
-else
-  echo "  RPE-2 MISSED (rc=$rc)" >&2; tail -8 "$LOG_DIR/RPE2.err" >&2
-  record "RPE-2" "MISSED (rc=$rc)"
-fi
-
-echo "== RPE-1: VERBMP codebook-index bug planted -> must REFUSE =="
-total=$((total+1))
-setup_state RPE1 "plant_codebook_bug" "$RPE1_OLD" "$RPE1_NEW"
-run_gate RPE1; rc=$?
-if [ "$rc" -ne 0 ] && grep -qE 'INTFER_DECODE1_VERBMP.*NOT bitwise identical' "$LOG_DIR/RPE1.log" \
-  && grep -qa 'decode1-verbmp' "$SB/RPE1/build/rowpair_equiv.vm.err"; then
-  record "RPE-1 REFUSED (INT2 diff + arm announced itself)" ok
-else
-  echo "  RPE-1 MISSED (rc=$rc): defect escaped the rewritten gate." >&2
-  tail -8 "$LOG_DIR/RPE1.err" >&2
-  record "RPE-1" "MISSED (rc=$rc)"
-fi
-
-echo "== RPE-2: the SAME defect planted on VERBSEL -> must ALSO REFUSE =="
-total=$((total+1))
-setup_state RPE2 "plant_codebook_bug" "$RPE2_OLD" "$RPE2_NEW"
-run_gate RPE2; rc=$?
-if [ "$rc" -ne 0 ] && grep -qE 'INTFER_DECODE1_VERBSEL.*NOT bitwise identical' "$LOG_DIR/RPE2.log" \
+if [ "$rc" -ne 0 ] && grep -qE 'INTFER_DECODE1_VERBSEL.*NOT bitwise identical' "$LOG_DIR/RPE2.err" \
   && grep -qa 'decode1-verbsel' "$SB/RPE2/build/rowpair_equiv.vs.err"; then
   record "RPE-2 REFUSED (same defect, different bit-exact arm -- not special-cased)" ok
 else
