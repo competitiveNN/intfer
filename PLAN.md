@@ -97,27 +97,63 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
 
 ### 1.3 SLM work-stealing tile scheduler for prefill tiles
 
+* **Status 2026-10-11: IMPLEMENTED and GATED (commit after this line).**
+  `INTFER_TILE_SCHED=1` (default OFF) turns the tiled DPAS kernel's
+  fixed `block % nWG` assignment into a per-device SLM work-stealing
+  claim queue: a WI that drains its block pulls the next unclaimed one
+  instead of idling. The claim is `atomic_update<atomic_op::inc>` on a
+  `local_accessor<uint32_t>` per block (the ESIMD primitive; `sycl::atomic_ref`
+  is not permitted in a `SYCL_ESIMD_KERNEL`). It is a pure DISPATCH
+  change — each tile computes the same dot products in the same order —
+  so the tiled kernel output is bit-identical to the fixed-assignment
+  path and no numerics contract is needed. Per-device, so TP-compatible.
+  The arithmetic is ONE shared device body (`process_block`, carrying the
+  `sycl_explicit_simd` attribute) called by both paths, so they cannot
+  drift. Announced `[tile-sched] INTFER_TILE_SCHED=on|off n_blocks=.. nWG=..`
+  once per process; gate arm in `test_tp2_27b.sh` with a 3-part self-check
+  (healthy / mode rewritten to `off` / empty log).
 * **Why:** vllm/sgl `TileScheduler` (one `atomicAdd` per tile-chunk)
   keeps the device busy under saturation; submit inflates ~84 us/launch
   at M=1 to ~600 us at M=128, so fewer, better-filled launches are
   the prefill lever. Per-device, so TP-compatible.
 * **Does NOT apply to M=1 decode:** one output per work-item, nothing
   to steal. Do not attempt it there.
-* **Where:** the prefill tiled DPAS kernels (`quant_gemm_dpas48_2d`).
+* **Where:** `quant_gemm_dpas48_tiled<R>` (`src/gemm/quant_gemm.cpp`),
+  reached via `run_linear_tp_dpas48` (`src/engine/engine.cpp:1163`) —
+  i.e. only when `INTFER_DPAS48=1`. On the default prefill path
+  (`sc.dpas48 == false`) the kernel is `quant_gemm_forward_usm`'s
+  64x64 tiled body, which this flag does NOT touch.
 * **Kill criterion:** if tile occupancy is already saturated at the
   current launch shape (probe with the device's own event timestamps),
-  close it.
+  close it. The measured verdict is OPERATOR-ONLY: this box's
+  `kernel` bucket is unverified for the engine (see below), so the
+  decision rests on `nk`/`nw`/`nr` and the host buckets, never on a
+  tok/s.
 
 ### 1.4 oneMKL `gemm` fallback for large contiguous FP16
 
-* **Why:** llama.cpp `ggml-sycl.cpp:3115` shape — a link-only change
-  today (verified: zero `dnnl`/`onemkl`/`mkl::` reference in
-  `src`/`include`/`examples`).
+* **Status 2026-10-11: IMPLEMENTED and GATED (commit after this line).**
+  `INTFER_ONEMKL=1` (default OFF) routes `quant_gemm_f16` through
+  `gemm::gemm_onemkl_fp16` when `onemkl_available() && M >= 8`. The
+  library is linked at build time (`INTFER_ENABLE_MKL=ON`); when it is
+  absent `gemm_onemkl.cpp` compiles the empty-fallback spellings of
+  `onemkl_available()` / `gemm_onemkl_fp16()` so the engine links either
+  way and the arm is unreachable rather than wrong. Announced
+  `[onemkl] FP16 gemm via oneMKL SYCL BLAS ACTIVE (M=.. N=.. K=..)`,
+  once per process. Gate arm in `test_tp2_27b.sh`.
+* **Why:** llama.cpp `ggml-sycl.cpp:3115` shape.
 * **Why it is fourth:** FP16 is 57.9% of decode traffic but already
   runs at 98-123% of the memory roofline (LA_QKV 559.9 GB/s, LA_OUT
   477.1 GB/s) — at the wall. This cannot pay on decode; it is a
   prefill/large-M item only.
-* **Contract:** stream-identity, same as every GEMM change.
+* **Contract: TOLERANCE-GATED, not bit-exact.** oneMKL's FP32
+  accumulation order is an internal implementation detail of the
+  `mkl::blas` kernel and is NOT the engine's row-major ascending-k
+  order, so no bit-exactness claim is made and none is warranted.
+  Any gate compares the token stream against base under an AGREED
+  tolerance. The `[onemkl]` announcement is what makes a run's having
+  reached the arm observable — without it a flag that never reached
+  the kernel would pass a tolerance-gated comparison just as easily.
 
 ### 1.5 Barrier-free subgroup reduction (SUBGROUP retry)
 
