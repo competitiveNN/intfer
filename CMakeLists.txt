@@ -20,6 +20,7 @@ option(INTFER_ENABLE_L0      "Enable the Intel Level-Zero native layer" ON)
 option(INTFER_BUILD_EXAMPLES "Build example programs"                   ON)
 option(INTFER_BUILD_QUANT    "Build Stage-1 quantization core (experimental)" OFF)
 option(INTFER_PROFILE_GPU    "Enable GPU timing instrumentation (experimental)" ON)
+option(INTFER_ENABLE_MKL     "Link oneMKL SYCL BLAS (PLAN.md 1.4); OFF when libmkl_sycl_blas is absent, so the default build is unchanged" OFF)
 
 set(INTFER_SYCL_TARGET "spir64" CACHE STRING "SYCL offload target triple")
 

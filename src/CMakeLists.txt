@@ -42,6 +42,13 @@ target_include_directories(intfer_gemm PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(intfer_gemm PUBLIC intfer_common)
 add_sycl_to_target(TARGET intfer_gemm SOURCES gemm/quant_gemm.cpp)
 
+# PLAN.md 1.3 (SLM work-stealing tile scheduler) and 1.4 (oneMKL SYCL BLAS
+# fallback). Both are wired here, next to the target that consumes them, so
+# they are part of the build rather than committed-but-uncompiled scaffolding.
+# The gemm subdir is processed AFTER intfer_gemm is defined, so the targets
+# below can link to it.
+add_subdirectory(gemm)
+
 # ---------------------------------------------------------------------------
 # Stage-2 inference engine: loads the .intfer, tensor-parallel shards the
 # quantized Linears across the Arc fleet, and runs the per-token decode via the

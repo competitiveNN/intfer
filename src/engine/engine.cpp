@@ -1204,6 +1204,39 @@ void Engine::run_linear_tp_dpas48(int tensor_index,
         (kernel_evt == sycl::event{}) || (kernel_evt == dep);
     if (declined) kernel_evt = gemm::quant_gemm_dpas48(q, p, dep);
     kernel_events.push_back(kernel_evt);
+    // INTFER_TILE_SCHED (PLAN.md 1.3, default OFF): the prefill tiled kernel
+    // can run its n_blocks tiles from a per-device SLM work-stealing claim
+    // queue instead of the fixed block%WG assignment. It is a pure dispatch
+    // change (each tile computes the same dot products in the same order),
+    // so the token stream is bit-identical to the base run and a stream
+    // comparison is satisfiable by a flag that never reached the kernel --
+    // the nested-flag vacuity the wg and gateup arms defeat with an
+    // announcement line. This one line names the dispatch mode the kernel
+    // actually used, host-side and once per process, so the arm asserts the
+    // thing that changed rather than a constant.
+    //
+    // n_blocks is the per-device tile count, nMG * nT, where nMG = (M + R - 1)
+    // / R and nT = N_local / 16. R is the row block: 1 for the shipped
+    // quant_gemm_dpas48 path and 2 for E4's quant_gemm_dpas48_2d, so it is
+    // derived from the geometry the launch actually used rather than assumed.
+    {
+      const uint32_t R_path = use_tiled ? 2u : 1u;
+      const uint32_t nT_path = N_local / 16u;
+      const uint32_t nMG_path = (M + R_path - 1) / R_path;
+      const uint32_t n_blocks = nMG_path * nT_path;
+      const uint32_t nWG_path = (p.wg == 0) ? 16u : p.wg;
+      static bool announced_ts = false;
+      if (!announced_ts) {
+        announced_ts = true;
+        std::fprintf(stderr,
+                     "[tile-sched] INTFER_TILE_SCHED=%s n_blocks=%u nWG=%u "
+                     "(per-device SLM work-stealing claim queue)\n",
+                     (std::getenv("INTFER_TILE_SCHED") != nullptr) ? "on"
+                                                                  : "off",
+                     n_blocks, nWG_path);
+        std::fflush(stderr);
+      }
+    }
 #ifdef INTFER_PROFILE_GPU
     {
       auto t1 = std::chrono::high_resolution_clock::now();

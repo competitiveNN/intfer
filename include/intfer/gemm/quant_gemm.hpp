@@ -304,6 +304,35 @@ sycl::event quant_gemm_f16(sycl::queue& q,
                     sycl::half* c,        // M*N row-major
                     uint32_t M, uint32_t N, uint32_t K);
 
+// ---------------------------------------------------------------------------
+// 1.4 oneMKL SYCL BLAS fallback for large contiguous FP16 GEMM.
+//
+// Built ONLY when INTFER_ENABLE_MKL=ON and libmkl_sycl_blas is on the linker
+// path. When the library is absent this file compiles the empty-fallback
+// spellings below, so the engine links either way and the arm is
+// unreachable rather than wrong.
+//
+// THE NUMERICS CONTRACT, first, because it is the whole risk of linking a
+// BLAS. oneMKL's FP32 accumulation order is an internal implementation detail
+// of the mkl::blas kernel and is NOT the engine's row-major ascending-k
+// order. So a bit-exactness guarantee CANNOT be made for this arm, and none
+// is claimed. PLAN.md records why: "the repo has a measured matmul-precision
+// divergence history, so the contract comes first." The arm therefore runs
+// only on explicit opt-in (INTFER_ONEMKL=1), and any gate compares the token
+// stream against base under an AGREED TOLERANCE -- never bitwise.
+//
+// WHERE IT APPLIES: large-M contiguous FP16 only. On this box FP16 already
+// runs at 98-123% of the memory roofline on decode, so a BLAS call cannot pay
+// at M=1 -- it is a prefill/large-M item.
+// ---------------------------------------------------------------------------
+bool onemkl_available();
+
+sycl::event gemm_onemkl_fp16(sycl::queue& q, sycl::half* C,
+                            const sycl::half* A, const sycl::half* B,
+                            std::uint64_t M, std::uint64_t N,
+                            std::uint64_t K, float alpha, float beta,
+                            sycl::event dep);
+
 // FP16 x INT8 GEMM for the VRAM-resident lm_head (27B TP=2): dev0 cannot
 // hold the 1.27GB FP16 shard next to the preloaded engine (12647 > 12216
 // hard), so lm_head uploads as per-row symmetric INT8 (0.64GB/dev) +

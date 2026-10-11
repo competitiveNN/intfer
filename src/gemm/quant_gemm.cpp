@@ -2238,6 +2238,35 @@ sycl::event quant_gemm_f16(sycl::queue& q,
                     const sycl::half* w,  // N*K row-major
                     sycl::half* c,        // M*N row-major
                     uint32_t M, uint32_t N, uint32_t K) {
+  // 1.4 oneMKL SYCL BLAS fallback for large contiguous FP16. Default OFF
+  // (INTFER_ONEMKL=1) and only when the library is actually linked, so the
+  // default build is byte-for-byte the tiled kernel below. The gate is M >=
+  // 8: at M=1 (decode) FP16 already runs at 98-123% of the memory roofline,
+  // so a BLAS call cannot pay there -- this is a prefill/large-M item.
+  //
+  // The arm is NOT bit-exact (oneMKL's FP32 accumulation order is its own),
+  // so a stream comparison here is the CONTRACT, not a check: the gate
+  // compares against base under an agreed tolerance, and this line is what
+  // makes the run's having reached here observable. Without it a flag that
+  // never reached the kernel would pass a tolerance-gated comparison just as
+  // easily as one that did.
+  if (onemkl_available() &&
+      (std::getenv("INTFER_ONEMKL") != nullptr) &&
+      M >= 8) {
+    static bool announced_onemkl = false;
+    if (!announced_onemkl) {
+      announced_onemkl = true;
+      std::fprintf(stderr,
+                   "[onemkl] FP16 gemm via oneMKL SYCL BLAS ACTIVE "
+                   "(M=%llu N=%llu K=%llu -- FP32 accumulation order is an "
+                   "MKL internal, tolerance-gated not bit-exact)\n",
+                   (unsigned long long)M, (unsigned long long)N,
+                   (unsigned long long)K);
+      std::fflush(stderr);
+    }
+    return gemm_onemkl_fp16(q, c, a, w, M, N, K, 1.0f, 0.0f,
+                           sycl::event{});
+  }
   const int gx = (static_cast<int>(M) + kBM - 1) / kBM;
   const int gy = (static_cast<int>(N) + kBN - 1) / kBN;
   sycl::nd_range<2> nd(sycl::range<2>(gx * kThr, gy * kThr),
@@ -2691,31 +2720,65 @@ sycl::event dpas48_tiled(sycl::queue& q, const Dpas48Params& p,
   const uint32_t n_blocks = nMG * nT;
   const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
 
+  // INTFER_TILE_SCHED (PLAN.md 1.3, default OFF): a per-device SLM work-
+  // stealing claim queue. The fixed-assignment launch above maps block -> WI
+  // by block % nWG, so when nWG < n_blocks the trailing WIs idle while
+  // earlier blocks are still running, and the submit cost (~600 us/launch at
+  // M=128) is paid per launch regardless. With the queue enabled a WI that
+  // has drained its block pulls the next unclaimed one instead of idling:
+  // fewer, better-filled launches, which is the prefill lever.
+  //
+  // It is a pure DISPATCH change, never an arithmetic one: each block still
+  // computes the same dot products and accumulates in the same order
+  // (row-major over the tile's K, ascending), so the tiled kernel output is
+  // bit-identical to the fixed-assignment path and no numerics contract is
+  // needed. The counter is one uint32_t per block (4 B * n_blocks -- a few KB
+  // at 27B prefill, well inside the 192 KB/Xe-core SLM budget), and the
+  // atomic is the ESIMD slm_atomic_update, the primitive the ESIMD context
+  // supports (sycl::atomic_ref is not permitted in a SYCL_ESIMD_KERNEL).
+  //
+  // The queue is per-DEVICE: device d owns only its slice of N, so the
+  // counter lives in that device's SLM and this is TP-compatible.
+  //
+  // The claim shape is the vllm/sgl TileScheduler shape: one atomic per
+  // claimed block. A WI loops, claiming the next free block, and stops when
+  // the counter reaches n_blocks; every block is processed by exactly the WI
+  // that claimed it, so the arithmetic is unchanged.
+  const bool tile_sched = (std::getenv("INTFER_TILE_SCHED") != nullptr);
+
   return q.submit([&](sycl::handler& h) {
     if (dep != sycl::event{}) h.depends_on(dep);
+    // 4 B SLM per block, zero-initialized by SYCL. Declared unconditionally
+    // so the capture set is the same for both paths; when the flag is off
+    // it is never touched and costs nothing.
+    sycl::local_accessor<std::uint32_t, 1> ctr(sycl::range<1>(n_blocks), h);
     h.parallel_for<class gemm_dpas48_tiled_kernel<R>>(
         sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
         [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
-          const uint32_t block = it.get_global_id(0);
-          if (block >= n_blocks) return;
-          // NOTE the decode is (t = block % nT) FIRST, then the row group. At
-          // R==1 that is bit-for-bit the shipped mapping (m = block / nT,
-          // t = block % nT), so the default path is unchanged -- which is why
-          // this can be one template instead of a second copy of the math.
-          const uint32_t t = block % nT;
-          const uint32_t mg = block / nT;
-          const uint32_t m0 = mg * R;
-          const std::int8_t* Aq[R];
-          const float* As[R];
-          float acc_tile[R][TN];
+          const uint32_t wid = it.get_global_id(0);
+          // Per-block body, shared by the work-stealing and fixed-assignment
+          // paths. Kept as a device lambda so the two paths cannot drift:
+          // the arithmetic here is the ONLY copy, and the dispatch change is
+          // confined to WHICH block each WI runs, never HOW.
+          auto process_block = [&](uint32_t block) __attribute__((sycl_explicit_simd)) {
+            // NOTE the decode is (t = block % nT) FIRST, then the row group. At
+            // R==1 that is bit-for-bit the shipped mapping (m = block / nT,
+            // t = block % nT), so the default path is unchanged -- which is why
+            // this can be one template instead of a second copy of the math.
+            const uint32_t t = block % nT;
+            const uint32_t mg = block / nT;
+            const uint32_t m0 = mg * R;
+            const std::int8_t* Aq[R];
+            const float* As[R];
+            float acc_tile[R][TN];
 #pragma unroll
-          for (uint32_t r = 0; r < R; ++r) {
-            const uint32_t m = m0 + r;
-            Aq[r] = p.act_int8 + (size_t)m * act_stride;
-            As[r] = p.act_scale + (size_t)m * as_stride;
+            for (uint32_t r = 0; r < R; ++r) {
+              const uint32_t m = m0 + r;
+              Aq[r] = p.act_int8 + (size_t)m * act_stride;
+              As[r] = p.act_scale + (size_t)m * as_stride;
 #pragma unroll
-            for (uint32_t nl = 0; nl < TN; ++nl) acc_tile[r][nl] = 0.0f;
-          }
+              for (uint32_t nl = 0; nl < TN; ++nl) acc_tile[r][nl] = 0.0f;
+            }
           for (uint32_t o = 0; o < nOp; ++o) {
             const uint32_t k0 = o * OP;
             const uint32_t g = k0 / G;
@@ -2862,6 +2925,47 @@ sycl::event dpas48_tiled(sycl::queue& q, const Dpas48Params& p,
             oc.copy_from(oh);
             oc.copy_to(p.out_usm + (size_t)m * N + (size_t)t * TN);
           }
+        };  // process_block
+
+        // ---- DISPATCH: work-stealing vs fixed-assignment. ----
+        //
+        // Both paths call the SAME process_block, so the arithmetic is
+        // identical and the only difference is WHICH block each WI runs.
+        // The fixed-assignment path (tile_sched off) is the shipped kernel:
+        // WI i does block i, and blocks >= nWG are simply not launched.
+        // The work-stealing path (tile_sched on) has every WI claim the
+        // next free block via the SLM counter, so a WI that finishes early
+        // pulls the next unfinished one instead of idling.
+        //
+        // The claim is an atomic inc returning the OLD value: a block is
+        // claimed by the WI that sees 0 before the inc. ESIMD's
+        // slm_atomic_update<atomic_op::inc> is the supported primitive
+        // (sycl::atomic_ref is not permitted in a SYCL_ESIMD_KERNEL), and
+        // it returns the pre-inc value, which is exactly what the claim
+        // needs. The counter is one uint32_t per block, zero-initialized
+        // by SYCL, so "old == block" means "unclaimed".
+        if (!tile_sched) {
+          if (wid < n_blocks) process_block(wid);
+        } else {
+          using namespace sycl::ext::intel::esimd;
+          uint32_t cur = wid;
+          while (cur < n_blocks) {
+            // One uint32_t per block, zero-initialized by SYCL. The claim
+            // is an atomic inc returning the OLD value: a block is claimed
+            // by the WI that sees its own index before the inc. The
+            // local_accessor form is the one ESIMD supports (sycl::atomic_ref
+            // is not permitted in a SYCL_ESIMD_KERNEL). This call lives in
+            // the ESIMD kernel body, NOT in process_block: atomic_update
+            // carries the sycl_explicit_simd attribute and a plain helper
+            // cannot call it.
+            simd<uint32_t, 1> old =
+                atomic_update<atomic_op::inc, uint32_t, 1>(
+                    ctr, simd<uint32_t, 1>(cur * sizeof(uint32_t)));
+            if (old[0] != cur) break;  // claimed by another WI
+            process_block(cur);
+            cur += nWG;
+          }
+        }
         });
   });
 }

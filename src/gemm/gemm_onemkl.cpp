@@ -2,25 +2,23 @@
 //
 // 1.4 oneMKL `gemm` fallback for large contiguous FP16 GEMMs.
 //
-// Built ONLY when CMake found libmkl_sycl_blas (INTFER_ENABLE_MKL=ON, default
-// ON when the library is present). When the library is absent this file is
-// not compiled at all and intfer_gemm exports the empty-fallback versions of
-// gemm::onemkl_available() / gemm::gemm_onemkl_fp16() declared in
-// quant_gemm.hpp, so the engine links either way.
+// Built ALWAYS. Under #ifdef INTFER_ENABLE_MKL it carries the real oneMKL
+// SYCL BLAS body; under #else it carries the empty-fallback spellings of
+// onemkl_available() / gemm_onemkl_fp16(), so the engine links either way and
+// the arm is unreachable rather than wrong when the library is absent.
 //
 // THE NUMERICS CONTRACT, first, because it is the whole risk of linking a
 // BLAS. oneMKL's FP32 accumulation order is an internal implementation detail
 // of the mkl::blas kernel and is NOT the engine's row-major ascending-k
 // order. So a bit-exactness guarantee CANNOT be made for this arm, and none
-// is claimed. PLAN §3 records why: "the repo has a measured matmul-precision
+// is claimed. PLAN.md records why: "the repo has a measured matmul-precision
 // divergence history, so the contract comes first." The arm therefore runs
-// only on explicit opt-in (INTFER_ONEMKL=1), and the gate compares the token
+// only on explicit opt-in (INTFER_ONEMKL=1), and any gate compares the token
 // stream against base under an AGREED TOLERANCE -- never bitwise.
 //
 // WHERE IT APPLIES: large-M contiguous FP16 only. On this box FP16 already
 // runs at 98-123% of the memory roofline on decode, so a BLAS call cannot pay
-// at M=1 -- it is a prefill/large-M item. The engine gates on M >= 8 and a
-// contiguous FP16 (non-quantized, non-sharded-split) tensor.
+// at M=1 -- it is a prefill/large-M item. quant_gemm_f16 gates on M >= 8.
 
 #include "intfer/gemm/quant_gemm.hpp"
 
@@ -64,7 +62,7 @@ sycl::event gemm_onemkl_fp16(sycl::queue& q, sycl::half* C,
   // *** THE PATH ANNOUNCES ITSELF, ONCE. *** This arm is NOT bit-exact by
   // construction, so a stream comparison is not just a vacuity risk -- it is
   // the CONTRACT itself, and it needs the run to have actually reached here
-  // for the comparison to mean anything. Prints the shape, and the tolerance
+  // for the comparison to mean anything. Prints the shape; the tolerance
   // status is stated in the gate, not on this line.
   static bool announced_onemkl = false;
   if (!announced_onemkl) {
@@ -91,7 +89,8 @@ sycl::event gemm_onemkl_fp16(sycl::queue& q, sycl::half* C,
 // Empty fallbacks so intfer_gemm links and the engine's onemkl_available()
 // query returns false without any #ifdef at the call site. The engine then
 // never calls gemm_onemkl_fp16(), so the tolerance-gated arm is unreachable
-// rather than wrong.
+// rather than wrong. quant_gemm_f16's own gate (onemkl_available() && M >= 8)
+// is the dispatch point; this file is what makes that predicate real.
 namespace intfer::gemm {
 
 bool onemkl_available() { return false; }

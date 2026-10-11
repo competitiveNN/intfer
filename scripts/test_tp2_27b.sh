@@ -1213,6 +1213,85 @@ fi
     rm -rf "$E4SB2"
   fi
 
+  # --- INTFER_TILE_SCHED certification (PLAN.md 1.3, prefill lever) ----------
+  # The prefill tiled DPAS kernel can run its n_blocks tiles from a
+  # per-device SLM work-stealing claim queue instead of the fixed
+  # block%WG assignment. It is a pure DISPATCH change (each tile computes
+  # the same dot products in the same order), so the token stream is
+  # bit-identical to the base run and a stream comparison is satisfiable by
+  # a flag that never reached the kernel -- the nested-flag vacuity the wg,
+  # gateup and E4 arms defeat with an announcement line. The subject is the
+  # DISPATCH MODE, and the engine announces it once per process as
+  # [tile-sched] INTFER_TILE_SCHED=on|off n_blocks=... nWG=... (per-device SLM
+  # work-stealing claim queue). The arm asserts the run hit the oracle AND
+  # the announcement names the stealing queue, and the self-check exercises
+  # that predicate in both directions (a real "on" vs one rewritten to "off",
+  # which is the exact shape of "the flag did not reach the kernel").
+  TS_OUT="$LOG.ts.out"; TS_ERR="$LOG.ts.err"
+  env INTFER_DPAS48=1 INTFER_TILE_SCHED=1 \
+  "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$TS_OUT" 2>"$TS_ERR"; TS_RC=$?
+  if [ "$TS_RC" -ne 0 ]; then
+  echo "GATE FAIL: INTFER_DPAS48=1 INTFER_TILE_SCHED=1 run exited rc=$TS_RC" >&2
+  tail -20 "$TS_ERR" >&2
+  PASS=0
+  else
+  echo "TILE-SCHED prefill: $(cli_prefill "$TS_ERR") (expect 11751)"
+  TS_LINE="$(grep -a "\[tile-sched\]" "$TS_ERR" | head -1)"
+  if [ -z "$TS_LINE" ]; then
+    echo "GATE FAIL: the tile-sched path never announced itself" >&2
+    echo "         (no [tile-sched] line); the flag did not reach the" >&2
+    echo "         kernel and this arm is vacuous." >&2
+    PASS=0
+  else
+    echo "TILE-SCHED layout: $TS_LINE"
+  fi
+  # The dispatch mode the operator asked for, as the announcement must print it.
+  TS_EXPECT_ANN="INTFER_TILE_SCHED=on"
+  echo "$TS_LINE" | grep -aq "$TS_EXPECT_ANN" \
+    || { echo "GATE FAIL: the announcement does not name the work-stealing" >&2
+         echo "         queue wanted '$TS_EXPECT_ANN', got '$TS_LINE'" >&2; PASS=0; }
+  mr_prefill_ok "$(cli_prefill "$TS_ERR")" \
+    || { echo "GATE FAIL: tile-sched prefill != 11751" >&2; PASS=0; }
+  TS_GOT="$(cli_ids "$TS_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  TS_BASE="$(cli_ids "$CLI_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+  [ "$TS_GOT" = "$TS_BASE" ] \
+    || { echo "GATE FAIL: tile-sched ids '$TS_GOT' != base '$TS_BASE'" >&2; PASS=0; }
+  # *** SELF-CHECK FOR THIS ARM. *** Same shape as the wg and E4 arms: the
+  # dispatch-mode field is the ONLY thing standing between a run where the
+  # flag was ignored (the fixed block%WG path ran, stream still matched) and
+  # a PASS. Built by rewriting the real announcement's mode to "off" -- the
+  # exact shape of "the flag did not reach the kernel". That fixture carries
+  # a real INTFER_TILE_SCHED= string, so the predicate can actually fire.
+  TSSB2="$(mktemp -d)"
+  TS_ANN_FULL="INTFER_TILE_SCHED=on"
+  # (a) healthy: the real run's own announcement must exist and name the
+  # work-stealing queue.
+  [ -n "$TS_LINE" ] || { echo "GATE FAIL: self-check (a) healthy fixture has no [tile-sched] line" >&2; PASS=0; }
+  echo "$TS_LINE" | grep -aq "$TS_ANN_FULL" \
+    || { echo "GATE FAIL: self-check (a) the announcement does not name the work-stealing queue" >&2; PASS=0; }
+  # (b) refusal: a log where the flag was IGNORED (the fixed-assignment path
+  # ran, stream still matched) must be refused. Built by rewriting the real
+  # announcement's mode to off.
+  TS_NOT_ERR="$TSSB2/ts_not.err"
+  sed 's/INTFER_TILE_SCHED=on/INTFER_TILE_SCHED=off/' "$TS_ERR" >"$TS_NOT_ERR"
+  if ! grep -aq "\[tile-sched\]" "$TS_NOT_ERR"; then
+    echo "GATE FAIL: self-check (b) the fixture builder removed the announcement" >&2; PASS=0
+  fi
+  TS_NOT_LINE="$(grep -a "\[tile-sched\]" "$TS_NOT_ERR" | head -1)"
+  if [ -n "$TS_NOT_LINE" ] && echo "$TS_NOT_LINE" | grep -aq "INTFER_TILE_SCHED=off"; then
+    echo "GATE FAIL: self-check (b) the arm ACCEPTED a run whose scheduler never fired" >&2; PASS=0
+  fi
+  # (c) vacuity: an empty log must fail the predicate.
+  TS_EMPTY_ERR="$TSSB2/ts_empty.err"
+  : >"$TS_EMPTY_ERR"
+  TS_EMPTY_LINE="$(grep -a "\[tile-sched\]" "$TS_EMPTY_ERR" | head -1)"
+  if [ -n "$TS_EMPTY_LINE" ]; then
+    echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log (vacuity)" >&2; PASS=0
+  fi
+  rm -rf "$TSSB2"
+  fi
+
   # --- INTFER_WAVE_LAUNCH_FUSE certification (prefill lever) ---------------
     # The wave is the prefill hot path: a layer's independent GEMMs (q/k/v
     # wave-3, z/b/a wave-4, gate/up wave-2) currently run as N separate
