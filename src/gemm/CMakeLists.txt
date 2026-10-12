@@ -50,7 +50,56 @@ add_library(intfer_onemkl STATIC ${CMAKE_CURRENT_SOURCE_DIR}/gemm_onemkl.cpp)
 target_include_directories(intfer_onemkl PUBLIC ${CMAKE_SOURCE_DIR}/include)
 if(INTFER_ENABLE_MKL)
   target_compile_definitions(intfer_onemkl PUBLIC INTFER_ENABLE_MKL=1)
-  target_link_libraries(intfer_onemkl PUBLIC ${MKL_SYCL_BLAS})
+
+  # *** DISCOVER THE MKL COMPONENT LIBS FROM THE WRAPPER'S OWN DIRECTORY. ***
+  # libmkl_sycl_blas.so is a SYCL wrapper: it calls into the BLAS, core and
+  # threading components and its own NEEDED chain is only libsycl + libdl, so
+  # linking the wrapper ALONE leaves those component symbols unresolved. Measured
+  # 2026-10-12 on this box: intfer_gemm (a static lib) built clean with the
+  # wrapper linked in isolation -- a .a needs no undefined symbols -- and the
+  # failure only surfaced at the final intfer_cli link, 272 undefined references
+  # (cblas_sgemm_64, mkl_serv_lock, ...), none of them the
+  # oneapi::mkl::blas::column_major::gemm that the wrapper DEFINES. The working
+  # probe linked -lmkl_gnu_thread -lmkl_intel_lp64 -lmkl_core by hand; derive
+  # the same set here from the wrapper's own path so no install prefix and no
+  # per-box -DCMAKE_EXE_LINKER_FLAGS has to be typed.
+  get_filename_component(_MKL_LIB_DIR "${MKL_SYCL_BLAS}" REALPATH)
+  get_filename_component(_MKL_LIB_DIR "${_MKL_LIB_DIR}" DIRECTORY)
+  foreach(_MKL_COMP IN ITEMS sycl_blas intel_lp64 core gnu_thread)
+    find_library(_MKL_${_MKL_COMP}_LIB NAMES mkl_${_MKL_COMP}
+      PATHS "${_MKL_LIB_DIR}" NO_DEFAULT_PATH)
+    if(_MKL_${_MKL_COMP}_LIB)
+      list(APPEND _MKL_LINK_LIBS "${_MKL_${_MKL_COMP}_LIB}")
+    else()
+      message(WARNING
+        "oneMKL component libmkl_${_MKL_COMP}.so not found in "
+        "${_MKL_LIB_DIR}; the INTFER_ENABLE_MKL link will be incomplete.")
+    endif()
+  endforeach()
+  target_link_libraries(intfer_onemkl PUBLIC ${_MKL_LINK_LIBS})
+
+  # *** DERIVE THE MKL HEADER DIR FROM THE LIBRARY, DO NOT GUESS IT. ***
+  # gemm_onemkl.cpp's real body #includes <oneapi/mkl/blas.hpp>, which lives
+  # under the oneMKL INSTALL PREFIX (e.g. .../mkl/latest/include), and that
+  # prefix is NOT discoverable from find_library: the .so is found via
+  # CMAKE_PREFIX_PATH but the include dir is not propagated by that call.
+  # Probed 2026-10-12 on this box: a -DINTFER_ENABLE_MKL=ON configure with
+  # -DCMAKE_PREFIX_PATH=/opt/intel/oneapi/mkl/latest found libmkl_sycl_blas
+  # and turned the #ifdef on, and then the TU failed to compile because
+  # <oneapi/mkl/blas.hpp> was not on any include path -- the arm was wired,
+  # the option was ON, and the code still could not build. Deriving the
+  # prefix from the library's own path (dirname of the .so -> ../include)
+  # makes the build work wherever the toolkit lays the .so down, with no
+  # per-box -DCMAKE_CXX_FLAGS hand-edit.
+  get_filename_component(_MKL_PREFIX "${_MKL_LIB_DIR}" DIRECTORY)
+  if(EXISTS "${_MKL_PREFIX}/include/oneapi/mkl/blas.hpp")
+    target_include_directories(intfer_onemkl PUBLIC "${_MKL_PREFIX}/include")
+  else()
+    message(WARNING
+      "libmkl_sycl_blas found at ${MKL_SYCL_BLAS} but no oneMKL headers "
+      "under ${_MKL_PREFIX}/include -- the INTFER_ENABLE_MKL body will not "
+      "compile. Point the oneMKL install at this box's prefix.")
+  endif()
 endif()
 add_sycl_to_target(TARGET intfer_onemkl SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/gemm_onemkl.cpp)
 

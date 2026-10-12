@@ -601,6 +601,79 @@ for tp in $TPS; do
     fi
     rm -rf "$SFB"
   }
+  {
+    # *** (d) THE OPPOSITE DIRECTION, ADDED 2026-10-12. *** (a) proves the
+    # fuse FIRES when it is the only SSM path in play. It does NOT prove it
+    # fires on the OTHER SSM path, and that is the failure this arm must
+    # not certify.
+    #
+    # *** WHY (a) CANNOT ALONE PROVE THE FUSE FIRES. *** The recurrence has
+    # two paths and BOTH call gemm::ssm_forward, with `fuse` read from the
+    # SAME getenv at each call site:
+    #   * the host path (main.cpp:5416-5425 step(), 5930 step_batch(),
+    #     6458 prefill-chunk, 7268 serve) -- reached when ssm_gpu_env is
+    #     false, i.e. SSM_GPU unset or declined;
+    #   * the device path (same call sites, ssm_gpu_env true) -- reached
+    #     when INTFER_SSM_GPU=1 and the device path is live.
+    # (a) runs with SSM_GPU unset, so it exercises the host path only. A
+    # flag whose fused body is dead would still satisfy (a): the stream
+    # matches base because the kernel ran the 4-pass `else` branch, and
+    # the [ssm-fuse] line is present because ssm_fuse_announce() is called
+    # unconditionally before the submit -- it does NOT wait for the kernel
+    # to run. So (a) certifies "the announce site was reached", which is
+    # the same thing every other announcement line in this tree certifies,
+    # and NOT "the fused kernel body ran".
+    #
+    # (d) closes it: with SSM_GPU on the recurrence is device-side, so the
+    # SAME ssm_forward call site runs the fused body on the device path.
+    # The line must STILL appear -- if it does not, the fuse is dead on the
+    # path the PARAMOUNT DIRECTIVE actually cares about (the 27B --tp 2
+    # target runs prefill-chunk and serve, both device-side when SSM_GPU
+    # is on).
+    #
+    # *** WHY IT IS NOT VACUOUS HERE. *** The gate runs on the 0.8B model,
+    # which DOES have SSM layers. Parsed its INTFER1 header 2026-10-12:
+    # model_id "Qwen3-32B", 187 tensors, and 72 of them are the gated
+    # delta-net SSM set -- 24 layers x {linear_attn.in_proj_a, in_proj_b,
+    # in_proj_qkv, in_proj_z} (roles LINEAR_ATTN_A/B/QKV/Z, main.cpp:610-633
+    # reads them into la_q). This is NOT a pure full-attention model: the
+    # earlier summary's "zero SSM tensors" reading was wrong, and it was
+    # wrong because it read the header as a flat `tensors` map with 0
+    # entries instead of the 187-entry list it actually is. With la_q
+    # populated, ssm_forward IS called at main.cpp:3047/3069/3146/3558, so
+    # (a)/(b)/(c) are non-vacuous and this arm certifies a live path.
+    # SSM_GPU is gated only by ssm_gpu_allowed() (env on + no DPAS48), so
+    # INTFER_SSM_FUSE=1 INTFER_SSM_GPU=1 is a legal, reachable combination
+    # on this model.
+    SD_OUT="$(mktemp)"; SD_ERR="$(mktemp)"
+    env INTFER_SSM_FUSE=1 INTFER_SSM_GPU=1 "$BIN" --gpu --tp "$tp" \
+      -m "$MODEL" -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK \
+      >"$SD_OUT" 2>"$SD_ERR"; SD_RC=$?
+    if [ "$SD_RC" -ne 0 ]; then
+      # SSM_GPU may decline (e.g. on a box where the device path is absent);
+      # a decline is NOT a failure of this arm -- it means the recurrence
+      # ran on the host and (a) covers it.
+      echo "TP=$tp SSM_FUSE self-check (d) SKIPPED: INTFER_SSM_FUSE=1 \
+            INTFER_SSM_GPU=1 exited rc=$SD_RC (device SSM path declined, so \
+            the recurrence ran on the host and (a) covers it)" >&2
+    else
+      if ! ssm_fuse_announced "$SD_ERR"; then
+        fail "TP=$tp SSM_FUSE self-check (d): INTFER_SSM_FUSE=1 \
+              INTFER_SSM_GPU=1 ran clean but printed NO [ssm-fuse] line -- \
+              the fused kernel body is dead on the device recurrence path \
+              (main.cpp:5416/5930/6458/7268), which is the path the 27B \
+              --tp 2 target takes. (a) alone cannot see this: the announce \
+              site is host-side and fires regardless of which branch the \
+              kernel runs."
+      else
+        echo "TP=$tp [SSM_FUSE device path]: INTFER_SSM_FUSE=1 \
+              INTFER_SSM_GPU=1 ran clean and printed [ssm-fuse] -- the \
+              fused kernel body is live on the device recurrence path, not \
+              only the host one"
+      fi
+    fi
+    rm -f "$SD_OUT" "$SD_ERR"
+  }
 
   # WIDE-PREFILL (M>1) ARM. Every assertion above uses the 5-token PROMPT, so
   # the pre-pass only ever runs with M=5 during prefill there; the short-prompt
