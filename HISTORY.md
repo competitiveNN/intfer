@@ -744,6 +744,35 @@ rc=1  verdict=FAIL  failed=3  stale=24  unproven=2  quick=1
   `scripts/run_ten_gates.sh`, and AGENTS.md standing rule 1 forbids an agent
   session from that (tens of minutes of model loads). **Operator only.**
 
+*** [SUPERSEDED 2026-10-12 — the paragraph below is a record of the 1-GPU era and
+of the `ad71739` measurement. It is kept in full, not rewritten. What happened
+afterwards, in order:**
+
+* **2026-10-04 the box came back to 2 GPUs** (HOST-SIDE driver enumeration; the
+  AGENTS.md box-state section records that this has happened four times with no
+  repo change). The 1-GPU investigation below is therefore a record of ONE of
+  those windows, exactly as AGENTS.md says.
+* **2026-10-08 the root cause was found and fixed (`f0192ea`):** the fused
+  gate+up kernel dispatched the FULL `Ng+Nu` output on every TP device and
+  indexed the code/scale shard with the GLOBAL row, so rank 1 read rows
+  0..Ng-1 of a buffer holding 4352 — the wrong answer, not a bounds error.
+  `gateup_equiv`'s isolation harness proved it: SLICED (sliced shard) crashes,
+  SLICED-OUTONLY (full shard, sliced out buffers) passes, 30/30 datasets PASS.
+* **2026-10-12 `run_all5` measured the healthy column GREEN for the first time
+  on this box.** `build/device_precond_matrix/test_tp2_27b.healthy.log` records
+  `[mlp-gateup] fused gate+up GEMM ACTIVE (Ng=17408 Nu=17408 K=5120 group=16
+  scheme=3, one launch for both)`, prefill 5 tokens in 4583.8 ms, decode 5
+  tokens in 1449.7 ms (3.45 tok/s), stdout `The capital of France is!!!!`.
+  **So the token-0 / `isrowned_x财神` symptom below was a CODE FAULT, not a
+  box-state fault, and the "rebind" remedy it points at was never needed.**
+  `check_device_precond.sh` is now **ok** in the full stack (run_all5:
+  `gate_inventory.sh` ok, `check_device_precond.sh` ok, 1 FAIL =
+  `mutate_device_precond.sh` M-C, 2 UNPROVEN operator-deferred).
+
+The `IF device_precond STILL FAILS AFTER A CLEAN REBIND` line below was
+recorded before any of this existed, so it is not acted on; it stays as the
+record of the branch that was, at the time, the correct next step. ***
+
 ### The box attribution: PLAUSIBLE, AND ONE PIECE OF IT HAS NOW FALLEN AWAY
 
 `check_e2_ctx.sh` was FAIL at `a0e3399` and is **ok** at `ad71739`, with **no
