@@ -530,6 +530,14 @@ dispatch() { # $1 = label -> runs it
       # corpus, which is what makes HW-1's catch attributable. Runs entirely
       # against copies under build/ -- the tracked tree is never edited.
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_hw_constants.sh"; return $? ;;
+    mutate_dpas_shape_audit.sh)
+      # DS-1/DS-3 plant synthetic .intifer models (the artifact under test is the
+      # model's tensor table, so the checker must REJECT a defective one -- AGENTS
+      # rule 11); DS-2 is the re-derived predicate drifting off _dpas_pred.sh
+      # (the rule-4 "remembered constant" in one line); DS-4 inverts the checker's
+      # own violation test. Runs entirely against copies under build/ -- the
+      # tracked tree is never edited, and the residue assertion re-proves it.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_dpas_shape_audit.sh"; return $? ;;
     mutate_dispatch_steps_consistency.sh)
       # DS-1 re-arms the bug that shipped: a dispatch arm whose path becomes a
       # filename containing a space. Valid shell, rc=127 at runtime.
@@ -886,7 +894,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------

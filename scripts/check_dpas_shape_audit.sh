@@ -112,9 +112,9 @@ fi
 # captured into $TMP/enum.out and parsed for the verdict (AGENTS rule 4:
 # the numbers are derived, never retyped). The predicate re-derivation is
 # folded into the same block so PREDICATE_DRIFT is measured in the same run.
-python3 - "$MODEL" "$NDEV" "$ROOT" > "$TMP/enum.out" <<'PYEOF'
+python3 - "$MODEL" "$NDEV" "$ROOT" "$TMP" > "$TMP/enum.out" <<'PYEOF'
 import json, os, sys
-model, ndev, root = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+model, ndev, root, tmp = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 
 with open(model, "rb") as f:
     hdr = f.read(1 << 22)
@@ -177,9 +177,17 @@ print("SHARDS_CHECKED=%d" % checked_shard)
 print("SHARD_VIOLATIONS=%d" % viol_shard)
 
 # --- the predicate this audit certifies, re-derived here and compared ---
+# The comparison is EXTERNAL: we ask scripts/_dpas_pred.sh -- the single home
+# of the predicate the engine consults (AGENTS rule 4) -- to judge each shard,
+# and compare its rc against this audit's own re-derivation. A previous
+# revision defined a local dpas_eligible() and compared it against itself, so
+# PREDICATE_DRIFT was structurally 0 and the "predicate re-derived" half of
+# the verdict certified nothing. That was caught by DS-2 in the mutation
+# matrix, not by reading the code.
+pred = os.path.join(root, "scripts", "_dpas_pred.sh")
 pred_bad = 0
 TN, OP = 16, 32
-def dpas_eligible(scheme, gs, Nl, K):
+def want_eligible(scheme, gs, Nl, K):
     bits = {"INT2": 2, "INT4": 4, "INT8": 8}.get(scheme, 16)
     if bits == 16:
         return 1
@@ -190,6 +198,7 @@ def dpas_eligible(scheme, gs, Nl, K):
     if Nl % TN or K % OP:
         return 1
     return 0
+cases = []
 for e in tensors:
     scheme = e["qcfg"]["scheme"]; gs = e["qcfg"]["group_size"]
     bits = {"INT2": 2, "INT4": 4, "INT8": 8}.get(scheme, 16)
@@ -203,12 +212,33 @@ for e in tensors:
         Nl = end - start
         if Nl == 0:
             continue
-        want = 0 if (combo and Nl % TN == 0 and e["K"] % OP == 0) else 1
-        got = dpas_eligible(scheme, gs, Nl, e["K"])
-        if want != got:
-            pred_bad += 1
-            print("  PRED-DRIFT name=%s scheme=%s rank=%d Nl=%d K=%d want=%d got=%d"
-                  % (e["name"], scheme, r, Nl, e["K"], want, got))
+        cases.append((e["name"], scheme, gs, Nl, e["K"],
+                      want_eligible(scheme, gs, Nl, e["K"])))
+probe = os.path.join(tmp, "pred_probe.sh")
+with open(probe, "w") as f:
+    # _dpas_pred.sh sets `set -u` and dpas_eligible() RETURNS its verdict, so
+    # each call must capture $? and print it. A previous version wrote the
+    # calls and nothing else: the predicate ran, returned, and the probe
+    # emitted 0 lines, so the comparison asserted "0 lines for N cases" and
+    # the DRIFT detector could never fire (DS-2).
+    f.write("#!/usr/bin/env bash\n")
+    f.write('source "%s"\n' % pred)
+    for (name, scheme, gs, Nl, K, want) in cases:
+        f.write('dpas_eligible "%s" "%s" "%d" "%d"; echo "$?"\n'
+                % (scheme, gs, Nl, K))
+import subprocess
+# Invoked via `bash`, not executed: the probe sources scripts/_dpas_pred.sh
+# and its shebang is irrelevant, so it works under any uid and does not need
+# an executable bit.
+out = subprocess.run(["bash", probe], capture_output=True, text=True).stdout.splitlines()
+assert len(out) == len(cases), \
+    "predicate probe returned %d lines for %d cases" % (len(out), len(cases))
+for (name, scheme, gs, Nl, K, want), line in zip(cases, out):
+    got = int(line.strip())
+    if want != got:
+        pred_bad += 1
+        print("  PRED-DRIFT name=%s scheme=%s rank Nl=%d K=%d want=%d got=%d"
+              % (name, scheme, Nl, K, want, got))
 print("PREDICATE_DRIFT=%d" % pred_bad)
 PYEOF
 
@@ -223,6 +253,7 @@ MODEL_NAME="$(get_enum MODEL_NAME)"
 TENSORS="$(get_enum TENSORS)"
 CF="$(get_enum FULL_TENSORS_CHECKED)"; VF="$(get_enum FULL_VIOLATIONS)"
 CS="$(get_enum SHARDS_CHECKED)"; VS="$(get_enum SHARD_VIOLATIONS)"
+PD="$(get_enum PREDICATE_DRIFT)"
 
 # --- anti-vacuity: the audit must have harvested a population ------------------
 if [ "${CF:-0}" -eq 0 ]; then
@@ -240,6 +271,21 @@ fi
 echo
 echo "  ..    $MODEL_NAME: ${TENSORS:-?} tensors, $CF INT2/INT4/INT8 full tensors,"
 echo "        $CS shards at TP=$NDEV"
+# The predicate half runs BEFORE the shape half. A previous revision put it
+# last, so a model with a shape violation exited on the shape verdict and the
+# drift detector was never exercised -- which is exactly how DS-2 came back
+# "MISSED (wrong reason; rc=1)" against a checker that could not fail on
+# drift at all. The two halves are independent claims and each must be able
+# to fail the run on its own.
+if [ "${PD:-0}" -ne 0 ]; then
+  echo "  FAIL  $PD shard(s) where the re-derived predicate disagrees with"
+  echo "        scripts/_dpas_pred.sh -- the two copies of the guard are not the"
+  echo "        same predicate (AGENTS rule 4: one home, not two)."
+  exit 1
+fi
+echo "  ok    the predicate this audit re-derives is byte-for-byte the one the"
+echo "        engine consults, so a green shape verdict certifies the guard"
+echo "        itself and not merely the model."
 if [ "$VF" -eq 0 ] && [ "$VS" -eq 0 ]; then
   echo "  ok    every DPAS-eligible tensor AND every TP=$NDEV shard satisfies"
   echo "        N%16==0, K%32==0 and the (bits, group) combo, so the engine's"
@@ -250,7 +296,7 @@ else
   exit 1
 fi
 echo
-if [ "$self_bad" -eq 0 ] && [ "$VF" -eq 0 ] && [ "$VS" -eq 0 ]; then
+if [ "$self_bad" -eq 0 ] && [ "$VF" -eq 0 ] && [ "$VS" -eq 0 ] && [ "${PD:-0}" -eq 0 ]; then
   echo "DPAS SHAPE: PASS (model enumerated, predicate re-derived, 0 violations)"
   echo "RESULT: no tensor or TP=$NDEV shard in $MODEL_NAME reaches a shape the"
   echo "        ESIMD DPAS kernels cannot lower, so the engine's own guard is"
@@ -258,5 +304,5 @@ if [ "$self_bad" -eq 0 ] && [ "$VF" -eq 0 ] && [ "$VS" -eq 0 ]; then
   echo "        XMX launch -- and it is reachable only for safe shapes."
   exit 0
 fi
-echo "DPAS SHAPE: FAIL ($self_bad self-check, $VF full, $VS shard)"
+echo "DPAS SHAPE: FAIL ($self_bad self-check, $VF full, $VS shard, $PD drift)"
 exit 1
