@@ -113,22 +113,6 @@ need() { grep -qE "$1" "$LOG" || {
           echo "      A missing arm is not a neutral result: it means the run did" >&2
           echo "      not measure what the gate claims to measure." >&2
           exit 1; }; }
-# *** MATRIX-MODE EXCLUSION. *** The arm-presence family and the probe's own
-# RESULT: PASS are graded against REAL probe runs by the bisect matrices
-# (mutate_roofline_bisect{,1,3}.sh, which mutate the probe source and require
-# the gate to notice a missing arm). This gate's own mutation matrix
-# (mutate_roofline_probe.sh) feeds SYNTHETIC logs, so running them here would
-# grade assertions against fabricated data -- a vacuous green of exactly the
-# kind this repo exists to prevent. INTFER_PROBE_SKIP_ARMS=1 is set ONLY by
-# that matrix, for the pass-state (B2) only, and it exits BEFORE need_ceiling
-# too, because need_ceiling reads a value the matrix chose.
-if [ -n "${INTFER_PROBE_SKIP_ARMS:-}" ]; then
-  echo "NOTE: INTFER_PROBE_SKIP_ARMS=1 -- the arm-presence assertions and the"
-  echo "      probe's own RESULT: PASS are NOT graded here. They are certified"
-  echo "      by mutate_roofline_bisect{,1,3}.sh against real probe runs."
-  echo "ROOFLINE-PROBE TEST: PASS (matrix mode: RC check + need_ceiling only)"
-  exit 0
-fi
 # *** VALUE-AWARE, not name-aware. *** MEASURED 2026-10-07: on this box every arm
 # prints `0.000 ms  inf GB/s` and the gate passed it, because `need 'stream/shared'`
 # matches the NAME on a line that measured nothing. The ceiling arm's median is
@@ -136,6 +120,17 @@ fi
 # is ever weakened. A real ceiling on this card is ~0.120 ms (52.43 MB / 436.8
 # GB/s, same allocator, same access pattern); the floor is a tenth of that, so a
 # profiling zero cannot satisfy it while a real run can.
+#
+# *** ORDERED BEFORE THE MATRIX-MODE SKIP, ON PURPOSE. *** MEASURED 2026-10-12:
+# the matrix's B1 state (RC=0, ceiling still 0.000 ms) PASSED this gate, because
+# the RC check passed and the SKIP_ARMS short-circuit below then exited 0
+# BEFORE need_ceiling ran -- so the one predicate the matrix exists to prove
+# load-bearing (a zero ceiling must fail even with a clean exit code) was
+# bypassed by the very exemption meant to let the matrix's PASS state through.
+# need_ceiling reads its value from the LOG, so it works identically in matrix
+# mode and real mode; nothing about it is fabricated. The skip now exempts only
+# the arm-presence assertions and the probe's own RESULT: PASS, which is what
+# the header says it exempts.
 need_ceiling() {
   local v
   # ANCHORED ON THE PROBE'S OWN PREFIX. `stream/shared` is a substring of
@@ -154,6 +149,22 @@ need_ceiling() {
   fi
 }
 need_ceiling
+# *** MATRIX-MODE EXCLUSION. *** The arm-presence family and the probe's own
+# RESULT: PASS are graded against REAL probe runs by the bisect matrices
+# (mutate_roofline_bisect{,1,3}.sh, which mutate the probe source and require
+# the gate to notice a missing arm). This gate's own mutation matrix
+# (mutate_roofline_probe.sh) feeds SYNTHETIC logs, so running them here would
+# grade assertions against fabricated data -- a vacuous green of exactly the
+# kind this repo exists to prevent. INTFER_PROBE_SKIP_ARMS=1 is set ONLY by
+# that matrix, for the pass-state (B2) only, and it exits AFTER need_ceiling
+# (above), because need_ceiling reads a value the matrix chose.
+if [ -n "${INTFER_PROBE_SKIP_ARMS:-}" ]; then
+  echo "NOTE: INTFER_PROBE_SKIP_ARMS=1 -- the arm-presence assertions and the"
+  echo "      probe's own RESULT: PASS are NOT graded here. They are certified"
+  echo "      by mutate_roofline_bisect{,1,3}.sh against real probe runs."
+  echo "ROOFLINE-PROBE TEST: PASS (matrix mode: RC check + need_ceiling only)"
+  exit 0
+fi
 
 need 'stream/shared'        "the malloc_shared ceiling arm"
 need 'stream/device'        "the malloc_device ceiling arm (E3.1's discriminator)"

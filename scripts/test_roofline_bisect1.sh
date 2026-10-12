@@ -88,7 +88,24 @@ need 'WHAT THIS RUN DOES'    "the what-this-establishes banner"
 # refuses any run whose VERBATIM median is not a finite positive millisecond,
 # which is the one number every ratio in the table is divided by. Without it the
 # gate reports PASS for a probe that produced no measurement.
-if grep -qE 'VERBATIM +0\.000 ms' "$LOG"; then
+#
+# *** THE ORIGINAL refusal was written for the VACUOUS all-zero era and encoded
+# "positive" as `[1-9][0-9]*\.` -- an INTEGER PART of at least 1. MEASURED
+# 2026-10-12: the probe now really measures on this box (device timestamps are
+# live again), with VERBATIM medians of 0.249-0.622 ms across all four bisect
+# arms, so the floor refused every REAL run with "no finite positive VERBATIM
+# median" -- and bisect-2's own comment below cites the real value as "~0.225
+# ms", i.e. the floor contradicted the reference quoted beside it. A floor that
+# refuses a real measurement is the always-red twin: it cannot be satisfied by
+# anything that runs, so it certifies nothing. Both predicates are now written
+# from the intended MEANING -- "finite" = a decimal number is present
+# (nan/inf/absent refuse), "positive" = not all zeroes -- and the vacuous case
+# is caught by the zero branch below, which was and stays the loud, specific
+# refusal. Both directions are exercised by mutate_roofline_bisect1.sh: RB1-8
+# is the vacuous stub (must REFUSE) and RB1-9 is a REAL sub-millisecond stub
+# (must PASS); without RB1-9 this defect could not have been observed here at
+# all, because the matrix only ever proved the floor could still fire.
+if grep -qE 'VERBATIM +0+\.0* ms' "$LOG"; then
   echo "FAIL: the bisect-1 probe printed a ZERO VERBATIM median -- the device" >&2
   echo "      timer reported command_start == command_end, so every GB/s and" >&2
   echo "      ratio in the table is inf/-nan and the run measured nothing. The" >&2
@@ -96,7 +113,7 @@ if grep -qE 'VERBATIM +0\.000 ms' "$LOG"; then
   echo "      this floor catches the case where it does not." >&2
   exit 1
 fi
-if ! grep -qE 'VERBATIM +[1-9][0-9]*\.[0-9]+ ms' "$LOG"; then
+if ! grep -qE 'VERBATIM +[0-9]+\.[0-9]+ ms' "$LOG"; then
   echo "FAIL: no finite positive VERBATIM median in the bisect-1 output -- the" >&2
   echo "      ratios are not anchored to a real measurement." >&2
   exit 1

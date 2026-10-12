@@ -53,7 +53,46 @@ sleep 3600
 STUB
 chmod +x "$SB/bin/roofline_probe_bisect"
 
-# A SECOND stub: the vacuous-but-green run this box actually produces. It returns
+# A THIRD stub: a REAL sub-millisecond run. The box now measures for real
+# (device timestamps live again 2026-10-12), with VERBATIM medians of
+# 0.249-0.622 ms, and the gate's floor was refusing every one of them. RB-9
+# needs this stub: it is the state that proves the floor is a FLOOR and not an
+# always-red predicate. The numbers are the real probe's own output, captured
+# from build/run_all_test_roofline_bisect_sh.log (the probe section, first
+# `[bisect-...]` line to `RESULT: PASS`).
+cat >"$SB/bin/roofline_probe_bisect_real" <<'STUB'
+#!/usr/bin/env bash
+cat <<EOF
+[bisect-bisect2] device 0: Intel(R) Arc(TM) B580 Graphics  (max_compute_units=160)
+[bisect-bisect2] ceiling    0.157 ms    334.9 GB/s    73.4% of peak CITATION(techpowerup arc-b580.c4244 / ARK 241598: 456.0 GB/s, 20 Xe cores)
+[bisect-bisect2] twin        0.036 ms  ratio to full = 0.23 (linear would be 0.25)
+[bisect-bisect2] -- MLP_GATE(INT2) (N_local=8704 K=5120 g16) -- CITATION(bisect-%s: every clone shares this buffer with every other clone, interleaved per rep)
+[bisect-bisect2]   MLP_GATE(INT2)/VERBATIM     0.285 ms     39.1 GB/s   1.00x vs VERBATIM
+[bisect-bisect2]   MLP_GATE(INT2)/VERB+HALF    0.249 ms     44.7 GB/s   1.14x vs VERBATIM
+[bisect-bisect2]   MLP_GATE(INT2)/VERB+TAIL    0.285 ms     39.1 GB/s   1.00x vs VERBATIM
+[bisect-bisect2]   MLP_GATE(INT2)/VERB+MP      0.283 ms     39.4 GB/s   1.01x vs VERBATIM
+[bisect-bisect2] -- MLP_DOWN(INT2) (N_local=2560 K=17408 g16) -- CITATION(bisect-%s: every clone shares this buffer with every other clone, interleaved per rep)
+[bisect-bisect2]   MLP_DOWN(INT2)/VERBATIM     0.622 ms     17.9 GB/s   1.00x vs VERBATIM
+[bisect-bisect2]   MLP_DOWN(INT2)/VERB+HALF    0.533 ms     20.9 GB/s   1.17x vs VERBATIM
+[bisect-bisect2]   MLP_DOWN(INT2)/VERB+TAIL    0.622 ms     17.9 GB/s   1.00x vs VERBATIM
+[bisect-bisect2]   MLP_DOWN(INT2)/VERB+MP      0.618 ms     18.0 GB/s   1.01x vs VERBATIM
+
+== WHAT THIS RUN DOES AND DOES NOT ESTABLISH ==
+  ESTABLISHED by examples/roofline_probe (THE OTHER binary):
+    the shipped INT2 kernel runs at 30-41 GB/s on MLP_GATE/MLP_DOWN
+    (device event timestamps, medians over 12 interleaved reps).
+  ESTABLISHED BY THIS RUN: whatever the columns below say, all measured
+    against the VERBATIM control on the SAME buffers, interleaved per rep;
+    ratios are within-run vs VERBATIM (index 0).
+  NOT ESTABLISHED: a mechanism, unless one of the single-change arms
+    closes most of the table-vs-VERBATIM gap. SHIPPED is anchored from
+    roofline_probe (cross-binary).
+
+RESULT: PASS
+EOF
+exit 0
+STUB
+chmod +x "$SB/bin/roofline_probe_bisect_real"
 # rc=0, prints RESULT: PASS, and prints every arm at 0.000 ms -- the exact
 # output the old gate certified with PASS. RB-8 needs this one, because a hanging
 # probe exits UNPROVEN before any `need` is reached and so cannot test the arm
@@ -97,6 +136,15 @@ setup_tree() {
 setup_vacuous_tree() {
   setup_tree
   cp "$SB/bin/roofline_probe_bisect_vacuous" \
+     "$SB/root/build/examples/roofline_probe_bisect/roofline_probe_bisect"
+}
+# Same again, but the probe under test is a REAL sub-millisecond run (the
+# numbers the box actually measures). The gate must ACCEPT this one -- a floor
+# that cannot be satisfied by a real measurement is an always-red twin, not a
+# guard. See RB-9.
+setup_real_tree() {
+  setup_tree
+  cp "$SB/bin/roofline_probe_bisect_real" \
      "$SB/root/build/examples/roofline_probe_bisect/roofline_probe_bisect"
 }
 patch_gate() { python3 - "$SB/root/scripts/test_roofline_bisect.sh" "$1" "$2" <<'PYX'
@@ -143,6 +191,14 @@ verdict() { # id want-expect-re out rc
   elif ! printf '%s' "$out" | grep -qE -- "$expect"; then
     record "$id" "MISSED '(non-zero, but no expected diagnostic: $expect)'"
   else record "$id" ok; fi
+}
+pass_verdict() { # id out rc -- the POSITIVE direction: the gate must ACCEPT
+  local id="$1" out="$2" rc="$3"
+  if [ "$rc" -eq 0 ]; then
+    record "$id" ok
+  else
+    record "$id" "MISSED '(the gate refused a REAL sub-millisecond run: rc=$rc)'"
+  fi
 }
 state() { # id expect-re old new
   total=$((total+1)); setup_tree
@@ -252,6 +308,23 @@ setup_vacuous_tree
 cp "$GATE_PRISTINE" "$SB/root/scripts/test_roofline_bisect.sh"
 run_gate
 verdict RB-8 'ZERO VERBATIM median' "$GATE_OUT" $?
+restore_gate
+
+# RB-9: the POSITIVE direction, which RB-8 alone could not provide. A floor
+# that can only ever fire is the always-red twin: it certifies nothing, because
+# nothing that runs can satisfy it. MEASURED 2026-10-12 -- the very defect this
+# state exists to catch -- the gate's floor refused every REAL run on this box
+# (VERBATIM medians 0.249-0.622 ms) with "no finite positive VERBATIM median",
+# i.e. it was red for the correct reason on the wrong data. The stub is the
+# real probe's own output (captured from build/run_all_test_roofline_bisect_sh.log)
+# with real measurements in it; the gate must ACCEPT it. Without this state the
+# matrix proves only that the floor can still fire, which is what the old
+# matrix proved and what let the defect ship.
+total=$((total+1))
+setup_real_tree
+cp "$GATE_PRISTINE" "$SB/root/scripts/test_roofline_bisect.sh"
+run_gate
+pass_verdict RB-9 "$GATE_OUT" $?
 restore_gate
 
 echo

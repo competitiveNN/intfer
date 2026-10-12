@@ -109,7 +109,7 @@ need 'WHAT THIS RUN DOES'    "the what-this-establishes banner"
 # refuses any run whose VERBATIM median is not a finite positive millisecond,
 # which is the one number every ratio in the table is divided by. Without it the
 # gate reports PASS for a probe that produced no measurement.
-if grep -qE 'VERBATIM +0\.000 ms' "$LOG"; then
+if grep -qE 'VERBATIM +0+\.0* ms' "$LOG"; then
   echo "FAIL: the bisect-3 probe printed a ZERO VERBATIM median -- the device" >&2
   echo "      timer reported command_start == command_end, so every GB/s and" >&2
   echo "      ratio in the table is inf/-nan and the run measured nothing. The" >&2
@@ -117,7 +117,13 @@ if grep -qE 'VERBATIM +0\.000 ms' "$LOG"; then
   echo "      this floor catches the case where it does not." >&2
   exit 1
 fi
-if ! grep -qE 'VERBATIM +[1-9][0-9]*\.[0-9]+ ms' "$LOG"; then
+# THE ORIGINAL floor encoded "positive" as `[1-9][0-9]*\.` (integer part >= 1),
+# which MEASURED 2026-10-12 refuses every REAL sub-millisecond run on this box
+# (VERBATIM medians 0.249-0.622 ms). "finite" is now "a decimal number is
+# present", "positive" is "not all zeroes" (the zero branch above catches that
+# specifically). Both directions are exercised by mutate_roofline_bisect3.sh:
+# the vacuous stub must REFUSE, the new real sub-millisecond stub must PASS.
+if ! grep -qE 'VERBATIM +[0-9]+\.[0-9]+ ms' "$LOG"; then
   echo "FAIL: no finite positive VERBATIM median in the bisect-3 output -- the" >&2
   echo "      ratios are not anchored to a real measurement." >&2
   exit 1
