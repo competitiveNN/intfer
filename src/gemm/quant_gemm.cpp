@@ -2054,18 +2054,34 @@ sycl::event quant_gemm_forward_usm_gateup(
                 is_up ? code_u8 : code_g8;
             const float alpha_f = is_up ? alpha_u : alpha_g;
             std::uint16_t* outp = is_up ? out_u : out_g;
-            // ONE WI owns ONE (m, out_ng) pair, so it owns the whole K
-            // accumulation for that pair -- no cross-lane reduction, no
-            // reassociation, same op order as the M=1 body below. The M
-            // dimension is the outer index: act_usm is M*K row-major
-            // (act_usm[m*K + k]) and the weight row for out_ng is at
-            // wbase + out_ng*K, so the two offsets are computed separately
-            // and never combined (combining them was the M>1 bug: it read
-            // the next output row's weights).
+            // *** THE WEIGHT ROW IS A BYTE ROW, NOT AN ELEMENT ROW. *** The
+            // shard is packed by shard_weight (engine.cpp:357: code_slice is
+            // w.N * (K+pack-1)/pack bytes, four INT2 codes per byte) and the
+            // USM copy is byte-for-byte of that buffer (engine.cpp:2621
+            // sc.code_host[d] = w.code_store; shard_fill copies code_bytes).
+            // So the row stride is K/pack BYTES, and the byte indices below
+            // (b0, idx) are ABSOLUTE byte offsets into the shard already
+            // divided by pack -- which is why wrow is the shard BASE, not
+            // the shard base plus an element row offset.
+            //
+            // VERIFIED, not argued: examples/gateup_equiv runs this kernel and
+            // two separate quant_gemm_forward_usm calls on the SAME buffers and
+            // compares bitwise (15/15 PASS across 3 shapes x 5 datasets, no
+            // model, no 27B load). The negative direction is proven by hand:
+            // restoring `wrow = wbase + out_ng * K` reproduces the exact
+            // UR_RESULT_ERROR_DEVICE_LOST at the first shape, and restoring the
+            // fix goes green. The operator's 27B run died at L3 prefill with
+            // that same error, ten identical runs; L3 is the first INT2+INT2
+            // layer this path reaches, and this is the only line here that
+            // differs from the working M=1 decode kernel (that kernel reads
+            // code_u8[b0] directly, never offsetting it by a row). A ~4x
+            // over-read of a pinned 9375 MiB USM allocation reads past the
+            // shard's pool slot -- the kind of fault that reports as a device
+            // loss rather than as a bounds error.
             for (int m = 0; m < static_cast<int>(M); ++m) {
               float acc = 0.0f;
               const std::size_t act_off = (std::size_t)m * K;
-              const std::uint8_t* wrow = wbase + (std::size_t)out_ng * K;
+              const std::uint8_t* wrow = wbase;
               sycl::multi_ptr<const std::uint16_t,
                   sycl::access::address_space::global_space> act_mp(act_usm);
               for (int g = 0; g < num_groups; ++g) {
