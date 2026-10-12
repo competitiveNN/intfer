@@ -406,6 +406,18 @@ Decide on those, never on `kernel`.
   launch** (both column-parallel over the same split, both device-local, and
   bit-exact because each output's K accumulation is untouched). Spec and the
   numerics argument: `AGENTS.md` "The TP=2 fusion surface".
+  **`run_mlp_gateup` passes the FULL Ng/Nu to the kernel and the readback
+  scatters the slice back into mg/mu by `start` (engine.cpp:1879-1916) — so
+  `quant_gemm_forward_usm_gateup` takes `start_g/Nl_g/start_u/Nl_u` and
+  dispatches ONLY this device's slice, indexing the code/scale shard with the
+  LOCAL row and the output buffer with the GLOBAL row (`start + local`, stride
+  Ng/Nu).** Dispatching the whole output and indexing the shard globally is the
+  defect that killed the operator's 27B run at L3 prefill with
+  `UR_RESULT_ERROR_DEVICE_LOST` (ten identical runs): rank 1 read rows
+  0..Ng-1 of a buffer holding 4352. `start/Nl = 0` with `Nl == Ng/Nu`
+  reproduces the TP=1 behaviour byte-for-byte. Verified by
+  `examples/gateup_equiv` (30/30 PASS incl. SLICED / SLICED-OUTONLY /
+  SLICED-OFFSET); the negative direction re-crashes. `f0192ea`.
 * **TP is COLUMN-parallel with a HOST gather — there is no All-Reduce.** `shard_weight`
   slices the output dim N; `run_linear_tp` waits all ranks, then each rank's D2H is
   `half_to_float_batch`-ed into `out.data() + m*t.N + start`. `grep -riE

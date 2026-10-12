@@ -1901,3 +1901,60 @@ empty) — the hoist did not touch any kernel body.
 (2 must-appear / 1 must-stay-quiet / 4 must-be-refused),
 `check_decode1_copies.sh` PASS (7/7 split-K atoms). The probe build
 was temporary and is not in the tree.
+
+---
+
+## 2026-10-12: the fused gate+up kernel read rows the other rank owns
+
+**The operator's 27B run died at L3 prefill with `UR_RESULT_ERROR_DEVICE_LOST`,
+ten identical runs.** The symptom was first recorded at `577984a` and the
+original investigation (a 9375 MiB over-read of `wrow = wbase + out_ng * K`)
+found and fixed ONE of the two defects (`c9d5be8`). Re-running
+`test_tp2_27b.sh` after that fix still crashed at L3 with the identical error,
+so the fix was not sufficient.
+
+**Root cause, found by reading the shard layout rather than guessing:**
+`shard_weight(model_, t, start, end, q)` (engine.cpp:278) emits **LOCAL** rows
+— `w.N = end - start`, `row_codes[r]` for `r` in `0..w.N`, `scale_slice[r]` for
+`r` in `0..w.N` (engine.cpp:312-316). So a TP device's code/scale USM holds only
+its slice, indexed 0..Nl-1. But `run_mlp_gateup` passed the **FULL** Ng/Nu to
+`quant_gemm_forward_usm_gateup` (engine.cpp:1815-1821) and the readback
+scatters the slice back into mg/mu by `start` (engine.cpp:1879-1916). The kernel
+therefore dispatched the whole Ng+Nu output on **every** device and indexed the
+shard with the **global** row: rank 1 read rows 0..Ng-1 of a buffer holding 4352.
+That is not a bounds error at all, it is the wrong answer — and before the shard
+was sliced correctly it read ~4x past the end and killed the device.
+
+**Fix (`f0192ea`):** the kernel now dispatches only this device's slice
+(Nl_g + Nl_u work-items), indexes the code/scale shard with the **LOCAL** row and
+the output buffer with the **GLOBAL** row (`start + local`, stride Ng/Nu).
+`start = 0, Nl = Ng/Nu` reproduces the TP=1 behaviour byte-for-byte, which is why
+the defect was invisible in `gateup_equiv` (always full-size shards) and in every
+M=1 decode path (which never calls this kernel).
+
+**Harness (`examples/gateup_equiv`), 30/30 PASS:**
+| shape | what it does |
+|---|---|
+| `MLP_GATE+UP` / `-RAGGED` / `-ODDN` | full-size, start=0 — the pre-existing 15/15 |
+| `MLP_GATE+UP-SLICED` | Nl=4352, start=0 — **reproduces the crash** |
+| `MLP_GATE+UP-SLICED-OUTONLY` | full code/scale, sliced out buffers — **PASSES** |
+| `MLP_GATE+UP-SLICED-OFFSET` | start=2048 — exercises the offset arithmetic |
+
+The SLICED-OUTONLY shape is the isolation: with the fault being the code/scale
+over-read and not the out over-write, it passes. A single "sliced" shape cannot
+tell the two apart, and guessing cost a run.
+
+**Negative direction, proven by hand (audit rule #13):** reverting the dispatch
+to the full output re-crashes with the identical `UR_RESULT_ERROR_DEVICE_LOST`
+at the SLICED shape; restoring the fix goes green.
+
+**Also fixed the same day:** `scripts/run_all_checks.sh` honoured a skip flag
+that existed nowhere else — `INTFER_SKIP_HEALTHY` — a bypass nobody could have
+known about, and the healthy column is the only thing in the stack that catches
+this crash. Renamed to `INTFER_DEVICE_PRECOND_SKIP_HEALTHY`, the only flag that
+silences it, honoured in exactly one place (the `dispatch()` arm). The doc block
+at the top of the file was corrected to match; `HISTORY.md`'s three
+`INTFER_SKIP_HEALTHY` citations are records of the old spelling and stay.
+`scripts/gate_inventory.sh` carries a comment block on the `granularity_of`
+re-derivation rather than special-casing `gate_require_device` into a fake
+granularity.
