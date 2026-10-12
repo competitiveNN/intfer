@@ -536,6 +536,72 @@ for tp in $TPS; do
   echo "TP=$tp [DPAS48+SSM_GPU n=24]: '$GOT'"
   [ "$GOT" = "$D48" ] || fail "TP=$tp [DPAS48+SSM_GPU] '$GOT' != DPAS48 '$D48'"
 
+  # --- INTFER_SSM_FUSE: fold the SSM recurrence's 4 kd-serial passes over the
+  # state matrix into 2 (decay+kv-dot, rank-1-update+readout). The kernel
+  # rewrites ssm_forward_kernel / ssm_forward_chain_kernel (quant_gemm.cpp);
+  # the 4-pass body is kept byte-for-byte in the `else` branch, so the default
+  # path is unchanged and this arm is a stream-identity check, not a
+  # numerics contract.
+  #
+  # *** WHY BIT-EXACT BY CONSTRUCTION, AND WHY THAT IS NOT ENOUGH. *** In the
+  # fused loop `S[d,c] *= g_t; kv += S[d,c]*kn[d]` -- the decay writes only
+  # S[d,c] and the kv dot immediately reads that same in-register value; no
+  # other element is touched, so the value read is identical to the 4-pass
+  # base's "decay everything, then read". Same for
+  # `S[d,c] += kn[d]*delta; s += S[d,c]*qn[d]`, and d is ascending in both
+  # forms, so the FP accumulation order is unchanged. The host reference at
+  # main.cpp:5448-5470 and the prefill path at 6380-6412 carry the identical
+  # 4-pass shape, so the device kernel is the same recurrence as the host.
+  # A stream comparison alone is satisfiable by a flag that never reached the
+  # branch, so the arm also asserts the once-per-process [ssm-fuse] line.
+  #
+  # *** TP-AGNOSTIC, AND THAT IS THE POINT. *** Unlike L4/L5 (which open with
+  # `num_devices_ != 1 => return false`) this fusion is INSIDE the kernel: the
+  # SSM recurrence runs on device 0 regardless of --tp, so it is reachable on
+  # the actual 27B --tp 2 target. The arm is therefore the SAME on tp=1 and
+  # tp=2, with no TP polarity to assert -- the opposite of every fusion seam
+  # in this tree.
+  ssm_fuse_announced() { grep -aq '\[ssm-fuse\]' "$1"; }
+  {
+    SF_OUT="$(mktemp)"; SF_ERR="$(mktemp)"
+    env INTFER_SSM_FUSE=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" \
+      -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$SF_OUT" 2>"$SF_ERR"; SF_RC=$?
+    if [ "$SF_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_SSM_FUSE=1 run exited rc=$SF_RC"; tail -10 "$SF_ERR" >&2
+    else
+      SF_IDS="$(ids_of "$tp" INTFER_SSM_FUSE=1)"
+      echo "TP=$tp [INTFER_SSM_FUSE=1]: '$SF_IDS'"
+      [ -n "$SF_IDS" ] || fail "TP=$tp INTFER_SSM_FUSE=1 stream EMPTY"
+      [ "$SF_IDS" = "$BASE" ] \
+        || fail "TP=$tp [INTFER_SSM_FUSE=1] '$SF_IDS' != base '$BASE' (must be bit-exact)"
+      if ! ssm_fuse_announced "$SF_ERR"; then
+        fail "TP=$tp INTFER_SSM_FUSE=1: no [ssm-fuse] line -- the fusion never took, stream match vacuous"
+      fi
+    fi
+    rm -f "$SF_OUT" "$SF_ERR"
+  }
+  {
+    SFB="$(mktemp -d)"
+    env INTFER_SSM_FUSE=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$SFB/good.out" 2>"$SFB/good.err" || true
+    cp "$SFB/good.err" "$SFB/not.err"
+    sed -i '/\[ssm-fuse\]/d' "$SFB/not.err"
+    : >"$SFB/empty.err"
+    if ! ssm_fuse_announced "$SFB/good.err"; then
+      echo "TP=$tp SSM_FUSE self-check SKIPPED: the tp=1 fixture produced no \
+            [ssm-fuse] line (the SSM layer did not run on this box), so the \
+            refusal/vacuity directions are unexercised here" >&2
+    else
+      if ssm_fuse_announced "$SFB/not.err"; then
+        fail "TP=$tp SSM_FUSE self-check (b): log with the decision line deleted was ACCEPTED -- arm is stream-only"
+      fi
+      if ssm_fuse_announced "$SFB/empty.err"; then
+        fail "TP=$tp SSM_FUSE self-check (c): arm ACCEPTED an empty log (vacuity)"
+      fi
+    fi
+    rm -rf "$SFB"
+  }
+
   # WIDE-PREFILL (M>1) ARM. Every assertion above uses the 5-token PROMPT, so
   # the pre-pass only ever runs with M=5 during prefill there; the short-prompt
   # arms prove nothing about the helper's 2*M*nGA row stride (act #4's hole).

@@ -1987,3 +1987,93 @@ at the top of the file was corrected to match; `HISTORY.md`'s three
 `scripts/gate_inventory.sh` carries a comment block on the `granularity_of`
 re-derivation rather than special-casing `gate_require_device` into a fake
 granularity.
+## 2026-10-12: `INTFER_SSM_FUSE` — the first fusion reachable at `--tp 2`
+
+**Why this matters more than a single flag.** The PARAMOUNT DIRECTIVE's whole
+framing was that TP=2 fusion was closed: `run_mlp_fused` (engine.cpp:1352) and
+`run_linear_tp_devact` (engine.cpp:1484) both open with
+`if (devices_.size() != 1) return false;`, so do L4 and L5. The reason is
+structural — TP slices N, so `gate`/`up` produce only device *d*'s slice of
+`inter` while `down` has K = the *full* `inter`, so the intermediate must cross
+the host, and there is no P2P. A judge ruling this session identified the hole
+in that conclusion: it was a claim about **host↔device seams**, and it had never
+been checked against **within-kernel pass fusion**.
+
+The SSM (GatedDeltaNet) recurrence in `quant_gemm.cpp` makes four kd-serial
+passes over the state matrix S per (head, column): decay, kv-dot, rank-1
+update, readout. Passes 1+2 consume each decayed element in the d-iteration
+that produced it; passes 3+4 do the same for the rank-1 update. Two passes
+instead of four, halving S memory traffic, and the SSM runs on device 0
+regardless of `--tp` — **so this fusion reaches the actual 27B `--tp 2` target.**
+
+**Bit-exact by construction, and the argument is the certification.** In
+`S[d,c] *= g_t; kv += S[d,c]*kn[d]` the decay writes only S[d,c] and the kv dot
+immediately reads that same in-register value; no other element is touched, so
+what is read is identical to the 4-pass base's "decay everything, then read".
+Same for `S[d,c] += kn[d]*delta; s += S[d,c]*qn[d]`, and d is ascending in both
+forms, so the FP accumulation order is untouched. The host reference loops
+(main.cpp:5448-5470 for decode, main.cpp:6380-6412 for the prefill chunk) carry
+the identical 4-pass shape, so the device kernel is the same recurrence as the
+host. The 4-pass body is kept byte-for-byte in the `else` branch of both
+`ssm_forward_kernel` and `ssm_forward_chain_kernel`, so the default path is
+unchanged and the arm is a stream-identity check rather than a numerics
+contract.
+
+Both rewritten kernels announce once per process:
+
+    [ssm-fuse] call 1 ACTIVE (once; set INTFER_SSM_FUSE_ANNOUNCE_EVERY=1 for every launch)
+
+A stream comparison alone would be satisfiable by a flag that never reached the
+branch, so the arm (`scripts/test_gpu_optin.sh:539+`) also asserts that line,
+with (b) refusal and (c) vacuity self-checks. Reachability is structural — the
+kernels are the only device SSM recurrence and both `gpu_ssm_rows` and the
+L4/L5 fused paths reach them via `ssm_gpu_allowed()`, already gated at
+`test_gpu_optin.sh:117/516`. **TP-agnostic**, so unlike every L4/L5 arm there is
+no TP polarity to assert and the arm is the same on tp=1 and tp=2.
+
+The predicate's polarity was proven by hand against synthetic logs before the
+arm was trusted (audit rule #13): accept on a log carrying the line, refuse the
+same log with the line deleted, refuse an empty log. All three held.
+
+`check_flag_gate_coverage.sh` now harvests the opt-in gap at **3**
+(`INTFER_DECODE1_ANNOUNCE_EVERY`, `INTFER_ONEMKL`,
+`INTFER_SSM_FUSE_ANNOUNCE_EVERY`), down from 4; its mutation matrix is still
+4/4 and its file is byte-identical to its pre-matrix state after the run.
+`gate_inventory.sh` and `check_scripts_live.sh` both still PASS.
+
+**Status: UNMEASURED — operator-only 27B `--tp 2` A/B** on the kernel bucket
+and the `nk`/`nw`/`nr` counters. Nothing was executed on a model this session.
+
+## 2026-10-12: upstream SYCL survey — the judge's two candidates do not port
+
+The same session surveyed `github.com/ggml-org/llama.cpp` `ggml/src/ggml-sycl/`
+for a second optimization to port onto the TP=2 GEMM/SSM path. The recursive
+tree was fetched from branch **`master`** (`main` is *not* the default branch)
+and filtered to the SYCL files. Six candidates were read; none ports to
+intfer's hot path, and the reasons are structural rather than a matter of taste:
+
+* **`gated_delta_net.cpp`** (366 lines, `template <int S_v, bool KDA, bool keep_rs_t>`) —
+  a 4-phase `nd_range<3>` scan/conv with `[[sycl::reqd_sub_group_size(WARP_SIZE)]]`
+  and the state in a rollback cache (`ggml_sycl_gated_delta_net_fused_cache`,
+  behind `ggml_sycl_try_gdn_cache_fusion`). This is a **different recurrence**
+  from intfer's per-(head, column) M-row `ssm_forward` loop, so porting it
+  would be a whole-path rewrite, not a micro-optimization.
+* **`gemm.hpp`** (95 lines) — not a GEMM kernel at all. It is the
+  `#if GGML_SYCL_DNNL` oneDNN `matmul` wrapper (`DnnlGemmWrapper`). intfer
+  routes no GEMM through oneDNN.
+* **`fused-gemm.cpp`** (1093 lines) — a generic `mx::precision` mixed-precision
+  *dequant* GEMM driver (`fg_combo<TA, TB, TM_, TN_, TK_, SG_>` with an
+  `mx::combination` device probe). It targets blocked/MX weight formats
+  (iq4_xs, q4_K, q8_0, ...), not intfer's FP16-activation dequant-on-the-fly path.
+* **`norm.cpp`** (1137 lines) — `rms_norm_f32` and friends, each with a
+  `warp_reduce_sum` + sub-group butterfly over `local_accessor<float> s_sum`.
+  **intfer's `ssm_norm_silu_to_half` (quant_gemm.cpp:3484) already implements
+  exactly this technique inline.** And the Q-K V-NORM fusion that could have
+  been built from it maps onto a *host-side* `l2norm` at main.cpp:3010-3011
+  whose output the device kernel reads already normalized — a host l2norm
+  change cannot touch kernel memory traffic, so it fails the fusion test on both
+  counts (no kernel delta and no round trip removed).
+
+Recorded as a **negative result, not a backlog item.** The `INTFER_SSM_FUSE`
+within-kernel fusion above is the optimization that actually reaches the target,
+and it is decided on `nk`/`nw`/`nr`, never on a tok/s.

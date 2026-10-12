@@ -88,6 +88,48 @@ inline float from_half_bits(std::uint16_t h) {
   return static_cast<float>(sycl::bit_cast<sycl::half>(h));
 }
 
+// ---- SSM pass-fusion announcement -------------------------------------------
+// INTFER_SSM_FUSE (default OFF, PRESENCE enables) folds the SSM recurrence's
+// four kd-serial passes over the state S into two, by consuming each updated
+// element in the same d-iteration that produced it:
+//   pass 1+2: S[d,c] *= g_t; kv += S[d,c]*kn[d]   (decay result feeds kv dot)
+//   pass 3+4: S[d,c] += kn[d]*delta; s += S[d,c]*qn[d]  (update feeds readout)
+// Bit-exact vs the 4-pass base: pass 1 writes S[d,c] in place and pass 2 reads
+// the SAME in-register value the store would have produced (the decay touches
+// only S[d,c], never S[d',c]); same for passes 3+4. The accumulation order is
+// unchanged (d ascending in both), so the FP results are identical and the
+// token stream cannot move. The win is S memory traffic: one load+store pair
+// replaces a load+store+load triple per (d, head, column).
+//
+// TP-agnostic: the SSM kernel runs on device 0 regardless of --tp, so this is
+// the one fusion the PARAMOUNT DIRECTIVE's TP=2 target can actually reach --
+// unlike the host<->device seams (run_mlp_fused / run_linear_tp_devact /
+// L4/L5 fused), which all open with `num_devices_ != 1 => return false`.
+//
+// Same once-per-process latch shape as decode1_announce (keyed by tag, call
+// counter, INTFER_SSM_FUSE_ANNOUNCE_EVERY=1 for every launch).
+inline void ssm_fuse_announce(const char* tag) {
+  static std::set<std::string> seen;
+  static std::mutex mu;
+  static int n_calls = 0;
+  const bool every =
+      (std::getenv("INTFER_SSM_FUSE_ANNOUNCE_EVERY") != nullptr);
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    ++n_calls;
+    if (!every && !seen.insert(tag).second) return;
+    const int n = n_calls;
+    if (every) {
+      std::fprintf(stderr, "[%s] call %d ACTIVE\n", tag, n);
+    } else {
+      std::fprintf(stderr, "[%s] call %d ACTIVE (once; "
+                           "set INTFER_SSM_FUSE_ANNOUNCE_EVERY=1 for every "
+                           "launch)\n",
+                   tag, n);
+    }
+  }
+}
+
 // Canonical DASH-Q codebook value for an unsigned code index `code`.
 // The Stage-1 pipeline stores LOW-BIT codes as *indices* into this codebook
 // (canonical_codebook() in dashq.cpp); the dequantized weight is scale*cb[code].
@@ -3210,6 +3252,15 @@ sycl::event ssm_forward(sycl::queue& q, const SsmParams& p) {
   const uint32_t nWG = 32;
   const uint32_t n_blocks = M * n_v * vd;
   const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
+  // INTFER_SSM_FUSE (default OFF, PRESENCE enables): fold the four kd-serial
+  // passes over S into two by consuming each updated element in the same
+  // d-iteration that produced it. Bit-exact vs the 4-pass base (the decay /
+  // update touch only S[d,c] before the dot reads it; d ascending in both),
+  // and TP-agnostic (device 0 regardless of --tp) -- the one fusion the
+  // PARAMOUNT DIRECTIVE's TP=2 target can actually reach, unlike the
+  // host<->device seams which all open with `num_devices_ != 1 => false`.
+  const bool fuse = (std::getenv("INTFER_SSM_FUSE") != nullptr);
+  if (fuse) ssm_fuse_announce("ssm-fuse");
   // Capture row-pointer arrays by value (device USM pointers; the arrays
   // themselves live in device USM and are indexed on-device).
   const float* const* qn_rows = p.qn_rows;
@@ -3242,18 +3293,37 @@ sycl::event ssm_forward(sycl::queue& q, const SsmParams& p) {
           const float bb = b_rows[m][hh];
           const float beta = 1.0f / (1.0f + sycl::exp(-bb));
           float* S = s_rows[m] + ((size_t)hh * kd) * vd;
-          // 1) decay this head's state column block: S[d,c] *= g_t.
-          for (uint32_t d = 0; d < kd; ++d) S[(size_t)d * vd + c] *= g_t;
-          // 2) kv[c] = sum_d S[d,c]*kn[d]; delta = (v-kv)*beta.
           float kv = 0.0f;
-          for (uint32_t d = 0; d < kd; ++d) kv += S[(size_t)d * vd + c] * kn[d];
-          const float delta = (vv[c] - kv) * beta;
-          // 3) rank-1 update: S[d,c] += kn[d]*delta.
-          for (uint32_t d = 0; d < kd; ++d)
-            S[(size_t)d * vd + c] += kn[d] * delta;
-          // 4) readout: core = sum_d S[d,c]*qn[d].
           float s = 0.0f;
-          for (uint32_t d = 0; d < kd; ++d) s += S[(size_t)d * vd + c] * qn[d];
+          if (fuse) {
+            // 1+2) decay S[d,c], then read the decayed value into the kv
+            // dot. The store and the read are the same value (the decay
+            // touches only S[d,c], never S[d',c]); d ascending in both
+            // forms, so the FP result is bit-identical to the 4-pass base
+            // and the token stream cannot move.
+            for (uint32_t d = 0; d < kd; ++d) {
+              S[(size_t)d * vd + c] *= g_t;
+              kv += S[(size_t)d * vd + c] * kn[d];
+            }
+            const float delta = (vv[c] - kv) * beta;
+            // 3+4) rank-1 update S[d,c], then read the updated value into
+            // the readout -- same argument, same accumulation order.
+            for (uint32_t d = 0; d < kd; ++d) {
+              S[(size_t)d * vd + c] += kn[d] * delta;
+              s += S[(size_t)d * vd + c] * qn[d];
+            }
+          } else {
+            // 1) decay this head's state column block: S[d,c] *= g_t.
+            for (uint32_t d = 0; d < kd; ++d) S[(size_t)d * vd + c] *= g_t;
+            // 2) kv[c] = sum_d S[d,c]*kn[d]; delta = (v-kv)*beta.
+            for (uint32_t d = 0; d < kd; ++d) kv += S[(size_t)d * vd + c] * kn[d];
+            const float delta = (vv[c] - kv) * beta;
+            // 3) rank-1 update: S[d,c] += kn[d]*delta.
+            for (uint32_t d = 0; d < kd; ++d)
+              S[(size_t)d * vd + c] += kn[d] * delta;
+            // 4) readout: core = sum_d S[d,c]*qn[d].
+            for (uint32_t d = 0; d < kd; ++d) s += S[(size_t)d * vd + c] * qn[d];
+          }
           core_rows[m][(size_t)hh * vd + c] = s;
         });
   });
@@ -3270,6 +3340,10 @@ sycl::event ssm_forward_chain(sycl::queue& q, const SsmChainParams& p) {
   const uint32_t nWG = 32;
   const uint32_t n_blocks = n_v * vd;
   const uint32_t global = ((n_blocks + nWG - 1) / nWG) * nWG;
+  // INTFER_SSM_FUSE: same 2-pass fold as ssm_forward. The chained kernel's
+  // per-(head,col) loop over m is unchanged; only the inner d-loop changes.
+  const bool fuse = (std::getenv("INTFER_SSM_FUSE") != nullptr);
+  if (fuse) ssm_fuse_announce("ssm-fuse");
   // Packed row-major inputs (single H2D upload); captured by value.
   const float* qn_all = p.qn_rows;
   const float* kn_all = p.kn_rows;
@@ -3297,16 +3371,28 @@ sycl::event ssm_forward_chain(sycl::queue& q, const SsmChainParams& p) {
             const float g_t = sycl::exp(g_all[(size_t)m * rs + hh]);
             const float bb = b_all[(size_t)m * rs + hh];
             const float beta = 1.0f / (1.0f + sycl::exp(-bb));
-            for (uint32_t d = 0; d < kd; ++d) S[(size_t)d * vd + c] *= g_t;
             float kv = 0.0f;
-            for (uint32_t d = 0; d < kd; ++d)
-              kv += S[(size_t)d * vd + c] * kn[d];
-            const float delta = (vv - kv) * beta;
-            for (uint32_t d = 0; d < kd; ++d)
-              S[(size_t)d * vd + c] += kn[d] * delta;
             float s = 0.0f;
-            for (uint32_t d = 0; d < kd; ++d)
-              s += S[(size_t)d * vd + c] * qn[d];
+            if (fuse) {
+              for (uint32_t d = 0; d < kd; ++d) {
+                S[(size_t)d * vd + c] *= g_t;
+                kv += S[(size_t)d * vd + c] * kn[d];
+              }
+              const float delta = (vv - kv) * beta;
+              for (uint32_t d = 0; d < kd; ++d) {
+                S[(size_t)d * vd + c] += kn[d] * delta;
+                s += S[(size_t)d * vd + c] * qn[d];
+              }
+            } else {
+              for (uint32_t d = 0; d < kd; ++d) S[(size_t)d * vd + c] *= g_t;
+              for (uint32_t d = 0; d < kd; ++d)
+                kv += S[(size_t)d * vd + c] * kn[d];
+              const float delta = (vv - kv) * beta;
+              for (uint32_t d = 0; d < kd; ++d)
+                S[(size_t)d * vd + c] += kn[d] * delta;
+              for (uint32_t d = 0; d < kd; ++d)
+                s += S[(size_t)d * vd + c] * qn[d];
+            }
             core_all[((size_t)m * n_v + hh) * vd + c] = s;
           }
         });

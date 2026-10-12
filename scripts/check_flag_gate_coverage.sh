@@ -60,6 +60,49 @@
 #                    Announcement [l5-front] at main.cpp:4771; same
 #                    TP=1/TP=2 polarity (L5_DECLINE("tp") at
 #                    main.cpp:4199) and same self-check shape.
+#   INTFER_SSM_FUSE ARMED (test_gpu_optin.sh:539+, the arm block ending
+#                    just before the WIDE-PREFILL comment). WITHIN-KERNEL
+#                    fusion of the SSM (GatedDeltaNet) recurrence's four
+#                    kd-serial passes over the state matrix S into two:
+#                    decay+kv-dot, then rank-1-update+readout (quant_gemm.cpp
+#                    ssm_forward_kernel and ssm_forward_chain_kernel, both
+#                    rewritten 2026-10-12). This is the FIRST fusion in this
+#                    tree that is reachable at the PARAMOUNT DIRECTIVE's
+#                    27B --tp 2 target: every other fusion seam
+#                    (run_mlp_fused, run_linear_tp_devact, L4, L5) opens
+#                    with `num_devices_ != 1 => return false` because the
+#                    fusion crosses the TP device boundary, whereas THIS one
+#                    is inside the kernel and the SSM recurrence runs on
+#                    device 0 regardless of --tp. TP-AGNOSTIC, so the arm
+#                    is the SAME on tp=1 and tp=2 and there is no TP
+#                    polarity to assert -- the opposite of L4/L5.
+#                    BIT-EXACT BY CONSTRUCTION, and the reasoning is the
+#                    certification: in `S[d,c] *= g_t; kv += S[d,c]*kn[d]`
+#                    the decay writes only S[d,c] and the dot immediately
+#                    reads that same in-register value, so what is read is
+#                    identical to the 4-pass base's "decay everything, then
+#                    read"; d is ascending in both forms, so the FP
+#                    accumulation ORDER is untouched. The host reference
+#                    (main.cpp:5448-5470) and the prefill path
+#                    (main.cpp:6380-6412) carry the same 4-pass shape, so the
+#                    device kernel is the same recurrence as the host. The
+#                    default (unset) path is the byte-for-byte 4-pass body,
+#                    so this arm is a stream-identity check and NOT a
+#                    numerics contract. Because a stream comparison alone
+#                    would be satisfiable by a flag that never reached the
+#                    branch, the arm ALSO asserts the once-per-process
+#                    [ssm-fuse] line, with (b) refusal and (c) vacuity
+#                    self-checks. Reachability is structural: the kernels are
+#                    the ONLY device SSM recurrence and both gpu_ssm_rows
+#                    and the L4/L5 fused paths reach them via
+#                    ssm_gpu_allowed(), already gated at
+#                    test_gpu_optin.sh:117/516.
+#   INTFER_SSM_FUSE_ANNOUNCE_EVERY NOT ARMED -- harness-only, same class and
+#                    same reason as INTFER_DECODE1_ANNOUNCE_EVERY: it
+#                    disables the once-only latch so every launch prints.
+#                    Certifying it would be certifying the test harness
+#                    against itself; the [ssm-fuse] predicate above already
+#                    exercises the latch when the gate runs.
 #   INTFER_INT8_KV_G ARMED (test_gpu_optin.sh:317+). Group size for the
 #                    INT8 KV quantiser (main.cpp:3821, default 32). A
 #                    tuning parameter of an already-gated feature
@@ -150,7 +193,7 @@
 #                    test harness against itself.
 #
 # The floor's purpose is met. The opt-in class existed so a residue could
-# not be left sitting unexamined; it is now examined flag by flag -- five
+# not be left sitting unexamined; it is now examined flag by flag -- six
 # armed, one with a stated reason verified against source. The class is
 # still non-empty (the harness latch) and the checker still refuses an
 # empty class; that is by design, not a remaining defect.

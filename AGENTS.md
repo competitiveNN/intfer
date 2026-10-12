@@ -237,6 +237,7 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_L4_FUSE` | fused ssm+norm+FP16 -> la_out GEMM (TP=1) | stream-identical, but M>1 nets ~-1.5% and scalar A/B was a variance wash. **Decline re-checked 2026-10-09:** the verdict stands and is *independent* of the gate+up fusion -- L4_FUSE fuses a different seam (the LA input path, `run_linear_wave`'s fwht_rot+4 GEMMs at main.cpp:4260-4289) and its TP=1-only guard (`run_mlp_fused`-style `if (devices_.size() != 1) return false`) is unrelated to the gate+up seam. The M>1 ~-1.5% is a device-saturation submit effect (the fusion ADDS launches to an already-saturated queue), not a numerics divergence; the stream-identity arm in `test_gpu_optin.sh` is unchanged and still the right certification for this flag. |
 | `INTFER_L5_FRONT` | device-resident whole LA input path | **dead end as built**: +144 launches/token, waitblock 5x. More kernels lose |
 | `INTFER_SSM_GPU` | device SSM recurrence | declines under `INTFER_DPAS48=1` (its ~1ulp drift flips a GA64 code at a tie) |
+| `INTFER_SSM_FUSE` | WITHIN-KERNEL fusion of the SSM (GatedDeltaNet) recurrence's four kd-serial passes over the state matrix S into two: decay+kv-dot, then rank-1-update+readout. Rewrites `ssm_forward_kernel` and `ssm_forward_chain_kernel` in `quant_gemm.cpp`; the 4-pass body is kept byte-for-byte in the `else` branch, so the default path is unchanged. `!= nullptr` spelling (PRESENCE enables). **Implemented 2026-10-12, GATED in `test_gpu_optin.sh:539+`** with a 3-part self-check. **THE FIRST FUSION IN THIS TREE REACHABLE AT THE 27B `--tp 2` TARGET** -- every other fusion seam (`run_mlp_fused`, `run_linear_tp_devact`, L4, L5) opens with `num_devices_ != 1 => return false` because the fusion crosses the TP device boundary, whereas THIS one is INSIDE the kernel and the SSM recurrence runs on device 0 regardless of `--tp`. TP-AGNOSTIC, so the arm is the SAME on tp=1 and tp=2 with no TP polarity to assert. **BIT-EXACT BY CONSTRUCTION, and the reasoning IS the certification**: in `S[d,c] *= g_t; kv += S[d,c]*kn[d]` the decay writes only S[d,c] and the dot immediately reads that same in-register value, so what is read is identical to the 4-pass base's "decay everything, then read"; d is ascending in both forms, so the FP accumulation ORDER is untouched. The host reference (main.cpp:5448-5470) and the prefill path (main.cpp:6380-6412) carry the same 4-pass shape, so the device kernel is the same recurrence as the host. Because a stream comparison alone would be satisfiable by a flag that never reached the branch, the arm ALSO asserts the once-per-process `[ssm-fuse]` line, with (b) refusal and (c) vacuity self-checks. Reachability is structural: the kernels are the only device SSM recurrence and both `gpu_ssm_rows` and the L4/L5 fused paths reach them via `ssm_gpu_allowed()`, already gated at `test_gpu_optin.sh:117/516`. **UNMEASURED** -- operator-only 27B `--tp 2` A/B on the kernel bucket. |
 | `INTFER_INT8_KV`, `INTFER_KV_Q8`, `INTFER_KV_HAD` | groupwise-INT8 KV cache | correctness-gated, no tok/s claim |
 | `INTFER_INT8_KV_G` | group size for the INT8 KV quantiser (main.cpp:3821, default 32). `!= nullptr` spelling (PRESENCE enables). **Gated 2026-10-11 in `test_gpu_optin.sh:317+`** with a 3-part self-check. A tuning parameter of an already-gated feature, not a separate arithmetic path, so the arm is REACHABILITY-only: it asserts the group the quantiser actually used via the new `[int8-kv-g]` line (main.cpp:10004) and asserts the stream is non-empty (the knob must not move it). Self-check (b) rewrites `group=16` to `group=32`, the exact shape of "the knob was ignored". |
 | `INTFER_L4_ROWS` | FNV row-fidelity hash over q/k/v/b/a/z/S in + out per row (main.cpp:3461-3513). `!= nullptr` spelling (PRESENCE enables). **Gated 2026-10-11 in `test_gpu_optin.sh:408+`** with a 3-part self-check. A DIAGNOSTIC by the census's own definition (it memcpy's data that is already there and discards the result), but its suffix is not in `is_diag`, so the mechanical classifier files it opt-in -- the classifier is correct as a query and the gap is recorded in `check_flag_gate_coverage.sh:25-41`, not silenced by widening the suffix list. The hash runs INSIDE the L4 fused path (TP=1 only, `L4_DECLINE("tp")` at main.cpp:3330), so the arm asserts the new `[l4-rows]` line (main.cpp:3461) on TP=1 and its ABSENCE on TP=2. |
@@ -246,6 +247,51 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_DECODE1_WVEC` | INT2 weight bytes via one `sycl::vec<uint8_t,2>` load from the row-base multi_ptr (PLAN.md 1.7) | bit-exact by construction, model-free MEASURED (rowpair_equiv `wv` order); performance UNKNOWN — kernel bucket only, liveness unverified for the engine. default OFF |
 | `INTFER_WAVE_ALIAS` | alias an UN-ROTATED wave input (qkv/z/b/a, q/k/v) to the caller's own normed buffer instead of memcpying it into a per-item scratch buffer | **bit-exact by construction** (an un-rotated tensor's staging buffer held a byte-for-byte copy of normed; rot_apply fully overwrites its target so a rotated tensor still gets its own buffer). Host-side only -- same kernels, same buffers, same output assembly -- so nk/nw/nr are provably unchanged and the effect is confined to the copy/usm_write buckets. The paying part is the engine's shared-input dedup (src/engine/engine.cpp:2025, POINTER IDENTITY plus an equal M*K): with all aliased items pointing at one vector the FP32->FP16 convert runs ONCE instead of once per item, plus the M*H host memcpys here disappear. 6 sites: step()'s decoder wave-4, prefill_layer_outer's Phase C M-row wave-4, step_batch's M-row mirror wave-4, and the three attention wave-3s (q/k/v). default OFF; PRESENCE enables. Gate: test_gpu_optin.sh asserts the stream matches base AND that the `[wave-alias]` decision line appeared -- a stream comparison alone is vacuous here because the two arms are bit-identical by construction and a flag that never reached the branch would also match; the line prints aliased=N (not ACTIVE-only) so it still appears, reporting aliased=0, on a fully-rotated model. |
 | `INTFER_WAVE_LAUNCH_FUSE` | fuse a wave's N independent GEMMs into ONE parallel_for per device over the union of their output elements, instead of N separate launches | **bit-exact by construction** (each item keeps its own accumulator, ascending kg, ascending j, its own group scale and wtab; the items are interleaved in the instruction stream, never summed together -- the same argument the gate+up kernel uses, which is measured, not argued). TP=2-valid: every item is column-parallel and device-local, and the activation for item i lives in its own wave slot, so nothing crosses the host. Removes N-1 submits + N-1 waits + N-1 D2H readbacks per device per wave (the prefill hot path). Declines on a mismatched M/K/group across items, on INT8 items (which take the host-quant DPAS path), or on any item the fused kernel does not support, so the default path is byte-for-byte the old one when the flag is unset. **UNMEASURED** -- operator-only 27B --tp 2 A/B on the submit bucket. Gate: test_tp2_27b.sh, announcement `[wave-launch-fuse] ... ACTIVE wave=qkv|qkvzba|gateup|zba|named items=N M=... K=... group=...` with a 5-part self-check. | **WIDENED 2026-10-10 (commit after the audit): the kernel now derives each item's group width and group count from its OWN K and group_size (quant_gemm.cpp:2211-2212), so the engine precondition no longer requires items to share K or group_size -- only a shared M. It also runs the fused Phase 3 (wait) and Phase 4 (readback) itself (engine.cpp:2040-2089), because the caller `return`s on success and would otherwise leave live[i]->out stale and the device work undrained -- that was a fatal bug in the shipped commit, invisible to the gate's --self-check because the self-check builds synthetic logs and never touches the engine. The only remaining refusal is the base path's INT8 DPAS branch (quant_gemm.cpp:337: scheme==INT8 && M>=8 && K%32==0 && N%16==0 && group_size==0), which is a different kernel; an INT8 item that misses those conditions takes the same generic dequant and is fusible.**
+
+### Upstream-port survey, 2026-10-12 (SYCL / Xe kernels)
+
+The PARAMOUNT DIRECTIVE's standing objective is to port upstream SYCL/Xe kernels from
+`github.com/ggml-org/llama.cpp` (`ggml/src/ggml-sycl/`), `github.com/vllm-project/vllm-xpu-kernels`
+and `github.com/sgl-project/sgl-kernel-xpu` onto intfer's TP=2 hot paths. This session's upstream
+survey (recursive tree fetched and filtered from `master`, the default branch -- `main` is NOT the
+default) covered the SSM and GEMM candidates the judge suggested:
+
+* **`ggml/src/ggml-sycl/gated_delta_net.cpp`** (366 lines, template `<int S_v, bool KDA, bool keep_rs_t>`).
+  A 4-phase `nd_range<3>` scan/conv with `[[sycl::reqd_sub_group_size(WARP_SIZE)]]`. It is a
+  *different recurrence* from intfer's `ssm_forward` / `ssm_forward_chain`: upstream keeps the
+  state in a rollback cache (`ggml_sycl_gated_delta_net_fused_cache`) and runs the scan as a
+  single fused kernel over the sequence, whereas intfer's kernel is a per-(head, column) loop
+  over M rows with the state passed in as an explicit pointer array. Porting it would be a
+  rewrite of the whole SSM path, not a micro-optimisation, and it is gated behind a
+  `ggml_sycl_try_gdn_cache_fusion` seam that has no analogue in intfer. **Not ported.**
+* **`ggml/src/ggml-sycl/gemm.hpp`** (95 lines). Not a GEMM kernel at all -- it is the
+  `#if GGML_SYCL_DNNL` oneDNN `matmul` wrapper (`DnnlGemmWrapper`), which intfer does not use
+  (its GEMMs are hand-written dequant-on-the-fly SYCL). **Not applicable.**
+* **`ggml/src/ggml-sycl/fused-gemm.cpp`** (1093 lines). A generic `mx::precision` mixed-precision
+  GEMM driver (`fg_combo<TA, TB, TM_, TN_, TK_, SG_>` with a `mx::combination` device probe at
+  `gemm.hpp:231` `dev.get_info<info::device::sub_group_sizes>()`). It is a *weight-dequant*
+  GEMM for MX/blocked formats (iq4_xs, q4_K, q8_0, ...), not the FP16-activation dequant-on-the-fly
+  GEMM intfer ships. **Not applicable to intfer's hot path.**
+* **`ggml/src/ggml-sycl/norm.cpp`** (1137 lines). Ships `norm_f32`, `group_norm_f32`,
+  `rms_norm_f32`, `mean_norm_f32`, and `rms_norm_f16`, all with a `warp_reduce_sum` +
+  `sub_group` butterfly over `local_accessor<float> s_sum`. This IS the technique intfer's
+  `ssm_norm_silu_to_half` already uses inline (per-head square-sum reduction, then
+  `(x*inv)*w*silu(z)` -> FP16). The Q-K V-NORM fusion the judge suggested would be
+  `norm.cpp`'s `rms_norm_f32` applied to intfer's `query`/`key` at the SSM row-prep site
+  (main.cpp:3010-3011, the `l2norm` + `qscale` multiply that becomes `qn_rows`/`kn_rows`).
+  **Not ported this session**: it is a host-side l2norm, already a cheap O(kd) loop, and the
+  device SSM kernel reads the *already-normalised* `qn_rows`/`kn_rows` buffers, so a host
+  normaliser change cannot touch the kernel's memory traffic -- it would be a host copy
+  reduction with no kernel delta, which per the PARAMOUNT DIRECTIVE's fusion test (which round
+  trips does it remove, and what is its launch delta) does not pay.
+
+**Verdict: no upstream micro-optimisation was ported this session.** The survey falsified the
+judge's two named candidates for intfer's actual hot path -- the upstream SSM is a different
+recurrence and the upstream GEMM is a different weight format -- and the upstream norm kernel
+targets a host-side l2norm that intfer already has and that cannot reach the device kernel.
+This is recorded as a *negative result*, not a gap: the SSM_FUSE within-kernel fusion
+(implemented and gated this session) is the fusion that actually reaches the 27B `--tp 2`
+target, and it is decided on `nk`/`nw`/`nr` (operator-only A/B), not on a tok/s.
 
 ### Default ON, with a kill switch
 
