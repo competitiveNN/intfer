@@ -416,7 +416,7 @@ Decide on those, never on `kernel`.
   `UR_RESULT_ERROR_DEVICE_LOST` (ten identical runs): rank 1 read rows
   0..Ng-1 of a buffer holding 4352. `start/Nl = 0` with `Nl == Ng/Nu`
   reproduces the TP=1 behaviour byte-for-byte. Verified by
-  `examples/gateup_equiv` (30/30 PASS incl. SLICED / SLICED-OUTONLY /
+  `examples/gateup_equiv` (30 of 30 datasets PASS incl. SLICED / SLICED-OUTONLY /
   SLICED-OFFSET); the negative direction re-crashes. `f0192ea`.
 * **TP is COLUMN-parallel with a HOST gather — there is no All-Reduce.** `shard_weight`
   slices the output dim N; `run_linear_tp` waits all ranks, then each rank's D2H is
