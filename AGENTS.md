@@ -324,11 +324,22 @@ and read against intfer's actual code; **none ports**, and the reasons are struc
   not applicable.**
 
 **The one sgl file that IS structurally closest** is `src/sycl/gdn_attn/chunk_gated_delta_rule.cpp`
-+ `gated_delta_rule.hpp` -- a chunked gated-delta-net scan. It was **not fetched** in round 1
-and is the single remaining upstream candidate. It was inspected only via the tree listing;
-fetching and diffing it against `ssm_forward_chain` is scoped work, not a port, because
-upstream's scan is a single fused kernel over the sequence with a rollback cache while intfer's
-chained kernel is a per-(head, column) loop over M rows with the state passed in as one pointer.
++ `gated_delta_rule.hpp` -- a chunked gated-delta-net scan. **Fetched 2026-10-12 (round 3) and
+diffed against `ssm_forward_chain`** -- the single remaining upstream candidate is now closed.
+The 2-pass fold it demonstrates (`state += k*delta; res += state*q`) is **already intfer's
+`INTFER_SSM_FUSE`** (commit `881c02f`), same decay-then-dot / update-then-readout, same
+ascending-d accumulation order. The one genuinely novel technique, an **in-kernel l2norm of q and
+k** (`q_sum = Σ q[i]²; reduce_over_group(sg, q_sum); q /= sqrt(q_sum+eps)`), fails the fusion
+test on both counts: intfer's Q/K normaliser is the *host-side* `l2norm` + `qscale`
+(`main.cpp:3010-3011`, M-row twin 3464-3467, 6512-6515) and the normalised `qn_rows`/`kn_rows`
+are already device USM (`quant_gemm.hpp:690-691`) consumed by the kernel with zero extra transfer
+-- porting the in-kernel norm would *add* an H2D upload of raw q/k and *remove* a host kernel
+that touches no device memory, so no round trip is removed and the launch count goes up. The
+`reduce_over_group` is not portable either: sgl splits v-dim across sub-group lanes
+(`v_dim_per_sg = 4`), so `kv_mem`/`res` are per-lane partials needing a cross-lane reduction, while
+intfer's SSM has one WI per (head, column) with scalar accumulators. sgl's spec-decoding rollback
+cache also has no consumer in intfer (no speculative decoding). **All four sgl-kernel-xpu
+candidates are now falsified.** See `upstream_sgl_gdn_chunk_20261012.md`.
 
 ### Default ON, with a kill switch
 
