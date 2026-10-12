@@ -2064,6 +2064,15 @@ bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
     code[i] = sc.code_usm[0];
     scale[i] = sc.scale_usm[0];
     alpha[i] = sc.has_global_divisor ? sc.global_host : 1.0f;
+    // *** Ni IS THE LOCAL COLUMN COUNT, NOT t.N. *** The kernel writes
+    // outp[m * Ni_arr[i] + n] for n in [0, Ni) and its nd_range total is
+    // sum(M_i * Ni_i), so Ni MUST be THIS DEVICE's column range, matching the
+    // wv_[...].out buffer (engine.cpp:669 allocates M * Nl_max). Passing
+    // t.N here made every fused wave at TP=2 compute m = local / t.N and
+    // write M * t.N halfs into an M * (t.N / 2) buffer -- a 2x OOB write whose
+    // data the Phase 4 readback (local N_local_rb stride) never reads. Seeded
+    // per device below; this pass only fills the device-0 arrays so they are
+    // never empty.
     Mi[i] = M; Ni[i] = t.N; Ki[i] = t.K; Gi[i] = sc.group_size;
     ws[i] = sc.scheme;
   }
@@ -2074,8 +2083,14 @@ bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
     sycl::queue& q = dev.queue;
     for (size_t i = 0; i < nl; ++i) {
       const auto& sc = shard_cache_[(size_t)items[i]->tensor_index];
+      const auto& ranges = shards_[(size_t)items[i]->tensor_index].ranges;
       code[i] = sc.code_usm[d];
       scale[i] = sc.scale_usm[d];
+      // Ni must be THIS DEVICE's column range: the kernel's linear -> (m, n)
+      // decode and its output stride are both Ni, and the out buffer slot is
+      // M * Nl_local. Using t.N (the sharded width) is a 2x OOB write at
+      // TP=2 -- see the note in the setup loop above.
+      Ni[i] = static_cast<uint32_t>(ranges[d].second - ranges[d].first);
       // act AND out are per (item, device): slot i on device d is
       // wv_[d*wv_W_ + i]. The default path below writes the same slots in
       // Phase 1/2 and reads them back in Phase 4, so the workspace is
@@ -2172,10 +2187,50 @@ bool Engine::run_linear_wave_fused(const LinearWaveItem** items, size_t nl,
     announced_wf = true;
     const auto& t0 = model_.tensors[(size_t)items[0]->tensor_index];
     const auto& sc0 = shard_cache_[(size_t)items[0]->tensor_index];
+    // WHICH wave fused. The launch count alone cannot say it: the q/k/v
+    // wave-3 and the z/b/a wave-4 both print items=3/4, so a gate reading
+    // only `items=` would certify "the q/k/v wave fused" on a log where only
+    // the z/b/a wave did. Classify from the tensors' own names -- the same
+    // suffixes the caller groups on (main.cpp: "q/k/v are independent",
+    // "z/b/a are independent", "gate/up share rin"). An item whose name the
+    // caller did not carry (name==nullptr) drops out of the classification
+    // and the tag falls back to "items", which is still a real distinction
+    // from the default path (nl separate launches).
+    bool has_q=false, has_k=false, has_v=false, has_z=false, has_b=false,
+         has_a=false, has_gate=false, has_up=false, has_qkv=false;
+    size_t named = 0;
+    for (size_t i = 0; i < nl; ++i) {
+      const std::string* nm = items[i]->name;
+      if (!nm) continue;
+      ++named;
+      if (nm->find("in_proj_qkv") != std::string::npos) has_qkv = true;
+      else {
+        if (nm->find("q_proj") != std::string::npos) has_q = true;
+        if (nm->find("k_proj") != std::string::npos) has_k = true;
+        if (nm->find("v_proj") != std::string::npos) has_v = true;
+      }
+      // in_proj_z.weight / in_proj_b.weight / in_proj_a.weight carry the
+      // letter right before ".weight", so "_z." / "_b." / "_a." matches.
+      if (nm->find("in_proj_z") != std::string::npos ||
+          nm->find("_z.") != std::string::npos) has_z = true;
+      if (nm->find("in_proj_b") != std::string::npos ||
+          nm->find("_b.") != std::string::npos) has_b = true;
+      if (nm->find("in_proj_a") != std::string::npos ||
+          nm->find("_a.") != std::string::npos) has_a = true;
+      if (nm->find("gate_proj") != std::string::npos) has_gate = true;
+      if (nm->find("up_proj") != std::string::npos) has_up = true;
+    }
+    const char* wave = "items";
+    if (has_qkv && has_z && has_b && has_a) wave = "qkvzba";
+    else if (has_q && has_k && has_v && has_z && has_b && has_a) wave = "qkvzba";
+    else if (has_q && has_k && has_v) wave = "qkv";
+    else if (has_gate && has_up) wave = "gateup";
+    else if (has_z && has_b && has_a) wave = "zba";
+    else if (named == nl) wave = "named";
     std::fprintf(stderr,
                  "[wave-launch-fuse] fused wave GEMM ACTIVE "
-                 "(items=%zu M=%u K=%u group=%u, one launch per device)\n",
-                 nl, M, t0.K, sc0.group_size);
+                 "(wave=%s items=%zu M=%u K=%u group=%u, one launch per device)\n",
+                 wave, nl, M, t0.K, sc0.group_size);
   }
   return true;
 }

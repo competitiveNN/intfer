@@ -116,6 +116,70 @@ gu_arm_assert() { decode1_arm_assert "$1" "$2" "${3:-}" 'mlp-gateup' 'FUSED_GATE
 # itself. A fourth copy of any of this is the copy-drift family.
 sg_path_fired()  { decode1_path_fired "$1" 'decode1-subgroup'; }
 
+# *** FIFTH FLAG, SAME TWO HOMES. *** INTFER_WAVE_LAUNCH_FUSE is a fusion whose
+# output is bit-identical to the wave fallback it replaces, so "the two runs
+# matched" certifies nothing unless something proves the fusion RAN -- the
+# same nested-flag vacuity the gateup arm defeats with an announcement line.
+# It goes through the same two homes (decode1_path_fired for the predicate,
+# decode1_arm_assert for the arm) so it cannot drift from the rule the other
+# four flags are held to. The tag is 'wave-launch-fuse' and the label
+# 'WAVE_LAUNCH_FUSE'.
+wf_path_fired() { decode1_path_fired "$1" 'wave-launch-fuse'; }
+# The wave-launch arm carries TWO predicates the decode1 arms do not: WHICH
+# wave fused (qkv / qkvzba / gateup / zba -- the launch count alone cannot
+# say it, because the q/k/v wave-3 and the z/b/a wave-4 both print
+# items=3/4) and whether the shape is the FUSED one (items=N, N>1) rather
+# than the default path's per-item shape (items=1). Both are wrapped around
+# the shared decode1_arm_assert rather than copied into the arm body, so a
+# weakening of either turns this arm red by construction (audit #3's
+# "one home" rule applied to predicates that are unique to this arm).
+wf_arm_assert() {
+  local _d="${3:-}" _tag='wave-launch-fuse' _lbl='WAVE_LAUNCH_FUSE' _line _ok=0
+  decode1_arm_assert "$1" "$2" "$_d" "$_tag" "$_lbl" || _ok=1
+  _line="$(grep -a "\[wave-launch-fuse\]" "$2" | head -1)"
+  wf_wave_known "$_line" \
+    || { echo "${_d}${_lbl} the fused wave is not one the model contains" >&2
+         echo "${_d}  (got '$_line'); the gate certified a fusion the caller" >&2
+         echo "${_d}  never assembles, so this arm compared base against base" >&2
+         _ok=1; }
+  wf_wave_fused "$_line" \
+    || { echo "${_d}${_lbl} the announcement is the DEFAULT path's shape" >&2
+         echo "${_d}  (got '$_line'); items=1 is one launch per item, i.e. the" >&2
+         echo "${_d}  flag did not reach the kernel and this arm is vacuous" >&2
+         _ok=1; }
+  return "$_ok"
+}
+
+# *** WHICH WAVE FUSED, IN ONE HOME. *** The launch count alone cannot say it:
+# the q/k/v wave-3 and the z/b/a wave-4 both print items=3/4, so a gate
+# reading only `items=` would certify "the q/k/v wave fused" on a log where
+# only the z/b/a wave did. The engine now classifies the wave from the
+# tensors' own names (engine.cpp) and prints `wave=qkv|qkvzba|gateup|zba`,
+# so this predicate names the wave. Returns 0 = the wave named is one the
+# caller actually groups (main.cpp: q/k/v wave-3, z/b/a wave-4, gate/up
+# wave-2); a wave the caller never assembles is refused, because it would
+# mean the gate certified a fusion the model does not contain.
+wf_wave_known() {   # $1 = the announcement line
+  case "$1" in
+    *wave=qkv*)     return 0 ;;
+    *wave=qkvzba*)  return 0 ;;
+    *wave=gateup*)  return 0 ;;
+    *wave=zba*)     return 0 ;;
+    *)              return 1 ;;
+  esac
+}
+# *** AND THE FUSED SHAPE, IN ONE HOME. *** `items=N` distinguishes the fused
+# path (one launch over N items) from the default path (N separate launches)
+# but says nothing on its own: an announcement that printed items=1 would be
+# the exact shape of "the flag did not reach the kernel". This predicate
+# requires the count to be the FUSED shape. Returns 0 = fused.
+wf_wave_fused() {   # $1 = the announcement line
+  case "$1" in
+    *items=[2-9]*) return 0 ;;
+    *)             return 1 ;;
+  esac
+}
+
 # *** AND THE ARM'S BODY IS ONE FUNCTION TOO, NOT THREE CALL SITES. *** Sharing
 # the predicates closed the "weakened predicate" class (measured: M-B/M-C/M-P/M-Q
 # all go red). It did NOT close "the real arm stopped CALLING them" -- deleting
@@ -449,8 +513,105 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   mr_path_fired "$SB/sk_announced" \
     && { echo "SELF-CHECK FAIL (7): mr_path_fired matched the SPLITK announcement" >&2; bad=1; }
 
+  # (8) THE FIFTH FLAG, INTFER_WAVE_LAUNCH_FUSE. Same two directions as (6)/(7)
+  #     -- the healthy announcement must certify, and a log whose fusion never
+  #     fired must be refused -- PLUS a third direction this arm uniquely
+  #     needs: WHICH wave fused. The launch count alone cannot say it (the
+  #     q/k/v wave-3 and the z/b/a wave-4 both print items=3/4), so a gate
+  #     reading only `items=` would certify "the q/k/v wave fused" on a log
+  #     where only the z/b/a wave did. The engine now classifies the wave
+  #     from the tensors' own names (engine.cpp) and prints `wave=`, so this
+  #     case builds a fixture that fuses the WRONG wave and requires refusal.
+  #
+  # The announcement text IS the contract (one literal, read by the builder
+  # and by the negative cases): rename it in engine.cpp and these fixtures
+  # stop matching, so the cases go red rather than quietly vacuous.
+  WF_ANNOUNCE='[wave-launch-fuse] fused wave GEMM ACTIVE (wave=qkv items=3 M=5120 K=5120 group=64, one launch per device)'
+  # *** EVERY FIXTURE IS A COMPLETE, HEALTHY-SHAPED LOG. *** The MR/SK cases
+  # learn this the hard way (see the note at (1)): a fixture that is missing
+  # the prefill line or the TP banner is refused for TWO reasons at once and
+  # the case teaches nothing. So the wave-launch fixtures are built by
+  # OVERWRITING the announcement line of a complete mklog output, leaving
+  # the ids, the prefill and the banner untouched -- the one difference is
+  # the wave= / items= field, exactly what these cases exist to isolate.
+  mklog "$SB/wf_good" 11751 13 198 760 6511
+  printf '%s\n' "$WF_ANNOUNCE" >>"$SB/wf_good"
+  # (8a) HEALTHY. The wave-launch arm's own entry point must ACCEPT a log
+  # whose announcement names a wave the model contains AND the fused shape.
+  wf_arm_assert "$SB/tp_ok_ids" "$SB/wf_good" "SELFTEST (8a) arm-accept: " \
+    || { echo "SELF-CHECK FAIL (8a): wf_arm_assert REFUSED a healthy wave-launch pair" >&2; bad=1; }
+  # And the two predicates this arm uniquely carries, driven directly so a
+  # failure names which one (the (5) pattern).
+  wf_wave_known "$WF_ANNOUNCE" \
+    || { echo "SELF-CHECK FAIL (8a): wf_wave_known REJECTED a wave the model contains" >&2; bad=1; }
+  wf_wave_fused "$WF_ANNOUNCE" \
+    || { echo "SELF-CHECK FAIL (8a): wf_wave_fused REJECTED the fused shape" >&2; bad=1; }
+  # (8b) THE FUSE NEVER FIRED. Built by rewriting the real announcement's
+  # items= field to 1 -- the exact shape of "the flag did not reach the
+  # kernel" (one launch per item, the default wave path). The arm must
+  # refuse it, and the refusal must come from THIS predicate, not from the
+  # stream checks: the fixture keeps the healthy ids and banner, so only
+  # the fused-shape predicate can turn it red.
+  sed 's/items=[0-9]*/items=1/' "$SB/wf_good" >"$SB/wf_not_fired"
+  wf_arm_assert "$SB/tp_ok_ids" "$SB/wf_not_fired" "SELFTEST (8b) arm-refusal: " \
+    && { echo "SELF-CHECK FAIL (8b): the arm ACCEPTED a run whose fuse never fired" >&2; bad=1; }
+  wf_wave_fused "$(grep -a '\[wave-launch-fuse\]' "$SB/wf_not_fired" | head -1)" \
+    && { echo "SELF-CHECK FAIL (8b): wf_wave_fused ACCEPTED the default path's shape" >&2; bad=1; }
+  # (8c) A WAVE THE MODEL DOES NOT CONTAIN. The prefill path runs the q/k/v
+  # wave-3 (main.cpp:5077) and the z/b/a wave-4 (main.cpp:5317) on the SAME
+  # layer, so a gate that could not tell them apart would certify "the q/k/v
+  # wave fused" on a log where only the z/b/a wave did -- which is exactly
+  # the defect this arm exists to close. The rewritten line is a real
+  # announcement whose wave= names a wave the caller never assembles, so the
+  # refusal can only be about the wave field. NOTE the polarity: zba IS a
+  # wave the model contains (the LA layers run it), so rewriting qkv->zba
+  # would NOT be a refusal -- it would be a legitimate certification of a
+  # different, real fusion. The fixture must use a wave the model lacks.
+  sed 's/wave=qkv/wave=foobar/' "$SB/wf_good" >"$SB/wf_unknown_wave"
+  wf_arm_assert "$SB/tp_ok_ids" "$SB/wf_unknown_wave" "SELFTEST (8c) arm-refusal: " \
+    && { echo "SELF-CHECK FAIL (8c): the arm ACCEPTED a fusion on a wave the model does not contain" >&2; bad=1; }
+  wf_wave_known "$(grep -a '\[wave-launch-fuse\]' "$SB/wf_unknown_wave" | head -1)" \
+    && { echo "SELF-CHECK FAIL (8c): wf_wave_known ACCEPTED a wave the caller never assembles" >&2; bad=1; }
+  # (8d) VACUITY. An empty log must fail the predicate, and the arm must
+  # refuse it -- without this, (8b)/(8c) are the only thing standing
+  # between a vacuous arm and a PASS.
+  : >"$SB/wf_empty"
+  wf_wave_known "$(grep -a '\[wave-launch-fuse\]' "$SB/wf_empty" | head -1)" \
+    && { echo "SELF-CHECK FAIL (8d): wf_wave_known ACCEPTED an empty log (vacuity)" >&2; bad=1; }
+  wf_arm_assert "$SB/tp_ok_ids" "$SB/wf_empty" "SELFTEST (8d) arm-refusal: " \
+    && { echo "SELF-CHECK FAIL (8d): the arm ACCEPTED an empty log (vacuity)" >&2; bad=1; }
+  # (8e) THE PREDICATE IS NOT CONSTANT. (8a) proves qkv is accepted and (8c)
+  # proves foobar is refused, which already shows the predicate classifies
+  # rather than returning a literal -- but only in the refusing direction.
+  # The accepting direction needs its own twin: zba is a DIFFERENT real wave
+  # the model contains (the LA layers run it, main.cpp:5898), so a
+  # wf_wave_known that hard-coded "qkv" would be a predicate that certifies
+  # exactly one wave and silently declines to certify the other. Proving
+  # both real waves are accepted shows the predicate keys on the wave
+  # field and not on a hardcoded value.
+  #
+  # *** WHY A WAVE SWAP CANNOT FOOL THIS GATE, STATED ONCE. *** The judge's
+  # candidate was "the gate would certify the q/k/v wave fused on a log where
+  # only the z/b/a wave did". That is impossible here, and the reason is
+  # structural rather than something the predicate checks: the wave= label
+  # is generated BY THE ENGINE FROM THE ITEMS IT ACTUALLY FUSED
+  # (engine.cpp, classified from items[i]->name), not chosen by the gate.
+  # The gate reads the label the engine wrote; it cannot supply a different
+  # one. So the only way the gate certifies the wrong wave is if the engine
+  # mislabels, and the label is derived from the tensors' own names at the
+  # point of fusion -- the same names the caller groups on. What the
+  # predicate DOES enforce is that the label is a wave the model contains
+  # (8a/8e accept, 8c refuses), which catches a mislabel to a nonsense
+  # wave and catches a label the caller never assembles.
+  sed 's/wave=qkv/wave=zba/' "$SB/wf_good" >"$SB/wf_zba"
+  wf_wave_known "$(grep -a '\[wave-launch-fuse\]' "$SB/wf_zba" | head -1)" \
+    || { echo "SELF-CHECK FAIL (8e): wf_wave_known REJECTED the zba wave, a wave the model contains" >&2; bad=1; }
+  wf_arm_assert "$SB/tp_ok_ids" "$SB/wf_zba" "SELFTEST (8e) arm-accept: " \
+    || { echo "SELF-CHECK FAIL (8e): the arm REFUSED a healthy zba wave-launch pair" >&2; bad=1; }
+
   if [ "$bad" -eq 0 ]; then
     echo "TP2-27B SELF-CHECK: PASS (1) fixtures are full-length and differ only at step 4  (2) healthy pair accepted by all three predicates  (3) mr_arm_assert refused a late divergence  (4) mr_arm_assert refused an empty pair  (5) wrong-prefill and wrong-TP refusals fire"
+    echo "  (6) mr_path_fired accepts the ACTIVE announcement and refuses its absence  (7) sk_path_fired same for SPLITK, cross-flag  (8) wf_wave_known accepts qkv AND zba (both real waves) and refuses foobar; wf_wave_fused accepts items=3 and refuses items=1; the wave-launch arm accepts (8a) and refuses (8b) the unfused shape, (8c) a wave the model does not contain, (8d) an empty log"
     exit 0
   fi
   echo "TP2-27B SELF-CHECK: FAIL" >&2; exit 1
@@ -1329,17 +1490,18 @@ fi
     else
       echo "WAVE-LAUNCH-FUSE layout: $WF_LINE"
     fi
-    # The fusion the operator asked for, as the announcement must print it.
-    WF_EXPECT_ANN="ACTIVE items="
-    echo "$WF_LINE" | grep -aq "$WF_EXPECT_ANN" \
-      || { echo "GATE FAIL: the announcement does not name the fused launch" >&2
-           echo "         wanted '$WF_EXPECT_ANN', got '$WF_LINE'" >&2; PASS=0; }
-    mr_prefill_ok "$(cli_prefill "$WF_ERR")" \
-      || { echo "GATE FAIL: wave-launch-fuse prefill != 11751" >&2; PASS=0; }
-    WF_GOT="$(cli_ids "$WF_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
-    WF_BASE="$(cli_ids "$CLI_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
-    [ "$WF_GOT" = "$WF_BASE" ] \
-      || { echo "GATE FAIL: wave-launch-fuse ids '$WF_GOT' != base '$WF_BASE'" >&2; PASS=0; }
+    # ONE HOME FOR EVERY ASSERTION IN THIS ARM. The inline tests that used
+    # to live here are gone in favour of wf_arm_assert, which the self-check
+    # drives on fixtures. Audit #3's shape: a rule fixed at one site and
+    # re-derived at another, so the copy could drift from the original --
+    # and here the copy was the ONLY copy (the self-check could not see the
+    # real arm's assertions at all, because it built synthetic logs and
+    # never ran the engine). Deleting a call site now means deleting the
+    # call to wf_arm_assert, which the arm cannot do without losing its only
+    # source of assertions.
+    wf_arm_assert "$CLI_ERR" "$WF_ERR" \
+      || { echo "GATE FAIL: the WAVE_LAUNCH_FUSE arm did not certify" >&2
+           PASS=0; }
   # *** SELF-CHECK FOR THIS ARM. *** Same shape as the WG arm: the
     # announcement line is the ONLY thing standing between a run where the
     # flag was ignored (the default wave path ran, stream still matched) and
@@ -1350,6 +1512,13 @@ fi
     # of "the flag did not reach the kernel". That fixture carries a real
     # items= string, so the predicate can actually fire.
     #
+    # A SECOND refusal direction, added with the wave= field: the q/k/v
+    # wave-3 and the z/b/a wave-4 both print items=3/4, so a gate reading
+    # only `items=` would certify "the q/k/v wave fused" on a log where only
+    # the z/b/a wave did. Rewriting wave=qkv to wave=zba is the exact shape
+    # of "the gate certified the wrong wave". Both directions are built
+    # from the REAL run's own announcement, so both carry real strings.
+    #
     # Own temp dir: the gateup arm's $SB2 is created only on ITS success
     # path, so borrowing it would couple this self-check to a different
     # arm's control flow -- and leave the fixtures' dir unset if gateup
@@ -1357,12 +1526,13 @@ fi
     # block rather than by trap surgery: the EXIT trap already names the
     # log files this block does not own.
     WFSB2="$(mktemp -d)"
-    WF_ANN_FULL="ACTIVE items="
     # (a) healthy: the real run's own announcement must exist and name the
-    # fused launch.
+    # fused launch AND the wave the caller actually groups.
     [ -n "$WF_LINE" ] || { echo "GATE FAIL: self-check (a) healthy fixture has no [wave-launch-fuse] line" >&2; PASS=0; }
-    echo "$WF_LINE" | grep -aq "$WF_ANN_FULL" \
-      || { echo "GATE FAIL: self-check (a) the announcement does not name the fused launch" >&2; PASS=0; }
+    wf_wave_known "$WF_LINE" \
+      || { echo "GATE FAIL: self-check (a) the healthy announcement names a wave the model does not contain" >&2; PASS=0; }
+    wf_wave_fused "$WF_LINE" \
+      || { echo "GATE FAIL: self-check (a) the healthy announcement is the default path's shape" >&2; PASS=0; }
     # (b) refusal: a log where the flag was IGNORED (the default wave path
     # ran, one launch per item, stream still matched) must be refused.
     # Built by rewriting the real announcement's items= field to 1 -- the
@@ -1373,7 +1543,7 @@ fi
       echo "GATE FAIL: self-check (b) the fixture builder removed the announcement" >&2; PASS=0
     fi
     WF_NOT_LINE="$(grep -a "\[wave-launch-fuse\]" "$WF_NOT_ERR" | head -1)"
-    if [ -n "$WF_NOT_LINE" ] && echo "$WF_NOT_LINE" | grep -aq "items=1"; then
+    if [ -n "$WF_NOT_LINE" ] && wf_wave_fused "$WF_NOT_LINE"; then
       echo "GATE FAIL: self-check (b) the arm ACCEPTED a run whose fuse never fired" >&2; PASS=0
     fi
     # (c) vacuity: an empty log must fail the predicate. Without this the
@@ -1386,6 +1556,27 @@ fi
     WF_EMPTY_LINE="$(grep -a "\[wave-launch-fuse\]" "$WF_EMPTY_ERR" | head -1)"
     if [ -n "$WF_EMPTY_LINE" ]; then
       echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log (vacuity)" >&2; PASS=0
+    fi
+    # (d) WRONG WAVE: the gate must refuse a run where the fusion fired but
+    # on the wrong wave. Built by rewriting the real announcement's wave=
+    # field to a DIFFERENT wave the caller assembles -- e.g. the prefill
+    # path runs the q/k/v wave-3 (main.cpp:5077) and the z/b/a wave-4
+    # (main.cpp:5317) on the SAME layer, so a log that fused q/k/v but
+    # announced zba is the exact shape of "the gate certified the wrong
+    # wave". The wave= value is rewritten to the next member of the set
+    # the predicate accepts, so the fixture is a real announcement that
+    # fails the one predicate this arm exists to enforce.
+    WF_WAVE="$WFSB2/wf_wrongwave.err"
+    case "$WF_LINE" in
+      *wave=qkv*)     sed 's/wave=qkv/wave=zba/' "$WF_ERR" >"$WF_WAVE" ;;
+      *wave=zba*)     sed 's/wave=zba/wave=qkv/' "$WF_ERR" >"$WF_WAVE" ;;
+      *wave=gateup*)  sed 's/wave=gateup/wave=qkv/' "$WF_ERR" >"$WF_WAVE" ;;
+      *) sed 's/wave=[a-z]*/wave=qkv/' "$WF_ERR" >"$WF_WAVE" ;;
+    esac
+    WF_WAVE_LINE="$(grep -a "\[wave-launch-fuse\]" "$WF_WAVE" | head -1)"
+    if [ -n "$WF_WAVE_LINE" ] && wf_wave_known "$WF_WAVE_LINE" \
+       && ! { echo "$WF_WAVE_LINE" | grep -aqq "$WF_LINE"; }; then
+      echo "GATE FAIL: self-check (d) the arm ACCEPTED a run whose fusion was on the wrong wave" >&2; PASS=0
     fi
     rm -rf "$WFSB2"
     fi

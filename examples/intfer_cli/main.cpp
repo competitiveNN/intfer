@@ -1122,6 +1122,14 @@ struct GpuBackend : public LinearBackend {
       eitems[ne].tensor_index = it->second;
       eitems[ne].x = items[i].x;
       eitems[ne].out = items[i].out;
+      // Carry the tensor's name into the engine's item so the fused-wave
+      // announcement can name WHICH wave fused. The launch count alone
+      // cannot: the q/k/v wave-3 and the z/b/a wave-4 both print
+      // items=3/4, and a gate reading only that field would certify "the
+      // q/k/v wave fused" on a log where only the z/b/a wave did. The
+      // caller's LinearWaveItem::name is a std::string (owned by the caller's
+      // stack array, alive through this call), so copying it here is safe.
+      eitems[ne].name = &items[i].name;
       ++ne;
     }
     if (ne == 0) return;
@@ -1158,6 +1166,10 @@ struct GpuBackend : public LinearBackend {
       eitems[ne].tensor_index = it->second;
       eitems[ne].x = items[i].X;
       eitems[ne].out = items[i].Y;
+      // Carry the tensor's name into the engine's item (see the scalar wave
+      // shim above): the M-row path feeds every batch call site, so without
+      // this the fused-wave announcement would be count-only there.
+      eitems[ne].name = &items[i].name;
       ++ne;
     }
     if (ne == 0) return;

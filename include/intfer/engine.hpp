@@ -81,6 +81,17 @@ class Engine {
     int tensor_index = -1;
     const std::vector<float>* x = nullptr;
     std::vector<float>* out = nullptr;
+    // The tensor's HF name (model_.tensors[tensor_index].name), carried by the
+    // caller so the fused-wave announcement can name WHICH wave fused. The
+    // launch count alone cannot: a wave of 4 items is 4 separate launches in
+    // the default path and 1 in the fused path, so `items=N` distinguishes
+    // fused from unfused but says nothing about which tensors were in it --
+    // the q/k/v wave-3 and the z/b/a wave-4 both print items=3/4 and a gate
+    // reading only that field would certify "the q/k/v wave fused" on a log
+    // where only the z/b/a wave did. Optional (nullptr = caller did not set
+    // it); the announcement falls back to the count-only form rather than
+    // crashing on a null deref.
+    const std::string* name = nullptr;
   };
   void run_linear_wave(const LinearWaveItem* items, size_t n, uint32_t M);
 
