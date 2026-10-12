@@ -3734,3 +3734,82 @@ checking the wrong number. That is the strongest argument yet for states over
 inspection in this repo: the defects were not subtle, the *harvests* were, and only
 something that deliberately broke the world noticed.
 
+
+=== 2026-10-12 AUDIT #34: A CHECKER WHOSE PREDICATE HALF COULD NOT FAIL, AND
+   THE FOUR WAYS IT WAS DEAD BEFORE THE MATRIX RAN ===
+
+scripts/check_dpas_shape_audit.sh enumerates every tensor in the model's
+.intifer header and asserts that the shape constraints the three ESIMD DPAS
+kernels require are met -- N%16==0, K%32==0, (bits,group) in the combo set --
+and that the predicate this audit re-derives is the SAME predicate
+scripts/_dpas_pred.sh defines, which is the one the engine consults.
+
+It is not a gate. It reads the header (never the weights) and derives every
+shard from engine.cpp's own integer-division split, so it is load-insensitive
+and runs on a contended box. It exists because the kernels derive nT = N/16 and
+nOp = K/32 with NO bounds check inside them (quant_gemm.cpp:2711, 3062,
+3145): a shape that does not divide evenly is not a declined launch, it is an
+out-of-bounds one. The engine's own dpas48_eligible (engine.cpp:201) makes the
+DPAS path unreachable for any non-dividing shape, so what is certified here is
+the GUARD, not the kernel -- and a future model or a future shard split that
+violates a constraint is caught here rather than at first 27B run.
+
+On the real 27B the verdict is PASS: 498 tensors, 242 INT2/INT4/INT8 full
+tensors, 484 TP=2 shards, 0 full-tensor violations, 0 shard violations, 0
+predicate drift.
+
+**WHAT THE MATRIX FOUND, and it was four separate ways the "predicate
+re-derived" half was DEAD before states were written against it.**
+
+*THE FIRST VERSION'S VERDICT PLUMBING NEVER RAN.* The script had THREE
+enumeration blocks -- two duplicates that ran uncaptured, and a third
+`python3 - ... > "$ENUM_FILE" <<'PYEOF'PYEOF` whose heredoc body was missing
+and which had a stray `)"`. Result: `ENUM_OUT` was empty, so `MODEL_NAME`,
+`TENSORS`, `FULL_VIOLATIONS` and `SHARD_VIOLATIONS` were all empty strings and
+the verdict block died on `[: : integer expected` under `set -u`. The fix was
+to delete the duplicates and keep exactly ONE enumeration block whose stdout is
+redirected into `$TMP/enum.out` and parsed. AGENTS.md rule 4 again: the numbers
+are derived, never retyped.
+
+*A KEY-VALUE PARSING DEFECT THE SELF-CHECK COULD NOT SEE.* The enumeration
+printed `FULL_TENSORS_CHECKED=%d FULL_VIOLATIONS=%d` on ONE line, so the
+checker's own `get_enum FULL_VIOLATIONS` -- anchored `^FULL_VIOLATIONS=` --
+silently returned nothing. Two keys on one line is the shape that makes a
+`grep -E "^KEY="` parser return empty rather than wrong, which is the same
+trap AUDIT #32's nullglob entry describes. Every key is now printed on its own
+line.
+
+*THE PREDICATE HALF WAS NEVER CONSULTED AT ALL.* The first working version
+computed `PREDICATE_DRIFT=n` and printed it, and the verdict block tested only
+`$VF`, `$VS` and `$self_bad`. A checker that prints a number it does not test
+has half its claim decorative. DS-2 in the mutation matrix -- a re-derived
+predicate whose combo set is STRICTER than the real one -- ran the checker, got
+"220 shard(s) where the re-derived predicate disagrees with _dpas_pred.sh",
+rc=1, and the matrix reported `MISSED (wrong reason; rc=1)` because the
+printed message and the tested variable were different sentences. Fixed by
+parsing `PREDICATE_DRIFT` into a shell variable and gating on it.
+
+*THE DRIFT DETECTOR WAS STRUCTURALLY INERT.* The re-derived predicate was
+deleted and rewritten to call scripts/_dpas_pred.sh via subprocess, because
+the original implementation ran a probe that called `dpas_eligible` WITHOUT
+echoing its rc, so the probe emitted 0 lines for N cases, the assertion
+`len(out) == len(cases)` fired, and the comparison never executed. A second
+version skipped `os.chmod` and `subprocess.run([probe])`, which failed
+`PermissionError: [Errno 13]` when the stack ran the checker as a uid that
+does not share the sandbox directory. Both are now fixed: the probe writes
+`dpas_eligible ...; echo "$?"` per case and is invoked as `bash probe`.
+
+*AND THE VERDICT ORDER HID THE REMAINING HALF.* With both halves finally
+working, the shape verdict came first and `exit 1`'d before the drift check
+was reached, so a model with a shape violation never exercised the drift
+detector. The two halves are independent claims; each must be able to fail the
+run on its own. The predicate half now runs BEFORE the shape half.
+
+**RULE, and it is the one this repo keeps re-learning: a checker whose verdict
+tests only part of what it computes is a checker whose untested half is
+furniture.** The only thing that proved the predicate half existed was a
+mutation state aimed at it. Inspection did not: every version of this file
+read as though both halves were live, including the two where the drift
+detector could not execute.
+
+=== END AUDIT #34 ===
