@@ -2077,3 +2077,43 @@ intfer's hot path, and the reasons are structural rather than a matter of taste:
 Recorded as a **negative result, not a backlog item.** The `INTFER_SSM_FUSE`
 within-kernel fusion above is the optimization that actually reaches the target,
 and it is decided on `nk`/`nw`/`nr`, never on a tok/s.
+
+## 2026-10-12 (round 2): sgl-kernel-xpu re-surveyed — all three judge-named candidates falsified
+
+The judge's Reminder 6 named three sgl-kernel-xpu candidates for intfer's TP=2 hot path.
+The repo's default branch is **`main`** (not `master`); the recursive tree (696 entries) was
+fetched and filtered. All three were fetched and read against intfer's actual code; **none
+ports**, and the reasons are structural:
+
+* **Fused QK norm+RoPE** (`src/sycl/FusedQKNormRope.cpp`, `include/sgl_kernel/jit_kernel/
+  elementwise/qknorm.hpp`, `rope.hpp`, `rmsnorm.hpp`) — sub-group-per-row, register-only,
+  grid-stride persistent. **Fails the fusion test on both counts.** intfer's Q/K normaliser is
+  the *host-side* `l2norm` + `qscale` at `main.cpp:3010-3011` (M-row twin at 3464-3467,
+  6512-6515); the device SSM kernel reads the already-normalised `qn_rows`/`kn_rows`
+  (`quant_gemm.hpp:690-691`). A host normaliser change touches no kernel memory traffic and
+  removes no round trip. Already-shipped technique, not a gap.
+* **DPAS48 MLA mainloop** (`src/sycl/kernels/mla/xe20/collective/xe_mla_mainloop.hpp`,
+  637 lines) — the judge's "two-part QK accumulation and per-VTile rescale-fused-with-GEMM2"
+  is an **online-softmax attention** pattern: `softmax_with_rescale()` at line 545,
+  `reduce<1>(tS, maximum{})`, `native::exp2`, `cute::gemm(mma_pv, tArP, tArV, tArA)` at
+  line 505. intfer's SSM recurrence (`ssm_forward`, `quant_gemm.cpp:3298-3327`) has **zero**
+  softmax/exp2/reduce-over-group -- it is a gated-delta-net recurrence (decay → kv-dot →
+  rank-1 update → readout) with no output accumulator to rescale. The rescale-fusion has no
+  consumer in intfer's hot path. Also Cutlass-tiled (`TiledMMAQK`, `ThrLayoutVMNK`,
+  `make_block_2d_copy`); intfer's GEMM is hand-written `sycl::nd_range<2>` +
+  `local_accessor`, not Cutlass. **Not ported.**
+* **W4A16 MoE GEMM** (`src/sycl/kernels/moe/xe20/w4a16/gemm_xe2.hpp`, 494 lines) — the
+  register-level scale folding (`scale_ptr[thr_N * channel_num]`, line 192, hoisted OUT of the
+  k-tile loop and carried as a pointer array) and the padded-N skip (`kSkipPaddedM`, line 276)
+  are real techniques, but intfer's M=1 decode arms **already ship the scale-row hoist** --
+  every `gemm_usm_decode1_*` arm computes `sptr = scale_usm + ng * num_groups_w` once outside
+  the group loop (`quant_gemm.cpp:1041, 1141, 1213, 1297, 1399, 1780`). The padded-N skip is
+  MoE-specific (expert boundary); intfer's GEMM has no expert grid. **Already shipped /
+  not applicable.**
+
+**The one sgl file that IS structurally closest** is `src/sycl/gdn_attn/chunk_gated_delta_rule.cpp`
++ `gated_delta_rule.hpp` -- a chunked gated-delta-net scan. It was **not fetched** in round 1
+and is the single remaining upstream candidate. It was inspected only via the tree listing;
+fetching and diffing it against `ssm_forward_chain` is scoped work, not a port, because
+upstream's scan is a single fused kernel over the sequence with a rollback cache while intfer's
+chained kernel is a per-(head, column) loop over M rows with the state passed in as one pointer.
