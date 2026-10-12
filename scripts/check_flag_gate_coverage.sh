@@ -104,6 +104,41 @@
 #                    design) and says so explicitly on every run. What
 #                    it does assert is reachability via the new
 #                    [lmhead-fp16] line (main.cpp:1433).
+#   INTFER_ONEMKL      NOT ARMED -- real code, unreachable from every gate on
+#                    this box, for TWO independent reasons, both mechanical.
+#                    (a) BUILD CONFIG: the arm lives under
+#                    `#ifdef INTFER_ENABLE_MKL` in gemm_onemkl.cpp; that is a
+#                    CMake option, OFF by default (CMakeLists.txt:23), and
+#                    NO gate script passes -DINTFER_ENABLE_MKL=ON (git grep
+#                    confirms). src/gemm/CMakeLists.txt:39-54 only turns the
+#                    #ifdef on and links libmkl_sycl_blas when the option is
+#                    ON, so with the default build `onemkl_available()`
+#                    returns false and quant_gemm_f16 never takes the arm --
+#                    unreachable by build configuration, not by flag.
+#                    (b) GATE SHAPES: even in an MKL build the predicate is
+#                    `onemkl_available() && getenv(INTFER_ONEMKL) && M >= 8`
+#                    (quant_gemm.cpp:2281-2283). Every gate on this box
+#                    either runs no FP16 GEMM at all, or runs one at M=1
+#                    (decode, and the lm_head at main.cpp:1374/2147/2422,
+#                    all M=1 or M<8). The only M>=8 caller is the 27B prefill
+#                    path, which no gate runs (standing rule 1). So the arm
+#                    cannot be reached by any gate that is permitted to run
+#                    here.
+#                    The arm itself is structurally sound: the branch is in
+#                    quant_gemm_f16, called by every FP16 GEMM, and the flag
+#                    is explicit (getenv != nullptr at quant_gemm.cpp:2282),
+#                    so enabling the build does NOT change the default path --
+#                    the default build is byte-for-byte the MKL-free tiled
+#                    kernel (gemm_onemkl.cpp:34-35). The blocker is the build
+#                    config, exactly the shape INTFER_ENABLE_L0 already solves
+#                    in scripts/build.sh:28. Arming it needs a build + a gate
+#                    run, which is measurement work and is retired on this
+#                    box (PARAMOUNT DIRECTIVE); the operator can arm it with
+#                    a throwaway -DINTFER_ENABLE_MKL=ON build dir (the
+#                    library exists: /opt/intel/oneapi/mkl/latest/lib/
+#                    libmkl_sycl_blas.so.6) and a tolerance-gated prefill
+#                    comparison. Until then this row is a genuine opt-in gap
+#                    whose remedy is operator-only, not agent-only.
 #   INTFER_DECODE1_ANNOUNCE_EVERY NOT ARMED -- harness-only. quant_gemm.
 #                    cpp:67: disables the once-only latch and prints
 #                    every launch. Its own comment states its purpose --

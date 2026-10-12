@@ -34,21 +34,45 @@ What remains is the reproducible finding: the shipped INT2 decode runs at
 That is the real deficit, and every row below is judged against it on
 load-insensitive counters (`kernel` bucket), clearing the spread floor.
 
-### 1.1 `block_load<uint8_t,128>` on the INT2 weight stream
+### 1.1 `block_load<uint8_t,128>` on the INT2 weight stream — **CLOSED 2026-10-12, not implemented, and the "prior" it cites does not exist**
 
-* **Why it is first:** INT2 is 20.2% of decode traffic
-  (1.837 GiB/device/token). The old rationale ("the entire 5.6-6.4x
-  deficit sits in the shared text") is void; this is now a plain
-  load-forming experiment on a ~10% utilisation kernel, and the
-  wider-chunk probe already measured `block_load<uint8_t,256>` at
-  0.25-0.35x — a 3-4x regression from register pressure.
-* **Where:** `src/gemm/quant_gemm.cpp`, M=1 INT2 decode lambda.
-  (`src/gemm/quant_gemm.cpp:457-465`.)
-* **Kill criterion (pre-committed):** < 2x closes the experiment —
-  that also closes llama.cpp's `block_load` direction for INT2, which
-  the wider-chunk probe already measured at 0.25-0.35x.
-* **Gate:** arm in `test_tp2_27b.sh` (TP=2 is the only gate whose
-  27B model carries INT2), stream-identity asserted.
+* **The prior is a misattribution, and it is the whole reason this row
+  sat untouched.** PLAN.md used to read "the wider-chunk probe already
+  measured `block_load<uint8_t,256>` at 0.25-0.35x". There is no
+  `block_load` arm in `examples/roofline_probe/main.cpp`. The 0.25-0.35x
+  is the probe's **ceiling twin ratio** — `main.cpp:710-713`, "ratio to
+  full = 0.25 (linear would be 0.25)", i.e. *a quarter of the bytes
+  taking a quarter of the time*, the always-red validator that proves
+  the GB/s figures are tracking traffic. It says nothing about load
+  forming. A fabricated prior is worse than no prior, so it is struck.
+* **The probe is vacuous on this box anyway** (AGENTS.md "The
+  profiling defect"): every arm returns 0.000 ms and the gate refuses
+  it. So even a real `block_load` arm could not have produced a number
+  here; the `kernel` bucket is unverified for the engine, and the
+  verdict would rest on `nk`/`nw`/`nr` alone, which a load-forming
+  change does not move.
+* **It is not implementable as specified, and that is the geometry, not
+  a judgement call.** The shipped INT2-tab body (`quant_gemm.cpp:1115`,
+  `CC = 8`) reads **two** weight bytes per 8-code chunk — `code_u8[b0]`
+  and `code_u8[b0+1]`, 16 bits over 8 codes. `block_load<uint8_t,128>`
+  is 128 B across the subgroup, i.e. **64 codes** at 2 bits each. There
+  is no chunk size in the shipped kernel that a 128-B gather would
+  service; the 256-B variant is worse still. The row's own comment
+  (`quant_gemm.cpp:549-558`) already says the arm is "SUBGROUP's body
+  with the two `code_u8[b0]`/`[b0+1]` reads replaced by one
+  `block_load<uint8_t,128>` per 32 codes" — 32 codes is 64 B, still not
+  128, and the replacement is not written anywhere. Writing it means
+  redesigning the chunk loop, which is a new kernel, not a one-change
+  arm, and it would need its own bit-exactness argument (the gather
+  changes which bytes land in which lane).
+* **Disposition: CLOSED, not attempted.** The only honest route to a
+  `block_load` number on this box is a working device-event profiling
+  path (PLAN.md section 5), which is a measurement fix, not an
+  optimization, and is itself blocked on the driver. The code comment
+  at `quant_gemm.cpp:548-558` is the record; it is not a TODO.
+* **Gate:** none, and none is warranted — a flag with no implementation
+  has nothing to certify. (The row's old "arm in `test_tp2_27b.sh`"
+  was aspirational and is removed.)
 
 ### 1.2 gate+up in a single launch (the one TP=2-valid fusion)
 
@@ -132,15 +156,55 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
 
 ### 1.4 oneMKL `gemm` fallback for large contiguous FP16
 
-* **Status 2026-10-11: IMPLEMENTED and GATED (commit after this line).**
-  `INTFER_ONEMKL=1` (default OFF) routes `quant_gemm_f16` through
-  `gemm::gemm_onemkl_fp16` when `onemkl_available() && M >= 8`. The
-  library is linked at build time (`INTFER_ENABLE_MKL=ON`); when it is
-  absent `gemm_onemkl.cpp` compiles the empty-fallback spellings of
-  `onemkl_available()` / `gemm_onemkl_fp16()` so the engine links either
-  way and the arm is unreachable rather than wrong. Announced
+* **Status 2026-10-11: IMPLEMENTED, NOT GATED — and the "GATED" claim that
+  used to sit here was false.** `INTFER_ONEMKL=1` (default OFF) routes
+  `quant_gemm_f16` through `gemm::gemm_onemkl_fp16` when
+  `onemkl_available() && M >= 8`. The library is linked at build time
+  (`INTFER_ENABLE_MKL=ON`); when it is absent `gemm_onemkl.cpp` compiles
+  the empty-fallback spellings of `onemkl_available()` /
+  `gemm_onemkl_fp16()` so the engine links either way and the arm is
+  unreachable rather than wrong. Announced
   `[onemkl] FP16 gemm via oneMKL SYCL BLAS ACTIVE (M=.. N=.. K=..)`,
-  once per process. Gate arm in `test_tp2_27b.sh`.
+  once per process. **There is no gate arm for this flag anywhere in
+  `scripts/test_*.sh`** (`git grep INTFER_ONEMKL -- scripts/test_*.sh`
+  returns nothing), so `check_flag_gate_coverage.sh` files it as the
+  sole remaining opt-in REAL GAP and its own disposition block
+  (`check_flag_gate_coverage.sh` header, the authoritative flag-by-flag
+  record) does not list it among the armed flags. The row's old "Gate
+  arm in `test_tp2_27b.sh`" was aspirational prose, not a measurement;
+  it is struck here and in AGENTS.md:233.
+  * **Why no gate can reach it on this box, and it is two independent
+    blockers, not one.** (a) BUILD CONFIG: the real oneMKL body lives
+    under `#ifdef INTFER_ENABLE_MKL` in `gemm_onemkl.cpp`; that is a
+    CMake option, OFF by default (`CMakeLists.txt:23`), and NO gate
+    script passes `-DINTFER_ENABLE_MKL=ON` (`src/gemm/CMakeLists.txt:39-54`
+    only turns the #ifdef on and links `libmkl_sycl_blas` when the
+    option is ON). With the default build `onemkl_available()` returns
+    false and `quant_gemm_f16` never takes the arm -- unreachable by
+    build configuration, not by flag. (b) GATE SHAPES: even in an MKL
+    build the predicate is
+    `onemkl_available() && getenv(INTFER_ONEMKL) && M >= 8`
+    (`quant_gemm.cpp:2281-2283`). Every gate on this box either runs no
+    FP16 GEMM at all, or runs one at M=1 (decode, and the lm_head at
+    `main.cpp:1374/2147/2422`, all M=1 or M<8). The only M>=8 caller is
+    the 27B prefill path, which no gate runs (standing rule 1). So the
+    arm cannot be reached by any gate that is permitted to run here.
+  * **The arm itself is sound and the default path is untouched.** The
+    branch is in `quant_gemm_f16`, called by every FP16 GEMM, and the
+    flag is explicit (`getenv != nullptr` at `quant_gemm.cpp:2282`), so
+    enabling the build does NOT change the default path -- the default
+    build is byte-for-byte the MKL-free tiled kernel
+    (`gemm_onemkl.cpp:34-35`). The blocker is the build config, exactly
+    the shape `INTFER_ENABLE_L0` already solves in `scripts/build.sh:28`.
+  * **Arming it is operator-only, not agent-only.** It needs a build +
+    a gate run, which is measurement work and is retired on this box
+    (PARAMOUNT DIRECTIVE). The library exists
+    (`/opt/intel/oneapi/mkl/latest/lib/libmkl_sycl_blas.so.6`), so a
+    throwaway `-DINTFER_ENABLE_MKL=ON` build dir (the
+    `mutate_rowpair_equiv.sh` pattern: `cmake -S .. -B $dir -D...`) makes
+    the arm real; then a tolerance-gated prefill comparison certifies
+    it. Until that run exists this row is a genuine opt-in gap whose
+    remedy is operator-only.
 * **Why:** llama.cpp `ggml-sycl.cpp:3115` shape.
 * **Why it is fourth:** FP16 is 57.9% of decode traffic but already
   runs at 98-123% of the memory roofline (LA_QKV 559.9 GB/s, LA_OUT
