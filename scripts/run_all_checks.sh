@@ -37,11 +37,16 @@
 # "citation vs guess" line -- see check_fold_matrix.sh's rc=2 handling.)
 #
 # Env:
-#   INTFER_BUILD_DIR   build tree (default $ROOT/build) for logs and stamps
-#   INTFER_SKIP_HEALTHY=1  forward to the device-precond checker to skip its
+#   INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1  forward to the device-precond checker to skip its
 #                     healthy column (saves ~6.5 min; the stamps then record the
 #                     column as NOT RUN, which the assertion below still sees as
-#                     a valid stamp for that sha)
+#                     a valid stamp for that sha). NOTE: this is the ONLY flag
+#                     that silences the healthy column, and it is honoured in
+#                     exactly one place (the dispatch() arm below). An earlier
+#                     spelling `INTFER_SKIP_HEALTHY` existed in this file and
+#                     nowhere else -- a bypass nobody could have known about,
+#                     and the healthy column is the only thing in the stack that
+#                     catches the 27B gateup crash. Renamed, not deleted.
 #   INTFER_QUICK=1    checkers only, no mutation matrices (~8 min vs ~45)
 #
 # Locked: the mutation matrices edit tracked source, so two concurrent runs would
@@ -186,7 +191,14 @@ dispatch() { # $1 = label -> runs it
     gate_inventory.sh)
       timeout -k 30 1800 bash "$SCRIPT_DIR/gate_inventory.sh"; return $? ;;
     check_device_precond.sh)
-      if [ "${INTFER_SKIP_HEALTHY:-0}" = "1" ]; then
+      # *** THE SKIP FLAG IS INTFER_DEVICE_PRECOND_SKIP_HEALTHY, and this branch
+      # is the ONLY place it is honoured. *** An earlier revision read
+      # `INTFER_SKIP_HEALTHY` here -- a flag that exists nowhere else, so it was
+      # a bypass nobody could have known about, and the healthy column is the
+      # only thing in the stack that catches the 27B gateup crash. The mutation
+      # matrix sets the correct flag by name; nothing else may silence this
+      # column, and the default (unset) runs it in full.
+      if [ "${INTFER_DEVICE_PRECOND_SKIP_HEALTHY:-0}" = "1" ]; then
         INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1 timeout -k 30 1800 bash "$SCRIPT_DIR/check_device_precond.sh"
       else
         timeout -k 30 3600 bash "$SCRIPT_DIR/check_device_precond.sh"

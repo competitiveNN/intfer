@@ -332,6 +332,20 @@ for f in $GATES; do
   # no guard), test_http_batch.sh and test_serve_load.sh (both launch the server
   # `--gpu --tp 1`). All three passed here, which is exactly why the gap was
   # invisible until the list was rebuilt from the gates themselves.
+  # *** NOTE ON THE `gran_raw` GATE, recorded rather than "fixed". *** The
+  # granularity_of() test answers "does this gate have a COUNT precondition",
+  # which is a different question from "does it have ANY device guard".
+  # test_dpas_fold.sh and test_gpu_optin.sh BOTH carry `gate_require_device`
+  # (the whole-gate, adapter-independent probe that covers both failure modes)
+  # and nothing else, so granularity_of() returns "none" for both -- and the
+  # NEEDS-GPU branch below then re-derives the device need and correctly reads
+  # render-node. So both gates ARE reported as guarded; only the render-node
+  # column is populated by re-derivation rather than by the guard the gate
+  # actually names. That is a documentation inaccuracy, not a classification
+  # error, and it is left as-is rather than "fixed" by special-casing
+  # `gate_require_device` into a fake granularity: that would be the
+  # copy-drift family (two lists to keep in sync), and the render-node column
+  # is already derived from code, not remembered.
   # RENDER-NODE column, one of four tokens and never a bare "-":
   #   via-count    a COUNT precondition (gate_gpu_count/gate_require_gpus) already
   #                covers the device check, so the render-node probe is redundant.

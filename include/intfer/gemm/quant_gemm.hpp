@@ -194,6 +194,25 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                       // CONTRACT. out_g and out_u are separate buffers (M*Ng and M*Nu FP16 bits);
                                       // the caller assembles them into the host vectors. gate/up MUST share K and
                                       // group_size; Ng and Nu may differ. Returns the event; caller waits once.
+                                      //
+                                      // *** THE SHARD IS A TP SLICE: code_g/scale_g hold rows start_g..start_g+Nl_g
+                                      // of the gate, and code_u/scale_u rows start_u..start_u+Nl_u of the up.
+                                      // OUT_g/out_u are FULL-sized (M*Ng / M*Nu). ***
+                                      // On a multi-device TP run the engine shards the output dim N across
+                                      // the ranks (build_shards(), engine.cpp:521-540), so a device holds
+                                      // only its slice -- but the readback scatters that slice back into
+                                      // mg/mu by `start` (engine.cpp:1879-1916), so the OUTPUT buffer must
+                                      // stay full-strided. The kernel therefore dispatches ONLY this
+                                      // device's Nl_g+Nl_u rows, indexes the shard with the LOCAL row
+                                      // (0..Nl-1) and the output with the GLOBAL row
+                                      // (start+local, stride Ng/Nu). Dispatched any other way, every rank
+                                      // computes rows it does not hold the weights for -- which is not a
+                                      // bounds error at all, it is the wrong answer, and before this
+                                      // kernel could return it read ~4x past the shard's end and killed
+                                      // the device (27B L3 prefill, UR_RESULT_ERROR_DEVICE_LOST, ten
+                                      // identical runs).
+                                      // start/Nl = 0 with Nl == Ng/Nu reproduces the TP=1 behaviour
+                                      // exactly, which is what the full-size shapes in gateup_equiv do.
                                       sycl::event quant_gemm_forward_usm_gateup(
                                           sycl::queue& q,
                                           std::uint16_t* act_usm,                 // shared M*K FP16 activation
@@ -203,6 +222,8 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                           std::uint16_t* out_u,                   // M*Nu FP16 output (up)
                                           uint32_t M, uint32_t Ng, uint32_t Nu, uint32_t K,
                                           uint32_t group_size,
+                                          uint32_t start_g, uint32_t Nl_g,
+                                          uint32_t start_u, uint32_t Nl_u,
                                           gemm::WeightScheme scheme_g, gemm::WeightScheme scheme_u,
                                           const sycl::event& copy_dep);
 

@@ -1818,7 +1818,14 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
         wv_[d * wv_W_ + 1].out,
         scu.code_usm[d], scu.scale_usm[d], au,
         wv_[d * wv_W_ + 2].out,
-        M, Ng, Nu, tg.K, scg.group_size, scg.scheme, scu.scheme,
+        M, Ng, Nu, tg.K, scg.group_size,
+        (uint32_t)shards_[gate_ti].ranges[d].first,
+        (uint32_t)(shards_[gate_ti].ranges[d].second -
+                   shards_[gate_ti].ranges[d].first),
+        (uint32_t)shards_[up_ti].ranges[d].first,
+        (uint32_t)(shards_[up_ti].ranges[d].second -
+                   shards_[up_ti].ranges[d].first),
+        scg.scheme, scu.scheme,
         sycl::event{});
     kernel_events.push_back(e);
     // nk accounting: ONE increment per launch, and it comes from the SAME

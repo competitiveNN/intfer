@@ -2015,6 +2015,7 @@ sycl::event quant_gemm_forward_usm_gateup(
     std::uint16_t* out_u,
     uint32_t M, uint32_t Ng, uint32_t Nu, uint32_t K,
     uint32_t group_size,
+    uint32_t start_g, uint32_t Nl_g, uint32_t start_u, uint32_t Nl_u,
     gemm::WeightScheme scheme_g, gemm::WeightScheme scheme_u,
     const sycl::event& copy_dep) {
   if (M == 0 || K == 0 || (Ng == 0 && Nu == 0)) return sycl::event();
@@ -2023,8 +2024,13 @@ sycl::event quant_gemm_forward_usm_gateup(
   const int num_groups = (static_cast<int>(K) + Gw - 1) / Gw;
   if (num_groups <= 0) return sycl::event();
 
+  // *** THE DISPATCH IS THE SLICE, NOT THE WHOLE OUTPUT. *** The shard holds
+  // only rows [start, start+Nl), so those are the only rows this device can
+  // compute. Dispatching the full Ng+Nu would have every rank compute rows it
+  // holds no weights for, and (before the shard was sliced correctly) read
+  // ~4x past the shard's end.
   constexpr int nWG = kThr;
-  const int total = static_cast<int>(Ng) + static_cast<int>(Nu);
+  const int total = static_cast<int>(Nl_g) + static_cast<int>(Nl_u);
   const int nBlocks = (total + nWG - 1) / nWG;
   const int global = nBlocks * nWG;
 
@@ -2045,11 +2051,19 @@ sycl::event quant_gemm_forward_usm_gateup(
           [=](sycl::nd_item<1> it) {
             const int ng = static_cast<int>(it.get_global_id(0));
             if (ng >= total) return;
-            const bool is_up = ng >= static_cast<int>(Ng);
-            const int out_ng = is_up ? (ng - static_cast<int>(Ng)) : ng;
+            // *** LOCAL ROW (SHARD) vs GLOBAL ROW (OUTPUT). *** The work item
+            // ids run over THIS DEVICE'S SLICE (total = Nl_g + Nl_u), so
+            // ng is a local row: local_g in [0, Nl_g) indexes the gate shard,
+            // local_u in [0, Nl_u) indexes the up shard. The GLOBAL output row
+            // is start + local, and only the output buffer (full M*Ng/M*Nu)
+            // uses it; the shard (code bytes, scale rows) uses the local one.
+            const bool is_up = ng >= static_cast<int>(Nl_g);
+            const uint32_t local = is_up ? (uint32_t)(ng - (int)Nl_g) : (uint32_t)ng;
+            const uint32_t out_ng = (is_up ? start_u : start_g) + local;
+            // Index the scale shard by the LOCAL row (w.N = Nl rows, engine.cpp:312).
             const std::uint16_t* sptr =
-                is_up ? (scale_u + (std::size_t)out_ng * num_groups)
-                      : (scale_g + (std::size_t)out_ng * num_groups);
+                is_up ? (scale_u + (std::size_t)local * num_groups)
+                      : (scale_g + (std::size_t)local * num_groups);
             const std::uint8_t* wbase =
                 is_up ? code_u8 : code_g8;
             const float alpha_f = is_up ? alpha_u : alpha_g;
@@ -2064,20 +2078,15 @@ sycl::event quant_gemm_forward_usm_gateup(
             // divided by pack -- which is why wrow is the shard BASE, not
             // the shard base plus an element row offset.
             //
-            // VERIFIED, not argued: examples/gateup_equiv runs this kernel and
-            // two separate quant_gemm_forward_usm calls on the SAME buffers and
-            // compares bitwise (15/15 PASS across 3 shapes x 5 datasets, no
-            // model, no 27B load). The negative direction is proven by hand:
-            // restoring `wrow = wbase + out_ng * K` reproduces the exact
-            // UR_RESULT_ERROR_DEVICE_LOST at the first shape, and restoring the
-            // fix goes green. The operator's 27B run died at L3 prefill with
-            // that same error, ten identical runs; L3 is the first INT2+INT2
-            // layer this path reaches, and this is the only line here that
-            // differs from the working M=1 decode kernel (that kernel reads
-            // code_u8[b0] directly, never offsetting it by a row). A ~4x
-            // over-read of a pinned 9375 MiB USM allocation reads past the
-            // shard's pool slot -- the kind of fault that reports as a device
-            // loss rather than as a bounds error.
+            // *** AND THE SHARD IS A TP SLICE, NOT THE FULL TENSOR. ***
+            // shard_weight(model_, t, start, end, q) (engine.cpp:278) emits
+            // LOCAL rows: w.N = end - start, row_codes[r] for r in 0..w.N,
+            // scale_slice[r] for r in 0..w.N (engine.cpp:312-316). The shard
+            // holds rows start..end of the tensor, indexed 0..Nl-1.
+            //
+            // On a single-device run (and every full-size shape in
+            // examples/gateup_equiv) start=0, Nl=Ng, so `local` == the global
+            // row and this is byte-identical to the TP=1 behaviour.
             for (int m = 0; m < static_cast<int>(M); ++m) {
               float acc = 0.0f;
               const std::size_t act_off = (std::size_t)m * K;
@@ -2093,7 +2102,10 @@ sycl::event quant_gemm_forward_usm_gateup(
                                        scale * (1.0f / 3.0f), scale * 1.0f};
                 constexpr int CC = 8;
                 int kg = kg0;
-                std::size_t b0 = ((std::size_t)out_ng * K +
+                // `local` is the row within THIS shard (0..Nl-1); the shard is packed
+                                // row-major so the byte row is local * K, and the byte within
+                                // it is kg / pack.
+                                std::size_t b0 = ((std::size_t)local * K +
                                   (std::size_t)kg) /
                                  (std::size_t)pack;
                 for (; kg + CC <= kg1; kg += CC) {
@@ -2114,7 +2126,7 @@ sycl::event quant_gemm_forward_usm_gateup(
                   const float av = from_half_bits(
                       act_usm[act_off + (std::size_t)kg]);
                   const std::size_t idx =
-                      (std::size_t)out_ng * K + (std::size_t)kg;
+                      (std::size_t)local * K + (std::size_t)kg;
                   const std::uint8_t byte = wrow[idx / pack];
                   const int within = static_cast<int>(idx % pack);
                   const int code = (byte >> (within * bits)) &

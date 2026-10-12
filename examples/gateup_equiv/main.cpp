@@ -43,16 +43,42 @@ namespace {
 // the fused kernel handles Ng != Nu (ng/un split on out_ng).
 struct Shape {
   const char* name;
-  std::uint32_t Ng;  // gate rows
-  std::uint32_t Nu;  // up rows
+  std::uint32_t Ng;   // rows the KERNEL is told (the full output dim)
+  std::uint32_t Nu;
+  std::uint32_t Nl_g; // rows actually ALLOCATED for code/scale (the TP slice)
+  std::uint32_t Nl_u;
+  std::uint32_t Og_bytes; // OUT buffer rows (full unless isolating the out write)
+  std::uint32_t Ou_bytes;
   std::uint32_t K;
   int group;
+  std::uint32_t start_g; // first output row the shard holds (0 = TP rank 0)
+  std::uint32_t start_u;
 };
 
 const Shape kShapes[] = {
-    {"MLP_GATE+UP(INT2)", 8704, 8704, 5120, 16},
-    {"MLP_GATE+UP-RAGGED(INT2)", 8704, 8704, 5122, 16},
-    {"MLP_GATE+UP-ODDN(INT2)", 8703, 8705, 5120, 16},
+    {"MLP_GATE+UP(INT2)", 8704, 8704, 8704, 8704, 8704, 8704, 5120, 16, 0, 0},
+    {"MLP_GATE+UP-RAGGED(INT2)", 8704, 8704, 8704, 8704, 8704, 8704, 5122, 16, 0, 0},
+    {"MLP_GATE+UP-ODDN(INT2)", 8703, 8705, 8703, 8705, 8703, 8705, 5120, 16, 0, 0},
+    // *** THE SLICED SHAPE, and the one that actually reproduces the crash. ***
+    // The engine shards the OUTPUT dim N across the 2 TP ranks, so each device
+    // holds only its 4352-row slice of the 8704-row gate/up -- but run_mlp_gateup
+    // (engine.cpp:1815-1821) passes the FULL Ng/Nu to the kernel, because the
+    // kernel's out_ng runs over the whole output and the readback below
+    // (engine.cpp:1886-1907) scatters each rank's slice back into mg/mu by
+    // `start`. So the kernel reads rows 4352..8703 of a buffer that holds 4352.
+    {"MLP_GATE+UP-SLICED(INT2)", 8704, 8704, 4352, 4352, 8704, 8704, 5120, 16, 0, 0},
+    // *** THE ISOLATION SHAPE: full code/scale, SLICED out buffers. *** The
+    // engine sizes out FULL (ensure_wave_workspace takes Nl = max(Ng, Nu)), so
+    // this is NOT a shape the engine produces -- it exists solely to separate
+    // the two failure hypotheses. If the crash is the CODE/SCALE over-read this
+    // passes; if it is the OUT over-write it still crashes. A single "sliced"
+    // shape cannot tell the two apart, and guessing cost a run.
+    {"MLP_GATE+UP-SLICED-OUTONLY(INT2)", 8704, 8704, 8704, 8704, 4352, 4352, 5120, 16, 0, 0},
+    // *** THE OFFSET SHAPE: a NON-ZERO start_g, so the offset arithmetic is
+    // exercised, not merely defaulted to 0. The engine's balanced split puts
+    // rank 0 at 0 and rank 1 at 4352; this shape puts the shard at 2048..6400,
+    // which no rank ever holds, and the reference computes exactly those rows.
+    {"MLP_GATE+UP-SLICED-OFFSET(INT2)", 8704, 8704, 4352, 4352, 8704, 8704, 5120, 16, 2048, 2048},
 };
 
 enum Dataset { kRandom = 0, kActOutliers, kFullCancellation, kAllEqual, kRowAdversarial, kCount };
@@ -124,6 +150,10 @@ void fill_act(int d, std::vector<std::uint16_t>& act, std::uint32_t K, std::uint
 
 int main(int argc, char** argv) {
   const char* only_ds = std::getenv("GATEUP_EQUIV_ONLY");
+  // The SLICED shape crashes the process (that is the point of it). To reach
+  // the isolation shape after it, skip SLICED by name rather than by index --
+  // the index shifts if a shape is added above.
+  const char* skip_named = std::getenv("GATEUP_EQUIV_SKIP_NAMED");
   // zeInit FIRST: the native L0 driver must be initialized before a SYCL L0
   // context exists, or the first malloc_shared fails with
   // UR_RESULT_ERROR_UNINITIALIZED. The engine reaches L0 via
@@ -147,41 +177,83 @@ int main(int argc, char** argv) {
   int checks = 0, fails = 0;
 
   for (const Shape& sh : kShapes) {
+    if (skip_named && std::strcmp(sh.name, skip_named) == 0) continue;
     const std::uint32_t ngroups = (sh.K + sh.group - 1) / sh.group;
-    const std::size_t cg_bytes = (std::size_t)sh.Ng * sh.K / pack;
-    const std::size_t cu_bytes = (std::size_t)sh.Nu * sh.K / pack;
-    const std::size_t sg_bytes = (std::size_t)sh.Ng * ngroups;
-    const std::size_t su_bytes = (std::size_t)sh.Nu * ngroups;
+  // ALLOCATED rows = the TP slice (Nl); the KERNEL is always told the FULL
+    // output dim (Ng/Nu), because run_mlp_gateup passes the full dims and the
+    // readback scatters the slice back in by `start`. On the non-sliced shapes
+    // Nl == Ng so this is a no-op; on the SLICED shape the kernel reads rows
+    // Nl..Ng of a buffer that holds Nl, which is the over-read that crashes.
+    const std::uint32_t Nl_g = sh.Nl_g, Nl_u = sh.Nl_u;
+    const std::size_t cg_bytes = (std::size_t)Nl_g * sh.K / pack;
+    const std::size_t cu_bytes = (std::size_t)Nl_u * sh.K / pack;
+    const std::size_t sg_bytes = (std::size_t)Nl_g * ngroups;
+    const std::size_t su_bytes = (std::size_t)Nl_u * ngroups;
     const std::size_t act_bytes = sh.K;   // M = 1
-    const std::size_t og_bytes = sh.Ng;   // M = 1
-    const std::size_t ou_bytes = sh.Nu;
+    // OUT buffers: the engine sizes them FULL (ensure_wave_workspace takes
+    // Nl = max(Ng, Nu)), so the out over-write is NOT the fault here -- the
+    // fault is the CODE/SCALE read past the sliced shard. The two SLICED*
+    // shapes below differ only in out sizing, which is what isolates it.
+    const std::size_t og_bytes = sh.Og_bytes;
+    const std::size_t ou_bytes = sh.Ou_bytes;
+    // The REFERENCE GEMM must not over-read either, so it runs on FULL-SIZE
+    // code/scale buffers (Ng/Nu rows). The shard buffers below hold only Nl.
+    const std::size_t cfg_bytes = (std::size_t)sh.Ng * sh.K / pack;
+    const std::size_t cuf_bytes = (std::size_t)sh.Nu * sh.K / pack;
+    const std::size_t sfg_bytes = (std::size_t)sh.Ng * ngroups;
+    const std::size_t suf_bytes = (std::size_t)sh.Nu * ngroups;
 
     auto* code_g = static_cast<std::uint8_t*>(sycl::malloc_shared(cg_bytes, dev.sycl_device, dev.sycl_context));
     auto* code_u = static_cast<std::uint8_t*>(sycl::malloc_shared(cu_bytes, dev.sycl_device, dev.sycl_context));
     auto* scg = static_cast<std::uint16_t*>(sycl::malloc_shared(sg_bytes * 2, dev.sycl_device, dev.sycl_context));
     auto* scu = static_cast<std::uint16_t*>(sycl::malloc_shared(su_bytes * 2, dev.sycl_device, dev.sycl_context));
+    auto* code_full_g = static_cast<std::uint8_t*>(sycl::malloc_shared(cfg_bytes, dev.sycl_device, dev.sycl_context));
+    auto* code_full_u = static_cast<std::uint8_t*>(sycl::malloc_shared(cuf_bytes, dev.sycl_device, dev.sycl_context));
+    auto* sc_full_g = static_cast<std::uint16_t*>(sycl::malloc_shared(sfg_bytes * 2, dev.sycl_device, dev.sycl_context));
+    auto* sc_full_u = static_cast<std::uint16_t*>(sycl::malloc_shared(suf_bytes * 2, dev.sycl_device, dev.sycl_context));
     auto* act = static_cast<std::uint16_t*>(sycl::malloc_shared(act_bytes * 2, dev.sycl_device, dev.sycl_context));
     auto* og = static_cast<std::uint16_t*>(sycl::malloc_shared(og_bytes * 2, dev.sycl_device, dev.sycl_context));
     auto* ou = static_cast<std::uint16_t*>(sycl::malloc_shared(ou_bytes * 2, dev.sycl_device, dev.sycl_context));
-    // Reference outputs: computed by two SEPARATE single-output GEMM calls.
+    // Reference outputs: computed by two SEPARATE single-output GEMM calls on
+    // the FULL-SIZE buffers (the engine's wave fallback also shards, so the
+    // honest comparison for the slice shape is slice-vs-slice).
     auto* og_ref = static_cast<std::uint16_t*>(sycl::malloc_shared(og_bytes * 2, dev.sycl_device, dev.sycl_context));
     auto* ou_ref = static_cast<std::uint16_t*>(sycl::malloc_shared(ou_bytes * 2, dev.sycl_device, dev.sycl_context));
-    if (!code_g || !code_u || !scg || !scu || !act || !og || !ou || !og_ref || !ou_ref) {
+    if (!code_g || !code_u || !scg || !scu || !code_full_g || !code_full_u ||
+        !sc_full_g || !sc_full_u || !act || !og || !ou || !og_ref || !ou_ref) {
       std::fprintf(stderr, "FAIL: allocation for %s\n", sh.name);
       return 1;
     }
 
-    std::fprintf(stderr, "[gateup] shape %s (Ng=%u Nu=%u K=%u group=%d)\n",
-                 sh.name, sh.Ng, sh.Nu, sh.K, sh.group);
+    std::fprintf(stderr, "[gateup] shape %s (Ng=%u Nu=%u Nl_g=%u Nl_u=%u K=%u group=%d)\n",
+                 sh.name, sh.Ng, sh.Nu, Nl_g, Nl_u, sh.K, sh.group);
 
     for (int d = 0; d < kCount; ++d) {
       if (only_ds && std::atoi(only_ds) != d) continue;
       const std::uint64_t seed = 0xC0FFEEull ^ ((std::uint64_t)sh.Ng << 20) ^ ((std::uint64_t)sh.K << 3);
-      std::vector<std::uint8_t> hg(cg_bytes), hu(cu_bytes);
-      std::vector<std::uint16_t> hsg(sg_bytes), hsu(su_bytes), hact(act_bytes);
-      fill_weights(hg, hu, sh, seed + 0x1000u * d);
-      fill_scales(hsg, hsu, seed + 0x1000u * d + 777);
+      // FULL-SIZE host vectors first: the reference GEMM must see the whole
+      // tensor. The shard's host vectors are then the contiguous slice
+      // [start, start+Nl) of these, which is exactly what shard_weight emits.
+      std::vector<std::uint8_t> hfg(cfg_bytes), hfu(cuf_bytes);
+      std::vector<std::uint16_t> hsfg(sfg_bytes), hsfu(suf_bytes), hact(act_bytes);
+      fill_weights(hfg, hfu, sh, seed + 0x1000u * d);
+      fill_scales(hsfg, hsfu, seed + 0x1000u * d + 777);
       fill_act(d, hact, sh.K, seed + 0x1000u * d + 999);
+      const std::size_t kp = (std::size_t)sh.K / pack;  // code bytes per row
+      std::vector<std::uint8_t> hg(cg_bytes), hu(cu_bytes);
+      std::vector<std::uint16_t> hsg(sg_bytes), hsu(su_bytes);
+      const std::size_t g_off = (std::size_t)sh.start_g * kp;
+      const std::size_t u_off = (std::size_t)sh.start_u * kp;
+      std::memcpy(hg.data(), hfg.data() + g_off, cg_bytes);
+      std::memcpy(hu.data(), hfu.data() + u_off, cu_bytes);
+      {
+        std::memcpy(hsg.data(), hsfg.data() + (std::size_t)sh.start_g * ngroups, sg_bytes * 2);
+        std::memcpy(hsu.data(), hsfu.data() + (std::size_t)sh.start_u * ngroups, su_bytes * 2);
+      }
+      std::memcpy(code_full_g, hfg.data(), cfg_bytes);
+      std::memcpy(code_full_u, hfu.data(), cuf_bytes);
+      std::memcpy(sc_full_g, hsfg.data(), sfg_bytes * 2);
+      std::memcpy(sc_full_u, hsfu.data(), suf_bytes * 2);
       std::memcpy(code_g, hg.data(), cg_bytes);
       std::memcpy(code_u, hu.data(), cu_bytes);
       std::memcpy(scg, hsg.data(), sg_bytes * 2);
@@ -191,40 +263,54 @@ int main(int argc, char** argv) {
       for (std::size_t i = 0; i < og_bytes; ++i) { og[i] = 0xDEAD; og_ref[i] = 0xBEEF; }
       for (std::size_t i = 0; i < ou_bytes; ++i) { ou[i] = 0xDEAD; ou_ref[i] = 0xBEEF; }
 
-      // REFERENCE: two separate single-output GEMMs on the SAME shard buffers.
-      intfer::gemm::quant_gemm_forward_usm(q, act, code_g, scg, 1.0f, og_ref,
+      // REFERENCE: two separate single-output GEMMs on a FULL-SIZE code/scale buffer
+      // (the reference must not itself over-read the sliced shard). The single
+      // GEMM writes its full M*Ng result into og_ref; the comparison window is
+      // the engine's readback window (start_g..start_g+Nl_g), which is the only
+      // part the fused kernel is contractually required to produce.
+      intfer::gemm::quant_gemm_forward_usm(q, act, code_full_g, sc_full_g, 1.0f, og_ref,
                                            1, sh.Ng, sh.K, sh.group, sc, sycl::event{}).wait_and_throw();
-      intfer::gemm::quant_gemm_forward_usm(q, act, code_u, scu, 1.0f, ou_ref,
+      intfer::gemm::quant_gemm_forward_usm(q, act, code_full_u, sc_full_u, 1.0f, ou_ref,
                                            1, sh.Nu, sh.K, sh.group, sc, sycl::event{}).wait_and_throw();
 
-      // ARM: the fused gate+up kernel on the SAME buffers.
+      // ARM: the fused gate+up kernel on the SLICED shard buffers, with the
+      // shard's first row and length passed through. On the full-size shapes
+      // these are 0 / Ng and the call is byte-identical to the pre-fix form.
       intfer::gemm::quant_gemm_forward_usm_gateup(
           q, act, code_g, scg, 1.0f, og, code_u, scu, 1.0f, ou,
-          1, sh.Ng, sh.Nu, sh.K, sh.group, sc, sc, sycl::event{}).wait_and_throw();
+          1, sh.Ng, sh.Nu, sh.K, sh.group,
+          sh.start_g, Nl_g, sh.start_u, Nl_u, sc, sc,
+          sycl::event{}).wait_and_throw();
 
       int dg = 0, du = 0;
-      for (std::size_t i = 0; i < og_bytes; ++i) if (og[i] != og_ref[i]) ++dg;
-      for (std::size_t i = 0; i < ou_bytes; ++i) if (ou[i] != ou_ref[i]) ++du;
+      for (std::uint32_t r = 0; r < Nl_g; ++r)
+        if (og[sh.start_g + r] != og_ref[sh.start_g + r]) ++dg;
+      for (std::uint32_t r = 0; r < Nl_u; ++r)
+        if (ou[sh.start_u + r] != ou_ref[sh.start_u + r]) ++du;
       const bool ok = (dg == 0 && du == 0);
       ++checks;
       if (!ok) ++fails;
       std::printf("%s|%s|%d|%s|%d|%d|%s\n", sh.name, "INT2", d, dataset_name(d),
                   dg, du, ok ? "PASS" : "MISMATCH");
       if (!ok) {
-        for (std::size_t i = 0; i < og_bytes && dg; ++i)
-          if (og[i] != og_ref[i]) {
-            std::fprintf(stderr, "  gate[%zu]: fused=0x%04x ref=0x%04x\n", i, og[i], og_ref[i]);
+        for (std::uint32_t r = 0; r < Nl_g && dg; ++r)
+          if (og[sh.start_g + r] != og_ref[sh.start_g + r]) {
+            std::fprintf(stderr, "  gate[%u]: fused=0x%04x ref=0x%04x\n",
+                         sh.start_g + r, og[sh.start_g + r], og_ref[sh.start_g + r]);
             break;
           }
-        for (std::size_t i = 0; i < ou_bytes && du; ++i)
-          if (ou[i] != ou_ref[i]) {
-            std::fprintf(stderr, "  up[%zu]: fused=0x%04x ref=0x%04x\n", i, ou[i], ou_ref[i]);
+        for (std::uint32_t r = 0; r < Nl_u && du; ++r)
+          if (ou[sh.start_u + r] != ou_ref[sh.start_u + r]) {
+            std::fprintf(stderr, "  up[%u]: fused=0x%04x ref=0x%04x\n",
+                         sh.start_u + r, ou[sh.start_u + r], ou_ref[sh.start_u + r]);
             break;
           }
       }
     }
     sycl::free(code_g, dev.sycl_context); sycl::free(code_u, dev.sycl_context);
     sycl::free(scg, dev.sycl_context); sycl::free(scu, dev.sycl_context);
+    sycl::free(code_full_g, dev.sycl_context); sycl::free(code_full_u, dev.sycl_context);
+    sycl::free(sc_full_g, dev.sycl_context); sycl::free(sc_full_u, dev.sycl_context);
     sycl::free(act, dev.sycl_context);
     sycl::free(og, dev.sycl_context); sycl::free(ou, dev.sycl_context);
     sycl::free(og_ref, dev.sycl_context); sycl::free(ou_ref, dev.sycl_context);
