@@ -164,19 +164,39 @@ for tp in $TPS; do
   # the activation repeats"; if it never repeats on this model, the flag is inert
   # and the stream trivially matches. So the arm asserts the kernel ANNOUNCED a
   # hit as well -- a vacuous-pass guard, not a second numerics claim.
+  #
+  # *** THE ARM FORCES A REACHABLE CONFIG (found 2026-10-12). *** fuse_act and
+  # its hit test live in Engine::run_linear_tp (engine.cpp:1358/1369), but the
+  # default MLP never goes through that function: TP=1 takes run_mlp_fused and
+  # TP=2 takes run_mlp_gateup, both of which convert the activation in their own
+  # phase-1 block, and the attention qkv goes through run_linear_wave, whose
+  # items each own a scratch buffer (so act_cache_ptr_ != x.data() even though
+  # the bytes are equal). MEASURED on the 0.8B with -n 32: ZERO hits, so the
+  # arm was comparing the default base against the same default base and the
+  # "[fuse-act] announced" assertion was satisfiable by a flag that never
+  # fired -- audit #3's vacuity, live, and invisible because the stream matched.
+  # INTFER_NO_FUSE_SILUMUL=1 INTFER_NO_WAVE=1 restores the sequential gate/up
+  # pair over the shared `rin`, which is the configuration the flag's own
+  # comment names ("consecutive linears consume the SAME activation vector").
+  # The base below is run under the SAME two kills, because they change the
+  # dispatch, and comparing against the default base would be comparing two
+  # different execution paths.
+  FUSE_BASE="$(ids_of "$tp" INTFER_NO_FUSE_SILUMUL=1 INTFER_NO_WAVE=1)"
   {
     # shellcheck disable=SC2086
     FUSE_OUT="$(mktemp)"; FUSE_ERR="$(mktemp)"
-    env INTFER_FUSE_ACT=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" -n "${N:-4}" \
+    env INTFER_FUSE_ACT=1 INTFER_NO_FUSE_SILUMUL=1 INTFER_NO_WAVE=1 \
+      "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" -n "${N:-4}" \
       --no-stream --ids $TOK >"$FUSE_OUT" 2>"$FUSE_ERR"; FUSE_RC=$?
     if [ "$FUSE_RC" -ne 0 ]; then
       fail "TP=$tp INTFER_FUSE_ACT=1 run exited rc=$FUSE_RC"; tail -10 "$FUSE_ERR" >&2
     else
-      FUSE_IDS="$(ids_of "$tp" INTFER_FUSE_ACT=1)"
-      echo "TP=$tp [INTFER_FUSE_ACT=1]: '$FUSE_IDS'"
+      FUSE_IDS="$(ids_of "$tp" INTFER_FUSE_ACT=1 INTFER_NO_FUSE_SILUMUL=1 INTFER_NO_WAVE=1)"
+      echo "TP=$tp [INTFER_FUSE_ACT=1 NO_FUSE_SILUMUL=1 NO_WAVE=1]: '$FUSE_IDS'"
       [ -n "$FUSE_IDS" ] || fail "TP=$tp [INTFER_FUSE_ACT=1] stream EMPTY"
-      [ "$FUSE_IDS" = "$BASE" ] \
-        || fail "TP=$tp [INTFER_FUSE_ACT=1] '$FUSE_IDS' != base '$BASE' (it must be bit-exact)"
+      [ -n "$FUSE_BASE" ] || fail "TP=$tp [INTFER_FUSE_ACT=1] sequential base EMPTY -- nothing to compare against"
+      [ "$FUSE_IDS" = "$FUSE_BASE" ] \
+        || fail "TP=$tp [INTFER_FUSE_ACT=1] '$FUSE_IDS' != sequential base '$FUSE_BASE' (it must be bit-exact)"
       fuse_act_announced "$FUSE_ERR" \
         || fail "TP=$tp [INTFER_FUSE_ACT=1] kernel never announced a staging HIT -- the flag never reached the repeat path, so the stream match above was vacuous"
     fi
@@ -346,7 +366,22 @@ for tp in $TPS; do
   #
   # The announcement is the group the engine read from the env, once per
   # process, so the arm certifies the knob rather than a constant.
-  int8kvg_announced() { grep -aq '\[int8-kv-g\] INT8 KV group ACTIVE' "$1"; }
+  #
+  # *** ONE PREDICATE, TWO CONSUMERS (audit #3). *** The predicate is the
+  # group the announcement names, NOT the tag's presence: the tag is the same
+  # whether the knob fired or not, so a self-check that only greps the tag
+  # would be driven by a predicate the real arm does not use, and a
+  # weakened real arm would stay green. Both the arm and the self-check go
+  # through int8kvg_group, which returns the group named by the line (or the
+  # empty string when there is no line at all).
+  int8kvg_group() { # $1 = log -> prints the group named, or nothing
+    grep -aoE '\[int8-kv-g\].*group=[0-9]+ ' "$1" | head -1 \
+      | grep -aoE 'group=[0-9]+' | head -1 \
+      | sed -E 's/group=([0-9]+)/\1/'
+  }
+  int8kvg_ok() {   # $1 = log, $2 = expected group. 0=accept.
+    [ "$(int8kvg_group "$1")" = "$2" ]
+  }
   {
     G_OUT="$(mktemp)"; G_ERR="$(mktemp)"
     env INTFER_INT8_KV=1 INTFER_INT8_KV_G=16 "$BIN" --gpu --tp "$tp" -m "$MODEL" \
@@ -359,12 +394,8 @@ for tp in $TPS; do
       [ -n "$G_IDS" ] || fail "TP=$tp INTFER_INT8_KV_G=16 stream EMPTY"
       [ "$G_IDS" = "$BASE" ] \
         || fail "TP=$tp [INTFER_INT8_KV_G=16] '$G_IDS' != base '$BASE' (group size is a quantiser knob, must not move the stream)"
-      if ! int8kvg_announced "$G_ERR"; then
-        fail "TP=$tp INTFER_INT8_KV_G=16: no [int8-kv-g] line -- the group size was never read, so the run above matched base because the default 32 ran, not because the knob worked"
-      fi
-      G_LINE="$(grep -a '\[int8-kv-g\] INT8 KV group ACTIVE' "$G_ERR" | head -1)"
-      echo "$G_LINE" | grep -aq "group=16 " \
-        || { echo "GATE FAIL: TP=$tp INTFER_INT8_KV_G=16: the announcement does not name group=16, got '$G_LINE'" >&2; PASS=0; }
+      int8kvg_ok "$G_ERR" 16 \
+        || { echo "GATE FAIL: TP=$tp INTFER_INT8_KV_G=16: the announcement does not name group=16, got '$(int8kvg_group "$G_ERR")'" >&2; PASS=0; }
     fi
     rm -f "$G_OUT" "$G_ERR"
   }
@@ -375,20 +406,27 @@ for tp in $TPS; do
     cp "$GSB/good.err" "$GSB/not.err"
     sed -i 's/group=16 /group=32 /' "$GSB/not.err"
     : >"$GSB/empty.err"
-    if ! int8kvg_announced "$GSB/good.err"; then
+    if [ "$(int8kvg_group "$GSB/good.err")" != "16" ]; then
       echo "TP=$tp INT8_KV_G self-check SKIPPED: the fixture produced no \
-            [int8-kv-g] line (the INT8 KV mirror never enabled on this box), \
-            so the refusal/vacuity directions are unexercised here" >&2
+            [int8-kv-g] group line (the INT8 KV mirror never enabled on this \
+            box), so the refusal/vacuity directions are unexercised here" >&2
     else
-      if int8kvg_announced "$GSB/not.err"; then
+      # (b) refusal: a log whose announcement says group=32 (the default -- the
+      # knob was ignored) must be refused. The fixture carries a real group
+      # string, so the predicate can actually fire -- which is what separates
+      # this from a vacuous always-false guard.
+      if int8kvg_ok "$GSB/not.err" 16; then
         fail "TP=$tp INT8_KV_G self-check (b): a log whose group was 32 (the default -- the knob ignored) was ACCEPTED -- arm is knob-only"
       fi
-      if int8kvg_announced "$GSB/empty.err"; then
+      # (c) vacuity: an empty log must fail the predicate.
+      if int8kvg_ok "$GSB/empty.err" 16; then
         fail "TP=$tp INT8_KV_G self-check (c): arm ACCEPTED an empty log (vacuity)"
       fi
     fi
     rm -rf "$GSB"
   }
+
+
   # --- INTFER_L4_ROWS: FNV row-fidelity hash, TP=1 only ---------------------
   # This flag is a DIAGNOSTIC by the census's own definition (it memcpy's data
   # that is already there, hashes it, and discards the result -- "print paths,
@@ -407,7 +445,14 @@ for tp in $TPS; do
   # try/catch and the result is discarded) -- so the stream is bit-identical
   # to base and a stream comparison is satisfiable by a flag that never
   # reached the hash. The line is what turns the match into certification.
-  l4_rows_announced() { grep -aq '\[l4-rows\] FNV row-fidelity hash ACTIVE' "$1"; }
+  l4_rows_path() { # $1 = log -> prints the path named, or nothing
+    grep -aoE '\[l4-rows\].*path=[a-z]+' "$1" | head -1 \
+      | grep -aoE 'path=[a-z]+' | head -1 \
+      | sed -E 's/path=([a-z]+)/\1/'
+  }
+  l4_rows_ok() {   # $1 = log, $2 = expected path. 0=accept.
+    [ "$(l4_rows_path "$1")" = "$2" ]
+  }
   {
     R_OUT="$(mktemp)"; R_ERR="$(mktemp)"
     env INTFER_L4_FUSE=1 INTFER_L4_ROWS=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" \
@@ -421,11 +466,10 @@ for tp in $TPS; do
       [ "$R_IDS" = "$BASE" ] \
         || fail "TP=$tp [INTFER_L4_ROWS=1] '$R_IDS' != base '$BASE' (the hash mutates nothing, must be bit-exact)"
       if [ "$tp" = "1" ]; then
-        if ! l4_rows_announced "$R_ERR"; then
-          fail "TP=$tp INTFER_L4_ROWS=1: no [l4-rows] line -- the hash never ran, so the stream match above was vacuous"
-        fi
+        l4_rows_ok "$R_ERR" "seam" \
+          || { echo "GATE FAIL: TP=$tp INTFER_L4_ROWS=1: the announcement does not name the seam path, got '$(l4_rows_path "$R_ERR")'" >&2; PASS=0; }
       else
-        if l4_rows_announced "$R_ERR"; then
+        if l4_rows_ok "$R_ERR" "seam"; then
           fail "TP=$tp INTFER_L4_ROWS=1: hash announced on TP=2 where the L4 fused path must decline"
         fi
       fi
@@ -437,17 +481,17 @@ for tp in $TPS; do
     env INTFER_L4_FUSE=1 INTFER_L4_ROWS=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
       -n "${N:-4}" --no-stream --ids $TOK >"$RSB/good.out" 2>"$RSB/good.err" || true
     cp "$RSB/good.err" "$RSB/not.err"
-    sed -i '/\[l4-rows\]/d' "$RSB/not.err"
+    sed -i 's/path=seam/path=host/' "$RSB/not.err"
     : >"$RSB/empty.err"
-    if ! l4_rows_announced "$RSB/good.err"; then
+    if [ "$(l4_rows_path "$RSB/good.err")" != "seam" ]; then
       echo "TP=$tp L4_ROWS self-check SKIPPED: the tp=1 fixture produced no \
             [l4-rows] line (the L4 fused path did not run on this box), so \
             the refusal/vacuity directions are unexercised here" >&2
     else
-      if l4_rows_announced "$RSB/not.err"; then
+      if l4_rows_ok "$RSB/not.err" "seam"; then
         fail "TP=$tp L4_ROWS self-check (b): log with the hash line deleted was ACCEPTED -- arm is observation-only"
       fi
-      if l4_rows_announced "$RSB/empty.err"; then
+      if l4_rows_ok "$RSB/empty.err" "seam"; then
         fail "TP=$tp L4_ROWS self-check (c): arm ACCEPTED an empty log (vacuity)"
       fi
     fi
@@ -655,11 +699,29 @@ for tp in $TPS; do
   # the policy rather than a constant. Reachability is structural: the branch
   # is in begin_layer (engine.cpp:779), which every layer's forward pass
   # calls, so the 0.8B model reaches it on every token.
-  stream_f16_announced() { grep -aq '\[stream-f16\] FP16 shard eviction policy ACTIVE' "$1"; }
+  #
+  # *** ONE PREDICATE, TWO CONSUMERS (audit #3). *** The predicate is the
+  # POLICY the announcement names, not the tag's presence: the tag is the same
+  # whether the policy fired or not, so a self-check that only greps the tag
+  # would be driven by a predicate the real arm does not use. Both go through
+  # stream_f16_policy, which returns the policy named (or the empty string).
+  stream_f16_policy() { # $1 = log -> prints evict-everything | keep-FP16-resident | nothing
+    # [A-Za-z0-9-]+, NOT [a-z-]+: keep-FP16-resident carries capitals, and a
+    # class that cannot name it would silently truncate the refusal fixture
+    # to 'keep-' -- still != evict-everything, so the (b) direction survives,
+    # but a predicate that cannot state its own documented value is a guard
+    # whose rationale does not apply (audit #5).
+    grep -aoE '\[stream-f16\].*policy=[A-Za-z0-9-]+' "$1" | head -1 \
+      | grep -aoE 'policy=[A-Za-z0-9-]+' | head -1 \
+      | sed -E 's/policy=([A-Za-z0-9-]+)/\1/'
+  }
+  stream_f16_ok() {   # $1 = log, $2 = expected policy. 0=accept.
+    [ "$(stream_f16_policy "$1")" = "$2" ]
+  }
   {
     SF_OUT="$(mktemp)"; SF_ERR="$(mktemp)"
-    env INTFER_STREAM_F16=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
-      -n "${N:-4}" --no-stream --ids $TOK >"$SF_OUT" 2>"$SF_ERR"; SF_RC=$?
+    env INTFER_STREAM_F16=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" \
+      -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$SF_OUT" 2>"$SF_ERR"; SF_RC=$?
     if [ "$SF_RC" -ne 0 ]; then
       fail "TP=$tp INTFER_STREAM_F16=1 run exited rc=$SF_RC"; tail -10 "$SF_ERR" >&2
     else
@@ -668,12 +730,8 @@ for tp in $TPS; do
       [ -n "$SF_IDS" ] || fail "TP=$tp INTFER_STREAM_F16=1 stream EMPTY"
       [ "$SF_IDS" = "$BASE" ] \
         || fail "TP=$tp [INTFER_STREAM_F16=1] '$SF_IDS' != base '$BASE' (the policy moves when, not what -- must be bit-exact)"
-      if ! stream_f16_announced "$SF_ERR"; then
-        fail "TP=$tp INTFER_STREAM_F16=1: no [stream-f16] line -- the policy was never read, so the run above matched base because the default keep-FP16-resident ran, not because the flag worked"
-      fi
-      SF_LINE="$(grep -a '\[stream-f16\] FP16 shard eviction policy ACTIVE' "$SF_ERR" | head -1)"
-      echo "$SF_LINE" | grep -aq "evict-everything" \
-        || { echo "GATE FAIL: TP=$tp INTFER_STREAM_F16=1: the announcement does not name the evict-everything policy, got '$SF_LINE'" >&2; PASS=0; }
+      stream_f16_ok "$SF_ERR" "evict-everything" \
+        || { echo "GATE FAIL: TP=$tp INTFER_STREAM_F16=1: the announcement does not name the evict-everything policy, got '$(stream_f16_policy "$SF_ERR")'" >&2; PASS=0; }
     fi
     rm -f "$SF_OUT" "$SF_ERR"
   }
@@ -684,15 +742,19 @@ for tp in $TPS; do
     cp "$SFSB/good.err" "$SFSB/not.err"
     sed -i 's/evict-everything/keep-FP16-resident/' "$SFSB/not.err"
     : >"$SFSB/empty.err"
-    if ! stream_f16_announced "$SFSB/good.err"; then
+    if [ "$(stream_f16_policy "$SFSB/good.err")" != "evict-everything" ]; then
       echo "TP=$tp STREAM_F16 self-check SKIPPED: the tp=1 fixture produced no \
-            [stream-f16] line (the engine did not run on this box), so the \
-            refusal/vacuity directions are unexercised here" >&2
+            [stream-f16] policy line (the engine did not run on this box), so \
+            the refusal/vacuity directions are unexercised here" >&2
     else
-      if stream_f16_announced "$SFSB/not.err"; then
+      # (b) refusal: a log whose policy is keep-FP16-resident (the default -- the
+      # flag was ignored) must be refused. The fixture carries a real policy
+      # string, so the predicate can actually fire.
+      if stream_f16_ok "$SFSB/not.err" "evict-everything"; then
         fail "TP=$tp STREAM_F16 self-check (b): a log whose policy was keep-FP16-resident (the default -- the flag ignored) was ACCEPTED -- arm is policy-only"
       fi
-      if stream_f16_announced "$SFSB/empty.err"; then
+      # (c) vacuity: an empty log must fail the predicate.
+      if stream_f16_ok "$SFSB/empty.err" "evict-everything"; then
         fail "TP=$tp STREAM_F16 self-check (c): arm ACCEPTED an empty log (vacuity)"
       fi
     fi
@@ -714,25 +776,33 @@ for tp in $TPS; do
   # What an arm CAN honestly assert here is REACHABILITY, and it is still
   # worth asserting: the branch is in run_lm_head_f16 (main.cpp:1433), which
   # every lm_head call enters, so the 0.8B model reaches it on every token.
-  # The arm checks the run exited 0, produced tokens, and -- the only thing
-  # that separates this from a flag that never reached the upload -- that the
-  # [lmhead-fp16] line appeared. It asserts NO stream identity and NO
-  # performance figure; saying so explicitly is the difference between a
-  # reachability arm and a vacuous pass.
-  lmhead_fp16_announced() { grep -aq '\[lmhead-fp16\] lm_head upload ACTIVE' "$1"; }
+  #
+  # *** ONE PREDICATE, TWO CONSUMERS (audit #3). *** The predicate is the
+  # PATH the upload chose, not the tag's presence -- the tag is the same
+  # whether the FP16 path ran or the default INT8 path did, so a self-check
+  # that only greps the tag would be driven by a predicate the real arm does
+  # not use. Both go through lmhead_fp16_path, which returns the path named
+  # (or the empty string).
+  lmhead_fp16_path() { # $1 = log -> prints fp16 | nothing
+    grep -aoE '\[lmhead-fp16\].*path=[A-Za-z0-9]+ per-tile [A-Z0-9]+ weights' "$1" | head -1 \
+      | grep -aoE 'path=[A-Za-z0-9]+' | head -1 \
+      | sed -E 's/path=([A-Za-z0-9]+)/\1/'
+  }
+  lmhead_fp16_ok() {   # $1 = log, $2 = expected path. 0=accept.
+    [ "$(lmhead_fp16_path "$1")" = "$2" ]
+  }
   {
     H_OUT="$(mktemp)"; H_ERR="$(mktemp)"
-    env INTFER_LMHEAD_FP16=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
-      -n "${N:-4}" --no-stream --ids $TOK >"$H_OUT" 2>"$H_ERR"; H_RC=$?
+    env INTFER_LMHEAD_FP16=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" \
+      -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$H_OUT" 2>"$H_ERR"; H_RC=$?
     if [ "$H_RC" -ne 0 ]; then
       fail "TP=$tp INTFER_LMHEAD_FP16=1 run exited rc=$H_RC"; tail -10 "$H_ERR" >&2
     else
       H_IDS="$(ids_of "$tp" INTFER_LMHEAD_FP16=1)"
       echo "TP=$tp [INTFER_LMHEAD_FP16=1]: '$H_IDS'"
       [ -n "$H_IDS" ] || fail "TP=$tp INTFER_LMHEAD_FP16=1 produced no tokens (see $H_ERR)"
-      if ! lmhead_fp16_announced "$H_ERR"; then
-        fail "TP=$tp INTFER_LMHEAD_FP16=1: no [lmhead-fp16] line -- the FP16 upload never ran, so the run above is the default INT8 path and this arm is vacuous"
-      fi
+      lmhead_fp16_ok "$H_ERR" "fp16" \
+        || { echo "GATE FAIL: TP=$tp INTFER_LMHEAD_FP16=1: the announcement does not name the per-tile FP16 upload, got '$(lmhead_fp16_path "$H_ERR")'" >&2; PASS=0; }
       # EXPLICITLY NOT a stream comparison: INT8 vs FP16 weight representation
       # differs by design. Recorded here so the omission is visible rather
       # than silent.
@@ -745,17 +815,21 @@ for tp in $TPS; do
     env INTFER_LMHEAD_FP16=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
       -n "${N:-4}" --no-stream --ids $TOK >"$HSB/good.out" 2>"$HSB/good.err" || true
     cp "$HSB/good.err" "$HSB/not.err"
-    sed -i '/\[lmhead-fp16\]/d' "$HSB/not.err"
+    sed -i 's/path=fp16 per-tile FP16 weights/path=int8 per-tile INT8 weights/' "$HSB/not.err"
     : >"$HSB/empty.err"
-    if ! lmhead_fp16_announced "$HSB/good.err"; then
+    if [ "$(lmhead_fp16_path "$HSB/good.err")" != "fp16" ]; then
       echo "TP=$tp LMHEAD_FP16 self-check SKIPPED: the tp=1 fixture produced no \
-            [lmhead-fp16] line (the lm_head upload never ran on this box), so \
-            the refusal/vacuity directions are unexercised here" >&2
+            [lmhead-fp16] upload line (the lm_head upload never ran on this box), \
+            so the refusal/vacuity directions are unexercised here" >&2
     else
-      if lmhead_fp16_announced "$HSB/not.err"; then
-        fail "TP=$tp LMHEAD_FP16 self-check (b): log with the upload line deleted was ACCEPTED -- arm is reachability-only"
+      # (b) refusal: a log whose upload took the default INT8 path (the flag
+      # was ignored) must be refused. The fixture carries a real path string,
+      # so the predicate can actually fire.
+      if lmhead_fp16_ok "$HSB/not.err" "fp16"; then
+        fail "TP=$tp LMHEAD_FP16 self-check (b): log with the default INT8 upload ACCEPTED -- arm is reachability-only"
       fi
-      if lmhead_fp16_announced "$HSB/empty.err"; then
+      # (c) vacuity: an empty log must fail the predicate.
+      if lmhead_fp16_ok "$HSB/empty.err" "fp16"; then
         fail "TP=$tp LMHEAD_FP16 self-check (c): arm ACCEPTED an empty log (vacuity)"
       fi
     fi

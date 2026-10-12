@@ -1463,7 +1463,8 @@ struct GpuBackend : public LinearBackend {
           announced_lmhead_fp16 = true;
           std::fprintf(stderr,
                        "[lmhead-fp16] lm_head upload ACTIVE "
-                       "(per-tile FP16 weights; INTFER_LMHEAD_FP16=1 -- "
+                       "(path=fp16 per-tile FP16 weights; "
+                       "INTFER_LMHEAD_FP16=1 -- "
                        "INT8-vs-FP16, tolerance-gated not bit-exact)\n");
           std::fflush(stderr);
         }
@@ -3158,11 +3159,22 @@ static bool gpu_l4_tail(GpuBackend& be, sycl::queue& q,
     // arm would certify a path that never ran. The policy is a property of
     // the engine's L4 tail, so it announces before the dispatch.
     static bool announced_l4_rows = false;
-    if (!announced_l4_rows) {
+    // The announcement is gated on the FLAG, not on the seam's mere presence:
+    // gpu_l4_tail is called by the L4 fused path whenever it runs, so a line
+    // ungated by the flag would print on a plain INTFER_L4_FUSE=1 run and the
+    // arm's "absent when the flag is off" half would be falsified. The flag is
+    // read here, not passed in, because gpu_l4_tail is a free function shared
+    // by the solo and M-row paths and neither caller carries the knob.
+    if (announced_l4_rows ||
+        std::getenv("INTFER_L4_ROWS") == nullptr) {
+      // already announced, or the flag is off -- in either case the seam runs
+      // without the hash and must not print a line for it.
+    } else {
       announced_l4_rows = true;
       std::fprintf(stderr,
                    "[l4-rows] FNV row-fidelity hash ACTIVE "
-                   "(q/k/v/b/a/z/S in + out per row; INTFER_L4_ROWS=1)\n");
+                   "(path=seam q/k/v/b/a/z/S in + out per row; "
+                   "INTFER_L4_ROWS=1)\n");
       std::fflush(stderr);
     }
     if(!be.eng->run_linear_tp_devact(la_out_ti, be.l4_act_dev_, o_la, 1,

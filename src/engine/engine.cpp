@@ -797,7 +797,7 @@ void Engine::begin_layer(int L) {
     announced_stream_f16 = true;
     std::fprintf(stderr,
                  "[stream-f16] FP16 shard eviction policy ACTIVE "
-                 "(evict-everything; INTFER_STREAM_F16=1)\n");
+                 "(policy=evict-everything; INTFER_STREAM_F16=1)\n");
     std::fflush(stderr);
   }
   if (pinned_) return;  // preload_all(): steady-state zero evict+rebuild.
@@ -1463,7 +1463,15 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     act_cache_K_ = (uint32_t)t.K;
     act_cache_gen_ = act_staging_gen_;
     static bool announced_act = false;
-    if (!announced_act) {
+    // Gated on act_hit, not on fuse_act. The flag only says the cache is
+    // CONSULTED; a line printed on the flag announces "the knob was read",
+    // which is exactly what the arm's stream comparison already cannot
+    // distinguish from a flag that did nothing. MEASURED: with -n 1 there is
+    // a single decode step after an M=5 prefill, so act_cache_M_ (5) can
+    // never equal M (1) and act_hit is unreachable -- the old flag-gated line
+    // still printed, so the gate's "announced a staging HIT" assertion was
+    // satisfiable with zero hits on the whole run.
+    if (act_hit && !announced_act) {
       announced_act = true;
       std::fprintf(stderr,
                    "[fuse-act] activation staging reuse ACTIVE "
