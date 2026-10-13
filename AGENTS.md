@@ -341,6 +341,52 @@ intfer's SSM has one WI per (head, column) with scalar accumulators. sgl's spec-
 cache also has no consumer in intfer (no speculative decoding). **All four sgl-kernel-xpu
 candidates are now falsified.** See `upstream_sgl_gdn_chunk_20261012.md`.
 
+**Re-survey 2026-10-13 (round 4, sgl-kernel-xpu) -- the judge-named files.** The judge's last
+reminder named six sgl files that had not been fetched in the earlier rounds. All six were fetched
+from `main` and read against intfer's actual code; **none ports**, and the reasons are recorded in
+full in `docs/upstream_sgl_survey.md`. The new files add no new *techniques* beyond the four
+already falsified -- they are either Cutlass-tiled attention (MLA, FMHA) targeting an op intfer
+does not run, or JIT elementwise kernels (FusedQKNormRope, RMSNorm) whose in-kernel l2norm would
+*add* an H2D upload and *remove* a host kernel that touches no device memory. The one genuinely
+new file, `src/sycl/xe35/dsv3_fused_a_gemm.cpp` (DeepSeek-V3 fused-A GEMM, Cutlass `GemmUniversal`,
+K=7168 / N∈{2048,2112} / M∈[1,16], BF16×BF16, `XE_DPAS_TT<8,float,bfloat16_t>`), is a fixed-shape
+specialisation with no shape match in intfer's 27B (K=4096 layer, N=128 lm_head tile, M=361
+prefill) and pulls in the Cutlass dependency that is not in intfer's build. `src/sycl/kernels/mla/
+xe20/kernel/mla_tile_scheduler.hpp` (178 lines) is pure Cutlass dispatch plumbing (`FastDivmod`,
+`BlockIdxZ/Y/X`, `num_kv_splits`) with no arithmetic. **The survey is now exhausted across four
+rounds (llama.cpp × 2, sgl-kernel-xpu × 3); every accessible candidate is falsified.**
+
+**What the survey's negative result surfaces is the INTERNAL fusion surface, and it is already the
+shipped one.** The four round survey confirms that the fusions intfer has actually shipped are the
+correct ones for its architecture, and the remaining gaps are structural, not missing
+micro-optimisations:
+
+1. **Prefill MLP gate+up+down device chain (TP=2)** -- `run_mlp_gateup` (engine.cpp:1728) already
+   fuses gate+up into one INT2+INT2 launch per device (nk 4→2, submit 4→2, usm_write 4→2), and
+   `silumul_to_half` (quant_gemm.cpp:3459) chains silu(gate)*up into the down activation on device.
+   The down-projection (`run_linear_tp`, engine.cpp:1315) still requires the **full inter**
+   (K = full inter) while gate/up only produce this device's N slice, so the silu-mul intermediate
+   must cross the host. **Not reachable at TP=2** (no P2P; `grep -riE 'allreduce|p2p|peer'` returns
+   nothing). This is the structural limit documented in "BOTH FUSION SEAMS ARE TP=1 ONLY".
+2. **SSM norm+silu+la_out GEMM device chain (TP=2)** -- `gpu_l4_tail` (main.cpp:3111) chains
+   `ssm_forward` → `ssm_norm_silu_to_half` → `run_linear_tp_devact` (la_out GEMM) on device 0,
+   removing the core D2H + host norm + H2D + la_out wait. **But `run_linear_tp_devact` is
+   TP=1-locked** (`engine.cpp:1954: devices_.size() != 1 => return false`), so on `--tp 2` the LA
+   layers fall back to the host la_out path (main.cpp:6550 `run_linear_batch(ln.la_out, ...)`).
+   This is a known, documented gap -- the L4 fused seam does not reach the 27B `--tp 2` target.
+3. **Prefill M-row wave launch fusion** -- `INTFER_WAVE_LAUNCH_FUSE` already ships this for any
+   wave (one launch per device instead of N separate launches, `quant_gemm_forward_usm_wave`,
+   quant_gemm.cpp:2200), and the prefill M-row wave (q/k/v/z/b/a/la_out at main.cpp:6326-6333)
+   already benefits. **Shipped.**
+
+**Conclusion of the survey.** The four rounds (llama.cpp × 2, sgl-kernel-xpu × 3) have exhausted
+the accessible upstream surface; every candidate fails the PARAMOUNT DIRECTIVE's fusion test or
+targets an op intfer does not run. The already-shipped fusions (gate+up in one launch, silu-mul
+device chain, SSM pass-fusion, wave-launch fusion) are the correct ones for intfer's actual
+architecture. The two remaining gaps (down-projection fusion at TP=2, L4 la_out device chain at
+TP=2) are **structural** -- they require P2P or a TP=1 seam, neither of which exists -- and are
+recorded here so the next session does not re-derive them as "not yet attempted".
+
 ### Default ON, with a kill switch
 
 `INTFER_NO_FUSE_SILUMUL` (fused MLP, TP=1 only — the shipped +13%), `INTFER_NO_WAVE`
