@@ -60,6 +60,7 @@ fi
 # cannot produce a PASS from a binary that no longer exists.
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 CXX="$(which icpx || echo /opt/intel/oneapi/compiler/latest/bin/icpx)"
+GATE_BUILD_DIR="${INTFER_ONEMKL_BUILD_DIR:-$ROOT/build/onemkl_gate}"
 mkdir -p "$GATE_BUILD_DIR"
 if ! cmake -S "$ROOT" -B "$GATE_BUILD_DIR" -G "Unix Makefiles" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -70,14 +71,18 @@ if ! cmake -S "$ROOT" -B "$GATE_BUILD_DIR" -G "Unix Makefiles" \
   exit 1
 fi
 
-# ---- 3. Build the probe in that dir. ----
+# ---- 3. Build the probe in that dir, THROUGH THE SHARED BUILD GUARD. ----
+# gate_inventory.sh requires every gate to build its own target through
+# gate_require_build; a gate that builds by hand is reported as
+# "NO BUILD GUARD" and fails the inventory. The guard honours
+# INTFER_BUILD_DIR, so point it at the throwaway dir configured above and let
+# it do the build -- that is the same stale-artifact protection every other
+# gate gets, rather than a hand-rolled equivalent that can drift.
+INTFER_BUILD_DIR="$GATE_BUILD_DIR" \
+INTFER_GATE_NO_BUILD=0 \
+. "$SCRIPT_DIR/_gate_build.sh"
+gate_require_build onemkl_probe || exit 1
 BIN="$GATE_BUILD_DIR/examples/onemkl_probe/onemkl_probe"
-if ! cmake --build "$GATE_BUILD_DIR" --target onemkl_probe -j4 \
-    >"$GATE_BUILD_DIR/gate_onemkl_build.log" 2>&1; then
-  echo "FAIL: onemkl_probe did not build" >&2
-  tail -20 "$GATE_BUILD_DIR/gate_onemkl_build.log" >&2
-  exit 1
-fi
 [ -x "$BIN" ] || { echo "FAIL: onemkl_probe binary missing: $BIN" >&2; exit 1; }
 
 # ---- 4. ldd must bind all five oneMKL .so's. ----

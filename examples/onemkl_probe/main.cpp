@@ -97,12 +97,28 @@ struct Shape {
 // M >= 8 is the arm's own gate. The K axis is the one that drives the FP32
 // reordering error, so it is the widest (up to 4096, the same order as a
 // real 27B prefill's K=5120 contraction).
+//
+// *** WHY THESE SHAPES, AND WHY M=361 IS THE SMALLEST THAT MATTERS. ***
+// The M>=8 gate exists because oneMKL cannot pay at M=1: FP16 decode already
+// runs at 98-123% of the memory roofline, so a BLAS launch is pure overhead
+// there. The payoff is the M-ROWED prefill path, and the 27B lm_head is the
+// only M-rowed FP16 GEMM in the tree (main.cpp:1350-1390, the
+// lm_head_xM_dev_ / lm_head_cM_dev_ path: quant_gemm_f16(q, x_row, w_dev,
+// c_dev, M, Nlt, K) with M = the prefill's token count, not 1). So the
+// shapes here are the lm_head's own geometry, not an arbitrary ladder:
+//   * N=128 is the lm_head tile width (lm_head_tiles_ slices the 128K-vocab
+//     output into 128-row tiles);
+//   * K=4096 is the hidden dim;
+//   * M=361 is a measured 27B prefill token count, and 8/16/32/64 are the
+//     small-M end where the gate's own M>=8 boundary sits.
+// A shape set that did not include the prefill's own M would certify the
+// arm without ever exercising the only caller that can pay for it.
 const Shape kMge8[] = {
     {8, 128, 128, "M8-N128-K128"},
     {16, 256, 512, "M16-N256-K512"},
     {32, 128, 2048, "M32-N128-K2048"},
     {64, 512, 1024, "M64-N512-K1024"},
-    {361, 128, 4096, "M361-N128-K4096"},   // a measured prefill M
+    {361, 128, 4096, "M361-N128-K4096"},   // a measured 27B prefill M
 };
 
 // Host FP32 reference: ascending-k, matching the engine's own scalar order as
