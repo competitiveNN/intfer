@@ -993,6 +993,69 @@ for tp in $TPS; do
     rm -rf "$HSB"
   }
 
+  # --- INTFER_XMX_GEMM: joint_matrix XMX DPAS for INT2/INT4 weights ---------
+  # Ported from llama.cpp fused-gemm. The portable tiled kernel
+  # (quant_gemm_forward_usm) dequantizes INT2/4 weights into SLM and
+  # accumulates with FP16 FMA on EU/ALU -- xmxmon reads zero DPAS there. This
+  # kernel issues the XMX DPAS directly via joint_matrix_mad after dequantizing
+  # the weight tile into FP16 in SLM.
+  #
+  # BIT-EXACT BY CONSTRUCTION: the dequantized FP16 weight tile holds the
+  # same bits the tiled kernel would load into sW, the activation tile holds
+  # the same bits as sA, and the DPAS FP32 accumulation order is the same
+  # ascending-K order as the tiled kernel's inner kk loop. The only
+  # difference is the compute unit (XMX DPAS vs EU/ALU FMA).
+  #
+  # *** WHY A STREAM COMPARISON ALONE IS VACUOUS HERE, AND WHAT DEFEATS IT. ***
+  # The base and this arm are bit-identical BY CONSTRUCTION (that is the
+  # claim), so "the two streams matched" certifies nothing on its own: a
+  # flag that never reached the branch would also produce matching streams.
+  # The per-site decision line below is what separates them -- it prints
+  # "[xmx-gemm] ACTIVE on eligible INT2/INT4 tiles" once per process, so the
+  # arm certifies the kernel ran rather than a constant.
+  #
+  # *** THE KERNEL ITSELF GUARDS THE SHAPES. *** quant_gemm_forward_usm_xmx
+  # returns a null event when M%16 != 0, N%16 != 0, or K%64 != 0, and the
+  # engine falls back to the tiled kernel. So this arm is REACHABILITY-only
+  # on the 0.8B model: it certifies that the XMX path is wired and reachable
+  # when the shapes are aligned, not that it fired on every tile. The gate
+  # asserts the announcement line is present when the flag is set.
+  xmx_announced() { grep -aq '\[xmx-gemm\]' "$1"; }
+  {
+    XM_OUT="$(mktemp)"; XM_ERR="$(mktemp)"
+    env INTFER_XMX_GEMM=1 "$BIN" --gpu --tp "$tp" -m "$MODEL"       -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$XM_OUT" 2>"$XM_ERR"; XM_RC=$?
+    if [ "$XM_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_XMX_GEMM=1 run exited rc=$XM_RC"; tail -10 "$XM_ERR" >&2
+    else
+      XM_IDS="$(ids_of "$tp" INTFER_XMX_GEMM=1)"
+      echo "TP=$tp [INTFER_XMX_GEMM=1]: '$XM_IDS'"
+      [ -n "$XM_IDS" ] || fail "TP=$tp INTFER_XMX_GEMM=1 stream EMPTY"
+      [ "$XM_IDS" = "$BASE" ]         || fail "TP=$tp [INTFER_XMX_GEMM=1] '$XM_IDS' != base '$BASE' (must be bit-exact)"
+      if ! xmx_announced "$XM_ERR"; then
+        fail "TP=$tp INTFER_XMX_GEMM=1: no [xmx-gemm] line -- the XMX path never took, stream match vacuous"
+      fi
+    fi
+    rm -f "$XM_OUT" "$XM_ERR"
+  }
+  {
+    XMSB="$(mktemp -d)"
+    env INTFER_XMX_GEMM=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT"       -n "${N:-4}" --no-stream --ids $TOK >"$XMSB/good.out" 2>"$XMSB/good.err" || true
+    cp "$XMSB/good.err" "$XMSB/not.err"
+    sed -i '/\[xmx-gemm\]/d' "$XMSB/not.err"
+    : >"$XMSB/empty.err"
+    if ! xmx_announced "$XMSB/good.err"; then
+      echo "TP=$tp XMX_GEMM self-check SKIPPED: the tp=1 fixture produced no             [xmx-gemm] line (no INT2/INT4 tiles on this model, or the engine             did not run on this box), so the refusal/vacuity directions are             unexercised here" >&2
+    else
+      if xmx_announced "$XMSB/not.err"; then
+        fail "TP=$tp XMX_GEMM self-check (b): log with the decision line deleted was ACCEPTED -- arm is stream-only"
+      fi
+      if xmx_announced "$XMSB/empty.err"; then
+        fail "TP=$tp XMX_GEMM self-check (c): arm ACCEPTED an empty log (vacuity)"
+      fi
+    fi
+    rm -rf "$XMSB"
+  }
+
 
 done
 

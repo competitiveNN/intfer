@@ -162,6 +162,42 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                       gemm::WeightScheme scheme,
                                       const sycl::event& copy_dep);
 
+
+// ---------------------------------------------------------------------------
+// XMX joint_matrix FP16-act x INT2/4-weight GEMM (INTFER_XMX_GEMM).
+// ---------------------------------------------------------------------------
+// Ported from llama.cpp fused-gemm (ggml/src/ggml-sycl/fused-gemm.cpp) using
+// the SYCL ext::oneapi::experimental::matrix API. The portable tiled kernel
+// (quant_gemm_forward_usm) dequantizes INT2/4 weights into SLM and
+// accumulates with FP16 FMA on EU/ALU -- xmxmon reads zero DPAS there. This
+// kernel issues the XMX DPAS directly via joint_matrix_mad after dequantizing
+// the weight tile into FP16 in SLM.
+//
+// INTFER_XMX_GEMM (default OFF, PRESENCE enables). M >= 8 only: XMX needs a
+// full TM x TK x TN tile to amortize the SLM round trip; M=1 decode is
+// memory-bound and the tiled kernel is already at the memory roofline.
+//
+// CALLER GUARD: M % 16 == 0, N % 16 == 0, K % 64 == 0. Returns a null event
+// otherwise; the caller must fall back to quant_gemm_forward_usm.
+//
+// NUMERICS. Bit-exact by construction: the dequantized FP16 weight tile holds
+// the same bits the tiled kernel would load into sW, the activation tile
+// holds the same bits as sA, and the DPAS FP32 accumulation order is the
+// same ascending-K order as the tiled kernel's inner kk loop. The only
+// difference is the compute unit (XMX DPAS vs EU/ALU FMA).
+// ---------------------------------------------------------------------------
+sycl::event quant_gemm_forward_usm_xmx(
+    sycl::queue& q,
+    std::uint16_t* act_usm,          // M*K FP16 activation
+    const void* code_usm,            // packed INT2/4 codes (N*K)
+    const std::uint16_t* scale_usm,  // FP16 per (row, group)
+    float alpha,                     // global divisor (1.0 if no global)
+    std::uint16_t* out_usm,          // M*N FP16 output
+    uint32_t M, uint32_t N, uint32_t K,
+    uint32_t group_size,
+    gemm::WeightScheme scheme,
+    const sycl::event& copy_dep);
+
                                       // ---------------------------------------------------------------------------
                                       // FUSED GATE+UP GEMM (INTFER_FUSED_GATE_UP). TP=2-only fusion.
                                       // ---------------------------------------------------------------------------

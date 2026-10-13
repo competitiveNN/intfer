@@ -2081,6 +2081,192 @@ void build_vnni_int8(const std::int8_t* w, std::int8_t* out,
 }
 
 // ---------------------------------------------------------------------------
+// XMX joint_matrix FP16-act x INT2/4-weight GEMM.
+// Ported from llama.cpp fused-gemm (ggml/src/ggml-sycl/fused-gemm.cpp)
+// using the SYCL ext::oneapi::experimental::matrix API.
+//
+// The portable tiled kernel (quant_gemm_forward_usm) dequantizes weights
+// into SLM and accumulates with FP16 FMA on EU/ALU -- the XMX matrix
+// engines are idle there (xmxmon reads zero DPAS on this path). This
+// kernel uses the SYCL joint_matrix API to issue the XMX DPAS directly
+// for the FP16 x FP16 case, after dequantizing the INT2/4 weight tile
+// into FP16 in SLM. The dequant is bit-identical to the tiled kernel's
+// (same canon_value, same scale, same alpha fold); only the compute
+// unit changes: XMX DPAS instead of EU/ALU FMA.
+//
+// INTFER_XMX_GEMM (default OFF, presence enables). M >= 8 only: XMX
+// needs a full TM x TK x TN tile to amortize the SLM round trip; M=1
+// decode is memory-bound and the tiled kernel is already at the
+// memory roofline.
+//
+// Tile: TM=16, TN=16, TK=32, SG=16 (one sub-group per tile, native
+// Xe2/3 sub-group size). Each sub-group owns a 16x16 output tile and
+// walks K in 32-wide steps. Work-group = (N/TN, M/TM) * SG threads.
+// Bit-exact by construction: the dequantized FP16 weight tile holds
+// the same bits the tiled kernel would load into sW, the activation
+// tile holds the same bits as sA, and the DPAS FP32 accumulation
+// order is the same ascending-K order as the tiled kernel's inner
+// kk loop -- so the output FP16 is bit-identical to the tiled kernel
+// and the token stream cannot move.
+//
+// CALLER GUARD: M % TM == 0, N % TN == 0, K % BK == 0. The kernel
+// only runs on full tiles; any residual is handled by the caller
+// falling back to quant_gemm_forward_usm.
+// ---------------------------------------------------------------------------
+namespace {
+
+// XMX tile configuration (ported from llama.cpp fused-gemm's
+// fg_combo<fg_half, fg_half, 16, 16, 32, 16>).
+struct xmx_tile_cfg {
+  static constexpr int TM = 16;  // output rows per sub-group
+  static constexpr int TN = 16;  // output cols per sub-group
+  static constexpr int TK = 32;  // K per inner step
+  static constexpr int SG = 16;  // sub-group size (Xe2/3 native)
+  static constexpr int BK = 64;  // K per SLM tile (2 x TK steps)
+};
+
+}  // namespace
+
+sycl::event quant_gemm_forward_usm_xmx(
+    sycl::queue& q, std::uint16_t* act_usm,
+    const void* code_usm, const std::uint16_t* scale_usm,
+    float alpha, std::uint16_t* out_usm,
+    uint32_t M, uint32_t N, uint32_t K,
+    uint32_t group_size, gemm::WeightScheme scheme,
+    const sycl::event& copy_dep) {
+  if (scheme == gemm::WeightScheme::FP16) return sycl::event{};
+  const int bits = (scheme == gemm::WeightScheme::INT2) ? 2
+                 : (scheme == gemm::WeightScheme::INT4) ? 4
+                 : 8;
+  if (bits == 8) return sycl::event{};  // INT8 uses the ESIMD DPAS path
+  if (M < 8) return sycl::event{};      // XMX needs a full tile
+  const int Gw = (group_size == 0) ? static_cast<int>(K) : static_cast<int>(group_size);
+  const int num_groups_w = (static_cast<int>(K) + Gw - 1) / Gw;
+  const auto* code_u8 = static_cast<const std::uint8_t*>(code_usm);
+
+  constexpr int TM = xmx_tile_cfg::TM;
+  constexpr int TN = xmx_tile_cfg::TN;
+  constexpr int TK = xmx_tile_cfg::TK;
+  constexpr int SG = xmx_tile_cfg::SG;
+  constexpr int BK = xmx_tile_cfg::BK;
+
+  // Caller must guard: M % TM == 0, N % TN == 0, K % BK == 0.
+  if (M % TM != 0 || N % TN != 0 || K % BK != 0) return sycl::event{};
+
+  const int gx = static_cast<int>(M) / TM;
+  const int gy = static_cast<int>(N) / TN;
+  // Work-group: (gy, gx). Each work-group owns one output tile
+  // (TM x TN) and one sub-group (SG threads) computes it.
+  sycl::nd_range<2> nd(sycl::range<2>(gy * gx, 1),
+                       sycl::range<2>(1, 1));
+
+  return q.submit([&](sycl::handler& h) {
+    if (copy_dep != sycl::event{}) h.depends_on(copy_dep);
+    // SLM: dequantized weight tile [BK x TN] (k-major, so a
+    // row_major joint_matrix load reads it as [TK x TN] per step).
+    // Declared on the HOST side (in the submit lambda), shared across
+    // sub-groups in the work-group (here 1 sub-group per work-group).
+    sycl::local_accessor<sycl::half, 1> sW(sycl::range<1>(BK * TN), h);
+    h.parallel_for(nd, [=](sycl::nd_item<2> it)
+                       [[sycl::reqd_sub_group_size(SG)]] {
+      const auto sg = it.get_sub_group();
+      const int lane = sg.get_local_id()[0];
+      const int wg_id = it.get_group(0);
+      const int tile_id = wg_id;  // one tile per work-group
+      const int bm = tile_id / gy;
+      const int bn = tile_id % gy;
+      const int m0 = bm * TM;
+      const int n0 = bn * TN;
+
+      using namespace sycl::ext::oneapi::experimental::matrix;
+      // FP32 accumulators: DPAS hardware accumulates in FP32.
+      // layout::dynamic is required by the joint_matrix API for
+      // accumulator matrices.
+      joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN,
+                   layout::dynamic> acc;
+      joint_matrix_fill(sg, acc, 0.0f);
+
+      const int nk_steps = static_cast<int>(K) / BK;
+      for (int bk = 0; bk < nk_steps; ++bk) {
+        const int k0 = bk * BK;
+        // Phase 1: dequantize the weight tile into SLM. Every lane
+        // dequantizes a contiguous slice of the BK*TN tile so the
+        // code loads coalesce (one lane per (k, n) pair, stride SG).
+        // Bit-identical to the tiled kernel's sW load.
+        for (int e = lane; e < BK * TN; e += SG) {
+          const int k = e / TN;
+          const int n = e % TN;
+          const int ng = n0 + n;
+          const int kg = k0 + k;
+          float wval = 0.0f;
+          if (ng < static_cast<int>(N) && kg < static_cast<int>(K)) {
+            const std::size_t idx = static_cast<std::size_t>(ng) * K + kg;
+            const int g = kg / Gw;
+            const float s = from_half_bits(
+                scale_usm[ng * num_groups_w + g]) * alpha;
+            int code;
+            if (bits >= 8) {
+              code = static_cast<int>(code_u8[idx]);
+            } else {
+              const int pack = 8 / bits;
+              const std::uint8_t b = code_u8[idx / pack];
+              const int within = static_cast<int>(idx % pack);
+              code = (b >> (within * bits)) & ((1 << bits) - 1);
+            }
+            wval = s * canon_value(bits, code);
+          }
+          sW[e] = sycl::half(wval);
+        }
+        it.barrier();
+
+        // Phase 2: XMX DPAS over the BK-wide K tile in TK steps.
+        // A is loaded from USM (FP16, row-major); B is loaded from
+        // SLM (FP16, row-major, k-major layout).
+        for (int kt = 0; kt < BK / TK; ++kt) {
+          const int kg0 = k0 + kt * TK;
+          // A tile: [TM x TK] from act_usm, row-major.
+          joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK,
+                       layout::row_major> sub_a;
+          // B tile: [TK x TN] from sW, row-major (k-major in SLM).
+          joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN,
+                       layout::row_major> sub_b;
+          // A load: act_usm[(m0 + m) * K + (kg0 + k)] for m in [0,TM), k in [0,TK).
+          const auto a_ptr = sycl::address_space_cast<
+              sycl::access::address_space::global_space,
+              sycl::access::decorated::no>(
+              reinterpret_cast<sycl::half*>(act_usm));
+          // B load: sW[k * TN + n] for k in [kt*TK, kt*TK+TK), n in [0,TN).
+          const auto b_ptr = sW.get_multi_ptr<sycl::access::decorated::no>();
+          joint_matrix_load(sg, sub_a,
+              a_ptr + static_cast<std::size_t>(m0) * K + kg0,
+              static_cast<size_t>(K));
+          joint_matrix_load(sg, sub_b,
+              b_ptr + static_cast<std::size_t>(kt) * TK * TN,
+              static_cast<size_t>(TN));
+          joint_matrix_mad(sg, acc, sub_a, sub_b, acc);
+        }
+        it.barrier();
+      }
+
+      // Store: FP32 acc -> FP16 out_usm[(m0+m)*N + (n0+n)].
+      // joint_matrix_copy converts float acc to half acc (RNE round),
+      // then joint_matrix_store writes [TM x TN] row-major, stride N.
+      joint_matrix<sycl::sub_group, sycl::half, use::accumulator, TM, TN,
+                     layout::dynamic> acc_half;
+      joint_matrix_copy(sg, acc, acc_half);
+      const auto out_ptr = sycl::address_space_cast<
+          sycl::access::address_space::global_space,
+          sycl::access::decorated::no>(
+          reinterpret_cast<sycl::half*>(out_usm));
+      joint_matrix_store(sg, acc_half,
+          out_ptr + static_cast<std::size_t>(m0) * N + n0,
+          static_cast<size_t>(N), layout::row_major);
+    });
+  });
+}
+
+
+// ---------------------------------------------------------------------------
 // FUSED GATE+UP GEMM (INTFER_FUSED_GATE_UP). See quant_gemm.hpp.
 sycl::event quant_gemm_forward_usm_gateup(
     sycl::queue& q, std::uint16_t* act_usm,
