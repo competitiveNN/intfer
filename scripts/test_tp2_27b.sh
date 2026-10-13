@@ -1440,7 +1440,17 @@ fi
     echo "GATE FAIL: self-check (b) the fixture builder removed the announcement" >&2; PASS=0
   fi
   TS_NOT_LINE="$(grep -a "\[tile-sched\]" "$TS_NOT_ERR" | head -1)"
-  if [ -n "$TS_NOT_LINE" ] && echo "$TS_NOT_LINE" | grep -aq "INTFER_TILE_SCHED=off"; then
+  # *** REFUSAL SHAPE, NOT FIXTURE CONTENT. *** The arm's predicate on a run
+  # whose scheduler never fired is "the announcement names the stealing
+  # queue" (grep "$TS_EXPECT_ANN"). Applying it to this fixture must REFUSE:
+  # the line says "off", so grep "on" must NOT match. The previous check
+  # grepped the fixture for "off" instead -- a match the fixture carries BY
+  # CONSTRUCTION (line 1438 built it that way) -- so the self-check fired
+  # unconditionally and the arm was structurally red on HEAD (found by
+  # reading 2026-10-13; the wave-launch 8b arm is the correct shape this
+  # check now copies: run the arm's predicate against the fixture and
+  # require refusal).
+  if [ -n "$TS_NOT_LINE" ] && echo "$TS_NOT_LINE" | grep -aq "$TS_ANN_FULL"; then
     echo "GATE FAIL: self-check (b) the arm ACCEPTED a run whose scheduler never fired" >&2; PASS=0
   fi
   # (c) vacuity: an empty log must fail the predicate.

@@ -610,15 +610,17 @@ for tp in $TPS; do
     if ssm_fuse_announced "$SFB/good.err"; then
       fail "TP=$tp SSM_FUSE self-check (b): SSM_GPU-less run PRINTED [ssm-fuse] -- the device kernel is reachable from the host recurrence path, contradicting the announce site (quant_gemm.cpp:3263)"
     fi
+    # The line-deleted and empty fixtures must stay ACCEPTED (the line is not
+    # expected on a host-path run), and the predicate must be proven live in
+    # BOTH directions -- a predicate that cannot fire would make the (b)
+    # refusal above vacuous, and one that fires on an empty log would make
+    # every future run fail for no reason.
     cp "$SFB/good.err" "$SFB/fake.err"
     echo '[ssm-fuse] fused SSM recurrence ACTIVE (host-path run that must not print)' >>"$SFB/fake.err"
-    if ssm_fuse_announced "$SFB/fake.err" && true; then
-      # The arm's own predicate must refuse this fixture (the line is present
-      # on a host-path run), which is what the real arm above does.
-      :
-    fi
-    if ! ssm_fuse_announced "$SFB/empty.err"; then
-      : # empty log: predicate correctly silent
+    ssm_fuse_announced "$SFB/fake.err" \
+      || fail "TP=$tp SSM_FUSE self-check (b2): the ABSENCE predicate did not fire on a fixture that CARRIES the line -- the arm's refusal is dead and the arm cannot fail"
+    if ssm_fuse_announced "$SFB/empty.err"; then
+      fail "TP=$tp SSM_FUSE self-check (c): the ABSENCE predicate fired on an EMPTY log (vacuity -- nothing was run)"
     fi
     rm -rf "$SFB"
   }
