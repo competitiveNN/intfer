@@ -1056,6 +1056,53 @@ for tp in $TPS; do
     rm -rf "$XMSB"
   }
 
+  # --- INTFER_XMX_TILE_SCHED: work-stealing tile scheduler for XMX kernel ----
+  # Ported from the DPAS path's INTFER_TILE_SCHED. The XMX kernel uses
+  # joint_matrix which requires ALL SG lanes to participate, so work-stealing
+  # is per-SUBGROUP: lane 0 claims the next tile, broadcasts it via a
+  # local_accessor, and all SG lanes process the claimed tile together.
+  #
+  # BIT-EXACT BY CONSTRUCTION: the process_tile body is shared by both
+  # paths; fixed-assignment and work-stealing compute the same dot products
+  # in the same order, only differing in WHICH tile each sub-group computes.
+  # So a stream comparison alone is vacuous here -- the arm asserts the
+  # [xmx-tile-sched] line, which prints n_tiles and nWG, so the gate can
+  # verify the work-stealing path was actually taken.
+  xmx_ts_announced() { grep -aq '\[xmx-tile-sched\]' "$1"; }
+  {
+    XT_OUT="$(mktemp)"; XT_ERR="$(mktemp)"
+    env INTFER_XMX_GEMM=1 INTFER_XMX_TILE_SCHED=1 "$BIN" --gpu --tp "$tp" \
+      -m "$MODEL" -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK \
+      >"$XT_OUT" 2>"$XT_ERR"; XT_RC=$?
+    if [ "$XT_RC" -ne 0 ]; then
+      fail "TP=$tp INTFER_XMX_TILE_SCHED=1 run exited rc=$XT_RC"; tail -10 "$XT_ERR" >&2
+    else
+      XT_IDS="$(ids_of "$tp" INTFER_XMX_TILE_SCHED=1)"
+      echo "TP=$tp [INTFER_XMX_TILE_SCHED=1]: '$XT_IDS'"
+      [ -n "$XT_IDS" ] || fail "TP=$tp INTFER_XMX_TILE_SCHED=1 stream EMPTY"
+      [ "$XT_IDS" = "$BASE" ] || fail "TP=$tp [INTFER_XMX_TILE_SCHED=1] '$XT_IDS' != base '$BASE' (must be bit-exact)"
+      if ! xmx_ts_announced "$XT_ERR"; then
+        echo "TP=$tp XMX_TILE_SCHED self-check SKIPPED: the fixture produced no             [xmx-tile-sched] line (no INT2/INT4 tiles on this model, or the             XMX path never took), so the work-stealing direction is             unexercised here" >&2
+      else
+        # Self-check (b): the announcement line is what separates the two
+        # paths. Delete it from the log and the arm must NOT match.
+        XT_NOT="$(mktemp)"
+        sed -i '/\[xmx-tile-sched\]/d' "$XT_ERR"
+        cp "$XT_ERR" "$XT_NOT"
+        if xmx_ts_announced "$XT_NOT"; then
+          fail "TP=$tp XMX_TILE_SCHED self-check (b): log with the decision line deleted was ACCEPTED -- arm is stream-only"
+        fi
+        XT_EMPTY="$(mktemp)"
+        : >"$XT_EMPTY"
+        if xmx_ts_announced "$XT_EMPTY"; then
+          fail "TP=$tp XMX_TILE_SCHED self-check (c): arm ACCEPTED an empty log (vacuity)"
+        fi
+        rm -f "$XT_NOT" "$XT_EMPTY"
+      fi
+    fi
+    rm -f "$XT_OUT" "$XT_ERR"
+  }
+
 
 done
 
