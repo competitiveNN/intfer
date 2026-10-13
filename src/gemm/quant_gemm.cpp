@@ -366,6 +366,39 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
                                     uint32_t group_size,
                                     gemm::WeightScheme scheme,
                                     const sycl::event& copy_dep) {
+  // *** LAUNCH-NOTE ACCOUNTING (2026-10-13 AUDIT). *** This entry point does
+  // NOT call profile_note_launch(), and that is CORRECT -- it is counted by
+  // its callers, which all drain the returned event and read its profiling
+  // timestamps. Do not "fix" this by adding a note.
+  //
+  // The twelve kernels that DO take the note (act_quant_ga64_dev, the three
+  // dpas48_* row variants, dpas48_tiled[1d/2d], the four SSM/norm kernels,
+  // fwht_rot_to_half, la_conv_prep, half_to_float, lm_head_argmax_tile) are
+  // all free functions whose callers (gpu_ssm_rows, the L4 fused path, the
+  // pre-act-quant probe) do NOT loop over events or read timestamps.
+  // profile_note_launch exists precisely for THAT class.
+  //
+  // quant_gemm_forward_usm is the OPPOSITE class: every caller drains and
+  // counts it. Engine paths drain the returned event in the post-wait loop
+  // (engine.cpp:1501-1508 run_linear_tp, 1878-1884 run_mlp_gateup,
+  // 2140-2146 run_linear_wave, 2451-2458 run_linear_wave), and the lm_head
+  // callers in main.cpp read command_start/command_end inline
+  // (1934-1937, 2150-2153, 2438-2441). Adding a note here would DOUBLE-count
+  // every engine launch of this kernel -- the engine's own comment at
+  // engine.cpp:1831-1842 records the same prohibition for gateup.
+  //
+  // THE INT8-DPAS BRANCH (line 430) IS NOT a gap. It dispatches
+  // quant_gemm_dpas_int8, which has no note -- but that branch is unreachable
+  // from the engine: (1) it requires scheme==INT8 && group_size==0, and that
+  // combination makes dpas48_eligible() true (engine.cpp:2687), which routes
+  // to run_linear_tp_dpas48 -- which calls the dpas48_* kernels DIRECTLY, not
+  // this branch; (2) the branch also needs ActScheme::INT8 activations, but
+  // the shard cache hardcodes act_scheme=FP16 (engine.hpp:279) with ZERO
+  // assignments anywhere in the tree, so it is dead code gated by "TODO 6".
+  // The lm_head INT8 path is quant_gemm_dpas_s8w (INT8 *weights*, FP16 acts),
+  // a different kernel that already carries profile_note_launch() (3153).
+  // So there is no uncounted launch on the live engine path and no fix to
+  // make here -- record the negative, do not add the note.
   const int bits = (scheme == WeightScheme::INT2) ? 2
                  : (scheme == WeightScheme::INT4) ? 4
                  : (scheme == WeightScheme::FP16) ? 16 : 8;
