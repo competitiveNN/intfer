@@ -172,16 +172,33 @@
 #                    is explicit (getenv != nullptr at quant_gemm.cpp:2282),
 #                    so enabling the build does NOT change the default path --
 #                    the default build is byte-for-byte the MKL-free tiled
-#                    kernel (gemm_onemkl.cpp:34-35). The blocker is the build
-#                    config, exactly the shape INTFER_ENABLE_L0 already solves
-#                    in scripts/build.sh:28. Arming it needs a build + a gate
-#                    run, which is measurement work and is retired on this
-#                    box (PARAMOUNT DIRECTIVE); the operator can arm it with
-#                    a throwaway -DINTFER_ENABLE_MKL=ON build dir (the
+#                    kernel (gemm_onemkl.cpp:34-35). Arming it needs a build +
+#                    a gate run, which is measurement work and is retired on
+#                    this box (PARAMOUNT DIRECTIVE); the operator can arm it
+#                    with a throwaway -DINTFER_ENABLE_MKL=ON build dir (the
 #                    library exists: /opt/intel/oneapi/mkl/latest/lib/
 #                    libmkl_sycl_blas.so.6) and a tolerance-gated prefill
 #                    comparison. Until then this row is a genuine opt-in gap
 #                    whose remedy is operator-only, not agent-only.
+#
+#                    *** 2026-10-12: THE BUILD BLOCKER (a) IS CLOSED. *** The
+#                    wiring in src/gemm/CMakeLists.txt used to be broken in
+#                    TWO ways and neither was visible at the intfer_gemm
+#                    (static lib) stage: find_library found the wrapper but
+#                    never added the oneMKL include dir, so the real
+#                    #ifdef body could not compile; and it linked ONLY the
+#                    wrapper, whose NEEDED chain is libsycl+libdl, leaving
+#                    272 component symbols (cblas_sgemm_64, mkl_serv_lock,
+#                    ...) unresolved at the final executable link. Both are
+#                    fixed (component libs + header dir derived from the
+#                    wrapper's own path) and verified end-to-end with a clean
+#                    build, no hand-typed linker flags: intfer_cli links,
+#                    ldd binds all four component .so's + libsycl, --help
+#                    exits 0. What remains is (b): the gate-shape reachability,
+#                    which no agent session can exercise. The row's verdict is
+#                    unchanged -- still NOT ARMED, still operator-only -- but
+#                    the remedy is now "build it and run a tolerance-gated
+#                    prefill comparison", not "fix the build first".
 #   INTFER_DECODE1_ANNOUNCE_EVERY NOT ARMED -- harness-only. quant_gemm.
 #                    cpp:67: disables the once-only latch and prints
 #                    every launch. Its own comment states its purpose --
