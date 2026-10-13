@@ -196,7 +196,8 @@ sycl::event quant_gemm_forward_usm_xmx(
     uint32_t M, uint32_t N, uint32_t K,
     uint32_t group_size,
     gemm::WeightScheme scheme,
-    const sycl::event& copy_dep);
+    const sycl::event& copy_dep,
+    std::uint32_t* tile_ctr = nullptr);  // work-stealing counter (null = fixed)
 
                                       // ---------------------------------------------------------------------------
                                       // FUSED GATE+UP GEMM (INTFER_FUSED_GATE_UP). TP=2-only fusion.

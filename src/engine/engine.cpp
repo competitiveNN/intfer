@@ -1430,16 +1430,55 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
 #ifdef INTFER_PROFILE_GPU
     auto t_s0 = std::chrono::high_resolution_clock::now();
 #endif
-    sycl::event kernel_evt = gemm::quant_gemm_forward_usm(q,
-                                  ws_[d].act,
-                                  sc.code_usm[d],
-                                  sc.scale_usm[d],
-                                  alpha,
-                                  ws_[d].out,
-                                  M, N_local, t.K,
-                                  sc.group_size,
-                                  sc.scheme,
-                                  sycl::event{});
+    sycl::event kernel_evt;
+    // INTFER_XMX_GEMM (default OFF, presence enables): the XMX joint_matrix
+    // GEMM path. The kernel declines (returns {}) on FP16/INT8/M<8 or
+    // non-tile shapes; the caller's fallback is the same as before.
+    // Work-stealing counter: one uint32_t per device, zero-init by caller.
+    const char* xmx_env = std::getenv("INTFER_XMX_GEMM");
+    static std::vector<std::uint32_t> xmx_tile_ctr;
+    static bool xmx_announced = false;
+    if (xmx_env) {
+      if (xmx_tile_ctr.size() < devices_.size())
+        xmx_tile_ctr.resize(devices_.size(), 0);
+      xmx_tile_ctr[d] = 0;
+      kernel_evt = gemm::quant_gemm_forward_usm_xmx(
+          q, ws_[d].act, sc.code_usm[d], sc.scale_usm[d],
+          alpha, ws_[d].out, M, N_local, t.K,
+          sc.group_size, sc.scheme, sycl::event{},
+          xmx_tile_ctr.data() + d);
+      // Announce the tile scheduler state ONCE per process. The line
+      // prints n_tiles and nWG so the gate can verify the work-stealing
+      // path was actually taken (a stream match alone is vacuous: the
+      // two paths are bit-identical by construction).
+      if (!xmx_announced) {
+        xmx_announced = true;
+        const char* ts_env = std::getenv("INTFER_XMX_TILE_SCHED");
+        const uint32_t gx = (M / 16);
+        const uint32_t gy = (N_local / 16);
+        const uint32_t n_tiles = gx * gy;
+        const uint32_t nWG = ts_env ? 16u : n_tiles;
+        std::fprintf(stderr,
+                     "[xmx-gemm] ACTIVE on eligible INT2/INT4 tiles "
+                     "(INTFER_XMX_GEMM=1)\n"
+                     "[xmx-tile-sched] %s n_tiles=%u nWG=%u "
+                     "(%s work-stealing)\n",
+                     ts_env ? "ACTIVE" : "OFF",
+                     n_tiles, nWG,
+                     ts_env ? "persistent" : "fixed-assignment");
+      }
+    } else {
+      kernel_evt = gemm::quant_gemm_forward_usm(q,
+                                ws_[d].act,
+                                sc.code_usm[d],
+                                sc.scale_usm[d],
+                                alpha,
+                                ws_[d].out,
+                                M, N_local, t.K,
+                                sc.group_size,
+                                sc.scheme,
+                                sycl::event{});
+    }
 #ifdef INTFER_PROFILE_GPU
     {
       auto t1 = std::chrono::high_resolution_clock::now();

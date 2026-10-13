@@ -2133,7 +2133,8 @@ sycl::event quant_gemm_forward_usm_xmx(
     float alpha, std::uint16_t* out_usm,
     uint32_t M, uint32_t N, uint32_t K,
     uint32_t group_size, gemm::WeightScheme scheme,
-    const sycl::event& copy_dep) {
+    const sycl::event& copy_dep,
+    std::uint32_t* tile_ctr) {
   if (scheme == gemm::WeightScheme::FP16) return sycl::event{};
   const int bits = (scheme == gemm::WeightScheme::INT2) ? 2
                  : (scheme == gemm::WeightScheme::INT4) ? 4
@@ -2155,112 +2156,170 @@ sycl::event quant_gemm_forward_usm_xmx(
 
   const int gx = static_cast<int>(M) / TM;
   const int gy = static_cast<int>(N) / TN;
-  // Work-group: (gy, gx). Each work-group owns one output tile
-  // (TM x TN) and one sub-group (SG threads) computes it.
-  sycl::nd_range<2> nd(sycl::range<2>(gy * gx, 1),
-                       sycl::range<2>(1, 1));
+  const int n_tiles = gx * gy;
+
+  // INTFER_XMX_TILE_SCHED (PLAN.md 1.3 port): work-stealing tile scheduler.
+  // When set, launches only nWG work-groups (default 16) regardless of
+  // n_tiles; each sub-group claims the next unclaimed tile via a global
+  // atomic counter, so a sub-group that finishes early pulls the next
+  // unfinished tile instead of idling. This is the persistent-kernel
+  // pattern: fewer launches, better EU saturation at M=128 prefill.
+  //
+  // Unlike the DPAS scheduler (per-WI work-stealing via ESIMD
+  // slm_atomic_update), the XMX kernel uses joint_matrix which requires
+  // ALL SG lanes to participate. So work-stealing is per-SUBGROUP: lane 0
+  // claims the next tile, broadcasts it via a local_accessor, and all
+  // SG lanes process the claimed tile together.
+  //
+  // Bit-exact by construction: the process_tile body is shared by both
+  // paths; fixed-assignment (bm = group, bn = group) and work-stealing
+  // (bm = claimed_tile / gy, bn = claimed_tile % gy) compute the same
+  // dot products in the same order, only differing in WHICH tile each
+  // sub-group computes.
+  const bool tile_sched = (std::getenv("INTFER_XMX_TILE_SCHED") != nullptr);
+  const uint32_t nWG = tile_sched ? 16u : static_cast<uint32_t>(n_tiles);
+  const uint32_t n_tiles_u = static_cast<uint32_t>(n_tiles);
+
+  // Work-group: one sub-group per tile (SG threads), SG lanes per sub-group.
+  // joint_matrix_load/store/mad REQUIRE a full sub-group (SG=16 on Xe2/3).
+  sycl::nd_range<1> nd(sycl::range<1>(nWG * SG),
+                       sycl::range<1>(SG));
 
   return q.submit([&](sycl::handler& h) {
     if (copy_dep != sycl::event{}) h.depends_on(copy_dep);
     // SLM: dequantized weight tile [BK x TN] (k-major, so a
     // row_major joint_matrix load reads it as [TK x TN] per step).
-    // Declared on the HOST side (in the submit lambda), shared across
-    // sub-groups in the work-group (here 1 sub-group per work-group).
+    // One tile per work-group; the SLM is private to that group.
     sycl::local_accessor<sycl::half, 1> sW(sycl::range<1>(BK * TN), h);
-    h.parallel_for(nd, [=](sycl::nd_item<2> it)
+    // Broadcast slot: lane 0 writes the claimed tile ID, all lanes read it.
+    sycl::local_accessor<int32_t, 1> tile_buf(sycl::range<1>(1), h);
+    h.parallel_for(nd, [=](sycl::nd_item<1> it)
                        [[sycl::reqd_sub_group_size(SG)]] {
       const auto sg = it.get_sub_group();
       const int lane = sg.get_local_id()[0];
-      const int wg_id = it.get_group(0);
-      const int tile_id = wg_id;  // one tile per work-group
-      const int bm = tile_id / gy;
-      const int bn = tile_id % gy;
-      const int m0 = bm * TM;
-      const int n0 = bn * TN;
 
-      using namespace sycl::ext::oneapi::experimental::matrix;
-      // FP32 accumulators: DPAS hardware accumulates in FP32.
-      // layout::dynamic is required by the joint_matrix API for
-      // accumulator matrices.
-      joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN,
-                   layout::dynamic> acc;
-      joint_matrix_fill(sg, acc, 0.0f);
+      // ---- Per-tile body (shared by fixed-assignment and work-stealing). ----
+      auto process_tile = [&](int bm, int bn) {
+        const int m0 = bm * TM;
+        const int n0 = bn * TN;
+        const bool tile_valid = (bm < gx) && (bn < gy);
 
-      const int nk_steps = static_cast<int>(K) / BK;
-      for (int bk = 0; bk < nk_steps; ++bk) {
-        const int k0 = bk * BK;
-        // Phase 1: dequantize the weight tile into SLM. Every lane
-        // dequantizes a contiguous slice of the BK*TN tile so the
-        // code loads coalesce (one lane per (k, n) pair, stride SG).
-        // Bit-identical to the tiled kernel's sW load.
-        for (int e = lane; e < BK * TN; e += SG) {
-          const int k = e / TN;
-          const int n = e % TN;
-          const int ng = n0 + n;
-          const int kg = k0 + k;
-          float wval = 0.0f;
-          if (ng < static_cast<int>(N) && kg < static_cast<int>(K)) {
-            const std::size_t idx = static_cast<std::size_t>(ng) * K + kg;
-            const int g = kg / Gw;
-            const float s = from_half_bits(
-                scale_usm[ng * num_groups_w + g]) * alpha;
-            int code;
-            if (bits >= 8) {
-              code = static_cast<int>(code_u8[idx]);
-            } else {
-              const int pack = 8 / bits;
-              const std::uint8_t b = code_u8[idx / pack];
-              const int within = static_cast<int>(idx % pack);
-              code = (b >> (within * bits)) & ((1 << bits) - 1);
+        using namespace sycl::ext::oneapi::experimental::matrix;
+        joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN,
+                     layout::dynamic> acc;
+        joint_matrix_fill(sg, acc, 0.0f);
+
+        const int nk_steps = static_cast<int>(K) / BK;
+        for (int bk = 0; bk < nk_steps; ++bk) {
+          const int k0 = bk * BK;
+          // Phase 1: dequantize the weight tile into SLM. Every lane
+          // dequantizes a contiguous slice of the BK*TN tile so the
+          // code loads coalesce (one lane per (k, n) pair, stride SG).
+          // Bit-identical to the tiled kernel's sW load.
+          for (int e = lane; e < BK * TN; e += SG) {
+            const int k = e / TN;
+            const int n = e % TN;
+            const int ng = n0 + n;
+            const int kg = k0 + k;
+            float wval = 0.0f;
+            if (tile_valid && ng < static_cast<int>(N) && kg < static_cast<int>(K)) {
+              const std::size_t idx = static_cast<std::size_t>(ng) * K + kg;
+              const int g = kg / Gw;
+              const float s = from_half_bits(
+                  scale_usm[ng * num_groups_w + g]) * alpha;
+              int code;
+              if (bits >= 8) {
+                code = static_cast<int>(code_u8[idx]);
+              } else {
+                const int pack = 8 / bits;
+                const std::uint8_t b = code_u8[idx / pack];
+                const int within = static_cast<int>(idx % pack);
+                code = (b >> (within * bits)) & ((1 << bits) - 1);
+              }
+              wval = s * canon_value(bits, code);
             }
-            wval = s * canon_value(bits, code);
+            sW[e] = sycl::half(wval);
           }
-          sW[e] = sycl::half(wval);
-        }
-        it.barrier();
+          it.barrier();
 
-        // Phase 2: XMX DPAS over the BK-wide K tile in TK steps.
-        // A is loaded from USM (FP16, row-major); B is loaded from
-        // SLM (FP16, row-major, k-major layout).
-        for (int kt = 0; kt < BK / TK; ++kt) {
-          const int kg0 = k0 + kt * TK;
-          // A tile: [TM x TK] from act_usm, row-major.
-          joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK,
-                       layout::row_major> sub_a;
-          // B tile: [TK x TN] from sW, row-major (k-major in SLM).
-          joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN,
-                       layout::row_major> sub_b;
-          // A load: act_usm[(m0 + m) * K + (kg0 + k)] for m in [0,TM), k in [0,TK).
-          const auto a_ptr = sycl::address_space_cast<
-              sycl::access::address_space::global_space,
-              sycl::access::decorated::no>(
-              reinterpret_cast<sycl::half*>(act_usm));
-          // B load: sW[k * TN + n] for k in [kt*TK, kt*TK+TK), n in [0,TN).
-          const auto b_ptr = sW.get_multi_ptr<sycl::access::decorated::no>();
-          joint_matrix_load(sg, sub_a,
-              a_ptr + static_cast<std::size_t>(m0) * K + kg0,
-              static_cast<size_t>(K));
-          joint_matrix_load(sg, sub_b,
-              b_ptr + static_cast<std::size_t>(kt) * TK * TN,
-              static_cast<size_t>(TN));
-          joint_matrix_mad(sg, acc, sub_a, sub_b, acc);
+          // Phase 2: XMX DPAS over the BK-wide K tile in TK steps.
+          // A is loaded from USM (FP16, row-major); B is loaded from
+          // SLM (FP16, row-major, k-major layout).
+          for (int kt = 0; kt < BK / TK; ++kt) {
+            const int kg0 = k0 + kt * TK;
+            // A tile: [TM x TK] from act_usm, row-major.
+            joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK,
+                         layout::row_major> sub_a;
+            // B tile: [TK x TN] from sW, row-major (k-major in SLM).
+            joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN,
+                         layout::row_major> sub_b;
+            // A load: act_usm[(m0 + m) * K + (kg0 + k)] for m in [0,TM), k in [0,TK).
+            const auto a_ptr = sycl::address_space_cast<
+                sycl::access::address_space::global_space,
+                sycl::access::decorated::no>(
+                reinterpret_cast<sycl::half*>(act_usm));
+            // B load: sW[k * TN + n] for k in [kt*TK, kt*TK+TK), n in [0,TN).
+            const auto b_ptr = sW.get_multi_ptr<sycl::access::decorated::no>();
+            joint_matrix_load(sg, sub_a,
+                a_ptr + static_cast<std::size_t>(m0) * K + kg0,
+                static_cast<size_t>(K));
+            joint_matrix_load(sg, sub_b,
+                b_ptr + static_cast<std::size_t>(kt) * TK * TN,
+                static_cast<size_t>(TN));
+            joint_matrix_mad(sg, acc, sub_a, sub_b, acc);
+          }
+          it.barrier();
         }
-        it.barrier();
+
+        // Store: FP32 acc -> FP16 out_usm[(m0+m)*N + (n0+n)].
+        // joint_matrix_copy converts float acc to half acc (RNE round),
+        // then joint_matrix_store writes [TM x TN] row-major, stride N.
+        joint_matrix<sycl::sub_group, sycl::half, use::accumulator, TM, TN,
+                       layout::dynamic> acc_half;
+        joint_matrix_copy(sg, acc, acc_half);
+        const auto out_ptr = sycl::address_space_cast<
+            sycl::access::address_space::global_space,
+            sycl::access::decorated::no>(
+            reinterpret_cast<sycl::half*>(out_usm));
+        joint_matrix_store(sg, acc_half,
+            out_ptr + static_cast<std::size_t>(m0) * N + n0,
+            static_cast<size_t>(N), layout::row_major);
+      };  // process_tile
+
+      // ---- DISPATCH: work-stealing vs fixed-assignment. ----
+      if (!tile_sched) {
+        // Fixed assignment: WG (bm, bn) does tile (bm, bn).
+        const int bm = it.get_group(0);
+        const int bn = it.get_group(1);
+        if (bm < gx && bn < gy) process_tile(bm, bn);
+      } else {
+        // Work-stealing: lane 0 claims the next tile, all SG lanes
+        // process it via broadcast. The counter is one uint32_t
+        // in global USM, 0-init by the caller. fetch_add returns the
+        // pre-increment value -- "claimed" iff old < n_tiles.
+        // memory_scope::work_group is correct here: the counter is
+        // device USM but the atomic is scoped to the work-group
+        // (one sub-group per WG, so this is the only scope that
+        // matters -- device-wide would serialize across groups).
+        static constexpr auto RELAXED = sycl::memory_order::relaxed;
+        static constexpr auto SCOPE = sycl::memory_scope::work_group;
+        while (true) {
+          tile_buf[0] = -1;
+          it.barrier();
+          if (lane == 0) {
+            sycl::atomic_ref<std::uint32_t, RELAXED, SCOPE>
+                ref(tile_ctr[0]);
+            uint32_t cur = ref.fetch_add(1);
+            if (cur < n_tiles_u) tile_buf[0] = static_cast<int32_t>(cur);
+          }
+          it.barrier();
+          int tile_id = tile_buf[0];
+          if (tile_id < 0) break;  // no more tiles
+          const int bm = tile_id / gy;
+          const int bn = tile_id % gy;
+          process_tile(bm, bn);
+        }
       }
-
-      // Store: FP32 acc -> FP16 out_usm[(m0+m)*N + (n0+n)].
-      // joint_matrix_copy converts float acc to half acc (RNE round),
-      // then joint_matrix_store writes [TM x TN] row-major, stride N.
-      joint_matrix<sycl::sub_group, sycl::half, use::accumulator, TM, TN,
-                     layout::dynamic> acc_half;
-      joint_matrix_copy(sg, acc, acc_half);
-      const auto out_ptr = sycl::address_space_cast<
-          sycl::access::address_space::global_space,
-          sycl::access::decorated::no>(
-          reinterpret_cast<sycl::half*>(out_usm));
-      joint_matrix_store(sg, acc_half,
-          out_ptr + static_cast<std::size_t>(m0) * N + n0,
-          static_cast<size_t>(N), layout::row_major);
     });
   });
 }
