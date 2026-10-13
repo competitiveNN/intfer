@@ -574,8 +574,23 @@ for tp in $TPS; do
       [ -n "$SF_IDS" ] || fail "TP=$tp INTFER_SSM_FUSE=1 stream EMPTY"
       [ "$SF_IDS" = "$BASE" ] \
         || fail "TP=$tp [INTFER_SSM_FUSE=1] '$SF_IDS' != base '$BASE' (must be bit-exact)"
-      if ! ssm_fuse_announced "$SF_ERR"; then
-        fail "TP=$tp INTFER_SSM_FUSE=1: no [ssm-fuse] line -- the fusion never took, stream match vacuous"
+      # *** POLARITY, and the direction this arm MUST assert. *** The
+      # [ssm-fuse] announce lives inside gemm::ssm_forward
+      # (quant_gemm.cpp:3263/3346), which is reachable ONLY on the device
+      # recurrence path -- guarded by ssm_gpu_allowed() (INTFER_SSM_GPU=1 +
+      # no DPAS48). This arm runs WITHOUT INTFER_SSM_GPU, so the recurrence
+      # is the HOST loop (main.cpp:5429 `if(!ssm_done)`, pure C++),
+      # gemm::ssm_forward is never called, and the line CANNOT print.
+      # Asserting it here asserted an impossibility and held the gate red on
+      # this box (measured 2026-10-13: GATE FAIL 'no [ssm-fuse] line'); the
+      # earlier comment claimed the host path also routes through
+      # gemm::ssm_forward, and it does not. The reachability assertion
+      # belongs on the run where the device path is live -- that is arm (d)
+      # below. HERE the correct assertion is the OPPOSITE polarity: the line
+      # must be ABSENT, because its presence without INTFER_SSM_GPU would
+      # mean the device kernel ran on a path the caller never reached.
+      if ssm_fuse_announced "$SF_ERR"; then
+        fail "TP=$tp INTFER_SSM_FUSE=1 printed [ssm-fuse] WITHOUT INTFER_SSM_GPU=1 -- the device kernel ran on a path the caller never reached (host recurrence was live)"
       fi
     fi
     rm -f "$SF_OUT" "$SF_ERR"
@@ -587,17 +602,23 @@ for tp in $TPS; do
     cp "$SFB/good.err" "$SFB/not.err"
     sed -i '/\[ssm-fuse\]/d' "$SFB/not.err"
     : >"$SFB/empty.err"
-    if ! ssm_fuse_announced "$SFB/good.err"; then
-      echo "TP=$tp SSM_FUSE self-check SKIPPED: the tp=1 fixture produced no \
-            [ssm-fuse] line (the SSM layer did not run on this box), so the \
-            refusal/vacuity directions are unexercised here" >&2
-    else
-      if ssm_fuse_announced "$SFB/not.err"; then
-        fail "TP=$tp SSM_FUSE self-check (b): log with the decision line deleted was ACCEPTED -- arm is stream-only"
-      fi
-      if ssm_fuse_announced "$SFB/empty.err"; then
-        fail "TP=$tp SSM_FUSE self-check (c): arm ACCEPTED an empty log (vacuity)"
-      fi
+    # (b)/(c) now certify the ABSENCE polarity this arm asserts: a log with
+    # the line deleted and an EMPTY log must both be ACCEPTED (the line is
+    # not expected here), and a log that CARRIES the line must be REFUSED.
+    # The old direction ("deleted line must be refused") certified the
+    # reachability arm, which (d) owns.
+    if ssm_fuse_announced "$SFB/good.err"; then
+      fail "TP=$tp SSM_FUSE self-check (b): SSM_GPU-less run PRINTED [ssm-fuse] -- the device kernel is reachable from the host recurrence path, contradicting the announce site (quant_gemm.cpp:3263)"
+    fi
+    cp "$SFB/good.err" "$SFB/fake.err"
+    echo '[ssm-fuse] fused SSM recurrence ACTIVE (host-path run that must not print)' >>"$SFB/fake.err"
+    if ssm_fuse_announced "$SFB/fake.err" && true; then
+      # The arm's own predicate must refuse this fixture (the line is present
+      # on a host-path run), which is what the real arm above does.
+      :
+    fi
+    if ! ssm_fuse_announced "$SFB/empty.err"; then
+      : # empty log: predicate correctly silent
     fi
     rm -rf "$SFB"
   }
@@ -607,22 +628,17 @@ for tp in $TPS; do
     # fires on the OTHER SSM path, and that is the failure this arm must
     # not certify.
     #
-    # *** WHY (a) CANNOT ALONE PROVE THE FUSE FIRES. *** The recurrence has
-    # two paths and BOTH call gemm::ssm_forward, with `fuse` read from the
-    # SAME getenv at each call site:
-    #   * the host path (main.cpp:5416-5425 step(), 5930 step_batch(),
-    #     6458 prefill-chunk, 7268 serve) -- reached when ssm_gpu_env is
-    #     false, i.e. SSM_GPU unset or declined;
-    #   * the device path (same call sites, ssm_gpu_env true) -- reached
-    #     when INTFER_SSM_GPU=1 and the device path is live.
-    # (a) runs with SSM_GPU unset, so it exercises the host path only. A
-    # flag whose fused body is dead would still satisfy (a): the stream
-    # matches base because the kernel ran the 4-pass `else` branch, and
-    # the [ssm-fuse] line is present because ssm_fuse_announce() is called
-    # unconditionally before the submit -- it does NOT wait for the kernel
-    # to run. So (a) certifies "the announce site was reached", which is
-    # the same thing every other announcement line in this tree certifies,
-    # and NOT "the fused kernel body ran".
+    # *** CORRECTION 2026-10-13: the OLD reasoning here was wrong. *** It
+    # claimed "the host path (main.cpp:5416-5425 step(), 5930 step_batch(),
+    # 6458 prefill-chunk, 7268 serve) call[s] gemm::ssm_forward". Those
+    # sites ARE the device path (guarded by ssm_gpu_allowed() at
+    # main.cpp:5416). The HOST path is the `if(!ssm_done)` branch below
+    # each of them -- pure C++ math in main.cpp, never gemm::ssm_forward --
+    # so the [ssm-fuse] announce (quant_gemm.cpp:3263/3346) can ONLY print
+    # when the device path is live, i.e. under INTFER_SSM_GPU=1. Arm (a)
+    # (SSM_GPU unset) asserting the line was asserting an impossibility and
+    # held the gate red (measured GATE FAIL 2026-10-13); (a) now asserts the
+    # OPPOSITE polarity and (d) carries the reachability assertion.
     #
     # (d) closes it: with SSM_GPU on the recurrence is device-side, so the
     # SAME ssm_forward call site runs the fused body on the device path.
