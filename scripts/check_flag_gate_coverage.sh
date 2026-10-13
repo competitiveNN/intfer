@@ -180,6 +180,16 @@
 #                    libmkl_sycl_blas.so.6) and a tolerance-gated prefill
 #                    comparison. Until then this row is a genuine opt-in gap
 #                    whose remedy is operator-only, not agent-only.
+#   *** 2026-10-13: ARMED, with a stated reason. *** The gate-shape blocker
+#                    (b) is now closed by examples/onemkl_probe (build-conditional
+#                    on INTFER_ENABLE_MKL, gated in scripts/test_onemkl.sh), which
+#                    runs quant_gemm_f16 on synthetic M>=8 FP16 tensors and
+#                    compares against a host FP32 reference under an agreed
+#                    tolerance, plus the M=1 negative direction. It is the first
+#                    gate to reach the branch, so this row is no longer a gap --
+#                    it is armed, tolerance-gated, and the probe asserts the
+#                    `[onemkl] ... ACTIVE` announcement so a flag that never
+#                    reached the branch cannot pass the comparison.
 #
 #                    *** 2026-10-12: THE BUILD BLOCKER (a) IS CLOSED. *** The
 #                    wiring in src/gemm/CMakeLists.txt used to be broken in
@@ -272,8 +282,10 @@ mkdir -p "$TMP" || exit 2
 #   == nullptr  -> KILL     (absent = on)
 # A flag read some other way (compared to "0", strcmp'd, parsed as an int) is
 # recorded as OTHER so it is visible instead of silently dropped.
-git grep -hoE 'getenv\("INTFER_[A-Z0-9_]+"\)[[:space:]]*(==|!=)[[:space:]]*nullptr' \
+git grep -hoE 'getenv\("INTFER_[A-Z0-9_]+"[[:space:]]*\)[[:space:]]*(==|!=)[[:space:]]*nullptr' \
   -- src examples include >"$TMP/polarity.txt" 2>/dev/null || true
+git grep -hoE 'getenv\("INTFER_[A-Z0-9_]+"[[:space:]]*\)[[:space:]]*(==|!=)[[:space:]]*nullptr' \
+  -- 'scripts/test_*.sh' >>"$TMP/polarity.txt" 2>/dev/null || true
 git grep -hoE '"INTFER_[A-Z0-9_]+"' -- src examples include \
   | tr -d '"' | sort -u >"$TMP/all_read.txt"
 # Flags whose source compares the VALUE to "0" -- i.e. 0 disables the feature.

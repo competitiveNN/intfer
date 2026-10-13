@@ -136,7 +136,7 @@ has_1gpu_arm() { # $1 = comment-stripped stream file
 # test_serve_load.sh (both launch the server `--gpu --tp 1`). All three PASS on a
 # 1-GPU box, which is exactly why the gap survived AUDIT #14.
 gpu_guard_state() { # $1 = comment-stripped code file
-  grep -qE -- '(--gpu|sycl-ls|level_zero|xpu-smi|dpas_fold_probe)' "$1" || { echo "not-gpu"; return 0; }
+  grep -qE -- '(--gpu|sycl-ls|level_zero|xpu-smi|dpas_fold_probe|onemkl_probe)' "$1" || { echo "not-gpu"; return 0; }
   # A GPU gate with no COUNT-based precondition still needs SOME guard. The
   # render-node check is the strict, adapter-independent one: a missing libumf
   # makes sycl-ls report zero devices on a perfectly healthy box, so a count

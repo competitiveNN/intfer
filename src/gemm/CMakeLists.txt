@@ -91,18 +91,64 @@ if(INTFER_ENABLE_MKL)
   # prefix from the library's own path (dirname of the .so -> ../include)
   # makes the build work wherever the toolkit lays the .so down, with no
   # per-box -DCMAKE_CXX_FLAGS hand-edit.
-  get_filename_component(_MKL_PREFIX "${_MKL_LIB_DIR}" DIRECTORY)
+get_filename_component(_MKL_PREFIX "${_MKL_LIB_DIR}" DIRECTORY)
+  message(STATUS "onemkl: wrapper=${MKL_SYCL_BLAS} _MKL_PREFIX=${_MKL_PREFIX}")
+  # NOTE: the oneMKL include dir is NOT applied with target_include_directories
+  # here. add_sycl_to_target() (called below) runs
+  # set_source_files_properties(${source} PROPERTIES INCLUDE_DIRECTORIES
+  # "${__sycl_cxx_include_directories}") for every source it is given, and a
+  # per-source INCLUDE_DIRECTORIES property OVERRIDES the target's for that
+  # file. So anything set before that call is silently dropped from the flags
+  # that actually reach the compiler -- observed live: the configure message
+  # said "ADDING include dir" and the generated flags.make still carried only
+  # the project include, so gemm_onemkl.cpp failed to find
+  # <oneapi/mkl/blas.hpp>. The union goes on the source property AFTER the
+  # macro call, which is what the compile line consumes.
+  add_sycl_to_target(TARGET intfer_onemkl SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/gemm_onemkl.cpp)
+
+  # *** DERIVE THE MKL HEADER DIR FROM THE LIBRARY, DO NOT GUESS IT. ***
+  # gemm_onemkl.cpp's real body #includes <oneapi/mkl/blas.hpp>, which lives
+  # under the oneMKL INSTALL PREFIX (e.g. .../mkl/latest/include), and that
+  # prefix is NOT discoverable from find_library: the .so is found via
+  # CMAKE_PREFIX_PATH but the include dir is not propagated by that call.
+  # Probed 2026-10-12 on this box: a -DINTFER_ENABLE_MKL=ON configure with
+  # -DCMAKE_PREFIX_PATH=/opt/intel/oneapi/mkl/latest found libmkl_sycl_blas
+  # and turned the #ifdef on, and then the TU failed to compile because
+  # <oneapi/mkl/blas.hpp> was not on any include path -- the arm was wired,
+  # the option was ON, and the code still could not build. Deriving the
+  # prefix from the library's own path (dirname of the .so -> ../include)
+  # makes the build work wherever the toolkit lays the .so down, with no
+  # per-box -DCMAKE_CXX_FLAGS hand-edit.
   if(EXISTS "${_MKL_PREFIX}/include/oneapi/mkl/blas.hpp")
-    target_include_directories(intfer_onemkl PUBLIC "${_MKL_PREFIX}/include")
-  else()
+    message(STATUS "onemkl: ADDING include dir ${_MKL_PREFIX}/include")
+    get_target_property(_MKL_SYCL_INC IntelSYCL::SYCL_CXX
+                        INTERFACE_INCLUDE_DIRECTORIES)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/gemm_onemkl.cpp
+      PROPERTIES INCLUDE_DIRECTORIES
+        "${_MKL_PREFIX}/include;${_MKL_SYCL_INC}")
+else()
     message(WARNING
       "libmkl_sycl_blas found at ${MKL_SYCL_BLAS} but no oneMKL headers "
       "under ${_MKL_PREFIX}/include -- the INTFER_ENABLE_MKL body will not "
       "compile. Point the oneMKL install at this box's prefix.")
   endif()
-endif()
-add_sycl_to_target(TARGET intfer_onemkl SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/gemm_onemkl.cpp)
 
+  # *** THE MKL COMPONENT LIBS LIVE UNDER A DIFFERENT PREFIX. *** The oneMKL
+  # install is found via CMAKE_PREFIX_PATH, not the compiler, so the build's
+  # default rpath (the SYCL lib dir) does not reach them. Observed live: the
+  # probe built and ran from a clean throwaway build dir, but `ldd` showed
+  # libmkl_sycl_blas.so.6 => not found. Publish the dir as a cache variable so
+  # the probe target can add it to ITS OWN link line -- a global
+  # CMAKE_BUILD_RPATH append is a no-op for the Makefile generator (which is
+  # what this box uses), and CMAKE_EXE_LINKER_FLAGS is a per-configure flag
+  # that would leak onto every executable in the tree.
+  get_filename_component(_MKL_RPATH_DIR "${MKL_SYCL_BLAS}" REALPATH)
+  get_filename_component(_MKL_RPATH_DIR "${_MKL_RPATH_DIR}" DIRECTORY)
+  if(EXISTS "${_MKL_RPATH_DIR}/libmkl_core.so")
+    set(MKL_LIB_DIR "${_MKL_RPATH_DIR}" CACHE PATH
+        "oneMKL component library directory (for rpath)")
+  endif()
+endif()
 # intfer_gemm CONSUMES intfer_onemkl: quant_gemm.cpp calls
 # onemkl_available() / gemm_onemkl_fp16(), so the fallback (or real) object
 # must be pulled into the engine's GEMM TU. Linking it here, from the

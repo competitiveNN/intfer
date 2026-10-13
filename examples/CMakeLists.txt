@@ -25,6 +25,7 @@ target_include_directories(roofline_probe_bisect1 PRIVATE ${CMAKE_CURRENT_SOURCE
 target_include_directories(roofline_probe_bisect3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/roofline_probe_bisect)
 target_include_directories(roofline_probe_bisect4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/roofline_probe_bisect)
 add_subdirectory(rowpair_equiv)
+add_subdirectory(onemkl_probe)
 add_subdirectory(gateup_equiv)
 add_subdirectory(qwen_forward_gpu)
 add_subdirectory(qwen_forward_intfer)
