@@ -929,9 +929,64 @@ norm/rope. Per-role min-bit floors are in `rco.cpp`.
 | `INTFER_DPAS_ROW` | ~460x slower |
 | L5 LA-front chain | +144 launches/token, waitblock 5x |
 | `INTFER_DPAS_PREQ` | +30720 launches to recover 52.7 ms |
+| `INTFER_L4_NORM_DEV` (TP=2 prefill norm seam) | **STRUCTURAL DEAD END — removed 2026-10-12, code deleted, see below.** |
 | retired throughput claims | the `8.16/15.33/17.98` sweep and the `0.8B` 8.16 numbers are **WITHDRAWN** |
 
 Revisit a dead end only if a profile shows the thing it removed is now >10% of a step.
+
+### `INTFER_L4_NORM_DEV` — TP=2 prefill norm seam (removed 2026-10-12)
+
+**Code deleted.** `run_l4_norm_dev`, `L4NormMParams`, `l4_norm_silu_to_half_m`,
+and the `l4_nact_dev_`/`l4_nact_cap_`/`l4_nact_zvw_` members were all removed
+(5 files, -204 lines). Nothing was wired to a caller and no gate arm was added.
+
+**Why it is a dead end rather than an unmeasured optimization.** Three structural
+findings, each independently fatal:
+
+1. **The recorded consumer does not exist.** `engine.hpp:160` claimed the caller
+   would feed the fused FP16 acts "through `run_linear_tp` (the batched path,
+   which does the same FP16->FP32 convert + H2D ...)". `run_linear_tp` takes a
+   host `std::vector<float>&` and does its own convert+H2D — it cannot consume a
+   device buffer. The only device-activation consumer in the tree is
+   `run_linear_tp_devact`, and that is TP=1-locked
+   (`engine.cpp:1961: devices_.size() != 1 => return false`). So at the 27B
+   `--tp 2` target the seam had no consumer, which is the exact
+   "default-OFF flag no gate can reach" class the flag census exists to kill.
+
+2. **Even at TP=1 the transfer arithmetic is negative.** The seam adds an H2D of
+   the core block as FP32 (M·K·4 bytes) plus a norm kernel launch. The path it
+   replaces — host norm loop, then `run_linear_tp`'s own convert+H2D — moves
+   M·K·2 bytes. **More bytes, more launches.** There is no round trip removed.
+
+3. **The reason is structural and unfixed by reordering.** At TP=2 the la_out
+   activation has K = the *full* inter, which both devices must consume, while
+   the SSM core is produced on device 0 only. With no P2P
+   (`grep -riE 'allreduce|p2p|peer'` returns nothing), the D2H + 2×H2D the
+   seam was meant to delete is **unavoidable** — the current path already pays
+   exactly it. The seam would add work on top of a transfer floor that cannot
+   be lowered.
+
+**The in-place aliasing bug (found during this cleanup) is a symptom, not a cause.**
+`engine.cpp:2073/2076` set `np.core_fp32 = act_dev` AND `np.act_fp16 = act_dev`
+on the same buffer — the FP16 output overwrote the FP32 input mid-kernel. The
+reviewer's proposed fix (split into separate in/out buffers) would have *worsened*
+the arithmetic: it would add a second device buffer while keeping the M·K·4 H2D,
+turning a transfer-negative seam into a transfer-negative seam with a bigger
+constant. The AGENTS.md fusion directive's test — *which round trips does it
+remove, and what is its launch delta?* — answers "none, and +1" before any
+reorder is attempted.
+
+**Note on the `ssm_norm_silu_to_half_m` serve kernel.** It is untouched and
+correct. The prefill path uses the host norm loop (main.cpp:6472-6500), which
+feeds `run_linear_batch(ln.la_out, c_ncore, c_y, M)` — the same GEMM the
+serve path's devact chain runs. The two are byte-identical in their GEMM; the
+serve path's win is that its devact chain removes the core D2H + host norm +
+H2D + la_out wait, and that chain is TP=1-locked for the reason above. That
+gap is recorded in the "upstream-port survey" section, not here.
+
+**Do not retry this seam in any form.** If a future session reconsiders it, the
+first thing to check is whether P2P has been added (`grep -riE 'allreduce|p2p|peer'`);
+without it the transfer floor stands and the seam cannot pay.
 
 ----- (original AGENTS.md "A default-OFF flag with no gate that can reach it"
 -----  and the 16 verification rules, moved here 2026-10-08)

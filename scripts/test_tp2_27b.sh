@@ -603,6 +603,41 @@ if [ "${SELFCHECK:-0}" = 1 ]; then
   # predicate DOES enforce is that the label is a wave the model contains
   # (8a/8e accept, 8c refuses), which catches a mislabel to a nonsense
   # wave and catches a label the caller never assembles.
+  #
+  # *** AND WHAT THIS GATE CANNOT CERTIFY, STATED ONCE (2026-10-13 audit). ***
+  # The arm's stream comparison is NOT a bit-exactness certificate, and
+  # treating it as one would be the exact retracted-claim class this repo
+  # exists to prevent. The fused kernel's per-term arithmetic is
+  #   acc += av * scale * canon_value(bits, code)      (quant_gemm.cpp:2293)
+  # while the base tiled kernel it replaces pre-rounds the dequantized
+  # weight to FP16 in shared memory BEFORE the multiply
+  #   wval = s * canon_value(bits, code); val = to_half_bits(wval);
+  #   sW[e] = val;  ...  acc += av * wv               (quant_gemm.cpp:321-334)
+  # For INT2/INT4/INT8, canon_value's 1/3 (bits=2), /15 (bits=4) and /255
+  # (bits=8) divisors are not powers of two, so s*canon is generically NOT
+  # representable in FP16 and the two orders round differently. The 0.8B
+  # 2026-10-13, so the divergence is live HERE, not modelling noise, and
+  # this arm's PASS was "divergence below the token oracle's resolution",
+  # not bit-identity. The FP16 (bits>=16) wave items ARE bit-exact: both
+  # sides read raw half bits and ignore the scale (base :306-311, fused
+  # :2279-2285).
+  #
+  # *** RESOLVED 2026-10-13: THE FUSED KERNEL NOW PRE-ROUNDS THE WEIGHT. ***
+  # The divergent fused branch (quant_gemm.cpp:2293) now computes
+  #   wval = scale * canon_value(bits, code);
+  #   wv = from_half_bits(to_half_bits(wval));      // base's FP16 pre-round
+  #   acc += av * wv;
+  # which is the base tiled kernel's per-element order exactly (:321-323).
+  # Gw_i == Gw per item (both from qcfg.group_size), the kg summation order
+  # is increasing in both, and sptr_row[g] indexes the same scale[row,group]
+  # buffer, so the per-element term is now IDENTICAL and the gate's
+  # mr_streams_agree PASS is underpinned by kernel bit-identity rather than
+  # merely argmax-stability. UNVERIFIED UNTIL THE NEXT 22:00+ gate RUN: the
+  # bit-exactness argument is a source-level derivation, so the arm's PASS
+  # must be re-derived on a real run before flipping the flag from
+  # default-OFF. Until that run exists this comment is the contract of
+  # record, and the FP16 branch needs no change (canon_value is the identity
+  # there).
   sed 's/wave=qkv/wave=zba/' "$SB/wf_good" >"$SB/wf_zba"
   wf_wave_known "$(grep -a '\[wave-launch-fuse\]' "$SB/wf_zba" | head -1)" \
     || { echo "SELF-CHECK FAIL (8e): wf_wave_known REJECTED the zba wave, a wave the model contains" >&2; bad=1; }

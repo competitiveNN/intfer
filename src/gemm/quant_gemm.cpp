@@ -2290,7 +2290,22 @@ sycl::event quant_gemm_forward_usm_wave(
                 const std::uint8_t byte = wrow[idx / pack];
                 const int within = static_cast<int>(idx % pack);
                 const int code = (byte >> (within * bits)) & ((1 << bits) - 1);
-                acc += av * scale * canon_value(bits, code);
+                // Bit-exactness vs the base tiled GEMM (quant_gemm_forward_usm,
+                // weight loop ~line 321): that path pre-rounds the scaled weight
+                // to FP16 via `to_half_bits(s * canon_value(...))` before the
+                // multiply, so the fused kernel MUST round the same way.  For
+                // INT2/INT4/INT8 the canon_value divisors (3/15/255) are not
+                // powers of two, so `av * scale * cv` held in FP32 diverges per
+                // term from `av * (half)(scale*cv)`.  Gw_i == Gw (both from the
+                // item's qcfg.group_size), the kg summation order is increasing
+                // in both, and sptr_row[g] indexes the same scale[row,group]
+                // buffer -- so this now reproduces the base's per-element
+                // rounding exactly.  The FP16-weight branch above needs no
+                // change: canon_value is the identity there and both paths
+                // expand raw half bits.
+                const float wval = scale * canon_value(bits, code);
+                const float wv = from_half_bits(to_half_bits(wval));
+                acc += av * wv;
               }
             }
           }
