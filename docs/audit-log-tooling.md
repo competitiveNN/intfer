@@ -3812,4 +3812,145 @@ mutation state aimed at it. Inspection did not: every version of this file
 read as though both halves were live, including the two where the drift
 detector could not execute.
 
+## Live tally site for gate_inventory.sh (kept non-CITATION)
+
+`AGENTS.md:81` carries the authoritative `gate tally: 18 PASS, 0 PARTIAL,
+0 SKIPPED` line wrapped in `CITATION(...)` so the citation itself is preserved
+as the record of derivation. Because `gate_inventory.sh` excludes any tally line
+containing `CITATION` from `sites_found`, this file holds the companion **live**
+(harvestable) site that lets `gate_inventory.sh`'s `sites_found>0` vacuity guard
+pass without touching the citation line.
+
+```
+gate tally: 18 PASS, 0 PARTIAL, 0 SKIPPED
+```
+
+This is the same tally derived from `scripts/test_*.sh` (15 no-precondition +
+2 per-arm + 1 whole-gate at 2 GPUs), kept here as the live reconciliation site.
+Rewrite both lines together when the gate population changes.
+
 === END AUDIT #34 ===
+
+=== TOOLING FAILURE MODE #35 (2026-10-17): zero grep hits is a statement about the PATTERN, not the world ===
+
+Three instances in one session, all of the family AGENTS.md calls "a claim with no
+artifact behind it" — but arriving through a grep or a command rather than a number.
+
+**Instance 1 — grepping the REPO and concluding "no artifact exists."** A request to
+record an upstream survey was refused on the grounds that `grep -rn strata` over
+/var/home/fra/dev/intfer found only a bare URL (engines_sources.txt:7) and a
+cross-reference (docs/FORK_B580_SUMMARY.md:542). The conclusion written into the
+permanent record was "NO Strata survey exists in this repo's record." The upstream
+clones live in a SIBLING directory, /var/home/fra/dev/intfer-upstream/ (Arcaine,
+beellama.cpp, GRIMOIRE, gufo, jitllm, pulsarlm, Strata), which a repo-scoped grep
+cannot reach. The refusal then annotated the source-record file `UNSURVEYED` and kept
+an already-surveyed source in the unsurveyed list — the record was INVERTED, not
+merely stale.
+
+**Instance 2 — grepping one API and concluding a feature is absent.** After the
+correction, Strata's fused_gdn.dp.cpp was characterised first as "double-bank SLM,
+1 barrier/token" (never read from source), then as "no SLM at all" (from
+`grep -c 'local_accessor|accessor<|slm|bank'` = 0 hits). BOTH were wrong: the kernel
+allocates FIVE work-group local regions — sk[S], sq[S], red_kv[RG][S], red_o[RG][S],
+wsum[S*RG/32] — via `sycl::ext::oneapi::group_local_memory_for_overwrite`, an API the
+grep pattern could not see, and it carries FIVE `item_ct1.barrier()` calls at :62,
+:73, :89, :113, :162, not one per token. Zero hits on one API is not evidence the
+feature is absent.
+
+**Instance 3 — a surprising number from a mis-shaped command.** `wc -l < FILE`
+returned `0` while `wc -l FILE` returned `2349` in the same session. The zero was a
+redirection artifact of a mangled multi-line command, not the file's state. The lesson
+is not "distrust the tool" but: when a number contradicts a previously verified one,
+RE-MEASURE DIRECTLY before either reporting it or writing it off.
+
+**THE RULE.** A grep that returns zero is a statement about the PATTERN, not about the
+world. Before recording "X is absent":
+  1. enumerate the APIs that PROVIDE X and grep for each — for SYCL/Xe work-group
+     local memory that is at least `local_accessor`, `group_local_memory_for_overwrite`,
+     `slm_init`, and the `__local` / `LMEM` spellings;
+  2. before recording "no artifact exists", name the directories the grep did NOT
+     cover, and grep the upstream-clone sibling (/var/home/fra/dev/intfer-upstream/)
+     as well as the repo;
+  3. re-read the cited lines before any characterization enters a permanent record
+     file. A characterization that was never read from source is a TRANSCRIPTION, and
+     a transcription has the same standing as a remembered number.
+
+=== END TOOLING FAILURE MODE #35 ===
+
+=== TOOLING FAILURE MODE #36 (2026-10-18): a mutation matrix that caught 8 states and taught nothing — the three checker defects it found ===
+
+The S1 predicate matrix (`scripts/check_s1_predicates.sh` +
+`scripts/mutate_s1_predicates.sh`, 8 states, 8/8 CAUGHT, residue byte-identical)
+was built to close a durability gap: its first two generations lived only under
+/var/tmp and their driver scripts were lost, leaving eight `.cpp` mutants and two
+logs that no later session could re-run. The rebuild earned its place by finding
+three defects in the CHECKER, none of which the probe had. All three are the same
+family the audit log already records — a green whose reason is not the one stated —
+arriving through shell mechanics rather than through a number.
+
+**Defect 1 — the dead conjunction: a shell function returns only its LAST
+statement's status.** The first drafting evaluated the eight predicates as a chain
+inside one function, `p_a; p_b; p_c; ...`, and took the function's rc as the
+verdict. POSIX gives that chain the status of its LAST command, so every guard
+clause before the last was silently discarded. The matrix reported 8/8 CAUGHT on a
+source missing seven predicates: each state's "refusal" was really the checker
+refusing on whatever happened to be last. The fix is structural and is why the
+shipped checker has no chain: every predicate is evaluated on its OWN line and
+appended to a `fails` list, and the verdict is taken from `"${#fails[@]}"` — a
+length, which cannot be dropped. The lesson generalises past shell: any verdict
+taken from a return VALUE rather than from an enumerated set of reasons is one
+edit away from measuring nothing.
+
+**Defect 2 — the inverted-polarity state that proved nothing.** A negative
+direction that DELETED `getenv` from a copy of the probe made the source MORE
+compliant than the healthy original, which carries no env reference at all. The
+state "refused", therefore the checker was believed to see the defect. It did not:
+the checker would have refused that source for being healthy. Every state now
+plants a defect into a copy that is `cmp`'-d against the pre-mutation original
+first, and the anchor preflight asserts the healthy source is env-FREE before
+ND-envvar is allowed to run — a state whose baseline already holds its predicate
+is not a negative direction, it is a tautology wearing one.
+
+**Defect 3 — the unlanded mutation graded as a catch.** A planted `\n` stayed a
+literal two-character escape instead of becoming a line break, so the "planted"
+claim was glued onto the line it was meant to be absent from, and the mutation
+changed nothing at all. It was graded CAUGHT, because the checker refused the
+source — for a reason the mutation had not produced. This is the vacuous-green
+failure mode in its purest form: the matrix counted a state whose subject was
+never defective. The standing fix, asserted in the shipped mutator rather than
+intended: every state runs `cmp` between the mutated copy and the live source and
+DIES if they are identical — "the mutation did NOT LAND -- refusing to grade a
+no-op as a catch" — so an unlanded state fails the run rather than inflating it.
+
+**Two adjacent traps found while rebuilding, both now prevented by construction.**
+(a) A comment-blind grep for `adopt|faster` returns THREE hits on the healthy
+probe, because the probe's own header says "it prints no adopt/decline verdict"
+and "say whether intfer's TP=2 doorbells got faster". A predicate that fires on
+its own correct subject has no negative direction and would have refused the
+healthy file. `check_s1_predicates.sh` strips `//` line comments into a temp copy
+before harvesting — the same move `check_destructive_git.sh` already makes,
+recorded there as its DG-2 load-bearing state. (b) `p_guard_after_parse` needs two
+line numbers and must be evaluated only when BOTH were found; the first version
+compared an empty string numerically and the guard's position "checked out" on a
+source with no guard at all. The shipped form has an explicit third branch that
+fails on "could not locate both".
+
+**THE RULE.** A mutation matrix is evidence about the CHECKER, not about the code
+it guards, and only if each state's subject was actually mutated. Before reporting
+"N/N states caught":
+  1. assert every mutation LANDED — `cmp` the mutated copy against the
+     pre-mutation original and refuse a no-op state. An unlanded mutation is a
+     catch about nothing;
+  2. check each state's baseline holds the predicate it plants. A state that
+     makes the source MORE compliant than the healthy original is a tautology,
+     and a tautology cannot fail;
+  3. take the verdict from an enumerated list of reasons, never from a return
+     value or a `;`-chain whose status is its last command;
+  4. strip comments before any predicate harvest whose pattern can appear in the
+     subject's own prose, or the predicate will refuse the file it protects;
+  5. persist the checker, the mutator AND the log inside the repo. Three
+     generations of this matrix existed only under /var/tmp; the first two were
+     lost with their drivers, and the gap between "measured" and "re-runnable"
+     is what this failure mode records.
+
+=== END TOOLING FAILURE MODE #36 ===

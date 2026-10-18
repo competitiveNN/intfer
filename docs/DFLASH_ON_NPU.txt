@@ -1,0 +1,37 @@
+Running **DFlash2** (or parallel block-diffusion/semi-autoregressive architectures like DSpark) on an NPU/DPU while the primary target model lives on a discrete GPU introduces a severe hardware-split engineering problem. Because DFlash2 relies on a block-diffusion forward pass coupled with a lightweight candidate selector, it generates multi-token candidate graphs rapidly.
+
+---
+
+### 1. The Engineering Solution: How to Run DFlash2 on an NPU with a GPU Target
+
+To make a cross-device setup work without destroying your throughput, you have to restructure the inference execution loop into an asynchronous, pipelined producer-consumer pattern:
+
+* **Unified Runtime Graphs via OpenVINO or ONNX Runtime:** Compile the DFlash2 draft model and its candidate selector into a dedicated runtime graph (such as OpenVINO for Intel NPUs) that exposes a clean C++/Python API.
+* **Asynchronous Ring Buffers & Zero-Copy Host Memory Pins:** Avoid copying tensors back and forth through standard Python host memory. Allocate pinned (page-locked) host memory shared buffers as an intermediary staging ground.
+* **Overlapping Prefill/Verification with Next-Draft Generation:**
+1. The GPU finishes verifying step $N$ and outputs the accepted base token.
+2. *Simultaneously*, the GPU signals the NPU via a lightweight asynchronous event trigger (e.g., a shared semaphore or CUDA-to-Host notification).
+3. While the GPU computes the massive target-model verification pass for the current draft block, the NPU *concurrently* executes the DFlash2 block-diffusion pass for the next candidate window.
+4. The NPU writes the resulting candidate token IDs and transition scores directly into the pinned staging buffer before the GPU even finishes its current verification cycle.
+
+
+
+---
+
+### 2. At What Model Size Does It Make Sense?
+
+The viability of splitting DFlash2 to an NPU while keeping the target model on a GPU depends entirely on the **target model's parameter footprint and arithmetic intensity**:
+
+* **Small Target Models ($\le 14B$ parameters):** **Does not make sense.** A smaller target model executes its forward pass so quickly on a modern GPU that the inter-device communication latency (PCIe round-trip or system fabric synchronization) will completely eclipse any time saved by offloading the draft model.
+* **Medium-to-Large Target Models ($27B$ to $70B+$ parameters, e.g., Qwen 27B/70B classes):** **This is the sweet spot.** Target models in this range have heavy memory-bandwidth or compute bottlenecks during verification. A DFlash2 draft model tailored for a $27B$ target model is large enough that offloading it frees up valuable GPU tensor cores and VRAM bandwidth for the primary model, provided the pipelining hides the transfer latency.
+* **Massive Target Models ($>70B$ or Multi-GPU setups):** **Highly viable, but better suited for local CPU/host memory than a discrete NPU.** When the GPU is completely saturated running a massive model, utilizing an NPU or spare system capacity for parallel drafting prevents the draft overhead from starving the main execution units.
+
+---
+
+### 3. Strategies to Minimize the Copy Requirement
+
+Because the primary bottleneck of a split GPU-NPU setup is moving token candidate matrices and hidden states across the hardware boundary, you must minimize data movement using these specific architectural patterns:
+
+* **Draft Metadata-Only Transfers (Token IDs vs. Logits):** Never transfer full vocabulary logits or massive hidden state tensors from the NPU to the GPU. DFlash2’s candidate selector should run *entirely on the NPU side*. The NPU should process the block-diffusion steps, run its internal scoring codebooks, resolve the top-K paths, and **only transmit the final compact array of candidate token IDs and path indices** (a tiny payload of a few dozen integers) across to the GPU.
+* **Shared Virtual Memory (SVM) / Unified Memory Pools:** On modern platforms where the CPU/NPU share a unified memory architecture with system RAM (or integrated system fabrics), map the tensor buffers using zero-copy device-agnostic allocations. This ensures the NPU writes directly to memory addresses that the GPU runtime can read directly without an explicit CPU-mediated `memcpy`.
+* **Static Graph Caching of Target Vocabulary Projections:** Keep the embedding and vocabulary projection layers mirrored or localized so that token ID mappings do not require translation tables moving across the PCIe bus during every single generation step.

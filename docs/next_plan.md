@@ -1,4 +1,4 @@
-# Next plan: 27B decode on 2x B580 TP=2 (was: 0.8B TP1)
+# Next plan: 27B decode on 2x B580 TP=2
 
 Date: 2026-09-26. HEAD `34d3c54` (argmax 27B no-op check; prefix-cache
 quiet-box complete; argmax scalar wall-time = measured loss).
