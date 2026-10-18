@@ -94,6 +94,97 @@ wide_ids_of() { # $1=tp $2=env... -- prints decode ids for the ~97-token prefill
     | tr '\n' ' ' | sed 's/ *$//'
 }
 
+# --- INTFER_XMX_GEMM / INTFER_XMX_TILE_SCHED: model-free probe ----
+# (full rationale in examples/xmx_probe/main.cpp)
+#
+# CENSUS SELF-CHECK. check_flag_gate_coverage.sh harvests the set of
+# INTFER_* names from scripts/test_*.sh and subtracts the engine's
+# own set; a flag that appears nowhere in a gate is filed as an
+# opt-in REAL GAP. Both XMX flags must therefore appear as literals
+# here, not merely be implied by the probe binary (which reads
+# INTFER_XMX_TILE_SCHED via getenv inside the kernel launch).
+if ! grep -qE '\bINTFER_XMX_GEMM\b' "$0" || \
+   ! grep -qE '\bINTFER_XMX_TILE_SCHED\b' "$0"; then
+  echo "FAIL: this gate does not name the XMX flags -- the flag "
+  echo "      census would file them as ungated opt-in gaps" >&2
+  exit 1
+fi
+#
+# WHY A PROBE, NOT THE ENGINE LOG. The engine wires the XMX arm
+# ONLY into Engine::run_linear_tp (engine.cpp:1446), and the only
+# run_linear_tp caller on the CLI path is the M=1 decode step.
+# The XMX kernel's own gate is M >= 8 with M % 16 == 0,
+# N % 16 == 0, K % 32 == 0, so on EVERY real model in this tree
+# the arm is UNREACHABLE from the CLI: the 0.8B fixture's prompt
+# is ~5 tokens (M = 5 < 8), so the kernel DECLINES every tile and
+# the engine falls back to the tiled kernel (measured: no
+# [xmx-gemm] line, stream 279 6511 314 279). The old gate arm
+# asserted the [xmx-gemm] announcement was PRESENT -- which could
+# only ever have passed vacuously, and now (the announcement is
+# gated on `ran`) cannot pass at all.
+#
+# The probe certifies the arm on synthetic tile-aligned shapes the
+# engine never produces:
+#   * (default)  the XMX kernel SUBMITS (ran==true) on aligned
+#                shapes, agrees with the tiled kernel to the FP32
+#                reordering bound, and both stay inside an absolute
+#                tolerance of a host FP32 reference;
+#   * --m1       the NEGATIVE direction: M=1 MUST decline (the
+#                decode path is memory-bound; if a future change
+#                loosened the M>=8 gate the probe would catch it);
+#   * --steal    the WORK-STEALING arm (INTFER_XMX_TILE_SCHED=1):
+#                n_tiles=32 > nWG=16, so the claim loop actually
+#                runs, and the claim counter must be consistent
+#                (sum in [n_tiles, n_tiles+nWG]). This is the
+#                direct evidence for the device-scope atomic the
+#                kernel uses on the SHARED global counter: a
+#                work_group-scoped atomic loses cross-group updates
+#                (sum < n_tiles), and a per-work-group counter
+#                makes every group claim the same tiles
+#                (sum = n_tiles * nWG, measured at 528). Both
+#                failure modes are bit-exact in the OUTPUT and so
+#                are detectable only in the counter -- which is why
+#                the probe asserts it rather than trusting the
+#                stream.
+#
+# BUILD-FIRST (audit #6/#7): the probe is a separate cmake target,
+# so it is built through the same shared guard as intfer_cli -- a
+# source edit that fails to compile must not leave a stale probe
+# binary that the gate would then run and report PASS for.
+gate_require_build xmx_probe || exit 1
+XMX_PROBE="$BUILD_DIR/examples/xmx_probe/xmx_probe"
+[ -x "$XMX_PROBE" ] || { echo "FAIL: xmx_probe binary missing: $XMX_PROBE" >&2; exit 1; }
+for xmx_mode in "" "--m1" "--steal"; do
+  XMX_OUT="$(mktemp)"
+  # WRAPPED IN A TIMEOUT, AND A TIMEOUT IS A SKIP, NOT A FAIL. This
+  # box is intermittently hung for SYCL kernel execution (see
+  # AGENTS.md: GPU SYCL hangs, CPU SYCL works), and the probe's
+  # queue construction blocks rather than throwing -- only an
+  # exception is catchable, not a hang. A gate that hangs on a hung
+  # box trains the operator to ignore it, which is worse than a loud
+  # SKIP, so rc=124 is reported as a precondition failure and exits
+  # 2 (the same code the probe returns for "no GPU"). A genuine
+  # defect in the arm returns 1 and is still red.
+  # shellcheck disable=SC2086
+  timeout 300 "$XMX_PROBE" $xmx_mode >"$XMX_OUT" 2>&1; XMX_RC=$?
+  if [ "$XMX_RC" = "124" ]; then
+    echo "SKIP: xmx_probe $xmx_mode timed out -- this box is hung for "
+    echo "      SYCL kernel execution (GPU SYCL hangs, CPU SYCL works; "
+    echo "      see AGENTS.md). That is a precondition, not a defect "
+    echo "      in the arm." >&2
+    exit 2
+  elif [ "$XMX_RC" = "2" ]; then
+    echo "SKIP: xmx_probe $xmx_mode found no GPU (precondition, not a defect)" >&2
+    exit 2
+  elif [ "$XMX_RC" -ne 0 ] || ! grep -aq '^RESULT: PASS$' "$XMX_OUT"; then
+    fail "xmx_probe $xmx_mode did not report RESULT: PASS (rc=$XMX_RC) -- the XMX arm is broken"
+    tail -12 "$XMX_OUT" >&2
+  else
+    echo "xmx_probe $xmx_mode: PASS"
+  fi
+  rm -f "$XMX_OUT"
+done
+
 for tp in $TPS; do
   BASE="$(ids_of "$tp")"
   echo "TP=$tp base: '$BASE'"
@@ -671,9 +762,29 @@ for tp in $TPS; do
       # SSM_GPU may decline (e.g. on a box where the device path is absent);
       # a decline is NOT a failure of this arm -- it means the recurrence
       # ran on the host and (a) covers it.
-      echo "TP=$tp SSM_FUSE self-check (d) SKIPPED: INTFER_SSM_FUSE=1 \
-            INTFER_SSM_GPU=1 exited rc=$SD_RC (device SSM path declined, so \
-            the recurrence ran on the host and (a) covers it)" >&2
+      #
+      # *** BUT A SKIP MUST BE PROVABLE, OR IT IS A SILENT PASS. *** The
+      # escape hatch says "the device path declined"; if the run died for an
+      # unrelated reason (crash, OOM, a shape this box refuses) the arm would
+      # take the same branch and report nothing. So the skip asserts the
+      # refusal line IS present: `ssm_gpu_allowed()` prints
+      # `[intfer] INTFER_SSM_GPU declined: ...` (main.cpp:2793) when it turns
+      # the recurrence back to the host. A non-zero exit without that line is
+      # a failure this arm must not cover up -- it means the device path was
+      # supposed to run and did not, which is exactly the dead-fuse this arm
+      # exists to catch.
+      if grep -aq "INTFER_SSM_GPU declined" "$SD_ERR"; then
+        echo "TP=$tp SSM_FUSE self-check (d) SKIPPED: INTFER_SSM_FUSE=1 \
+              INTFER_SSM_GPU=1 exited rc=$SD_RC and the device path refused \
+              (the recurrence ran on the host and (a) covers it)" >&2
+      else
+        fail "TP=$tp SSM_FUSE self-check (d): INTFER_SSM_FUSE=1 \
+              INTFER_SSM_GPU=1 exited rc=$SD_RC with NO 'INTFER_SSM_GPU \
+              declined' line -- the run died for a reason unrelated to the \
+              device-path decline, so the skip hatch covered a failure this \
+              arm exists to catch (the fused kernel body is dead on a path \
+              that was supposed to run)"
+      fi
     else
       if ! ssm_fuse_announced "$SD_ERR"; then
         fail "TP=$tp SSM_FUSE self-check (d): INTFER_SSM_FUSE=1 \
@@ -993,115 +1104,269 @@ for tp in $TPS; do
     rm -rf "$HSB"
   }
 
-  # --- INTFER_XMX_GEMM: joint_matrix XMX DPAS for INT2/INT4 weights ---------
-  # Ported from llama.cpp fused-gemm. The portable tiled kernel
-  # (quant_gemm_forward_usm) dequantizes INT2/4 weights into SLM and
-  # accumulates with FP16 FMA on EU/ALU -- xmxmon reads zero DPAS there. This
-  # kernel issues the XMX DPAS directly via joint_matrix_mad after dequantizing
-  # the weight tile into FP16 in SLM.
+  # --- INTFER_XMX_GEMM / INTFER_XMX_TILE_SCHED: engine wiring ----
+  # On the 0.8B fixture the XMX kernel DECLINES every tile: the
+  # prompt is ~5 tokens (M = 5 < 8), so the kernel's own shape
+  # gate refuses and the engine falls back to the tiled kernel.
+  # The correct behaviour is therefore decline + fallback, and the
+  # arm asserts exactly that:
+  #   * the stream is UNCHANGED (the fallback wrote the right
+  #     bytes -- a broken fallback would corrupt the stream), and
+  #   * the [xmx-gemm] announcement is ABSENT. The announcement
+  #     is gated on `ran` (engine.cpp:1491), so its absence proves
+  #     the kernel declined rather than merely that the env var was
+  #     read. A flag that wrongly dispatched the XMX kernel on this
+  #     unaligned shape would either crash, change the stream, or
+  #     print the announcement -- all three are FAILs.
+  # The model-free certification of the KERNEL itself (reachability,
+  # numerics, the M=1 decline, and the work-stealing claim counter)
+  # is the xmx_probe block above, which runs on tile-aligned shapes
+  # the engine never produces.
   #
-  # BIT-EXACT BY CONSTRUCTION: the dequantized FP16 weight tile holds the
-  # same bits the tiled kernel would load into sW, the activation tile holds
-  # the same bits as sA, and the DPAS FP32 accumulation order is the same
-  # ascending-K order as the tiled kernel's inner kk loop. The only
-  # difference is the compute unit (XMX DPAS vs EU/ALU FMA).
-  #
-  # *** WHY A STREAM COMPARISON ALONE IS VACUOUS HERE, AND WHAT DEFEATS IT. ***
-  # The base and this arm are bit-identical BY CONSTRUCTION (that is the
-  # claim), so "the two streams matched" certifies nothing on its own: a
-  # flag that never reached the branch would also produce matching streams.
-  # The per-site decision line below is what separates them -- it prints
-  # "[xmx-gemm] ACTIVE on eligible INT2/INT4 tiles" once per process, so the
-  # arm certifies the kernel ran rather than a constant.
-  #
-  # *** THE KERNEL ITSELF GUARDS THE SHAPES. *** quant_gemm_forward_usm_xmx
-  # returns a null event when M%16 != 0, N%16 != 0, or K%64 != 0, and the
-  # engine falls back to the tiled kernel. So this arm is REACHABILITY-only
-  # on the 0.8B model: it certifies that the XMX path is wired and reachable
-  # when the shapes are aligned, not that it fired on every tile. The gate
-  # asserts the announcement line is present when the flag is set.
-  xmx_announced() { grep -aq '\[xmx-gemm\]' "$1"; }
-  {
+  # *** ONE PREDICATE, TWO CONSUMERS (audit #3). *** The predicate
+  # is the conjunction "stream matches AND no announcement", not
+  # either clause alone: the stream clause is the anti-vacuity guard
+  # (an empty log, or a run that produced no tokens, has no stream
+  # to match), and the announcement clause is the anti-vacuity guard
+  # for the decline direction (a log where the kernel ran is
+  # rejected). Each clause alone is satisfiable by a flag that never
+  # reached the branch; only the conjunction is not.
+  xmx_stream_of() { # $1 = log -> prints space-separated decode ids
+    grep -aoE "decode step [0-9]+: token=[0-9]+" "$1" | sed -E 's/.*token=//' | tr '\n' ' ' | sed 's/ *$//'
+  }
+  xmx_fallback_ok() { # $1 = log, $2 = expected ids. 0=accept.
+    [ "$(xmx_stream_of "$1")" = "$2" ] && ! grep -aq '\[xmx-gemm\]' "$1"
+  }
+  # shellcheck disable=SC2086
+  for xmx_env in "INTFER_XMX_GEMM=1" "INTFER_XMX_GEMM=1 INTFER_XMX_TILE_SCHED=1"; do
     XM_OUT="$(mktemp)"; XM_ERR="$(mktemp)"
-    env INTFER_XMX_GEMM=1 "$BIN" --gpu --tp "$tp" -m "$MODEL"       -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$XM_OUT" 2>"$XM_ERR"; XM_RC=$?
+    env $xmx_env "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$XM_OUT" 2>"$XM_ERR"; XM_RC=$?
     if [ "$XM_RC" -ne 0 ]; then
-      fail "TP=$tp INTFER_XMX_GEMM=1 run exited rc=$XM_RC"; tail -10 "$XM_ERR" >&2
+      fail "TP=$tp $xmx_env run exited rc=$XM_RC"; tail -10 "$XM_ERR" >&2
     else
-      XM_IDS="$(ids_of "$tp" INTFER_XMX_GEMM=1)"
-      echo "TP=$tp [INTFER_XMX_GEMM=1]: '$XM_IDS'"
-      [ -n "$XM_IDS" ] || fail "TP=$tp INTFER_XMX_GEMM=1 stream EMPTY"
-      [ "$XM_IDS" = "$BASE" ]         || fail "TP=$tp [INTFER_XMX_GEMM=1] '$XM_IDS' != base '$BASE' (must be bit-exact)"
-      if ! xmx_announced "$XM_ERR"; then
-        fail "TP=$tp INTFER_XMX_GEMM=1: no [xmx-gemm] line -- the XMX path never took, stream match vacuous"
-      fi
+      XM_IDS="$(ids_of "$tp" $xmx_env)"
+      echo "TP=$tp [$xmx_env]: '$XM_IDS'"
+      [ -n "$XM_IDS" ] || fail "TP=$tp $xmx_env stream EMPTY"
+      [ "$XM_IDS" = "$BASE" ] || fail "TP=$tp [$xmx_env] '$XM_IDS' != base '$BASE' (the fallback must be stream-identical)"
+      xmx_fallback_ok "$XM_ERR" "$XM_IDS" \
+        || fail "TP=$tp $xmx_env: the XMX kernel either RAN on an unaligned tile ([xmx-gemm] present) or produced no stream -- the decline+fallback is not observable"
     fi
     rm -f "$XM_OUT" "$XM_ERR"
-  }
-  {
-    XMSB="$(mktemp -d)"
-    env INTFER_XMX_GEMM=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT"       -n "${N:-4}" --no-stream --ids $TOK >"$XMSB/good.out" 2>"$XMSB/good.err" || true
-    cp "$XMSB/good.err" "$XMSB/not.err"
-    sed -i '/\[xmx-gemm\]/d' "$XMSB/not.err"
-    : >"$XMSB/empty.err"
-    if ! xmx_announced "$XMSB/good.err"; then
-      echo "TP=$tp XMX_GEMM self-check SKIPPED: the tp=1 fixture produced no             [xmx-gemm] line (no INT2/INT4 tiles on this model, or the engine             did not run on this box), so the refusal/vacuity directions are             unexercised here" >&2
+  done
+  # Self-checks run once, at tp=1 (the predicate's polarity is
+  # tp-independent; only the stream it matches is tp-dependent, and
+  # tp=1's BASE is in scope here).
+  if [ "$tp" = "1" ]; then
+    XSB="$(mktemp -d)"
+    env INTFER_XMX_GEMM=1 "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$XSB/good.out" 2>"$XSB/good.err" || true
+    cp "$XSB/good.err" "$XSB/not.err"
+    printf '[xmx-gemm] ACTIVE on eligible INT2/INT4 tiles (INTFER_XMX_GEMM=1)\n' >> "$XSB/not.err"
+    : >"$XSB/empty.err"
+    if [ "$(xmx_stream_of "$XSB/good.err")" != "$BASE" ]; then
+      echo "TP=$tp XMX self-check SKIPPED: the tp=1 fixture produced no "
+      echo "      stream (the engine did not run on this box), so the "
+      echo "      refusal/vacuity directions are unexercised here" >&2
     else
-      if xmx_announced "$XMSB/not.err"; then
-        fail "TP=$tp XMX_GEMM self-check (b): log with the decision line deleted was ACCEPTED -- arm is stream-only"
+      # (b) refusal: a log with the announcement present (the kernel
+      # wrongly ran on an unaligned tile) must be refused.
+      if xmx_fallback_ok "$XSB/not.err" "$BASE"; then
+        fail "TP=$tp XMX self-check (b): log with the [xmx-gemm] announcement ACCEPTED -- the arm does not observe the decline"
       fi
-      if xmx_announced "$XMSB/empty.err"; then
-        fail "TP=$tp XMX_GEMM self-check (c): arm ACCEPTED an empty log (vacuity)"
+      # (c) vacuity: an empty log must fail the predicate.
+      if xmx_fallback_ok "$XSB/empty.err" "$BASE"; then
+        fail "TP=$tp XMX self-check (c): arm ACCEPTED an empty log (vacuity)"
       fi
     fi
-    rm -rf "$XMSB"
-  }
+    rm -rf "$XSB"
+  fi
 
-  # --- INTFER_XMX_TILE_SCHED: work-stealing tile scheduler for XMX kernel ----
-  # Ported from the DPAS path's INTFER_TILE_SCHED. The XMX kernel uses
-  # joint_matrix which requires ALL SG lanes to participate, so work-stealing
-  # is per-SUBGROUP: lane 0 claims the next tile, broadcasts it via a
-  # local_accessor, and all SG lanes process the claimed tile together.
+  # --- INTFER_MLP_PARTIAL_DOWN: TP=2 partial-sum down projection -------
+  # PLAN.md 1.2b. The MLP down-projection at TP=2 becomes a
+  # two-kernel split per device behind the default-OFF
+  # presence-spelled INTFER_MLP_PARTIAL_DOWN: device d keeps
+  # its gate/up outputs ON DEVICE, fuses silu(gate)*up via
+  # silumul_to_half into a per-device M*inter FP16 buffer, then
+  # runs the down GEMM over its K-sliced FULL-N shard (N=td.N,
+  # K=td.K/2) writing an FP16 partial, and the host sums the two
+  # partials in FP32. NOT bit-exact (two FP16 partials summed in
+  # FP32 vs the tiled kernel's single FP32-accumulate-then-FP16
+  # store) -> TOLERANCE CONTRACT, never stream identity.
   #
-  # BIT-EXACT BY CONSTRUCTION: the process_tile body is shared by both
-  # paths; fixed-assignment and work-stealing compute the same dot products
-  # in the same order, only differing in WHICH tile each sub-group computes.
-  # So a stream comparison alone is vacuous here -- the arm asserts the
-  # [xmx-tile-sched] line, which prints n_tiles and nWG, so the gate can
-  # verify the work-stealing path was actually taken.
-  xmx_ts_announced() { grep -aq '\[xmx-tile-sched\]' "$1"; }
-  {
-    XT_OUT="$(mktemp)"; XT_ERR="$(mktemp)"
-    env INTFER_XMX_GEMM=1 INTFER_XMX_TILE_SCHED=1 "$BIN" --gpu --tp "$tp" \
-      -m "$MODEL" -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK \
-      >"$XT_OUT" 2>"$XT_ERR"; XT_RC=$?
-    if [ "$XT_RC" -ne 0 ]; then
-      fail "TP=$tp INTFER_XMX_TILE_SCHED=1 run exited rc=$XT_RC"; tail -10 "$XT_ERR" >&2
+  # *** THIS ARM ASSERTS THE DECLINE, NOT THE REACHABILITY. ***
+  # run_mlp_partial_down guards on `tg.qcfg.scheme == INT2`
+  # (engine.cpp:3304) and the fused gateup kernel it dispatches
+  # has an INT2+INT2-only body (quant_gemm.cpp:2432). THIS
+  # fixture's MLP tensors are INT4 -- verified 2026-10-14 by
+  # parsing the .intifer header directly: every MLP_GATE/MLP_UP/
+  # MLP_DOWN is scheme=INT4 group=64 (four of the 24 gate tensors
+  # are INT8 g32). So on the 0.8B fixture the partial-down path
+  # CANNOT run: the guard returns false at the scheme check, the
+  # caller falls back to the host gateup path, and the
+  # [mlp-partial-down] announcement never prints. Asserting the
+  # announcement here would hold the gate red on correct code, and
+  # asserting the stream alone would be vacuous (the fallback is
+  # identical by construction). The correct assertion is the
+  # DECLINE: the flag is read, the guard refuses the INT4 scheme,
+  # the run exits 0 producing the BASE stream, and no announcement
+  # appears. That is the negative direction of the reachability
+  # assertion, in the same polarity discipline the SSM_FUSE arm
+  # uses (test_gpu_optin.sh:668-685 -- HERE the line must be
+  # ABSENT; the reachability direction lives on the arm where the
+  # path is actually live). The reachability (ACTIVE) direction for
+  # INTFER_MLP_PARTIAL_DOWN is gated in scripts/test_tp2_27b.sh:1173+,
+  # which runs the 27B INT2 fixture where the path runs for real.
+  pd_stream_of() { # $1 = log -> prints space-separated decode ids
+    grep -aoE "decode step [0-9]+: token=[0-9]+" "$1" | sed -E 's/.*token=//' | tr '\n' ' ' | sed 's/ *$//'
+  }
+  pd_decline_ok() { # $1 = log, $2 = expected ids. 0=accept (decline).
+    [ "$(pd_stream_of "$1")" = "$2" ] && ! grep -aq '\[mlp-partial-down\]' "$1"
+  }
+  PD_OUT="$(mktemp)"; PD_ERR="$(mktemp)"
+  env INTFER_MLP_PARTIAL_DOWN=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" \
+    -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$PD_OUT" 2>"$PD_ERR"; PD_RC=$?
+  if [ "$PD_RC" -ne 0 ]; then
+    fail "TP=$tp INTFER_MLP_PARTIAL_DOWN=1 run exited rc=$PD_RC"; tail -10 "$PD_ERR" >&2
+  else
+    PD_IDS="$(ids_of "$tp" INTFER_MLP_PARTIAL_DOWN=1)"
+    echo "TP=$tp [INTFER_MLP_PARTIAL_DOWN=1]: '$PD_IDS'"
+    [ -n "$PD_IDS" ] || fail "TP=$tp INTFER_MLP_PARTIAL_DOWN=1 stream EMPTY"
+    [ "$PD_IDS" = "$BASE" ] \
+      || fail "TP=$tp [INTFER_MLP_PARTIAL_DOWN=1] '$PD_IDS' != base '$BASE' (the INT4 fixture must fall back to the host gateup path, bit-exact)"
+    # *** ONE PREDICATE, TWO CONSUMERS (audit #3). *** The
+    # predicate is the conjunction "stream matches AND no
+    # announcement", not either clause alone: the stream clause is
+    # the anti-vacuity guard (an empty log, or a run that produced
+    # no tokens, has no stream to match), and the announcement
+    # clause is the anti-vacuity guard for the decline direction (a
+    # log where the partial-down path ran on an INT4 model --
+    # impossible by the scheme guard, but exactly what a broken
+    # guard would produce -- is rejected). Each clause alone is
+    # satisfiable by a flag that never reached the branch; only the
+    # conjunction is not. Same shape as the XMX arm above.
+    pd_decline_ok "$PD_ERR" "$PD_IDS" \
+      || fail "TP=$tp INTFER_MLP_PARTIAL_DOWN=1: either the stream diverged or the partial-down path ran on an INT4 model ([mlp-partial-down] present) -- the scheme guard did not decline"
+  fi
+  rm -f "$PD_OUT" "$PD_ERR"
+  # Self-checks run once, at tp=1 (the predicate's polarity is
+  # tp-independent; only the stream it matches is tp-dependent, and
+  # tp=1's BASE is in scope here).
+  if [ "$tp" = "1" ]; then
+    PDSB="$(mktemp -d)"
+    env INTFER_MLP_PARTIAL_DOWN=1 "$BIN" --gpu --tp 1 -m "$MODEL" \
+      -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$PDSB/good.out" 2>"$PDSB/good.err" || true
+    cp "$PDSB/good.err" "$PDSB/not.err"
+    printf '[mlp-partial-down] ACTIVE (INTFER_MLP_PARTIAL_DOWN=1) on a fixture whose MLPs are INT4 -- the scheme guard must have refused this\n' >> "$PDSB/not.err"
+    : >"$PDSB/empty.err"
+    if [ "$(pd_stream_of "$PDSB/good.err")" != "$BASE" ]; then
+      echo "TP=$tp MLP_PARTIAL_DOWN self-check SKIPPED: the tp=1 fixture produced no "
+      echo "      stream (the engine did not run on this box), so the "
+      echo "      refusal/vacuity directions are unexercised here" >&2
     else
-      XT_IDS="$(ids_of "$tp" INTFER_XMX_TILE_SCHED=1)"
-      echo "TP=$tp [INTFER_XMX_TILE_SCHED=1]: '$XT_IDS'"
-      [ -n "$XT_IDS" ] || fail "TP=$tp INTFER_XMX_TILE_SCHED=1 stream EMPTY"
-      [ "$XT_IDS" = "$BASE" ] || fail "TP=$tp [INTFER_XMX_TILE_SCHED=1] '$XT_IDS' != base '$BASE' (must be bit-exact)"
-      if ! xmx_ts_announced "$XT_ERR"; then
-        echo "TP=$tp XMX_TILE_SCHED self-check SKIPPED: the fixture produced no             [xmx-tile-sched] line (no INT2/INT4 tiles on this model, or the             XMX path never took), so the work-stealing direction is             unexercised here" >&2
-      else
-        # Self-check (b): the announcement line is what separates the two
-        # paths. Delete it from the log and the arm must NOT match.
-        XT_NOT="$(mktemp)"
-        sed -i '/\[xmx-tile-sched\]/d' "$XT_ERR"
-        cp "$XT_ERR" "$XT_NOT"
-        if xmx_ts_announced "$XT_NOT"; then
-          fail "TP=$tp XMX_TILE_SCHED self-check (b): log with the decision line deleted was ACCEPTED -- arm is stream-only"
-        fi
-        XT_EMPTY="$(mktemp)"
-        : >"$XT_EMPTY"
-        if xmx_ts_announced "$XT_EMPTY"; then
-          fail "TP=$tp XMX_TILE_SCHED self-check (c): arm ACCEPTED an empty log (vacuity)"
-        fi
-        rm -f "$XT_NOT" "$XT_EMPTY"
+      # (b) refusal: a log with the announcement present (the
+      # partial-down path wrongly ran on an INT4 model) must be
+      # refused.
+      if pd_decline_ok "$PDSB/not.err" "$BASE"; then
+        fail "TP=$tp MLP_PARTIAL_DOWN self-check (b): log with the [mlp-partial-down] announcement ACCEPTED -- the arm does not observe the INT4 decline"
+      fi
+      # (c) vacuity: an empty log must fail the predicate.
+      if pd_decline_ok "$PDSB/empty.err" "$BASE"; then
+        fail "TP=$tp MLP_PARTIAL_DOWN self-check (c): arm ACCEPTED an empty log (vacuity)"
       fi
     fi
-    rm -f "$XT_OUT" "$XT_ERR"
+    rm -rf "$PDSB"
+  fi
+
+  # --- INTFER_MLP_GATEUP_SILUMUL_FUSE: fused gate+up+silumul -----------
+  # Plan 1.2c (2026-10-14). The partial-down path's Phase 2 currently
+  # runs TWO launches per device: quant_gemm_forward_usm_gateup_compact
+  # (gate+up GEMM, one launch) then silumul_to_half (silu(gate)*up, a
+  # second launch chained by event). INTFER_MLP_GATEUP_SILUMUL_FUSE
+  # fuses the silu-mul epilogue INTO the gateup kernel: one WI per
+  # local column computes BOTH the gate and up dot products (gate and
+  # up are column-parallel over the SAME split, so Nl_g == Nl_u and the
+  # dispatch is Nl_g WIs), then applies silu(gate)*up in-register and
+  # writes the fused FP16 activation directly into ws_[d].act. This
+  # removes 1 submit + 1 wait + 1 D2H readback per device per MLP
+  # layer. Bit-exact by construction: the accumulator, the kg/j element
+  # order and the wtab are unchanged, and silu(g) = g/(1+exp(-g)) is
+  # computed in FP32 with the same to_half_bits RNE store that
+  # silumul_to_half uses (sycl::half(f) == dev_float_to_half, verified
+  # by the existing CPU parity gate), so every element is the same as if
+  # the compact gateup output had been fed through silumul_to_half.
+  # Stream-identity gate is warranted -- the down GEMM below sees the
+  # identical bytes.
+  #
+  # *** THE 0.8B FIXTURE'S MLPs ARE INT4, SO THE FUSED KERNEL DECLINES. ***
+  # The fused kernel's dispatch (quant_gemm.cpp, the
+  # quant_gemm_forward_usm_gateup_compact_silumul body) is INT2+INT2
+  # only: any other scheme pair returns sycl::event() and the caller
+  # falls back to the separate silumul_to_half call. On this fixture the
+  # fused kernel is NEVER reached (the partial-down path itself declines
+  # at the INT2 scheme guard, and even with INTFER_MLP_PARTIAL_DOWN
+  # unset the default TP=2 MLP path uses run_mlp_gateup, not the fused
+  # kernel). So on the 0.8B fixture this arm certifies the DECLINE
+  # direction only: the flag is read, the kernel refuses the INT4
+  # scheme, the run exits 0 producing the BASE stream, and no
+  # [mlp-gateup-silumul-fuse] announcement appears. The reachability
+  # (ACTIVE) direction lives on the 27B INT2 fixture in
+  # scripts/test_tp2_27b.sh, where the partial-down path is reachable.
+  #
+  # *** BIT-EXACT BY CONSTRUCTION, so the stream comparison alone is
+  # VACUOUS here. *** The fused kernel's output is byte-identical to the
+  # two-launch chain, and the two-launch chain is byte-identical to the
+  # base path (both produce the same FP16 activation buffer). So a log
+  # with the announcement absent, matching base, is ALSO what a flag
+  # that never reached the branch would produce. The arm therefore
+  # asserts the CONJUNCTION: stream matches AND no announcement, with
+  # the same shape as the MLP_PARTIAL_DOWN decline arm above.
+  gs_stream_of() { # $1 = log -> prints space-separated decode ids
+    grep -aoE "decode step [0-9]+: token=[0-9]+" "$1" | sed -E 's/.*token=//' | tr '\n' ' ' | sed 's/ *$//'
   }
+  gs_decline_ok() { # $1 = log, $2 = expected ids. 0=accept (decline).
+    [ "$(gs_stream_of "$1")" = "$2" ] && ! grep -aq '\[mlp-gateup-silumul-fuse\]' "$1"
+  }
+  GS_OUT="$(mktemp)"; GS_ERR="$(mktemp)"
+  env INTFER_MLP_GATEUP_SILUMUL_FUSE=1 "$BIN" --gpu --tp "$tp" -m "$MODEL" \
+    -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$GS_OUT" 2>"$GS_ERR"; GS_RC=$?
+  if [ "$GS_RC" -ne 0 ]; then
+    fail "TP=$tp INTFER_MLP_GATEUP_SILUMUL_FUSE=1 run exited rc=$GS_RC"; tail -10 "$GS_ERR" >&2
+  else
+    GS_IDS="$(ids_of "$tp" INTFER_MLP_GATEUP_SILUMUL_FUSE=1)"
+    echo "TP=$tp [INTFER_MLP_GATEUP_SILUMUL_FUSE=1]: '$GS_IDS'"
+    [ -n "$GS_IDS" ] || fail "TP=$tp INTFER_MLP_GATEUP_SILUMUL_FUSE=1 stream EMPTY"
+    [ "$GS_IDS" = "$BASE" ] \
+      || fail "TP=$tp [INTFER_MLP_GATEUP_SILUMUL_FUSE=1] '$GS_IDS' != base '$BASE' (the fused kernel must decline on the INT4 fixture, bit-exact)"
+    gs_decline_ok "$GS_ERR" "$GS_IDS" \
+      || fail "TP=$tp INTFER_MLP_GATEUP_SILUMUL_FUSE=1: either the stream diverged or the fused kernel ran on an INT4 model ([mlp-gateup-silumul-fuse] present) -- the scheme guard did not decline"
+  fi
+  rm -f "$GS_OUT" "$GS_ERR"
+  # Self-checks run once, at tp=1 (the predicate's polarity is
+  # tp-independent; only the stream it matches is tp-dependent, and
+  # tp=1's BASE is in scope here).
+  if [ "$tp" = "1" ]; then
+    GSSB="$(mktemp -d)"
+    env INTFER_MLP_GATEUP_SILUMUL_FUSE=1 "$BIN" --gpu --tp 1 -m "$MODEL" \
+      -p "$PROMPT" -n "${N:-4}" --no-stream --ids $TOK >"$GSSB/good.out" 2>"$GSSB/good.err" || true
+    cp "$GSSB/good.err" "$GSSB/not.err"
+    printf '[mlp-gateup-silumul-fuse] ACTIVE (INTFER_MLP_GATEUP_SILUMUL_FUSE=1) on a fixture whose MLPs are INT4 -- the scheme guard must have refused this\n' >> "$GSSB/not.err"
+    : >"$GSSB/empty.err"
+    if [ "$(gs_stream_of "$GSSB/good.err")" != "$BASE" ]; then
+      echo "TP=$tp MLP_GATEUP_SILUMUL_FUSE self-check SKIPPED: the tp=1 fixture produced no "
+      echo "      stream (the engine did not run on this box), so the "
+      echo "      refusal/vacuity directions are unexercised here" >&2
+    else
+      # (b) refusal: a log with the announcement present (the fused
+      # kernel wrongly ran on an INT4 model) must be refused.
+      if gs_decline_ok "$GSSB/not.err" "$BASE"; then
+        fail "TP=$tp MLP_GATEUP_SILUMUL_FUSE self-check (b): log with the [mlp-gateup-silumul-fuse] announcement ACCEPTED -- the arm does not observe the INT4 decline"
+      fi
+      # (c) vacuity: an empty log must fail the predicate.
+      if gs_decline_ok "$GSSB/empty.err" "$BASE"; then
+        fail "TP=$tp MLP_GATEUP_SILUMUL_FUSE self-check (c): arm ACCEPTED an empty log (vacuity)"
+      fi
+    fi
+    rm -rf "$GSSB"
+  fi
 
 
 done

@@ -287,11 +287,11 @@ else
   GREEDY_OUT="$(curl -s -m 120 -X POST "http://127.0.0.1:$SERVE_PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":8,"temperature":0}')"
-  echo "$GREEDY_OUT" | grep -q '"finish_reason"' || fail "greedy serve request failed: $GREEDY_OUT"
+  grep -q '"finish_reason"' <<<"$GREEDY_OUT" || fail "greedy serve request failed: $GREEDY_OUT"
   SAMPLING_OUT="$(curl -s -m 120 -X POST "http://127.0.0.1:$SERVE_PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":8,"temperature":0.7}')"
-  echo "$SAMPLING_OUT" | grep -q '"finish_reason"' || fail "post-greedy sampling request failed (fence erosion?): $SAMPLING_OUT"
+  grep -q '"finish_reason"' <<<"$SAMPLING_OUT" || fail "post-greedy sampling request failed (fence erosion?): $SAMPLING_OUT"
   MIXED_OK=1
   CURLPIDS=""
   for _ in 1 2 3; do
@@ -300,10 +300,15 @@ else
       -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":8,"temperature":0}' >/dev/null 2>&1 &
     CURLPIDS="$CURLPIDS $!"
   done
-  curl -s -m 120 -X POST "http://127.0.0.1:$SERVE_PORT/v1/chat/completions" \
+  # *** CAPTURED, NOT PIPED. *** The original piped curl straight into
+  # `grep -q`, the true SIGPIPE direction: grep -q exits at the match while
+  # curl is still streaming, curl gets SIGPIPE (exit 141) and pipefail fires
+  # the MIXED_OK=0 branch on a successful match. Capture to a variable and
+  # grep the variable via a here-string instead.
+  MIXED_OUT="$(curl -s -m 120 -X POST "http://127.0.0.1:$SERVE_PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
-    -d '{"messages":[{"role":"user","content":"Write a short poem about the sea"}],"max_tokens":8,"temperature":0.7}' \
-    | grep -q '"finish_reason"' || MIXED_OK=0
+    -d '{"messages":[{"role":"user","content":"Write a short poem about the sea"}],"max_tokens":8,"temperature":0.7}')" \
+    && grep -q '"finish_reason"' <<<"$MIXED_OUT" || MIXED_OK=0
   # shellcheck disable=SC2086
   wait $CURLPIDS # PID-scoped: bare `wait` would also catch the detached
                  # server child and hang until it exits (gate stuck 11h).

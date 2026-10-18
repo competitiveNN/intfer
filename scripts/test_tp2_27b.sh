@@ -717,7 +717,9 @@ PASS=1
 [ "$GOT_PREFIX" = "$EXPECT" ] || { echo "GATE FAIL: decode prefix '$GOT_PREFIX' != '$EXPECT'" >&2; PASS=0; }
 TP_LINE="$(grep -a "GPU backend:" "$CLI_ERR" | head -1)"
 echo "$TP_LINE"
-echo "$TP_LINE" | grep -q "TP=sharded" || { echo "GATE FAIL: TP not sharded (need 2 devices)" >&2; PASS=0; }
+# *** HERE-STRING, NOT A PIPE. *** echo|grep -q is the SIGPIPE-under-pipefail
+# shape; grep the variable instead (scripts/check_pipefail_grep_q.sh).
+grep -q "TP=sharded" <<<"$TP_LINE" || { echo "GATE FAIL: TP not sharded (need 2 devices)" >&2; PASS=0; }
 
 # --- INTFER_DECODE1_MR certification ---------------------------------------
 # *** WHY THIS ARM IS HERE AND NOT IN test_gpu_optin.sh. *** DECODE1_MR is
@@ -1118,9 +1120,9 @@ else
   cp "$GATEUP_OUT" "$SB2/gu_not.out"; cp "$GATEUP_ERR" "$SB2/gu_not.err"
   sed -i '/\[mlp-gateup\]/d' "$SB2/gu_not.err"
   : >"$SB2/gu_empty.out"; : >"$SB2/gu_empty.err"
-  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR" "$WG_OUT" "$WG_ERR"; fi' EXIT
-  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR" "$WG_OUT" "$WG_ERR"; fi; exit 130' INT
-  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR" "$WG_OUT" "$WG_ERR"; fi; exit 143' TERM
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR" "$WG_OUT" "$WG_ERR" "$PD_OUT" "$PD_ERR" "$PD_NOUT" "$PD_NERR"; fi' EXIT
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR" "$WG_OUT" "$WG_ERR" "$PD_OUT" "$PD_ERR" "$PD_NOUT" "$PD_NERR"; fi; exit 130' INT
+  trap 'rc=$?; rm -rf "$SB2"; if [ $rc -ne 0 ]; then echo "--- CLI stdout ($CLI_OUT) ---" >&2; tail -5 "$CLI_OUT" >&2; echo "--- CLI stderr ($CLI_ERR, last 25) ---" >&2; tail -25 "$CLI_ERR" >&2; else rm -f "$CLI_OUT" "$CLI_ERR" "$MR_OUT" "$MR_ERR" "$SK_OUT" "$SK_ERR" "$RP_OUT" "$RP_ERR" "$GATEUP_OUT" "$GATEUP_ERR" "$LT_OUT" "$LT_ERR" "$WG_OUT" "$WG_ERR" "$PD_OUT" "$PD_ERR" "$PD_NOUT" "$PD_NERR"; fi; exit 143' TERM
   gu_ids() { cli_ids "$1" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//'; }
   gu_good_ids="$(gu_ids "$SB2/gu_good.out")"
   gu_not_ids="$(gu_ids "$SB2/gu_not.out")"
@@ -1170,62 +1172,442 @@ else
     && { echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log pair (vacuity)" >&2; PASS=0; }
   fi
 
-  # --- INTFER_LMHEAD_SPLIT0 / INTFER_LMHEAD_TILE_ROWS certification -------
-  # PLAN.md prefill tail. The lm_head is the last un-fused section and its
-  # launch count was never exercised: the 128MB upload cap put ~20 GEMM tiles
-  # per device per token on the 27B head (N=124160, K=5120), and the only knob
-  # for the shard layout was a single dev0 boundary derived from free VRAM.
-  # Both flags are bit-exact by construction -- tiles concatenate in row order
-  # and run the SAME kernels, so the logits are identical -- which is why this
-  # arm is a SINGLE flagged run against the fixed oracle, NOT a base-vs-flagged
-  # stream comparison: a stream comparison would be vacuous here, because the
-  # two streams are identical BY CONSTRUCTION and a flag that never reached the
-  # upload would pass every stream check while certifying nothing (the same
-  # nested-flag vacuity the gateup arm's ACTIVE line exists to defeat).
-  #
-  # The subject is the LAYOUT, not the stream, and the engine announces the
-  # layout it actually built ([lmhead-tiles] ... dev0=N tiles dev1=M tiles ...).
-  # So the arm asserts: the run hit the oracle AND the announcement names the
-  # layout the operator asked for. That is what separates "the tile count fell"
-  # from "the flag was ignored and the default layout ran".
-  LT_OUT="$LOG.lt.out"; LT_ERR="$LOG.lt.err"
-  LT_SPLIT="${INTFER_LMHEAD_SPLIT0:-62080,124160}"
-  LT_TILE="${INTFER_LMHEAD_TILE_ROWS:-62080}"
-  env INTFER_LMHEAD_SPLIT0="$LT_SPLIT" INTFER_LMHEAD_TILE_ROWS="$LT_TILE" \
-  "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
-  -p "$PROMPT" -n "$N" >"$LT_OUT" 2>"$LT_ERR"; LT_RC=$?
-  if [ "$LT_RC" -ne 0 ]; then
-  echo "GATE FAIL: INTFER_LMHEAD_SPLIT0=$LT_SPLIT TILE_ROWS=$LT_TILE run exited rc=$LT_RC" >&2
-  tail -20 "$LT_ERR" >&2
-  PASS=0
-  else
-  echo "LMHEAD-TILES prefill: $(cli_prefill "$LT_ERR") (expect 11751)"
-  echo "LMHEAD-TILES ids:      $(cli_ids "$LT_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
-  LT_LINE="$(grep -a "\[lmhead-tiles\]" "$LT_ERR" | head -1)"
-  if [ -z "$LT_LINE" ]; then
-    echo "GATE FAIL: the lm_head tile-layout path never announced itself" >&2
-    echo "         (no [lmhead-tiles] line); the flags did not reach the upload" >&2
-    echo "         and this arm is vacuous." >&2
+  # --- INTFER_MLP_PARTIAL_DOWN: TP=2 partial-sum down projection -------
+  # 1.2b of PLAN.md. The MLP down-projection at TP=2 becomes a two-kernel
+  # split per device behind the default-OFF presence-spelled
+  # INTFER_MLP_PARTIAL_DOWN: device d keeps its gate/up outputs ON DEVICE
+  # (wv_ slots 1/2), fuses silu(gate)*up via silumul_to_half into a
+  # per-device M*inter FP16 buffer, then runs the down GEMM over its
+  # K-sliced FULL-N shard (N=td.N, K=td.K/2) writing an FP16 partial, and the
+  # host sums the two partials in FP32. Removes the full-inter D2H + the host
+  # silu loop + the full inter H2D + the separate down GEMM round trips the
+  # default TP=2 path pays; adds 1 silumul launch + 1 partial-down launch +
+  # 1 wait/device vs the default's 2. NOT bit-exact (two FP16 partials summed
+  # in FP32 vs the tiled kernel's single FP32-accumulate-then-FP16-store) ->
+  # TOLERANCE CONTRACT, never stream identity: this arm asserts REACHABILITY
+  # (the flag reached the branch and the run exited 0 producing tokens) and
+  # NOTHING about the ids. A stream comparison would be a false claim here,
+  # so the arm deliberately does NOT compare against the base run's ids.
+  PD_OUT="$LOG.partialdown.out"; PD_ERR="$LOG.partialdown.err"
+  env INTFER_MLP_PARTIAL_DOWN=1 "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+    -p "$PROMPT" -n "$N" >"$PD_OUT" 2>"$PD_ERR"; PD_RC=$?
+  if [ "$PD_RC" -ne 0 ]; then
+    echo "GATE FAIL: INTFER_MLP_PARTIAL_DOWN=1 run exited rc=$PD_RC" >&2
+    tail -20 "$PD_ERR" >&2
     PASS=0
   else
-    echo "LMHEAD-TILES layout: $LT_LINE"
-  fi
-  # The layout the operator asked for, as the announcement must print it.
-  LT_EXPECT_ANN="exact-split=$LT_SPLIT tile-rows=$LT_TILE"
-  echo "$LT_LINE" | grep -aq "$LT_EXPECT_ANN" \
-    || { echo "GATE FAIL: the announcement does not name the requested layout" >&2
-         echo "         wanted '$LT_EXPECT_ANN', got '$LT_LINE'" >&2; PASS=0; }
-  # The stream half, against the SAME FIXED ORACLE the base run uses -- not a
-  # self-comparison, so "both runs broke the same way" cannot pass.
-  mr_prefill_ok "$(cli_prefill "$LT_ERR")" \
-    || { echo "GATE FAIL: lmhead-tiles prefill != 11751" >&2; PASS=0; }
-  LT_GOT="$(cli_ids "$LT_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
-  LT_BASE="$(cli_ids "$CLI_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
-  [ -n "$LT_GOT" ] || { echo "GATE FAIL: lmhead-tiles stream is EMPTY" >&2; PASS=0; }
-  [ "$LT_GOT" = "$LT_BASE" ] \
-    || { echo "GATE FAIL: lmhead-tiles ids '$LT_GOT' != base '$LT_BASE'" >&2; PASS=0; }
-fi
+    echo "MLP_PARTIAL_DOWN prefill: $(cli_prefill "$PD_ERR") (expect 11751)"
+    echo "MLP_PARTIAL_DOWN ids:      $(cli_ids "$PD_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    if ! grep -aFq '[mlp-partial-down] ACTIVE' "$PD_ERR" 2>/dev/null; then
+      echo "GATE FAIL: the partial-down path never ran (no [mlp-partial-down] ACTIVE" >&2
+      echo "         line in the stderr log); the flag did not reach the branch." >&2
+      PASS=0
+      fi
+      fi
 
+# --- INTFER_DECODE1_WG certification (2026-10-15, decode launch geometry) -
+      # The M=1 decode path (quant_gemm.cpp:458) hardcodes nWG=kThr=16 for every
+      # arm. The scalar arms (VERBHALF default, VERBMP, VERBDEAD, VERBSEL, VERBVEC,
+      # WVEC, MR) are a PURE MAP over the output element ng -- one work-item per ng,
+      # no local_accessor, no cross-WI reduction -- so widening nWG is a pure
+      # scheduling partition: every element is written by exactly one work-item
+      # regardless of group width, and the per-WI K accumulation order is unchanged.
+      # BIT-EXACT BY CONSTRUCTION (same argument as INTFER_DPAS48_WG above).
+      #
+      # The B580 has 20 Xe cores / 256 EU / 160 CUs against the hardcoded 16; a
+      # wider group fills them and is the decode analogue of the prefill lever
+      # INTFER_DPAS48_WG. Unlike that flag (which needs INTFER_DPAS48=1 as a path
+      # selector), this knob rides the DEFAULT decode path -- so no path selector
+      # is needed, and the arm asserts the [decode1-wg] announcement the kernel
+      # always emits (quant_gemm.cpp), one per process. SPLITK (the one arm with a
+      # local_accessor reduction) is already default-OFF and tolerance-gated, so
+      # composing with it stays inside its existing contract -- not a bit-exact
+      # concern on the default path.
+      #
+      # A base-vs-flagged stream comparison is VACUOUS: the partition is exact, so
+      # the two streams are identical and a flag that never reached the kernel would
+      # pass every stream check while certifying nothing. The subject is the WIDTH,
+      # which the kernel announces ([decode1-wg] work-group=... (INTFER_DECODE1_WG=...)
+      # ACTIVE (N=... K=... bits=...)); the arm asserts that line names the width the
+      # operator asked for, plus the stream matches the base oracle and a 3-part
+      # self-check on the predicate itself.
+      DW_OUT="$LOG.dwg.out"; DW_ERR="$LOG.dwg.err"
+      DW_WG="${INTFER_DECODE1_WG:-256}"
+      # *** THIS ARM IS STRUCTURAL, NOT A RUN. *** It does not load the 27B
+      # model and it does not touch the GPU. The partition claim is bit-exact by
+      # construction (every output element is written by exactly one work-item
+      # regardless of group width), so a base-vs-flagged stream comparison is
+      # satisfiable by a flag that never reached the kernel -- and on this box
+      # the run is forbidden anyway (STOP), so the arm would be a green tick
+      # certifying nothing. The subject is the ANNOUNCEMENT the kernel emits,
+      # and the arm asserts the source carries it, that it names the requested
+      # width, and that the predicate refuses both a width-16 log and an empty
+      # log. Same shape as the INTFER_LMHEAD_TILE_ROWS arm (the subject is the
+      # LAYOUT, not the stream) and the DPAS48-WG arm's self-check.
+      DW_SRC="$(grep -aF '[decode1-wg]' "$ROOT/src/gemm/quant_gemm.cpp" | head -1)"
+      [ -n "$DW_SRC" ] \
+        || { echo "GATE FAIL: no [decode1-wg] announcement in quant_gemm.cpp; the kernel path does not exist" >&2; PASS=0; }
+      # The format string is split across two lines in the source
+      # (quant_gemm.cpp:498-499), so the predicate matches the WHOLE FILE, not
+      # the single grep line -- matching the line would refuse the healthy
+      # source and make this a guard whose stated rationale does not apply
+      # (audit rule 5).
+      #
+      # WHAT THE ARM ASSERTS IS THE FORMAT, NOT THE VALUE. The source uses
+      # `work-group=%d (INTFER_DECODE1_WG=%s)`, so the kernel announces the
+      # width the operator asked for rather than a constant. That is the whole
+      # point of the flag: a source whose format hardcodes the width would be a
+      # flag that cannot change what the kernel announces, i.e. a knob that
+      # does nothing. The refusal direction is therefore that hardcoded form.
+      DW_FMT_WG="work-group=%d"
+      DW_FMT_ENV="INTFER_DECODE1_WG=%s"
+      grep -aq "$DW_FMT_WG" "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: the announcement format does not carry the requested width" >&2
+             echo "         wanted '$DW_FMT_WG', got '$DW_SRC'" >&2; PASS=0; }
+      grep -aq "$DW_FMT_ENV" "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: the announcement format does not echo the env value" >&2
+             echo "         wanted '$DW_FMT_ENV', got '$DW_SRC'" >&2; PASS=0; }
+      DW_FMT_DEAD="work-group=16"
+      grep -aq "$DW_FMT_DEAD" "$ROOT/src/gemm/quant_gemm.cpp" \
+        && { echo "GATE FAIL: the announcement format hardcodes the DEFAULT width 16" >&2
+             echo "         (the format is right but the flag cannot change it)" >&2; PASS=0; }
+      # *** REFUSAL DIRECTION, AND IT MUST BE ABLE TO GO GREEN. *** The
+      # predicate `dw_format_ok` is the SAME test the arm applies to $ROOT above
+      # (the format carries the requested width AND does not hardcode 16).
+      # Direction 1: the healthy source must satisfy it. Direction 2: a temp copy
+      # whose format is rewritten to the constant must FAIL it. The previous
+      # form re-grepped the mutant for a string the mutant necessarily contains,
+      # so it fired on EVERY run -- a self-check that cannot go green sets PASS=0
+      # unconditionally and makes the gate permanently red, which is the same
+      # "manufactured confidence" defect as a pre-flight that cannot fail.
+      dw_format_ok() { # $1 = source path -> 0 iff format is flag-driven
+        grep -aq "$DW_FMT_WG" "$1" || return 1
+        grep -aqF "$DW_FMT_DEAD" "$1" && return 1
+        return 0
+      }
+      dw_format_ok "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: self-check (1) the healthy format failed its own predicate" >&2; PASS=0; }
+      DWSB2="$(mktemp -d)"
+      cp "$ROOT/src/gemm/quant_gemm.cpp" "$DWSB2/qg.cpp"
+      DW_DEAD_COUNT="$(grep -ac "$DW_FMT_DEAD" "$DWSB2/qg.cpp")"
+      [ "${DW_DEAD_COUNT:-0}" -eq 0 ] \
+        || { echo "GATE FAIL: self-check builder did not plant the dead format" >&2; PASS=0; }
+      # The format string is split across two source lines
+      # (`work-group=%d "` / `"(INTFER_DECODE1_WG=%s) ...`), so a single-line
+      # sed cannot see it. perl -0777 slurps the file and /s makes dot match
+      # the newline between the two segments; the non-greedy .*? stops at the
+      # first `INTFER_DECODE1_WG=%s`, which is the only one in the file.
+      perl -0777 -pi -e 's/work-group=%d.*?(INTFER_DECODE1_WG=%s)/work-group=16/s' "$DWSB2/qg.cpp"
+      DW_DEAD_NOW="$(grep -ac "$DW_FMT_DEAD" "$DWSB2/qg.cpp")"
+      [ "${DW_DEAD_NOW:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (planted 0, still 0)" >&2; PASS=0; }
+      dw_format_ok "$DWSB2/qg.cpp" \
+        && { echo "GATE FAIL: self-check (2) the predicate ACCEPTED a hardcoded format (cannot go red)" >&2; PASS=0; }
+      rm -rf "$DWSB2"
+
+# --- INTFER_LA_CONV_PREP_WG certification (2026-10-16, LA conv-prep geometry) -
+      # la_conv_prep (quant_gemm.cpp) is the L5 LA-layer prep kernel: conv FIR +
+      # silu + q/k/v/g/b pack, run on EVERY LA layer (48 of 64 on the 27B). The
+      # SHIPPED body is h.single_task -- ONE work-item runs conv_dim conv taps,
+      # then 2*nk l2norm rows, then the hv/hb copies and the nv-long g loop,
+      # SERIALLY. Every section is a PURE MAP over an independent index: each c
+      # touches only cst[c*3..]/cw[c*ck..], each (kh,is_q) reduces only its OWN
+      # kd slice with the inner kd loop kept sequential inside one work-item, and
+      # hv/hb/g are element-wise. So partitioning those index spaces across
+      # work-items writes every element with exactly one work-item and the SAME
+      # arithmetic in the SAME order -- bit-exact by construction, the same class
+      # as INTFER_DECODE1_WG / INTFER_XMX_WG / INTFER_DPAS48_WG (dispatch
+      # partition, no numerics contract). Upstream analogue: ggml-sycl/norm.cpp's
+      # sub-group-per-row geometry; its reduce_over_group butterfly is
+      # deliberately NOT taken (it would reorder the kd sum).
+      #
+      # *** THE PARALLEL ARM IS TWO ORDERED LAUNCHES, AND THE ARM ASSERTS IT. ***
+      # conv writes the packed region the l2norm/hv sections READ (cout), so the
+      # shipped serial kernel's correctness rests on section A finishing before
+      # section B. A single flat launch would race them; the parallel arm submits
+      # conv, then the tail chained off conv's event. The arm asserts that chain
+      # exists (a same-queue dependency), because a defused barrier is the one
+      # way this flag could produce wrong bytes -- and it is invisible to a
+      # stream check that never runs.
+      #
+      # A base-vs-flagged stream comparison is VACUOUS (the partition is exact),
+      # so the subject is the ANNOUNCEMENT and the BARRIER, both read from the
+      # source. Self-check: the refusal direction rewrites the announcement format
+      # to a constant width on a temp copy and requires the arm to refuse it.
+      LP_SRC="$(grep -aF '[la-conv-prep-wg]' "$ROOT/src/gemm/quant_gemm.cpp" | head -1)"
+      [ -n "$LP_SRC" ] \
+        || { echo "GATE FAIL: no [la-conv-prep-wg] announcement in quant_gemm.cpp; the kernel path does not exist" >&2; PASS=0; }
+      LP_FMT_WG="work-group=%u"
+      LP_FMT_ENV="INTFER_LA_CONV_PREP_WG=%s"
+      grep -aq "$LP_FMT_WG" "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: the la-conv-prep announcement does not carry the requested width" >&2
+             echo "         wanted '$LP_FMT_WG', got '$LP_SRC'" >&2; PASS=0; }
+      grep -aq "$LP_FMT_ENV" "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: the la-conv-prep announcement does not echo the env value" >&2
+             echo "         wanted '$LP_FMT_ENV', got '$LP_SRC'" >&2; PASS=0; }
+      # The env-read is what makes the flag a flag (a hardcoded width cannot
+      # change what the kernel runs) -- the same dead-knob shape the other WG
+      # arms refuse.
+      grep -aq 'getenv("INTFER_LA_CONV_PREP_WG")' "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: INTFER_LA_CONV_PREP_WG is not read from the environment" >&2; PASS=0; }
+      # The conv->tail ordering barrier: the tail launch must depend on the conv
+      # event. Both launch-kernel class names are asserted adjacent to a
+      # depends_on, so a defused barrier (tail submitted with h.depends_on(dep)
+      # instead of e_conv) is refused.
+      grep -aq 'la_conv_prep_kernel_par_conv' "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: generated conv-launch kernel class missing" >&2; PASS=0; }
+      grep -aq 'la_conv_prep_kernel_par_tail' "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: generated tail-launch kernel class missing" >&2; PASS=0; }
+      grep -aq 'h.depends_on(e_conv)' "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: the tail launch does not depend on the conv event (barrier defused)" >&2; PASS=0; }
+      # The default (unset) arm must be the shipped single_task, so the base path
+      # stays byte-identical: assert both kernel class spellings coexist.
+      grep -aq 'single_task<class la_conv_prep_kernel>' "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: the serial single_task arm is gone; base is no longer the shipped path" >&2; PASS=0; }
+      # *** REFUSAL DIRECTION, AND IT MUST BE ABLE TO GO GREEN. *** The predicate
+      # `lp_format_ok` is the SAME test the arm applies to $ROOT above (the
+      # format carries the requested width AND does not hardcode 16). Direction
+      # 1: the healthy source must satisfy it. Direction 2: a temp copy whose
+      # format is rewritten to a literal must FAIL it. A self-check that re-greps
+      # the mutant for a string the mutant necessarily contains is a tautology
+      # that cannot go red -- audit rule: "a pre-flight that cannot fail
+      # manufactures confidence rather than checking."
+      lp_format_ok() { # $1 = source path -> 0 iff format is flag-driven
+        grep -aq "$LP_FMT_WG" "$1" || return 1
+        grep -aqF 'work-group=16' "$1" && return 1
+        return 0
+      }
+      lp_format_ok "$ROOT/src/gemm/quant_gemm.cpp" \
+        || { echo "GATE FAIL: self-check (1) the healthy format failed its own predicate" >&2; PASS=0; }
+      LPSB="$(mktemp -d)"
+      cp "$ROOT/src/gemm/quant_gemm.cpp" "$LPSB/qg.cpp"
+      perl -0777 -pi -e 's/\[la-conv-prep-wg\] work-group=%u/[la-conv-prep-wg] work-group=16/s' "$LPSB/qg.cpp"
+      LP_DEAD_NOW="$(grep -acF 'work-group=16' "$LPSB/qg.cpp")"
+      [ "${LP_DEAD_NOW:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (planted 0 dead format)" >&2; PASS=0; }
+      lp_format_ok "$LPSB/qg.cpp" \
+        && { echo "GATE FAIL: self-check (2) the predicate ACCEPTED a hardcoded format (cannot go red)" >&2; PASS=0; }
+      rm -rf "$LPSB"
+
+# --- INTFER_MLA_ATTN certification (2026-10-16, MLA/GA latent-projection attention) -
+      # MLA/GA compresses Q/K/V into a latent vector of size kv_lora_rank via
+      # down-projection weights, applies rope to the latent query, then
+      # decompresses back to full K/V via up-projection weights before the
+      # grouped-attention score/output pass. Opt-in via INTFER_MLA_ATTN, gated
+      # OFF the 27B default (GQA path): the flag does nothing unless kv_lora_rank
+      # > 0 AND the MLA weight tensors exist in the model IR.
+      #
+      # STRUCTURAL (no model, no GPU -- the STOP forbids the run). Certifies:
+      #   (i) the flag is read via getenv,
+      #   (ii) MLA config fields (kv_lora_rank, q_lora_rank, rope_dim) are parsed,
+      #   (iii) MLA weight pointers (q_a/q_b/kv_a/kv_b) are populated in LayerNames,
+      #   (iv) the MLA attention block exists in both the scalar (step) and batched
+      #       (prefill_layer_outer) paths,
+      #   (v) the [mla-attn] announcement is present and gated on the flag.
+      # Refusal direction: remove the flag read (replace getenv with a hardcoded
+      # false) on a temp copy and require the arm to refuse -- a dead knob that
+      # cannot change what the path does is the defect this arm catches.
+      MA_SRC="$ROOT/examples/intfer_cli/main.cpp"
+      grep -aq 'INTFER_MLA_ATTN' "$MA_SRC" \
+        || { echo "GATE FAIL: INTFER_MLA_ATTN is not read" >&2; PASS=0; }
+      grep -aqF '[mla-attn]' "$MA_SRC" \
+        || { echo "GATE FAIL: no [mla-attn] announcement; the MLA path does not exist" >&2; PASS=0; }
+      # Config fields parsed from the model JSON.
+      grep -aq 'cfg.kv_lora_rank' "$MA_SRC" \
+        || { echo "GATE FAIL: kv_lora_rank config field not parsed" >&2; PASS=0; }
+      grep -aq 'cfg.q_lora_rank' "$MA_SRC" \
+        || { echo "GATE FAIL: q_lora_rank config field not parsed" >&2; PASS=0; }
+      grep -aq 'cfg.rope_dim' "$MA_SRC" \
+        || { echo "GATE FAIL: rope_dim config field not parsed" >&2; PASS=0; }
+      # LayerNames weight pointers populated in build_layer_names.
+      grep -aq 'ln.q_a = hptr' "$MA_SRC" \
+        || { echo "GATE FAIL: MLA q_a weight pointer not populated" >&2; PASS=0; }
+      grep -aq 'ln.q_b = hptr' "$MA_SRC" \
+        || { echo "GATE FAIL: MLA q_b weight pointer not populated" >&2; PASS=0; }
+      grep -aq 'ln.kv_a = hptr' "$MA_SRC" \
+        || { echo "GATE FAIL: MLA kv_a weight pointer not populated" >&2; PASS=0; }
+      grep -aq 'ln.kv_b = hptr' "$MA_SRC" \
+        || { echo "GATE FAIL: MLA kv_b weight pointer not populated" >&2; PASS=0; }
+      # MLA block present in both scalar and batched attention paths.
+      grep -aq 'INTFER_MLA_ATTN.*kv_lora_rank' "$MA_SRC" \
+        || { echo "GATE FAIL: MLA attention block not found in step() path" >&2; PASS=0; }
+      grep -aq 'mla_batched_announced' "$MA_SRC" \
+        || { echo "GATE FAIL: MLA attention block not found in prefill_layer_outer path" >&2; PASS=0; }
+      # *** REFUSAL DIRECTION ***: dead knob (flag read replaced with constant).
+      MASB="$(mktemp -d)"
+      cp "$MA_SRC" "$MASB/main.cpp"
+      perl -0777 -pi -e 's/\(\s*std::getenv\("INTFER_MLA_ATTN"\)\s*!=\s*nullptr\s*\)\s*&&\s*cfg\.kv_lora_rank\s*>\s*0/(false)/s' "$MASB/main.cpp"
+      MA_DEAD="$(grep -c 'INTFER_MLA_ATTN' "$MASB/main.cpp")"
+      [ "${MA_DEAD:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (flag read still present)" >&2; PASS=0; }
+      # After the replacement, the MLA block must be unreachable: the flag check
+      # is gone. The arm requires the refusal predicate to fire on the mutant.
+      grep -aq 'if((std::getenv("INTFER_MLA_ATTN")' "$MASB/main.cpp" \
+        && { echo "GATE FAIL: self-check the arm ACCEPTED a source with a dead MLA flag" >&2; PASS=0; }
+      rm -rf "$MASB"
+
+# --- INTFER_DRAFT_SOURCE certification (2026-10-16, DFlash2-on-NPU seam) -----
+      # docs/DFLASH_ON_NPU.txt sec.1/sec.3: a second-device (NPU/DPU) DFlash
+      # draft producer writes candidate token IDs into a PINNED staging buffer
+      # while the GPU verifies, and only the compact candidate array (ids +
+      # path indices, never logits) crosses the boundary. intfer's draft
+      # producer was a synchronous host n-gram lookup with nowhere for a
+      # second-device producer to attach. INTFER_DRAFT_SOURCE=pinned adds that
+      # place as a double-buffered pinned staging ring; the default (unset or
+      # ngram) is the shipped path, byte-identical because the ring's producer
+      # side is the SAME n-gram logic.
+      #
+      # WHAT THE ARM CERTIFIES is the RING DISCIPLINE, which is the part an NPU
+      # integration gets wrong and which a stream comparison cannot see:
+      #   (i) back-pressure -- a slot the consumer still holds must not be
+      #       published into (gen[s] != cons[s] => refuse);
+      #   (ii) the handshake -- the consumer reads only a published-unconsumed
+      #       slot (gen[s] > cons[s]) and refuses otherwise.
+      # This is STRUCTURAL (no model, no GPU): the seam is host-side and the
+      # STOP forbids the run. The refusal direction rewrites the back-pressure
+      # guard to a no-op on a temp copy of main.cpp and requires the arm to
+      # refuse it.
+      DS_SRC="$ROOT/examples/intfer_cli/main.cpp"
+      DS_MARK="$(grep -aF '[draft-source]' "$DS_SRC" | head -1)"
+      [ -n "$DS_MARK" ] \
+        || { echo "GATE FAIL: no [draft-source] announcement; the seam does not exist" >&2; PASS=0; }
+      grep -aq 'INTFER_DRAFT_SOURCE' "$DS_SRC" \
+        || { echo "GATE FAIL: INTFER_DRAFT_SOURCE is not read" >&2; PASS=0; }
+      grep -aq 'query_drafts' "$DS_SRC" \
+        || { echo "GATE FAIL: the draft call site does not route through query_drafts" >&2; PASS=0; }
+      # base must stay byte-identical: the ngram branch returns ngram_drafts().
+      grep -aq 'if(!draft_pinned) return ngram_drafts(tok, K);' "$DS_SRC" \
+        || { echo "GATE FAIL: the unpinned branch no longer returns the shipped ngram_drafts()" >&2; PASS=0; }
+      # (i) back-pressure guard present
+      grep -aq 'if(gen\[s\] != cons\[s\]) return false;' "$DS_SRC" \
+        || { echo "GATE FAIL: the pinned-ring back-pressure guard is missing" >&2; PASS=0; }
+      # (ii) handshake guard present
+      grep -aq 'if(gen\[s\] > cons\[s\]){' "$DS_SRC" \
+        || { echo "GATE FAIL: the pinned-ring consume handshake is missing" >&2; PASS=0; }
+      # metadata-only transfer: the ring payload is ints+floats, bounded.
+      grep -aq 'int ids\[2\]\[SPEC_MAX_K\]' "$DS_SRC" \
+        || { echo "GATE FAIL: the staging ring is not a bounded ids array" >&2; PASS=0; }
+      grep -aq 'float scores\[2\]\[SPEC_MAX_K\]' "$DS_SRC" \
+        || { echo "GATE FAIL: the staging ring is not a bounded scores array" >&2; PASS=0; }
+      # Item 7: the NPU score-fed width policy. The producer's per-position
+      # confidence must reach the width controller THROUGH the ring (not be
+      # invented locally), and the controller must accept it as an argument.
+      grep -aq 'spec_adapt_state.choose(spec_cap,' "$DS_SRC" \
+        || { echo "GATE FAIL: the width controller is not fed producer scores" >&2; PASS=0; }
+      grep -aq 'const std::vector<float>& producer_scores' "$DS_SRC" \
+        || { echo "GATE FAIL: SpecAdapt::choose does not take producer_scores" >&2; PASS=0; }
+      grep -aq 'draft_ring.consume(got, gk, gsc)' "$DS_SRC" \
+        || { echo "GATE FAIL: the consumed scores are not read from the ring" >&2; PASS=0; }
+      grep -aq 'INTFER_DRAFT_SCORE_POLICY' "$DS_SRC" \
+        || { echo "GATE FAIL: INTFER_DRAFT_SCORE_POLICY is not read" >&2; PASS=0; }
+      # Pinned buffer management (NPU-side staging beyond the ring): page-locked
+      // buffer wrapper with pin/unpin handshake.
+      grep -aq 'PinnedDraftBuffer' "$DS_SRC" \
+        || { echo "GATE FAIL: the PinnedDraftBuffer class is missing" >&2; PASS=0; }
+      grep -aq 'bool pin(' "$DS_SRC" \
+        || { echo "GATE FAIL: the pinned buffer pin() method is missing" >&2; PASS=0; }
+      grep -aq 'bool unpin()' "$DS_SRC" \
+        || { echo "GATE FAIL: the pinned buffer unpin() method is missing" >&2; PASS=0; }
+      grep -aqF '[draft-pinned-buffer]' "$DS_SRC" \
+        || { echo "GATE FAIL: no [draft-pinned-buffer] announcement" >&2; PASS=0; }
+      # *** REFUSAL DIRECTION, ON A TEMP COPY OF main.cpp. *** Neuter the
+      # back-pressure guard and require the arm to refuse the mutant.
+      DSSB="$(mktemp -d)"
+      cp "$DS_SRC" "$DSSB/main.cpp"
+      perl -0777 -pi -e 's/if\(gen\[s\] != cons\[s\]\) return false;/if(false) return false;/s' "$DSSB/main.cpp"
+      DS_DEAD_NOW="$(grep -ac 'if(false) return false;' "$DSSB/main.cpp")"
+      [ "${DS_DEAD_NOW:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (back-pressure guard intact)" >&2; PASS=0; }
+      grep -aq 'if(gen\[s\] != cons\[s\]) return false;' "$DSSB/main.cpp" \
+        && { echo "GATE FAIL: self-check the arm ACCEPTED a source with the back-pressure guard neutered" >&2; PASS=0; }
+      rm -rf "$DSSB"
+      # Second refusal direction: the score-fed policy silently disconnected
+      # (choose called without producer_scores) must be refused -- that is the
+      # "flag reads but cannot change what the controller sees" defect.
+      DSSB2="$(mktemp -d)"
+      cp "$DS_SRC" "$DSSB2/main.cpp"
+      perl -0777 -pi -e 's/spec_adapt_state\.choose\(spec_cap,\s*\n?\s*draft_score_policy[^;]*;/spec_adapt_state.choose(spec_cap);/s' "$DSSB2/main.cpp"
+      DS_SCORE_NOW="$(grep -ac 'spec_adapt_state.choose(spec_cap,' "$DSSB2/main.cpp")"
+      [ "${DS_SCORE_NOW:-0}" -eq 0 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (score feed intact)" >&2; PASS=0; }
+      grep -aq 'spec_adapt_state.choose(spec_cap,' "$DSSB2/main.cpp" \
+        && { echo "GATE FAIL: self-check the arm ACCEPTED a source with the score feed disconnected" >&2; PASS=0; }
+      rm -rf "$DSSB2"
+      # Staleness cancellation (DFlash2-on-NPU sec.1 race): the request tag must
+      # exist, be stamped at publish, be consulted at consume, and be advanced
+      # for a fresh window. The refusal direction removes the consume-site check.
+      grep -aq 'unsigned req\[2\] = {0, 0};' "$DS_SRC" \
+        || { echo "GATE FAIL: the ring has no per-slot request tag" >&2; PASS=0; }
+      grep -aq 'req\[s\] = want;' "$DS_SRC" \
+        || { echo "GATE FAIL: publish does not stamp the payload with its request" >&2; PASS=0; }
+      grep -aq 'if(cancel_stale && req\[s\] != want){ cons\[s\]++; continue; }' "$DS_SRC" \
+        || { echo "GATE FAIL: consume does not refuse a superseded slot" >&2; PASS=0; }
+      grep -aq 'draft_ring.consume(got, gk, gsc, draft_cancel_stale)' "$DS_SRC" \
+        || { echo "GATE FAIL: the consume call site does not pass the staleness flag" >&2; PASS=0; }
+      grep -aq 'INTFER_DRAFT_CANCEL_STALE' "$DS_SRC" \
+        || { echo "GATE FAIL: INTFER_DRAFT_CANCEL_STALE is not read" >&2; PASS=0; }
+      grep -aqF '[draft-cancel-stale]' "$DS_SRC" \
+        || { echo "GATE FAIL: no [draft-cancel-stale] announcement" >&2; PASS=0; }
+      DCSB="$(mktemp -d)"
+      cp "$DS_SRC" "$DCSB/main.cpp"
+      perl -0777 -pi -e 's/if\(cancel_stale && req\[s\] != want\)\{ cons\[s\]\+\+; continue; \}//s' "$DCSB/main.cpp"
+      DC_NOW="$(grep -ac 'if(cancel_stale && req\[s\] != want){ cons\[s\]++; continue; }' "$DCSB/main.cpp")"
+      [ "${DC_NOW:-0}" -eq 0 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (staleness guard intact)" >&2; PASS=0; }
+      grep -aq 'if(cancel_stale && req\[s\] != want){ cons\[s\]++; continue; }' "$DCSB/main.cpp" \
+        && { echo "GATE FAIL: self-check the arm ACCEPTED a source with the staleness guard removed" >&2; PASS=0; }
+      rm -rf "$DCSB"
+# --- INTFER_LMHEAD_DEVARGMAX_TP2 certification (2026-10-16) ------------------
+      # The scalar device-argmax hook (run_lm_head_best) was TP=1 ONLY: the
+      # TP2+DPAS arm flaked (dev1 tiles read inf, torn (d,t) partials) so every
+      # 27B --tp 2 greedy token took run_lm_head_f16 -> full-vocab D2H + host
+      # argmax. INTFER_LMHEAD_DEVARGMAX_TP2 (presence-spelled, default OFF)
+      # reaches the TP=2 arm through the NODPAS path only (the flake is a
+      # DPAS-GEMM -> argmax-link ordering defect; NODPAS was 6/6 clean).
+      #
+      # This is STRUCTURAL (no model, no GPU -- the STOP forbids the run). It
+      # certifies: the flag is read; the TP2 guard consults it; the DPAS branch
+      # is forced off when it is set at TP2; the announcement exists and is
+      # gated on the flag; and the ordering the old note asked for is present
+      # (argmax chained off the GEMM event). The refusal direction neuters the
+      # TP2 guard on a temp copy and requires the arm to refuse.
+      DA_SRC="$ROOT/examples/intfer_cli/main.cpp"
+      DA_MARK="$(grep -aF '[lmhead-devargmax-tp2]' "$DA_SRC" | head -1)"
+      [ -n "$DA_MARK" ] \
+        || { echo "GATE FAIL: no [lmhead-devargmax-tp2] announcement; the seam does not exist" >&2; PASS=0; }
+      grep -aq 'INTFER_LMHEAD_DEVARGMAX_TP2' "$DA_SRC" \
+        || { echo "GATE FAIL: INTFER_LMHEAD_DEVARGMAX_TP2 is not read" >&2; PASS=0; }
+      # the TP2 guard must consult the flag (not be the old unconditional TP=1-only)
+      grep -aq 'if(eng->num_devices() != 1 && !devargmax_tp2) return false;' "$DA_SRC" \
+        || { echo "GATE FAIL: the TP2 guard no longer consults the flag" >&2; PASS=0; }
+      # DPAS forced off at TP2 when the flag is set
+      grep -aq 'if(devargmax_tp2 && eng->num_devices() != 1) use_dpas = false;' "$DA_SRC" \
+        || { echo "GATE FAIL: the DPAS branch is not forced off for the TP2 device-argmax arm" >&2; PASS=0; }
+      # the ordering the old note asked for: argmax chained off the GEMM event
+      grep -aq 'aevt = gemm::lm_head_argmax_tile(q, ap, evt);' "$DA_SRC" \
+        || { echo "GATE FAIL: the argmax tile is no longer chained off the GEMM event" >&2; PASS=0; }
+      # *** REFUSAL DIRECTION, ON A TEMP COPY OF main.cpp. *** Neuter the TP2
+      # guard (drop the flag consultation) and require the arm to refuse it.
+      DASB="$(mktemp -d)"
+      cp "$DA_SRC" "$DASB/main.cpp"
+      perl -0777 -pi -e 's/if\(eng->num_devices\(\) != 1 && !devargmax_tp2\) return false;/if(eng->num_devices() != 1) return false;/s' "$DASB/main.cpp"
+      DA_NOW="$(grep -ac 'if(eng->num_devices() != 1 && !devargmax_tp2) return false;' "$DASB/main.cpp")"
+      [ "${DA_NOW:-0}" -eq 0 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (TP2 guard intact)" >&2; PASS=0; }
+      grep -aq 'if(eng->num_devices() != 1 && !devargmax_tp2) return false;' "$DASB/main.cpp" \
+        && { echo "GATE FAIL: self-check the arm ACCEPTED a source with the TP2 guard neutered" >&2; PASS=0; }
+      rm -rf "$DASB"
+      # Second refusal direction: the DPAS force-off removed (the TP2 arm would
+      # then touch the flaky DPAS path) must be refused.
+      DASB2="$(mktemp -d)"
+      cp "$DA_SRC" "$DASB2/main.cpp"
+      perl -0777 -pi -e 's/if\(devargmax_tp2 && eng->num_devices\(\) != 1\) use_dpas = false;//s' "$DASB2/main.cpp"
+      DA2_NOW="$(grep -ac 'if(devargmax_tp2 && eng->num_devices() != 1) use_dpas = false;' "$DASB2/main.cpp")"
+      [ "${DA2_NOW:-0}" -eq 0 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (DPAS force-off intact)" >&2; PASS=0; }
+      grep -aq 'if(devargmax_tp2 && eng->num_devices() != 1) use_dpas = false;' "$DASB2/main.cpp" \
+        && { echo "GATE FAIL: self-check the arm ACCEPTED a source with the DPAS force-off removed" >&2; PASS=0; }
+      rm -rf "$DASB2"
 # --- INTFER_DPAS48_WG certification (PLAN item 1.3, prefill lever) ----------
   # The tiled DPAS kernel is one WI per (row-group of R, 16-N tile), and each
   # output element (m,n) is written by EXACTLY ONE block (t = n/16, mg = m/R),
@@ -1275,7 +1657,7 @@ fi
   fi
   # The width the operator asked for, as the announcement must print it.
   WG_EXPECT_ANN="work-group=$WG_WG (INTFER_DPAS48_WG=$WG_WG)"
-  echo "$WG_LINE" | grep -aq "$WG_EXPECT_ANN" \
+  grep -aq "$WG_EXPECT_ANN" <<<"$WG_LINE" \
     || { echo "GATE FAIL: the announcement does not name the requested width" >&2
          echo "         wanted '$WG_EXPECT_ANN', got '$WG_LINE'" >&2; PASS=0; }
   # The stream half, against the SAME FIXED ORACLE the base run uses -- not a
@@ -1321,7 +1703,7 @@ fi
   WG_DEFAULT_ANN="work-group=16 (INTFER_DPAS48_WG=$WG_WG)"
   # (a) healthy: the real run's own announcement must exist and name the width.
   [ -n "$WG_LINE" ] || { echo "GATE FAIL: self-check (a) healthy fixture has no [dpas48-wg] line" >&2; PASS=0; }
-  echo "$WG_LINE" | grep -aq "$WG_ANN_FULL" \
+  grep -aq "$WG_ANN_FULL" <<<"$WG_LINE" \
     || { echo "GATE FAIL: self-check (a) the announcement does not name the requested width" >&2; PASS=0; }
   # (b) refusal: a log where the flag was IGNORED (default width 16 ran, stream
   # still matched) must be refused. Built by rewriting the real announcement's
@@ -1332,7 +1714,7 @@ fi
     echo "GATE FAIL: self-check (b) fixture builder removed the announcement" >&2; PASS=0
   fi
   WG_NOT_LINE="$(grep -a "\[dpas48-wg\]" "$WG_NOT_ERR" | head -1)"
-  if [ -n "$WG_NOT_LINE" ] && echo "$WG_NOT_LINE" | grep -aq "$WG_DEFAULT_ANN"; then
+  if [ -n "$WG_NOT_LINE" ] && grep -aq "$WG_DEFAULT_ANN" <<<"$WG_NOT_LINE"; then
     echo "GATE FAIL: self-check (b) the arm ACCEPTED a run whose width path never fired" >&2; PASS=0
   fi
   # (c) vacuity: an empty log must fail the predicate.
@@ -1377,7 +1759,7 @@ fi
       echo "E4 layout: $E4_LINE"
     fi
     # The geometry the operator asked for, as the announcement must print it.
-    if ! echo "$E4_LINE" | grep -aq "geometry=tiled2d"; then
+    if ! grep -aq "geometry=tiled2d" <<<"$E4_LINE"; then
       echo "GATE FAIL: the announcement does not name geometry=tiled2d" >&2
       echo "         wanted 'geometry=tiled2d', got '$E4_LINE'" >&2; PASS=0
     fi
@@ -1403,7 +1785,7 @@ fi
       echo "GATE FAIL: self-check the fixture builder removed the announcement" >&2; PASS=0
     fi
     E4_NOT_LINE="$(grep -a "\[dpas48-wg\]" "$E4_NOT_ERR" | head -1)"
-    if [ -n "$E4_NOT_LINE" ] && echo "$E4_NOT_LINE" | grep -aq "geometry=tiled1d"; then
+    if [ -n "$E4_NOT_LINE" ] && grep -aq "geometry=tiled1d" <<<"$E4_NOT_LINE"; then
       echo "GATE FAIL: self-check the arm ACCEPTED a run whose tiled path never fired" >&2; PASS=0
     fi
     rm -rf "$E4SB2"
@@ -1444,9 +1826,29 @@ fi
   fi
   # The dispatch mode the operator asked for, as the announcement must print it.
   TS_EXPECT_ANN="INTFER_TILE_SCHED=on"
-  echo "$TS_LINE" | grep -aq "$TS_EXPECT_ANN" \
+  grep -aq "$TS_EXPECT_ANN" <<<"$TS_LINE" \
     || { echo "GATE FAIL: the announcement does not name the work-stealing" >&2
          echo "         queue wanted '$TS_EXPECT_ANN', got '$TS_LINE'" >&2; PASS=0; }
+  # *** GEOMETRY, NOT JUST MODE. *** The announcement is the only witness
+  # that the persistent-kernel dispatch ran (nWG=16 work-stealing queue)
+  # rather than one work-group per tile. A line that said nWG=<n_blocks>
+  # would be the fixed-assignment contract wearing the "on" label -- same
+  # vacuity class the mode check defeats, one level down. The engine
+  # contract is nWG = (p.wg == 0) ? 16 : p.wg (engine.cpp), and the
+  # 27B run never sets INTFER_DPAS48_WG, so the persistent geometry is
+  # exactly 16. n_blocks must parse and be positive (a zero-tile dispatch
+  # computes nothing while the stream still matches -- silent no-op).
+  TS_NB="$(echo "$TS_LINE" | sed -n 's/.*n_blocks=\([0-9]*\).*/\1/p')"
+  TS_NWG="$(echo "$TS_LINE" | sed -n 's/.*nWG=\([0-9]*\).*/\1/p')"
+  if [ -n "$TS_NB" ] && [ -n "$TS_NWG" ]; then
+    [ "$TS_NB" -ge 1 ] 2>/dev/null \
+      || { echo "GATE FAIL: tile-sched n_blocks='$TS_NB' is not a positive tile count (got '$TS_LINE')" >&2; PASS=0; }
+    [ "$TS_NWG" = "16" ] \
+      || { echo "GATE FAIL: tile-sched nWG=$TS_NWG != 16 (persistent-kernel contract; got '$TS_LINE')" >&2; PASS=0; }
+  else
+    echo "GATE FAIL: the tile-sched announcement does not parse n_blocks/nWG" >&2
+    echo "         got '$TS_LINE'" >&2; PASS=0
+  fi
   mr_prefill_ok "$(cli_prefill "$TS_ERR")" \
     || { echo "GATE FAIL: tile-sched prefill != 11751" >&2; PASS=0; }
   TS_GOT="$(cli_ids "$TS_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
@@ -1464,7 +1866,7 @@ fi
   # (a) healthy: the real run's own announcement must exist and name the
   # work-stealing queue.
   [ -n "$TS_LINE" ] || { echo "GATE FAIL: self-check (a) healthy fixture has no [tile-sched] line" >&2; PASS=0; }
-  echo "$TS_LINE" | grep -aq "$TS_ANN_FULL" \
+  grep -aq "$TS_ANN_FULL" <<<"$TS_LINE" \
     || { echo "GATE FAIL: self-check (a) the announcement does not name the work-stealing queue" >&2; PASS=0; }
   # (b) refusal: a log where the flag was IGNORED (the fixed-assignment path
   # ran, stream still matched) must be refused. Built by rewriting the real
@@ -1485,7 +1887,7 @@ fi
   # reading 2026-10-13; the wave-launch 8b arm is the correct shape this
   # check now copies: run the arm's predicate against the fixture and
   # require refusal).
-  if [ -n "$TS_NOT_LINE" ] && echo "$TS_NOT_LINE" | grep -aq "$TS_ANN_FULL"; then
+  if [ -n "$TS_NOT_LINE" ] && grep -aq "$TS_ANN_FULL" <<<"$TS_NOT_LINE"; then
     echo "GATE FAIL: self-check (b) the arm ACCEPTED a run whose scheduler never fired" >&2; PASS=0
   fi
   # (c) vacuity: an empty log must fail the predicate.
@@ -1496,6 +1898,323 @@ fi
     echo "GATE FAIL: self-check (c) the arm ACCEPTED an empty log (vacuity)" >&2; PASS=0
   fi
   rm -rf "$TSSB2"
+  fi
+
+  # --- INTFER_XMX_GEMM (wave-path reachability, prefill lever) --------
+  # The XMX joint_matrix kernel was reachable ONLY through
+  # run_linear_tp (the down-projection and run_linear_batch
+  # callers); the q/k/v/z/b/a/la_out wave -- the majority of
+  # layer-GEMM launches at prefill -- ran the EU/ALU tiled
+  # kernel and could never touch the matrix engines. 2026-10-14
+  # wired the same try-XMX-first-then-fallback dispatch into
+  # run_linear_wave's Phase 2 (engine.cpp), so this arm
+  # certifies the NEW reachability at the target: the 27B is
+  # INT2 (XMX-eligible) and prefill chunks are M=128 (M%16==0),
+  # so the wave items dispatch the XMX kernel and the engine
+  # announces [xmx-gemm] ACTIVE once per process.
+  #
+  # *** TOLERANCE CLASS, NOT BIT-EXACT. *** The DPAS accumulation
+  # order differs from the tiled kernel's scalar ascending-kk
+  # chain (the model-free xmx_probe measured 1-7 differing
+  # elements per shape at K>=128), so the token stream is NOT
+  # stream-identical to base and this arm deliberately asserts
+  # NOTHING about the ids beyond non-emptiness -- not the
+  # prefill token (11751), not the decode ids, not equality
+  # with base. The reachability proof is the announcement (it is
+  # gated on xmx_ran, so its presence proves the kernel
+  # dispatched, not merely that the env var was read); the
+  # anti-vacuity guard is the non-empty stream. The operator
+  # compares the printed ids against the base run by eye.
+  XMW_OUT="$LOG.xmw.out"; XMW_ERR="$LOG.xmw.err"
+  env INTFER_XMX_GEMM=1 \
+  "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$XMW_OUT" 2>"$XMW_ERR"; XMW_RC=$?
+  if [ "$XMW_RC" -ne 0 ]; then
+    echo "GATE FAIL: INTFER_XMX_GEMM=1 (wave) run exited rc=$XMW_RC" >&2
+    tail -20 "$XMW_ERR" >&2
+    PASS=0
+  else
+    XMW_LINE="$(grep -a "\[xmx-gemm\]" "$XMW_ERR" | head -1)"
+    if [ -z "$XMW_LINE" ]; then
+      echo "GATE FAIL: the XMX wave path never announced itself" >&2
+      echo "         (no [xmx-gemm] line); the wave wiring did not" >&2
+      echo "         dispatch the kernel and this arm is vacuous." >&2
+      PASS=0
+    else
+      echo "XMX-WAVE layout: $XMW_LINE"
+    fi
+    # The dispatch geometry the kernel must print: n_tiles >= 1
+    # and, with the scheduler off (INTFER_XMX_TILE_SCHED unset),
+    # one work-group per tile (nWG == n_tiles). The announcement
+    # is printed by the FIRST wave item that dispatched XMX, so
+    # the geometry is that item's -- the relationship, not the
+    # absolute count, is the contract.
+    XMW_SCHED_LINE="$(grep -a "\[xmx-tile-sched\]" "$XMW_ERR" | head -1)"
+    grep -aq "n_tiles=[1-9]" <<<"$XMW_SCHED_LINE" \
+      || { echo "GATE FAIL: the XMX announcement names no tiles" >&2
+           echo "         wanted 'n_tiles=[1-9]', got '$XMW_SCHED_LINE'" >&2; PASS=0; }
+    grep -aq "OFF" <<<"$XMW_SCHED_LINE" \
+      || { echo "GATE FAIL: the XMX announcement does not name the" >&2
+           echo "         scheduler OFF (INTFER_XMX_TILE_SCHED unset)" >&2
+           echo "         got '$XMW_SCHED_LINE'" >&2; PASS=0; }
+    grep -aq "fixed-assignment" <<<"$XMW_SCHED_LINE" \
+      || { echo "GATE FAIL: the XMX announcement does not name the" >&2
+           echo "         fixed-assignment scheduler" >&2
+           echo "         got '$XMW_SCHED_LINE'" >&2; PASS=0; }
+    XMW_NT="$(echo "$XMW_SCHED_LINE" | sed -n 's/.*n_tiles=\([0-9]*\).*/\1/p')"
+    XMW_NWG="$(echo "$XMW_SCHED_LINE" | sed -n 's/.*nWG=\([0-9]*\).*/\1/p')"
+    if [ -n "$XMW_NT" ] && [ -n "$XMW_NWG" ]; then
+      [ "$XMW_NWG" = "$XMW_NT" ] \
+        || { echo "GATE FAIL: XMX nWG=$XMW_NWG != n_tiles=$XMW_NT with the scheduler off (one work-group per tile is the fixed-assignment contract)" >&2; PASS=0; }
+    else
+      echo "GATE FAIL: the XMX announcement does not parse n_tiles/nWG" >&2
+      echo "         got '$XMW_SCHED_LINE'" >&2; PASS=0
+    fi
+    # Anti-vacuity: the stream must be non-empty. NOT compared to
+    # base -- tolerance class (see the comment above).
+    XMW_IDS="$(cli_ids "$XMW_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    [ -n "$XMW_IDS" ] \
+      || { echo "GATE FAIL: XMX wave stream EMPTY (vacuity)" >&2; PASS=0; }
+    echo "XMX-WAVE ids (TOLERANCE CLASS -- may differ from base): $XMW_IDS"
+    # *** SELF-CHECK FOR THIS ARM. *** The announcement is the
+    # only thing standing between a run where the wiring never
+    # dispatched XMX (every wave tile declined, the tiled kernel
+    # wrote the output) and a PASS. Built by DELETING the
+    # announcement from the real log -- the exact shape of "the
+    # kernel declined every wave tile". The arm's predicate (a
+    # non-empty [xmx-gemm] grep) must REFUSE that fixture.
+    XMW2="$(mktemp -d)"
+    XMW_NOT_ERR="$XMW2/xmw_not.err"
+    sed '/\[xmx-gemm\]/d' "$XMW_ERR" >"$XMW_NOT_ERR"
+    # The fixture builder must have removed the line (a builder
+    # that silently no-ops would make the refusal case pass for
+    # the wrong reason).
+    if grep -aq "\[xmx-gemm\]" "$XMW_NOT_ERR"; then
+      echo "GATE FAIL: self-check the fixture builder removed nothing" >&2; PASS=0
+    fi
+    XMW_NOT_LINE="$(grep -a "\[xmx-gemm\]" "$XMW_NOT_ERR" | head -1)"
+    if [ -n "$XMW_NOT_LINE" ]; then
+      echo "GATE FAIL: self-check the arm ACCEPTED a log whose XMX path never fired" >&2; PASS=0
+    fi
+    # (c) vacuity: an empty log must fail the predicate.
+    : >"$XMW2/xmw_empty.err"
+    XMW_EMPTY_LINE="$(grep -a "\[xmx-gemm\]" "$XMW2/xmw_empty.err" | head -1)"
+    if [ -n "$XMW_EMPTY_LINE" ]; then
+      echo "GATE FAIL: self-check the arm ACCEPTED an empty log (vacuity)" >&2; PASS=0
+    fi
+    rm -rf "$XMW2"
+fi
+
+  # --- INTFER_XMX_WG certification (2026-10-15, XMX work-group count) --------
+  # The XMX joint_matrix kernel launches n_tiles sub-groups by default (one
+  # per 16x16 output tile, fixed assignment). The B580 has 20 Xe cores / 160
+  # CUs, and prefill shapes far exceed that (M=128, N=4352 => 2176 tiles), so
+  # the launch is oversubscribed by construction. INTFER_XMX_WG caps the
+  # work-group count and switches on the work-stealing scheduler, which is a
+  # pure DISPATCH change (each tile computes the same dot products in the same
+  # order; fixed-assignment and work-stealing share the process_tile body at
+  # quant_gemm.cpp:2288) -- BIT-EXACT BY CONSTRUCTION, no numerics contract.
+  #
+  # *** STRUCTURAL ARM, NOT A RUN. *** Same shape as the DECODE1_WG arm: the
+  # partition is exact by construction, so a base-vs-flagged stream comparison
+  # is satisfiable by a flag that never reached the kernel, and on this box
+  # the run is forbidden anyway (STOP). The subject is the WORK-GROUP COUNT,
+  # which the kernel announces ([xmx-wg] XMX work-group=... (INTFER_XMX_WG=...)
+  # scheduler=... n_tiles=... (... work-stealing)), once per process. The arm
+  # asserts the source carries the announcement, that the format names the
+  # width rather than a constant, and that the predicate refuses both a
+  # no-op source (INTFER_XMX_WG >= n_tiles => the cap never bit) and an empty
+  # log. The refusal direction is built on a temp copy of the source, never
+  # the tracked file.
+  XW_SRC="$(grep -aF '[xmx-wg]' "$ROOT/src/gemm/quant_gemm.cpp" | head -1)"
+  [ -n "$XW_SRC" ] \
+    || { echo "GATE FAIL: no [xmx-wg] announcement in quant_gemm.cpp; the XMX path does not exist" >&2; PASS=0; }
+  # The format string is split across source lines (quant_gemm.cpp:2503-2504:
+  # `work-group count=%u "` / `"(INTFER_XMX_WG=%s) ...`), so the predicate
+  # matches the WHOLE FILE, not the single grep line -- matching the line
+  # would refuse the healthy source and make this a guard whose stated
+  # rationale does not apply (audit rule 5).
+  XW_FMT_WG="work-group count=%u"
+  XW_FMT_ENV="INTFER_XMX_WG=%s"
+  grep -aq "$XW_FMT_WG" "$ROOT/src/gemm/quant_gemm.cpp" \
+    || { echo "GATE FAIL: the [xmx-wg] announcement format does not carry the requested width" >&2
+         echo "         wanted '$XW_FMT_WG', got '$XW_SRC'" >&2; PASS=0; }
+  grep -aq "$XW_FMT_ENV" "$ROOT/src/gemm/quant_gemm.cpp" \
+    || { echo "GATE FAIL: the [xmx-wg] announcement format does not echo the env value" >&2
+         echo "         wanted '$XW_FMT_ENV', got '$XW_SRC'" >&2; PASS=0; }
+  # The refusal direction: a format that hardcodes a width the arm asks for is
+  # a knob that cannot change what the kernel announces. The healthy source
+  # carries `count=%u` (variable), so the dead form is the constant.
+  XW_FMT_DEAD="work-group count=16"
+  grep -aq "$XW_FMT_DEAD" "$ROOT/src/gemm/quant_gemm.cpp" \
+    && { echo "GATE FAIL: the [xmx-wg] announcement format hardcodes a width" >&2
+         echo "         (the format is right but the flag cannot change it)" >&2; PASS=0; }
+  # *** REFUSAL DIRECTION, ON A TEMP COPY OF THE SOURCE. *** Built by rewriting
+  # the format to the constant, then requiring the arm to refuse that copy.
+  # The builder preflight asserts the rewrite actually changed something -- a
+  # sed that silently no-ops would leave the healthy format in place and the
+  # refusal would fire on the wrong reason. The format string is split across
+  # two source lines, so a single-line sed cannot see it; perl -0777 slurps
+  # the file and /s makes dot match the newline between the two segments. The
+  # non-greedy .*? stops at the first `INTFER_XMX_WG=%s`, which is the only
+  # one in the file. Verified against the real source (perl_rc=0, count=16
+  # planted, count=%u and INTFER_XMX_WG=%s both gone).
+  XWSB2="$(mktemp -d)"
+  cp "$ROOT/src/gemm/quant_gemm.cpp" "$XWSB2/qg.cpp"
+  XW_DEAD_COUNT="$(grep -ac "$XW_FMT_DEAD" "$XWSB2/qg.cpp")"
+  [ "${XW_DEAD_COUNT:-0}" -eq 0 ] \
+    || { echo "GATE FAIL: self-check builder did not plant the dead format" >&2; PASS=0; }
+  perl -0777 -pi -e 's/work-group count=%u.*?(INTFER_XMX_WG=%s)/work-group count=16/s' "$XWSB2/qg.cpp"
+  XW_DEAD_NOW="$(grep -ac "$XW_FMT_DEAD" "$XWSB2/qg.cpp")"
+  [ "${XW_DEAD_NOW:-0}" -ge 1 ] \
+    || { echo "GATE FAIL: self-check builder perl no-op'd (planted 0, still 0)" >&2; PASS=0; }
+  grep -aq "$XW_FMT_DEAD" "$XWSB2/qg.cpp" \
+    && { echo "GATE FAIL: self-check the arm ACCEPTED a source whose announcement cannot change" >&2; PASS=0; }
+  rm -rf "$XWSB2"
+
+  # --- INTFER_LA_OUT_TP2 certification (2026-10-15, TP=2 la_out fusion) ----
+  # The first la_out seam reachable at the 27B --tp 2 target (run_linear_tp_
+  # devact is TP=1-locked). Subject source: examples/intfer_cli/main.cpp.
+  # *** STRUCTURAL ARM, NOT A RUN *** (STOP in force; same class as the
+  # DECODE1_WG / XMX_WG arms). The fusion is NOT bit-exact with the host
+  # path it replaces (sycl::exp vs expf in the norm kernel, FP16 vs FP32-core
+  # activation), so a stream A/B would be the WRONG certification even on an
+  # operator box -- the operator A/B (nk/nw/nr + host buckets) arbitrates the
+  # performance; this arm certifies (a) the path exists, (b) the flag is what
+  # arms it, (c) the announcement is gated on the path's SUCCESS rather than
+  # on the flag-read (an announce placed before the devact seam would fire on
+  # a declined seam -- the vacuous-green shape the L4 seam's own rows block
+  # documents at main.cpp:3218-3224), (d) the DPAS48 conflict is refused
+  # (the drift class that makes SSM_GPU decline under DPAS48), (e) the static
+  # pre-flight runs BEFORE the chain kernel commits the recurrence (a
+  # decline-after-submit would corrupt the state), and (f) the prefill
+  # wiring calls it. The refusal direction is built on temp copies.
+  LATP2_MAIN="$ROOT/examples/intfer_cli/main.cpp"
+  latp2_check_src() {  # echoes one violation line per failed predicate
+    local f="$1"
+    grep -aq '\[la-out-tp2\]' "$f" \
+      || echo "no [la-out-tp2] announcement (the path does not exist)"
+    grep -aq 'INTFER_LA_OUT_TP2=1' "$f" \
+      || echo "the announcement format does not echo the env value"
+    grep -aqF 'static const bool la_env = (std::getenv("INTFER_LA_OUT_TP2") != nullptr);' "$f" \
+      || echo "the body's presence gate is gone (the flag no longer arms it)"
+    local body dev_line ann_line elig_line chain_line
+    body="$(grep -an 'static const bool la_env = ' "$f" | head -1 | cut -d: -f1)"
+    if [ -n "$body" ]; then
+      dev_line="$(awk -v s="$body" 'NR>=s && /run_linear_tp_devact_tp2\(la_out_ti/ {print NR; exit}' "$f")"
+      ann_line="$(awk -v s="$body" 'NR>=s && /\[la-out-tp2\]/ {print NR; exit}' "$f")"
+      elig_line="$(awk -v s="$body" 'NR>=s && /la_out_tp2_eligible\(la_out_ti/ {print NR; exit}' "$f")"
+      chain_line="$(awk -v s="$body" 'NR>=s && /ssm_forward_chain\(q, p\)/ {print NR; exit}' "$f")"
+      [ -n "$dev_line" ] && [ -n "$ann_line" ] && [ "$dev_line" -lt "$ann_line" ] \
+        || echo "the announcement precedes the devact_tp2 call (fires on a declined seam)"
+      [ -n "$elig_line" ] && [ -n "$chain_line" ] && [ "$elig_line" -lt "$chain_line" ] \
+        || echo "the la_out_tp2_eligible pre-flight does not precede the chain kernel"
+    else
+      echo "the body's la_env gate line was not found"
+    fi
+    grep -aq 'INTFER_LA_OUT_TP2 declined: INTFER_DPAS48=1 is' "$f" \
+      || echo "the DPAS48 conflict refusal is gone"
+    grep -aq 'gpu_ssm_laout_fused_tp2(\*gpu_be' "$f" \
+      || echo "the prefill wiring no longer calls the fusion"
+  }
+  LATP2_VIO="$(latp2_check_src "$LATP2_MAIN")"
+  if [ -n "$LATP2_VIO" ]; then
+    echo "GATE FAIL: INTFER_LA_OUT_TP2 structural predicates on the healthy source:" >&2
+    printf '%s\n' "$LATP2_VIO" | sed 's/^/         - /' >&2
+    PASS=0
+  fi
+  # *** REFUSAL DIRECTION 1: a flag-independent body. *** la_env := true
+  # makes the path run (and announce) without INTFER_LA_OUT_TP2 -- the
+  # "flag cannot change what the path does" defect. The presence-gate
+  # predicate must refuse it. Builder preflight asserts the dead form is
+  # absent before the rewrite and planted after (a silent perl no-op would
+  # leave the healthy source and the refusal would fire on the wrong file).
+  LATP2_B1="$(mktemp -d)"
+  cp "$LATP2_MAIN" "$LATP2_B1/main.cpp"
+  LATP2_DEADCNT_BEFORE="$(grep -ac 'la_env = true;' "$LATP2_B1/main.cpp")"
+  [ "${LATP2_DEADCNT_BEFORE:-0}" -eq 0 ] \
+    || { echo "GATE FAIL: self-check builder 1 preflight: dead form already present" >&2; PASS=0; }
+  perl -pi -e 's/static const bool la_env = \(std::getenv\("INTFER_LA_OUT_TP2"\) != nullptr\);/static const bool la_env = true;/' "$LATP2_B1/main.cpp"
+  LATP2_DEADCNT_NOW="$(grep -ac 'la_env = true;' "$LATP2_B1/main.cpp")"
+  [ "${LATP2_DEADCNT_NOW:-0}" -ge 1 ] \
+    || { echo "GATE FAIL: self-check builder 1 perl no-op'd (planted 0, still 0)" >&2; PASS=0; }
+  LATP2_VIO1="$(latp2_check_src "$LATP2_B1/main.cpp")"
+  LATP2_VIO1_TMP="$(mktemp)"; printf '%s\n' "$LATP2_VIO1" >"$LATP2_VIO1_TMP"
+  grep -aq 'presence gate is gone' "$LATP2_VIO1_TMP" \
+    || { echo "GATE FAIL: the arm ACCEPTED a flag-independent la_out fusion body" >&2; PASS=0; }
+  rm -f "$LATP2_VIO1_TMP"
+  rm -rf "$LATP2_B1"
+  # *** REFUSAL DIRECTION 2: the announcement deleted. *** The reachability
+  # predicate must refuse (an arm that only checked the flag gate would be
+  # satisfied by a path that never announces itself).
+  LATP2_B2="$(mktemp -d)"
+  cp "$LATP2_MAIN" "$LATP2_B2/main.cpp"
+  LATP2_ANN_BEFORE="$(grep -ac '\[la-out-tp2\]' "$LATP2_B2/main.cpp")"
+  [ "${LATP2_ANN_BEFORE:-0}" -ge 1 ] \
+    || { echo "GATE FAIL: self-check builder 2 preflight: no announcement to delete" >&2; PASS=0; }
+  perl -pi -e 's/"\[la-out-tp2\] TP=2 la_out fusion ACTIVE "/"[la-out-tp2-deleted] "/' "$LATP2_B2/main.cpp"
+  LATP2_ANN_NOW="$(grep -ac '\[la-out-tp2\]' "$LATP2_B2/main.cpp")"
+  [ "${LATP2_ANN_NOW:-0}" -eq 0 ] \
+    || { echo "GATE FAIL: self-check builder 2 did not delete the announcement" >&2; PASS=0; }
+  LATP2_VIO2="$(latp2_check_src "$LATP2_B2/main.cpp")"
+  LATP2_VIO2_TMP="$(mktemp)"; printf '%s\n' "$LATP2_VIO2" >"$LATP2_VIO2_TMP"
+  grep -aq 'no \[la-out-tp2\] announcement' "$LATP2_VIO2_TMP" \
+    || { echo "GATE FAIL: the arm ACCEPTED a source without the announcement" >&2; PASS=0; }
+  rm -f "$LATP2_VIO2_TMP"
+  rm -rf "$LATP2_B2"
+
+  # --- INTFER_XMX_GEMM x INTFER_WAVE_LAUNCH_FUSE PRECEDENCE (2026-10-15) ---
+  env INTFER_XMX_GEMM=1 INTFER_WAVE_LAUNCH_FUSE=1 \
+  "$BIN" -m "$MODEL" --gpu --tp 2 --ids \
+  -p "$PROMPT" -n "$N" >"$XMWxF_OUT" 2>"$XMWxF_ERR"; XMWxF_RC=$?
+  if [ "$XMWxF_RC" -ne 0 ]; then
+    echo "GATE FAIL: INTFER_XMX_GEMM=1 INTFER_WAVE_LAUNCH_FUSE=1 run exited rc=$XMWxF_RC" >&2
+    tail -20 "$XMWxF_ERR" >&2
+    PASS=0
+  else
+    XMWxF_LINE="$(grep -a "per-item INTFER_XMX_GEMM dispatch" "$XMWxF_ERR" | head -1)"
+    if [ -z "$XMWxF_LINE" ]; then
+      echo "GATE FAIL: the XMX x WAVE_LAUNCH_FUSE precedence never announced" >&2
+      echo "         (no 'per-item INTFER_XMX_GEMM dispatch skipped for this wave' line)" >&2
+      echo "         with both flags set a fused wave MUST pre-empt XMX, so" >&2
+      echo "         the absence means the precedence is dead or unwired." >&2
+      PASS=0
+    else
+      echo "XMXxF precedence: $XMWxF_LINE"
+    fi
+    # The precedence is a dispatch-order fact, not a correctness one: the
+    # run must still produce a stream, or a crash masked as a precedence
+    # line would be a green gate.
+    XMWxF_IDS="$(cli_ids "$XMWxF_ERR" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')"
+    [ -n "$XMWxF_IDS" ] \
+      || { echo "GATE FAIL: XMXxF stream EMPTY (vacuity)" >&2; PASS=0; }
+    echo "XMXxF ids (tolerance class -- may differ from base): $XMWxF_IDS"
+    # *** SELF-CHECK. *** The precedence line is the only thing standing
+    # between a run where the wiring never pre-empted XMX and a PASS.
+    # Built by DELETING the line from the real log -- the exact shape of
+    # "the fused wave returned without announcing the precedence". The
+    # arm's predicate (a non-empty grep) must REFUSE that fixture.
+    XMWxF2="$(mktemp -d)"
+    sed '/per-item INTFER_XMX_GEMM dispatch/d' "$XMWxF_ERR" >"$XMWxF2/xmwx_not.err"
+    if grep -aq "per-item INTFER_XMX_GEMM dispatch" "$XMWxF2/xmwx_not.err"; then
+      echo "GATE FAIL: self-check the fixture builder removed nothing" >&2; PASS=0
+    fi
+    XMWxF_NOT="$(grep -a "per-item INTFER_XMX_GEMM dispatch" "$XMWxF2/xmwx_not.err" | head -1)"
+    if [ -n "$XMWxF_NOT" ]; then
+      echo "GATE FAIL: self-check the arm ACCEPTED a log with no precedence line" >&2; PASS=0
+    fi
+    # (c) VACUITY. The predicate is a non-empty grep; an empty log must fail
+    # it. Without this, (b) is the only thing between a vacuous arm and a
+    # PASS -- an arm whose grep is itself broken would still refuse (b) (no
+    # line -> the grep finds nothing) but would have nothing left to refuse
+    # an empty log. Same shape as the WAVE_LAUNCH_FUSE arm's (c)
+    # (test_tp2_27b.sh:1841-1851).
+    : >"$XMWxF2/empty.err"
+    XMWxF_EMPTY="$(grep -a "per-item INTFER_XMX_GEMM dispatch" "$XMWxF2/empty.err" | head -1)"
+    if [ -n "$XMWxF_EMPTY" ]; then
+      echo "GATE FAIL: self-check the arm ACCEPTED an empty log (vacuity)" >&2; PASS=0
+    fi
+    rm -rf "$XMWxF2"
   fi
 
   # --- INTFER_WAVE_LAUNCH_FUSE certification (prefill lever) ---------------
@@ -1620,10 +2339,247 @@ fi
     esac
     WF_WAVE_LINE="$(grep -a "\[wave-launch-fuse\]" "$WF_WAVE" | head -1)"
     if [ -n "$WF_WAVE_LINE" ] && wf_wave_known "$WF_WAVE_LINE" \
-       && ! { echo "$WF_WAVE_LINE" | grep -aqq "$WF_LINE"; }; then
+       && ! { grep -aqq "$WF_LINE" <<<"$WF_WAVE_LINE"; }; then
       echo "GATE FAIL: self-check (d) the arm ACCEPTED a run whose fusion was on the wrong wave" >&2; PASS=0
     fi
-    rm -rf "$WFSB2"
+rm -rf "$WFSB2"
+  fi
+
+
+  # --- INTFER_SAMPLE_TOPK_DIRECT certification (2026-10-15, FORK_B580 §8 #313) ----
+  # Port: when top-k is the FIRST active sampler stage (top_k>0, top_p<=0,
+  # temperature>0) select the k largest logits directly and softmax over only
+  # those, instead of the base's full-vocab softmax + nth_element prune +
+  # renormalize. BIT-EXACT BY CONSTRUCTION (the survivor set is the same set:
+  # softmax is strictly monotone in logits, so {i : probs[i] >= kth_prob} ==
+  # {i : logits[i] >= kthl}, independent of nth_element's permutation), so a
+  # stream A/B is a formality and this arm is STRUCTURAL -- it certifies (a)
+  # the path exists, (b) the flag arms it, (c) the announcement is inside the
+  # branch (gated on the path running, not on the flag-read -- the vacuous
+  # green shape), (d) the branch's guard is the right predicate, and (e) the
+  # guard is read BEFORE the branch (a guard after the branch is dead code).
+  # Subject source: examples/intfer_cli/main.cpp (sample()).
+  STD_MAIN="$ROOT/examples/intfer_cli/main.cpp"
+  std_check_src() {  # echoes one violation line per failed predicate
+    local f="$1"
+    grep -aq '\[sample-topk-direct\]' "$f" \
+      || echo "no [sample-topk-direct] announcement (the path does not exist)"
+    grep -aq 'INTFER_SAMPLE_TOPK_DIRECT=1' "$f" \
+      || echo "the announcement format does not echo the env value"
+    grep -aqF 'static const bool topk_direct = (std::getenv("INTFER_SAMPLE_TOPK_DIRECT") != nullptr);' "$f" \
+      || echo "the branch's presence gate is gone (the flag no longer arms it)"
+    local guard_line branch_line ann_line
+    guard_line="$(grep -an 'static const bool topk_direct = ' "$f" | head -1 | cut -d: -f1)"
+    if [ -n "$guard_line" ]; then
+      branch_line="$(awk -v s="$guard_line" 'NR>=s && /if(topk_direct && top_k > 0 && top_p <= 0.f/ {print NR; exit}' "$f")"
+      ann_line="$(awk -v s="$guard_line" 'NR>=s && /\[sample-topk-direct\]/ {print NR; exit}' "$f")"
+      [ -n "$branch_line" ] && [ -n "$ann_line" ] && [ "$branch_line" -lt "$ann_line" ] \
+        || echo "the announcement does not sit inside the branch (fires on a declined path)"
+      [ -n "$branch_line" ] && [ "$guard_line" -lt "$branch_line" ] \
+        || echo "the guard is read after the branch (dead code)"
+    else
+      echo "the branch's topk_direct gate line was not found"
     fi
+    grep -aq 'INTFER_SAMPLE_TOPK_DIRECT=1' "$f" \
+      || echo "the announcement does not echo the env value"
+  }
+  STD_VIO="$(std_check_src "$STD_MAIN")"
+  if [ -n "$STD_VIO" ]; then
+    echo "GATE FAIL: INTFER_SAMPLE_TOPK_DIRECT structural predicates on the healthy source:" >&2
+    printf '%s\n' "$STD_VIO" | sed 's/^/         - /' >&2
+    PASS=0
+  fi
+  # *** REFUSAL DIRECTION 1: a flag-independent branch. *** topk_direct := true
+  # makes the path run (and announce) without INTFER_SAMPLE_TOPK_DIRECT -- the
+  # "flag cannot change what the path does" defect. The presence-gate
+  # predicate must refuse it. Builder preflight asserts the dead form is
+  # absent before the rewrite and planted after (a silent perl no-op would
+  # leave the healthy source and the refusal would fire on the wrong file).
+  STD_B1="$(mktemp -d)"
+  cp "$STD_MAIN" "$STD_B1/main.cpp"
+  STD_DEADCNT_BEFORE="$(grep -ac 'topk_direct = true;' "$STD_B1/main.cpp")"
+  [ "${STD_DEADCNT_BEFORE:-0}" -eq 0 ] \
+    || { echo "GATE FAIL: self-check builder 1 preflight: dead form already present" >&2; PASS=0; }
+  perl -pi -e 's/static const bool topk_direct = \(std::getenv\("INTFER_SAMPLE_TOPK_DIRECT"\) != nullptr\);/static const bool topk_direct = true;/' "$STD_B1/main.cpp"
+  STD_DEADCNT_NOW="$(grep -ac 'topk_direct = true;' "$STD_B1/main.cpp")"
+  [ "${STD_DEADCNT_NOW:-0}" -ge 1 ] \
+    || { echo "GATE FAIL: self-check builder 1 perl no-op'd (planted 0, still 0)" >&2; PASS=0; }
+  STD_VIO1="$(std_check_src "$STD_B1/main.cpp")"
+  STD_VIO1_TMP="$(mktemp)"; printf '%s\n' "$STD_VIO1" >"$STD_VIO1_TMP"
+  grep -aq 'presence gate is gone' "$STD_VIO1_TMP" \
+    || { echo "GATE FAIL: the arm ACCEPTED a flag-independent top-k-direct branch" >&2; PASS=0; }
+  rm -f "$STD_VIO1_TMP"
+  rm -rf "$STD_B1"
+  # *** REFUSAL DIRECTION 2: the announcement deleted. *** The reachability
+  # predicate must refuse (an arm that only checked the flag gate would be
+  # satisfied by a path that never announces itself).
+  STD_B2="$(mktemp -d)"
+  cp "$STD_MAIN" "$STD_B2/main.cpp"
+  STD_ANN_BEFORE="$(grep -ac '\[sample-topk-direct\]' "$STD_B2/main.cpp")"
+  [ "${STD_ANN_BEFORE:-0}" -ge 1 ] \
+    || { echo "GATE FAIL: self-check builder 2 preflight: no announcement to delete" >&2; PASS=0; }
+  perl -pi -e 's/"\[sample-topk-direct\] ACTIVE "/"[sample-topk-direct-deleted] "/' "$STD_B2/main.cpp"
+  STD_ANN_NOW="$(grep -ac '\[sample-topk-direct\]' "$STD_B2/main.cpp")"
+  [ "${STD_ANN_NOW:-0}" -eq 0 ] \
+    || { echo "GATE FAIL: self-check builder 2 did not delete the announcement" >&2; PASS=0; }
+  STD_VIO2="$(std_check_src "$STD_B2/main.cpp")"
+  STD_VIO2_TMP="$(mktemp)"; printf '%s\n' "$STD_VIO2" >"$STD_VIO2_TMP"
+  grep -aq 'no \[sample-topk-direct\] announcement' "$STD_VIO2_TMP" \
+    || { echo "GATE FAIL: the arm ACCEPTED a source without the announcement" >&2; PASS=0; }
+  rm -f "$STD_VIO2_TMP"
+  rm -rf "$STD_B2"
+
+    # --- INTFER_DECODE1_ANNOUNCE_EVERY certification (opt-in: every-launch decode1 announcement) --
+      # quant_gemm.cpp decode1_announce() prints a once-per-process [decode1-*] line;
+      # INTFER_DECODE1_ANNOUNCE_EVERY=1 disables the latch and prints every launch.
+      # STRUCTURAL (no model, no GPU). Certifies the flag read, the once-only latch,
+      # and the per-arm announcement tags.
+      DA_SRC="$ROOT/src/gemm/quant_gemm.cpp"
+      grep -aq 'decode1_announce' "$DA_SRC" \
+        || { echo "GATE FAIL: decode1_announce not found in quant_gemm.cpp" >&2; PASS=0; }
+      grep -aq 'INTFER_DECODE1_ANNOUNCE_EVERY' "$DA_SRC" \
+        || { echo "GATE FAIL: INTFER_DECODE1_ANNOUNCE_EVERY is not read" >&2; PASS=0; }
+      grep -aq 'std::set<std::string> seen' "$DA_SRC" \
+        || { echo "GATE FAIL: decode1_announce once-only latch missing" >&2; PASS=0; }
+      grep -aq 'decode1-rowpair' "$DA_SRC" \
+        || { echo "GATE FAIL: decode1-rowpair announcement tag missing" >&2; PASS=0; }
+      grep -aq 'decode1-verbhalf' "$DA_SRC" \
+        || { echo "GATE FAIL: decode1-verbhalf announcement tag missing" >&2; PASS=0; }
+      grep -aq 'call %d ACTIVE' "$DA_SRC" \
+        || { echo "GATE FAIL: decode1_announce call-counter format missing" >&2; PASS=0; }
+      # *** REFUSAL DIRECTION ***: replace the flag read with false -> dead knob.
+      DA_SB="$(mktemp -d)"
+      cp "$DA_SRC" "$DA_SB/quant_gemm.cpp"
+      DA_DEAD_BEFORE="$(grep -ac 'INTFER_DECODE1_ANNOUNCE_EVERY' "$DA_SB/quant_gemm.cpp")"
+      [ "${DA_DEAD_BEFORE:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder preflight: INTFER_DECODE1_ANNOUNCE_EVERY absent" >&2; PASS=0; }
+      perl -0777 -pi -e 's/std::getenv\("INTFER_DECODE1_ANNOUNCE_EVERY"\) != nullptr/false/' "$DA_SB/quant_gemm.cpp"
+      DA_DEAD_AFTER="$(grep -ac 'INTFER_DECODE1_ANNOUNCE_EVERY' "$DA_SB/quant_gemm.cpp")"
+      [ "${DA_DEAD_AFTER:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (flag read still present)" >&2; PASS=0; }
+      # After the replacement the every-flag is gone; the arm must refuse a source
+      # where INTFER_DECODE1_ANNOUNCE_EVERY is not read.
+      grep -aq 'INTFER_DECODE1_ANNOUNCE_EVERY' "$DA_SB/quant_gemm.cpp" \
+        && { echo "GATE FAIL: arm ACCEPTED a source where INTFER_DECODE1_ANNOUNCE_EVERY is dead" >&2; PASS=0; }
+      rm -rf "$DA_SB"
+
+    # --- INTFER_LMHEAD_SPLIT0 certification (opt-in: lm_head TP split override) --
+      # main.cpp run_lm_head_batch() reads INTFER_LMHEAD_SPLIT0=<rows> (integer form)
+      # or INTFER_LMHEAD_SPLIT0=<b0>,<b1>,... (comma list) to override the dev0 row
+      # count. STRUCTURAL (no model, no GPU). Certifies the flag read, both shapes,
+      # and the split0 variable being used.
+      LM_SRC="$ROOT/examples/intfer_cli/main.cpp"
+      grep -aq 'INTFER_LMHEAD_SPLIT0' "$LM_SRC" \
+        || { echo "GATE FAIL: INTFER_LMHEAD_SPLIT0 is not read" >&2; PASS=0; }
+      grep -aq 'strchr(so' "$LM_SRC" \
+        || { echo "GATE FAIL: INTFER_LMHEAD_SPLIT0 comma-list shape missing" >&2; PASS=0; }
+      grep -aq 'split0' "$LM_SRC" \
+        || { echo "GATE FAIL: split0 variable not used" >&2; PASS=0; }
+      grep -aq 'lm_head_ranges_' "$LM_SRC" \
+        || { echo "GATE FAIL: lm_head_ranges_ not populated" >&2; PASS=0; }
+      # *** REFUSAL DIRECTION ***: replace the flag read with nullptr -> dead knob.
+      LM_SB="$(mktemp -d)"
+      cp "$LM_SRC" "$LM_SB/main.cpp"
+      LM_DEAD_BEFORE="$(grep -ac 'INTFER_LMHEAD_SPLIT0' "$LM_SB/main.cpp")"
+      [ "${LM_DEAD_BEFORE:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder preflight: INTFER_LMHEAD_SPLIT0 absent" >&2; PASS=0; }
+      perl -0777 -pi -e 's/std::getenv\("INTFER_LMHEAD_SPLIT0"\) != nullptr/false/' "$LM_SB/main.cpp"
+      LM_DEAD_AFTER="$(grep -ac 'INTFER_LMHEAD_SPLIT0' "$LM_SB/main.cpp")"
+      [ "${LM_DEAD_AFTER:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (flag read still present)" >&2; PASS=0; }
+      grep -aq 'INTFER_LMHEAD_SPLIT0' "$LM_SB/main.cpp" \
+        && { echo "GATE FAIL: arm ACCEPTED a source where INTFER_LMHEAD_SPLIT0 is dead" >&2; PASS=0; }
+      rm -rf "$LM_SB"
+
+    # --- INTFER_SPEC_ADAPT certification (opt-in: adaptive spec-draft width) --
+      # main.cpp reads INTFER_SPEC_ADAPT and builds a SpecAdapt controller that
+      # chooses the draft width maximising expected_emitted / verify_cost.
+      # STRUCTURAL (no model, no GPU). Certifies the flag read, the SpecAdapt struct,
+      # and the choose() call site being fed producer scores.
+      SA_SRC="$ROOT/examples/intfer_cli/main.cpp"
+      grep -aq 'INTFER_SPEC_ADAPT' "$SA_SRC" \
+        || { echo "GATE FAIL: INTFER_SPEC_ADAPT is not read" >&2; PASS=0; }
+      grep -aq 'struct SpecAdapt' "$SA_SRC" \
+        || { echo "GATE FAIL: SpecAdapt struct missing" >&2; PASS=0; }
+      grep -aq 'spec_adapt_state.choose' "$SA_SRC" \
+        || { echo "GATE FAIL: spec_adapt_state.choose not called" >&2; PASS=0; }
+      grep -aq 'spec_adapt_state.observe' "$SA_SRC" \
+        || { echo "GATE FAIL: spec_adapt_state.observe not called" >&2; PASS=0; }
+      # *** REFUSAL DIRECTION ***: replace the flag read with nullptr -> dead knob.
+      SA_SB="$(mktemp -d)"
+      cp "$SA_SRC" "$SA_SB/main.cpp"
+      SA_DEAD_BEFORE="$(grep -ac 'INTFER_SPEC_ADAPT' "$SA_SB/main.cpp")"
+      [ "${SA_DEAD_BEFORE:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder preflight: INTFER_SPEC_ADAPT absent" >&2; PASS=0; }
+      perl -0777 -pi -e 's/std::getenv\("INTFER_SPEC_ADAPT"\) != nullptr/false/' "$SA_SB/main.cpp"
+      SA_DEAD_AFTER="$(grep -ac 'INTFER_SPEC_ADAPT' "$SA_SB/main.cpp")"
+      [ "${SA_DEAD_AFTER:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (flag read still present)" >&2; PASS=0; }
+      grep -aq 'INTFER_SPEC_ADAPT' "$SA_SB/main.cpp" \
+        && { echo "GATE FAIL: arm ACCEPTED a source where INTFER_SPEC_ADAPT is dead" >&2; PASS=0; }
+      rm -rf "$SA_SB"
+
+    # --- INTFER_SSM_FUSE_ANNOUNCE_EVERY certification (opt-in: every-launch ssm-fuse announcement) --
+      # quant_gemm.cpp ssm_fuse_announce() prints a once-per-process [ssm-fuse] line;
+      # INTFER_SSM_FUSE_ANNOUNCE_EVERY=1 disables the latch and prints every launch.
+      # STRUCTURAL (no model, no GPU). Certifies the flag read, the once-only latch,
+      # and the [ssm-fuse] announcement tag.
+      SSA_SRC="$ROOT/src/gemm/quant_gemm.cpp"
+      grep -aq 'ssm_fuse_announce' "$SSA_SRC" \
+        || { echo "GATE FAIL: ssm_fuse_announce not found in quant_gemm.cpp" >&2; PASS=0; }
+      grep -aq 'INTFER_SSM_FUSE_ANNOUNCE_EVERY' "$SSA_SRC" \
+        || { echo "GATE FAIL: INTFER_SSM_FUSE_ANNOUNCE_EVERY is not read" >&2; PASS=0; }
+      grep -aq 'std::set<std::string> seen' "$SSA_SRC" \
+        || { echo "GATE FAIL: ssm_fuse_announce once-only latch missing" >&2; PASS=0; }
+      grep -aq 'ssm-fuse' "$SSA_SRC" \
+        || { echo "GATE FAIL: ssm-fuse announcement tag missing" >&2; PASS=0; }
+      # *** REFUSAL DIRECTION ***: replace the flag read with false -> dead knob.
+      SSA_SB="$(mktemp -d)"
+      cp "$SSA_SRC" "$SSA_SB/quant_gemm.cpp"
+      SSA_DEAD_BEFORE="$(grep -ac 'INTFER_SSM_FUSE_ANNOUNCE_EVERY' "$SSA_SB/quant_gemm.cpp")"
+      [ "${SSA_DEAD_BEFORE:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder preflight: INTFER_SSM_FUSE_ANNOUNCE_EVERY absent" >&2; PASS=0; }
+      perl -0777 -pi -e 's/std::getenv\("INTFER_SSM_FUSE_ANNOUNCE_EVERY"\) != nullptr/false/' "$SSA_SB/quant_gemm.cpp"
+      SSA_DEAD_AFTER="$(grep -ac 'INTFER_SSM_FUSE_ANNOUNCE_EVERY' "$SSA_SB/quant_gemm.cpp")"
+      [ "${SSA_DEAD_AFTER:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (flag read still present)" >&2; PASS=0; }
+      grep -aq 'INTFER_SSM_FUSE_ANNOUNCE_EVERY' "$SSA_SB/quant_gemm.cpp" \
+        && { echo "GATE FAIL: arm ACCEPTED a source where INTFER_SSM_FUSE_ANNOUNCE_EVERY is dead" >&2; PASS=0; }
+      rm -rf "$SSA_SB"
+
+    # --- INTFER_TIMELINE certification (opt-in: device-timeline markers) --
+      # engine.cpp timeline_mark() reads INTFER_TIMELINE and submits 1-work-item
+      # empty kernels as region markers; main.cpp calls timeline_dump() at the end
+      # of the run. STRUCTURAL (no model, no GPU). Certifies the flag read, the
+      # timeline_dump call, and the [timeline] announcement.
+      TL_ENGINE="$ROOT/src/engine/engine.cpp"
+      TL_MAIN="$ROOT/examples/intfer_cli/main.cpp"
+      grep -aq 'INTFER_TIMELINE' "$TL_ENGINE" \
+        || { echo "GATE FAIL: INTFER_TIMELINE is not read in engine.cpp" >&2; PASS=0; }
+      grep -aq 'timeline_dump' "$TL_MAIN" \
+        || { echo "GATE FAIL: timeline_dump not called in main.cpp" >&2; PASS=0; }
+      grep -aq '\[timeline\]' "$TL_ENGINE" \
+        || { echo "GATE FAIL: [timeline] announcement missing in engine.cpp" >&2; PASS=0; }
+      grep -aq 'g_timeline_on' "$TL_ENGINE" \
+        || { echo "GATE FAIL: g_timeline_on flag missing in engine.cpp" >&2; PASS=0; }
+      # *** REFUSAL DIRECTION ***: replace the flag read with nullptr -> dead knob.
+      TL_SB="$(mktemp -d)"
+      cp "$TL_ENGINE" "$TL_SB/engine.cpp"
+      TL_DEAD_BEFORE="$(grep -ac 'INTFER_TIMELINE' "$TL_SB/engine.cpp")"
+      [ "${TL_DEAD_BEFORE:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder preflight: INTFER_TIMELINE absent" >&2; PASS=0; }
+      perl -0777 -pi -e 's/std::getenv\("INTFER_TIMELINE"\) != nullptr/false/' "$TL_SB/engine.cpp"
+      TL_DEAD_AFTER="$(grep -ac 'INTFER_TIMELINE' "$TL_SB/engine.cpp")"
+      [ "${TL_DEAD_AFTER:-0}" -ge 1 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (flag read still present)" >&2; PASS=0; }
+      grep -aq 'INTFER_TIMELINE' "$TL_SB/engine.cpp" \
+        && { echo "GATE FAIL: arm ACCEPTED a source where INTFER_TIMELINE is dead" >&2; PASS=0; }
+      rm -rf "$TL_SB"
 
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
+# *** PASS -> EXIT (2026-10-15). *** Appended AFTER the rm so the conversion is
+# the last statement and the trailing-rm escape hatch (a conversion above the
+# rm means exit 0 on FAIL) is closed. run_ten_gates.sh classifies by exit code
+# (rc 0 -> GPASS, :79), so without this line the gate reported PASS with EVERY
+# arm failing.
+if [ "$PASS" = 1 ]; then echo "TP2-27B TEST: PASS"; else echo "TP2-27B TEST: FAIL" >&2; exit 1; fi
