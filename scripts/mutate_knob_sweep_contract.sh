@@ -214,7 +214,12 @@ no-op is exit 4, never exit 0 -- the #36 vacuous-green shape.
 import sys
 
 ANCHOR = "# ---- RESIDUE. The live subject"
-PLANT = 'echo "# ks-resid-plant" >> "$LIVE"'
+# THE WORDING IS LOAD-BEARING, NOT DECORATIVE. The recorded pair's second sha is
+# the subject's bytes after THIS comment was appended, so re-wording the plant
+# changes the measured pair and the equivalence check refuses -- correctly. Restoring
+# the historical wording re-derives the recorded measurement; rewriting the record to
+# match a new wording would be moving the durable number to agree with the tool.
+PLANT = 'echo "# residue negative-direction plant" >> "$LIVE"'
 
 
 def main(argv):
@@ -508,10 +513,17 @@ AFTER="$(sha256sum "$LIVE" | cut -d' ' -f1)"
 if [ "$AFTER" != "$BEFORE" ]; then
   die "the live subject CHANGED during the matrix (sha $BEFORE -> $AFTER)"
 fi
-# knob_sweep.sh is UNTRACKED in this repo's standing state (registered in
-# run_all_checks.sh but never committed, per the standing no-commit rule), so git
-# status reports it as '??'; that is expected and filtered. The sha assertion
-# above is the real residue check -- a byte comparison, not a status reading.
+# [SUPERSEDED 2026-10-18 by the operator's commit 530f61f, recorded not deleted]
+# This comment used to read: knob_sweep.sh is UNTRACKED in this repo's standing
+# state (registered in run_all_checks.sh but never committed, per the standing
+# no-commit rule), so git status reports it as '??'; that is expected and filtered.
+# That was true when written and is no longer true: the operator committed the
+# whole harness -- checkers, mutators and knob_sweep.sh itself -- at 530f61f while
+# this session was running, so the file is TRACKED at HEAD and the filter below is
+# a no-op. It is kept anyway, because it masks nothing: a modified TRACKED file
+# reports ' M' and never '??', so an actual working-tree edit still fires. The sha
+# assertion above remains the real residue check -- a byte comparison, not a status
+# reading, which is why this check did not notice the commit that made it stale.
 if [ -n "$(cd "$ROOT" && git status --porcelain -- scripts/knob_sweep.sh 2>/dev/null | grep -v '^??')" ]; then
   die "git reports a TRACKED-file change under scripts/knob_sweep.sh"
 fi

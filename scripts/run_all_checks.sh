@@ -395,6 +395,51 @@ dispatch() { # $1 = label -> runs it
        # Runs BEFORE check_scripts_live.sh so its presence does not count as an
        # unreachable script.
        timeout -k 30 600 bash "$SCRIPT_DIR/check_knob_sweep_contract.sh"; return $? ;;
+    check_durable_claims.sh)
+       # SOURCE-level certification of the DURABLE RECORDS -- that every figure
+       # they assert in prose is either re-derivable or explicitly marked not.
+       # No GPU, no model, no build: the subject is HISTORY.md plus
+       # engines_sources.txt as TEXT, and the sha of the scripts the records cite.
+       #
+       # WHY IT EXISTS. The residue-pair episode (2026-10-18): HISTORY.md asserted
+       # a 12-state re-measurement whose SECOND sha appeared in no artifact
+       # anywhere. It was retracted and re-measured, and the mutator now re-derives
+       # the pair itself -- which fixed ONE figure. This checker generalises it:
+       # every sha pair, every matrix tally, every run-result tally and every
+       # /var/tmp citation is a claim whose artifact may not have survived the
+       # reboot, so "the log said so" quietly becomes "remember so". MEASURED,
+       # not asserted: its first full run harvested 11 citations and 7 tallies and
+       # refused ALL of them, which is why those are now marked -- and the classes
+       # have since widened to FOUR harvested families (12 predicates) with the
+       # residue class counted and reconciled against a recorded census, so the
+       # boundary is itself a gate. Its sibling check_tally_propagation.sh asks the
+       # complementary question (is the marker the RIGHT one for this claim).
+       #
+       # THE CONVENTION, with no third state: REGEN(<command>) -- the command that
+       # regenerates the artifact -- or EPHEMERAL(<why>) -- it cannot be, and the
+       # reason is part of the claim. An undisposed figure is REFUSED, never
+       # assumed. Harvest counts are printed and a zero harvest FAILS, so
+       # "0 findings" is distinguishable from "looked at nothing"; the tally
+       # harvest is case-insensitive because history.md records one as lowercase.
+       # Runs BEFORE check_scripts_live.sh so its presence does not count as an
+       # unreachable script.
+       timeout -k 30 600 bash "$SCRIPT_DIR/check_durable_claims.sh"; return $? ;;
+    check_tally_propagation.sh)
+       # SOURCE-level certification of a DIFFERENT question from the checker above:
+       # not "does this tally carry a marker" but "does the marker re-derive THIS
+       # tally". Measured: a line recording mutate_fold_matrix.sh's 7/7 marked
+       # REGEN(bash scripts/mutate_tp2_pass_exit.sh) satisfies check_durable_claims.sh
+       # twice over -- p_tally_regen sees a disposition and p_target_exists sees a
+       # script that exists -- while re-running the marker re-derives another matrix
+       # entirely. That is the propagation defect: the re-measurement never reached
+       # the site that records it. The sweep harvests every tally/run-result site that
+       # NAMES a script and requires the disposition to be EPHEMERAL(<why>) or a REGEN
+       # naming THAT script, prints sites=/named=/self=/ephemeral=/unnamed=, and
+       # refuses a run in which no site named a script (the vacuity guard). Text only:
+       # no GPU, no model, no build, and mutators are never executed.
+       # Runs BEFORE check_scripts_live.sh so its presence does not count as an
+       # unreachable script.
+       timeout -k 30 600 bash "$SCRIPT_DIR/check_tally_propagation.sh"; return $? ;;
     check_scripts_live.sh)
       # MEASURED 2026-10-05, not predicted: a full reference-graph derivation of
       # scripts/ found SIXTEEN entries that no code referenced -- a superseded
@@ -656,6 +701,37 @@ dispatch() { # $1 = label -> runs it
        # against the live source) BEFORE it is graded, so a no-op mutation is
        # reported vacuous instead of counted as a catch.
        timeout -k 30 900 bash "$SCRIPT_DIR/mutate_s1_predicates.sh"; return $? ;;
+    mutate_durable_claims.sh)
+       # SIXTEEN states, but the subject is a TEMP ROOT rather than a temp copy of
+       # one file: the checker's subject is HISTORY.md + engines_sources.txt plus
+       # the sha of every script in scripts/, so the matrix stamps a complete fake
+       # root and grades the checker against that. Mutating the live records in
+       # place would rewrite the very history this checker exists to protect, so
+       # they are only ever READ (copied in), and the residue assertion at the end
+       # proves they came out byte-identical.
+       #
+       # Three states carry the anti-vacuity teeth: DC-no-cites and DC-no-tallies
+       # erase their whole harvest and must FAIL on the zero-harvest guard rather
+       # than on a later predicate (a state that passes by tripping something it
+       # was not planted for is caught by the "CAUGHT FOR THE WRONG REASON" report,
+       # which fires on the harvested predicate name). DC-fake-before forges the
+       # pair's BEFORE sha, which a text-level checker can see outright.
+       # Each state asserts it LANDED with cmp before grading, so a no-op is
+       # reported unlanded rather than counted as a catch. No GPU, no model, no
+       # build, and the live records are never modified.
+       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_durable_claims.sh"; return $? ;;
+    mutate_tally_propagation.sh)
+       # FOUR states on a TEMP ROOT of the durable records (text-only -- the sweep
+       # resolves no script, so copying scripts/ would be a fiction). TP-wrong-target
+       # swaps the fold-matrix marker for another REAL script, which no other
+       # predicate can see: the marker is present and its target exists and the record
+       # is still wrong. TP-undisposed strips the marker from a named site.
+       # TP-unnamed erases every subject name (the rule cannot be applied to a line
+       # that names nothing) and TP-no-sites empties the harvest outright -- the two
+       # anti-vacuity halves, which must FAIL rather than pass over an empty
+       # population. Every state cmp-asserts it LANDED before grading, and the residue
+       # half proves the live records were never modified.
+       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_tally_propagation.sh"; return $? ;;
     mutate_knob_sweep_contract.sh)
        # TWELVE states, each planting ONE structural defect into a temp copy of
        # scripts/knob_sweep.sh (NOT a synthetic log -- a log built from the fixed
@@ -1037,7 +1113,7 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_decode1_shipped_anchor.sh check_s1_predicates.sh check_knob_sweep_contract.sh check_tp2_pass_exit.sh check_gate_exit_verdict.sh check_flag_gate_coverage.sh check_hw_constants.sh check_dpas_shape_audit.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_scripts_live.sh check_pipefail_grep_q.sh"
+  STEPS="gate_inventory.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_decode1_shipped_anchor.sh check_s1_predicates.sh check_knob_sweep_contract.sh check_durable_claims.sh check_tally_propagation.sh check_tp2_pass_exit.sh check_gate_exit_verdict.sh check_flag_gate_coverage.sh check_hw_constants.sh check_dpas_shape_audit.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_scripts_live.sh check_pipefail_grep_q.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   # A REAL gate, but it needs a GPU and takes ~30 s, so it sits in the
   # same INTFER_QUICK-off band as check_l0_cite.sh. Quick mode is meant to be
@@ -1057,7 +1133,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS knob_sweep.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_tp2_pass_exit.sh mutate_gate_exit_verdict.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_s1_predicates.sh mutate_knob_sweep_contract.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh mutate_pipefail_grep_q.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_tp2_pass_exit.sh mutate_gate_exit_verdict.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_s1_predicates.sh mutate_knob_sweep_contract.sh mutate_durable_claims.sh mutate_tally_propagation.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh mutate_pipefail_grep_q.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------

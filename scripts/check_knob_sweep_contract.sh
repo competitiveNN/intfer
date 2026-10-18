@@ -15,8 +15,11 @@
 # guards at source, with no execution and no GPU -- and the sweep's own numbers
 # stay UNMEASURED on purpose, for the operator.
 #
-# THE ELEVEN PREDICATES. Each refuses the shape of a defect that was actually
-# planted and measured (mutate_knob_sweep_contract.sh):
+# THE TWELVE PREDICATES. Each refuses the shape of a defect that was actually
+# planted and measured (mutate_knob_sweep_contract.sh). The count is DERIVED, not
+# remembered: it must equal the number of `note p_` sites this file emits and the
+# `evaluated=` line below, which is what the stale "ELEVEN" here actually was -- the
+# list had twelve entries and the title disagreed with itself:
 #   p_knob_catalog   the 3 geometry knobs are the default catalogue (KS-catalog)
 #   p_knob_override  INTFER_SWEEP_KNOBS overrides that catalogue  (KS-override)
 #   p_baseline_first the baseline runs before every combo          (KS-baseline)
