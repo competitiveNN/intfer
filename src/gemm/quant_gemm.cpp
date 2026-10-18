@@ -456,7 +456,67 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
   // output for a single row. A flat 1D kernel with one output element per
   // work-item is far more efficient for decode.
   if (M == 1) {
-    constexpr int nWG = kThr;
+    // INTFER_DECODE1_WG (default 0 => kThr=16, the shipped value): work-group
+    // width for the M=1 decode path. The scalar arms below (VERBHALF, VERBMP,
+    // VERBDEAD, VERBSEL, VERBVEC, WVEC, MR -- every arm with NO local_accessor)
+    // are a PURE MAP over the output element ng: one work-item per ng, each
+    // work-item writes exactly out_usm[ng], no cross-WI reduction and no shared
+    // state. So nWG is a pure SCHEDULING parameter -- every output element is
+    // written by exactly one work-item regardless of the group width, and the
+    // FP32 accumulation order inside each work-item is unchanged. BIT-EXACT BY
+    // CONSTRUCTION, the same partition argument as INTFER_DPAS48_WG (quant_
+    // gemm.cpp:3378) and INTFER_LMHEAD_TILE_ROWS (main.cpp:1667).
+    //
+    // The B580 has 20 Xe cores / 256 EU against the hardcoded 16; this is the
+    // DECODE analogue of the prefill lever INTFER_DPAS48_WG, and it is a
+    // dispatch knob with no numerics contract -- UNMEASURED, operator-only.
+    //
+    // *** SPLITK composition, and why it is NOT a bit-exact concern. *** The one
+    // arm that uses a local_accessor reduction (SPLITK,
+    // quant_gemm.cpp:1702) derives its partial count S from nWG, so composing
+    // this flag with INTFER_DECODE1_SPLITK=1 changes S. That arm is already
+    // tolerance-gated (NOT bit-exact by contract; the ascending-combine
+    // contract is measured by examples/ksplit_contract) and already
+    // default-OFF and MEASURED-LOSS, so the composition stays inside its
+    // existing contract class -- more/fewer partials, same ascending combine.
+    // The gate arm runs on the DEFAULT path (VERBHALF), where the claim holds
+    // exactly, so the composition needs no separate certification.
+    int nWG = kThr;
+    if(const char* wg_env = std::getenv("INTFER_DECODE1_WG")){
+      long v = std::atol(wg_env);
+      if(v > 0) nWG = (int)v;
+    }
+    // THE PATH ANNOUNCES ITSELF, ONCE -- AND ONLY WHEN THE FLAG IS SET.
+    // Same shape as the [dpas48-wg] line and every decode1_* latch: a
+    // base-vs-flagged stream comparison is satisfiable by a flag that never
+    // reached the branch (the partition is exact, so the two streams are
+    // identical by construction), so the arm asserts the WIDTH the kernel
+    // actually used rather than a constant.
+    //
+    // *** WHY THE ANNOUNCEMENT IS GATED ON THE ENV, NOT UNCONDITIONAL. ***
+    // Unlike INTFER_DPAS48_WG (whose line lives INSIDE run_linear_tp's
+    // dpas48 branch, reachable only under the INTFER_DPAS48=1 path selector,
+    // so it cannot fire on a base run), THIS knob rides the DEFAULT decode
+    // path with no selector -- so an unconditional once-per-process
+    // announcement prints on the BASE run too. MEASURED DEFECT, 2026-10-15:
+    // that was exactly what it did, and scripts/test_rowpair_equiv.sh went
+    // red on all eight arms with "base printed a marker but no arm was
+    // selected: [decode1-wg]" -- the gate's marker contract is that the base
+    // order prints NO [decode1-*] marker, because a marker on base is an arm
+    // that ran when none was selected. Gating on presence of the env restores
+    // both halves at once: the line is now a genuine reachability marker (it
+    // CANNOT print unless the flag exists), and base stays quiet.
+    if(const char* wg_env = std::getenv("INTFER_DECODE1_WG")){
+      static bool announced_wg = false;
+      if(!announced_wg){
+        announced_wg = true;
+        std::fprintf(stderr,
+                     "[decode1-wg] M=1 decode: work-group=%d "
+                     "(INTFER_DECODE1_WG=%s) ACTIVE (N=%d K=%d bits=%d)\n",
+                     nWG, wg_env, N, K, bits);
+        std::fflush(stderr);
+      }
+    }
     const int nBlocks = (N + nWG - 1) / nWG;
     const int global = nBlocks * nWG;
 
@@ -531,8 +591,23 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
     {
       const bool tab_m1 = (bits == 2 && use_int2_tab && num_groups > 0);
       const bool rp_ok  = (bits == 2 && (N & 1) == 0);
-      int no = 0; const char* on[2] = {nullptr, nullptr};
-      auto note_o = [&](const char* n) { on[no] = n; ++no; };
+      // *** THE ARRAY WAS SZED 2 AGAINST A POPULATION OF SEVEN. ***
+      // note_o is called by SEVEN guards below -- rowpair, verbdead,
+      // verbsel, verbvec, wvec, mr, splitk -- so a state with three or
+      // more live opt-in arms wrote past on[1] (an out-of-bounds stack
+      // store) AND the refusal named only the first two, hiding the
+      // third from the operator the message exists to inform. The size is
+      // therefore derived from the guards that feed it, note_o clamps
+      // the index, and the message enumerates every live arm. The default
+      // production state sets ZERO opt-in flags, so the refusal is
+      // unreachable on the hot path and this changes no arithmetic.
+      const char* on[8] = {nullptr, nullptr, nullptr, nullptr,
+                           nullptr, nullptr, nullptr, nullptr};
+      int no = 0;
+      auto note_o = [&](const char* n) {
+        if (no < 8) on[no] = n;
+        ++no;
+      };
       if (use_rowpair  && rp_ok)  note_o("INTFER_DECODE1_ROWPAIR");
       if (use_verbdead && tab_m1) note_o("INTFER_DECODE1_VERBDEAD");
       if (use_verbsel  && tab_m1) note_o("INTFER_DECODE1_VERBSEL");
@@ -541,13 +616,19 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
       if (use_mr       && tab_m1) note_o("INTFER_DECODE1_MR");
       if (use_splitk   && tab_m1) note_o("INTFER_DECODE1_SPLITK");
       if (no > 1) {
+        // Enumeration, not "%s and %s": with the OOB store fixed above,
+        // more than two live arms is now a reachable state, and a
+        // two-name message would under-report it -- the guard's whole
+        // job is that the operator sees every flag that is live.
         std::fprintf(stderr,
-                     "[decode1-bisect] REFUSING: %s and %s are both live and\n"
-                     "  both dispatch on this shape. The M=1 decode1 arms each\n"
+                     "[decode1-bisect] REFUSING: %d opt-in arms are live and\n"
+                     "  all dispatch on this shape. The M=1 decode1 arms each\n"
                      "  end in `return q.submit(...)`, so the EARLIEST one wins\n"
-                     "  and the later one is silently unreachable.\n"
-                     "  Exactly one opt-in arm at a time.\n",
-                     on[0], on[1]);
+                     "  and the later ones are silently unreachable:\n",
+                     no);
+        for (int i = 0; i < no && i < 8; ++i)
+          std::fprintf(stderr, "    %s\n", on[i]);
+        std::fprintf(stderr, "  Exactly one opt-in arm at a time.\n");
         return sycl::event();
       }
     }
@@ -2115,14 +2196,37 @@ void build_vnni_int8(const std::int8_t* w, std::int8_t* out,
 // ---------------------------------------------------------------------------
 namespace {
 
-// XMX tile configuration (ported from llama.cpp fused-gemm's
-// fg_combo<fg_half, fg_half, 16, 16, 32, 16>).
+// XMX tile configuration. TM=TN=16, SG=16 are the Xe2/3 native
+// sub-group size and the only accumulator width the hardware accepts.
+// TK is the K-width of each joint_matrix_mad step.
+//
+// *** TK=16, NOT 32. *** The first draft ported llama.cpp fused-gemm's
+// fg_combo<fg_half,fg_half,16,16,32,16> verbatim (TK=32, BK=64), and
+// the kernel threw on the very first launch on this box:
+//   "joint_matrix with parameters matrix_type::fp16, use::a, Rows=16,
+//    Cols=32 is not supported on this device"
+// i.e. joint_matrix<sub_group,half,use::a,16,32,row_major> and its
+// B-side twin <32,16,row_major> are both ILLEGAL on B580. Probed
+// exhaustively (examples/xmx_probe's companion probe): the legal
+// fp16 use::a combos are K=16 with M in {1,2,4,8,16,32} and K=32 with
+// M=1 only; use::b is K=16 N=16 only. So the whole TK=32 axis is
+// unsupported here -- it is a Xe2/Xe3-H (512 EU) shape, and B580 is
+// Xe2-S (256 EU). TK=16, BK=32 (2 steps per BK tile) is the widest
+// legal combo and is what ships.
 struct xmx_tile_cfg {
-  static constexpr int TM = 16;  // output rows per sub-group
-  static constexpr int TN = 16;  // output cols per sub-group
-  static constexpr int TK = 32;  // K per inner step
-  static constexpr int SG = 16;  // sub-group size (Xe2/3 native)
-  static constexpr int BK = 64;  // K per SLM tile (2 x TK steps)
+static constexpr int TM = 16;  // output rows per sub-group
+static constexpr int TN = 16;  // output cols per sub-group
+static constexpr int TK = 16;  // K per inner step (B580 legal width)
+static constexpr int SG = 16;  // sub-group size (Xe2/3 native)
+static constexpr int BK = 32;  // K per SLM tile (2 x TK steps)
+// Work-group COUNT the work-stealing scheduler caps the launch at when
+// INTFER_XMX_TILE_SCHED is set. Named, not a literal, because
+// examples/xmx_probe --steal asserts sum(tile_ctr) == n_tiles + this value
+// and a silent change to the literal silently breaks the probe. Named the
+// same magnitude as SG by design: one sub-group per WG, and 16 groups on a
+// B580 (20 Xe cores / 160 CUs) is the saturation floor the scheduler exists
+// to exceed.
+static constexpr int kXmxSchedWG = 16;
 };
 
 }  // namespace
@@ -2134,6 +2238,7 @@ sycl::event quant_gemm_forward_usm_xmx(
     uint32_t M, uint32_t N, uint32_t K,
     uint32_t group_size, gemm::WeightScheme scheme,
     const sycl::event& copy_dep,
+    bool* ran,
     std::uint32_t* tile_ctr) {
   if (scheme == gemm::WeightScheme::FP16) return sycl::event{};
   const int bits = (scheme == gemm::WeightScheme::INT2) ? 2
@@ -2176,8 +2281,64 @@ sycl::event quant_gemm_forward_usm_xmx(
   // (bm = claimed_tile / gy, bn = claimed_tile % gy) compute the same
   // dot products in the same order, only differing in WHICH tile each
   // sub-group computes.
+  // *** THE nWG FALLBACK MUST REMEMBER tile_sched (regression, fixed here). ***
+  // INTFER_XMX_TILE_SCHED's contract is "launches ONLY nWG work-groups
+  // (default 16) regardless of n_tiles" (the comment above), and examples/
+  // xmx_probe --steal asserts that contract: sum(tile_ctr) == n_tiles + nWG
+  // with nWG hardcoded to 16 the way the scheduler's own design states. An
+  // earlier revision derived `nWG = xmx_wg_active ? nWG_raw : n_tiles`, so
+  // with INTFER_XMX_TILE_SCHED set alone the launch widened to n_tiles groups
+  // and every sub-group claimed exactly one tile -- the work-stealing
+  // degenerated into fixed assignment plus n_tiles atomics, the measured
+  // claim counter read 64 (= 32 + 32) against the bound [32, 48], and the
+  // persistent-kernel pattern the flag exists for was silently defeated.
+  // The output stayed bit-exact, so ONLY the counter could see it. Hence the
+  // fallback: tile_sched still caps at 16, and xmx_wg_active keeps its own
+  // override (a positive value below n_tiles) on top of it.
   const bool tile_sched = (std::getenv("INTFER_XMX_TILE_SCHED") != nullptr);
-  const uint32_t nWG = tile_sched ? 16u : static_cast<uint32_t>(n_tiles);
+  // *** INTFER_XMX_WG (2026-10-15): work-group COUNT for the XMX kernel. ***
+  // Default 0 => n_tiles (one sub-group per tile, the shipped fixed-assignment
+  // geometry). A positive value caps the launch at that many work-groups and
+  // switches on the work-stealing scheduler (fewer groups than tiles means
+  // groups must claim multiple tiles, which only the scheduler path supports).
+  // The scheduler is a pure DISPATCH change (each tile computes the same dot
+  // products in the same order; fixed-assignment and work-stealing share the
+  // same process_tile body, quant_gemm.cpp:2288), so this is BIT-EXACT BY
+  // CONSTRUCTION -- no numerics contract. The B580 has 20 Xe cores / 160 CUs;
+  // the shipped n_tiles is often far below that (prefill M=128, N=4352 =>
+  // 8x272 = 2176 tiles, which is 136x the 16-group floor), so a cap is the
+  // decode-analogue of INTFER_DECODE1_WG and the prefill analogue of
+  // INTFER_DPAS48_WG. Unlike those two this rides the XMX path, so it needs
+  // NO path selector -- the kernel declines non-eligible shapes before the
+  // dispatch geometry is consulted.
+  //
+  // *** WHY IT IS NOT MERGED WITH INTFER_XMX_TILE_SCHED. *** Both knobs move
+  // nWG, and either alone implies the other (nWG < n_tiles forces work-stealing
+  // or tiles are re-run). They are kept separate because the gate arm asserts
+  // the scheduler state the kernel actually used: INTFER_XMX_TILE_SCHED's arm
+  // asserts "OFF / fixed-assignment" with nWG == n_tiles, and a combined knob
+  // would make that arm unsatisfiable whenever the width flag was set. Two
+  // knobs, two arms, each asserting its own observable.
+  //
+  // *** xmx_wg_active IS TRUE ONLY WHEN THE CAP ACTUALLY BITES. *** A value
+  // >= n_tiles is a no-op (nWG falls back to n_tiles, the launch is the
+  // default fixed-assignment geometry), so it must NOT switch the scheduler
+  // on and must NOT announce -- otherwise an operator setting
+  // INTFER_XMX_WG=999999 (a "I want everything" value) would get a
+  // work-stealing launch and a misleading announcement for a run that is
+  // byte-for-byte the default. The gate arm asks for a cap below n_tiles, so
+  // this is the shape it certifies; the refusal direction is the no-op value.
+  const uint32_t nWG_raw =
+      (std::getenv("INTFER_XMX_WG") != nullptr)
+          ? static_cast<uint32_t>(std::atol(std::getenv("INTFER_XMX_WG")))
+          : 0u;
+  const bool xmx_wg_active =
+      (nWG_raw > 0 && nWG_raw < static_cast<uint32_t>(n_tiles));
+  const uint32_t nWG = xmx_wg_active ? nWG_raw
+                                     : (tile_sched
+                                            ? xmx_tile_cfg::kXmxSchedWG
+                                            : static_cast<uint32_t>(n_tiles));
+  const bool tile_sched_effective = tile_sched || xmx_wg_active;
   const uint32_t n_tiles_u = static_cast<uint32_t>(n_tiles);
 
   // Work-group: one sub-group per tile (SG threads), SG lanes per sub-group.
@@ -2185,7 +2346,10 @@ sycl::event quant_gemm_forward_usm_xmx(
   sycl::nd_range<1> nd(sycl::range<1>(nWG * SG),
                        sycl::range<1>(SG));
 
-  return q.submit([&](sycl::handler& h) {
+  // Capture the event rather than returning the submit() result directly,
+  // so `ran` can be set: the caller must know whether a real submission
+  // happened (a null event here means the output was never written).
+  sycl::event xmx_evt = q.submit([&](sycl::handler& h) {
     if (copy_dep != sycl::event{}) h.depends_on(copy_dep);
     // SLM: dequantized weight tile [BK x TN] (k-major, so a
     // row_major joint_matrix load reads it as [TK x TN] per step).
@@ -2287,22 +2451,55 @@ sycl::event quant_gemm_forward_usm_xmx(
       };  // process_tile
 
       // ---- DISPATCH: work-stealing vs fixed-assignment. ----
-      if (!tile_sched) {
-        // Fixed assignment: WG (bm, bn) does tile (bm, bn).
-        const int bm = it.get_group(0);
-        const int bn = it.get_group(1);
+      // tile_sched_effective is true when EITHER knob requested it
+      // (INTFER_XMX_TILE_SCHED, or INTFER_XMX_WG capping the group count
+      // below n_tiles). Both paths share process_tile, so the output is
+      // bit-exact either way -- the predicate only changes WHICH tile each
+      // sub-group computes.
+      if (!tile_sched_effective) {
+        // Fixed assignment: WG g does tile (bm, bn) where
+        // g is the LINEAR work-group id. The range is nd_range<1>
+        // (one sub-group per tile), so get_group() has exactly one
+        // dimension -- the first draft read it.get_group(1), which
+        // is an out-of-range dimension on a 1D range (undefined
+        // behaviour) and faulted the device with
+        // UR_RESULT_ERROR_DEVICE_LOST on the very first launch.
+        // Derive (bm, bn) from the single group index instead.
+        const int g = static_cast<int>(it.get_group(0));
+        const int bm = g / gy;
+        const int bn = g % gy;
         if (bm < gx && bn < gy) process_tile(bm, bn);
       } else {
         // Work-stealing: lane 0 claims the next tile, all SG lanes
-        // process it via broadcast. The counter is one uint32_t
-        // in global USM, 0-init by the caller. fetch_add returns the
-        // pre-increment value -- "claimed" iff old < n_tiles.
-        // memory_scope::work_group is correct here: the counter is
-        // device USM but the atomic is scoped to the work-group
-        // (one sub-group per WG, so this is the only scope that
-        // matters -- device-wide would serialize across groups).
+        // process it via broadcast. The counter is ONE uint32_t
+        // in global USM shared by every work-group, 0-init by
+        // the caller. fetch_add returns the pre-increment value
+        // -- "claimed" iff old < n_tiles.
+        //
+        // *** THE SCOPE IS DEVICE, NOT WORK_GROUP. *** This was
+        // a real bug, and it is invisible in the output: the
+        // counter is GLOBAL USM shared across all work-groups,
+        // so a work_group-scoped atomic has NO cross-group
+        // ordering guarantee. Every work-group reads the same
+        // pre-inc value, writes the same post-inc value, and the
+        // update is lost -- the claim degenerates and tiles are
+        // re-run. The OUTPUT can still come out bit-exact (the
+        // same tile computed twice is the same result), so the
+        // race is detectable ONLY in the claim counter, which is
+        // why the probe asserts sum == n_tiles.
+        //
+        // The counter is a single shared address (tile_ctr[0]),
+        // NOT one slot per work-group: a per-WG slot would make
+        // every work-group claim the same tiles independently
+        // (measured: n_tiles=32, nWG=16 -> sum=528 = 16 x 33,
+        // min=33, every tile claimed 16 times). The earlier
+        // comment ("device-wide would serialize across groups")
+        // mistook correctness for cost -- serialization on one
+        // address is the whole point of a claim counter, and one
+        // atomic per claimed tile is negligible next to a GEMM
+        // tile.
         static constexpr auto RELAXED = sycl::memory_order::relaxed;
-        static constexpr auto SCOPE = sycl::memory_scope::work_group;
+        static constexpr auto SCOPE = sycl::memory_scope::device;
         while (true) {
           tile_buf[0] = -1;
           it.barrier();
@@ -2322,6 +2519,39 @@ sycl::event quant_gemm_forward_usm_xmx(
       }
     });
   });
+  // *** THE PATH ANNOUNCES ITSELF, ONCE. *** Same shape as the [decode1-wg]
+  // line (quant_gemm.cpp:494) and the [xmx-tile-sched] line the engine emits:
+  // a base-vs-flagged stream comparison is satisfiable by a flag that never
+  // reached the branch (the scheduler is a pure dispatch change, so the two
+  // streams are bit-identical by construction), so the arm asserts the WIDTH
+  // and the scheduler state the kernel ACTUALLY used rather than a constant.
+  // Gated on xmx_wg_active (the flag was read AND the cap actually bit --
+  // a value >= n_tiles is a no-op and must not announce), not on
+  // tile_sched_effective: the scheduler may be on for its own reasons
+  // (INTFER_XMX_TILE_SCHED), and this line must not fire then -- the
+  // [xmx-tile-sched] arm asserts scheduler OFF with nWG==n_tiles, so a line
+  // here would make that arm's "OFF" assertion unsatisfiable whenever the
+  // width flag was also set. Two knobs, two announcements, each asserting
+  // its own observable.
+  if (xmx_wg_active) {
+    static bool announced_xmx_wg = false;
+    if (!announced_xmx_wg) {
+      announced_xmx_wg = true;
+      std::fprintf(stderr,
+                   "[xmx-wg] XMX work-group count=%u "
+                   "(INTFER_XMX_WG=%s) scheduler=%s n_tiles=%u "
+                   "(%s work-stealing)\n",
+                   nWG,
+                   std::getenv("INTFER_XMX_WG") ?
+                       std::getenv("INTFER_XMX_WG") : "0",
+                   tile_sched_effective ? "ACTIVE" : "OFF",
+                   n_tiles_u,
+                   tile_sched_effective ? "persistent" : "fixed-assignment");
+      std::fflush(stderr);
+    }
+  }
+  if (ran) *ran = true;
+  return xmx_evt;
 }
 
 
@@ -2337,7 +2567,7 @@ sycl::event quant_gemm_forward_usm_gateup(
     uint32_t group_size,
     uint32_t start_g, uint32_t Nl_g, uint32_t start_u, uint32_t Nl_u,
     gemm::WeightScheme scheme_g, gemm::WeightScheme scheme_u,
-    const sycl::event& copy_dep) {
+    const sycl::event& copy_dep, bool compact) {
   if (M == 0 || K == 0 || (Ng == 0 && Nu == 0)) return sycl::event();
   if (group_size == 0) group_size = K;
   const int Gw = static_cast<int>(group_size);
@@ -2454,14 +2684,241 @@ sycl::event quant_gemm_forward_usm_gateup(
                   acc += av * scale * canon_value(bits, code);
                 }
               }
-              outp[(std::size_t)m * (is_up ? Nu : Ng) + out_ng] =
-                  to_half_bits(acc);
+              // *** STORE LAYOUT IS PER-MODE, AND IT IS THE ONLY THING THAT
+              // CHANGES. *** compact=true writes the device's own slice
+              // compactly (outp[m*Nl + local], Nl = Nl_g for gate / Nl_u for
+              // up) so the downstream silumul_to_half kernel can read it as one
+              // contiguous [M*inter] buffer; compact=false (the default) writes
+              // GLOBAL-SCATTER into a full-width buffer (outp[m*(is_up?Nu:Ng)
+              // + out_ng]) so the host readback can pick this device's slice
+              // out of it. The accumulator, the kg/j element order and the
+              // wtab are identical in both modes, so the two forms agree on
+              // every column this device owns.
+              const uint32_t Nl = is_up ? Nl_u : Nl_g;
+              const std::size_t store_off =
+                  compact ? (std::size_t)m * Nl + local
+                          : (std::size_t)m * (is_up ? Nu : Ng) + out_ng;
+              outp[store_off] = to_half_bits(acc);
             }
           });
     });
   }
 
   return sycl::event();
+}
+
+// *** INTFER_MLP_GATEUP_SILUMUL_FUSE (2026-10-14). ***
+// Fused gate+up GEMM + silu(gate)*up epilogue in ONE launch.
+// Default OFF (INTFER_MLP_GATEUP_SILUMUL_FUSE, presence spells).
+//
+// Removes the separate silumul_to_half launch: with the flag set the
+// per-device chain is ONE launch (this kernel) instead of TWO (compact
+// gateup + silumul_to_half chained off its event), so 1 submit and 1
+// wait are removed per device per MLP layer. (The partial-down path has
+// NO D2H readback in either branch -- gate/up slots stay on device and
+// the host sums the down partials straight from USM -- so the win is
+// launch count, not transfer count.)
+//
+// BIT-IDENTITY CONTRACT. The accumulator, the kg/j element order and
+// the wtab are identical to the compact gateup kernel — only the
+// epilogue changes. silu(g) = g/(1+exp(-g)) is computed in FP32 with
+// sycl::exp (the same call site silumul_to_half uses), and the store
+// is to_half_bits (sycl::half RNE, bit-identical to silumul_to_half's
+// dev_float_to_half). So every element is the same as if the compact
+// gateup output had been fed through silumul_to_half. Stream-identity
+// gate is warranted.
+//
+// TP=2-VALID: per-device slice, no cross-device dependency, no P2P.
+// Only the INT2+INT2 body exists; any other scheme pair returns
+// sycl::event() and the caller keeps the two-launch path.
+//
+// The fused kernel is placed AFTER the compact gateup kernel (which it
+// is a strict superset of) so it can see to_half_bits, which is defined
+// at the top of this file.
+sycl::event quant_gemm_forward_usm_gateup_compact_silumul(
+    sycl::queue& q, std::uint16_t* act_usm,
+    const void* code_g, const std::uint16_t* scale_g, float alpha_g,
+    std::uint16_t* out_g,
+    const void* code_u, const std::uint16_t* scale_u, float alpha_u,
+    std::uint16_t* out_u,
+    uint32_t M, uint32_t Ng, uint32_t Nu, uint32_t K,
+    uint32_t group_size,
+    uint32_t start_g, uint32_t Nl_g, uint32_t start_u, uint32_t Nl_u,
+    gemm::WeightScheme scheme_g, gemm::WeightScheme scheme_u,
+    const sycl::event& copy_dep,
+    std::uint16_t* act_fp16) {
+  // *** INTFER_MLP_GATEUP_SILUMUL_FUSE dispatch. ***
+  // Each WI computes ONE local column's gate AND up dot products (gate and
+  // up are column-parallel over the SAME split on TP=2, so Nl_g == Nl_u and
+  // the dispatch is Nl_g WIs). The compact gateup kernel computes one column
+  // per WI too; this kernel does the same work twice in the same WI (one
+  // accumulator per output, ascending kg, ascending j, its own group scale
+  // and wtab), so the instruction stream is the compact kernel's plus a
+  // silu-mul. Nothing is summed across WIs. Stream-identity gate is
+  // warranted -- the compact gateup output is byte-identical and the fused
+  // act_fp16 is byte-identical to silumul_to_half's output.
+  //
+  // act_fp16 is M x (Nl_g + Nl_u) compact: gate columns 0..Nl_g-1, then up
+  // columns Nl_g..Nl_g+Nl_u-1, row-major. This is the SAME layout the
+  // silumul_to_half kernel would have produced from the compact gateup
+  // outputs (out_g is M*Nl_g, out_u is M*Nl_u, concatenated). The down GEMM
+  // reads ws_[d].act as M*inter with inter = Nl_g + Nl_u (the full inter on
+  // TP=2), so this is exactly the buffer it expects.
+  //
+  // Returns sycl::event() on any non-INT2+INT2 scheme pair; the caller keeps
+  // the two-launch path. Default OFF (INTFER_MLP_GATEUP_SILUMUL_FUSE).
+  if (scheme_g != WeightScheme::INT2 || scheme_u != WeightScheme::INT2) {
+    return sycl::event();
+  }
+  if (M == 0 || K == 0 || (Ng == 0 && Nu == 0)) return sycl::event{};
+  if (group_size == 0) group_size = K;
+  const int Gw = static_cast<int>(group_size);
+  const int num_groups = (static_cast<int>(K) + Gw - 1) / Gw;
+  if (num_groups <= 0) return sycl::event{};
+
+  // Dispatch same as compact gateup: one WI per (row m, local output ng).
+  // Each WI computes BOTH gate and up for its local column (gate and up are
+  // column-parallel over the SAME split on TP=2, so Nl_g == Nl_u).
+  constexpr int nWG = kThr;
+  const int total = static_cast<int>(Nl_g);
+  const int nBlocks = (total + nWG - 1) / nWG;
+  const int global = nBlocks * nWG;
+
+  const int bits = 2;
+  const int pack = 8 / bits;
+  const auto* code_g8 = static_cast<const std::uint8_t*>(code_g);
+  const auto* code_u8 = static_cast<const std::uint8_t*>(code_u);
+
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(copy_dep);
+    h.parallel_for<class gemm_usm_decode1_gateup_int2tab_silumul>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(nWG)),
+        [=](sycl::nd_item<1> it) {
+const int ng = static_cast<int>(it.get_global_id(0));
+          if (ng >= total) return;
+          // *** ONE WI PER LOCAL COLUMN, COMPUTING BOTH GATE AND UP. ***
+          // Gate and up are column-parallel over the SAME split (run_mlp_partial_down),
+          // so Nl_g == Nl_u on every reachable call and the dispatch is Nl_g WIs, each
+          // computing BOTH gate and up for its local column, sharing the activation
+          // load. This is the compact gateup's per-column work (one accumulator, one
+          // kg/j order, one wtab) done TWICE in the same WI, so the instruction
+          // stream is the compact kernel's plus a silu-mul; nothing is summed across
+          // WIs. Stream-identity gate is warranted.
+          const uint32_t local = static_cast<uint32_t>(ng);
+          const std::uint16_t* sptr_g =
+              scale_g + (std::size_t)local * num_groups;
+          const std::uint16_t* sptr_u =
+              scale_u + (std::size_t)local * num_groups;
+          const std::uint8_t* wrow_g = code_g8;
+          const std::uint8_t* wrow_u = code_u8;
+
+          for (int m = 0; m < static_cast<int>(M); ++m) {
+            float acc_g = 0.0f;
+            float acc_u = 0.0f;
+            const std::size_t act_off = (std::size_t)m * K;
+            sycl::multi_ptr<const std::uint16_t,
+                sycl::access::address_space::global_space> act_mp(act_usm);
+            for (int g = 0; g < num_groups; ++g) {
+              const float scale_g_val = from_half_bits(sptr_g[g]) * alpha_g;
+              const float wtab_g[4] = {scale_g_val * -1.0f,
+                                       scale_g_val * (-1.0f / 3.0f),
+                                       scale_g_val * (1.0f / 3.0f),
+                                       scale_g_val * 1.0f};
+              const float scale_u_val = from_half_bits(sptr_u[g]) * alpha_u;
+              const float wtab_u[4] = {scale_u_val * -1.0f,
+                                       scale_u_val * (-1.0f / 3.0f),
+                                       scale_u_val * (1.0f / 3.0f),
+                                       scale_u_val * 1.0f};
+              const int kg0 = g * Gw;
+              int kg1 = kg0 + Gw;
+              if (kg1 > static_cast<int>(K)) kg1 = static_cast<int>(K);
+              constexpr int CC = 8;
+              int kg = kg0;
+              std::size_t b0_g = ((std::size_t)local * K +
+                                  (std::size_t)kg) / (std::size_t)pack;
+              std::size_t b0_u = b0_g;
+              for (; kg + CC <= kg1; kg += CC) {
+                sycl::vec<std::uint16_t, 8> a16;
+                a16.load(0, act_mp + act_off + kg);
+                const std::uint8_t b0v_g = wrow_g[b0_g];
+                const std::uint8_t b1v_g = wrow_g[b0_g + 1];
+                const std::uint8_t b0v_u = wrow_u[b0_u];
+                const std::uint8_t b1v_u = wrow_u[b0_u + 1];
+                b0_g += 2;
+                b0_u += 2;
+                for (int j = 0; j < CC; ++j) {
+                  const float av =
+                      static_cast<float>(sycl::bit_cast<sycl::half>(a16[j]));
+                  const std::uint8_t bv_g = (j < 4) ? b0v_g : b1v_g;
+                  const int code_g_val = (bv_g >> ((j & 3) * 2)) & 3;
+                  acc_g += av * wtab_g[code_g_val];
+                  const std::uint8_t bv_u = (j < 4) ? b0v_u : b1v_u;
+                  const int code_u_val = (bv_u >> ((j & 3) * 2)) & 3;
+                  acc_u += av * wtab_u[code_u_val];
+                }
+              }
+              for (; kg < kg1; ++kg) {
+                const float av =
+                    from_half_bits(act_usm[act_off + (std::size_t)kg]);
+                const std::size_t idx =
+                    (std::size_t)local * K + (std::size_t)kg;
+                const std::uint8_t byte_g = wrow_g[idx / pack];
+                const int within = static_cast<int>(idx % pack);
+                const int code_g_val =
+                    (byte_g >> (within * bits)) & ((1 << bits) - 1);
+                acc_g += av * scale_g_val * canon_value(bits, code_g_val);
+                const std::uint8_t byte_u = wrow_u[idx / pack];
+                const int code_u_val =
+                    (byte_u >> (within * bits)) & ((1 << bits) - 1);
+                acc_u += av * scale_u_val * canon_value(bits, code_u_val);
+              }
+            }
+            // Compact stores (same as the compact gateup kernel).
+            const std::size_t store_off_g =
+                (std::size_t)m * Nl_g + local;
+            out_g[store_off_g] = to_half_bits(acc_g);
+            const std::size_t store_off_u =
+                (std::size_t)m * Nl_u + local;
+            out_u[store_off_u] = to_half_bits(acc_u);
+            // *** FUSED EPILOGUE. *** silu(gate)*up, same FP32 order and
+            // same RNE FP16 store as silumul_to_half. The fused activation
+            // buffer is compact [M*(Nl_g+Nl_u)] row-major: gate columns
+            // 0..Nl_g-1 then up columns Nl_g..Nl_g+Nl_u-1, so this WI's
+            // column is `local` in both halves.
+            const float s = acc_g / (1.0f + sycl::exp(-acc_g));
+            const std::size_t act_off_fused =
+                (std::size_t)m * (Nl_g + Nl_u) + (std::size_t)local;
+            act_fp16[act_off_fused] = to_half_bits(s * acc_u);
+          }
+        });
+  });
+}
+
+// *** INTFER_MLP_PARTIAL_DOWN (2026-10-14): compact-write variant. ***
+// *** INTFER_MLP_GATEUP_SILUMUL_FUSE (2026-10-14): fused gate+up + silu-mul. ***
+// The fused kernel lives ABOVE the compact wrapper (which it is a strict
+// superset of) so it can see to_half_bits, which is defined at the top
+// of this file. The compact wrapper is kept as a named function so the
+// partial-down path cannot accidentally pass compact=false and feed a
+// global-scatter buffer into silumul_to_half -- the two layouts are
+// not interchangeable, and a single spelling makes the call site
+// self-documenting.
+sycl::event quant_gemm_forward_usm_gateup_compact(
+    sycl::queue& q, std::uint16_t* act_usm,
+    const void* code_g, const std::uint16_t* scale_g, float alpha_g,
+    std::uint16_t* out_g,
+    const void* code_u, const std::uint16_t* scale_u, float alpha_u,
+    std::uint16_t* out_u,
+    uint32_t M, uint32_t Ng, uint32_t Nu, uint32_t K,
+    uint32_t group_size,
+    uint32_t start_g, uint32_t Nl_g, uint32_t start_u, uint32_t Nl_u,
+    gemm::WeightScheme scheme_g, gemm::WeightScheme scheme_u,
+    const sycl::event& copy_dep) {
+  return quant_gemm_forward_usm_gateup(
+      q, act_usm, code_g, scale_g, alpha_g, out_g,
+      code_u, scale_u, alpha_u, out_u,
+      M, Ng, Nu, K, group_size, start_g, Nl_g, start_u, Nl_u,
+      scheme_g, scheme_u, copy_dep, /*compact=*/true);
 }
 
 // ---------------------------------------------------------------------------
@@ -3715,7 +4172,7 @@ static inline std::uint16_t dev_float_to_half(float v) {
     const std::uint32_t rem = m2 & ((1u << shift) - 1u);
     const std::uint32_t hbit = 1u << (shift - 1);
     if (rem > hbit || (rem == hbit && (half & 1u))) half += 1u;
-    if (half & 0x400u) return (std::uint16_t)(sign | 0x0400u);  // to min-normal
+    if (half & 0x400u) return (std::uint16_t)(sign | 0x0400u);
     return (std::uint16_t)(sign | (half & 0x3FFu));
   }
   std::uint32_t half = ((std::uint32_t)e << 10) | (mant >> 13);
@@ -3737,7 +4194,7 @@ static inline float dev_half_to_float(std::uint16_t h) {
       std::uint32_t m2 = mant;
       while (!(m2 & 0x400u)) { m2 <<= 1; ++e; }
       m2 &= 0x3FFu;
-      x = (sign << 31) | ((127 - 14 - e) << 23) | (m2 << 13);
+      x = (sign << 31) | ((127 - 15 + e) << 23) | (m2 << 13);
     }
   } else if (exp == 0x1Fu) {
     x = (sign << 31) | 0x7F800000u | (mant << 13);
@@ -3947,73 +4404,156 @@ sycl::event la_conv_prep(sycl::queue& q, const LaConvPrepParams& p,
   if (cdim == 0 || ck == 0 || nv == 0 || nk == 0 || kd == 0 || vd == 0)
     return sycl::event{};
   const size_t zvw = (size_t)nv * vd;
-  return q.submit([&](sycl::handler& h) {
-    h.depends_on(dep);
-    h.single_task<class la_conv_prep_kernel>([=]() {
-      // conv section layout inside mqkv (host step order, conv_k==4):
-      // query [0,nk*kd), key [nk*kd,2*nk*kd), value [2*nk*kd,2*nk*kd+zvw).
-      // Taps 0..2 read conv_state[c*3+0..2], tap 3 reads mqkv[c] — exactly
-      // the 4 host lines. conv_state shifts in place (host order).
-      const size_t qk = (size_t)nk * kd;
-      // query/key/value section base offsets in conv_out space
-      for (std::uint32_t c = 0; c < cdim; ++c) {
-        float s = 0.0f;
-        if (ck == 4) {
-          s = cw[(size_t)c * ck + 0] * cst[(size_t)c * 3 + 0] +
-              cw[(size_t)c * ck + 1] * cst[(size_t)c * 3 + 1] +
-              cw[(size_t)c * ck + 2] * cst[(size_t)c * 3 + 2] +
-              cw[(size_t)c * ck + 3] * mqkv[c];
-        } else {
-          for (std::uint32_t k = 0; k + 1 < ck; ++k)
-            s += cw[(size_t)c * ck + k] * cst[(size_t)c * 3 + k];
-          s += cw[(size_t)c * ck + ck - 1] * mqkv[c];
-        }
-        const float es = sycl::exp(-s);
-        const float silu = s / (1.0f + es);
-        // shift history, append mqkv (host order)
-        cst[(size_t)c * 3 + 0] = cst[(size_t)c * 3 + 1];
-        cst[(size_t)c * 3 + 1] = cst[(size_t)c * 3 + 2];
-        cst[(size_t)c * 3 + 2] = mqkv[c];
-        // stash conv_out[c] = silu into packed's v section layout later;
-        // first write to a scratch area past the packed tail (caller sizes
-        // packed_in + cdim floats of scratch).
-        packed[(2 * qk + zvw + 2 * (size_t)nv) + c] = silu;
+  // Bit-exact dispatch knob (INTFER_LA_CONV_PREP_WG). The shipped body is a
+  // single_task: ONE work-item runs every section serially (conv over
+  // conv_dim, l2norm over 2*nk, the hv/hb copies, the g loop over nv). Each
+  // section is a PURE MAP over an independent index -- each c touches only
+  // cst[c*3..]/cw[c*ck..], each (kh,is_q) reduces only its OWN kd slice (the
+  // inner kd loop stays sequential inside one work-item, so sqrt/sum order is
+  // untouched), hv/hb are copies, each hh is independent -- so partitioning
+  // those index spaces across work-items writes every element with exactly one
+  // work-item and the SAME arithmetic in the SAME order. No cross-WI
+  // reduction, no shared local_accessor: bit-exact by construction, the same
+  // class as INTFER_DECODE1_WG / INTFER_XMX_WG / INTFER_DPAS48_WG (dispatch
+  // partition, no numerics contract). The upstream analogue is
+  // ggml-sycl/norm.cpp's sub-group-per-row geometry; its reduce_over_group
+  // butterfly is deliberately NOT taken (it would reorder the kd sum and break
+  // bit-exactness) -- the GEOMETRY ports, the reduction does not.
+  //
+  // The per-element bodies are shared lambdas so the serial and parallel
+  // launches compute them byte-for-byte; the ONLY difference between arms is
+  // the launch geometry, which is what makes the stream-identity claim
+  // provable.
+  //
+  // *** THE CONV SECTION IS AN ORDERING BARRIER, NOT A SECTION. *** conv
+  // writes packed[(2*qk+zvw+2*nv) + c] -- which is the `cout` region the
+  // l2norm and hv sections READ. The shipped serial kernel works only because
+  // section A finishes before section B starts. A single flat parallel launch
+  // would race them, so the parallel arm submits TWO ordered launches (conv,
+  // then tail chained off conv's event). Two launches still replaces one
+  // work-item running conv_dim+nk+zvw+2*nv iterations with a partitioned map.
+  const size_t qk = (size_t)nk * kd;
+  const float* cout = packed + (2 * qk + zvw + 2 * (size_t)nv);
+  // Section A: conv, one WI per channel c in [0, cdim).
+  auto emit_conv = [=](std::uint32_t c) {
+    float s = 0.0f;
+    if (ck == 4) {
+      s = cw[(size_t)c * ck + 0] * cst[(size_t)c * 3 + 0] +
+          cw[(size_t)c * ck + 1] * cst[(size_t)c * 3 + 1] +
+          cw[(size_t)c * ck + 2] * cst[(size_t)c * 3 + 2] +
+          cw[(size_t)c * ck + 3] * mqkv[c];
+    } else {
+      for (std::uint32_t k = 0; k + 1 < ck; ++k)
+        s += cw[(size_t)c * ck + k] * cst[(size_t)c * 3 + k];
+      s += cw[(size_t)c * ck + ck - 1] * mqkv[c];
+    }
+    const float es = sycl::exp(-s);
+    const float silu = s / (1.0f + es);
+    cst[(size_t)c * 3 + 0] = cst[(size_t)c * 3 + 1];
+    cst[(size_t)c * 3 + 1] = cst[(size_t)c * 3 + 2];
+    cst[(size_t)c * 3 + 2] = mqkv[c];
+    packed[(2 * qk + zvw + 2 * (size_t)nv) + c] = silu;
+  };
+  // The tail after conv: l2norm [0,2*nk), hv copy [0,zvw), hb copy [0,nv),
+  // g [0,nv). One WI per flat index j over the concatenation.
+  const std::uint32_t tail_total =
+      (std::uint32_t)(2 * nk + zvw + 2 * (size_t)nv);
+  auto emit_tail = [=](std::uint32_t j) {
+    // l2norm: even => query, odd => key (matches the serial per-head order,
+    // whose kd sum stays sequential inside one WI).
+    if (j < 2 * nk) {
+      const std::uint32_t kh = j >> 1;
+      const bool is_q = ((j & 1u) == 0u);
+      const float* src = (is_q ? cout : cout + qk) + (size_t)kh * kd;
+      float* dst = (is_q ? packed : packed + qk) + (size_t)kh * kd;
+      float ss = 0.0f;
+      for (std::uint32_t d = 0; d < kd; ++d) ss += src[d] * src[d];
+      const float inv = 1.0f / sycl::sqrt(ss + 1e-6f);
+      if (is_q) {
+        for (std::uint32_t d = 0; d < kd; ++d)
+          dst[d] = src[d] * inv * qscale;
+      } else {
+        for (std::uint32_t d = 0; d < kd; ++d) dst[d] = src[d] * inv;
       }
-      const float* cout = packed + (2 * qk + zvw + 2 * (size_t)nv);
-      const float* query = cout;
-      const float* key = cout + qk;
-      const float* value = cout + 2 * qk;
-      float* hqn = packed;
-      float* hkn = packed + qk;
+      return;
+    }
+    j -= 2 * nk;
+    if ((size_t)j < zvw) {
       float* hv = packed + 2 * qk;
-      float* hg = hv + zvw;
-      float* hb = hg + nv;
-      for (std::uint32_t kh = 0; kh < nk; ++kh) {
-        // l2norm sequential (host l2norm order: sum squares ascending,
-        // inv=1/sqrt(s+1e-6), out=x*inv — matched exactly, then q*qscale
-        // in the same two-rounding order as the host's separate loop).
-        float sq = 0.0f, sk = 0.0f;
-        for (std::uint32_t d = 0; d < kd; ++d) {
-          sq += query[(size_t)kh * kd + d] * query[(size_t)kh * kd + d];
-          sk += key[(size_t)kh * kd + d] * key[(size_t)kh * kd + d];
-        }
-        const float iq = 1.0f / sycl::sqrt(sq + 1e-6f);
-        const float ik = 1.0f / sycl::sqrt(sk + 1e-6f);
-        for (std::uint32_t d = 0; d < kd; ++d) {
-          hqn[(size_t)kh * kd + d] = query[(size_t)kh * kd + d] * iq * qscale;
-          hkn[(size_t)kh * kd + d] = key[(size_t)kh * kd + d] * ik;
-        }
-      }
-      for (size_t i = 0; i < zvw; ++i) hv[i] = value[i];
-      for (std::uint32_t i = 0; i < nv; ++i) hb[i] = brow[i];
-      for (std::uint32_t hh = 0; hh < nv; ++hh) {
-        // host: sp=log1pf(expf(a+dt)); g=-expf(A_log)*sp. sycl exp/log1p
-        // analogs (~1ulp vs host expf/log1pf — oracle arbitrates, L4 norm).
-        const float sp =
-            sycl::log1p(sycl::exp(arow[hh] + dtb[hh]));
-        hg[hh] = -sycl::exp(Alog[hh]) * sp;
-      }
+      hv[j] = cout[2 * qk + j];
+      return;
+    }
+    j -= (std::uint32_t)zvw;
+    // Layout mirrors the host reference (main.cpp:4864-4866):
+    //   hqn [0,nk*kd), hkn [nk*kd,2nk*kd), hv [2nk*kd, 2nk*kd+zvw),
+    //   hg [2nk*kd+zvw, ...+nv), hb [..+nv, ..+2nv).
+    // so hg sits BEFORE hb (hg = hv+zvw, hb = hg+nv).
+    if (j < nv) {
+      float* hg = packed + 2 * qk + zvw;
+      const std::uint32_t hh = j;
+      const float sp = sycl::log1p(sycl::exp(arow[hh] + dtb[hh]));
+      hg[hh] = -sycl::exp(Alog[hh]) * sp;
+      return;
+    }
+    j -= nv;
+    float* hb = packed + 2 * qk + zvw + nv;
+    hb[j] = brow[j];
+  };
+  const std::uint32_t wg_env = []() -> std::uint32_t {
+    const char* e = std::getenv("INTFER_LA_CONV_PREP_WG");
+    if (!e) return 0;
+    int v = std::atoi(e);
+    return v > 0 ? (std::uint32_t)v : 0;
+  }();
+  if (wg_env == 0) {
+    return q.submit([&](sycl::handler& h) {
+      h.depends_on(dep);
+      h.single_task<class la_conv_prep_kernel>([=]() {
+        for (std::uint32_t c = 0; c < cdim; ++c) emit_conv(c);
+        for (std::uint32_t j = 0; j < tail_total; ++j) emit_tail(j);
+      });
     });
+  }
+  // Parallel arm: the IDENTICAL per-element bodies, partitioned over
+  // work-items, with conv and tail as two ordered launches (the cout region
+  // makes conv a producer the tail consumes). The announcement is gated on the
+  // env: the base arm must stay silent (a marker on base is an arm that ran
+  // when none was selected -- the test_rowpair_equiv.sh contract).
+  {
+    static bool announced = false;
+    if (!announced) {
+      announced = true;
+      std::fprintf(stderr,
+                   "[la-conv-prep-wg] work-group=%u "
+                   "(INTFER_LA_CONV_PREP_WG=%s) ACTIVE "
+                   "(conv_dim=%u nk=%u nv=%u tail=%u)\n",
+                   wg_env, std::getenv("INTFER_LA_CONV_PREP_WG"), cdim, nk, nv,
+                   tail_total);
+      std::fflush(stderr);
+    }
+  }
+  const std::uint32_t wg = wg_env;
+  const std::uint32_t gconv = ((cdim + wg - 1) / wg) * wg;
+  const std::uint32_t gtail = ((tail_total + wg - 1) / wg) * wg;
+  sycl::event e_conv = q.submit([&](sycl::handler& h) {
+    h.depends_on(dep);
+    h.parallel_for<class la_conv_prep_kernel_par_conv>(
+        sycl::nd_range<1>(sycl::range<1>(gconv), sycl::range<1>(wg)),
+        [=](sycl::nd_item<1> it) {
+          const std::uint32_t i = (std::uint32_t)it.get_global_id(0);
+          if (i >= cdim) return;
+          emit_conv(i);
+        });
+  });
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(e_conv);
+    h.parallel_for<class la_conv_prep_kernel_par_tail>(
+        sycl::nd_range<1>(sycl::range<1>(gtail), sycl::range<1>(wg)),
+        [=](sycl::nd_item<1> it) {
+          const std::uint32_t j = (std::uint32_t)it.get_global_id(0);
+          if (j >= tail_total) return;
+          emit_tail(j);
+        });
   });
 }
 

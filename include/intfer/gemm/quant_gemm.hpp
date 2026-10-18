@@ -177,14 +177,43 @@ sycl::event quant_gemm_forward_usm(sycl::queue& q,
 // full TM x TK x TN tile to amortize the SLM round trip; M=1 decode is
 // memory-bound and the tiled kernel is already at the memory roofline.
 //
-// CALLER GUARD: M % 16 == 0, N % 16 == 0, K % 64 == 0. Returns a null event
-// otherwise; the caller must fall back to quant_gemm_forward_usm.
+// CALLER GUARD: M % 16 == 0, N % 16 == 0, K % 32 == 0. The kernel
+// declines (returns a null event) on any residual; the caller MUST fall
+// back to quant_gemm_forward_usm on a null event -- a null event is NOT
+// a no-op here, it means the output was never written.
 //
-// NUMERICS. Bit-exact by construction: the dequantized FP16 weight tile holds
-// the same bits the tiled kernel would load into sW, the activation tile
-// holds the same bits as sA, and the DPAS FP32 accumulation order is the
-// same ascending-K order as the tiled kernel's inner kk loop. The only
-// difference is the compute unit (XMX DPAS vs EU/ALU FMA).
+// *** TK=16, NOT 32. *** B580 (Xe2-S, 256 EU) rejects the
+// joint_matrix<sub_group,half,use::a,16,32,row_major> and <32,16,row_major>
+// shapes the first draft took from llama.cpp fused-gemm (TK=32, BK=64):
+// "joint_matrix with parameters matrix_type::fp16, use::a, Rows=16,
+// Cols=32 is not supported on this device". The legal fp16 combos are
+// K=16 with M in {1,2,4,8,16,32} and K=32 with M=1 only (use::b is
+// K=16 N=16 only), so the whole TK=32 axis is unsupported here -- it is
+// a Xe2/3-H (512 EU) shape. TK=16, BK=32 is the widest legal combo.
+//
+// `ran` is set to true iff a real submission was made; on every decline it
+// is left false. The caller gates its announcement on `ran`, so the
+// announcement cannot fire on a shape the kernel refused (the engine used
+// to print "[xmx-gemm] ACTIVE" unconditionally, which is a vacuous-green
+// defect: a gate asserting that line would pass on a fixture where the
+// kernel declined every tile and the fallback wrote nothing).
+//
+// NUMERICS. The dequantized FP16 weight tile holds the same bits the
+// tiled kernel would load into sW, the activation tile holds the same
+// bits as sA, and the DPAS accumulates in FP32 in the same ascending-K
+// order as the tiled kernel's inner loop -- so the two outputs agree
+// to the FP32 REORDERING bound, not bitwise in general. The difference
+// is the compute unit (XMX DPAS vs EU/ALU FMA) and, on shapes where K
+// spans more than one BK tile, the tiled kernel's sub-tile reduction
+// order vs the joint_matrix accumulator's blocked order. Measured on
+// this box (examples/xmx_probe): bit_diff 0/256 at K=32, 0/512 at
+// K=64, 1/512 at K=128, 5/4096 at K=256, 7/4096 at K=512 -- i.e. a
+// handful of ULPs at most, and the tiled kernel is outside the same
+// absolute budget of the host reference by construction (the kernel
+// rounds the dequantized weight into an FP16 SLM tile, the reference
+// keeps it in FP32). The honest contract is therefore an ABSOLUTE
+// tolerance (K ULPs of the weight rounding), never a bit identity and
+// never a relative one (relative error explodes on near-zero sums).
 // ---------------------------------------------------------------------------
 sycl::event quant_gemm_forward_usm_xmx(
     sycl::queue& q,
@@ -197,6 +226,7 @@ sycl::event quant_gemm_forward_usm_xmx(
     uint32_t group_size,
     gemm::WeightScheme scheme,
     const sycl::event& copy_dep,
+    bool* ran,
     std::uint32_t* tile_ctr = nullptr);  // work-stealing counter (null = fixed)
 
                                       // ---------------------------------------------------------------------------
@@ -262,7 +292,67 @@ sycl::event quant_gemm_forward_usm_xmx(
                                           uint32_t start_g, uint32_t Nl_g,
                                           uint32_t start_u, uint32_t Nl_u,
                                           gemm::WeightScheme scheme_g, gemm::WeightScheme scheme_u,
-                                          const sycl::event& copy_dep);
+                                          const sycl::event& copy_dep,
+                                          bool compact = false);
+
+                                            // *** INTFER_MLP_PARTIAL_DOWN (2026-10-14): compact-write mode. ***
+                                            // The gateup kernel stores GLOBAL-SCATTER by default
+                                            // (outp[m*(is_up?Nu:Ng) + (start+local)]) so the readback can pick device d's
+                                            // slice out of a full-width buffer. That layout is unreadable by
+                                            // silumul_to_half, which takes two compact [n] inputs (n = M*inter).
+                                            //
+                                            // compact=true keeps the SAME accumulator, the SAME kg/j element order and
+                                            // the SAME wtab -- only the store index changes, to outp[m*Nl + local] --
+                                            // so the device outputs are byte-identical to the global-scatter form in the
+                                            // columns this device owns and unreadable in the columns it does not. The
+                                            // default is false: every existing caller (gateup_equiv, run_mlp_gateup's
+                                            // readback path) is unchanged and the shipped gateup fusion is untouched.
+                                            // The mode exists solely so run_mlp_partial_down can feed silumul_to_half
+                                            // off the gateup launch without a D2H.
+                                            sycl::event quant_gemm_forward_usm_gateup_compact(
+                                                sycl::queue& q, std::uint16_t* act_usm,
+                                                const void* code_g, const std::uint16_t* scale_g, float alpha_g,
+                                                std::uint16_t* out_g,
+                                                const void* code_u, const std::uint16_t* scale_u, float alpha_u,
+                                                std::uint16_t* out_u,
+                                                uint32_t M, uint32_t Ng, uint32_t Nu, uint32_t K,
+                                                uint32_t group_size,
+                                                uint32_t start_g, uint32_t Nl_g, uint32_t start_u, uint32_t Nl_u,
+                                                gemm::WeightScheme scheme_g, gemm::WeightScheme scheme_u,
+                                                const sycl::event& copy_dep);
+
+                                             // *** INTFER_MLP_GATEUP_SILUMUL_FUSE (2026-10-14). ***
+                                             // Fused gate+up GEMM + silu(gate)*up epilogue in ONE launch.
+                                             // Same kernel body as quant_gemm_forward_usm_gateup
+                                             // (compact mode) but each WI appends the silu-mul of its
+                                             // own gate/up output before the store, writing the
+                                             // fused FP16 down-activation into act_fp16 at the same
+                                             // compact index (m*Nl + local). Removes the separate
+                                             // silumul_to_half launch (1 submit + 1 wait + 1 D2H
+                                             // readback per device per MLP). Bit-exact vs the
+                                             // two-launch chain: the accumulator, kg/j element order
+                                             // and wtab are unchanged, and silu(g) = g/(1+exp(-g))
+                                             // is computed in FP32 with the same round-to-nearest-even
+                                             // FP16 store as silumul_to_half (dev_float_to_half),
+                                             // so every element is the same as if the compact gateup
+                                             // output had been fed through the existing kernel.
+                                             // TP=2-viable: per-device, no cross-device dependency.
+                                             // Default OFF (INTFER_MLP_GATEUP_SILUMUL_FUSE, presence
+                                             // spells). Only the INT2+INT2 body exists; any other
+                                             // scheme returns sycl::event() and the caller keeps
+                                             // the two-launch path.
+                                             sycl::event quant_gemm_forward_usm_gateup_compact_silumul(
+                                                 sycl::queue& q, std::uint16_t* act_usm,
+                                                 const void* code_g, const std::uint16_t* scale_g, float alpha_g,
+                                                 std::uint16_t* out_g,
+                                                 const void* code_u, const std::uint16_t* scale_u, float alpha_u,
+                                                 std::uint16_t* out_u,
+                                                 uint32_t M, uint32_t Ng, uint32_t Nu, uint32_t K,
+                                                 uint32_t group_size,
+                                                 uint32_t start_g, uint32_t Nl_g, uint32_t start_u, uint32_t Nl_u,
+                                                 gemm::WeightScheme scheme_g, gemm::WeightScheme scheme_u,
+                                                 const sycl::event& copy_dep,
+                                                 std::uint16_t* act_fp16);
 
                                       // ---------------------------------------------------------------------------
                                       // FUSED WAVE LAUNCH (INTFER_WAVE_LAUNCH_FUSE).
