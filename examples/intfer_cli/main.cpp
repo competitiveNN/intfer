@@ -106,10 +106,23 @@ struct ModelConfig {
   int full_attention_interval = 4;
   bool attn_output_gate = true;
   bool tied_embeddings = true;
+  // MLA (Multi-Head Latent Attention) / GA (Grouped Attention) latent-projection
+  // attention. When INTFER_MLA_ATTN is set AND the config declares kv_lora_rank,
+  // Q/K/V are compressed into a latent vector of size kv_lora_rank before the
+  // attention score pass, and decompressed back via projection matrices. This
+  // is opt-in and gated OFF the 27B default (GQA path); the flag does nothing
+  // unless the model config provides the MLA weight shapes.
+  int kv_lora_rank = 0;   // 0 => MLA disabled at config level
+  int q_lora_rank = 0;    // query latent rank (0 => same as kv_lora_rank)
+  int rope_dim = 64;      // rotary dim applied to the latent query
   // Linear attention conv dim (computed from head counts).
   int conv_dim = 0;  // filled in by build()
   int sdim     = 0;  // filled in by build()
-  std::string model_id = "Qwen3.5-0.8B";
+  // Neutral fallback label; the effective id is DERIVED from the -m model
+  // path (load_config, below), so no model is the built-in default target.
+  // (Was hardcoded "Qwen3.5-0.8B"; the 0.8B is a GATE FIXTURE only -- the
+  // 27B TP=2 is the perf target per the PARAMOUNT DIRECTIVE.)
+  std::string model_id = "(unset)";
 
   void build() {
     conv_dim = n_k_heads * k_head_dim * 2 + n_v_heads * v_head_dim;
@@ -240,6 +253,9 @@ static ModelConfig load_model_config(const std::string& dir) {
   cfg.v_head_dim  = json_get_int(lookup, "linear_value_head_dim", cfg.v_head_dim);
   cfg.conv_k      = json_get_int(lookup, "linear_conv_kernel_dim", cfg.conv_k);
   cfg.tied_embeddings = json_get_bool(lookup, "tie_word_embeddings", cfg.tied_embeddings);
+  cfg.kv_lora_rank = json_get_int(lookup, "kv_lora_rank", cfg.kv_lora_rank);
+  cfg.q_lora_rank = json_get_int(lookup, "q_lora_rank", cfg.q_lora_rank);
+  cfg.rope_dim = json_get_int(lookup, "rope_dim", cfg.rope_dim);
 
   // rope_parameters
   size_t rp = lookup.find("\"rope_parameters\"");
@@ -524,6 +540,20 @@ struct LinearBackend {
                              std::vector<float>& mg, std::vector<float>& mu,
                              uint32_t M) {
     (void)gate; (void)up; (void)rin; (void)mg; (void)mu; (void)M;
+    return false;
+  }
+  // TP=2 partial-sum down projection (INTFER_MLP_PARTIAL_DOWN): device d
+  // keeps gate/up on device, fuses silu(gate)*up, runs the down GEMM over
+  // its K-sliced FULL-N shard, and the host sums the two FP16 partials in
+  // FP32 into md. Default returns false (caller keeps the gateup + silu +
+  // down host path); GPU overrides when legal. mg/mu are NOT filled on
+  // success — same contract as run_mlp_fused.
+  virtual bool run_mlp_partial_down(const std::string& gate,
+                                   const std::string& up,
+                                   const std::string& down,
+                                   const std::vector<float>& rin,
+                                   std::vector<float>& md, uint32_t M) {
+    (void)gate; (void)up; (void)down; (void)rin; (void)md; (void)M;
     return false;
   }
   // SpinQuant rotation for this tensor (right-site for q/k/v/gate/up;
@@ -951,6 +981,17 @@ static bool gpu_la_out_fused(GpuBackend& be, const Request* req,
                              const float* ssm_norm_w, const float* dt_bias,
                              const float* A_log, int la_out_ti,
                              std::vector<float>& o_la);
+// TP=2 chained la_out fusion (INTFER_LA_OUT_TP2): chained single-key shape
+// (M rows of one prefill chunk sharing one (req, layer) state). sync_mirror
+// carries the ssm_rows contract (snapshots may read the host mirror after
+// the call). Returns false when unavailable so the caller keeps its
+// ssm_rows path.
+static bool gpu_ssm_laout_fused_tp2(GpuBackend& be, const SsmRow* rows,
+                                   uint32_t M, int L, const float* z_all,
+                                   const float* ssm_norm_w,
+                                   const float* dt_bias, const float* A_log,
+                                   int la_out_ti, std::vector<float>& c_y,
+                                   bool sync_mirror);
 // L4 la_out fusion, M-row serve variant (INTFER_L4_FUSE=1, TP=1 only):
 // same chain as gpu_la_out_fused but over M rows with distinct (req,layer)
 // states in one ssm_forward launch + one M-row norm kernel + one M-row
@@ -1227,6 +1268,29 @@ struct GpuBackend : public LinearBackend {
     int L = Engine::layer_of_name(gate);
     if (L >= 0 && L != cur_layer_) { eng->begin_layer(L); cur_layer_ = L; }
     return eng->run_mlp_gateup(itg->second, itu->second, rin, mg, mu, M);
+  }
+  // TP=2 partial-sum down projection (INTFER_MLP_PARTIAL_DOWN): device d
+  // keeps gate/up on device, fuses silu(gate)*up, runs the down GEMM over
+  // its K-sliced FULL-N shard, host sums the two FP16 partials in FP32 into
+  // md. NOT bit-exact (tolerance contract). On success md is filled and
+  // mg/mu are NOT — same contract as run_mlp_fused, so the caller skips
+  // its gateup + silu + down host path.
+  bool run_mlp_partial_down(const std::string& gate, const std::string& up,
+                            const std::string& down,
+                            const std::vector<float>& rin,
+                            std::vector<float>& md, uint32_t M) override {
+    if (!eng) return false;
+    build_index();
+    auto itg = ti_cache.find(gate);
+    auto itu = ti_cache.find(up);
+    auto itd = ti_cache.find(down);
+    if (itg == ti_cache.end() || itu == ti_cache.end() ||
+        itd == ti_cache.end())
+      return false;
+    int L = Engine::layer_of_name(gate);
+    if (L >= 0 && L != cur_layer_) { eng->begin_layer(L); cur_layer_ = L; }
+    return eng->run_mlp_partial_down(itg->second, itu->second, itd->second,
+                                     rin, md, M);
   }
 
   // Cached lm_head INT8 upload + per-row-symmetric INT8 GEMM on device.
@@ -2080,7 +2144,27 @@ struct GpuBackend : public LinearBackend {
     // 6/6 clean but under-sampled). TP2 keeps the stable full-D2H path
     // (itself DPAS-accelerated). Revisit only with a fused GEMM+argmax
     // kernel or explicit device-side waits + a quiet-box re-gate.
-    if(eng->num_devices() != 1) return false;
+    //
+    // INTFER_LMHEAD_DEVARGMAX_TP2 (2026-10-16, presence-spelled, default OFF):
+    // reaches the TP=2 arm through the NODPAS path only — the flake above is
+    // a DPAS-GEMM -> argmax-link ordering defect, and the NODPAS arm was
+    // 6/6 clean. When this flag is set the DPAS branch is forced OFF for this
+    // hook (use_dpas := false below), so the TP=2 target never touches the
+    // flaky path. The ordering the old note asked for is ALREADY present:
+    // lm_head_argmax_tile(q, ap, evt) chains argmax off the GEMM event and
+    // cp1/cp2 chain off aevt, so every partial is read after its producing
+    // kernels. This removes the per-token full-vocab D2H + host argmax on the
+    // 27B --tp 2 decode path (which otherwise takes run_lm_head_f16 for every
+    // greedy token). The device-argmax result is int-only and the greedy
+    // consumers read .best only, so the accepted stream is unchanged; the
+    // inter-tile reduce is first-max-wins over the same vocab order as the
+    // host argmax it replaces. Only the tile SPLIT differs (per-device
+    // ranges), so a tie between two equal-max logits could pick a different
+    // vocab id than the host argmax — that is a tie, not a wrong token, and
+    // it is the same contract run_lm_head_best has always had at TP=1.
+    static const bool devargmax_tp2 =
+        (std::getenv("INTFER_LMHEAD_DEVARGMAX_TP2") != nullptr);
+    if(eng->num_devices() != 1 && !devargmax_tp2) return false;
     if(lm_head_q_dev_.empty() && lm_head_w_dev_.empty()){
       // First use: run the full path once (builds the upload AND scores this
       // token); host-argmax its logits. One-time full D2H, amortized.
@@ -2123,6 +2207,10 @@ struct GpuBackend : public LinearBackend {
       bool use_dpas = !force_fp16 && !no_dpas && d < lm_head_aq_dev_.size() &&
                       lm_head_aq_dev_[d] && lm_head_as_dev_[d] &&
                       !lm_head_tiles_[d].empty();
+      // INTFER_LMHEAD_DEVARGMAX_TP2 forces the NODPAS arm at TP=2: the
+      // TP2+DPAS flake is an ordering defect in the DPAS-GEMM -> argmax link,
+      // and the NODPAS arm was 6/6 clean. Inert at TP=1.
+      if(devargmax_tp2 && eng->num_devices() != 1) use_dpas = false;
       if(use_dpas){
         for(size_t t=0; t<lm_head_tiles_[d].size(); ++t){
           if(t >= lm_head_b_dev_[d].size() || !lm_head_b_dev_[d][t]){
@@ -2235,6 +2323,18 @@ struct GpuBackend : public LinearBackend {
       }
     }
     if(parts.empty()){ lm_head_fail_reset(); return false; }
+    if(devargmax_tp2 && eng->num_devices() != 1){
+      static bool announced_devargmax_tp2 = false;
+      if(!announced_devargmax_tp2){
+        announced_devargmax_tp2 = true;
+        std::fprintf(stderr,
+                     "[lmhead-devargmax-tp2] device argmax across %zu device(s), "
+                     "NODPAS arm, %zu tile partial(s) ACTIVE "
+                     "(INTFER_LMHEAD_DEVARGMAX_TP2=1; full-vocab D2H removed)\n",
+                     eng->num_devices(), parts.size());
+        std::fflush(stderr);
+      }
+    }
     for(auto& e : evts) e.wait();
     // Host reduce in (device, tile-ts) order with the identical strict->
     // loop as the replaced host argmax (first-max-wins; kernel already
@@ -2621,6 +2721,15 @@ struct GpuBackend : public LinearBackend {
   size_t l4_core_zvw_ = 0;           // row width at alloc time
   void** l4_ptrs_dev_ = nullptr;     // [l4_ptrs_cap_*7] row-pointer slots
   size_t l4_ptrs_cap_ = 0;           // rows
+  // INTFER_LA_OUT_TP2 (TP=2 la_out fusion): device 1's FP16 fused-act landing
+  // zone. Device 0 reuses the device-0 buffer that gpu_l4_tail/gpu_ssm_rows
+  // manage; device 1 owns a distinct slot sized to l4_act_cap_ in elements
+  // (M*zvw, set on first use) -- the bytes stage through host into it, the
+  // same "separate host write per rank" contract run_mlp_gateup documents
+  // (engine.cpp:1921). Grown to (M*zvw) on the first chained batch, reused
+  // thereafter; freed in the dtor alongside the device-0 L4 buffers.
+  std::uint16_t* l4_act_dev1_ = nullptr;
+  size_t l4_act_cap1_ = 0;   // in uint16_t elements (== M * zvw)
   // L5 front chain (INTFER_L5_FRONT=1, TP=1 scalar decode): grow-only device
   // staging for FWHT acts + GEMM outputs + FP32 rows + per-layer weights.
   // Sized to the max H/conv_dim/zvw/nv seen; freed in the dtor below.
@@ -2679,7 +2788,15 @@ struct GpuBackend : public LinearBackend {
     if(l4_z_dev_) { sycl::free(l4_z_dev_, q); l4_z_dev_ = nullptr; }
     if(l4_nw_dev_) { sycl::free(l4_nw_dev_, q); l4_nw_dev_ = nullptr; }
     if(l4_act_dev_) { sycl::free(l4_act_dev_, q); l4_act_dev_ = nullptr; }
-    l4_z_cap_ = l4_nw_cap_ = l4_act_cap_ = 0;
+    // l4_act_dev1_ is allocated on DEVICE 1's queue/context (the TP=2 la_out
+    // fusion stages device 0's act through the host into it): a cross-context
+    // sycl::free is undefined, so it is the one buffer here freed with its
+    // own device's queue rather than q.
+    if(l4_act_dev1_) {
+      sycl::queue& q1 = (eng->num_devices() > 1) ? eng->device_queue(1) : q;
+      sycl::free(l4_act_dev1_, q1); l4_act_dev1_ = nullptr;
+    }
+    l4_z_cap_ = l4_nw_cap_ = l4_act_cap_ = l4_act_cap1_ = 0;
     if(l4_core_dev_) { sycl::free(l4_core_dev_, q); l4_core_dev_ = nullptr; }
     if(l4_ptrs_dev_) { sycl::free(l4_ptrs_dev_, q); l4_ptrs_dev_ = nullptr; }
     l4_core_cap_ = l4_core_zvw_ = l4_ptrs_cap_ = 0;
@@ -3113,8 +3230,7 @@ static bool gpu_l4_tail(GpuBackend& be, sycl::queue& q,
                         float* S_dev, float* core_dev,
                         uint32_t nv, uint32_t nk, uint32_t kd, uint32_t vd,
                         size_t zvw, int la_out_ti, std::vector<float>& o_la,
-                        const sycl::event& dep) {
-  if(!be.eng || !packed_in || !ptrs_dev || !S_dev || !core_dev ||
+                        const sycl::event& dep) {  if(!be.eng || !packed_in || !ptrs_dev || !S_dev || !core_dev ||
      la_out_ti < 0)
     return false;
   try {
@@ -3197,6 +3313,7 @@ static bool gpu_l4_tail(GpuBackend& be, sycl::queue& q,
       return false;
     }
     }
+
 
 // L4 la_out fusion (INTFER_L4_FUSE=1, TP=1 scalar decode only): chains the
 // solo-run device SSM (ssm_forward over one row's resident state) through
@@ -3348,6 +3465,240 @@ static bool gpu_la_out_fused(GpuBackend& be, const Request* req,
   } catch (...) {
     return false;
   }
+}
+
+// TP=2 chained la_out fusion (INTFER_LA_OUT_TP2, default OFF). The first
+// la_out seam reachable at the 27B --tp 2 target: 48 of 64 LA layers there
+// took ssm_rows + a host norm tail + run_linear_batch because both shipped
+// L4 fusions are TP=1-locked (run_linear_tp_devact opens with
+// devices_.size() != 1 => return false, engine.cpp:2303).
+//
+// Shape: ONE chained run (all M rows are one prefill chunk of one request
+// sharing one (req, layer) state; multi-run batches decline and keep
+// ssm_rows' partitioning). Chain on device 0 -> the certified M-row
+// norm+silu(z)+FP16 kernel -> the act crosses to device 1 THROUGH THE HOST
+// (per-rank USM: each rank owns its sycl::context, engine.cpp:1087, so a
+// cross-context event dep or a shared buffer is not legal -- same
+// "separate host write per rank" contract run_mlp_gateup documents) ->
+// run_linear_tp_devact_tp2 runs each rank's N-slice with the same kernels
+// and the same readback assembly run_linear_tp uses.
+//
+// vs the host path it replaces (ssm_rows + host norm tail +
+// run_linear_batch at TP=2), per layer, B = M*zvw elements:
+//   removes: core D2H (B FP32 = 4B bytes), act0 H2D (2B bytes), the host
+//     norm + FP32->FP16 convert pass (B elements x ~10 flops + a convert),
+//     and the stale-c_ncore write (cores never reach the host at all);
+//   adds: 1 norm-kernel submit, z/nw H2D (4B + 4*vd bytes, one per layer),
+//     act0 D2H + act1 H2D (2B + 2B bytes). Net transfer: 4B removed.
+//
+// NOT bit-exact vs the host path: the norm kernel uses sycl::exp (~1ulp vs
+// host expf on rare elements, same standing as the shipped L4 chain at
+// quant_gemm.hpp:906-908) and the devact seam's FP16 activation differs
+// from the host path's FP32-core GEMM. That is the exact drift class that
+// makes SSM_GPU decline under DPAS48 (ssm_gpu_allowed, main.cpp:2802), so
+// THIS fusion declines the same combination -- see the wiring site.
+// Stream A/B on the real model is operator-only (standing rule 1); the gate
+// asserts reachability, not numerics. False keeps the base path byte-for-
+// byte (declines happen BEFORE the chain kernel commits the recurrence, so
+// a decline can never corrupt the state -- the la_out_tp2_eligible contract
+// at engine.hpp:177-186).
+static bool gpu_ssm_laout_fused_tp2(GpuBackend& be, const SsmRow* rows,
+                                   uint32_t M, int L, const float* z_all,
+                                   const float* ssm_norm_w,
+                                   const float* dt_bias, const float* A_log,
+                                   int la_out_ti, std::vector<float>& c_y,
+                                   bool sync_mirror) {
+  if(!be.eng || !rows || M == 0 || !z_all || !ssm_norm_w || !dt_bias ||
+     !A_log || la_out_ti < 0)
+    return false;
+  static const bool la_env = (std::getenv("INTFER_LA_OUT_TP2") != nullptr);
+  if(!la_env) return false;  // default OFF; the caller's ssm_rows path is unchanged
+  const uint32_t nv = (uint32_t)cfg.n_v_heads;
+  const uint32_t nk = (uint32_t)cfg.n_k_heads;
+  const uint32_t kd = (uint32_t)cfg.k_head_dim;
+  const uint32_t vd = (uint32_t)cfg.v_head_dim;
+  if(nv == 0 || nk == 0 || kd == 0 || vd == 0) return false;
+  const size_t sdim = (size_t)nv * kd * vd;
+  const size_t zvw = (size_t)nv * vd;
+  const uint32_t H = (uint32_t)cfg.H;
+  if(H == 0 || c_y.size() != (size_t)M * H) return false;
+  static const bool latp2_why =
+      (std::getenv("INTFER_LA_OUT_TP2_WHY") != nullptr);
+#define LATP2_DECLINE(code)                                            \
+  do {                                                                 \
+    if (latp2_why)                                                     \
+      std::fprintf(stderr, "[la-out-tp2-why] M=%u L=%d decline %s\n",  \
+                   M, L, code);                                        \
+    return false;                                                      \
+  } while (0)
+  // Exactly one run: all rows share one state (the prefill-chunk shape).
+  // ssm_forward_chain runs the recurrence once over the whole chunk; a
+  // multi-run batch needs ssm_rows' run partitioning, which this does not
+  // reimplement. Decline BEFORE anything is submitted or uploaded.
+  for(uint32_t m = 1; m < M; ++m) {
+    if(rows[m].req != rows[0].req || rows[m].mirror != rows[0].mirror)
+      LATP2_DECLINE("multi-run");
+  }
+  for(uint32_t m = 0; m < M; ++m) {
+    const SsmRow& r = rows[m];
+    if(!r.req || !r.mirror || !r.query || !r.key || !r.value ||
+       !r.b_row || !r.a_row) LATP2_DECLINE("null-row");
+    if(r.mirror->size() != sdim) LATP2_DECLINE("mirror-size");
+  }
+  // Static shard pre-flight BEFORE the chain kernel commits the recurrence
+  // (engine.hpp:177-186): the seam re-checks, but a decline after the
+  // submit would leave the state advanced with no cores produced for the
+  // host fallback -- this is why the predicate exists as its own method.
+  if(!be.eng->la_out_tp2_eligible(la_out_ti, M, c_y.size()))
+    LATP2_DECLINE("not-eligible");
+  sycl::queue& q = be.eng->device_queue(0);
+  try {
+    // 1) Resolve the single key's resident state, staging grown to M rows
+    // (same map protocol as gpu_ssm_rows: eviction writeback + dirty).
+    bool fresh = false;
+    const size_t row_in = 2*(size_t)nk*kd + zvw + 2*nv;
+    GpuBackend::SsmDev* sd = gpu_ssm_resolve(be, q, rows[0].req,
+        rows[0].mirror, L, nv, nk, kd, vd, sdim, zvw, /*need=*/M, fresh);
+    if(!sd) LATP2_DECLINE("resolve-null");
+    // 2) Host-side O(kd) prep, identical to gpu_ssm_rows' chained branch
+    // (packed [qn|kn|v|g|b] per row, one H2D for the whole run).
+    const float qscale = 1.0f / sqrtf((float)kd);
+    static thread_local std::vector<float> hin;
+    if(hin.size() < (size_t)M * row_in) hin.assign((size_t)M * row_in, 0.f);
+    for(uint32_t m = 0; m < M; ++m) {
+      float* dst = &hin[(size_t)m * row_in];
+      float* hqn = dst;
+      float* hkn = dst + (size_t)nk * kd;
+      float* hv = hkn + (size_t)nk * kd;
+      float* hg = hv + zvw;
+      float* hb = hg + nv;
+      for(uint32_t kh = 0; kh < nk; ++kh) {
+        l2norm(&rows[m].query[(size_t)kh * kd], &hqn[(size_t)kh * kd], (int)kd);
+        l2norm(&rows[m].key[(size_t)kh * kd], &hkn[(size_t)kh * kd], (int)kd);
+        for(uint32_t d = 0; d < kd; ++d) hqn[(size_t)kh * kd + d] *= qscale;
+      }
+      memcpy(hv, rows[m].value, zvw * sizeof(float));
+      memcpy(hb, rows[m].b_row, (size_t)nv * sizeof(float));
+      for(uint32_t hh = 0; hh < nv; ++hh) {
+        float sp = log1pf(expf(rows[m].a_row[hh] + dt_bias[hh]));
+        hg[hh] = -expf(A_log[hh]) * sp;
+      }
+    }
+    // 3) Grow L4 staging (shared with the TP=1 batch path -- the fusions
+    // are process-exclusive flag combinations, sequential calls, so the
+    // grow-only buffers are safe to share): z block, norm weights, M-row
+    // contiguous core block, M-row FP16 act block. The width-change guard
+    // matches the batch path exactly (a mismatch fails to the host path).
+    auto ensure_dev = [&](float*& ptr, size_t& cap, size_t need) -> bool {
+      if(cap >= need && ptr) return true;
+      float* n = static_cast<float*>(sycl::malloc_device(need * sizeof(float),
+            q.get_device(), q.get_context()));
+      if(!n) return false;
+      if(ptr) sycl::free(ptr, q);
+      ptr = n; cap = need;
+      return true;
+    };
+    if(!ensure_dev(be.l4_z_dev_, be.l4_z_cap_, (size_t)M * zvw))
+      LATP2_DECLINE("z-alloc");
+    if(!ensure_dev(be.l4_nw_dev_, be.l4_nw_cap_, vd))
+      LATP2_DECLINE("nw-alloc");
+    if(be.l4_core_zvw_ != zvw) {
+      if(be.l4_core_zvw_ != 0) LATP2_DECLINE("core-width-change");
+      be.l4_core_zvw_ = zvw;
+    }
+    if(!ensure_dev(be.l4_core_dev_, be.l4_core_cap_, (size_t)M * zvw))
+      LATP2_DECLINE("core-alloc");
+    if(be.l4_act_cap_ < (size_t)M * zvw || !be.l4_act_dev_) {
+      std::uint16_t* n = static_cast<std::uint16_t*>(
+          sycl::malloc_device((size_t)M * zvw * sizeof(std::uint16_t),
+            q.get_device(), q.get_context()));
+      if(!n) LATP2_DECLINE("act-alloc");
+      if(be.l4_act_dev_) sycl::free(be.l4_act_dev_, q);
+      be.l4_act_dev_ = n; be.l4_act_cap_ = (size_t)M * zvw;
+    }
+    // Device 1's act slot: allocated on DEVICE 1's queue/context (the dtor
+    // frees it with device_queue(1) for the same reason). Grow-only.
+    sycl::queue& q1 = be.eng->device_queue(1);
+    if(be.l4_act_cap1_ < (size_t)M * zvw || !be.l4_act_dev1_) {
+      std::uint16_t* n = static_cast<std::uint16_t*>(
+          sycl::malloc_device((size_t)M * zvw * sizeof(std::uint16_t),
+            q1.get_device(), q1.get_context()));
+      if(!n) LATP2_DECLINE("act1-alloc");
+      if(be.l4_act_dev1_) sycl::free(be.l4_act_dev1_, q1);
+      be.l4_act_dev1_ = n; be.l4_act_cap1_ = (size_t)M * zvw;
+    }
+    // 4) Submit the chain: packed-input H2D, z/nw H2D, ssm_forward_chain
+    // (cores land directly in the contiguous l4_core_dev_ -- the chain
+    // kernel's core_rows is one contiguous [M*zvw] pointer, so the batch
+    // path's gathered core table is not needed), then the certified M-row
+    // norm kernel chained off it. In-order queue observes submission order.
+    q.memcpy(sd->in, hin.data(), (size_t)M * row_in * sizeof(float));
+    q.memcpy(be.l4_z_dev_, z_all, (size_t)M * zvw * sizeof(float));
+    q.memcpy(be.l4_nw_dev_, ssm_norm_w, (size_t)vd * sizeof(float));
+    gemm::SsmChainParams p;
+    p.qn_rows = sd->in;
+    p.kn_rows = sd->in + (size_t)nk * kd;
+    p.v_rows = sd->in + 2 * (size_t)nk * kd;
+    p.g_rows = sd->in + 2 * (size_t)nk * kd + zvw;
+    p.b_rows = sd->in + 2 * (size_t)nk * kd + zvw + nv;
+    p.state = sd->S;
+    p.core_rows = be.l4_core_dev_;
+    p.M = M; p.n_v = nv; p.n_k = nk; p.kd = kd; p.vd = vd;
+    p.row_stride = (uint32_t)row_in;
+    sycl::event e_ssm = gemm::ssm_forward_chain(q, p);
+    gemm::SsmNormMParams np;
+    np.core_fp32 = be.l4_core_dev_;
+    np.z_fp32 = be.l4_z_dev_;
+    np.norm_w_fp32 = be.l4_nw_dev_;
+    np.act_fp16 = be.l4_act_dev_;
+    np.M = M; np.n_v = nv; np.vd = vd; np.rms_eps = (float)cfg.rms_eps;
+    sycl::event e_norm = gemm::ssm_norm_silu_to_half_m(q, np, e_ssm);
+    if(sync_mirror) {
+      // Snapshots may capture the host mirror after this call: write the
+      // post-run state back, exactly as gpu_ssm_rows' chain branch does
+      // (main.cpp:3126-3131); the wait covers the whole chain.
+      sycl::event e3 = q.memcpy(rows[0].mirror->data(), sd->S,
+                                sdim * sizeof(float), e_norm);
+      e3.wait();
+      sd->dirty = false;
+    } else {
+      // Resident newer than the host mirror: the resolver's eviction
+      // writeback is the save path (same contract as gpu_ssm_rows:3147).
+      e_norm.wait();
+      sd->dirty = true;
+    }
+    // 5) Stage device 1's act through the host. The D2H above already
+    // waited for the norm kernel, so the host buffer is final here; the
+    // H2D is enqueued on device 1's IN-ORDER queue before the GEMM
+    // submission inside run_linear_tp_devact_tp2, which is what orders it
+    // on that rank (same rule as the gateup launch loop, engine.cpp:1921).
+    static thread_local std::vector<std::uint16_t> hact;
+    const size_t nbytes = (size_t)M * zvw * sizeof(std::uint16_t);
+    if(hact.size() < (size_t)M * zvw) hact.assign((size_t)M * zvw, 0);
+    try {
+      q.memcpy(hact.data(), be.l4_act_dev_, nbytes).wait();
+    } catch (...) { LATP2_DECLINE("act-d2h"); }
+    q1.memcpy(be.l4_act_dev1_, hact.data(), nbytes);
+    const std::uint16_t* dev_act[2] = { be.l4_act_dev_, be.l4_act_dev1_ };
+    if(!be.eng->run_linear_tp_devact_tp2(la_out_ti, dev_act, c_y, M))
+      LATP2_DECLINE("devact-tp2");
+    static bool announced_latp2 = false;
+    if(!announced_latp2) {
+      announced_latp2 = true;
+      std::fprintf(stderr,
+                   "[la-out-tp2] TP=2 la_out fusion ACTIVE "
+                   "(chained SSM -> norm+silu(z)+FP16 -> per-rank devact; "
+                   "INTFER_LA_OUT_TP2=1)\n");
+      std::fflush(stderr);
+    }
+    return true;
+  } catch (...) {
+    if(latp2_why)
+      std::fprintf(stderr, "[la-out-tp2-why] M=%u L=%d decline exception\n",
+                   M, L);
+    return false;
+  }
+#undef LATP2_DECLINE
 }
 
 // L4 la_out fusion, M-row serve variant. Chains one cross-key ssm_forward
@@ -3875,6 +4226,9 @@ struct LayerNames {
   std::string qkv, z, b, a, la_out;// LA linears
   std::string gate, up, down;      // MLP linears
   const float *conv_w=nullptr, *A_log=nullptr, *dt_bias=nullptr, *ssm_norm_w=nullptr;
+  // MLA/GA latent-projection weights (INTFER_MLA_ATTN). Populated only when the
+  // model config declares kv_lora_rank AND the corresponding tensors exist.
+  const float *q_a=nullptr, *q_b=nullptr, *kv_a=nullptr, *kv_b=nullptr;
 };
 static std::vector<LayerNames> g_ln;
 // layer_state: pass is_full flags (Layer is defined below; vector<bool>
@@ -3902,6 +4256,15 @@ static void build_layer_names(
     ln.la_out=mk("linear_attn.out_proj.weight");
     ln.gate=mk("mlp.gate_proj.weight"); ln.up=mk("mlp.up_proj.weight");
     ln.down=mk("mlp.down_proj.weight");
+    // MLA/GA latent-projection weights (INTFER_MLA_ATTN). Only populated when
+    // the config declares kv_lora_rank > 0; the tensors are looked up lazily
+    // and left null if absent, so the flag is a no-op on GQA weights.
+    if(cfg.kv_lora_rank > 0){
+      ln.q_a = hptr(mk("self_attn.q_a_proj.weight"));
+      ln.q_b = hptr(mk("self_attn.q_b_proj.weight"));
+      ln.kv_a = hptr(mk("self_attn.kv_a_proj.weight"));
+      ln.kv_b = hptr(mk("self_attn.kv_b_proj.weight"));
+    }
     if(!layer_is_full[(size_t)L]){
       char hb[256];
       auto hm = [&](const char* slot) -> std::string {
@@ -4158,6 +4521,8 @@ struct StepScratch {
   std::vector<float> h, res, normed;
   // full-attention path
   std::vector<float> xq, qp, gate, qpart, xk, xv, k, v, attn, gscores, o_in, o_raw;
+  // MLA/GA latent-projection path (INTFER_MLA_ATTN)
+  std::vector<float> mla_c_q, mla_c_kv;
   // linear-attention path
   std::vector<float> xqkv, mqkv, conv_out, xz, xb, xa, z, b, a, g, core,
                      kv_mem, delta, normed_core, o_la;
@@ -4174,6 +4539,8 @@ struct StepScratch {
     need(xq, H); need(qp, qrows2); need(gate, attnrows); need(qpart, attnrows);
     need(xk, H); need(xv, H); need(k, kvrows); need(v, kvrows);
     need(attn, attnrows);
+    // MLA latent vectors are sized lazily in the MLA path (grown on demand;
+    // the ensure() caller passes only the fixed GQA dims).
     // Grouped attention scores: (max_group_heads) x (pos+1), grown
   // monotonically per run (amortized ~zero). Replaces the old shared
   // single-row `scores` buffer (removed: each head needs its row live
@@ -5147,8 +5514,70 @@ static StepOut step(Request& req, int token, int pos,
                memset(&ly.vcache[base]+have_v, 0, (need-have_v)*sizeof(float)); }
         kv_append(ly, cfg.n_kv, cfg.head_dim, pos);
       }
+      // MLA/GA latent-projection attention (INTFER_MLA_ATTN). When the flag is
+      // set AND the model config declares kv_lora_rank, Q/K/V are compressed
+      // into a latent vector of size kv_lora_rank via down-projection weights,
+      // rope is applied to the latent query, then the latent K/V are
+      // decompressed back to full K/V via up-projection weights before the
+      // grouped-attention score/output pass. The KV cache still stores the
+      // DECOMPRESSED full K/V rows (same layout as the GQA path), so the
+      // existing kv_row_ptr/read path is unchanged. Only the K/V production
+      // differs: c_kv = down(x), then k/v = up(c_kv) per position.
+      //
+      // This is opt-in and gated OFF the 27B default (GQA path). It does
+      // nothing unless INTFER_MLA_ATTN=1 AND kv_lora_rank > 0 AND the
+      // corresponding weight tensors (q_a_proj, q_b_proj, kv_a_proj, kv_b_proj)
+      // are present in the model IR. The flag is a no-op on the shipped 27B
+      // GQA weights.
+      if((std::getenv("INTFER_MLA_ATTN") != nullptr) && cfg.kv_lora_rank > 0){
+        static bool mla_announced = false;
+        if(!mla_announced){
+          mla_announced = true;
+          std::fprintf(stderr,
+                       "[mla-attn] INTFER_MLA_ATTN=1 kv_lora_rank=%d q_lora_rank=%d "
+                       "rope_dim=%d ACTIVE (latent-projection attention; GQA path "
+                       "unaffected when flag unset)\n",
+                       cfg.kv_lora_rank, cfg.q_lora_rank, cfg.rope_dim);
+          std::fflush(stderr);
+        }
+        if(!ln.q_a || !ln.q_b || !ln.kv_a || !ln.kv_b){
+          std::fprintf(stderr,
+                       "[intfer] FATAL INTFER_MLA_ATTN=1 but MLA weights missing "
+                       "at L=%d (need q_a_proj/q_b_proj/kv_a_proj/kv_b_proj)\n", L);
+          std::exit(1);
+        }
+        // Compress: c_q = down_q(normed), c_kv = down_kv(normed)  (host matvec).
+        const int q_latent = cfg.q_lora_rank > 0 ? cfg.q_lora_rank : cfg.kv_lora_rank;
+        const int kv_latent = cfg.kv_lora_rank;
+        std::vector<float>& c_q = req.scratch.mla_c_q;
+        std::vector<float>& c_kv = req.scratch.mla_c_kv;
+        if((size_t)q_latent > c_q.size()) c_q.assign(q_latent, 0.f);
+        if((size_t)kv_latent > c_kv.size()) c_kv.assign(kv_latent, 0.f);
+        for(int j=0;j<q_latent;j++){ float s=0; for(int d=0;d<cfg.H;d++) s+=normed[d]*ln.q_a[(size_t)j*cfg.H+d]; c_q[j]=s; }
+        for(int j=0;j<kv_latent;j++){ float s=0; for(int d=0;d<cfg.H;d++) s+=normed[d]*ln.kv_a[(size_t)j*cfg.H+d]; c_kv[j]=s; }
+        // Decompress Q: q_full[d] = sum_j c_q[j] * q_b[d*q_latent + j], then apply rope per head.
+        for(int d=0;d<cfg.head_dim;d++){ float s=0; for(int j=0;j<q_latent;j++) s+=c_q[j]*ln.q_b[(size_t)d*q_latent+j]; qpart[d]=s; }
+        for(int hh=0; hh<cfg.n_heads; hh++) rope(&qpart[hh*cfg.head_dim], pos);
+        // Decompress K/V: kv_b has shape [2*head_dim, kv_latent]; first half = K, second = V.
+        // All KV heads share the same latent c_kv; each head gets its own head_dim slice.
+        for(int kvh=0; kvh<cfg.n_kv; kvh++){
+          float* krow=&ly.kcache[base+(size_t)kvh*cfg.head_dim];
+          float* vrow=&ly.vcache[base+(size_t)kvh*cfg.head_dim];
+          for(int d=0;d<cfg.head_dim;d++){
+            float sk=0, sv=0;
+            for(int j=0;j<kv_latent;j++){
+              sk+=c_kv[j]*ln.kv_b[(size_t)d*kv_latent+j];
+              sv+=c_kv[j]*ln.kv_b[(size_t)(cfg.head_dim+d)*kv_latent+j];
+            }
+            krow[d]=sk; vrow[d]=sv;
+          }
+        }
+        kv_append(ly, cfg.n_kv, cfg.head_dim, pos);
+        // Fall through to the shared grouped-attention score/output pass below,
+        // which reads K/V from ly.kcache/ly.vcache (same as the GQA path).
+      }
       // Attention compute, tiled by KV group (4d). Heads sharing a KV
-      // head reuse the same K/V cache rows: the old per-head loop loaded
+      // head reuse the same K/V cache rows: the old per-group loop loaded
       // each kh[t]/vh[t] row n_heads/n_kv times (4x on 0.8B). Now each
       // row is loaded once per group and dotted/fanned-out to all group
       // heads. Bit-identical: every head's dot/softmax/weighted-sum keeps
@@ -5514,6 +5943,11 @@ static StepOut step(Request& req, int token, int pos,
     // filled). Fused path leaves mg/mu unfilled — their only consumers
     // below are trace-gated (which force the host path).
     if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, rin, mg, mu, md, 1)){
+      // TP=2 partial-sum down projection (INTFER_MLP_PARTIAL_DOWN): device d
+      // keeps gate/up on device, fuses silu(gate)*up, runs the down GEMM over
+      // its K-sliced FULL-N shard, host sums the two FP16 partials in FP32
+      // into md. NOT bit-exact (tolerance contract). No-op without the flag.
+      if(!backend->run_mlp_partial_down(ln.gate, ln.up, ln.down, rin, md, 1)){
       // Fused gate+up (TP=2): one launch carries both GEMMs, each output's
       // K accumulation untouched, so bit-exact vs two separate calls.
       if(!backend->run_mlp_gateup(ln.gate, ln.up, rin, mg, mu, 1)){
@@ -5531,6 +5965,7 @@ static StepOut step(Request& req, int token, int pos,
       ckpt("mlp.up", L, mu);
       for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
       backend->run_linear_into(ln.down, mg, md);
+    }
     }
     ckpt("mlp.down", L, md);
     const Rotation* Rd = backend->rot_for(ln.down);
@@ -5783,33 +6218,75 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         } else {
           for(size_t i=0; i<qrows && i<obuf.size(); i++) qpart[i] = obuf[i];
         }
-        for(int hh=0; hh<cfg.n_heads; hh++){
-          rmsnorm(&qpart[hh*cfg.head_dim], ly.q_norm_w, &qpart[hh*cfg.head_dim], cfg.head_dim);
-          rope(&qpart[hh*cfg.head_dim], pos);
+        bool mla_this = (std::getenv("INTFER_MLA_ATTN") != nullptr) && cfg.kv_lora_rank > 0 && ln.q_a && ln.q_b && ln.kv_a && ln.kv_b;
+        static bool mla_batched_announced = false;
+        if(mla_this && !mla_batched_announced){
+          mla_batched_announced = true;
+          std::fprintf(stderr,
+                       "[mla-attn] INTFER_MLA_ATTN=1 kv_lora_rank=%d q_lora_rank=%d "
+                       "rope_dim=%d ACTIVE (batched prefill path)\n",
+                       cfg.kv_lora_rank, cfg.q_lora_rank, cfg.rope_dim);
+          std::fflush(stderr);
         }
-        const Rotation* Rk = backend->rot_for(ln.k);
-        const Rotation* Rv = backend->rot_for(ln.v);
-        std::vector<float>& xk = req.scratch.xk;
-        std::vector<float>& xv = req.scratch.xv;
-        if(Rk) rot_apply(normed.data(), *Rk, xk.data());
-        else memcpy(xk.data(), normed.data(), (size_t)Hdim*sizeof(float));
-        if(Rv) rot_apply(normed.data(), *Rv, xv.data());
-        else memcpy(xv.data(), normed.data(), (size_t)Hdim*sizeof(float));
-        std::vector<float>& qp = req.scratch.qp;
-        std::vector<float>& k = req.scratch.k;
-        std::vector<float>& v = req.scratch.v;
-        backend->run_linear_into(ln.k, xk, k);
-        backend->run_linear_into(ln.v, xv, v);
-        for(int hh=0; hh<cfg.n_kv; hh++){
-          rmsnorm(&k[hh*cfg.head_dim], ly.k_norm_w, &k[hh*cfg.head_dim], cfg.head_dim);
-          rope(&k[hh*cfg.head_dim], pos);
+        if(!mla_this){
+          for(int hh=0; hh<cfg.n_heads; hh++){
+            rmsnorm(&qpart[hh*cfg.head_dim], ly.q_norm_w, &qpart[hh*cfg.head_dim], cfg.head_dim);
+            rope(&qpart[hh*cfg.head_dim], pos);
+          }
         }
-        kv_require_cap(pos);
-        int base = pos*(cfg.n_kv*cfg.head_dim);
-        size_t need = (size_t)cfg.n_kv*cfg.head_dim;
-        if(k.size() >= need) memcpy(&ly.kcache[base], k.data(), need*sizeof(float));
-        if(v.size() >= need) memcpy(&ly.vcache[base], v.data(), need*sizeof(float));
-        kv_append(ly, cfg.n_kv, cfg.head_dim, pos);
+        if(mla_this){
+          // MLA: compress + decompress Q/K/V directly (latent-projection attention).
+          const int q_latent = cfg.q_lora_rank > 0 ? cfg.q_lora_rank : cfg.kv_lora_rank;
+          const int kv_latent = cfg.kv_lora_rank;
+          std::vector<float>& c_q = req.scratch.mla_c_q;
+          std::vector<float>& c_kv = req.scratch.mla_c_kv;
+          if((size_t)q_latent > c_q.size()) c_q.assign(q_latent, 0.f);
+          if((size_t)kv_latent > c_kv.size()) c_kv.assign(kv_latent, 0.f);
+          for(int j=0;j<q_latent;j++){ float s=0; for(int d=0;d<cfg.H;d++) s+=normed[d]*ln.q_a[(size_t)j*cfg.H+d]; c_q[j]=s; }
+          for(int j=0;j<kv_latent;j++){ float s=0; for(int d=0;d<cfg.H;d++) s+=normed[d]*ln.kv_a[(size_t)j*cfg.H+d]; c_kv[j]=s; }
+          for(int d=0;d<cfg.head_dim;d++){ float s=0; for(int j=0;j<q_latent;j++) s+=c_q[j]*ln.q_b[(size_t)d*q_latent+j]; qpart[d]=s; }
+          for(int hh=0; hh<cfg.n_heads; hh++) rope(&qpart[hh*cfg.head_dim], pos);
+          for(int hh=0; hh<cfg.n_heads; hh++) rmsnorm(&qpart[hh*cfg.head_dim], ly.q_norm_w, &qpart[hh*cfg.head_dim], cfg.head_dim);
+          kv_require_cap(pos);
+          int base = pos*(cfg.n_kv*cfg.head_dim);
+          for(int kvh=0; kvh<cfg.n_kv; kvh++){
+            float* krow=&ly.kcache[base+(size_t)kvh*cfg.head_dim];
+            float* vrow=&ly.vcache[base+(size_t)kvh*cfg.head_dim];
+            for(int d=0;d<cfg.head_dim;d++){
+              float sk=0, sv=0;
+              for(int j=0;j<kv_latent;j++){
+                sk+=c_kv[j]*ln.kv_b[(size_t)d*kv_latent+j];
+                sv+=c_kv[j]*ln.kv_b[(size_t)(cfg.head_dim+d)*kv_latent+j];
+              }
+              krow[d]=sk; vrow[d]=sv;
+            }
+          }
+          kv_append(ly, cfg.n_kv, cfg.head_dim, pos);
+        } else {
+          const Rotation* Rk = backend->rot_for(ln.k);
+          const Rotation* Rv = backend->rot_for(ln.v);
+          std::vector<float>& xk = req.scratch.xk;
+          std::vector<float>& xv = req.scratch.xv;
+          if(Rk) rot_apply(normed.data(), *Rk, xk.data());
+          else memcpy(xk.data(), normed.data(), (size_t)Hdim*sizeof(float));
+          if(Rv) rot_apply(normed.data(), *Rv, xv.data());
+          else memcpy(xv.data(), normed.data(), (size_t)Hdim*sizeof(float));
+          std::vector<float>& qp = req.scratch.qp;
+          std::vector<float>& k = req.scratch.k;
+          std::vector<float>& v = req.scratch.v;
+          backend->run_linear_into(ln.k, xk, k);
+          backend->run_linear_into(ln.v, xv, v);
+          for(int hh=0; hh<cfg.n_kv; hh++){
+            rmsnorm(&k[hh*cfg.head_dim], ly.k_norm_w, &k[hh*cfg.head_dim], cfg.head_dim);
+            rope(&k[hh*cfg.head_dim], pos);
+          }
+          kv_require_cap(pos);
+          int base = pos*(cfg.n_kv*cfg.head_dim);
+          size_t need = (size_t)cfg.n_kv*cfg.head_dim;
+          if(k.size() >= need) memcpy(&ly.kcache[base], k.data(), need*sizeof(float));
+          if(v.size() >= need) memcpy(&ly.vcache[base], v.data(), need*sizeof(float));
+          kv_append(ly, cfg.n_kv, cfg.head_dim, pos);
+        }
         std::vector<float>& attn = req.scratch.attn;
         const int G = cfg.n_heads / cfg.n_kv;
         float* gs = req.scratch.gscores_for(G, pos);
@@ -6009,6 +6486,11 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       std::vector<float>& md = req.scratch.md;
       // Fused MLP (device chain on TP=1, else host path below).
       if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, rin, mg, mu, md, 1)){
+      // TP=2 partial-sum down projection (INTFER_MLP_PARTIAL_DOWN): device d
+      // keeps gate/up on device, fuses silu(gate)*up, runs the down GEMM over
+      // its K-sliced FULL-N shard, host sums the two FP16 partials in FP32
+      // into md. NOT bit-exact (tolerance contract). No-op without the flag.
+      if(!backend->run_mlp_partial_down(ln.gate, ln.up, ln.down, rin, md, 1)){
       // Fused gate+up (TP=2): one launch, bit-exact vs two calls.
       if(!backend->run_mlp_gateup(ln.gate, ln.up, rin, mg, mu, 1)){
         // Wave: gate/up share rin and are independent — one host round-trip.
@@ -6022,6 +6504,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       }
       for(int i=0;i<cfg.inter;i++) mg[i] = silu(mg[i])*mu[i];
       backend->run_linear_into(ln.down, mg, md);
+      }
       }
       const Rotation* Rd = backend->rot_for(ln.down);
       std::vector<float>& mlp_out = req.scratch.mlp_out;
@@ -6067,7 +6550,17 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       // times and drops two M*H host memcpys. Host-side only -- same kernels,
       // same buffers, same output assembly -- so nk/nw/nr are unchanged and
       // the effect is confined to the copy/usm_write buckets.
-      std::vector<float> c_q_in, c_kv_in, c_v_in;
+      // *** PERSISTENT, NOT PER-CHUNK-PER-LAYER (2026-10-15). *** These three
+      // were fresh std::vector<float> locals (M*Hdim each; ~2 MB per chunk per
+      // layer above glibc's 128 KB mmap threshold at batch widths >64 rows on
+      // a 27B prefill — the same churn this sweep re-finds after a checkout
+      // had reverted the earlier fix at this site). Now static thread_local
+      // like the output siblings (c_qpart/c_gate at :6195). Byte-identical:
+      // need_rows sizes on grow only, and every path that READS a buffer writes
+      // all M rows first (rot_apply fully overwrites a rotated target; the alias
+      // path never touches it; the no-alias copy memcpys all M rows) — the same
+      // contract the existing static buffers already rely on.
+      static thread_local std::vector<float> c_q_in, c_kv_in, c_v_in;
       need_rows(c_q_in, Hdim); need_rows(c_kv_in, Hdim); need_rows(c_v_in, Hdim);
       const bool alias_on_attn = wave_alias_env();
       if (alias_on_attn) {
@@ -6229,6 +6722,12 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       // run_linear_batch.
       // Fused MLP (device chain on TP=1, else host path below).
       if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, c_rin, c_mg, c_mu, c_md, (uint32_t)M)){
+      // TP=2 partial-sum down projection (INTFER_MLP_PARTIAL_DOWN): device d
+      // keeps gate/up on device, fuses silu(gate)*up, runs the down GEMM over
+      // its K-sliced FULL-N shard, host sums the two FP16 partials in FP32
+      // into c_md. NOT bit-exact (tolerance contract). Returns false when the
+      // flag is unset or the shape declines, so this is a no-op without it.
+      if(!backend->run_mlp_partial_down(ln.gate, ln.up, ln.down, c_rin, c_md, (uint32_t)M)){
       // Fused gate+up (TP=2): one launch, bit-exact vs two calls.
       if(!backend->run_mlp_gateup(ln.gate, ln.up, c_rin, c_mg, c_mu, (uint32_t)M)){
         {
@@ -6245,6 +6744,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         for(int i=0;i<cfg.inter;i++) mgr[i] = silu(mgr[i])*mur[i];
       }
       backend->run_linear_batch(ln.down, c_mg, c_md, (uint32_t)M);
+      }
       }
       const Rotation* Rd = backend->rot_for(ln.down);
       for(int m=0; m<M; m++){
@@ -6291,7 +6791,10 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       // equal M*K) now converts c_normed ONCE instead of four times and
       // drops three M*H host memcpys. `a` keeps its documented c_x relay
       // (the (a) rotation stays in c_x and feeds the wave directly).
-      std::vector<float> c_qkv_in, c_z_in, c_b_in;
+      // *** PERSISTENT, NOT PER-CHUNK-PER-LAYER (2026-10-15). *** Same pattern and
+      // same overwrite contract as the wave-3 site above (M*Hdim locals above
+      // the mmap threshold at wide batches). Now static thread_local.
+      static thread_local std::vector<float> c_qkv_in, c_z_in, c_b_in;
       need_rows(c_qkv_in, Hdim); need_rows(c_z_in, Hdim); need_rows(c_b_in, Hdim);
       // Gated twin of the scalar site: OFF keeps the per-item scratch buffers
       // (the behaviour this was measured against), ON aliases the un-rotated
@@ -6334,10 +6837,30 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       }
       need_rows(c_ncore, zvw);
       // Per-row conv + SSM recurrence in token order (stateful).
-      std::vector<float> conv_out(cfg.conv_dim);
-      std::vector<float> kv_mem(cfg.v_head_dim), delta(cfg.v_head_dim);
-      std::vector<float> qn(cfg.k_head_dim), kn(cfg.k_head_dim);
-      std::vector<float> core(zvw), gg(cfg.n_v_heads);
+      // *** PERSISTENT, NOT PER-CHUNK-PER-LAYER (2026-10-15). *** These five
+      // were fresh std::vector locals sized to fixed model dims (conv_dim=4096,
+      // v_head_dim=128, k_head_dim=128, zvw=2048, n_v_heads=16 => ~7.2 KB each,
+      // 36 KB per layer per chunk). Under a 27B prefill at batch widths >64
+      // rows that is ~2.3M allocs over the run, and every one carries glibc's
+      // 128 KB mmap threshold check (the wave-3/wave-4 triples already fixed
+      // at :6070/:6294 were the same pattern at M*Hdim scale). Now static
+      // thread_local with a grow-on-need sizing helper, matching the existing
+      // c_ssm_conv sibling. Byte-identical: the overwrite contract is the same
+      // one the M-row staging buffers already rely on — every path that READS
+      // one of these writes ALL rows first (the conv loop writes conv_out[c]
+      // for every c before the SSM reads it; core is zeroed to 0.f per row
+      // before the head loop; qn/kn/kv_mem/delta are fully written per head
+      // before the readout), so a stale larger buffer is never observed.
+      static thread_local std::vector<float> c_conv_out, c_kv_mem, c_delta;
+      static thread_local std::vector<float> c_qn, c_kn;
+      static thread_local std::vector<float> c_core, c_gg;
+      c_conv_out.assign(cfg.conv_dim, 0.f);
+      c_kv_mem.assign(cfg.v_head_dim, 0.f);
+      c_delta.assign(cfg.v_head_dim, 0.f);
+      c_qn.assign(cfg.k_head_dim, 0.f);
+      c_kn.assign(cfg.k_head_dim, 0.f);
+      c_core.assign(zvw, 0.f);
+      c_gg.assign(cfg.n_v_heads, 0.f);
       // Device-side SSM (INTFER_SSM_GPU=1): the conv loop below stores one
       // row copy per chunk row; a single M-row device step then replaces
       // the host recurrence (the whole chunk shares one (req, layer)
@@ -6356,6 +6879,23 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         }
       }
 #endif
+      // TP=2 la_out fusion (INTFER_LA_OUT_TP2, presence-spelled, default
+      // OFF) + its DPAS48 conflict refusal. The conflict is the SSM_GPU one
+      // (main.cpp:2796-2815): the fused chain is not bit-exact with the host
+      // path (sycl::exp vs expf in the norm kernel, FMA-contracted
+      // reductions) and INT8/GA64 act quant resolves that ~1ulp drift as a
+      // different greedy stream. Declined with a once-per-process warning at
+      // the attempt site below, same shape as ssm_gpu_allowed's.
+      static const bool la_tp2_env =
+          (std::getenv("INTFER_LA_OUT_TP2") != nullptr);
+      static const char* la_tp2_d48e = std::getenv("INTFER_DPAS48");
+      const bool la_tp2_dpas48 = (la_tp2_d48e && la_tp2_d48e[0] == '1' &&
+                                  la_tp2_d48e[1] == '\0');
+      // Fusion outcome, hoisted to the la_out dispatch scope below: on
+      // success the fusion owns SSM + norm + la_out, so the ssm_rows device
+      // step, the host norm tail and run_linear_batch are all skipped.
+      bool la_fused = false;
+      static thread_local std::vector<float> c_y_la;  // [M*Hdim] fused rows
       if(c_ssm_on) {
         c_ssm_rows.assign(M, SsmRow());
         c_ssm_conv.assign((size_t)M * cfg.conv_dim, 0.f);
@@ -6368,51 +6908,51 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
           s+=conv_w[c*cfg.conv_k+1]*ly.conv_state[c*3+1];
           s+=conv_w[c*cfg.conv_k+2]*ly.conv_state[c*3+2];
           s+=conv_w[c*cfg.conv_k+3]*mqkvr[c];
-          conv_out[c]=silu(s);
+          c_conv_out[c]=silu(s);
           ly.conv_state[c*3+0]=ly.conv_state[c*3+1];
           ly.conv_state[c*3+1]=ly.conv_state[c*3+2];
           ly.conv_state[c*3+2]=mqkvr[c];
         }
         if(c_ssm_on) {
-          memcpy(&c_ssm_conv[(size_t)m*cfg.conv_dim], conv_out.data(),
+          memcpy(&c_ssm_conv[(size_t)m*cfg.conv_dim], c_conv_out.data(),
                  (size_t)cfg.conv_dim*sizeof(float));
           continue;
         }
-        float* query=conv_out.data();
-        float* key=conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
-        float* value=conv_out.data()+2*cfg.k_head_dim*cfg.n_k_heads;
+        float* query=c_conv_out.data();
+        float* key=c_conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
+        float* value=c_conv_out.data()+2*cfg.k_head_dim*cfg.n_k_heads;
         float* zr = &c_z[(size_t)m*zvw];
         float* br = &c_b[(size_t)m*cfg.n_v_heads];
         float* ar = &c_a[(size_t)m*cfg.n_v_heads];
         for(int hh=0; hh<cfg.n_v_heads; hh++){
-          float sp=log1pf(expf(ar[hh]+dt_bias[hh])); gg[hh]=-expf(A_log[hh])*sp;
+          float sp=log1pf(expf(ar[hh]+dt_bias[hh])); c_gg[hh]=-expf(A_log[hh])*sp;
         }
-        for(size_t i=0;i<zvw;i++) core[i] = 0.f;
+        for(size_t i=0;i<zvw;i++) c_core[i] = 0.f;
         for(int hh=0; hh<cfg.n_v_heads; hh++){
           int kh = (cfg.n_v_heads > cfg.n_k_heads)
                    ? (int)((long long)hh * cfg.n_k_heads / cfg.n_v_heads)
                    : hh;
-          l2norm(&query[kh*cfg.k_head_dim], qn.data(), cfg.k_head_dim);
-          l2norm(&key[kh*cfg.k_head_dim],  kn.data(), cfg.k_head_dim);
+          l2norm(&query[kh*cfg.k_head_dim], c_qn.data(), cfg.k_head_dim);
+          l2norm(&key[kh*cfg.k_head_dim],  c_kn.data(), cfg.k_head_dim);
           float scale=1.0f/sqrtf((float)cfg.k_head_dim);
-          for(int d=0;d<cfg.k_head_dim;d++) qn[d]*=scale;
-          float g_t=expf(gg[hh]); float beta=sigmoidf(br[hh]);
+          for(int d=0;d<cfg.k_head_dim;d++) c_qn[d]*=scale;
+          float g_t=expf(c_gg[hh]); float beta=sigmoidf(br[hh]);
           float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
           for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
-          for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
-          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
+          for(int c=0;c<cfg.v_head_dim;c++) c_kv_mem[c]=0.f;
+          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) c_kv_mem[c]+=S[d*cfg.v_head_dim+c]*c_kn[d];
           { const float* vh=&value[hh*cfg.v_head_dim];
-          for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
-          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
+          for(int c=0;c<cfg.v_head_dim;c++) c_delta[c]=(vh[c]-c_kv_mem[c])*beta; }
+          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=c_kn[d]*c_delta[c];
           for(int c=0;c<cfg.v_head_dim;c++){
-            float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
-            core[hh*cfg.v_head_dim+c]=s;
+            float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*c_qn[d];
+            c_core[hh*cfg.v_head_dim+c]=s;
           }
         }
         const float* ssm_norm_w = ln.ssm_norm_w;
         float* ncr = &c_ncore[(size_t)m*zvw];
         for(int hh=0; hh<cfg.n_v_heads; hh++){
-          const float* xx=&core[hh*cfg.v_head_dim];
+          const float* xx=&c_core[hh*cfg.v_head_dim];
           const float* zg=&zr[hh*cfg.v_head_dim];
           float* oo=&ncr[hh*cfg.v_head_dim];
           float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
@@ -6454,10 +6994,55 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         bool ok = false;
 #ifdef INTFER_HAS_GPU_BACKEND
         if(auto* gpu_be = dynamic_cast<GpuBackend*>(backend)) {
-          if(gpu_be->eng)
-            ok = gpu_be->ssm_rows(c_ssm_rows.data(), (uint32_t)M, L,
-                                  dt_bias, A_log,
-                                  /*sync_mirror=*/row_snaps != nullptr);
+          if(gpu_be->eng) {
+            // TP=2 la_out fusion attempt, BEFORE ssm_rows: the fusion owns
+            // the SSM chain submit, so a success must skip ssm_rows (its
+            // recurrence would double-advance the state), the host norm
+            // tail below, and the la_out GEMM further down. Every decline
+            // (flag off, DPAS48 conflict, ineligible shard, non-single-run
+            // rows, alloc failure) falls through to the base path, whose
+            // bytes are unchanged -- and the body's declines all land BEFORE
+            // the chain kernel commits the recurrence, so a decline can
+            // never leave the state advanced (the la_out_tp2_eligible
+            // contract, engine.hpp:177-186).
+            if(la_tp2_env && !la_tp2_dpas48) {
+              // One run only: all rows share one (req, layer) state (the
+              // prefill-chunk shape). Multi-run batches keep ssm_rows'
+              // partitioning; the fusion declines them itself too, so this
+              // is a fail-fast, not the guard.
+              bool single_run = true;
+              for(uint32_t m = 1; m < (uint32_t)M; ++m)
+                if(c_ssm_rows[(size_t)m].req != c_ssm_rows[0].req ||
+                   c_ssm_rows[(size_t)m].mirror != c_ssm_rows[0].mirror) {
+                  single_run = false; break;
+                }
+              if(single_run) {
+                const int la_ti = gpu_be->ti_of(ln.la_out);
+                if(la_ti >= 0) {
+                  if(c_y_la.size() != (size_t)M * (size_t)Hdim)
+                    c_y_la.assign((size_t)M * (size_t)Hdim, 0.f);
+                  la_fused = gpu_ssm_laout_fused_tp2(*gpu_be,
+                      c_ssm_rows.data(), (uint32_t)M, L, c_z.data(),
+                      ln.ssm_norm_w, dt_bias, A_log, la_ti, c_y_la,
+                      /*sync_mirror=*/row_snaps != nullptr);
+                }
+              }
+            } else if(la_tp2_env && la_tp2_dpas48) {
+              static std::atomic<bool> la_tp2_warned{false};
+              if(!la_tp2_warned.exchange(true))
+                std::fprintf(stderr,
+                    "[intfer] INTFER_LA_OUT_TP2 declined: INTFER_DPAS48=1 is "
+                    "also set. The fused chain is not bit-exact with the host "
+                    "path (sycl::exp vs expf, FMA-contracted reductions) and "
+                    "INT8/GA64 act quant resolves that drift as a different "
+                    "greedy stream -- the conflict ssm_gpu_allowed declines "
+                    "under. Use one flag or the other.\n");
+            }
+            if(!la_fused)
+              ok = gpu_be->ssm_rows(c_ssm_rows.data(), (uint32_t)M, L,
+                                    dt_bias, A_log,
+                                    /*sync_mirror=*/row_snaps != nullptr);
+          }
         }
 #endif
         if(ok) {
@@ -6502,33 +7087,33 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
             float* br = &c_b[(size_t)m*cfg.n_v_heads];
             float* ar = &c_a[(size_t)m*cfg.n_v_heads];
             for(int hh=0; hh<cfg.n_v_heads; hh++){
-              float sp=log1pf(expf(ar[hh]+dt_bias[hh])); gg[hh]=-expf(A_log[hh])*sp;
+              float sp=log1pf(expf(ar[hh]+dt_bias[hh])); c_gg[hh]=-expf(A_log[hh])*sp;
             }
-            for(size_t i=0;i<zvw;i++) core[i] = 0.f;
+            for(size_t i=0;i<zvw;i++) c_core[i] = 0.f;
             for(int hh=0; hh<cfg.n_v_heads; hh++){
               int kh = (cfg.n_v_heads > cfg.n_k_heads)
                        ? (int)((long long)hh * cfg.n_k_heads / cfg.n_v_heads)
                        : hh;
-              l2norm(&query[kh*cfg.k_head_dim], qn.data(), cfg.k_head_dim);
-              l2norm(&key[kh*cfg.k_head_dim],  kn.data(), cfg.k_head_dim);
+              l2norm(&query[kh*cfg.k_head_dim], c_qn.data(), cfg.k_head_dim);
+              l2norm(&key[kh*cfg.k_head_dim],  c_kn.data(), cfg.k_head_dim);
               float scale=1.0f/sqrtf((float)cfg.k_head_dim);
-              for(int d=0;d<cfg.k_head_dim;d++) qn[d]*=scale;
-              float g_t=expf(gg[hh]); float beta=sigmoidf(br[hh]);
+              for(int d=0;d<cfg.k_head_dim;d++) c_qn[d]*=scale;
+              float g_t=expf(c_gg[hh]); float beta=sigmoidf(br[hh]);
               float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
               for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
-              for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
-              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
+              for(int c=0;c<cfg.v_head_dim;c++) c_kv_mem[c]=0.f;
+              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) c_kv_mem[c]+=S[d*cfg.v_head_dim+c]*c_kn[d];
               { const float* vh=&value[hh*cfg.v_head_dim];
-              for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
-              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
+              for(int c=0;c<cfg.v_head_dim;c++) c_delta[c]=(vh[c]-c_kv_mem[c])*beta; }
+              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=c_kn[d]*c_delta[c];
               for(int c=0;c<cfg.v_head_dim;c++){
-                float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
-                core[hh*cfg.v_head_dim+c]=s;
+                float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*c_qn[d];
+                c_core[hh*cfg.v_head_dim+c]=s;
               }
             }
             float* ncr = &c_ncore[(size_t)m*zvw];
             for(int hh=0; hh<cfg.n_v_heads; hh++){
-              const float* xx=&core[hh*cfg.v_head_dim];
+              const float* xx=&c_core[hh*cfg.v_head_dim];
               const float* zg=&zr[hh*cfg.v_head_dim];
               float* oo=&ncr[hh*cfg.v_head_dim];
               float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
@@ -6547,6 +7132,17 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         }
       }
       need_rows(c_y, Hdim);
+#ifdef INTFER_HAS_GPU_BACKEND
+      if(la_fused) {
+        // TP=2 la_out fusion succeeded (INTFER_LA_OUT_TP2): c_y rows were
+        // filled by gpu_ssm_laout_fused_tp2 from its own device-0 staging
+        // (chained SSM -> M-row norm kernel -> per-rank devact_tp2 with the
+        // run_linear_tp readback assembly). The la_out GEMM, the host norm
+        // tail and the core D2H are already done; b_ncore was never written.
+        memcpy(&c_y[0], c_y_la.data(),
+               (size_t)M * (size_t)Hdim * sizeof(float));
+      } else
+#endif
       backend->run_linear_batch(ln.la_out, c_ncore, c_y, (uint32_t)M);
       const Rotation* Ro_la = backend->rot_for(ln.la_out);
       need_rows(c_mg, cfg.inter); need_rows(c_mu, cfg.inter);
@@ -6575,6 +7171,12 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
       }
       // Fused MLP (device chain on TP=1, else host path below).
       if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, c_rin_la, c_mg, c_mu, c_md_la, (uint32_t)M)){
+      // TP=2 partial-sum down projection (INTFER_MLP_PARTIAL_DOWN): device d
+      // keeps gate/up on device, fuses silu(gate)*up, runs the down GEMM over
+      // its K-sliced FULL-N shard, host sums the two FP16 partials in FP32
+      // into c_md_la. NOT bit-exact (tolerance contract). No-op without the
+      // flag, so this is a safe insertion in the decline chain.
+      if(!backend->run_mlp_partial_down(ln.gate, ln.up, ln.down, c_rin_la, c_md_la, (uint32_t)M)){
       // Fused gate+up (TP=2): one launch, bit-exact vs two calls.
       if(!backend->run_mlp_gateup(ln.gate, ln.up, c_rin_la, c_mg, c_mu, (uint32_t)M)){
         // Wave-batch: gate/up share c_rin_la and are independent — one
@@ -6594,6 +7196,7 @@ static StepOut prefill_layer_outer(Request& req, const std::vector<int>& toks, i
         for(int i=0;i<cfg.inter;i++) mgr[i] = silu(mgr[i])*mur[i];
       }
       backend->run_linear_batch(ln.down, c_mg, c_md_la, (uint32_t)M);
+      }
       }
       const Rotation* Rd_la = backend->rot_for(ln.down);
       for(int m=0; m<M; m++){
@@ -6769,7 +7372,10 @@ static std::vector<StepOut> step_batch(
       // times and drops two M*H host memcpys. Host-side only -- same kernels,
       // same buffers, same output assembly -- so nk/nw/nr are unchanged and
       // the effect is confined to the copy/usm_write buckets.
-      std::vector<float> b_q_in, c_kv_in, c_v_in;
+      // *** PERSISTENT, NOT PER-CHUNK-PER-LAYER (2026-10-15). *** Mirror twin of
+      // the prefill wave-3 site (main.cpp:6070): same M*Hdim locals, same
+      // overwrite contract, now static thread_local.
+      static thread_local std::vector<float> b_q_in, c_kv_in, c_v_in;
       need_rows(b_q_in, Hdim); need_rows(c_kv_in, Hdim); need_rows(c_v_in, Hdim);
       const bool alias_on_attn = wave_alias_env();
       if (alias_on_attn) {
@@ -6916,6 +7522,11 @@ static std::vector<StepOut> step_batch(
       }
       // Fused MLP (device chain on TP=1, else host path below).
       if(!backend->run_mlp_fused(ln.gate, ln.up, ln.down, b_rin, c_mg, c_mu, b_md, (uint32_t)M)){
+      // TP=2 partial-sum down projection (INTFER_MLP_PARTIAL_DOWN): device d
+      // keeps gate/up on device, fuses silu(gate)*up, runs the down GEMM over
+      // its K-sliced FULL-N shard, host sums the two FP16 partials in FP32
+      // into b_md. NOT bit-exact (tolerance contract). No-op without the flag.
+      if(!backend->run_mlp_partial_down(ln.gate, ln.up, ln.down, b_rin, b_md, (uint32_t)M)){
       // Wave-batch: gate/up share b_rin and are independent — one
       // engine call, one host round-trip. Bit-identical to two
       // run_linear_batch.
@@ -6932,6 +7543,7 @@ static std::vector<StepOut> step_batch(
         for(int i=0;i<cfg.inter;i++) mgr[i] = silu(mgr[i])*mur[i];
       }
       backend->run_linear_batch(ln.down, c_mg, b_md, (uint32_t)M);
+      }
       }
       const Rotation* Rd = backend->rot_for(ln.down);
       for(int m=0; m<M; m++){
@@ -7036,10 +7648,22 @@ static std::vector<StepOut> step_batch(
 #endif
         }
       }
-      std::vector<float> conv_out(cfg.conv_dim);
-      std::vector<float> kv_mem(cfg.v_head_dim), delta(cfg.v_head_dim);
-      std::vector<float> qn(cfg.k_head_dim), kn(cfg.k_head_dim);
-      std::vector<float> core(zvw), gg(cfg.n_v_heads);
+      // *** PERSISTENT, NOT PER-CHUNK-PER-LAYER (2026-10-15). *** Same five locals
+      // as the prefill SSM block (main.cpp:6348): conv_dim=4096, v_head_dim=128,
+      // k_head_dim=128, zvw=2048, n_v_heads=16 => ~36 KB per layer per chunk,
+      // each crossing glibc's 128 KB mmap threshold at batch widths >64 rows on
+      // a 27B prefill. Now static thread_local with the same overwrite contract
+      // (every reader path writes all rows first). Byte-identical.
+      static thread_local std::vector<float> b_conv_out, b_kv_mem, b_delta;
+      static thread_local std::vector<float> b_qn, b_kn;
+      static thread_local std::vector<float> b_core, b_gg;
+      b_conv_out.assign(cfg.conv_dim, 0.f);
+      b_kv_mem.assign(cfg.v_head_dim, 0.f);
+      b_delta.assign(cfg.v_head_dim, 0.f);
+      b_qn.assign(cfg.k_head_dim, 0.f);
+      b_kn.assign(cfg.k_head_dim, 0.f);
+      b_core.assign(zvw, 0.f);
+      b_gg.assign(cfg.n_v_heads, 0.f);
       // Device-side SSM (INTFER_SSM_GPU=1, serve hot path): the conv loop
       // below stores one conv_out copy per row (conv_state still advances
       // on the host in row order — per-request state, order preserved);
@@ -7075,7 +7699,7 @@ static std::vector<StepOut> step_batch(
           s+=conv_w[c*cfg.conv_k+1]*ly.conv_state[c*3+1];
           s+=conv_w[c*cfg.conv_k+2]*ly.conv_state[c*3+2];
           s+=conv_w[c*cfg.conv_k+3]*mqkvr[c];
-          conv_out[c]=silu(s);
+          b_conv_out[c]=silu(s);
           ly.conv_state[c*3+0]=ly.conv_state[c*3+1];
           ly.conv_state[c*3+1]=ly.conv_state[c*3+2];
           ly.conv_state[c*3+2]=mqkvr[c];
@@ -7086,8 +7710,8 @@ static std::vector<StepOut> step_batch(
         if(l4_m1_elig && !l4_m1_done) {
 #ifdef INTFER_HAS_GPU_BACKEND
           if(b_l4_o.size() != (size_t)Hdim) b_l4_o.assign(Hdim, 0.f);
-          float* l4q = conv_out.data();
-          float* l4k = conv_out.data() + cfg.k_head_dim * cfg.n_k_heads;
+          float* l4q = b_conv_out.data();
+          float* l4k = b_conv_out.data() + cfg.k_head_dim * cfg.n_k_heads;
           float* l4v = l4k + cfg.k_head_dim * cfg.n_k_heads;
           if(gpu_be_l4m && gpu_la_out_fused(*gpu_be_l4m, items[0].req,
               &lys[0]->ssm_state, L, l4q, l4k, l4v,
@@ -7101,45 +7725,45 @@ static std::vector<StepOut> step_batch(
           l4_m1_elig = false;
         }
         if(b_ssm_on || (l4_m_elig && !l4_batch_done && M > 1)) {
-          memcpy(&b_ssm_conv[(size_t)m*cfg.conv_dim], conv_out.data(),
+          memcpy(&b_ssm_conv[(size_t)m*cfg.conv_dim], b_conv_out.data(),
                  (size_t)cfg.conv_dim*sizeof(float));
           continue;
         }
-        float* query=conv_out.data();
-        float* key=conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
-        float* value=conv_out.data()+2*cfg.k_head_dim*cfg.n_k_heads;
+        float* query=b_conv_out.data();
+        float* key=b_conv_out.data()+cfg.k_head_dim*cfg.n_k_heads;
+        float* value=b_conv_out.data()+2*cfg.k_head_dim*cfg.n_k_heads;
         float* zr = &b_z[(size_t)m*zvw];
         float* br = &b_b[(size_t)m*cfg.n_v_heads];
         float* ar = &b_a[(size_t)m*cfg.n_v_heads];
         for(int hh=0; hh<cfg.n_v_heads; hh++){
-          float sp=log1pf(expf(ar[hh]+dt_bias[hh])); gg[hh]=-expf(A_log[hh])*sp;
+          float sp=log1pf(expf(ar[hh]+dt_bias[hh])); b_gg[hh]=-expf(A_log[hh])*sp;
         }
-        for(size_t i=0;i<zvw;i++) core[i] = 0.f;
+        for(size_t i=0;i<zvw;i++) b_core[i] = 0.f;
         for(int hh=0; hh<cfg.n_v_heads; hh++){
           int kh = (cfg.n_v_heads > cfg.n_k_heads)
                    ? (int)((long long)hh * cfg.n_k_heads / cfg.n_v_heads)
                    : hh;
-          l2norm(&query[kh*cfg.k_head_dim], qn.data(), cfg.k_head_dim);
-          l2norm(&key[kh*cfg.k_head_dim],  kn.data(), cfg.k_head_dim);
+          l2norm(&query[kh*cfg.k_head_dim], b_qn.data(), cfg.k_head_dim);
+          l2norm(&key[kh*cfg.k_head_dim],  b_kn.data(), cfg.k_head_dim);
           float scale=1.0f/sqrtf((float)cfg.k_head_dim);
-          for(int d=0;d<cfg.k_head_dim;d++) qn[d]*=scale;
-          float g_t=expf(gg[hh]); float beta=sigmoidf(br[hh]);
+          for(int d=0;d<cfg.k_head_dim;d++) b_qn[d]*=scale;
+          float g_t=expf(b_gg[hh]); float beta=sigmoidf(br[hh]);
           float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
           for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
-          for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
-          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
+          for(int c=0;c<cfg.v_head_dim;c++) b_kv_mem[c]=0.f;
+          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) b_kv_mem[c]+=S[d*cfg.v_head_dim+c]*b_kn[d];
           { const float* vh=&value[hh*cfg.v_head_dim];
-          for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
-          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
+          for(int c=0;c<cfg.v_head_dim;c++) b_delta[c]=(vh[c]-b_kv_mem[c])*beta; }
+          for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=b_kn[d]*b_delta[c];
           for(int c=0;c<cfg.v_head_dim;c++){
-            float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
-            core[hh*cfg.v_head_dim+c]=s;
+            float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*b_qn[d];
+            b_core[hh*cfg.v_head_dim+c]=s;
           }
         }
         const float* ssm_norm_w = ln.ssm_norm_w;
         float* ncr = &b_ncore[(size_t)m*zvw];
         for(int hh=0; hh<cfg.n_v_heads; hh++){
-          const float* xx=&core[hh*cfg.v_head_dim];
+          const float* xx=&b_core[hh*cfg.v_head_dim];
           const float* zg=&zr[hh*cfg.v_head_dim];
           float* oo=&ncr[hh*cfg.v_head_dim];
           float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
@@ -7207,33 +7831,33 @@ static std::vector<StepOut> step_batch(
           float* br = &b_b[(size_t)m*cfg.n_v_heads];
           float* ar = &b_a[(size_t)m*cfg.n_v_heads];
           for(int hh=0; hh<cfg.n_v_heads; hh++){
-            float sp=log1pf(expf(ar[hh]+dt_bias[hh])); gg[hh]=-expf(A_log[hh])*sp;
+            float sp=log1pf(expf(ar[hh]+dt_bias[hh])); b_gg[hh]=-expf(A_log[hh])*sp;
           }
-          for(size_t i=0;i<zvw;i++) core[i] = 0.f;
+          for(size_t i=0;i<zvw;i++) b_core[i] = 0.f;
           for(int hh=0; hh<cfg.n_v_heads; hh++){
             int kh = (cfg.n_v_heads > cfg.n_k_heads)
                      ? (int)((long long)hh * cfg.n_k_heads / cfg.n_v_heads)
                      : hh;
-            l2norm(&query[kh*cfg.k_head_dim], qn.data(), cfg.k_head_dim);
-            l2norm(&key[kh*cfg.k_head_dim],  kn.data(), cfg.k_head_dim);
+            l2norm(&query[kh*cfg.k_head_dim], b_qn.data(), cfg.k_head_dim);
+            l2norm(&key[kh*cfg.k_head_dim],  b_kn.data(), cfg.k_head_dim);
             float scale=1.0f/sqrtf((float)cfg.k_head_dim);
-            for(int d=0;d<cfg.k_head_dim;d++) qn[d]*=scale;
-            float g_t=expf(gg[hh]); float beta=sigmoidf(br[hh]);
+            for(int d=0;d<cfg.k_head_dim;d++) b_qn[d]*=scale;
+            float g_t=expf(b_gg[hh]); float beta=sigmoidf(br[hh]);
             float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
             for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
-            for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
-            for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
+            for(int c=0;c<cfg.v_head_dim;c++) b_kv_mem[c]=0.f;
+            for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) b_kv_mem[c]+=S[d*cfg.v_head_dim+c]*b_kn[d];
             { const float* vh=&value[hh*cfg.v_head_dim];
-            for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
-            for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
+            for(int c=0;c<cfg.v_head_dim;c++) b_delta[c]=(vh[c]-b_kv_mem[c])*beta; }
+            for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=b_kn[d]*b_delta[c];
             for(int c=0;c<cfg.v_head_dim;c++){
-              float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
-              core[hh*cfg.v_head_dim+c]=s;
+              float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*b_qn[d];
+              b_core[hh*cfg.v_head_dim+c]=s;
             }
           }
           float* ncr = &b_ncore[(size_t)m*zvw];
           for(int hh=0; hh<cfg.n_v_heads; hh++){
-            const float* xx=&core[hh*cfg.v_head_dim];
+            const float* xx=&b_core[hh*cfg.v_head_dim];
             const float* zg=&zr[hh*cfg.v_head_dim];
             float* oo=&ncr[hh*cfg.v_head_dim];
             float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
@@ -7302,33 +7926,33 @@ static std::vector<StepOut> step_batch(
             float* br = &b_b[(size_t)m*cfg.n_v_heads];
             float* ar = &b_a[(size_t)m*cfg.n_v_heads];
             for(int hh=0; hh<cfg.n_v_heads; hh++){
-              float sp=log1pf(expf(ar[hh]+dt_bias[hh])); gg[hh]=-expf(A_log[hh])*sp;
+              float sp=log1pf(expf(ar[hh]+dt_bias[hh])); b_gg[hh]=-expf(A_log[hh])*sp;
             }
-            for(size_t i=0;i<zvw;i++) core[i] = 0.f;
+            for(size_t i=0;i<zvw;i++) b_core[i] = 0.f;
             for(int hh=0; hh<cfg.n_v_heads; hh++){
               int kh = (cfg.n_v_heads > cfg.n_k_heads)
                        ? (int)((long long)hh * cfg.n_k_heads / cfg.n_v_heads)
                        : hh;
-              l2norm(&query[kh*cfg.k_head_dim], qn.data(), cfg.k_head_dim);
-              l2norm(&key[kh*cfg.k_head_dim],  kn.data(), cfg.k_head_dim);
+              l2norm(&query[kh*cfg.k_head_dim], b_qn.data(), cfg.k_head_dim);
+              l2norm(&key[kh*cfg.k_head_dim],  b_kn.data(), cfg.k_head_dim);
               float scale=1.0f/sqrtf((float)cfg.k_head_dim);
-              for(int d=0;d<cfg.k_head_dim;d++) qn[d]*=scale;
-              float g_t=expf(gg[hh]); float beta=sigmoidf(br[hh]);
+              for(int d=0;d<cfg.k_head_dim;d++) b_qn[d]*=scale;
+              float g_t=expf(b_gg[hh]); float beta=sigmoidf(br[hh]);
               float* S=&ly.ssm_state[hh*cfg.k_head_dim*cfg.v_head_dim];
               for(int i=0;i<cfg.k_head_dim*cfg.v_head_dim;i++) S[i]*=g_t;
-              for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]=0.f;
-              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) kv_mem[c]+=S[d*cfg.v_head_dim+c]*kn[d];
+              for(int c=0;c<cfg.v_head_dim;c++) b_kv_mem[c]=0.f;
+              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) b_kv_mem[c]+=S[d*cfg.v_head_dim+c]*b_kn[d];
               { const float* vh=&value[hh*cfg.v_head_dim];
-              for(int c=0;c<cfg.v_head_dim;c++) delta[c]=(vh[c]-kv_mem[c])*beta; }
-              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=kn[d]*delta[c];
+              for(int c=0;c<cfg.v_head_dim;c++) b_delta[c]=(vh[c]-b_kv_mem[c])*beta; }
+              for(int d=0;d<cfg.k_head_dim;d++) for(int c=0;c<cfg.v_head_dim;c++) S[d*cfg.v_head_dim+c]+=b_kn[d]*b_delta[c];
               for(int c=0;c<cfg.v_head_dim;c++){
-                float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*qn[d];
-                core[hh*cfg.v_head_dim+c]=s;
+                float s=0; for(int d=0;d<cfg.k_head_dim;d++) s+=S[d*cfg.v_head_dim+c]*b_qn[d];
+                b_core[hh*cfg.v_head_dim+c]=s;
               }
             }
             float* ncr = &b_ncore[(size_t)m*zvw];
             for(int hh=0; hh<cfg.n_v_heads; hh++){
-              const float* xx=&core[hh*cfg.v_head_dim];
+              const float* xx=&b_core[hh*cfg.v_head_dim];
               const float* zg=&zr[hh*cfg.v_head_dim];
               float* oo=&ncr[hh*cfg.v_head_dim];
               float v=0; for(int i=0;i<cfg.v_head_dim;i++) v+=xx[i]*xx[i];
@@ -7834,6 +8458,54 @@ static bool parse_serve_line(const std::string& line, std::string& prompt,
 static int sample(const std::vector<float>& logits, int top_k, float top_p,
                   float temperature, std::mt19937& rng){
   if(temperature <= 0.f) temperature = 1e-5f;
+  // FORK_B580 §8 #313: when top-k is the FIRST active sampler stage
+  // (top_k>0, top_p<=0, temperature>0) there is nothing before it to do --
+  // this CLI has no penalty, no grammar, no logit bias, no mirostat, no backend
+  // sampling, so the base's full-vocab softmax + nth_element prune +
+  // renormalize can be replaced by selecting the k largest logits directly
+  // and softmaxing over only those. BIT-EXACT BY CONSTRUCTION: the base's
+  // survivor set is {i : probs[i] >= kth_prob} and it zeroes only p < kth
+  // (so ties at kth survive). Because probs[i] = expf((logits[i]-mx)/T) is
+  // strictly monotone in logits[i] and kth_prob == expf((kthl-mx)/T) where
+  // kthl is the top_k-th largest logit, {i : probs[i] >= kth_prob} ==
+  // {i : logits[i] >= kthl} -- the same set this selects, independent of
+  // nth_element's permutation. The per-token expf values, the renormalized
+  // probs and the inverse-CDF draw over the same vector are then
+  // byte-identical, so a stream A/B is a formality (not a tolerance
+  // contract). Announcement is inside the branch, so it is gated on the
+  // path actually running, not on the flag-read.
+  static const bool topk_direct =
+    (std::getenv("INTFER_SAMPLE_TOPK_DIRECT") != nullptr);
+  if(topk_direct && top_k > 0 && top_p <= 0.f && temperature > 0.f &&
+     (int)logits.size() > top_k){
+    std::fprintf(stderr,
+      "[sample-topk-direct] ACTIVE top_k=%d vocab=%zu "
+      "(INTFER_SAMPLE_TOPK_DIRECT=1)\n",
+      top_k, logits.size());
+    float mx = -1e30f;
+    for(float v : logits) if(v>mx) mx=v;
+    std::vector<float> lcopy = logits;
+    std::nth_element(lcopy.begin(), lcopy.end()-top_k, lcopy.end());
+    float kth = lcopy[lcopy.size()-top_k];
+    // Reused across calls (single-threaded CLI); sized to vocab once.
+    static std::vector<float> probs;
+    if(probs.size() != logits.size()) probs.assign(logits.size(), 0.f);
+    float sum = 0.f;
+    for(size_t i=0;i<logits.size();i++){
+      if(logits[i] < kth){ probs[i] = 0.f; continue; }
+      probs[i] = expf((logits[i]-mx)/temperature);
+      sum += probs[i];
+    }
+    for(float& p : probs) p /= sum;
+    std::uniform_real_distribution<float> U(0.f, 1.f);
+    float r = U(rng);
+    float acc = 0.f;
+    for(size_t i=0;i<probs.size();i++){
+      acc += probs[i];
+      if(r <= acc) return (int)i;
+    }
+    return (int)(probs.size()-1);
+  }
   float mx = -1e30f;
   for(float v : logits) if(v>mx) mx=v;
   // Reused across calls (single-threaded CLI); sized to vocab once.
@@ -8673,14 +9345,6 @@ struct PrefixCache {
       if(p <= 0 || (size_t)p > e.state_len) continue;
       if((int)kv.second.size() != cfg.layers) continue;
       e.grid[p] = kv.second;
-    }
-    {
-      std::vector<PcSsm> top(cfg.layers);
-      for(size_t L = 0; L < q.layers.size(); L++){
-        const Layer& ly = q.layers[L];
-        if(!ly.is_full){ top[L].ssm = ly.ssm_state; top[L].conv = ly.conv_state; }
-      }
-      e.grid[(int)e.state_len] = std::move(top);
     }
     // Bound retained memory: lowest-4 + highest-12 (same policy as record).
     while(e.grid.size() > 16){
@@ -9574,7 +10238,7 @@ static void usage(const char* p){
     "  --gpu          force SYCL/GPU backend (intfer::Engine)\n"
     "  --no-gpu       force CPU backend (dequant + host matmul)\n"
     "  --tp N         tensor-parallel GPU count (default: 2, the 2x B580 fleet)\n"
-    "  --tokenizer P  path to tokenizer.json (default: Qwen3.5-0.8B)\n"
+    "  --tokenizer P  path to tokenizer.json (derived from -m; INTFER_08B retargets the gate fixture)\n"
     "  --tokenizer-py P path to bpe_tokenize.py\n"
     "  --detok-py P   path to bpe_detokenize.py\n"
     "  --no-stream    do not stream tokens (print full output after generation)\n"
@@ -9601,8 +10265,10 @@ int main(int argc, char** argv){
   // ---- Arg parse
   std::string intfer_path, st_path, prompt_file;
   std::vector<std::string> prompts; // repeatable -p (Stage 3.2 scheduler)
-  std::string tokenizer_json =
-      "/var/home/fra/data/models/safetensors/Qwen3.5-0.8B/tokenizer.json";
+  // Tokenizer path: DERIVED from -m below (build_st_* probe chain). Empty here
+  // so no model is the hardcoded starting point; the 0.8B and 27B are fallback
+  // probes in that chain, not defaults.
+  std::string tokenizer_json;
   std::string tokenizer_py;
   std::string detok_py;
   {
@@ -9720,14 +10386,9 @@ int main(int argc, char** argv){
       set_st("/var/home/fra/data/models/safetensors/" + model_name);
     else if(!model_name.empty() && try_path("test/models/" + model_name))
       set_st("test/models/" + model_name);
-    else if(try_path("test/models/Qwen3.5-0.8B"))      set_st("test/models/Qwen3.5-0.8B");
     else if(try_path("test/models/Qwen3.8-27B"))  set_st("test/models/Qwen3.8-27B");
-    else if(try_path("/var/home/fra/data/models/safetensors/Qwen3.5-0.8B"))
-      set_st("/var/home/fra/data/models/safetensors/Qwen3.5-0.8B");
     else if(try_path("/var/home/fra/data/models/safetensors/Qwen3.8-27B"))
       set_st("/var/home/fra/data/models/safetensors/Qwen3.8-27B");
-    else if(try_path("/home/fra/data/models/safetensors/Qwen3.5-0.8B"))
-      set_st("/home/fra/data/models/safetensors/Qwen3.5-0.8B");
     else if(try_path("/home/fra/data/models/safetensors/Qwen3.8-27B"))
       set_st("/home/fra/data/models/safetensors/Qwen3.8-27B");
     else { std::fprintf(stderr, "intfer: cannot auto-detect safetensors. "
@@ -9760,7 +10421,7 @@ int main(int argc, char** argv){
       if(sp != std::string::npos) cfg_try(st_path.substr(0, sp));
     }
     if(config_dir.empty() && !model_name.empty()){
-      // Self-contained mode: -m /path/to/Qwen3.5-0.8B-sc.intifer ->
+      // Self-contained mode: -m /path/to/model-sc.intifer ->
       // config in sibling dirs (same basename minus any -sc/-full suffix).
       std::string base = model_name;
       for(const char* suf : {"-sc", "-full", "-noembed", "-int2"}){
@@ -9775,6 +10436,27 @@ int main(int argc, char** argv){
     }
     ModelConfig loaded = load_model_config(config_dir);
     cfg = loaded;
+    // Tokenizer: DERIVE from the resolved model dir (the dir that holds
+    // config.json, or the -m sibling, or the -s safetensors dir). No model is
+    // the hardcoded default; INTFER_08B retargets the gate fixture.
+    if(tokenizer_json.empty()){
+      auto tok_in = [](const std::string& dir){
+        return dir.empty() ? std::string() : (dir + "/tokenizer.json");
+      };
+      auto exists = [](const std::string& p) -> bool {
+        if(p.empty()) return false;
+        FILE* f = fopen(p.c_str(), "rb"); if(!f) return false; fclose(f); return true;
+      };
+      std::string cand = tok_in(config_dir);
+      if(!exists(cand)) cand = tok_in(st_path);
+      if(!exists(cand) && !model_name.empty()){
+        size_t sp = intfer_path.rfind('/');
+        std::string idir = (sp != std::string::npos) ? intfer_path.substr(0, sp) : ".";
+        cand = tok_in(idir + "/" + model_name);
+      }
+      if(!exists(cand)) cand = std::string(); // no last-resort family fallback; INTFER_08B retargets the gate fixture
+      tokenizer_json = cand;
+    }
     std::fprintf(stderr, "[intfer] config: model_id=%s H=%d layers=%d inter=%d heads=%d kv=%d conv_dim=%d sdim=%d (from %s)\n",
                  cfg.model_id.c_str(), cfg.H, cfg.layers, cfg.inter, cfg.n_heads, cfg.n_kv, cfg.conv_dim, cfg.sdim,
                  config_dir.empty() ? "<defaults>" : (config_dir + "/config.json").c_str());
@@ -10496,8 +11178,69 @@ int main(int argc, char** argv){
   if(const char* se = std::getenv("INTFER_SPEC_K")){
     int v = std::atoi(se); if(v >= 1 && v <= 16) spec_K = v;
   }
+  // INTFER_SPEC_ADAPT=1 (gufo's dflash_policy.hpp): instead of a fixed
+  // draft width, choose the width that maximises
+  //   expected_emitted / verify_cost
+  // over w = 1..cap, where expected_emitted = w * accept_ema (EMA of the
+  // accepted/try ratio) and verify_cost = w+1 (one prefill_layer_outer row
+  // per draft token plus the prompt row — intfer's verify is exactly an
+  // M=K+1 batched prefill, so the cost model is measured, not assumed).
+  //
+  // This is a SCHEDULING change only: it changes how many draft tokens are
+  // proposed and verified per round, never which tokens, never the
+  // arithmetic. With a constant accept rate the controller converges to a
+  // fixed width, so on a steady workload it reproduces a fixed-K run
+  // (greedy output parity is already asserted by the existing spec arm).
+  // The EMA floor (0.05) and ceiling (0.95) keep the first round off a
+  // zero-width choice when nothing has been observed.
+  static const bool spec_adapt =
+      (std::getenv("INTFER_SPEC_ADAPT") != nullptr);
+  struct SpecAdapt {
+    double accept_ema = 0.5;
+    // DFlash2-on-NPU score-fed extension (docs/DFLASH_ON_NPU.txt sec.3): when
+    // the draft producer is a SECOND DEVICE it also knows its own per-position
+    // confidence (the ring's `scores`), which intfer's local accept-EMA cannot
+    // see. `producer_scores` is that per-position confidence for the CURRENT
+    // draft window (empty => fall back to the local EMA exactly). The policy is
+    // still a SCHEDULING change -- it only picks HOW MANY drafts to propose,
+    // never which tokens (the drafts themselves come from the producer), so a
+    // greedy run's accepted/emitted stream is unchanged in kind.
+    int choose(int cap, const std::vector<float>& producer_scores = {}) const {
+      if(cap < 1) return 1;
+      int best = 1; double best_score = -1.0;
+      for(int w = 1; w <= cap; ++w){
+        // Baseline expected accepted count from the local accept rate.
+        double expected = (double)w * accept_ema;
+        // If the producer supplied a confidence for position w (0-based w-1),
+        // blend it in: the producer's own estimate of position w surviving.
+        // Blend is multiplicative on the expected count so a confident
+        // producer widens the window and an unsure one narrows it; the floor
+        // keeps w=1 reachable when the producer reports nothing.
+        if(w <= (int)producer_scores.size()){
+          double conf = (double)producer_scores[(size_t)(w - 1)];
+          if(conf < 0.0) conf = 0.0;
+          if(conf > 1.0) conf = 1.0;
+          expected *= (0.5 + 0.5 * conf);
+        }
+        double cost = (double)w + 1.0;
+        double score = expected / cost;
+        if(score > best_score){ best_score = score; best = w; }
+      }
+      return best;
+    }
+    void observe(int accepted, int tried){
+      if(tried <= 0) return;
+      double r = (double)accepted / (double)tried;
+      accept_ema = accept_ema * 0.75 + r * 0.25;
+      if(accept_ema < 0.05) accept_ema = 0.05;
+      if(accept_ema > 0.95) accept_ema = 0.95;
+    }
+  };
+  int spec_cap = spec_K;
+  if(spec_adapt && spec_cap < 1) spec_cap = 8;
+  if(spec_cap > 16) spec_cap = 16;
   bool greedy = (temperature <= 0.f && top_k==0 && top_p<=0.f);
-  bool use_spec = (spec_K > 0 && greedy);
+  bool use_spec = greedy && (spec_cap > 0);
   // N-gram drafter: last occurrence of the current token in the committed
   // history; the following tokens are free drafts (no model cost).
   auto ngram_drafts = [&](int tok, int K){
@@ -10528,6 +11271,233 @@ int main(int argc, char** argv){
     if((int)d.size() > K) d.resize(K);
     return d;
   };
+  // ------------------------------------------------------------------------
+  // DRAFT-SOURCE SEAM (docs/DFLASH_ON_NPU.txt sec.1/sec.3).
+  //
+  // The F/DFlash/DFlash2-on-NPU architecture is an asynchronous
+  // producer-consumer split: a draft model on a second device (NPU/DPU)
+  // produces a block of candidate token IDs into a PINNED staging buffer while
+  // the target model on the GPU runs the verify pass, and only the COMPACT
+  // candidate array (token IDs + path indices -- never logits, never hidden
+  // states, per sec.3) crosses the boundary. intfer's draft producer is
+  // currently a synchronous host n-gram lookup, so there is no place for a
+  // second-device producer to attach.
+  //
+  // This seam introduces that place WITHOUT changing the shipped behaviour: the
+  // default source IS the n-gram drafter (byte-identical -- it is the same
+  // code), and the new source is a double-buffered PINNED STAGING RING whose
+  // contract is the one an NPU producer would have to satisfy:
+  //
+  //   * the ring has TWO slots. The consumer only ever reads a slot whose
+  //     `ready` handshake was published by the producer (acquire/release), so a
+  //     producer that has not finished writing a slot can never be read;
+  //   * the consumer publishes a `consumed` mark, and the producer MUST NOT
+  //     write a slot until it observes it -- this is the back-pressure that
+  //     stops the producer from overwriting a slot the verify path still holds;
+  //   * only ints (ids) and floats (path scores) cross; the payload is bounded
+  //     by SPEC_MAX_K, which is a metadata-only transfer by construction.
+  //
+  // Today the producer side is filled by the SAME n-gram logic (there is no NPU
+  // backend in this tree), so the two sources return identical drafts on the
+  // shipped model and the seam is certifiable by construction. What is NEW and
+  // testable is the RING DISCIPLINE: the handshake is enforced (a stale or
+  // not-ready slot is refused rather than read), which is exactly the part an
+  // NPU integration gets wrong. Flag INTFER_DRAFT_SOURCE=pinned selects it;
+  // unset/ngram keeps the shipped path.
+  // ------------------------------------------------------------------------
+  static constexpr int SPEC_MAX_K = 16;
+  // Page-locked / pinned buffer wrapper for draft-ring slots (DFlash2-on-NPU
+  // sec.1: "Pinned host memory shared buffers as an intermediary staging
+  // ground"). In a real NPU integration this would be a CL_MEM_ALLOC_HOST_PTR
+  // buffer or sycl::malloc_host allocation that the NPU DMA-writes directly.
+  // The pin/unpin handshake simulates clEnqueueMapBuffer / clEnqueueUnmapMemObject:
+  // while pinned, the NPU owns the buffer and the CPU must not touch it.
+  struct PinnedDraftBuffer {
+    int* ids = nullptr;
+    float* scores = nullptr;
+    int cap = 0;
+    int n = 0;
+    bool pinned = false;
+
+    // Pin the buffer for producer (NPU) access. Returns false if already pinned.
+    bool pin(int* id_buf, float* score_buf, int cap_in) {
+      if (pinned) return false;
+      ids = id_buf;
+      scores = score_buf;
+      cap = cap_in;
+      n = 0;
+      pinned = true;
+      return true;
+    }
+
+    // Unpin the buffer after consumer (GPU) has read it. Returns false if not pinned.
+    bool unpin() {
+      if (!pinned) return false;
+      ids = nullptr;
+      scores = nullptr;
+      n = 0;
+      cap = 0;
+      pinned = false;
+      return true;
+    }
+
+    bool is_pinned() const { return pinned; }
+  };
+
+  struct DraftRing {
+    // Two slots; `gen[i]` counts publishes to slot i, `cons[i]` counts consumes.
+    // A slot is readable iff gen[i] > cons[i] (producer published, consumer has
+    // not taken it). The producer may write slot i iff gen[i] == cons[i]
+    // (nothing outstanding) -- the back-pressure rule above.
+    //
+    // Backing store (NPU-side staging optimization): each slot owns page-locked
+    // style host memory that an NPU producer could DMA-write into directly.
+    // This replaces the previous null-pointer wiring where `pin()` was called
+    // with `bufs[s].ids` (initially nullptr) and the slot then wrote through
+    // that null pointer. The ring now owns the memory; `pin()` attaches it.
+    int ids_store[2][SPEC_MAX_K];
+    float scores_store[2][SPEC_MAX_K];
+    PinnedDraftBuffer bufs[2];
+    int n[2] = {0, 0};
+    unsigned gen[2] = {0, 0};
+    unsigned cons[2] = {0, 0};
+    // Staleness tag (DFlash2-on-NPU sec.1 race): the producer runs AHEAD of the
+    // verify path, so a draft it finishes can belong to a window the consumer
+    // has already moved past. `req[slot]` records which request the slot's
+    // payload answers; `want` is the consumer's current request. A slot whose
+    // req != want is STALE and must be refused, not consumed -- that is the
+    // "NPU writes candidates while the GPU is a window ahead" failure mode made
+    // observable. Only used when INTFER_DRAFT_CANCEL_STALE is set.
+    unsigned req[2] = {0, 0};
+    unsigned want = 0;
+    int slot = 0;
+    bool publish(const int* in, int k){
+      if(k < 0 || k > SPEC_MAX_K) return false;
+      const int s = slot;
+      // Back-pressure: refuse to publish into a slot the consumer still holds.
+      if(gen[s] != cons[s]) return false;
+      // Pin the slot's owned backing store for producer (NPU) access -- while
+      // pinned the CPU must not touch it. The NPU DMA-writes into the pinned
+      // buffer directly; this memory is page-locked style (simulating
+      // CL_MEM_ALLOC_HOST_PTR / sycl::malloc_host).
+      if(!bufs[s].pin(ids_store[s], scores_store[s], SPEC_MAX_K)) return false;
+      for(int i = 0; i < k; ++i){ bufs[s].ids[i] = in[i]; bufs[s].scores[i] = 0.f; }
+      n[s] = k;
+      bufs[s].n = k;       // mirror count in the pinned buffer
+      req[s] = want;       // tag the payload with the request it answers
+      gen[s]++;            // release: publish
+      slot = 1 - slot;
+      return true;
+    }
+    bool consume(int* out, int& k, float* scores_out = nullptr,
+                 bool cancel_stale = false){
+      // Read the OLDEST published-but-unconsumed slot; refuse if none.
+      for(int s = 0; s < 2; ++s){
+        if(gen[s] > cons[s]){
+          // Staleness: a slot answering a superseded request is refused AND
+          // retired (cons++) so it cannot block the ring forever -- the same
+          // "refuse rather than read" contract as a not-ready slot.
+          if(cancel_stale && req[s] != want){ bufs[s].unpin(); cons[s]++; continue; }
+          k = n[s];
+          for(int i = 0; i < k; ++i){
+            out[i] = bufs[s].ids[i];
+            if(scores_out) scores_out[i] = bufs[s].scores[i];
+          }
+          bufs[s].unpin();     // release: CPU/GPU done reading, NPU may re-pin
+          cons[s]++;       // acquire: mark consumed (frees the producer)
+          return true;
+        }
+      }
+      return false;
+    }
+  };
+
+  // The source indirection. `ngram` wraps the shipped drafter unchanged.
+  // `pinned` routes through the ring: the producer publishes the n-gram result
+  // (stand-in for an NPU producer) and the consumer drains it, so a broken
+  // handshake surfaces as an empty/refused draft rather than silent garbage.
+  static const bool draft_pinned =
+      ([] { const char* e = std::getenv("INTFER_DRAFT_SOURCE");
+            return e && std::strcmp(e, "pinned") == 0; }());
+  // NPU score-fed width policy (item 7, docs/DFLASH_ON_NPU.txt sec.3): when set
+  // AND the pinned ring is active, the adaptive controller is fed the
+  // producer's per-position confidence for the window it just asked for. A
+  // pure SCHEDULING change (how many drafts, never which), so it does not alter
+  // which tokens a greedy run accepts. Off => the controller uses only its
+  // local accept EMA (the shipped behaviour).
+  static const bool draft_score_policy =
+      (std::getenv("INTFER_DRAFT_SCORE_POLICY") != nullptr);
+  // Staleness cancellation (DFlash2-on-NPU sec.1 race). When set AND the
+  // pinned ring is active, the consumer tags each request with a monotonically
+  // increasing `want` and REFUSES (and retires) any slot whose payload answers
+  // a superseded request. The producer runs ahead of the verify path, so this
+  // is the window the async split actually races on. Off => the shipped
+  // consume (no request tag).
+  static const bool draft_cancel_stale =
+      (std::getenv("INTFER_DRAFT_CANCEL_STALE") != nullptr);
+  DraftRing draft_ring;
+  // Producer confidence for the last window (position w-1 confidence in
+  // scores[w-1]); filled only on the pinned path. Empty => EMA-only.
+  std::vector<float> draft_scores_last;
+  auto query_drafts = [&](int tok, int K) -> std::vector<int> {
+    draft_scores_last.clear();
+    if(!draft_pinned) return ngram_drafts(tok, K);
+    {
+      static bool announced = false;
+      if(!announced){
+        announced = true;
+        std::fprintf(stderr,
+                     "[draft-source] source=pinned ring=2-slot pinned-ring "
+                     "payload=ids+scores max_k=%d ACTIVE "
+                     "(producer stands in for an NPU/DFlash draft device; "
+                     "ids-only transfer, no logits)\n", SPEC_MAX_K);
+        std::fflush(stderr);
+      }
+    }
+    {
+      static bool announced_pb = false;
+      if(!announced_pb){
+        announced_pb = true;
+        std::fprintf(stderr,
+                     "[draft-pinned-buffer] slot=pinned page-locked pin/unpin=handshake "
+                     "ACTIVE (INTFER_DRAFT_SOURCE=pinned; NPU DMA-writes, GPU reads directly)\n");
+        std::fflush(stderr);
+      }
+    }
+    if(draft_cancel_stale){
+      static bool announced_stale = false;
+      if(!announced_stale){
+        announced_stale = true;
+        std::fprintf(stderr,
+                     "[draft-cancel-stale] request-tagged ring, superseded "
+                     "slots refused+retired ACTIVE "
+                     "(INTFER_DRAFT_CANCEL_STALE=1; window=%u)\n",
+                     draft_ring.want);
+        std::fflush(stderr);
+      }
+    }
+    if(K > SPEC_MAX_K) K = SPEC_MAX_K;
+    // Fresh request: advance the consumer's window tag BEFORE the producer
+    // publishes, so the payload it writes is tagged with THIS window. Two
+    // consumes for the same window keep the same tag; the tag moves only when
+    // the caller asks for a new window (i.e. the verify path advanced).
+    if(draft_cancel_stale) draft_ring.want++;
+    std::vector<int> d = ngram_drafts(tok, K);
+    int tmp[SPEC_MAX_K];
+    for(size_t i = 0; i < d.size() && i < (size_t)SPEC_MAX_K; ++i) tmp[i] = d[i];
+    if(!draft_ring.publish(tmp, (int)d.size())) return {}; // back-pressure: refuse
+    int got[SPEC_MAX_K], gk = 0;
+    float gsc[SPEC_MAX_K];
+    if(!draft_ring.consume(got, gk, gsc, draft_cancel_stale)) return {}; // handshake/staleness: refuse
+    // Score-fed: carry the producer's confidence for this window to the width
+    // policy. The ring's `scores` are the producer's own estimate. The n-gram
+    // stand-in has no confidence model, so it publishes 0.0, and the policy
+    // degrades to EMA-only automatically -- an NPU producer would fill real
+    // values through the same ring. Values are read from the slot just
+    // consumed, so the policy sees the producer's view of THIS window.
+    if(draft_score_policy) draft_scores_last.assign(gsc, gsc + gk);
+    return std::vector<int>(got, got + gk);
+  };
   auto emit_tok = [&](int step_i, int id){
     if(print_ids) std::fprintf(stderr, "  [%d] id=%d\n", step_i, id);
     generated.push_back(id);
@@ -10538,6 +11508,8 @@ int main(int argc, char** argv){
   // Per-layer pre-verify snapshots + verify per-row LA snapshots (reused
   // across rounds; vector assign reuses capacity after the first round).
   std::vector<std::vector<CacheSnap>> spec_rows;
+  // Adaptive spec-draft controller state (INTFER_SPEC_ADAPT=1).
+  SpecAdapt spec_adapt_state;
   std::vector<float> Hv;
   std::vector<StepOut> outs;
   for(int step_i = 0; step_i < max_new;){
@@ -10546,7 +11518,13 @@ int main(int argc, char** argv){
     bool spec_round = false;
     if(use_spec){
       int p = S + step_i;
-      std::vector<int> drafts = ngram_drafts(token, spec_K);
+      // Draft width: fixed INTFER_SPEC_K, or the adaptive controller's
+      // expected-emitted/cost maximiser (INTFER_SPEC_ADAPT=1).
+      int draft_w = spec_adapt
+          ? spec_adapt_state.choose(spec_cap,
+                draft_score_policy ? draft_scores_last : std::vector<float>{})
+          : spec_K;
+      std::vector<int> drafts = query_drafts(token, draft_w);
       if(!drafts.empty()){
         // Verify rows: [token @ p, d_1 @ p+1, ..., d_K @ p+K].
         // Drafts were never run (free n-gram tokens), so live state is
@@ -10567,6 +11545,8 @@ int main(int argc, char** argv){
         // outs[i-1].best == d_i.
         int a = 0;
         while(a < K && outs[(size_t)a].best == drafts[(size_t)a]) a++;
+        // Adaptive controller: observe the acceptance rate of this round.
+        if(spec_adapt) spec_adapt_state.observe(a, K);
         int c = outs[(size_t)a].best; // corrected (a<K) or bonus (a==K)
         // Emission list: accepted drafts up to and including the first EOS,
         // plus c iff no EOS was emitted.
@@ -10686,6 +11666,16 @@ int main(int argc, char** argv){
       p.peak_wait_depth,
       100.0 * (p.kernel_us / 1000.0) / std::max(1.0, decode_ms));
   }
+  // Device-timeline markers (INTFER_TIMELINE=1): the region-by-region
+  // device wall-clock breakdown, which is the ONLY way to attribute time
+  // on this box (the per-event kernel timestamps are dead -- see
+  // AGENTS.md "The profiling defect"). Reported SEPARATELY from the
+  // buckets above because it is host wall-clock between in-order points
+  // and is load-sensitive: decide on nk/nw/nr, never on a timeline
+  // figure. It is a diagnostic, off by default.
+#ifdef INTFER_PROFILE_GPU
+  if(std::getenv("INTFER_TIMELINE") != nullptr) intfer::timeline_dump();
+#endif
 #endif
   if(!stream) std::fwrite(output.data(), 1, output.size(), stdout);
   std::fwrite("\n", 1, 1, stdout);
