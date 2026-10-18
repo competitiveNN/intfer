@@ -23,6 +23,23 @@
 # says STALE but whose remediation does NOT mention the gate run must be reported
 # as CLEARABLE. If the classifier called everything pending it would pass PO-1..2
 # for the wrong reason and be useless.
+#
+# PO-4 is the DEFECT THAT WAS MEASURED on the real tree, 2026-10-16. The classifier's
+# predicate was `run_ten_gates\.sh|run_ten_gates\b`, which matches the checker's own
+# OUTPUT as well as its remediation advice. Two TEXT-ONLY steps were therefore filed
+# under "remediation needs the 27B run" -- the operator was told to spend tens of
+# minutes and both GPUs on steps that only grep source, and both were re-run here
+# and PASSED. The logs that produced it (kept verbatim in the state, because the
+# matrix must grade the shape that actually occurred, not a tidier one):
+#   run_all_check_scripts_live_sh.log   [gate glob parsed from run_ten_gates.sh]
+#                                       -- gate class: test_*.sh (parsed from run_ten_gates.sh,
+#                                       run_ten_gates.sh    NAMED by check_engine_cert.sh
+#   run_all_check_build_dir_consumers_sh.log   run_ten_gates.sh  ok  routes through ...
+# Every one of those is a SUBJECT the checker reports on, not a command it issues.
+# The advice the classifier must read is always the imperative form -- a verb
+# directly in front of the PATH (`run scripts/run_ten_gates.sh`), which is what
+# check_engine_cert.sh:56/:245 and run_all_checks.sh:779/1148 print. PO-4 plants
+# exactly the subject-only shape and requires CLEARABLE.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -60,6 +77,13 @@ EOF
 
 restore() { rm -rf "$SANDBOX"; mklogs "$SANDBOX"; }
 
+# The two classification blocks, extracted from a SAVED checker log. PO-4/PO-4b
+# assert on WHICH block a step lands in, not on a bare count: "pending=0" would
+# also be satisfied by a classifier that dropped the step out of BOTH classes,
+# which is the vacuous direction -- a missing answer is not a correct one.
+pend_block() { sed -n '/PENDING-OPERATOR step(s)/,/CLEARABLE-HERE/p' "$1"; }
+clear_block() { sed -n '/CLEARABLE-HERE step(s)/,/^[[:space:]]*$/p' "$1"; }
+
 total=0; caught=0; RESULTS=()
 # $1 id, $2 expect-regex, $3 want: reject | keep-green, $4 checker to run (defaults
 # to the real one). $4 exists because PO-2 mutates a COPY of the checker; the
@@ -91,6 +115,8 @@ if [ "${1:-}" = "--list" ]; then
   echo "  PO-1  no step logs at all -> must be INCONCLUSIVE, not 'nothing pending'"
   echo "  PO-2  the 27B-model marker destroyed -> derived set empty     [must REJECT]"
   echo "  PO-3  a stale step with NO gate remediation is CLEARABLE HERE   [must ACCEPT]"
+  echo "  PO-4  a subject-only run_ten_gates mention is CLEARABLE        [must ACCEPT]"
+  echo "  PO-4b the ORIGINAL loose predicate misfiles it as pending     [must CATCH]"
   exit 0
 fi
 
@@ -135,9 +161,81 @@ RESULT: engine certification STALE -- re-run the stack on this machine
 EOF
 }
 
+# PO-4 plant a TEXT-ONLY step whose only mentions of run_ten_gates.sh are the
+# SUBJECTS it classifies -- the exact shape measured in the two real logs above.
+# It must be reported CLEARABLE, not operator-deferred.
+po4() { cat >"$SANDBOX/run_all_check_scripts_live_sh.log" <<'EOF'
+== SCRIPTS LIVE (population: scripts/*.{sh,py,c}) ==
+  ok    [gate glob parsed from run_ten_gates.sh] harvested 9 item(s)
+-- gate class: test_*.sh (parsed from run_ten_gates.sh, not restated)
+  ok    run_ten_gates.sh                   NAMED by scripts/check_engine_cert.sh (+34 more)
+RESULT: FAIL (2) -- a script nothing runs is not tooling
+EOF
+}
+
 po1; run_state PO-1 'INCONCLUSIVE|no .*logs' reject
 po2; run_state PO-2 'no gate script names the 27B model|broken derivation' reject "$SANDBOX/chk.sh"
 po3; run_state PO-3 '' keep-green
+
+# PO-4 is decided on the CLASSIFICATION, not on the rc: check_pending_operator.sh
+# ends in `exit 0` on every path, so an rc-based state would be satisfied by a
+# classifier that files EVERY failing step in the operator's queue -- the
+# always-red twin in disguise. Two directions, and the second is what stops the
+# first from being vacuous:
+#   (a) the CORRECT predicate must leave the planted step in CLEARABLE;
+#   (b) a copy carrying the ORIGINAL loose predicate must move the SAME log into
+#       PENDING -- proving the state can still see the defect it is named after.
+# NB the sandbox is the STANDARD pair plus the planted log, and `restore` re-seeds
+# `engine_cert` (whose advice legitimately matches) -- so the expected split is
+# 1 pending / 2 clearable. The first draft of this state asserted 0/1, forgot
+# that re-seed, and would have MISSED a correct checker. A state whose
+# expectation is wrong about its own fixture is worse than no state: it fails the
+# code that is right and teaches the next session to distrust a green matrix.
+po4
+total=$((total + 1))
+out="$(INTFER_BUILD_DIR="$SANDBOX" bash "$CHECK" 2>&1)"; rc=$?
+printf '%s\n' "$out" >"$SB/PO-4.log"
+restore
+if [ "$rc" -eq 0 ] \
+   && grep -qE 'PENDING-OPERATOR step\(s\)[^:]*: 1$' "$SB/PO-4.log" \
+   && ! pend_block "$SB/PO-4.log" | grep -qE '^[[:space:]]+run_all_check_scripts_live_sh$' \
+   && clear_block "$SB/PO-4.log" | grep -qE '^[[:space:]]+run_all_check_scripts_live_sh$'; then
+  caught=$((caught + 1)); RESULTS+=("PO-4 CAUGHT ''")
+else
+  RESULTS+=("PO-4 MISSED '(a subject mention was filed as operator-deferred)'")
+fi
+
+# (b) the negative direction. The copy CANNOT live in $SANDBOX: the checker derives
+# ROOT from its own directory, and $SANDBOX sits two levels below the build tree,
+# so `cd $ROOT` leaves the real scripts/test_*.sh unfindable and the 27B-gate
+# derivation (the PO-2 floor) refuses BEFORE the classifier runs -- MEASURED on the
+# first draft, which printed "broken derivation" and rc=1. mktemp directly under
+# the REPO ROOT keeps the parent correct; the directory is removed immediately so
+# the residue check still sees a clean tree.
+LOOSE_DIR="$(mktemp -d "$ROOT/.po4loose.XXXXXX")" || LOOSE_DIR=""
+if [ -n "$LOOSE_DIR" ]; then
+  sed 's/grep -qiE .(re-?run|run)\[\[:space:\]\]+scripts\/run_ten_gates\\.sh./grep -qE "run_ten_gates\\.sh|run_ten_gates\\b"/g' \
+      "$CHECK" >"$LOOSE_DIR/chk_loose.sh" 2>/dev/null
+  chmod +x "$LOOSE_DIR/chk_loose.sh" 2>/dev/null
+fi
+if [ -n "$LOOSE_DIR" ] && grep -qF 'run_ten_gates\.sh|run_ten_gates\b' "$LOOSE_DIR/chk_loose.sh" 2>/dev/null; then
+  po4
+  total=$((total + 1))
+  lout="$(INTFER_BUILD_DIR="$SANDBOX" bash "$LOOSE_DIR/chk_loose.sh" 2>&1)"; lrc=$?
+  printf '%s\n' "$lout" >"$SB/PO-4b.log"
+  restore
+  if [ "$lrc" -eq 0 ] \
+     && grep -qE 'PENDING-OPERATOR step\(s\)[^:]*: 2$' "$SB/PO-4b.log" \
+     && pend_block "$SB/PO-4b.log" | grep -qE '^[[:space:]]+run_all_check_scripts_live_sh$'; then
+    caught=$((caught + 1)); RESULTS+=("PO-4b CAUGHT ''")
+  else
+    RESULTS+=("PO-4b MISSED '(the loose predicate no longer misfiles -- the state proves nothing)'")
+  fi
+else
+  total=$((total + 1))
+  RESULTS+=("PO-4b MISSED '(could not build a loose-predicate copy to prove the direction)'")
+fi
+[ -n "${LOOSE_DIR:-}" ] && rm -rf "$LOOSE_DIR"
 
 for r in "${RESULTS[@]}"; do printf '  %s\n' "$r"; done
 
@@ -151,6 +249,9 @@ if [ "$caught" -eq "$total" ]; then
   echo "        vacuous zero that the first version of the classifier actually printed"
   echo "  PO-2: a broken 27B derivation is visible rather than reported as zero"
   echo "  PO-3: a stale step with no gate remediation is CLEARABLE (not always-pending)"
+  echo "  PO-4 / PO-4b: the predicate names the ADVICE, not any mention -- a subject-only"
+  echo "        run_ten_gates.sh line is CLEARABLE, and PO-4b proves the original loose"
+  echo "        predicate still misfiles that very log as operator-deferred."
   echo "RESULT: PASS ($caught/$total states caught)"
   exit 0
 fi

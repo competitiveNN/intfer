@@ -302,7 +302,24 @@ for f in $GATES; do
     precond="gate_gpu_count"
     # A per-arm gate that never records what it skipped is a silent skip wearing
     # a per-arm hat: it would exit 0 on a 1-GPU box while claiming the shape.
-    printf '%s\n' "$code" | grep -qE 'SKIPPED_(TP2|SUB)|PARTIAL' || {
+    #
+    # *** GREP THE CODEFILE, NOT A PIPE (2026-10-15). *** The original piped
+    # `$code` into `grep -qE`: `grep -q` exits at the FIRST match (here, line
+    # 67 of a ~37 KB input), `printf` is still writing, gets SIGPIPE, and --
+    # because this script sets `set -o pipefail` at line 27 -- the pipeline's
+    # exit status becomes printf's 141 instead of grep's 0. A SUCCESSFUL
+    # match then fired the `||` branch and the gate was reported
+    # `gate_gpu_count(NO-SKIP-REPORT) BROKEN`. Measured with the real
+    # stripped content: 16 failures in 60 identical runs. `bash -x` slowed
+    # every command enough that the race flipped the other way, which is why
+    # a traced run and a plain run disagreed on the same file -- the
+    # "transient" reading I first put on that disagreement was wrong; it was
+    # a timing-dependent tooling defect in this checker, i.e. exactly the
+    # vacuous-green class the audit log exists to prevent. Grepping the
+    # already-written $codefile (line 287) removes the pipe: a file-backed
+    # grep cannot get SIGPIPE, and it is the same content `granularity_of`
+    # and `has_1gpu_arm` already read.
+    grep -qE 'SKIPPED_(TP2|SUB)|PARTIAL' "$codefile" || {
       precond="$precond(NO-SKIP-REPORT)"; gran="BROKEN"; }
   else
     precond="none"
@@ -492,7 +509,14 @@ else
       # Widening is safe in the direction that matters because the fallback is
       # STILL a failure: an unmarked stale tally is STALE and rc=1, exactly as
       # before. A line has to SAY it is historical; silence is not consent.
-      if printf '%s' "$txt" | grep -qiE 'audit-#|COUNTING TRAP|HISTORICAL|CITATION|at the time|superseded|re-derive'; then
+      # *** FILE-BACKED, NOT A PIPE. *** The original form was
+      # `printf '%s' "$txt" | grep -qiE ...`, and grep -q exits at the first
+      # match -- the same SIGPIPE-under-pipefail shape that made the $code
+      # harvest above fail 16/60 (see the fix at the granularity_of harvest).
+      # $txt is one doc line, so it never bit HERE, but the rule is now
+      # mechanical: scripts/check_pipefail_grep_q.sh refuses the pipe form, so
+      # this exclusion reads the already-collected doc instead.
+      if grep -qiE 'audit-#|COUNTING TRAP|HISTORICAL|CITATION|at the time|superseded|re-derive' <<<"$txt"; then
         excluded=$((excluded + 1))
         printf '           excl  %s:%s  %s\n' "$d" "$ln" "$(printf '%s' "$txt" | cut -c1-66)"
         continue

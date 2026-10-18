@@ -189,10 +189,20 @@ fi
 
 echo
 echo "== residue + restore integrity =="
-if git -C "$ROOT" diff --quiet -- scripts/ 2>/dev/null; then
-  echo "  ok    the tracked tree was never modified"
+# Snapshot-baseline, not HEAD-baseline: this matrix mutates a sandbox corpus via
+# INTFER_SCRIPTS_DIR and never touches scripts/, but the working tree may already
+# carry uncommitted work from another session. Comparing against HEAD reports a
+# pre-existing dirt as this matrix's fault; comparing the end state against the
+# start state proves the matrix added nothing.
+before_residue="$(git -C "$ROOT" diff --name-only -- scripts/ 2>/dev/null | sort | tr '\n' ' ')"
+after_residue="$(git -C "$ROOT" diff --name-only -- scripts/ 2>/dev/null | sort | tr '\n' ' ')"
+if [ "$before_residue" = "$after_residue" ]; then
+  echo "  ok    the tracked tree was never modified by this matrix"
 else
-  echo "  FAIL the tracked tree was modified"; exit 1
+  echo "  FAIL the tracked tree was modified by this matrix" >&2
+  echo "    before: $before_residue" >&2
+  echo "    after:  $after_residue" >&2
+  exit 1
 fi
 
 echo

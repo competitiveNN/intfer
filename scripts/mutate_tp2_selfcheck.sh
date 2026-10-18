@@ -211,6 +211,7 @@ if [ "${1:-}" = "--list" ]; then
   echo "  [EXCLUDED] GU-14 gu_path_fired aliases the MR tag instead of its own -- reason at its site"
   echo "  [EXCLUDED] GU-15 gu_arm_assert always certifies -- reason at its site"
   echo "  [EXCLUDED] GU-16 gu_arm_assert call deleted from the arm -- reason at its site"
+  echo "  [EXCLUDED] XM-17 XMXxWAVE precedence vacuity self-check deleted -- reason at its site"
   exit 0
 fi
 
@@ -326,6 +327,7 @@ run_state SK-13 'SELF-CHECK FAIL \(7\)' m_sk13
 record_excluded GU-14 "gu_path_fired aliases the MR tag; the stubbed self-check never calls it"
 record_excluded GU-15 "gu_arm_assert always certifies; the stubbed self-check never calls it"
 record_excluded GU-16 "gu_arm_assert call deleted from the arm; the stubbed self-check never calls it"
+record_excluded XM-17 "XMXxWAVE precedence vacuity self-check deleted; it sits in the rc-gated real-run half, which --self-check never drives"
 
 # --- residue: the tracked file must be byte-identical to HEAD ----------------
 if [ "$SB_DIGEST_BEFORE" != "$(cat "$TARGET" | cksum)" ]; then
@@ -370,6 +372,6 @@ fi
   echo "states=$total"
   echo "caught=$caught"
   echo "baselines=$baselines"
-  echo "excluded=MR-1 (arm call site; observable only by a real 27B run -- see the file)"
+  echo "excluded=MR-1, GU-14, GU-15, GU-16, XM-17 (arm call sites / rc-gated real-run halves; observable only by a real 27B run -- see the file)"
 } >"$STAMP.tmp" && mv "$STAMP.tmp" "$STAMP"
 exit 0

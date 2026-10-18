@@ -89,7 +89,7 @@ if [ "$BG" = 1 ]; then
       "http://$HOST:$PORT/v1/completions" \
       -H 'Content-Type: application/json' \
       -d '{"prompt":"warmup","max_tokens":1,"temperature":0}' 2>/dev/null) \
-      && printf '%s' "$_wresp" | grep -q '"choices"'; then
+      && grep -q '"choices"' <<<"$_wresp"; then
       echo "warmup: done in $(($(date +%s) - _w0))s"
     else
       echo "warmup: request failed, timed out, or bad response (server still up; first real request pays migration)" >&2

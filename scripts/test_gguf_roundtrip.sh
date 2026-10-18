@@ -35,5 +35,5 @@ trap 'rm -f "$GGUF"; exit 143' TERM
 OUT="$("$BIN" "$MODEL" "$GGUF" 2>&1)"; RC=$?
 echo "$OUT"
 [ "$RC" = "0" ] || { echo "GATE FAIL: intfer_gguf exited rc=$RC" >&2; exit 1; }
-echo "$OUT" | grep -aq "(PASS)" || { echo "GATE FAIL: no PASS line" >&2; exit 1; }
+grep -aq "(PASS)" <<<"$OUT" || { echo "GATE FAIL: no PASS line" >&2; exit 1; }
 echo "GGUF-ROUNDTRIP TEST: PASS"

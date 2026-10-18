@@ -362,7 +362,13 @@ for f in scripts/test_*.sh; do
   # as guarded (the audit-#14 defect: the ONLY gate_require_gpus mention in
   # test_device_argmax.sh was inside a comment).
   code="$(sed -e 's/[[:space:]]#.*$//' "$f")"
-  printf '%s\n' "$code" | grep -qE -- '(--gpu|sycl-ls|level_zero|xpu-smi|dpas_fold_probe)' || continue
+  # onemkl_probe is in the shared list (gate_inventory.sh:139) but was NOT
+  # here, so test_onemkl.sh -- a real device gate that runs a SYCL GPU queue --
+  # was silently dropped from this harness's own_devices while gate_inventory
+  # classified it render-node. That is a genuine classification drift, not a
+  # disagreement about an edge case: the two derivations must use the SAME
+  # predicate. MEASURED 2026-10-15.
+  printf '%s\n' "$code" | grep -qE -- '(--gpu|sycl-ls|level_zero|xpu-smi|dpas_fold_probe|onemkl_probe)' || continue
   printf '%s\n' "$code" | grep -qE 'gate_require_device|gate_require_render_node|gate_require_gpus|gate_gpu_count' || {
     echo "  FAIL  $(basename "$f") needs a device but carries NO guard at all." >&2
     echo "        It will exit 0 on a 1-GPU box and go RED when a GPU gate loses" >&2

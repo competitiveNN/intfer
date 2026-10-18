@@ -44,12 +44,23 @@
 #   DC-5  ONLY the UNCOVERED rule removed, DC-1's defect planted   [STILL REFUSE]
 #   DC-6  ALL FIVE rename guards removed, DC-1's defect planted   [EXCLUDED - coupled]
 #   DC-7  row-pair dropped from the required set, body emptied      [EXCLUDED - coupled]
+#   DC-8  the PRE-FIX exclusivity refusal planted in the guard     [REFUSE]
 #
 # DC-4/6/7 are FLOOR states: a floor cannot be tested by deleting it, so the defect
 # it should catch is planted at the same time and the state passes only if the
 # checker goes GREEN. DC-5 is the opposite and is deliberately a REFUSE: it proves
 # the checker has a second independent guard, so no single deletion hides a renamed
 # body.
+#
+# DC-8 is the same idea for the new enumeration section. The pre-fix guard printed
+# `"%s and %s"` from on[0]/on[1] -- exactly two names for up to seven live arms, so
+# it hid every third and later arm from the operator the refusal exists to inform,
+# and it also wrote past on[1] whenever three or more arms were live. Planting the
+# pre-fix message (and the pre-fix on[2] array) and requiring the checker to REFUSE
+# is rule 11: the artifact under test is correct by construction, so weakening the
+# CHECKER is unobservable -- mutate the ARTIFACT and require rejection. The state
+# is a source mutation, not a synthetic log, because a synthetic log would prove
+# nothing: it is built from the fixed guard and passes by construction.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -238,6 +249,65 @@ if [ "$ok" -eq 0 ]; then
   verdict DC-5 refuse 'exists but is not pinned|did not extract' "$out" "$rc"
 else record DC-5 'ANCHOR-DRIFT (a removal moved; state not run)'; fi
 
+# ---- DC-8: the PRE-FIX exclusivity refusal planted in the guard -> REFUSE -------
+# The pre-fix guard sized on[2] against seven note_o callers and printed
+# `"%s and %s"` from on[0]/on[1]. Both halves are planted together: the two-name
+# message is the arity defect, and on[2] is the capacity defect (three or more
+# live arms wrote past the array). The checker must refuse for the ARITY reason,
+# which is the one the operator sees; the capacity half is what made it UB.
+GUARD_OLD='const char* on[8] = {nullptr, nullptr, nullptr, nullptr,
+                           nullptr, nullptr, nullptr, nullptr};'
+GUARD_NEW='const char* on[2] = {nullptr, nullptr};'
+REFUSAL_OLD='std::fprintf(stderr,
+                     "[decode1-bisect] REFUSING: %d opt-in arms are live and\n"'
+REFUSAL_NEW='std::fprintf(stderr,
+                     "[decode1-bisect] REFUSING: %s and %s are both live and\n"'
+# DC-10's anchors: the clamp, and its absence. The plant is the ABSENCE, spelled as an
+# unconditional store, so the capacity check's derived clamp bound becomes empty ("").
+CLAMP_OLD='        if (no < 8) on[no] = n;'
+CLAMP_NEW='        on[no] = n;'
+total=$((total + 1)); restore_all
+ok=0
+plant "$GUARD_OLD" "$GUARD_NEW" || ok=1
+plant "$REFUSAL_OLD" "$REFUSAL_NEW" || ok=1
+if [ "$ok" -eq 0 ]; then
+  setup_root; out="$(run_checker)"; rc=$?
+  verdict DC-8 refuse 'two-name form|SMALLER than the number' "$out" "$rc"
+else record DC-8 'ANCHOR-DRIFT (state not run)'; fi
+
+# ---- DC-9: the PRE-FIX two-name refusal restored, on[8] INTACT -> REFUSE ----------
+# DC-8 plants BOTH halves together (on[2] AND the two-name message), which is the state the
+# pre-fix guard actually shipped. DC-9 isolates the ARITY half alone: the message reverts to
+# `"%s and %s"` while the array stays on[8]. The capacity check is satisfied (8 >= 7 arms)
+# and no out-of-bounds store occurs, so if the checker goes GREEN here the arity check is the
+# ONLY thing standing between the operator and a refusal that names two of seven live arms.
+# This is the single-defect state; DC-8 is the coupled one.
+total=$((total + 1)); restore_all
+ok=0
+plant "$REFUSAL_OLD" "$REFUSAL_NEW" || ok=1
+if [ "$ok" -eq 0 ]; then
+  setup_root; out="$(run_checker)"; rc=$?
+  verdict DC-9 refuse 'two-name form' "$out" "$rc"
+else record DC-9 'ANCHOR-DRIFT (state not run)'; fi
+
+# ---- DC-10: note_o UNCLAMPED, on[8] INTACT -> REFUSE (load-bearing today) ----------
+# The judge's list asked for this as a single-defect state. It IS observable, and my first
+# read of it was wrong, which is worth recording rather than papered over: I thought seven
+# note_o callers into on[8] were in-bounds with or without the clamp. They are not, because
+# note_o is called UNCONDITIONALLY by every guard -- each `if (use_x && ...) note_o("...")`
+# runs its note_o regardless of whether the guard's own condition was true -- so `no` reaches
+# 7 and on[7] is written. The array is sized 8, which is in-bounds, but the clamp check
+# derives its bound FROM THE CLAMP LITERAL, so removing the clamp empties the bound and the
+# check fires on an empty bound rather than on an index. That is a real single change with a
+# real refusal, and it is CAUGHT.
+total=$((total + 1)); restore_all
+ok=0
+plant "$CLAMP_OLD" "$CLAMP_NEW" || ok=1
+if [ "$ok" -eq 0 ]; then
+  setup_root; out="$(run_checker)"; rc=$?
+  verdict DC-10 refuse 'clamp[s]? to the array bound' "$out" "$rc"
+else record DC-10 'ANCHOR-DRIFT (state not run)'; fi
+
 # ---- DC-6 / DC-7: EXCLUDED WITH A REASON, not counted ------------------------
 # Both were implemented and both are UNOBSERVABLE, for the same structural reason,
 # which is worth more than a green tick: the checker's UNCOVERED rule and its
@@ -287,10 +357,27 @@ if [ "$caught" -eq "$total" ]; then
   echo "  DC-6/7 EXCLUDED WITH REASON: the UNCOVERED rule and the REQUIRED-SET share"
   echo "        one list, so relaxing the set makes the other rule fire. Testing them"
   echo "        independently would mean adding a seam to the checker only to host the"
-  echo "        test. The attempt DID establish that the enumeration is defended by FIVE"
-  echo "        independent guards, found by measurement -- DC-5 proved a second, and"
-  echo "        each probe disabling the known ones still refused, surfacing the third,"
-  echo "        fourth and fifth."
+  echo "        test."
+  echo "  DC-8: the PRE-FIX exclusivity refusal (on[2] + the two-name message) planted"
+  echo "        in the guard is REFUSED. Rule 11: the fixed guard is correct by"
+  echo "        construction, so the only way to prove the checker can fail is to plant"
+  echo "        the defect and require rejection. The state mutates the SOURCE, not a"
+  echo "        synthetic log -- a log built from the fixed guard passes by construction."
+  echo "  DC-9: the ARITY half alone -- two-name message restored with on[8] INTACT -- is"
+  echo "        REFUSED. If it went green, the arity check would be the only thing"
+  echo "        between the operator and a refusal naming two of seven live arms."
+  echo "  DC-10: note_o's clamp removed with on[8] INTACT is REFUSED. My first read of"
+  echo "        this state was wrong and I recorded it as unobservable: I thought seven"
+  echo "        note_o callers into on[8] were in-bounds with or without the clamp. They"
+  echo "        are not, because note_o is called UNCONDITIONALLY by every guard, so no"
+  echo "        reaches 7 and on[7] is written -- and the clamp check derives its bound"
+  echo "        FROM THE CLAMP LITERAL, so removing the clamp empties the bound and the"
+  echo "        check fires on an empty bound rather than on an index."
+  echo "  DC-6/7 EXCLUDED WITH REASON (as above). NOTE the enumeration is defended by"
+  echo "        EIGHT guards now, not five: the five recorded in the 2026-10-05 attempt"
+  echo "        (DC-1/2/3/4/5) plus the three added this round for the new section"
+  echo "        (DC-8 arity, DC-9 arity-isolated, DC-10 clamp). The earlier 'five'"
+  echo "        figure was correct when written and is superseded here, not corrected."
   echo "RESULT: PASS ($caught/$total states caught)"
   exit 0
 fi

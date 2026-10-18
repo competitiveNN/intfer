@@ -173,6 +173,32 @@ for k in "${ALL_D1[@]}"; do
       echo "     exempt-by-reason  $k  (TP=2 gate+up FUSION, not a per-output" \
            "decode copy; bit-exactness is certified by the test_tp2_27b.sh" \
            "FUSED_GATE_UP arm, see the case header)" ;;
+           gemm_usm_decode1_gateup_int2tab_silumul)
+             # INTFER_MLP_GATEUP_SILUMUL_FUSE: the gate+up FUSION with silu(gate)*up
+             # folded into the down activation on device (engine.cpp:3388
+             # quant_gemm_forward_usm_gateup_compact_silumul). This is the SAME
+             # fusion seam as gateup_int2tab, so the same structural reasons apply:
+             #   * it is a FUSION of two GEMMs, not one -- each WI dispatches on
+             #     `is_up` to read gate OR up weights and write to out_g OR out_u;
+             #   * it carries an OUTER m loop (M>1 prefill), so it is not an M=1
+             #     body;
+             #   * its weight row is computed as `wbase + out_ng*K` INSIDE the m
+             #     loop (quant_gemm.cpp:2677), so the byte-index expression is
+             #     `((size_t)local * K + kg) / pack` -- structurally different from
+             #     the decode bodies' `code_u8[idx / pack]` with idx = row_base + kg.
+             # The relation that DOES hold is bit-exactness against two separate
+             # quant_gemm_forward_usm calls, and that is certified by the
+             # GATEUP_SILUMUL_FUSE arm in scripts/test_gpu_optin.sh (the only gate
+             # whose model carries INT2+INT2 MLPs), which asserts the stream
+             # against the fixed oracle -- not by this checker, which is about
+             # drift BETWEEN copies, and this body has no sibling copy to drift
+             # from. It is a SIBLING of gateup_int2tab, not a copy: the two differ
+             # in whether silumul_to_half is chained off the launch event, so
+             # comparing them would be a numerics contract (the silu-mul changes
+             # the down activation), not a drift check.
+             echo "     exempt-by-reason  $k  (TP=2 gate+up+silumul FUSION, not a" \
+           "per-output decode copy; bit-exactness is certified by the" \
+           "test_gpu_optin.sh GATEUP_SILUMUL_FUSE arm, see the case header)" ;;
     gemm_usm_decode1_wave_fuse)
       # INTFER_WAVE_LAUNCH_FUSE: ONE parallel_for over the UNION of a wave's
       # independent GEMM outputs, instead of N separate launches. This is NOT a
@@ -209,7 +235,7 @@ if printf '%s\n' "${ALL_D1[@]}" | grep -qx 'gemm_usm_decode1_rowpair' && [ "$rp_
 fi
 # An UNCOVERED entry is drift in the POPULATION, not a style note.
 if printf '%s\n' "${ALL_D1[@]}" | grep -qvE \
-     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp|gemm_usm_decode1_verbdead|gemm_usm_decode1_verbsel|gemm_usm_decode1_verbvec|gemm_usm_decode1_wvec|gemm_usm_decode1_gateup_int2tab|gemm_usm_decode1_wave_fuse)$'; then
+     '^(gemm_usm_decode1|gemm_usm_decode1_vec|gemm_usm_decode1_vec_splitk|gemm_usm_decode1_vec_mr|gemm_usm_decode1_f16|gemm_usm_decode1_rowpair|gemm_usm_decode1_verbhalf|gemm_usm_decode1_verbmp|gemm_usm_decode1_verbdead|gemm_usm_decode1_verbsel|gemm_usm_decode1_verbvec|gemm_usm_decode1_wvec|gemm_usm_decode1_gateup_int2tab|gemm_usm_decode1_gateup_int2tab_silumul|gemm_usm_decode1_wave_fuse)$'; then
   echo "  FAIL  a decode1 body is neither pinned nor exempted -- enumerate it" >&2
   printf '%s\n' "${ALL_D1[@]}" | sed 's/^/        /' >&2
   exit 1
@@ -454,12 +480,128 @@ if [ "$n_invented" != 0 ]; then
 fi
 
 echo "  ok    all $n_sk_a split-K atom(s) also present in the general body"
+
+# ---------- THE EXCLUSIVITY GUARD'S ENUMERATION (added 2026-10-14) ----------
+# The decode1 bisect arms each end in `return q.submit(...)`, so with more than one
+# opt-in arm live the EARLIEST wins and the later ones are silently unreachable.
+# The guard that refuses that state used to size its name array `on[2]` against a
+# population of SEVEN `note_o` callers, so a 3-live-arm state wrote past on[1] (an
+# out-of-bounds stack store) AND the refusal named only the first two -- hiding the
+# third from the operator the message exists to inform. The fix (quant_gemm.cpp:544-573)
+# sizes on[8], clamps note_o, and ENUMERATES every live arm.
+#
+# WHAT THIS SECTION CLAIMS, AND WHY IT ASSERTS ON SOURCE AND NOT ON A LOG. It pins
+# the two properties the fix exists to guarantee:
+#   (a) ARITY -- the refusal must name EVERY live arm, which requires a printing
+#       LOOP, and the pre-fix form (`"%s and %s"` from on[0]/on[1]) is exactly the
+#       two-name output that must be refused.
+#   (b) CAPACITY -- the name array must be sized at least as large as the number of
+#       arms note_o can be called for, which is derived, not remembered.
+# An earlier draft of this section synthesised a log and asserted three indented
+# names appeared in it. That proved nothing: the log was built from the FIXED guard,
+# so it passed by construction, and it would have passed with the same shape whether
+# the guard enumerated or not. The negative direction is not a synthetic log, it is
+# the pre-fix MESSAGE PLANTED IN THE SOURCE -- mutate_decode1_copies.sh DC-8 plants
+# `"%s and %s"`/`on[0]`/`on[1]` and requires this checker to REFUSE it (rule 11:
+# weaken the artifact, require rejection). Both polarities are therefore exercised,
+# and neither by the checker congratulating itself.
+echo
+echo "== DECODE1 EXCLUSIVITY-GUARD ENUMERATION (asserted on source) =="
+guard_src="$(sed -n '/const char\* on\[/,/^    }$/p' "$SRC")"
+if [ -z "$guard_src" ]; then
+  echo "  FAIL  the exclusivity guard did not extract -- a checker that cannot read" >&2
+  echo "        the guard it pins would certify nothing and pass anyway." >&2
+  exit 1
+fi
+# (b) CAPACITY: the array is sized against the arms that feed it. Both numbers are
+# DERIVED from the source's own literals at RUNTIME, so a rename or a seventh arm moves
+# both -- this is not a remembered constant. The derivation is the point: a hand-written
+# "on[8]" here would be a citation that decays, and a seventh note_o caller would silently
+# write past the array without either number moving.
+n_arms="$(printf '%s\n' "$guard_src" | grep -oE 'note_o\("[A-Z0-9_]+"\)' | grep -c . || true)"
+arr_sz="$(printf '%s\n' "$guard_src" | grep -oE 'on\[[0-9]+\]' | head -1 \
+          | sed -E 's/on\[([0-9]+)\]/\1/' || true)"
+echo "-- guard: $n_arms note_o call(s), name array sized $arr_sz (both derived at runtime)"
+if [ -z "$arr_sz" ] || [ "$arr_sz" -lt "$n_arms" ]; then
+  echo "  FAIL  the guard's name array (on[$arr_sz]) is SMALLER than the number of" >&2
+  echo "        arms that write into it ($n_arms) -- a state with more than $arr_sz" >&2
+  echo "        live opt-in arms writes past the array (the pre-fix defect) AND" >&2
+  echo "        cannot be enumerated by any message." >&2
+  exit 1
+fi
+# note_o must CLAMP, not blindly store: writing only inside the bound is what makes
+# the oversized population a refused-state loud failure instead of UB. The bound is
+# DERIVED from the array size (not remembered as a literal), so planting on[2]
+# makes this fire on the clamp check rather than on the extraction.
+clamp_bound="$(printf '%s\n' "$guard_src" | grep -oE 'no < [0-9]+' | head -1 \
+               | sed -E 's/no < ([0-9]+)/\1/' || true)"
+if [ -z "$clamp_bound" ] || [ "$clamp_bound" -lt "$arr_sz" ]; then
+  echo "  FAIL  note_o no longer clamps to the array bound (bound=$clamp_bound," >&2
+  echo "        array=on[$arr_sz]) -- the clamp is what turns an oversized population" >&2
+  echo "        into a loud refusal instead of an out-of-bounds store." >&2
+  exit 1
+fi
+# (a) ARITY, both halves. The refusal must CONTAIN the printing loop (enumeration)
+# and must NOT contain the pre-fix two-name form. An extractor that only recognised
+# the right answer could not detect the wrong one -- that is how the first version of
+# this checker passed a planted bug -- so the two-name literal is matched verbatim.
+refusal="$(printf '%s\n' "$guard_src" | sed -n '/decode1-bisect\] REFUSING/,/Exactly one opt-in arm/p')"
+if [ -z "$refusal" ]; then
+  echo "  FAIL  the guard's refusal message did not extract -- the enumeration claim" >&2
+  echo "        would be agreement with nothing." >&2
+  exit 1
+fi
+if printf '%s\n' "$refusal" | grep -q 'for (int i = 0'; then
+  echo "  ok    the refusal enumerates by loop"
+else
+  echo "  FAIL  the guard's refusal does not enumerate the live arms by loop --" >&2
+  echo "        a fixed-arity message cannot name three arms, which is exactly the" >&2
+  echo "        defect this pin exists to catch (DC-8 plants it; it must REFUSE)." >&2
+  exit 1
+fi
+if printf '%s\n' "$refusal" | grep -qE '%s and %s|on\[0\], on\[1\]'; then
+  echo "  FAIL  the guard's refusal still uses the two-name form (a single format" >&2
+  echo "        string binding on[0] and on[1]) -- only the FIRST TWO live arms" >&2
+  echo "        would ever be named, hiding every later one from the operator the" >&2
+  echo "        refusal exists to inform. Enumerate every live arm instead." >&2
+  echo "        *** NOTE the extractor matches the WRONG spelling too, not only the" >&2
+  echo "            right one: a pattern that recognises only the fixed form cannot" >&2
+  echo "            detect the defect, which is how this checker once passed one. ***" >&2
+  exit 1
+fi
+echo "  ok    the refusal does not use the pre-fix two-name form"
+# The default production state (zero opt-in flags) must not reach the refusal. This
+# is the always-red twin's quiet half: a guard that fired on the default path would
+# be tuned away until it refused nothing. Derived from the guard's OWN condition.
+if printf '%s\n' "$guard_src" | grep -q 'if (no > 1)'; then
+  echo "  ok    the guard's condition is no>1, so the default state (0 opt-in" \
+       "flags) cannot refuse"
+else
+  echo "  FAIL  the guard's dispatch condition is no longer no>1 -- the hot path" >&2
+  echo "        may now be refused by a guard nobody dares remove." >&2
+  exit 1
+fi
+# *** THE RUNTIME DERIVATION IS ALREADY EXERCISED, AND BY A SINGLE CHANGE. *** A
+# seventh note_o caller cannot be planted without also editing the array (they are
+# the same literal), so "add a caller, keep on[8]" is a coupled two-change state and is
+# excluded for the same reason as DC-6/7. But the derivation's other direction IS a
+# single change: DC-8 plants on[2] (array shrunk, population unchanged at 7), and the
+# capacity check fires on it -- 2 < 7. So the derivation is load-bearing and is
+# exercised by the matrix; no separate state is needed, and inventing one would be the
+# vacuous-state defect this repo has a memory tag for.
+echo "  ok    capacity is derived at runtime (7 note_o callers vs on[$arr_sz]); DC-8" \
+     "plants on[2] and fires it"
+
 echo
 echo "DECODE1-COPY PIN: PASS ($n_sk_a/$n_sk_a split-K atoms present in the general body;"
-echo "                   general body holds $n_base_a, split-K body holds $n_sk_a)"
+echo "                   general body holds $n_base_a, split-K body holds $n_sk_a;"
+echo "                   exclusivity guard names on[$arr_sz] >= $n_arms arm(s) and enumerates by loop)"
 echo "NOTE what this does and does not claim:"
 echo "  DRIFT between the two inline copies ....... caught here, in milliseconds"
 echo "  CORRECTNESS against the token oracle ........ test_tp2_27b.sh's arm"
 echo "  (both copies changing together is NOT drift, and correctly stays green)"
+echo "  EXCLUSIVITY-GUARD arity/capacity ......... pinned here; DC-8 in"
+echo "    mutate_decode1_copies.sh plants the pre-fix two-name refusal and must REFUSE"
 echo "RESULT: the duplicated M=1 decode arithmetic has NOT drifted"
+echo "RESULT: the exclusivity guard enumerates every live arm (no pre-fix two-name)"
 exit 0

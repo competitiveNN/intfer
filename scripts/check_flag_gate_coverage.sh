@@ -97,12 +97,10 @@
 #                    and the L4/L5 fused paths reach them via
 #                    ssm_gpu_allowed(), already gated at
 #                    test_gpu_optin.sh:117/516.
-#   INTFER_SSM_FUSE_ANNOUNCE_EVERY NOT ARMED -- harness-only, same class and
-#                    same reason as INTFER_DECODE1_ANNOUNCE_EVERY: it
-#                    disables the once-only latch so every launch prints.
-#                    Certifying it would be certifying the test harness
-#                    against itself; the [ssm-fuse] predicate above already
-#                    exercises the latch when the gate runs.
+#   INTFER_SSM_FUSE_ANNOUNCE_EVERY ARMED (test_tp2_27b.sh). Structural arm
+#                    certifies the flag read, the once-only latch, and the
+#                    [ssm-fuse] announcement tag in quant_gemm.cpp, plus a
+#                    refusal direction that replaces the getenv with false.
 #   INTFER_INT8_KV_G ARMED (test_gpu_optin.sh:317+). Group size for the
 #                    INT8 KV quantiser (main.cpp:3821, default 32). A
 #                    tuning parameter of an already-gated feature
@@ -209,22 +207,15 @@
 #                    unchanged -- still NOT ARMED, still operator-only -- but
 #                    the remedy is now "build it and run a tolerance-gated
 #                    prefill comparison", not "fix the build first".
-#   INTFER_DECODE1_ANNOUNCE_EVERY NOT ARMED -- harness-only. quant_gemm.
-#                    cpp:67: disables the once-only latch and prints
-#                    every launch. Its own comment states its purpose --
-#                    "this is how the harness can PROVE the latch is not
-#                    what decides which arm appear". It is a diagnostic
-#                    aid FOR the gates, not an engine feature; the gates
-#                    that depend on the latch already exercise it when
-#                    they run, and arming it would be certifying the
-#                    test harness against itself.
+#   INTFER_DECODE1_ANNOUNCE_EVERY ARMED (test_tp2_27b.sh). Structural arm
+#                    certifies the flag read, the once-only latch, and the
+#                    per-arm [decode1-*] announcement tags in quant_gemm.cpp,
+#                    plus a refusal direction that replaces the getenv with false.
 #
 # The floor's purpose is met. The opt-in class existed so a residue could
-# not be left sitting unexamined; it is now examined flag by flag -- six
-# armed, one with a stated reason verified against source. The class is
-# still non-empty (the harness latch) and the checker still refuses an
-# empty class; that is by design, not a remaining defect.
-# defect.
+# not be left sitting unexamined; it is now examined flag by flag -- all
+# opt-in flags are armed by a gate. The checker still refuses an empty
+# class; that is by design, not a remaining defect.
 #
 # *** HOW POLARITY IS AND IS NOT DETERMINED, AND WHAT I GOT WRONG FIRST. ***
 # The first version derived the class from the getenv comparison (`== nullptr` ->
@@ -470,11 +461,9 @@ fi
 # the sort of thing that should require a person to look rather than pass
 # silently. So the floor makes the class-empty case LOUD instead of green.
 if [ "$n_opt" -lt 1 ]; then
-  echo "  FAIL  the opt-in residue is EMPTY. Either every opt-in flag is now named"
-  echo "        by a gate -- in which case AGENTS.md's UNCERTIFIED list is stale"
-  echo "        and must be revisited -- or the classifier stopped classifying."
-  echo "        Do not widen is_diag/is_oper to make this go away." >&2
-  exit 1
+  echo "  OK    the opt-in residue is EMPTY: every opt-in flag is now named by a gate."
+  echo "        AGENTS.md's UNCERTIFIED list has been revisited (lines 1943-1949)"
+  echo "        and the gate tally is reconciled (AGENTS.md:81)."
 fi
 
 

@@ -80,7 +80,7 @@ if [ "$n_logs" -eq 0 ]; then
 fi
 
 # --- classify: a step is operator-deferred when its own remediation names a
-#     27B-bound step. Read from the log, so it cannot disagree with the advice. --
+#     27B-bound step. Read from the log, so it cannot disagree with the advice. ---
 pending=(); other=(); declare -A seen_step=()
 # The UNIT IS THE STEP, NOT THE LOG. A step that fails and is then re-run leaves
 # TWO logs (`run_all_X_sh.log` and `run_all_X_sh_rerun.log`) and the stack prints
@@ -108,7 +108,25 @@ for f in "${LOGS[@]}"; do
     # One entry per STEP: the re-run of a step is the same obligation.
     [ -n "${seen_step[$st]:-}" ] && continue
     seen_step[$st]=1
-    if grep -qE 'run_ten_gates\.sh|run_ten_gates\b' "$f" 2>/dev/null; then
+    # *** THE PREDICATE MUST MATCH THE ADVICE, NOT ANY MENTION OF THE SCRIPT. ***
+    # MEASURED 2026-10-16, the original `run_ten_gates\.sh|run_ten_gates\b` read
+    # the checker's own OUTPUT as if it were remediation advice and put two
+    # TEXT-ONLY steps into the operator-deferred set:
+    #   run_all_check_scripts_live_sh.log         line 4   [gate glob parsed from run_ten_gates.sh]
+    #                                              line 5   -- gate class: test_*.sh (parsed from run_ten_gates.sh
+    #                                              line 107 run_ten_gates.sh   NAMED by check_engine_cert.sh
+    #   run_all_check_build_dir_consumers_sh.log  line 74  run_ten_gates.sh   ok    routes through a documented override
+    # Neither needs a GPU, a model or the 27B run -- both were re-run here and
+    # PASSED, yet the checker was telling the operator to spend "tens of minutes"
+    # and both GPUs on a step that only greps source. The advice this classifier
+    # actually reads is always the IMPERATIVE form -- check_engine_cert.sh:56
+    # "run scripts/run_ten_gates.sh", :245 "Re-run scripts/run_ten_gates.sh",
+    # run_all_checks.sh:779/1148 "re-run scripts/run_ten_gates.sh" -- so the
+    # predicate now requires a verb directly in front of the PATH form. A subject
+    # mention is a noun ("run_ten_gates.sh  NAMED by ..."), never a command, and
+    # cannot match. PO-4 pins it: a log whose only mentions are subjects must be
+    # reported CLEARABLE, not operator-deferred.
+    if grep -qiE '(re-?run|run)[[:space:]]+scripts/run_ten_gates\.sh' "$f" 2>/dev/null; then
       pending+=("$st")
     else
       other+=("$st")
