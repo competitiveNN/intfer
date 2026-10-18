@@ -303,7 +303,7 @@ e.g. S3's contract column is 40 not 42).
    http_batch, ga64_recip, gguf_roundtrip, oracle_equiv, serve_load all PASS;
    gpu_optin and device_argmax are PARTIAL (their TP=1 arms all pass, their
    TP=2 arms do not run — **TP=2 is UNVERIFIED**); tp2_27b is SKIPPED.
-   *** The line this replaces read "gpu_optin PASS (20/20 arms TP=1+TP=2)". It
+   *** The line this replaces read "gpu_optin PASS (20/20 arms TP=1+TP=2)". It EPHEMERAL(historical: a quoted line the surrounding edit REPLACED, recorded so the substitution is visible)
    was true of the 2-GPU era (AUDIT #11: the second GPU later vanished) and is
    NOT a claim about the tree you are reading. ***
    LESSON: when a fix lands at ONE call site of a layout rule, grep for the
@@ -1183,11 +1183,11 @@ e.g. S3's contract column is 40 not 42).
   `scripts/run_all_checks.sh` (full, NOT `INTFER_QUICK=1`) exits **0**, with 3
   checkers + 4 matrices green, **5/5 enumerated stamps naming HEAD**, tracked
   tree clean, and no new untracked file anywhere in the work tree;
-  `mutate_run_all_checks.sh` is **11/11 caught with 11/11 baselines correct**
+  `mutate_run_all_checks.sh` is **11/11 caught with 11/11 baselines correct** EPHEMERAL(historical: the count is the record of the audit state at this date, and this very paragraph's annotation below already marks it SUPERSEDED and names the authoritative stamp; the live figures are not in this file)
   *** HISTORICAL CITATION — superseded. As of 2026-10-01 the matrix has 12
   baselines: N-Kq and N-L add the CONVERSE half of the mid-run HEAD-moved
   detector (it must stay silent when HEAD holds still, and an always-firing
-  detector must be rejected). So the current figures are 11/11 caught, 12/12
+  detector must be rejected). So the current figures are 11/11 caught, 12/12 EPHEMERAL(historical: same paragraph as above -- a dated audit-log record, deliberately not rewritten; the live figures are read from the mutator's stamp)
   baselines. Read them from `build/run_all_mutate/last_pass.stamp`
   (`states=`, `caught=`, `baselines=`), never from here — this paragraph is a
   citation and cannot track the tree. ***
@@ -1561,7 +1561,7 @@ e.g. S3's contract column is 40 not 42).
       AUDIT #17 anchor parser: confirm the anchor form mechanically, never by eye.
       (b) `summary.txt` was never truncated between runs, so it ACCUMULATED and the
       printed summary listed `B-A MISSED (fn)` from the PREVIOUS run directly above
-      `B-A caught`, under a `PASS (5/5)` line — the self-contradicting-report
+      `B-A caught`, under a `PASS (5/5)` line — the self-contradicting-report EPHEMERAL(historical: the shape of a self-contradicting report that was fixed, quoted as the defect it was)
       class of AUDIT #22, and the worst place for it: the in-memory counters make
       the VERDICT correct, so only the EVIDENCE was wrong.
     - **AND THE STACK CAUGHT A REGRESSION OF MINE, WHICH IS THE POINT OF IT.**
@@ -2836,7 +2836,7 @@ e.g. S3's contract column is 40 not 42).
     evidence nor a regression, and the two call for opposite actions). The
     comparison uses `$HEAD_NOW`, so a moved HEAD is not additionally misreported
     as 5 phantom STALE stamps. Mutated by state **N-K** in
-    `scripts/mutate_run_all_checks.sh` (11/11 caught, 12 baselines — the extra two
+    `scripts/mutate_run_all_checks.sh` (11/11 caught, 12 baselines — the extra two EPHEMERAL(historical: this paragraph's own next lines already redirect to the live figures in the mutator's stamp, so the number here is a dated record, not a claim to re-run)
    are the N-K converse; read the live figures from its stamp; a synthetic
     `step_commit` makes the move reproducible without disarming the mutant's
     dirty-tree guard). If you see "HEAD MOVED under this run", finish the other
@@ -3649,7 +3649,7 @@ e.g. S3's contract column is 40 not 42).
     file, so the inherited dirty-tree guard blocked a legitimate run — a guard
     whose rationale is false is worse than none); a **self-contradicting
     verdict** that printed `FAIL (10/10 states caught)` because it demanded one
-    baseline *per state* and this shape has exactly one; **`_gate_pop.sh`'s
+    baseline *per state* and this shape has exactly one; EPHEMERAL(record of the pre-fix DEFECT this paragraph lists: the checker demanded one baseline per state while this matrix shape has exactly one, so it printed FAIL with 10/10 caught -- the artifact is a defect state that the fix removed and the current tree cannot regenerate it; re-running that matrix today yields the fixed verdict, not the recorded one) **`_gate_pop.sh`'s
     derivation read COMMENTS as declarations** (my own comment quoted a sibling's
     real declaration as an example, and the helper harvested the prose, so the
     matrix's own directory was reported as an unowned leak — fixed at the source
@@ -3880,7 +3880,7 @@ world. Before recording "X is absent":
 === TOOLING FAILURE MODE #36 (2026-10-18): a mutation matrix that caught 8 states and taught nothing — the three checker defects it found ===
 
 The S1 predicate matrix (`scripts/check_s1_predicates.sh` +
-`scripts/mutate_s1_predicates.sh`, 8 states, 8/8 CAUGHT, residue byte-identical)
+`scripts/mutate_s1_predicates.sh`, 8 states, 8/8 CAUGHT, residue byte-identical) REGEN(bash scripts/mutate_s1_predicates.sh)
 was built to close a durability gap: its first two generations lived only under
 /var/tmp and their driver scripts were lost, leaving eight `.cpp` mutants and two
 logs that no later session could re-run. The rebuild earned its place by finding
@@ -3892,7 +3892,7 @@ arriving through shell mechanics rather than through a number.
 statement's status.** The first drafting evaluated the eight predicates as a chain
 inside one function, `p_a; p_b; p_c; ...`, and took the function's rc as the
 verdict. POSIX gives that chain the status of its LAST command, so every guard
-clause before the last was silently discarded. The matrix reported 8/8 CAUGHT on a
+clause before the last was silently discarded. The matrix reported 8/8 CAUGHT on a EPHEMERAL(historical: the sentence records the PRE-FIX matrix verdict on a source missing seven predicates; re-running the matrix today yields the fixed 8/8, not this state)
 source missing seven predicates: each state's "refusal" was really the checker
 refusing on whatever happened to be last. The fix is structural and is why the
 shipped checker has no chain: every predicate is evaluated on its OWN line and

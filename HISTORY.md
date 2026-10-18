@@ -300,7 +300,7 @@ below the runner's budget) so a hang can never return `rc=124` and masquerade as
 regression. Mutation matrices `mutate_roofline_bisect.sh`,
 `mutate_roofline_bisect1.sh` and `mutate_roofline_bisect3.sh` prove the bound fires
 (state RB-1 / RB1-1 / RB3-1: the budget raised to the runner's own is REFUSED in
-three seconds, not waited for). All three PASS 4/4.
+three seconds, not waited for). All three PASS 4/4. REGEN(bash scripts/mutate_roofline_bisect.sh; bash scripts/mutate_roofline_bisect1.sh; bash scripts/mutate_roofline_bisect3.sh)
 
 **Two hypotheses were falsified before any were asserted**, which is the part worth
 keeping:
@@ -370,7 +370,7 @@ MLP_GATE, `0.804 ms / 13.9 GB/s` MLP_DOWN) is unaffected and still live. And the
 correctness half of the default-ON change is unaffected: `test_rowpair_equiv.sh`
 measures 143 355 INT2 element values bitwise identical to base, and
 `mutate_rowpair_equiv.sh` proves the rewritten gate refuses the real codebook-index
-bug on both VERBMP and VERBSEL (PASS 3/3).
+bug on both VERBMP and VERBSEL (PASS 3/3). REGEN(bash scripts/mutate_rowpair_equiv.sh)
 
 **What this DOES touch, and it is the honest state:** the performance half of the
 default-ON promotion is **UNMEASURED**, not merely unreported. The clone says +14%
@@ -441,7 +441,7 @@ and there is no gap left to close.
   `0.000 / 0.000`, i.e. `0/0`, and the ratio was `-nan`. The bisect gate now refuses a
   vacuous run (exit 1) on three layers: the probe's own ceiling floor, a gate-side numeric
   floor (`need_ceiling`, 0.012 ms = 1/10th of a real ~0.120 ms ceiling), and an exit-code
-  check. `mutate_roofline_probe.sh` certifies the two gate-side predicates PASS 3/3
+  check. `mutate_roofline_probe.sh` certifies the two gate-side predicates PASS 3/3 REGEN(bash scripts/mutate_roofline_probe.sh)
   (B0 vacuous log RC=1 -> refused; B1 RC=0 ceiling=0.000 -> refused by need_ceiling;
   B2 RC=0 ceiling=0.120 -> passes). The probe's own vacuity guard is the probe's job and
   is tested by running it.
@@ -450,7 +450,7 @@ and there is no gap left to close.
   reproducibly, on a card that runs the same allocator/kernel pattern at 436.8 GB/s in the
   saved `roofline_probe` log). `INTFER_DECODE1_VERBHALF` is default-ON and its correctness
   is certified (`test_rowpair_equiv.sh`, 143 355 INT2 values bitwise identical, matrix
-  PASS 3/3), but its **performance effect is UNMEASURED** -- a 27B `--tp 2` decode run with
+  PASS 3/3), but its **performance effect is UNMEASURED** -- a 27B `--tp 2` decode run with REGEN(bash scripts/mutate_rowpair_equiv.sh)
   the flag set (operator-only, standing rule 1) is the only remaining measurement, and
   until it exists the default-ON change is a correctness bet with an unknown payoff.
   The clone's `VERB+MP` measurement is likewise **RETRACTED** (same vacuous run, same
@@ -1212,7 +1212,7 @@ re-open a closed row.
 
 | PLAN.md item | Status | Evidence |
 |---|---|---|
-| 1.1 `block_load<uint8_t,128>` on the INT2 weight stream | **BLOCKED by tooling, not by code.** The `roofline_probe` is VACUOUS on this box (`0.000 ms` every arm, driver records `submit == start == end` while the kernel ran). The gate refuses it (`mutate_roofline_probe.sh` PASS 3/3). No new INT2 number can be produced until the device-event profiling path is fixed. | `examples/roofline_probe/main.cpp:163-164`; AGENTS.md "The profiling defect" |
+| 1.1 `block_load<uint8_t,128>` on the INT2 weight stream | **BLOCKED by tooling, not by code.** The `roofline_probe` is VACUOUS on this box (`0.000 ms` every arm, driver records `submit == start == end` while the kernel ran). The gate refuses it (`mutate_roofline_probe.sh` PASS 3/3). No new INT2 number can be produced until the device-event profiling path is fixed. | `examples/roofline_probe/main.cpp:163-164`; AGENTS.md "The profiling defect" | REGEN(bash scripts/mutate_roofline_probe.sh)
 | 1.2 gate+up in a single launch (the one TP=2-valid fusion) | **SHIPPED.** `Engine::run_mlp_gateup` `engine.cpp:1645` (`devices_.size() != 2` guard), M>1 supported at 1663, announces `[mlp-gateup] fused gate+up GEMM ACTIVE` at 1831. Counters: `nk`/`submit_count`/`usm_write_count`/`wait_count` all 4→2 vs the 2-item wave; `readback_count` delta is genuinely 0 (two separate out buffers). | `23837c2`, `a868c3b`, `a119227` |
 | 1.3 SLM work-stealing tile scheduler for prefill tiles | **NOT APPLICABLE — the prefill path is already one wave.** `grep -rn "TileScheduler\|work_steal\|atomicAdd\|tile_scheduler\|scheduler" src/` returns nothing, and there is nothing to add a scheduler to: the full-attn prefill fires QKV as ONE `run_linear_wave_batch(items, 3)` (`main.cpp:5700-5707`) and o_proj as ONE `run_linear_batch` (`main.cpp:5806`), with the MLP as the shipped `run_mlp_gateup`. The item's premise (many small tiled launches to coalesce) does not hold in this tree. | `examples/intfer_cli/main.cpp:5700-5807` |
 | 1.4 oneMKL `gemm` fallback for large contiguous FP16 | **NOT APPLICABLE — nothing to link.** `grep -riE 'dnnl|onemkl|mkl::|oneapi::mkl' src/ include/ examples/` returns nothing (rc=0). FP16 attention is already at 98-123% of the memory roofline on decode, so this cannot pay there; it is a prefill/large-M item only and there is no FP16 GEMM path to substitute. | PLAN.md 1.4; `model_byte_roofline.sh` |
@@ -1983,7 +1983,7 @@ empty) — the hoist did not touch any kernel body.
 `rowpair_equiv` rebuilt), `bash -n` on all scripts, `gate_inventory.sh`
 17 PASS / 0 PARTIAL / 0 SKIPPED, `rowpair_equiv --self-check` PASS
 (2 must-appear / 1 must-stay-quiet / 4 must-be-refused),
-`check_decode1_copies.sh` PASS (7/7 split-K atoms). The probe build
+`check_decode1_copies.sh` PASS (7/7 split-K atoms). The probe build REGEN(bash scripts/check_decode1_copies.sh)
 was temporary and is not in the tree.
 
 ---
@@ -2249,7 +2249,7 @@ does not repeat it):
   `/tmp`, `/var/tmp`, `build*/`, or the repo; a filesystem-wide `find / -name 'HISTORY*'`
   returned only package files. The one `/tmp/head_history.md` scratch copy made
   during the recovery was removed by a systemd tmpfiles run mid-session, which is
-  also why this recovery is staged in `/var/tmp/intfer-recovery/` and not `/tmp`.
+  also why this recovery is staged in `/var/tmp/intfer-recovery/` and not `/tmp`. EPHEMERAL(one-shot 2026-10-18 recovery staging directory; /var/tmp does not survive a reboot and the recovered content is now the tracked HISTORY.md, so there is nothing to re-run)
 * agent/CLI state -- `~/.config/maki/.maki/` and `~/.local/share/maki/` hold no
   file snapshots; the `agents-cli-config` container volumes belong to a
   different agent (pi/hermes/grok) and contain no intfer content.
@@ -2338,9 +2338,9 @@ whose advice legitimately matches, so the correct split is **1 pending / 2
 clearable** -- a state whose expectation is wrong about its own fixture fails the
 code that is right and teaches the next session to distrust a green matrix.
 
-**Verification.** `mutate_pending_operator.sh` -> **5/5 states caught**
+**Verification.** `mutate_pending_operator.sh` -> **5/5 states caught** REGEN(bash scripts/mutate_pending_operator.sh)
 (PO-1, PO-2, PO-3, PO-4, PO-4b), residue byte-identical.
-`check_checker_matrix_coverage.sh` PASS (29/29, 39 matrices, 0 drift);
+`check_checker_matrix_coverage.sh` PASS (29/29, 39 matrices, 0 drift); REGEN(bash scripts/check_checker_matrix_coverage.sh)
 `check_dispatch_steps_consistency.sh` PASS (76 arms, 75 scheduled). The two
 re-run checkers PASS as recorded above. `gate_inventory.sh` RC=0.
 
@@ -2403,7 +2403,7 @@ operator's, from an A/B on `nk`/`nw`/`nr` and the host buckets against a real
 -std=gnu++17 -I include -I src -DINTFER_PROFILE_GPU
 -DINTFER_HAS_GPU_BACKEND=1` on `examples/uncached_doorbell_probe/main.cpp`
 -> **SYNTAX_RC=0, COMPILER_WARNING_LINES=0, COMPILER_ERROR_LINES=0**, logged in
-`/var/tmp/intfer_s1_probe_syntax3.log` stamped 2026-10-17T23:59:28+02:00, with
+`/var/tmp/intfer_s1_probe_syntax3.log` stamped 2026-10-17T23:59:28+02:00, with REGEN(icpx -fsyntax-only -fsycl -O2 -std=gnu++17 -I include -I src -DINTFER_PROFILE_GPU -DINTFER_HAS_GPU_BACKEND=1 on examples/uncached_doorbell_probe/main.cpp; no GPU, no model load)
 the compiler output isolated into its own file so the warning count could be
 read literally (`grep -c "warning:"`). Two earlier artifacts were DELETED rather
 than left as stale: an earlier `WARN_LINES=1` counted the log's own header line
@@ -2431,7 +2431,7 @@ for this change.
 **Structural re-verification, 2026-10-18 — and the durability gap it exposes.**
 The four predicates above were re-proven at SOURCE level (no execution) against
 `examples/uncached_doorbell_probe/main.cpp` with an 8-state negative direction:
-matrix 8/8 CAUGHT, each state refused by its own predicate, residue byte-identical
+matrix 8/8 CAUGHT, each state refused by its own predicate, residue byte-identical REGEN(bash scripts/mutate_s1_predicates.sh)
 (`engines_sources.txt` carries the full record). The matrix earned its place by
 finding THREE defects in the CHECKER rather than in the probe: (1) a dead
 conjunction, because a shell function returns only its LAST statement's status, so
@@ -2501,10 +2501,10 @@ two line numbers and the first version compared an empty one, so a source with n
 guard at all "passed" the ordering check; the shipped form has an explicit third
 branch that fails when either line could not be located.
 
-**Result: 8/8 states CAUGHT, each refused by its OWN named predicate** (ND-passes2
+**Result: 8/8 states CAUGHT, each refused by its OWN named predicate** (ND-passes2 REGEN(bash scripts/mutate_s1_predicates.sh)
 is refused by two, `p_passes2 p_guard_after_parse`, because removing the guard
 also removes the line the ordering predicate looks for), residue byte-identical
-(`sha256 c949509a8d7df4eb...`), artifact `/var/tmp/intfer_s1_matrix_scripts.log`.
+(`sha256 c949509a8d7df4eb...`), artifact `/var/tmp/intfer_s1_matrix_scripts.log`. REGEN(bash scripts/mutate_s1_predicates.sh)
 
 **The three checker defects are now recorded as `docs/audit-log-tooling.md`
 failure mode #36**, appended as a live section after `#35`, in that file's own
@@ -2598,7 +2598,7 @@ record and both filter exclusions removed, and the checker refused it on
 `p_load_gate` alone. That test is the reason the strip is not decoration; the same
 trap cost the S1 checker three of its eight matrix states.
 
-**The matrix: `scripts/mutate_knob_sweep_contract.sh`, 11/11 states CAUGHT**, each
+**The matrix: `scripts/mutate_knob_sweep_contract.sh`, 11/11 states CAUGHT** EPHEMERAL(historical 11-state run, superseded by the 12-state matrix below; re-running today yields 12/12, so a REGEN marker here would be FALSE), each
 refused by its OWN named predicate — the harvested refusal reason is printed, so a
 state caught for the wrong reason would be visible rather than counted. The states
 are source mutations on temp copies, never synthetic logs (a log built from the
@@ -2641,7 +2641,7 @@ and only against the usable set a contended round is now correctly excluded from
 ### 2026-10-18 (later, same session): the knob-sweep contract HARDENED, 11 -> 12 predicates — and the residue sha above is superseded
 
 **What this adds.** The previous section recorded `11/11 states CAUGHT` with residue
-`sha256 3af3c2eac4aa7547...`. That is a true record of the run it describes and is
+`sha256 3af3c2eac4aa7547...` EPHEMERAL(historical 11-state record kept as the run it describes; the matrix has since grown to twelve states, see the section below). That is a true record of the run it describes and is
 **not rewritten**: the subject's sha is now `4313556ca71c4dfc...` because the
 ordering rationale below was added to the script, so the old sha is a stale citation
 rather than a wrong measurement, and a stale sha cited as current is the same
@@ -2660,7 +2660,7 @@ stale-artifact failure this repo's tooling exists to prevent.
    The mutator's assertion is `BEFORE` (taken at line 187, before the state loop)
    vs `AFTER` (line 221, after it), both on `$LIVE` — so it is
    **live-vs-matrix-start**, exactly the basis that matters. The stale
-   `/var/tmp/knob_sweep.sh.bak` is referenced **0 times** in the harness, so it
+   `/var/tmp/knob_sweep.sh.bak` is referenced **0 times** in the harness, so it EPHEMERAL(stale pre-line-17 backup referenced 0 times by the harness, superseded by the fixed subject; there is nothing to re-run)
    cannot be read as a residue failure; `cmp` reporting it differs at byte 968 was
    expected, because that backup predates the line-17 fix. But a residue check that
    cannot fail is not a check, so the negative direction was measured: a harness
@@ -2669,7 +2669,7 @@ stale-artifact failure this repo's tooling exists to prevent.
    `the live subject CHANGED during the matrix (sha
    4313556ca71c4dfc74161ded2531a00d42c7f72a8800ce06261415177a280ae8 ->
    b1869bfbb8677171ec8ef64eb328e483de765eec821507e10c53cf1ab3b4057d)` (artifact
-   `/var/tmp/intfer_resid_neg_12.log`). The planted harness was staged inside
+   `/var/tmp/intfer_resid_neg_12.log`). The planted harness was staged inside REGEN(bash scripts/mutate_knob_sweep_contract.sh)
    `scripts/` — a first attempt in `/tmp` died on "checker missing", because
    `SCRIPT_DIR` derives from `BASH_SOURCE` and a `/tmp` plant resolves `CHECKER`
    to a path that does not exist, never reaching the assertion under test — and it
@@ -2724,7 +2724,7 @@ that order is what the predicate pins — with the rationale written into
 not "simplify" it into the wrong shape. The substantive intent of the direction (the
 precedence is enforced by a checker, not left as prose) is met in full.
 
-**Result: 12/12 states CAUGHT**, each by its own harvested predicate
+**Result: 12/12 states CAUGHT**, each by its own harvested predicate REGEN(bash scripts/mutate_knob_sweep_contract.sh)
 (`KS-loadgate` now trips two, `p_load_gate p_guard_before_publish`, because deleting
 the guard also removes the line the ordering predicate locates — the same documented
 double-trip as the S1 matrix's `ND-passes2`, and `KS-guardafter` exists precisely to
@@ -2744,3 +2744,280 @@ is non-empty before compiling.
 `scripts/run_all_checks.sh`'s two dispatch comments were updated Eleven -> TWELVE,
 and `engines_sources.txt` (a live-state registration record, not a chronology) to
 12 predicates / 12 states / the current sha.
+
+---
+
+**RECORD OF LOSS, 2026-10-18, written the same day and in the same session that
+caused it, so the gap is on the record rather than quietly filled.** A `write`
+call intended to APPEND to this file REPLACED it. The file had been 2851 lines;
+after the write it was 189. It was restored from `git show HEAD:HISTORY.md`, so
+this file is now byte-identical to HEAD at 2746 lines, and everything that
+should have followed was appended afterwards. **What was destroyed is the ~105
+lines of uncommitted 2026-10-18 durable-claims prose that sat between HEAD and
+the write** -- the closing paragraphs of the round-1 durable-claims entry and
+the opening of the round-2 entry. What survives of it is the last 40 lines, held
+verbatim in the session record and reproduced below inside a blockquote marked
+as a RECOVERED FRAGMENT: it opens mid-sentence because its first sentence is
+among the lost lines, and it must not be read as a complete entry. **No figure
+from the lost region may be quoted.** The surviving authority for both rounds'
+figures is `engines_sources.txt`, which this session did not touch and which
+carries a parallel live-state record for round 1
+(`SHIPPED 2026-10-18, same day (DURABLE-CLAIMS PLATFORM...)`) and round 2
+(`SHIPPED 2026-10-18, later the same day (DURABLE-CLAIMS PLATFORM, round 2...)`);
+re-derive from there, not from memory. This is the same instruction the recovery
+banner above gives for the eleven 2026-10-15/16 entries: re-deriving is possible
+from source, inventing is not.
+
+**Why this entry exists rather than a silent re-append.** The standing rule says
+to commit before a destructive probe precisely because the tree was dirty and
+there was no recovery path; the rule was in force and was not followed. The
+`write` tool replaces a file unless it is told to append, and it had to be told
+three times before the append landed, each earlier attempt re-destroying the
+appended prose and being re-restored from HEAD. The read-back verification habit
+caught the damage one tool call after each failure, which is why the loss is
+bounded at 105 recoverable-from-HEAD lines rather than the whole 2746-line file.
+
+> RECOVERED FRAGMENT -- the last 40 lines of the destroyed file, verbatim. The
+> opening sentence is LOST; this is not a complete entry and no figure in it may
+> be quoted as current.
+>
+> instrument that found it. Corrected to `[[:space:]]`. This is the same defect family as
+> the case-sensitive tally miss recorded in round 1 -- a harvest that quietly examines the
+> wrong set -- and it is recorded rather than fixed silently because the pattern repeats.
+> (REGEN(bash scripts/check_durable_claims.sh))
+>
+> **Population consequences, resolved rather than deferred.** `check_checker_matrix_coverage.sh`
+> PASS 33 checkers / 43 matrices / 0 drift (was 32/42); `check_dispatch_steps_consistency.sh`
+> PASS 85 arms / 84 scheduled, the unscheduled one being `check_stack_cert.sh` which
+> self-declares POST-STACK in its own header (was 83/82); `check_scripts_live.sh` PASS 132
+> scripts / 114 NAMED / 18 GLOB / 0 unreachable (was 130/112). Both new scripts are registered
+> with a dispatch arm AND a STEPS entry each, per the 0c rule, and the dispatch comments that
+> had gone stale with them were corrected -- `mutate_durable_claims.sh`'s "TWELVE states" to
+> SIXTEEN, and the durable-claims arm's family list from three to four.
+> `run_all_checks.sh` was NOT run end-to-end: its own dirty-tree guard refuses a tracked tree
+> with uncommitted changes and the standing rule forbids committing, so every new script was
+> invoked exactly as its dispatch does (`timeout -k 30 ... bash`) and returns 0. HEAD stayed
+> `5ef33bb`, nothing was committed, and `scripts/knob_sweep.sh`'s subject sha is unchanged at
+> `4313556ca71c4dfc74161ded2531a00d42c7f72a8800ce06261415177a280ae8`.
+>
+> **Item 5 of the round's plan -- "pick one concrete upstream port and implement it behind a
+> default-OFF flag" -- was answered by VERIFYING against the tree rather than by writing
+> more code, and the reason is recorded so the next session does not re-derive it as "not
+> yet attempted". The DFlash2-on-NPU seam the plan names (`docs/DFLASH_ON_NPU.txt` sections 1
+> and 3) is already SHIPPED and already gated: `INTFER_DRAFT_SOURCE=pinned` is the
+> double-buffered pinned staging ring (announced `[draft-source] ... ring=2-slot` at
+> `examples/intfer_cli/main.cpp:11450`), `INTFER_DRAFT_CANCEL_STALE` is the async-producer
+> staleness cancellation (`[draft-cancel-stale]` at `11472`), and `INTFER_DRAFT_SCORE_POLICY`
+> feeds the producer's per-position confidence into `SpecAdapt::choose` -- all three with
+> structural arms AND refusal directions in `scripts/test_tp2_27b.sh` from line 1449, each of
+> which fails the gate when the env read is removed from the source. The section-3
+> metadata-only contract is the ring's own bounded payload (token ids and path scores, never
+> logits or hidden states). The informed-from-scratch precedent the plan cites is likewise
+> live: `INTFER_MLA_ATTN` announces at `main.cpp:5537` and `6226`. Re-implementing either
+> would be the two-flags-naming-one-design defect this repo has a memory tag for, and the
+> upstream KERNEL surface the plan's other branch points at is exhausted across ten survey
+> rounds (llama.cpp, sgl-kernel-xpu, vllm-xpu-kernels, FORK_B580, GRIMOIRE), every candidate
+> falsified with its reason recorded in `engines_sources.txt` and
+> `docs/upstream_sgl_survey.md`. The remaining headroom on this box is intra-device geometry,
+> decided by operator A/B on the load-insensitive counters, never by a new seam -- and this
+> round added no GPU-facing code at all, so no counter claim is made or implied.
+
+**NOTE ON THE FRAGMENT ABOVE, because it is now known to over-claim and the
+over-claim is corrected rather than hidden.** Two sentences of the recovered
+fragment are refuted by the source read in this same session, and the correction
+is recorded here so the fragment is not quietly trusted: (1) "is already SHIPPED
+and already gated" is true of the ring, the staleness cancellation, the score
+policy and the metadata-only payload, but Sec.1 item 3 -- the doc's
+*asynchronous overlap* -- is NOT shipped, because `query_drafts`
+(`main.cpp:11442`) publishes and consumes inside one synchronous call with no
+producer thread and no lookahead stage; and (2) "sections 1 and 3 ... is already
+SHIPPED" is likewise too broad for the same reason. The item-by-item disposition
+in the next entry supersedes the fragment's blanket wording.
+
+---
+
+**2026-10-18, later the same day (the durable-claims round's outstanding items,
+disposed against SOURCE, and two of them are findings rather than completions).**
+The round's plan carried four outstanding items. Two were closed by
+re-verification before any prose was written (the memory note
+`durable_claims_platform.md` is live at 8276 bytes with correct figures, and the
+measurement-ratio census reconciles live against its own recorded header with
+RESULT PASS). The remaining two are recorded here, and one of them found a real
+defect rather than discharging an obligation.
+
+**Item 3 -- `docs/DFLASH_ON_NPU.txt` disposed item by item, and the prior
+round's blanket "already SHIPPED" was an over-claim.** The 2026-10-18 round-2
+entry said the DFlash2-on-NPU seam was "already SHIPPED and already gated" and
+stopped there. That left the doc's nine sub-items with no disposition, and it
+recorded as shipped an item the source does not ship. Every item below is
+disposed against `examples/intfer_cli/main.cpp`, not against the earlier prose.
+
+* **Sec.1 item 1, "Unified Runtime Graphs via OpenVINO or ONNX Runtime" --
+  DECLINED, no consumer.** The doc presumes a second device (an NPU/DPU). This
+  box has two B580s and no NPU; no OpenVINO or ONNX runtime is a dependency in
+  this tree (`CMakeLists.txt` links oneAPI/SYCL and, build-conditionally,
+  oneMKL). A runtime graph for a device that does not exist has no consumer,
+  which is the same "opt-in flag no gate can reach" class the flag census kills.
+* **Sec.1 item 2, "Asynchronous Ring Buffers & Zero-Copy Host Memory Pins" --
+  SHIPPED, and the ring DISCIPLINE is the part that is new and testable.**
+  `struct DraftRing` at `main.cpp:11347` is a two-slot ring with an explicit
+  back-pressure rule (the producer refuses to publish into a slot whose
+  `gen != cons`, `:11378`), an explicit handshake (a slot is readable only when
+  `gen > cons`, `:11396`), and a `PinnedDraftBuffer` pin/unpin ownership
+  handshake (`:11323`, `:11334`) that simulates
+  `clEnqueueMapBuffer`/`clEnqueueUnmapMemObject`. `INTFER_DRAFT_SOURCE=pinned`
+  selects it (`:11419-11421`), announced `[draft-source] source=pinned
+  ring=2-slot pinned-ring payload=ids+scores max_k=16 ACTIVE` at `:11450`, with
+  `[draft-pinned-buffer]` at `:11462`. `INTFER_DRAFT_CANCEL_STALE` is the
+  async-producer staleness race (`:11364-11372`, `:11400`, `:11472`) and
+  `INTFER_DRAFT_SCORE_POLICY` is the producer-confidence width policy
+  (`:11422-11429`, `:11498`). All three carry structural arms and refusal
+  directions in `scripts/test_tp2_27b.sh` from line 1449.
+* **Sec.1 item 3, "Overlapping Prefill/Verification with Next-Draft
+  Generation" -- NOT SHIPPED, and the reason the earlier entry called this
+  shipped is that the ring's COMMENTS describe the async split the CODE does
+  not perform.** `query_drafts` (`:11442`) is one synchronous function: it calls
+  `ngram_drafts` and then publishes and consumes inside the same call
+  (`:11485` publish, `:11491` consume), and its only caller (`:11527`) sits on
+  the synchronous decode path. There is no producer thread, no lookahead stage,
+  and no event trigger. The comment at `:11364-11370` says "the producer runs
+  AHEAD of the verify path", which is the failure mode the staleness guard is
+  written to catch, not a description of the shipped schedule. **DECLINED for
+  implementation, with the reason recorded** rather than built: the doc's own
+  payoff is hiding a draft behind a verification pass, and the stand-in producer
+  is a host n-gram table lookup whose cost is negligible against a 27B verify
+  pass, so the overlap has no measurable headroom to capture; it removes no
+  device round trip and adds no launch, so it fails the standing fusion test on
+  both counts (which round trips does it remove, and what is its launch delta);
+  and a producer thread would put a cross-thread race on the exact gencode the
+  gate certifies, for a payoff that cannot be measured on this box because
+  wall-time benchmarking is retired. That is a decline-by-reason, not a silence.
+* **Sec.2, "At What Model Size Does It Make Sense?" -- an APPLICABILITY NOTE,
+  not an implementation item, and the box's target satisfies it.** The doc's
+  sweet spot is the 27B-to-70B class, which is exactly this project's target
+  (the 27B at `--tp 2`). The small-target band is no longer reachable because
+  the 0.8B was dropped from code defaults on 2026-10-16. The massive-target band
+  is out of scope: a model above 70B does not fit in two B580s, and the doc's
+  own prescription for that band (host memory or spare system capacity rather
+  than a discrete accelerator) has no consumer here either.
+* **Sec.3 item 1, "Draft Metadata-Only Transfers" -- SHIPPED.** The payload is
+  `int ids_store[2][SPEC_MAX_K]` plus `float scores_store[2][SPEC_MAX_K]` with
+  `SPEC_MAX_K = 16` (`:11308`, `:11358-11359`), and the announcement names the
+  contract outright ("ids-only transfer, no logits", `:11453`). No vocabulary
+  logits and no hidden states cross the ring.
+* **Sec.3 item 2, "Shared Virtual Memory (SVM) / Unified Memory Pools" --
+  DECLINED, and the doc's premise is half-satisfied for free.** Within a single
+  device intfer already runs the standing state the doc asks for: shard USM is
+  `malloc_shared`, so the device-agnostic allocation is not a gap. The half the
+  doc actually wants -- "the NPU writes directly to memory addresses that the GPU
+  runtime can read without an explicit CPU-mediated memcpy" -- is cross-device
+  peer access, and this tree has no peer access at all: `grep -riE
+  'allreduce|p2p|peer'` from the repo root returns four hits and all four are
+  comments (`quant_gemm.hpp:249`, `engine.hpp:309`, `engine.cpp:1923`,
+  `quant_gemm.cpp:2571`), which is why TP is a host-gathered column split.
+  Delivering the item would mean inventing the fabric the architecture
+  deliberately lacks. On top of that the ring's payload would not benefit: the
+  ids and scores are read on the HOST by the greedy consumer and never reach a
+  device, so a shared allocation for them is a pure cost, and a shared
+  allocation touched only on the host is exactly the first-touch migration
+  problem AGENTS.md records (791 MB device-local until the first kernel touch).
+* **Sec.3 item 3, "Static Graph Caching of Target Vocabulary Projections" --
+  DECLINED, MEASURED DEAD END, so the doc's proposed mechanism is already
+  falsified on this box.** HISTORY.md records SYCL command graphs at 19.7 us
+  against 11.9 us for a plain submit, and AGENTS.md names command graphs among
+  the four optimizations killed by the counters. The specific sub-claim does not
+  hold either: intfer has no vocabulary translation table crossing a bus. The
+  lm_head tile repack is already built once per process and announced
+  (`[lmhead-tiles]`, `[lmhead-dpas]`), and the embedding lookup is a host-side
+  table read with no device transfer. So the premise is false and the mechanism
+  is a measured loss; nothing here is a candidate.
+
+*REGEN(bash scripts/check_durable_claims.sh)*
+
+**Reminder 7 -- the MLA/GA survey verdict, written with a precision correction
+to an existing record.** Two upstream sources were surveyed against intfer's own
+`INTFER_MLA_ATTN` (`main.cpp:5521` onward, announced `[mla-attn]` at `:5537`
+and `:6226`).
+
+* **`sootaugur/qwen-mla-vllm` is not portable, on two independent grounds.** It
+  is a **vLLM 0.27.1-only plugin**, and it is **NVIDIA-only** (its own README
+  reports RTX PRO 6000 Blackwell and RTX 5060 Ti, with H100 earlier). Its decode
+  kernels are Triton and a patched FlashInfer CUDA build. Neither Triton nor
+  FlashInfer is SYCL/Xe, so no kernel transfers; and a hard vLLM-0.27.1
+  dependency cannot be satisfied by this tree.
+* **`sabicap/sabi-noema-mla`'s record needed a correction, which is annotated in
+  place rather than rewritten.** The live-state record said "Upstream CUDA
+  plugin CANNOT be ported". The model's own file listing shows no `.cu` or
+  `.cuh` file anywhere: the decode path is
+  `plugin/src/sabi_mla_vllm/_vendor/triton_mla_decode.py` (Triton), the
+  modelling code is PyTorch (`modeling_sabi_mla.py`, `SabiMlaConfig`, model
+  type `sabi_mla`), and the latent attention lives in `_vendor/latent_mla/`. So
+  the decline is right on substance -- Triton is not SYCL/Xe, so nothing ports --
+  but the recorded mechanism named the wrong language. The reason survives; the
+  wording did not.
+* **What upstream has that intfer genuinely lacks, recorded as a capability gap
+  rather than re-derived as "not yet attempted" later.** intfer's MLA path is a
+  pure arithmetic re-routing: it compresses Q/K/V into a latent, decompresses
+  them, and writes the **decompressed** rows into `ly.kcache`/`ly.vcache`, then
+  falls through to the existing grouped-attention pass. Its own comment says so
+  at `main.cpp:5525-5526` ("The KV cache still stores the DECOMPRESSED full K/V
+  rows (same layout as the GQA path)"). So `INTFER_MLA_ATTN` realises **none**
+  of MLA's KV-cache memory win. Upstream's three transferable capabilities are
+  (i) a **latent-resident KV cache** -- "the 16 full-attention layers cache a
+  per-layer latent plus a small RoPE and normalisation tail, instead of per-head
+  keys and values"; (ii) **GLA-g2 at TP=2**, which splits the latent into two
+  head groups so per-GPU KV halves under tensor parallelism, where plain MLA
+  replicates its latent on every rank; and (iii) a **per-head score divisor kept
+  as a one-byte log2 code** (0.8% max error where e4m3 gives 6%). None is ported.
+* **Why the latent-resident KV cache is DECLINED rather than implemented behind
+  a default-OFF flag, and the reason is the repo's own precedent.** The flag
+  requires `cfg.kv_lora_rank > 0` and the `q_a`/`q_b`/`kv_a`/`kv_b` tensors, so
+  on the shipped 27B GQA weights it is inert by construction. A latent-resident
+  cache would therefore be **dead code at the 27B `--tp 2` target** -- the
+  "default-OFF flag no gate can reach" class, the same reason `run_mlp_fused`
+  and `run_linear_tp_devact` are recorded as TP=1-locked. There is also no MLA
+  fixture model in this tree, so a gate arm could assert source structure only
+  and could not be non-vacuous in the sense the `INTFER_MLA_ATTN` arm already
+  is. And on the fusion test it removes no device round trip at the target while
+  rewriting the attention score/output pass to decompress on the fly. Recorded
+  as a capability gap with the reason, not deferred.
+
+*REGEN(bash scripts/check_durable_claims.sh)*
+
+**Reminders 8 and 9 -- answered by a finding, not by a move, and the finding is
+that the move already happened and the target was then destroyed.** AGENTS.md
+carries twelve pointers of the form "Moved to HISTORY.md (...). ... lives
+there", at lines 1565, 1572, 1579, 1586, 1593, 1600, 1608, 1615, 1622, 1715,
+2001 and 2010. HISTORY.md's own recovery banner records that 509 lines were
+destroyed and that the eleven dated entries AGENTS.md points at -- including
+`2026-10-16: 0.8B removed from code defaults/paths` (reminder 8) and
+`2026-10-16: Architectural improvements beyond fusion -- reminder #9
+evaluation` -- are gone, with the banner's own instruction to not quote them as
+if the file still carried them. So both reminders were **already discharged**
+when the sections were written, and the destination was subsequently truncated.
+
+* **Reminder 9's content is NOT lost**, and that matters for how this is fixed:
+  AGENTS.md itself carries the full five-item evaluation (KV-cache block layout
+  for TP=2 declined; per-layer op scheduling declined as requiring the peer
+  access this tree lacks; intra-device geometry knobs adopted as
+  `INTFER_DECODE1_WG`/`INTFER_XMX_WG`/`INTFER_LA_CONV_PREP_WG`;
+  `INTFER_KV_KVARN` documented as a tolerance-class candidate with no flag yet;
+  MLA/GA adopted as an informed-from-scratch opt-in). Only the *pointer* is
+  dangling. Annotating it is sufficient and is what was done.
+* **Reminder 8's body is genuinely gone.** AGENTS.md retains a summary
+  parenthetical (dropped paths and defaults, dropped tracked artifacts, a kept
+  gitignored gate fixture, retargetable via `INTFER_08B`) and nothing more. The
+  pointer is annotated with that fact rather than left implying a body, because
+  re-deriving it from source is possible and inventing it is not.
+* **The correction is an annotation, never a rewrite**, per the standing rule:
+  AGENTS.md's twelve sites now name the truncation explicitly. This is the same
+  laundering failure in the other direction as a stale gate tally -- a pointer
+  that claims a body it cannot show is a citation that decays into a guess, and
+  `check_durable_claims.sh` exists to refuse exactly that.
+
+*REGEN(bash scripts/check_durable_claims.sh)*
+
+**What this round did NOT do.** No GPU, no model load, no build, no gate
+execution, no counter claim and no tok/s. `nk`/`nw`/`nr` and the host buckets
+are untouched. HEAD stayed `5ef33bb` and nothing was committed.
+

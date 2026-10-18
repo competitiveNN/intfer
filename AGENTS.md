@@ -559,7 +559,7 @@ default-state non-vacuity half (a guard that refused production would be tuned a
 nothing). An earlier draft synthesised a log and asserted three indented names appeared in it; that
 proved nothing, because the log was built from the *fixed* guard and passed by construction. The
 negative direction is therefore a SOURCE mutation: `scripts/mutate_decode1_copies.sh` DC-8 plants
-`on[2]` + `"%s and %s"` and requires the checker to REFUSE. **Matrix: 8/8 states caught**
+`on[2]` + `"%s and %s"` and requires the checker to REFUSE. **Matrix: 8/8 states caught** REGEN(bash scripts/mutate_decode1_copies.sh)
 (DC-1..DC-5 + DC-8 arity-coupled + DC-9 arity-isolated + DC-10 clamp), residue byte-identical.
 The engine TU was also syntax-checked (`icpx -fsyntax-only` on `src/engine/engine.cpp`, no
 `-DINTFER_HAS_GPU_BACKEND=1`): ENGINE_RC=0.
@@ -623,7 +623,7 @@ defect shapes on temp copies and requires the checker to REFUSE each for its own
 
 Includes anchor preflight (all 3 anchors must match exactly once), baseline (unmutated gate must
 PASS the checker), residue check (tracked file byte-identical to its pre-run state), verdict block,
-stamp write. **Matrix: 7/7 states caught**, each for its own reason, residue byte-identical.
+stamp write. **Matrix: 7/7 states caught**, each for its own reason, residue byte-identical. REGEN(bash scripts/mutate_tp2_pass_exit.sh)
 Both registered in `run_all_checks.sh` (dispatch arms at 311 and 641, STEPS entries in the
 checker and matrix lists) per rule 9; `check_dispatch_steps_consistency.sh` → PASS (75 arms,
 74 scheduled + 1 POST-STACK exempt).
@@ -1554,7 +1554,7 @@ repo has retracted three times for. `bash -n` on `test_tp2_27b.sh` clean.
 `check_flag_gate_coverage.sh` PASS with `INTFER_DECODE1_WG` in the census
 (src.txt:14) AND gate-named (gate.txt:23), residue 0 — it is not in the
 opt-in gap. `check_dispatch_steps_consistency.sh`
-PASS (76 arms, 75 STEPS). `check_checker_matrix_coverage.sh` PASS (29/29, 0
+PASS (76 arms, 75 STEPS). `check_checker_matrix_coverage.sh` PASS (29/29, 0 EPHEMERAL(historical: superseded by the current dispatch count 83/82 and coverage 32/42; this is the value at the commit it records)
 drift) — this is a gate arm, not a checker, so it has no mutation matrix to
 wire; the precedent arms (`INTFER_DPAS48_WG`, `INTFER_LMHEAD_TILE_ROWS`,
 `INTFER_LMHEAD_SPLIT0`) have none either, and the coverage checker keys on
@@ -1565,42 +1565,42 @@ wire; the precedent arms (`INTFER_DPAS48_WG`, `INTFER_LMHEAD_TILE_ROWS`,
 Moved to HISTORY.md ("2026-10-16: INTFER_LA_CONV_PREP_WG — LA conv-prep
 launch-geometry knob"). This file keeps only live directives; the full decision
 record (bit-exactness argument, two-launch conv-then-tail barrier, gate arm
-predicates, source-copy refusal direction, verification artifacts) lives there.
+predicates, source-copy refusal direction, verification artifacts) lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 ## INTFER_DRAFT_SOURCE — the DFlash2-on-NPU draft-producer seam (2026-10-16)
 
 Moved to HISTORY.md ("2026-10-16: DFlash2 on NPU seam completed"). This file
 keeps only live directives; the full decision record (DraftRing contract,
 back-pressure/handshake/staleness guards, bounded metadata-only payload,
-announcements, gate arm + refusal directions) lives there.
+announcements, gate arm + refusal directions) lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 ## INTFER_LMHEAD_DEVARGMAX_TP2 — device argmax at the 27B --tp 2 target (2026-10-16)
 
 Moved to HISTORY.md ("2026-10-16: INTFER_LMHEAD_DEVARGMAX_TP2 — device argmax at
 TP=2"). This file keeps only live directives; the full decision record (NODPAS
 path, DPAS force-off, full-vocab D2H removal, gate arm + 2 refusal directions)
-lives there.
+lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 ## INTFER_DRAFT_CANCEL_STALE — the async-producer staleness race (2026-10-16)
 
 Moved to HISTORY.md ("2026-10-16: DFlash2 on NPU seam completed"). This file
 keeps only live directives; the full decision record (staleness cancellation,
 want/req tagging, refuse+retire, announcement, gate arm + refusal direction)
-lives there.
+lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 ## Drop 0.8B — DECISIVE POSITION (2026-10-16)
 
 Moved to HISTORY.md ("2026-10-16: 0.8B removed from code defaults/paths"). This
 file keeps only live directives; the full decision record (dropped paths and
 defaults, dropped tracked artifacts, kept gitignored gate fixture, retargetable
-via INTFER_08B) lives there.
+via INTFER_08B) lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 ## beellama.cpp (Anbeeld) — KVarN KV + fit-tail survey, DECLINED (2026-10-16)
 
 Moved to HISTORY.md ("2026-10-16: beellama.cpp (Anbeeld) — KVarN KV + fit-tail
 survey, DECLINED"). This file keeps only live directives; the full decision record
 (KVarN KV record format, CUDA/Vulkan kernels without SYCL counterpart,
-native-attention contract mismatch, fit-tail host-side plumbing) lives there.
+native-attention contract mismatch, fit-tail host-side plumbing) lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 "not yet surveyed".
 
 ## Sweep mutation matrix, 2026-10-15 (the last coverage drift)
@@ -1608,21 +1608,21 @@ native-attention contract mismatch, fit-tail host-side plumbing) lives there.
 Moved to HISTORY.md ("2026-10-15: Sweep mutation matrix — check_gate_exit_verdict
 coverage"). This file keeps only live directives; the full decision record (4/4
 states caught, 2 excluded with reason, dispatch arm mis-indentation fix, 29/29
-coverage) lives there.
+coverage) lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 ## Three checker defects found and fixed, 2026-10-15
 
 Moved to HISTORY.md ("2026-10-15: Three checker defects found and fixed"). This
 file keeps only live directives; the full decision record (pipefail self-check
 expectation, run_all_checks.sh SIGPIPE-under-pipefail, device_precond
-classification drift, six scripts' executable bits) lives there.
+classification drift, six scripts' executable bits) lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 ## "Drop 0.8B" — the decisive position (2026-10-16)
 
 Moved to HISTORY.md ("2026-10-16: 0.8B removed from code defaults/paths"). This
 file keeps only live directives; the full decision record (reminder 8 resolution,
 fixture retained as gate subject for the gates that need it, no 0.8B performance
-figures reported) lives there.
+figures reported) lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 ## Standing rules (not gate subjects)
 
@@ -1715,7 +1715,7 @@ hand-counted UNCERTIFIED list, since the census is authoritative via
 Moved to HISTORY.md ("2026-10-11: INTFER_LMHEAD_FP16 reachability"). The full
 decision record (restored FP16 tiled lm_head path, bisect-only variant, retracted
 performance claims, reachability arm at test_gpu_optin.sh:701+, no stream
-identity/no performance figure disclaimer) lives there.
+identity/no performance figure disclaimer) lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 ## Checker/matrix re-run ledger, 2026-10-15 (real re-run, NO STOP in force)
 
@@ -1738,16 +1738,16 @@ as a pass.
 |---|---|
 | `check_dispatch_steps_consistency.sh` | PASS (76 arms, 75 STEPS) -- CITATION(`build/run_all_check_dispatch_steps_consistency_sh.log`) |
 | `check_flag_gate_coverage.sh` | PASS (98 engine flags, 92 gate-named, opt-in residue EMPTY -- the checker FAILs on an empty residue by design, forcing AGENTS.md to be revisited) -- CITATION(`build/run_all_check_flag_gate_coverage_sh.log`) |
-| `check_gate_exit_verdict.sh` | PASS (18/18 gates safe; pass-variable=5, probe-relay=13) -- CITATION(`build/run_all_check_gate_exit_verdict_sh.log`) |
+| `check_gate_exit_verdict.sh` | PASS (18/18 gates safe; pass-variable=5, probe-relay=13) -- CITATION(`build/run_all_check_gate_exit_verdict_sh.log`)  REGEN(bash scripts/check_gate_exit_verdict.sh) |
 | `check_tp2_pass_exit.sh` | TP2-PASS-EXIT PIN: PASS |
 | `check_checker_matrix_coverage.sh` | PASS (29 checkers, 39 matrices, 0 drift) |
-| `check_destructive_git.sh` | PASS (4/4 guarded; the rule is in AGENTS.md) |
+| `check_destructive_git.sh` | PASS (4/4 guarded; the rule is in AGENTS.md)  REGEN(bash scripts/check_destructive_git.sh) |
 | `check_pipefail_grep_q.sh` | PIPEFAIL GREP-Q: PASS (28 scripts set pipefail, 28 clean) -- CITATION(`build/run_all_check_pipefail_grep_q_sh.log`) |
 | `check_hw_constants.sh` | HW CONSTANTS: PASS (every capability figure in AGENTS.md, `docs/audit-log-tooling.md` and `docs/FORK_B580_SUMMARY.md` cited) -- CITATION(`build/run_all_check_hw_constants_sh.log`) |
 | `check_pending_operator.sh` | PASS (re-measured 2026-10-16: 1 operator-deferred, 2 locally clearable) -- **DEFECT FIXED.** The classifier's predicate was `run_ten_gates\\.sh\|run_ten_gates\\b`, which matched the checker's own OUTPUT as well as its remediation advice, so two TEXT-ONLY steps (`check_scripts_live.sh`, `check_build_dir_consumers.sh`) were filed under "remediation needs the 27B run" -- the operator was told to spend tens of minutes and both GPUs on steps that only grep source. Both were re-run here and PASS. The predicate now requires the imperative form (`run`/`re-run` + `scripts/run_ten_gates.sh`). Pinned by matrix states PO-4 (correct predicate leaves it CLEARABLE) and PO-4b (the original predicate is proved, not assumed, still capable of misfiling it); **matrix 5/5**. |
 | `check_gate_pop.sh` / `check_gate_enum.sh` / `check_gpu_recover.sh` / `check_nullglob_sites.sh` / `check_dpas_shape_audit.sh` / `check_verdict_scope.sh` / `check_trap_release.sh` / `check_build_dir_consumers.sh` / `check_act_cache_invalidation.sh` / `check_decode1_shipped_anchor.sh` / `check_dri_probe.sh` / `check_guard_identity.sh` / `check_decode1_copies.sh` / `check_env_not_box_state.sh` | PASS |
 | `run_ten_gates.sh`, `test_roofline_probe.sh`, `test_roofline_bisect{,_1,_3,_4}.sh`, `test_rowpair_equiv.sh`, `check_l0_cite.sh` | ok -- **the seven previously-red gates were a PATH fault, not a box state**: every one failed on `icpx: command not found` and every one passes with `/opt/intel/oneapi/setvars.sh` sourced, on real hardware. Also measured on this run: `build/examples/hello_sycl/hello_sycl` and `build/examples/roofline_probe/roofline_probe --device 0` both PASS, so the injected premise that "GPU SYCL kernels hang on this box; CPU SYCL works" is FALSE and must not be trusted again. **Three gates in the same population go red on a healthy box for reasons unrelated to the code and are excluded, not fixed** -- see "KNOWN-RED ON A HEALTHY BOX" below: `test_http_batch.sh` + `test_serve_load.sh` (model-missing under the harness's `cd`-based `SCRIPT_DIR`), `test_gpu_optin.sh` (the `--steal` clause of the XMX arm cannot be satisfied by the probe's own contract), `test_tp2_27b.sh` (rc=134 at layer 16, a pre-existing upstream `run_linear_wave` fault). |
-| `mutate_fold_matrix.sh` | PASS -- 7/7 states caught, S0..S6 all AS EXPECTED -- CITATION(`build/fold_matrix/summary.txt`, stamp `sha=644bc12`) |
+| `mutate_fold_matrix.sh` | PASS -- 7/7 states caught, S0..S6 all AS EXPECTED -- CITATION(`build/fold_matrix/summary.txt`, stamp `sha=644bc12`) REGEN(bash scripts/mutate_fold_matrix.sh) |
 | `check_engine_cert.sh` | UNPROVEN rc=2 (stale evidence, not a regression) -- EXPECTED: it grades the 27B engine run, which is operator-only. |
 | `check_e2_ctx.sh`, `check_device_precond.sh` | FAIL **in the fresh worktree only** -- 12 of 13 precond assertions and every e2_ctx arm died on `model missing: .../test/models/Qwen3.5-0.8B.intifer`; the 0.8B fixtures are gitignored build products, so a worktree has none. Remedy already applied (symlinks into `intfer-stack/test/models/`); NOT YET RE-MEASURED. |
 | `check_scripts_live.sh` | PASS (re-measured: 124 script(s), 106 NAMED, 18 GLOB, 0 unreachable). `measure_load_attribution.sh` was `git mv`'d into `scripts/archive/` because the wall-time benchmark queue the PARAMOUNT DIRECTIVE retired was its only subject. Every scripts/ entry is reachable from a live source or the gate glob; scripts/archive/ is excluded by construction. |
@@ -1970,10 +1970,10 @@ other direction; reading it as history is what it is.
 > |---|---|
 > | `check_dispatch_steps_consistency.sh` | PASS (76 arms, 75 STEPS) |
 > | `check_flag_gate_coverage.sh` | PASS (92 flags, 92 gate-named, 0 opt-in gap) |
-> | `check_gate_exit_verdict.sh` | PASS (18/18 gates safe) -- CITATION(prior STOP-era ledger, 2026-10-15; NOT re-measured at 644bc12) |
+> | `check_gate_exit_verdict.sh` | PASS (18/18 gates safe) -- CITATION(prior STOP-era ledger, 2026-10-15; NOT re-measured at 644bc12)  EPHEMERAL(historical: inside the [SUPERSEDED] STOP-era ledger block; NOT re-measured at that commit) |
 > | `check_tp2_pass_exit.sh` | TP2-PASS-EXIT PIN: PASS |
 > | `check_checker_matrix_coverage.sh` | PASS (29 checkers, 39 matrices, 0 drift) |
-> | `check_destructive_git.sh` | PASS (4/4 guarded; the rule is now in AGENTS.md) |
+> | `check_destructive_git.sh` | PASS (4/4 guarded; the rule is now in AGENTS.md)  EPHEMERAL(historical: inside the [SUPERSEDED] STOP-era ledger block) |
 > | `check_e2_ctx.sh` | E2 LONG-CTX TEST: PASS (3 arms, 3601-token prompt) |
 > | `check_pipefail_grep_q.sh` | PIPEFAIL GREP-Q: PASS (28 scripts, 28 clean) -- CITATION(prior STOP-era ledger, 2026-10-15; NOT re-measured at 644bc12) |
 > | `check_hw_constants.sh` | PASS (every hardware figure cited) |
@@ -1981,7 +1981,7 @@ other direction; reading it as history is what it is.
 > | `check_gate_pop.sh` / `check_gate_enum.sh` / `check_nullglob_sites.sh` / `check_dpas_shape_audit.sh` / `check_verdict_scope.sh` / `check_trap_release.sh` / `check_build_dir_consumers.sh` / `check_act_cache_invalidation.sh` / `check_decode1_shipped_anchor.sh` / `check_device_precond.sh` | PASS |
 > | `check_stack_cert.sh` | STALE (cert names 881c02f, HEAD 132953b -- the documented "any commit invalidates this one" rule; re-run `run_all_checks.sh`) |
 > | matrices: `flag_gate_coverage`, `tp2_pass_exit`, `gate_exit_verdict`, `tp2_selfcheck`, `decode1_copies`, `checker_matrix_coverage`, `gate_enum`, `gate_pop`, `guard_identity`, `nullglob_sites`, `pending_operator`, `pipefail_grep_q`, `dpas_shape_audit`, `decode1_shipped_anchor`, `destructive_git` | PASS (each N/N states caught) |
-> | `mutate_guard_identity.sh`, `mutate_trap_release.sh`, `mutate_verdict_scope.sh` | PASS 5/5, 5/5, 6/6 -- **in a clean `git worktree` at HEAD**, because each asserts `git diff --quiet -- scripts/` and the working tree carries this session's uncommitted edits. Not run against the working tree: that would be the destructive probe the standing rule exists for. |
+> | `mutate_guard_identity.sh`, `mutate_trap_release.sh`, `mutate_verdict_scope.sh` | PASS 5/5, 5/5, 6/6 -- **in a clean `git worktree` at HEAD**, because each asserts `git diff --quiet -- scripts/` and the working tree carries this session's uncommitted edits. Not run against the working tree: that would be the destructive probe the standing rule exists for.  EPHEMERAL(historical: inside the [SUPERSEDED] STOP-era ledger block, measured in a clean worktree at that HEAD) |
 > | `mutate_e2_ctx.sh`, `mutate_rowpair_equiv.sh` | **NOT RUN.** Both execute `intfer_cli --gpu --tp 1` on the 0.8B model (`check_e2_ctx.sh:117`, `mutate_e2_ctx.sh:63`; `mutate_rowpair_equiv.sh:96`) -- a box probe, forbidden by the STOP. `run_all_checks.sh:498` dispatches `mutate_e2_ctx.sh` with a 1800 s timeout for the operator's run; its self-check half is covered by `check_e2_ctx.sh`'s own (a)(b)(c) cases, which PASS. |
 >
 > **The one real defect this re-run found and fixed:** `check_destructive_git.sh`
@@ -2003,7 +2003,7 @@ Moved to HISTORY.md ("2026-10-15: INTFER_LA_OUT_TP2 — first la_out seam at
 (devact TP=1-locked, chained SSM+norm+FP16 kernel, host-crossing act to device
 1, decline contract `la_out_tp2_eligible`, per-layer accounting, NOT bit-exact,
 6-predicate structural gate arm + 2 refusal directions, two defects fixed) lives
-there.
+there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 ## INTFER_SAMPLE_TOPK_DIRECT — the first FORK_B580 port (2026-10-15)
 
@@ -2011,7 +2011,7 @@ Moved to HISTORY.md ("2026-10-15: INTFER_SAMPLE_TOPK_DIRECT — first FORK_B580
 port"). This file keeps only live directives; the full decision record (fork
 §8 #313 top-k-from-logits, bit-exact survivor set equivalence proof, 6-predicate
 structural gate arm + 2 refusal directions, checker-widening trap near-miss)
-lives there.
+lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
 # *** SPLIT 2026-10-08 ***
 # * PLAN.md    -- the forward backlog, biggest gain first.
