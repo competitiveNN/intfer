@@ -1,2 +1,0 @@
-/usr/bin/ar qc libintfer_gemm.a CMakeFiles/intfer_gemm.dir/gemm/quant_gemm.cpp.o
-/usr/bin/ranlib libintfer_gemm.a

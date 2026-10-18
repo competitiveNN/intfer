@@ -1,2 +1,0 @@
-/usr/bin/ar qc libintfer_device.a CMakeFiles/intfer_device.dir/device/device_manager.cpp.o
-/usr/bin/ranlib libintfer_device.a
