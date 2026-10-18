@@ -47,6 +47,7 @@ retired here is scripts whose *subject* is gone, and each row says which.
 | `gpu_health_check.sh` | why card1 fails to enumerate, one window | `gpu_recover.sh diag` |
 | `l0_enum_trace.sh` | which of the driver's 5 silent skips fires, one window | `gpu_recover.sh diag` |
 | `stream_ids.sh` | hand-run token-id diff | `scripts/test_cpu_parity.sh`, `test_tp2_27b.sh` |
+| `measure_load_attribution.sh` | "how much of `load1` during a bench arm is the benchmark itself" — the diagnostic for a *question that is gone*. The **wall-time benchmark queue is closed** (AGENTS.md, PARAMOUNT DIRECTIVE): every optimization is now decided on the load-insensitive counters (`nk`/`nw`/`nr` + the host buckets), so the quiet-box premise this script existed to interrogate no longer governs any decision. Retired 2026-10-15 by `check_scripts_live.sh`, which found it with zero code references. | counters (`nk`/`nw`/`nr`); no successor needed |
 
 ## The three findings worth keeping, which lived only in these headers
 
@@ -94,6 +95,16 @@ build/examples/quant_merge/quant_merge OUT.intifer /var/home/fra/data/models/int
 
 Pass the chunks in layer order (`sort -V`); `merge_27b_batched.sh` is the archived
 driver if the exact invocation is needed.
+
+## 0.8B quant-sweep logs (`quant_int2_08b/`)
+
+Eight `08b_*.log` files moved out of `test/quant_int2/` (2026-10-16) when the
+0.8B was demoted from a built-in target to a gate-only fixture. They are
+unreferenced historical bit/beta sweep output (`b0.30`…`b0.60`, `ne_b30`) from
+the 0.8B INT2 quantiser tuning; no script reads them, and `git grep` found no
+consumer. Kept because they are the record of how the 0.8B fixture's quant was
+chosen — the fixture itself is still the subject of 7 gates, so its provenance
+is worth keeping one directory away rather than deleted.
 
 ## The one-GPU-era investigation kit is here, and the fault recurs
 
