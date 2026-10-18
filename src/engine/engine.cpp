@@ -170,6 +170,9 @@ void Engine::pool_release(size_t device, void* ptr, size_t bytes) {
     uint64_t readback_count = 0;
     uint64_t submit_count   = 0;   // q.submit host overhead calls
     uint64_t usm_write_count = 0;   // host USM activation write memcpy calls
+    // Device-timeline markers (INTFER_TIMELINE=1): count of 1-work-item
+    // empty kernels submitted as region boundaries. See timeline_mark().
+    uint64_t timeline_marker_count = 0;
   };
   static GpuProfile g_gpu_profile;
 #endif
@@ -275,15 +278,25 @@ bool wave_launch_fuse_enabled() {
 // re-unpack and re-pack on the host into the kernel's layout ONCE at load
 // time, then use simple row-major slices for TP. The shard covers the
 // contiguous range [start,end) of the N dimension.
+//
+// k_off/k_len (INTFER_MLP_PARTIAL_DOWN): instead of a contiguous N-slice, take
+// the FULL N (start=0, end=t.N) and a K-slice [k_off, k_off+k_len) of every
+// row. The kernel reads code[ng*K+kg] with K = k_len, so the shard is a
+// full-N x K-slice buffer; the group-major source is sampled at the columns
+// that fall inside the slice (a group may contribute 0..G columns). This is
+// the partial-down shard: device d computes partial_d[n] over its K-slice for
+// all n, and the host sums partial_0 + partial_1 in FP32. Default k_off=0,
+// k_len=0 => the full-K contiguous slice every existing caller uses.
 gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
                                      uint32_t start, uint32_t end,
-                                     sycl::queue& q) {
+                                     sycl::queue& q,
+                                     uint32_t k_off = 0, uint32_t k_len = 0) {
   gemm::GemmWeightBuffers w;
   w.scheme = to_ws(t.qcfg.scheme);
   w.group_size = t.qcfg.group_size;
   w.has_global_divisor = t.qcfg.has_global_divisor;
   w.N = end - start;
-  w.K = t.K;
+  w.K = (k_len == 0) ? t.K : k_len;
   const uint32_t N = t.N, K = t.K;
   const uint32_t G = t.qcfg.group_size > 0 ? t.qcfg.group_size : K;
   const uint32_t n_groups = (K + G - 1) / G;
@@ -291,7 +304,6 @@ gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
                  : (w.scheme == gemm::WeightScheme::INT4) ? 4
                  : (w.scheme == gemm::WeightScheme::FP16) ? 16 : 8;
   const int pack = (bits >= 8) ? 1 : (8 / bits);
-  const uint32_t per_row_code_bytes = (K + pack - 1) / pack;
 
   // 1) Build the per-group scale table (FP16 bits) and a per-row broadcast
   //    view. The kernel reads scale[ng*n_groups + g], so we emit (N*n_groups)
@@ -303,17 +315,17 @@ gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
   const uint16_t* scale_src =
       reinterpret_cast<const uint16_t*>(m.scale_data() + t.scale_offset);
   const bool fp16_passthrough = (w.scheme == gemm::WeightScheme::FP16);
-  std::vector<uint16_t> scale_broadcast((size_t)N * n_groups);
-  for (uint32_t r = 0; r < N; ++r)
-    for (uint32_t g = 0; g < n_groups; ++g)
-      scale_broadcast[(size_t)r * n_groups + g] =
-          fp16_passthrough ? 0x3C00 : scale_src[g];
-  // Take the TP slice on the host (contiguous, byte-aligned by N*2).
-  std::vector<uint16_t> scale_slice((size_t)w.N * n_groups);
+  // K-slice shard: the groups that fall inside [k_off, k_off+w.K). Requires
+  // w.K to be group-aligned (caller's responsibility) so a group contributes
+  // either wholly or not at all.
+  const uint32_t g0 = k_off / G;
+  const uint32_t g1 = (k_len == 0) ? n_groups : g0 + w.K / G;
+  const uint32_t n_groups_s = g1 - g0;
+  std::vector<uint16_t> scale_slice((size_t)w.N * n_groups_s);
   for (uint32_t r = 0; r < w.N; ++r)
-    std::memcpy(&scale_slice[(size_t)r * n_groups],
-                &scale_broadcast[(size_t)(r + start) * n_groups],
-                n_groups * sizeof(uint16_t));
+    for (uint32_t g = 0; g < n_groups_s; ++g)
+      scale_slice[(size_t)r * n_groups_s + g] =
+          fp16_passthrough ? 0x3C00 : scale_src[g0 + g];
   // Keep the packed vectors alive in the returned struct. The buffer is built
   // from the vector's iterators (eager copy, like gemm_demo); the vector stays
   // alive in `w` until the GEMM runs, so the payload is never lost.
@@ -327,35 +339,43 @@ gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
   //    is exactly what it expects.
   if (w.scheme == gemm::WeightScheme::FP16) {
     // FP16: pass-through the N*K*2 byte slice (identity for the kernel).
-    std::vector<uint8_t> code_slice((size_t)w.N * K * 2);
-    const uint8_t* base = m.code_data() + t.code_offset + start * K * 2;
+    std::vector<uint8_t> code_slice((size_t)w.N * w.K * 2);
+    const uint8_t* base = m.code_data() + t.code_offset
+                        + (size_t)(start * K + k_off) * 2;
     std::memcpy(code_slice.data(), base, code_slice.size());
     w.code_store = std::move(code_slice);
     w.code = sycl::buffer<std::uint8_t>(w.code_store.data(),
                                          sycl::range<1>(w.code_store.size()));
   } else {
-    // Group-major unpack -> row-major INT8 -> pack to bits.
-    std::vector<uint8_t> row_codes((size_t)w.N * K);
-    for (uint32_t g = 0; g < n_groups; ++g) {
+    // Group-major unpack -> row-major INT8 -> pack to bits. For a K-slice
+    // shard the destination K is w.K (the slice length) and the source
+    // columns are [k_off, k_off+w.K); a group that straddles the slice
+    // boundary contributes only its in-slice columns (Glocal is recomputed
+    // per group from the intersection).
+    std::vector<uint8_t> row_codes((size_t)w.N * w.K);
+    for (uint32_t g = g0; g < g1; ++g) {
       const uint32_t k0 = g * G;
       const uint32_t k1 = std::min(k0 + G, K);
+      const uint32_t c0 = std::max(k0, k_off);
+      const uint32_t c1 = std::min(k1, k_off + w.K);
+      if (c0 >= c1) continue;
+      const uint32_t Glocal = k1 - k0;
       for (uint32_t r = 0; r < w.N; ++r) {
         const uint32_t src_row = r + start;
-        // Source idx: g*(N*Glocal) + r_src*Glocal + (c - g*G)
-        const uint32_t Glocal = k1 - k0;
-        for (uint32_t c = k0; c < k1; ++c) {
+        for (uint32_t c = c0; c < c1; ++c) {
           const size_t src_idx = (size_t)g * (N * Glocal)
                                + (size_t)src_row * Glocal + (c - k0);
           const uint8_t b = m.code_data()[t.code_offset + src_idx / pack];
           const int within = (int)(src_idx % pack);
           const uint8_t val = (b >> (within * bits)) & ((1u << bits) - 1u);
-          row_codes[(size_t)r * K + c] = val;
+          row_codes[(size_t)r * w.K + (c - k_off)] = val;
         }
       }
     }
     // Repack row-major INT8 to packed bytes (kernel layout).
-    std::vector<uint8_t> code_slice((size_t)w.N * per_row_code_bytes, 0);
-    for (size_t i = 0; i < row_codes.size(); ++i) {
+    const uint32_t per_row_code_bytes_s = (w.K + pack - 1) / pack;
+    std::vector<uint8_t> code_slice((size_t)w.N * per_row_code_bytes_s, 0);
+    for (size_t i = 0; i < (size_t)w.N * w.K; ++i) {
       const size_t pack_idx = i / pack;
       const int within = (int)(i % pack);
       code_slice[pack_idx] |= (uint8_t)((row_codes[i] & ((1u << bits) - 1u))
@@ -363,7 +383,7 @@ gemm::GemmWeightBuffers shard_weight(const ModelIR& m, const TensorIR& t,
     }
     w.code_store = std::move(code_slice);
     w.code = sycl::buffer<std::uint8_t>(w.code_store.data(),
-                                        sycl::range<1>(w.code_store.size()));
+                                         sycl::range<1>(w.code_store.size()));
   }
 
   if (t.global_bytes > 0) {
@@ -634,11 +654,42 @@ void Engine::release_shard(int tensor_index) {
       pool_release(d, sc.scale_usm[d], scale_bytes);
       sc.scale_usm[d] = nullptr;
     }
+    // *** INTFER_MLP_PARTIAL_DOWN: K-split shard release. *** Same shape-keyed
+    // pool, different layout (full N x K-slice). Sizes come from the host
+    // cache when present, else from the ksplit geometry (N=t.N rows, K=ksplit_K).
+    if (sc.ksplit) {
+      size_t code_bytes_k = sc.has_host_cache && d < sc.ksplit_code_host.size()
+          ? sc.ksplit_code_host[d].size() : 0;
+      size_t scale_bytes_k = sc.has_host_cache && d < sc.ksplit_scale_host.size()
+          ? sc.ksplit_scale_host[d].size() * sizeof(uint16_t) : 0;
+      if (code_bytes_k == 0 || scale_bytes_k == 0) {
+        const uint32_t G = t.qcfg.group_size > 0 ? t.qcfg.group_size : t.K;
+        const uint32_t ng = (sc.ksplit_K + G - 1) / G;
+        const int bits = (sc.scheme == gemm::WeightScheme::INT2) ? 2
+                       : (sc.scheme == gemm::WeightScheme::INT4) ? 4
+                       : (sc.scheme == gemm::WeightScheme::FP16) ? 16 : 8;
+        const int pack = (bits >= 8) ? 1 : (8 / bits);
+        code_bytes_k = (sc.scheme == gemm::WeightScheme::FP16)
+            ? (size_t)t.N * sc.ksplit_K * 2
+            : (size_t)t.N * ((sc.ksplit_K + pack - 1) / pack);
+        scale_bytes_k = (size_t)t.N * ng * sizeof(uint16_t);
+      }
+      if (sc.ksplit_code_usm.size() > d && sc.ksplit_code_usm[d]) {
+        pool_release(d, sc.ksplit_code_usm[d], code_bytes_k);
+        sc.ksplit_code_usm[d] = nullptr;
+      }
+      if (sc.ksplit_scale_usm.size() > d && sc.ksplit_scale_usm[d]) {
+        pool_release(d, sc.ksplit_scale_usm[d], scale_bytes_k);
+        sc.ksplit_scale_usm[d] = nullptr;
+      }
+    }
     // NOTE: alpha is host-side only (global_host); no device global buffer.
     // NOTE: no per-shard act/out — the shared workspaces (ws_) serve all
     // shards, so release only the weight buffers (code/scale).
   }
   sc.code_usm.clear(); sc.scale_usm.clear();
+  sc.ksplit_code_usm.clear(); sc.ksplit_scale_usm.clear();
+  sc.ksplit = false; sc.ksplit_K = 0;
   sc.built = false;
 }
 
@@ -1434,30 +1485,58 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     // INTFER_XMX_GEMM (default OFF, presence enables): the XMX joint_matrix
     // GEMM path. The kernel declines (returns {}) on FP16/INT8/M<8 or
     // non-tile shapes; the caller's fallback is the same as before.
-    // Work-stealing counter: one uint32_t per device, zero-init by caller.
+    //
+    // Work-stealing claim counter: ONE uint32_t per device, zero-init
+    // by the caller. The kernel claims tiles on a SINGLE shared
+    // address (tile_ctr[0]) with a device-scope atomic -- not one
+    // slot per work-group, which would make every group claim the
+    // same tiles independently. The pointer handed to the kernel is
+    // this device's slot, so one slot per device is exactly enough.
     const char* xmx_env = std::getenv("INTFER_XMX_GEMM");
     static std::vector<std::uint32_t> xmx_tile_ctr;
     static bool xmx_announced = false;
     if (xmx_env) {
+      const uint32_t gx = (M / 16);
+      const uint32_t gy = (N_local / 16);
+      const uint32_t n_tiles = gx * gy;
+      const bool ts_env = (std::getenv("INTFER_XMX_TILE_SCHED") != nullptr);
+      const uint32_t nWG = ts_env ? 16u : n_tiles;
       if (xmx_tile_ctr.size() < devices_.size())
         xmx_tile_ctr.resize(devices_.size(), 0);
       xmx_tile_ctr[d] = 0;
+      bool xmx_ran = false;
       kernel_evt = gemm::quant_gemm_forward_usm_xmx(
           q, ws_[d].act, sc.code_usm[d], sc.scale_usm[d],
           alpha, ws_[d].out, M, N_local, t.K,
           sc.group_size, sc.scheme, sycl::event{},
-          xmx_tile_ctr.data() + d);
-      // Announce the tile scheduler state ONCE per process. The line
-      // prints n_tiles and nWG so the gate can verify the work-stealing
-      // path was actually taken (a stream match alone is vacuous: the
-      // two paths are bit-identical by construction).
-      if (!xmx_announced) {
+          &xmx_ran, xmx_tile_ctr.data() + d);
+      // A null event means the kernel DECLINED this shape (M<8, non-tile
+      // residual, FP16/INT8 scheme) and wrote nothing to ws_[d].out. The
+      // caller MUST fall back to the tiled kernel in that case -- a null
+      // event is not a no-op here, it is an unwritten buffer. The old code
+      // pushed the null event and read back garbage on every declined tile.
+      if (!xmx_ran) {
+        kernel_evt = gemm::quant_gemm_forward_usm(q,
+                                  ws_[d].act,
+                                  sc.code_usm[d],
+                                  sc.scale_usm[d],
+                                  alpha,
+                                  ws_[d].out,
+                                  M, N_local, t.K,
+                                  sc.group_size,
+                                  sc.scheme,
+                                  sycl::event{});
+      }
+      // Announce the tile scheduler state ONCE per process, ONLY when the
+      // XMX path actually ran. The line prints n_tiles and nWG so the gate
+      // can verify the work-stealing path was taken. Gating on `xmx_ran`
+      // makes the announcement a proof of execution rather than a proof
+      // that the env var was read (the engine used to print it
+      // unconditionally, so a gate asserting it would pass on a fixture
+      // where the kernel declined every tile and the fallback wrote
+      // nothing -- a vacuous-green defect).
+      if (xmx_ran && !xmx_announced) {
         xmx_announced = true;
-        const char* ts_env = std::getenv("INTFER_XMX_TILE_SCHED");
-        const uint32_t gx = (M / 16);
-        const uint32_t gy = (N_local / 16);
-        const uint32_t n_tiles = gx * gy;
-        const uint32_t nWG = ts_env ? 16u : n_tiles;
         std::fprintf(stderr,
                      "[xmx-gemm] ACTIVE on eligible INT2/INT4 tiles "
                      "(INTFER_XMX_GEMM=1)\n"
@@ -1524,6 +1603,12 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   // GEMM outputs). Only the timing accumulation is profiling-gated.
 #ifdef INTFER_PROFILE_GPU
   auto t_wb0 = std::chrono::high_resolution_clock::now();
+  // Device-timeline marker: the region between this and the readback
+  // marker below is the kernel+wait region. On this box the per-event
+  // kernel timestamps are dead (submit==start==end), so a marker pair is
+  // the only way to attribute wall-clock to the compute region rather
+  // than to the host. See timeline_mark in engine.cpp.
+  intfer::timeline_mark(devices_[0].queue, "run_linear_tp:compute");
 #endif
   for (size_t d = 0; d < devices_.size(); ++d) {
     kernel_events[d].wait();
@@ -1547,6 +1632,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
   }
 
   auto t_rb0 = std::chrono::high_resolution_clock::now();
+  intfer::timeline_mark(devices_[0].queue, "run_linear_tp:readback");
 #endif
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto [start, end] = ranges[d];
@@ -1563,6 +1649,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
     g_gpu_profile.total_readback_us += std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
     g_gpu_profile.readback_count++;
   }
+  intfer::timeline_mark(devices_[0].queue, "run_linear_tp:done");
 #endif
 }
 
@@ -1654,6 +1741,14 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
   sycl::event e_gate = gemm::quant_gemm_forward_usm(q, wv_[0].act,
       scg.code_usm[0], scg.scale_usm[0], ag, wv_[0].out,
       M, inter, tg.K, scg.group_size, scg.scheme, sycl::event{});
+  // *** NO XMX DISPATCH HERE, DELIBERATELY (2026-10-14 coverage audit). ***
+  // run_mlp_fused is TP=1-locked (devices_.size() != 1 => false, above), so
+  // at the 27B --tp 2 target this whole path is dead code; wiring
+  // INTFER_XMX_GEMM into it would create the "opt-in flag no gate can
+  // reach" class the flag census exists to kill. The TP=2 MLP XMX dispatch
+  // lives in run_mlp_gateup (per-output, with the compact/global readback
+  // branch); if this seam is ever promoted to TP=2, port that dispatch
+  // contract with it, including the per-arm layout rule.
   sycl::event e_up = gemm::quant_gemm_forward_usm(q, wv_[1].act,
       scu.code_usm[0], scu.scale_usm[0], au, wv_[1].out,
       M, inter, tu.K, scu.group_size, scu.scheme, e_gate);
@@ -1767,7 +1862,16 @@ bool Engine::run_mlp_fused(int gate_ti, int up_ti, int down_ti,
 bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
                             const std::vector<float>& rin,
                             std::vector<float>& mg, std::vector<float>& mu,
-                            uint32_t M) {
+                            uint32_t M, bool readback,
+                            std::vector<sycl::event>* chain_out) {
+  // *** readback=false + chain_out: run_mlp_partial_down reuses this launch
+  // loop to put gate/up outputs ON DEVICE (wv_ slots 1/2) and chains the silu
+  // mul + partial down off the returned events, so the inter never reaches the
+  // host. The host readback/wait/profiling/announcement blocks below are gated
+  // by readback; the launch-loop submit/usm_write accounting is NOT (it must
+  // stay true in both modes). chain_out, if set, absorbs the unsignaled events
+  // for the caller to chain; the wait loop is skipped so the caller owns the
+  // single wait for the whole device chain.
   if (devices_.size() != 2) return false;
   if (M == 0) M = 1;
   for (int ti : {gate_ti, up_ti}) {
@@ -1825,11 +1929,42 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
   // 2-item wave this saves one host USM activation write and one q.submit
   // per device, and it saves one launch per device on nk too (the wave
   // submits gate and up as two separate items, each on both devices).
+  // The one remaining usm_write per device (same act_staging_ bytes to both
+  // devices' slot 0) is NOT collapsible (2026-10-14 fusion test): each
+  // device's slot is distinct USM and there is no P2P on this box, so the
+  // bytes must reach each slot by a separate host write. Round trips
+  // removed 0, launch delta 0. Recorded, not attempted.
   // The event.wait is already one per wave and the D2H readback is NOT
   // saved (two separate out buffers, see header).
   ensure_wave_workspace(M, 3, tg.K, std::max(Ng, Nu));
   std::vector<sycl::event> kernel_events;
   kernel_events.reserve(2);
+  // Per-device XMX disposition, consumed by the readback loop below (the
+  // launch loop's own locals are out of scope by then):
+  //   xmx_ran_g[d]  -- gate's slice ran quant_gemm_forward_usm_xmx on
+  //                      device d => the gate slot is COMPACT (M x Nl_g).
+  //   up_compact[d] -- up's slot was written by a compact-layout kernel
+  //                      on device d (XMX, or the plain tiled fallback).
+  // Both false == the scalar gateup kernel wrote BOTH slots GLOBAL-SCATTER.
+  bool xmx_ran_g[2] = {false, false};
+  bool up_compact[2] = {false, false};
+  // Per-device work-stealing counters for the XMX kernel -- the same
+  // pattern as run_linear_tp (engine.cpp:1445) and run_linear_wave
+  // (engine.cpp:2585), but TWO SLOTS PER DEVICE, not one: gate and up
+  // are separate XMX launches on the same device and the kernel reads its
+  // counter DURING execution (quant_gemm.cpp:2357-2360), so a single
+  // slot would leave up's claims starting from gate's final count --
+  // cur >= n_tiles breaks the claim loop immediately and up writes
+  // nothing. Each slot is host-zeroed immediately before ITS OWN launch,
+  // and this function waits for every event before returning (the loop
+  // below), so no launch ever reads a slot being zeroed. A null or
+  // invalid tile_ctr with INTFER_XMX_TILE_SCHED=ON is a device fault,
+  // not a decline: the kernel dereferences it unconditionally in
+  // work-stealing mode.
+  static std::vector<std::uint32_t> xmx_tile_ctr;
+  if (std::getenv("INTFER_XMX_GEMM") &&
+      xmx_tile_ctr.size() < 2 * devices_.size())
+    xmx_tile_ctr.resize(2 * devices_.size(), 0);
   for (size_t d = 0; d < 2; ++d) {
     auto& dev = devices_[d];
     sycl::queue& q = dev.queue;
@@ -1851,21 +1986,131 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
 #ifdef INTFER_PROFILE_GPU
     auto t_s0 = std::chrono::high_resolution_clock::now();
 #endif
-    sycl::event e = gemm::quant_gemm_forward_usm_gateup(
-        q, act_ptr,
-        scg.code_usm[d], scg.scale_usm[d], ag,
-        wv_[d * wv_W_ + 1].out,
-        scu.code_usm[d], scu.scale_usm[d], au,
-        wv_[d * wv_W_ + 2].out,
-        M, Ng, Nu, tg.K, scg.group_size,
-        (uint32_t)shards_[gate_ti].ranges[d].first,
-        (uint32_t)(shards_[gate_ti].ranges[d].second -
-                   shards_[gate_ti].ranges[d].first),
-        (uint32_t)shards_[up_ti].ranges[d].first,
-        (uint32_t)(shards_[up_ti].ranges[d].second -
-                   shards_[up_ti].ranges[d].first),
-        scg.scheme, scu.scheme,
-        sycl::event{});
+    // *** INTFER_XMX_GEMM ON THE GATE+UP PATH (2026-10-14). *** The gate+up
+    // launch is the largest INT2 GEMM population in prefill that the XMX
+    // joint_matrix kernel had never reached: run_linear_tp and (since the
+    // wave wiring) run_linear_wave both try XMX first, but this path
+    // submitted the scalar INT2 kernel unconditionally. The 27B shape is
+    // XMX-eligible on both ranks: chunk_M = 128 (%16==0), Nl = Ng/2 = 4352
+    // (%16==0), K = 5120 (%32==0). Each output keeps its own accumulator and
+    // its own launch, so this is the SAME try-XMX-then-fallback contract the
+    // other two paths use -- XMX first per output, tiled scalar kernel as the
+    // mandatory fallback when the kernel declines (M<8, non-tile residual,
+    // FP16/INT8 scheme, or any % condition). A decline submits NOTHING, so
+    // the fallback is not cosmetic: pushing a null event would leave the
+    // wave slot unwritten and the caller would read garbage into mg/mu --
+    // the same unwritten-slot class the scheme guard at 1830 refuses.
+    //
+    // *** THE SLOT LAYOUT IS PER-ARM, AND THE READBACK MUST FOLLOW IT. ***
+    // Three writers can touch these two slots, and they use two different
+    // layouts (derived from the kernel bodies, not remembered):
+    //   * quant_gemm_forward_usm_gateup writes GLOBAL-SCATTER,
+    //     outp[m * (is_up ? Nu : Ng) + (start + local)]
+    //     (quant_gemm.cpp:2506, f0192ea);
+    //   * quant_gemm_forward_usm_xmx writes COMPACT, out[m*N + n]
+    //     (quant_gemm.cpp:2304, joint_matrix_store stride N); and
+    //   * quant_gemm_forward_usm (the up fallback) writes COMPACT,
+    //     out_usm[m*N + n] -- the layout the wave path reads back at
+    //     engine.cpp:2841 (out_ptr + m*N_local, no offset).
+    // So whenever ANY XMX dispatch ran on this device, both slots are
+    // compact; the gateup fallback is the only global-scatter writer.
+    // xmx_ran_g[d] / up_compact[d] (declared above the loop) record
+    // which, and the readback loops branch on them.
+    //
+    // *** THREE XMX ANNOUNCEMENT SITES, THREE FUNCTION STATICS. *** The
+    // [xmx-gemm] line is printed from run_linear_tp (engine.cpp:1446),
+    // from here, and from run_linear_wave (engine.cpp:2682, named
+    // xmx_wave_announced). Each is a function-local static, so the three
+    // never collide -- but each fires at most once per process, IN CALL
+    // ORDER. A run that reaches run_linear_tp's XMX dispatch first prints
+    // the tp-flavoured line; the gateup-flavoured line then still fires
+    // here (its own static is unset), so a gate grepping EITHER flavour
+    // still sees its path. Do NOT merge them into one shared static: the
+    // first path to run would silence the other two and a gate asserting
+    // a silenced flavour would go red for an ordering reason.
+    static bool xmx_announced = false;
+    const uint32_t Nl_g = static_cast<uint32_t>(
+        shards_[gate_ti].ranges[d].second - shards_[gate_ti].ranges[d].first);
+    const uint32_t Nl_u = static_cast<uint32_t>(
+        shards_[up_ti].ranges[d].second - shards_[up_ti].ranges[d].first);
+    bool xmx_ran_u = false;
+    sycl::event e;
+    if (std::getenv("INTFER_XMX_GEMM")) {
+      xmx_tile_ctr[2 * d] = 0;
+      e = gemm::quant_gemm_forward_usm_xmx(
+          q, act_ptr,
+          scg.code_usm[d], scg.scale_usm[d], ag,
+          wv_[d * wv_W_ + 1].out,
+          M, Nl_g, tg.K, scg.group_size, scg.scheme,
+          sycl::event{}, &xmx_ran_g[d], xmx_tile_ctr.data() + 2 * d);
+      if (!xmx_ran_g[d]) {
+        e = gemm::quant_gemm_forward_usm_gateup(
+            q, act_ptr,
+            scg.code_usm[d], scg.scale_usm[d], ag,
+            wv_[d * wv_W_ + 1].out,
+            scu.code_usm[d], scu.scale_usm[d], au,
+            wv_[d * wv_W_ + 2].out,
+            M, Ng, Nu, tg.K, scg.group_size,
+            (uint32_t)shards_[gate_ti].ranges[d].first, Nl_g,
+            (uint32_t)shards_[up_ti].ranges[d].first, Nl_u,
+            scg.scheme, scu.scheme,
+            sycl::event{});
+      } else {
+        // Gate's slice went through XMX (compact slot). Up still tries
+        // its own XMX; on a decline it falls back to the plain
+        // single-output tiled kernel, which writes the SAME compact
+        // layout -- so up's slot is compact on this device EITHER WAY,
+        // and up_compact records it. The scalar gateup kernel is NOT
+        // re-run here: it writes BOTH outputs and would double-write
+        // gate's slice.
+        up_compact[d] = true;
+        xmx_tile_ctr[2 * d + 1] = 0;
+        sycl::event e_u = gemm::quant_gemm_forward_usm_xmx(
+            q, act_ptr,
+            scu.code_usm[d], scu.scale_usm[d], au,
+            wv_[d * wv_W_ + 2].out,
+            M, Nl_u, tu.K, scu.group_size, scu.scheme,
+            sycl::event{}, &xmx_ran_u, xmx_tile_ctr.data() + 2 * d + 1);
+        if (!xmx_ran_u) {
+          e_u = gemm::quant_gemm_forward_usm(
+              q, act_ptr, scu.code_usm[d], scu.scale_usm[d], au,
+              wv_[d * wv_W_ + 2].out,
+              M, Nl_u, tu.K, scu.group_size, scu.scheme,
+              sycl::event{});
+        }
+        // Push up's event instead of waiting it inline: the shared wait
+        // loop and the post-wait profiling loop below then cover it, so
+        // the kernel/submit/wait counters stay true in the mixed arm (an
+        // inline wait would be an UNCOUNTED host wait and up's kernel
+        // time would vanish from the kernel bucket).
+        kernel_events.push_back(e_u);
+      }
+      if ((xmx_ran_g[d] || xmx_ran_u) && !xmx_announced) {
+        xmx_announced = true;
+        const bool ts = (std::getenv("INTFER_XMX_TILE_SCHED") != nullptr);
+        std::fprintf(stderr,
+                     "[xmx-gemm] ACTIVE on the fused gate+up launch "
+                     "(INTFER_XMX_GEMM=1, M=%u Nl_g=%u Nl_u=%u K=%u)\n"
+                     "[xmx-gateup-tiles] gate_tiles=%u up_tiles=%u "
+                     "(%s work-stealing)\n",
+                     M, Nl_g, Nl_u, tg.K,
+                     (M / 16) * (Nl_g / 16), (M / 16) * (Nl_u / 16),
+                     ts ? "persistent" : "fixed-assignment");
+        std::fflush(stderr);
+      }
+    } else {
+      e = gemm::quant_gemm_forward_usm_gateup(
+          q, act_ptr,
+          scg.code_usm[d], scg.scale_usm[d], ag,
+          wv_[d * wv_W_ + 1].out,
+          scu.code_usm[d], scu.scale_usm[d], au,
+          wv_[d * wv_W_ + 2].out,
+          M, Ng, Nu, tg.K, scg.group_size,
+          (uint32_t)shards_[gate_ti].ranges[d].first, Nl_g,
+          (uint32_t)shards_[up_ti].ranges[d].first, Nl_u,
+          scg.scheme, scu.scheme,
+          sycl::event{});
+    }
     kernel_events.push_back(e);
     // nk accounting: ONE increment per launch, and it comes from the SAME
     // mechanism every other engine path uses -- the post-wait
@@ -1884,13 +2129,29 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
       auto t1 = std::chrono::high_resolution_clock::now();
       g_gpu_profile.total_submit_us +=
           std::chrono::duration<double, std::micro>(t1 - t_s0).count();
-      g_gpu_profile.submit_count += 1;
+      // submit_count is the number of q.submit CALLS. In the mixed XMX arm
+      // up took its own launch on this device (its event was pushed into
+      // kernel_events, not waited inline), so that device contributes 2;
+      // every other arm submits exactly one per device. This matches what
+      // the post-wait profiling loop counts into kernel_count below.
+      g_gpu_profile.submit_count += (up_compact[d] ? 2 : 1);
     }
 #endif
   }
 #ifdef INTFER_PROFILE_GPU
   auto t_wb0 = std::chrono::high_resolution_clock::now();
 #endif
+  // readback=false (run_mlp_partial_down): the caller chains silu-mul + the
+  // partial-down GEMM off these SAME events and owns the single wait for the
+  // whole device chain, so this path does NOT wait here. It absorbs the
+  // unsignaled events into chain_out for the caller to chain; the caller's
+  // own post-wait profiling loop counts them into nk, so the device launches
+  // are described identically in both modes -- only the host wait/readback
+  // moves.
+  if (!readback) {
+    if (chain_out) *chain_out = std::move(kernel_events);
+    return true;
+  }
   for (auto& e : kernel_events) e.wait();
 #ifdef INTFER_PROFILE_GPU
   {
@@ -1898,19 +2159,21 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
     g_gpu_profile.total_waitblock_us +=
         std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
     // wait_count is the number of HOST .wait() CALLS. This path loops over
-    // kernel_events (2, one per device) and calls e.wait() on each, so it
-    // contributes 2. The wave fallback loops over 4 events (2 items x 2
-    // devices) and contributes 4. So the fusion DOES halve wait_count
-    // (4 -> 2), exactly like nk, submit_count and usm_write_count -- it
-    // is not flat and must not be written off as "already one per wave".
+    // kernel_events (2, one per device -- 4 in the mixed XMX arm, where up
+    // takes its own launch on each device) and calls e.wait() on each, so
+    // it contributes 2 (4 in that arm). The wave fallback loops over 4
+    // events (2 items x 2 devices) and contributes 4. So the fusion DOES
+    // halve wait_count (4 -> 2), exactly like nk, submit_count and
+    // usm_write_count -- it is not flat and must not be written off as
+    // "already one per wave".
     // The one thing it does NOT do is cut the number of HOST WAITS below
-    // one per device: gate and up go into two separate out buffers, so
-    // the readback cannot be fused the way run_mlp_fused (TP=1) does,
-    // and the host still has to wait for each device's launch to finish
-    // before reading. Counting it per event keeps this counter
-    // consistent with every other engine path; dropping it would make a
-    // fused token report wait_count=0 and read as "the fusion removed
-    // every wait", which is not true.
+    // one per device: gate and up go into two separate out buffers, so the
+    // readback cannot be fused the way run_mlp_fused (TP=1) does, and the
+    // host still has to wait for each device's launch to finish before
+    // reading. Counting it per event keeps this counter consistent with
+    // every other engine path; dropping it would make a fused token report
+    // wait_count=0 and read as "the fusion removed every wait", which is
+    // not true.
     g_gpu_profile.wait_count += (int)kernel_events.size();
   }
 #endif
@@ -1922,6 +2185,48 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
       g_gpu_profile.kernel_count++;
     } catch (...) {}
   }
+  // *** THE READBACK MUST MATCH THE KERNEL'S WRITE LAYOUT, AND THERE ARE
+  // TWO OF THEM (both derived from the kernel bodies, not remembered). ***
+  // The scalar gateup kernel writes GLOBAL-SCATTER:
+  // outp[m * (is_up ? Nu : Ng) + (start + local)] (quant_gemm.cpp:2506,
+  // f0192ea). The slot is sized M x max(Ng, Nu) (ensure_wave_workspace
+  // takes Nl = max(Ng, Nu)), so the row stride IS Ng/Nu and the shard
+  // occupies COLUMNS [start, start+Nl) of every row; the source index is
+  // m * Ng + start + local. A compact source (m * Nl_g) would read columns
+  // [0, Nl_g) -- columns the kernel never wrote at TP=2 -- and the two
+  // layouts agree only when start == 0 && Nl == Ng, i.e. TP=1. That defect
+  // was invisible to the gateup arm (and to examples/gateup_equiv, which
+  // compares the kernel's output against the reference directly): the fused
+  // path IS the default TP=2 path, so base and fused produce the SAME bytes
+  // and the stream-identity predicate cannot see a wrong-but-consistent
+  // readback.
+  //
+  // The XMX arm and the plain tiled up fallback write COMPACT:
+  // out[m * Nl + n] -- the layout the wave path reads back at
+  // engine.cpp:2841 (out_ptr + m*N_local, no offset). Each device's
+  // readback therefore branches on the disposition flags recorded in the
+  // launch loop (xmx_ran_g[d] for gate, up_compact[d] for up). On this
+  // architecture Ng == Nu == inter (gate and up both project hidden ->
+  // inter), so the global-strided rows never collide.
+  // *** THE TWO READBACK LOOPS ARE NOT FUSIBLE (2026-10-14 fusion test). ***
+  // They read two DIFFERENT device slots (wv slot 1 = gate out, slot 2 =
+  // up out) into two DIFFERENT caller buffers (mg, mu). One "fused" pass
+  // would still iterate both (slot, buffer) pairs -- same D2H transfers,
+  // same bytes, launch delta 0, round trips removed 0. The readback is
+  // host-side; there is no launch to fuse and no producer/consumer pair
+  // to collapse. readback_count stays 2 per device (4 total), which matches
+  // the wave fallback's granularity and keeps the counters comparable.
+  // Collapsing to ONE out slot would change the kernel's write layout (the
+  // f0192ea shard contract), the XMX compact precedent and the wave slot
+  // sharing -- a layout migration with zero launch delta, paid only in the
+  // load-sensitive host buckets. Recorded, not attempted.
+  // *** readback=false skips this block ENTIRELY: run_mlp_partial_down keeps
+  // gate/up outputs on device (wv_ slots 1/2) and fuses silu-mul + the partial
+  // down off the absorbed events, so there is no mg/mu to fill and no D2H.
+  // The launch-loop submit/usm_write accounting above is NOT gated by
+  // readback -- it stays true in both modes, so the counters describe the
+  // device work the same way whether the host reads the results or not.
+  if (readback) {
   for (size_t d = 0; d < 2; ++d) {
     auto [start, end] = shards_[gate_ti].ranges[d];
     const uint32_t Nl_g = static_cast<uint32_t>(end - start);
@@ -1929,10 +2234,16 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
 #ifdef INTFER_PROFILE_GPU
     auto t_rb0 = std::chrono::high_resolution_clock::now();
 #endif
+    // Source layout follows which kernel ran on THIS device: global-scatter
+    // (row stride Ng, column start+local) for the gateup kernel, compact
+    // (row stride Nl_g, column 0) for XMX. The DESTINATION is the same
+    // either way (the caller's mg row, columns [start, start+Nl_g)).
     for (uint32_t m = 0; m < M; ++m)
-      dashq::half_to_float_batch(g_out + (size_t)m * Nl_g,
-                                 mg.data() + (size_t)m * tg.N + start,
-                                 Nl_g);
+      dashq::half_to_float_batch(
+          g_out + (xmx_ran_g[d] ? (size_t)m * Nl_g
+                                : (size_t)m * Ng + start),
+          mg.data() + (size_t)m * tg.N + start,
+          Nl_g);
 #ifdef INTFER_PROFILE_GPU
     {
       auto t1 = std::chrono::high_resolution_clock::now();
@@ -1947,10 +2258,15 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
 #ifdef INTFER_PROFILE_GPU
     t_rb0 = std::chrono::high_resolution_clock::now();
 #endif
+    // Same branch for up: compact (up_compact[d]) when an XMX-dispatch
+    // kernel wrote the slot, global-scatter (row stride Nu, column s2)
+    // when the gateup kernel wrote both.
     for (uint32_t m = 0; m < M; ++m)
-      dashq::half_to_float_batch(u_out + (size_t)m * Nl_u,
-                                 mu.data() + (size_t)m * tu.N + s2,
-                                 Nl_u);
+      dashq::half_to_float_batch(
+          u_out + (up_compact[d] ? (size_t)m * Nl_u
+                                 : (size_t)m * Nu + s2),
+          mu.data() + (size_t)m * tu.N + s2,
+          Nl_u);
 #ifdef INTFER_PROFILE_GPU
     {
       auto t1 = std::chrono::high_resolution_clock::now();
@@ -1960,6 +2276,7 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
     }
 #endif
   }
+  }  // if (readback)
   // THE PATH ANNOUNCES ITSELF, ONCE. Same shape as the decode1 arms and the
   // L4 la_out seam: without it, a gate that compares this run's token stream
   // against the base run's cannot tell whether the fused path ran -- the two
@@ -1998,6 +2315,11 @@ bool Engine::run_linear_tp_devact(int tensor_index,
   if (!dev_act || M == 0) return false;
   if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size())
     return false;
+  // *** NO XMX DISPATCH HERE, DELIBERATELY (2026-10-14 coverage audit). ***
+  // TP=1-locked (devices_.size() != 1 => false, above) — dead code at the
+  // 27B --tp 2 target, so an INTFER_XMX_GEMM dispatch here would be
+  // unreachable from any gate. See run_mlp_fused's note for the same
+  // decision at the other TP=1 seam.
   const auto& t = model_.tensors[(size_t)tensor_index];
   const auto& ranges = shards_[tensor_index].ranges;
   if (ranges.size() != 1) return false;
@@ -2067,6 +2389,207 @@ bool Engine::run_linear_tp_devact(int tensor_index,
     g_gpu_profile.readback_count++;
   }
 #endif
+  return true;
+}
+
+// TP=2 twin of run_linear_tp_devact (INTFER_LA_OUT_TP2). The activation is
+// a PER-DEVICE array because the SSM producer lives on device 0 and there is
+// no P2P on this box: device 0 hands the engine the norm kernel's own
+// device buffer, device 1 gets its own copy (the caller stages it -- see
+// run_mlp_gateup's documented "bytes must reach each slot by a separate
+// host write" rule at the gateup launch loop). Each rank then runs its own
+// N-slice with the SAME kernel run_linear_tp uses, so the arithmetic is
+// unchanged and the readback assembly is the one run_linear_tp already does.
+// Everything else (XMX try-first + mandatory fallback, the once-per-process
+// announcement, the shared wait, the profiling buckets) mirrors it so the
+// counters stay comparable rather than a second accounting path.
+bool Engine::run_linear_tp_devact_tp2(int tensor_index,
+                                      const std::uint16_t* const* dev_act,
+                                      std::vector<float>& out, uint32_t M,
+                                      const sycl::event& dep) {
+  if (devices_.size() != 2) return false;  // TP=2 only
+  if (!dev_act || M == 0) return false;
+  if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size())
+    return false;
+  const auto& t = model_.tensors[(size_t)tensor_index];
+  const auto& ranges = shards_[tensor_index].ranges;
+  if (ranges.size() != 2) return false;  // must be a 2-rank column split
+  if (ranges[0].first != 0 || ranges[1].second != t.N) return false;
+  for (size_t d = 0; d < 2; ++d)
+    if (ranges[d].second <= ranges[d].first) return false;
+  if (t.N == 0 || t.K == 0) return false;
+  // No mutation on failure: the caller reuses its output buffer on the host
+  // fallback path, so a shape mismatch must not resize it.
+  if (out.size() != (size_t)M * t.N) return false;
+  if (!shard_cache_[(size_t)tensor_index].built &&
+      !ensure_shard_built(tensor_index))
+    return false;
+  const auto& sc = shard_cache_[(size_t)tensor_index];
+  if (sc.dpas48) return false;  // FP16-act path only; host path covers DPAS
+  if (sc.code_usm.size() != 2) return false;
+  for (size_t d = 0; d < 2; ++d) {
+    if (!sc.code_usm[d] || !sc.scale_usm[d]) return false;
+    if (!dev_act[d]) return false;
+  }
+  // Shared workspaces grow-only across ranks; Nl_max is over TP ranks.
+  {
+    uint32_t Nl_max = std::max(ranges[0].second - ranges[0].first,
+                               ranges[1].second - ranges[1].first);
+    ensure_workspace(M, t.K, Nl_max);
+  }
+  // Output staging reuses ws_[d].out, so a dev_act aliasing it would corrupt
+  // its own input -- checked after ensure_workspace so the pointer is final.
+  for (size_t d = 0; d < 2; ++d) {
+    if (ws_[d].out && dev_act[d] >= ws_[d].out &&
+        dev_act[d] < ws_[d].out + (size_t)ws_[d].M * ws_[d].Nl)
+      return false;
+  }
+  const float alpha = sc.has_global_divisor ? sc.global_host : 1.0f;
+#ifdef INTFER_PROFILE_GPU
+  auto t_s0 = std::chrono::high_resolution_clock::now();
+#endif
+  std::vector<sycl::event> kernel_events;
+  kernel_events.reserve(2);
+  // Per-device work-stealing counters for the XMX kernel (same 2-slot rule
+  // as run_mlp_gateup: the kernel reads its counter DURING execution, so one
+  // slot per device is the minimum and each is host-zeroed before its own
+  // launch).
+  static std::vector<std::uint32_t> xmx_tile_ctr;
+  if (std::getenv("INTFER_XMX_GEMM") &&
+      xmx_tile_ctr.size() < 2 * devices_.size())
+    xmx_tile_ctr.resize(2 * devices_.size(), 0);
+  bool xmx_ran_any = false;
+  for (size_t d = 0; d < 2; ++d) {
+    auto& dev = devices_[d];
+    auto [start, end] = ranges[d];
+    sycl::queue& q = dev.queue;
+    uint32_t N_local = end - start;
+    sycl::event kernel_evt;
+    const char* xmx_env = std::getenv("INTFER_XMX_GEMM");
+    if (xmx_env) {
+      bool xmx_ran = false;
+      xmx_tile_ctr[d] = 0;
+      kernel_evt = gemm::quant_gemm_forward_usm_xmx(
+          q, const_cast<std::uint16_t*>(dev_act[d]), sc.code_usm[d],
+          sc.scale_usm[d], alpha, ws_[d].out, M, N_local, t.K,
+          sc.group_size, sc.scheme, sycl::event{}, &xmx_ran,
+          xmx_tile_ctr.data() + d);
+      // A declined XMX attempt writes NOTHING, so the tiled fallback is
+      // mandatory, not cosmetic (same contract as run_linear_tp:1505).
+      if (!xmx_ran) {
+        kernel_evt = gemm::quant_gemm_forward_usm(
+            q, const_cast<std::uint16_t*>(dev_act[d]), sc.code_usm[d],
+            sc.scale_usm[d], alpha, ws_[d].out, M, N_local, t.K,
+            sc.group_size, sc.scheme, sycl::event{});
+      } else {
+        xmx_ran_any = true;
+      }
+    } else {
+      kernel_evt = gemm::quant_gemm_forward_usm(
+          q, const_cast<std::uint16_t*>(dev_act[d]), sc.code_usm[d],
+          sc.scale_usm[d], alpha, ws_[d].out, M, N_local, t.K,
+          sc.group_size, sc.scheme, sycl::event{});
+      (void)dep;
+    }
+    kernel_events.push_back(kernel_evt);
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_submit_us += std::chrono::duration<double, std::micro>(t1 - t_s0).count();
+    }
+    if (kernel_events.size() > g_gpu_profile.peak_wait_depth)
+      g_gpu_profile.peak_wait_depth = kernel_events.size();
+#endif
+  }
+  // THE PATH ANNOUNCES ITSELF, ONCE, gated on xmx_ran_any rather than on the
+  // env var: a line printed for a flag the kernel declined would be exactly
+  // the vacuous-green shape the [xmx-gemm] arm in run_linear_tp gates
+  // against. Its own function-local static keeps it from colliding with the
+  // tp/gateup/wave flavours (the three-statics rule at run_mlp_gateup:2009).
+  if (xmx_ran_any) {
+    static bool announced_l4_tp2 = false;
+    if (!announced_l4_tp2) {
+      announced_l4_tp2 = true;
+      std::fprintf(stderr,
+                   "[xmx-gemm] ACTIVE on eligible INT2/INT4 tiles "
+                   "(INTFER_XMX_GEMM=1)\n");
+    }
+  }
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t_wb0 = std::chrono::high_resolution_clock::now();
+    for (auto& e : kernel_events) e.wait();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_waitblock_us += std::chrono::duration<double, std::micro>(t1 - t_wb0).count();
+    g_gpu_profile.wait_count += devices_.size();
+  }
+  // t_rb0 MUST live at this scope (not inside the wait block above): the
+  // readback accumulator below, still inside its own INTFER_PROFILE_GPU
+  // block, reads it -- the first revision declared it in the wait block's
+  // scope and the engine TU failed to compile.
+  for (auto& e : kernel_events) {
+    try {
+      auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
+      auto t1e = e.get_profiling_info<sycl::info::event_profiling::command_end>();
+      g_gpu_profile.total_kernel_us += (double)(t1e - t0) / 1000.0;
+      g_gpu_profile.kernel_count++;
+    } catch (...) {}
+  }
+  auto t_rb0 = std::chrono::high_resolution_clock::now();
+#else
+  for (auto& e : kernel_events) e.wait();
+#endif
+  // Read back FP16 -> FP32 per rank into out.data() + m*t.N + start. The
+  // wait above is load-bearing, not profiling: without it the host reads
+  // ws_[d].out before the kernel runs.
+  for (size_t d = 0; d < 2; ++d) {
+    auto [start, end] = ranges[d];
+    const std::uint16_t* out_ptr = ws_[d].out;
+    const uint32_t N_local_rb = static_cast<uint32_t>(end - start);
+    for (uint32_t m = 0; m < M; ++m)
+      dashq::half_to_float_batch(out_ptr + (size_t)m * N_local_rb,
+                                 out.data() + (size_t)m * t.N + start,
+                                 N_local_rb);
+  }
+#ifdef INTFER_PROFILE_GPU
+  {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_gpu_profile.total_readback_us += std::chrono::duration<double, std::micro>(t1 - t_rb0).count();
+    g_gpu_profile.readback_count += (int)devices_.size();
+  }
+#endif
+  return true;
+}
+
+// Static pre-flight for run_linear_tp_devact_tp2 (see the header). Every
+// precondition the seam can check without touching device state: the tensor
+// exists, is column-sharded across exactly 2 ranks, is FP16-act (not DPAS48),
+// the shard is built, and the caller's output buffer is the right size. The
+// caller MUST run this BEFORE submitting the SSM chain kernel, because the
+// chain advances the recurrent state in place and a decline after that would
+// corrupt it (the fusion would have to re-run the recurrence to produce
+// c_ncore for the host path). Same "eligibility predicate consulted before
+// the launch" idiom as run_linear_tp_dpas48:1270.
+bool Engine::la_out_tp2_eligible(int tensor_index, uint32_t M,
+                                 size_t out_elems) const {
+  if (devices_.size() != 2) return false;
+  if (M == 0) return false;
+  if (tensor_index < 0 || (size_t)tensor_index >= model_.tensors.size())
+    return false;
+  const auto& t = model_.tensors[(size_t)tensor_index];
+  const auto& ranges = shards_[(size_t)tensor_index].ranges;
+  if (ranges.size() != 2) return false;
+  if (ranges[0].first != 0 || ranges[1].second != t.N) return false;
+  for (size_t d = 0; d < 2; ++d)
+    if (ranges[d].second <= ranges[d].first) return false;
+  if (t.N == 0 || t.K == 0) return false;
+  if (out_elems != (size_t)M * t.N) return false;
+  const auto& sc = shard_cache_[(size_t)tensor_index];
+  if (!sc.built) return false;
+  if (sc.dpas48) return false;  // FP16-act path only; host path covers DPAS
+  if (sc.code_usm.size() != 2) return false;
+  for (size_t d = 0; d < 2; ++d)
+    if (!sc.code_usm[d] || !sc.scale_usm[d]) return false;
   return true;
 }
 
@@ -2354,7 +2877,35 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
         ok = false; break;
       }
     }
-    if (ok && run_linear_wave_fused(live, nl, M)) return;
+    if (ok && run_linear_wave_fused(live, nl, M)) {
+      // *** INTFER_WAVE_LAUNCH_FUSE PRE-EMPTS THE PER-ITEM XMX DISPATCH
+      // (2026-10-14). *** run_linear_wave_fused submits
+      // quant_gemm_forward_usm_wave directly (engine.cpp:2336) -- ONE
+      // parallel_for over the union of the wave's items -- so a wave that
+      // takes it never reaches the per-item try-XMX-first dispatch below.
+      // With INTFER_XMX_GEMM also set, the matrix engines therefore run
+      // ONLY the non-fused waves (every wave that misses a fused-launch
+      // precondition: INT8 items, mismatched M, ...), and a gate arm that
+      // sets both flags and asserts the [xmx-gemm] wave announcement
+      // would go red for a reason that is precedence, not a wiring break.
+      // Correctness is unaffected: both kernels write the same compact
+      // out[m*Ni+n] layout into the same slots and the Phase 4 readback is
+      // shared, so the bytes are the same either way (XMX is a tolerance
+      // change, not a bit change -- see the XMX wave arm in
+      // scripts/test_tp2_27b.sh). This line names the precedence once per
+      // process so the interaction is greppable instead of silent.
+      static bool announced_wf_xmx = false;
+      if (!announced_wf_xmx && std::getenv("INTFER_XMX_GEMM")) {
+        announced_wf_xmx = true;
+        std::fprintf(stderr,
+                     "[wave-launch-fuse] fused wave took the EU/ALU "
+                     "wave kernel; per-item INTFER_XMX_GEMM dispatch "
+                     "skipped for this wave (n_items=%zu M=%u)\n",
+                     nl, M);
+        std::fflush(stderr);
+      }
+      return;
+    }
   }
 
   // Phase 1: per item — convert + write each device's wave slot.
@@ -2365,8 +2916,11 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
   // duplicates — bit-identical (same input bytes by construction), one
   // convert + one host-side staging copy saved per duplicate. Slots stay
   // per-item (kernels read their own slot); only the convert dedupes.
-  // Scope is this call only (local map — no cross-call staleness).
-  std::vector<std::uint16_t> shared_staging;
+  // Scope is this call only (the shared_valid flag — no cross-call
+  // staleness). The staging buffer is the PERSISTENT member
+  // wave_shared_staging_ (resized on grow): the local vector it replaced
+  // heap-allocated M*K halves (~1 MB on 27B prefill chunks, above glibc's
+  // mmap threshold) on every wave call that had a reused input.
   const float* shared_ptr = nullptr;
   size_t shared_need = 0;
   bool shared_valid = false;
@@ -2392,8 +2946,8 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
       ++act_staging_gen_;   // shared buffer: see run_linear_tp_devact
       dashq::float_to_half_batch(x.data(), act_staging_.data(), need);
       if (reused) {
-        if (shared_staging.size() != need) shared_staging.resize(need);
-        std::memcpy(shared_staging.data(), act_staging_.data(), need * sizeof(std::uint16_t));
+        if (wave_shared_staging_.size() != need) wave_shared_staging_.resize(need);
+        std::memcpy(wave_shared_staging_.data(), act_staging_.data(), need * sizeof(std::uint16_t));
         shared_ptr = x.data();
         shared_need = need;
         shared_valid = true;
@@ -2424,7 +2978,7 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
       auto t_w0 = std::chrono::high_resolution_clock::now();
 #endif
       for (size_t d = 0; d < devices_.size(); ++d)
-        std::memcpy(wv_[d * wv_W_ + i].act, shared_staging.data(),
+        std::memcpy(wv_[d * wv_W_ + i].act, wave_shared_staging_.data(),
                     (size_t)M * t.K * sizeof(std::uint16_t));
 #ifdef INTFER_PROFILE_GPU
       {
@@ -2437,6 +2991,33 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
   }
 
   // Phase 2: per device — submit all items' kernels back-to-back.
+  // *** INTFER_XMX_GEMM WAVE WIRING (2026-10-14). *** The same
+  // try-XMX-first-then-fallback dispatch run_linear_tp applies
+  // (engine.cpp:1444-1498), applied to the wave's per-item
+  // launch. Without this the XMX joint_matrix kernel was
+  // reachable ONLY through run_linear_tp (the down-projection and
+  // run_linear_batch callers) and never through the q/k/v/z/b/a/
+  // la_out wave -- the majority of layer-GEMM launches at prefill
+  // (chunk_M=128, so M%16==0 holds on every full chunk; the
+  // ragged tail chunk and every M<8 shape decline inside the
+  // kernel and fall back to the tiled kernel below, byte-
+  // identically). NOT bit-exact vs the tiled kernel: the DPAS
+  // accumulation order differs (the xmx_probe measured 1-7
+  // differing elements per shape at K>=128), so this is a
+  // TOLERANCE-CLASS flag like INTFER_ONEMKL -- the announcement
+  // is the reachability proof and a stream comparison against
+  // base is the CONTRACT, not a check. Declined attempts submit
+  // nothing (every decline path returns before q.submit), so the
+  // submit accounting below still counts exactly one launch per
+  // item.
+  const char* xmx_env = std::getenv("INTFER_XMX_GEMM");
+  static std::vector<std::uint32_t> xmx_tile_ctr;
+  static bool xmx_wave_announced = false;
+  if (xmx_env && xmx_tile_ctr.size() < devices_.size())
+    xmx_tile_ctr.resize(devices_.size(), 0);
+  const bool xmx_ts_env =
+      (xmx_env != nullptr) &&
+      (std::getenv("INTFER_XMX_TILE_SCHED") != nullptr);
   std::vector<sycl::event> kernel_events;
   kernel_events.reserve(devices_.size() * nl);
   for (size_t d = 0; d < devices_.size(); ++d) {
@@ -2452,16 +3033,65 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
 #ifdef INTFER_PROFILE_GPU
       auto t_s0 = std::chrono::high_resolution_clock::now();
 #endif
-      sycl::event kernel_evt = gemm::quant_gemm_forward_usm(q,
-                                    wv_[d * wv_W_ + i].act,
-                                    sc.code_usm[d],
-                                    sc.scale_usm[d],
-                                    alpha,
-                                    wv_[d * wv_W_ + i].out,
-                                    M, N_local, t.K,
-                                    sc.group_size,
-                                    sc.scheme,
-                                    sycl::event{});
+      sycl::event kernel_evt;
+      if (xmx_env) {
+        // Try the XMX joint_matrix kernel first. The shape gates
+        // (INT2/INT4 only, M>=8, M%16==0, N%16==0, K%32==0) are
+        // the kernel's own; a decline (xmx_ran == false) submits
+        // NOTHING and wrote nothing, so the fallback below is
+        // mandatory, not cosmetic -- pushing the null event would
+        // leave this item's wave slot unwritten.
+        const uint32_t gx = (M / 16);
+        const uint32_t gy = (N_local / 16);
+        const uint32_t n_tiles = gx * gy;
+        const uint32_t nWG = xmx_ts_env ? 16u : n_tiles;
+        xmx_tile_ctr[d] = 0;
+        bool xmx_ran = false;
+        kernel_evt = gemm::quant_gemm_forward_usm_xmx(
+            q, wv_[d * wv_W_ + i].act, sc.code_usm[d],
+            sc.scale_usm[d], alpha, wv_[d * wv_W_ + i].out,
+            M, N_local, t.K, sc.group_size, sc.scheme,
+            sycl::event{}, &xmx_ran, xmx_tile_ctr.data() + d);
+        if (!xmx_ran) {
+          kernel_evt = gemm::quant_gemm_forward_usm(q,
+                                        wv_[d * wv_W_ + i].act,
+                                        sc.code_usm[d],
+                                        sc.scale_usm[d],
+                                        alpha,
+                                        wv_[d * wv_W_ + i].out,
+                                        M, N_local, t.K,
+                                        sc.group_size,
+                                        sc.scheme,
+                                        sycl::event{});
+        }
+        // Announce once per process, ONLY when the kernel actually
+        // ran -- the same xmx_ran-gated polarity as run_linear_tp's
+        // announcement (engine.cpp:1487): a log where the kernel
+        // declined every tile must NOT print the line, or the gate
+        // arm's announcement-absent assertion is vacuous.
+        if (xmx_ran && !xmx_wave_announced) {
+          xmx_wave_announced = true;
+          std::fprintf(stderr,
+                       "[xmx-gemm] ACTIVE on eligible INT2/INT4 tiles "
+                       "(INTFER_XMX_GEMM=1)\n"
+                       "[xmx-tile-sched] %s n_tiles=%u nWG=%u "
+                       "(%s work-stealing)\n",
+                       xmx_ts_env ? "ACTIVE" : "OFF",
+                       n_tiles, nWG,
+                       xmx_ts_env ? "persistent" : "fixed-assignment");
+        }
+      } else {
+        kernel_evt = gemm::quant_gemm_forward_usm(q,
+                                      wv_[d * wv_W_ + i].act,
+                                      sc.code_usm[d],
+                                      sc.scale_usm[d],
+                                      alpha,
+                                      wv_[d * wv_W_ + i].out,
+                                      M, N_local, t.K,
+                                      sc.group_size,
+                                      sc.scheme,
+                                      sycl::event{});
+      }
 #ifdef INTFER_PROFILE_GPU
       {
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -2542,9 +3172,74 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
             g_gpu_profile.peak_wait_depth,
             g_gpu_profile.kernel_count, g_gpu_profile.wait_count,
             g_gpu_profile.copy_count, g_gpu_profile.readback_count,
-            g_gpu_profile.submit_count, g_gpu_profile.usm_write_count};
+            g_gpu_profile.submit_count, g_gpu_profile.usm_write_count,
+            g_gpu_profile.timeline_marker_count};
   }
   void reset_gpu_profile() { g_gpu_profile = GpuProfile{}; }
+  // ---- Device-timeline markers (INTFER_TIMELINE=1) ----
+  // GRIMOIRE's mark() pattern: submit a 1-work-item empty kernel and record
+  // its event. On an in-order queue the gap between marker i's end and
+  // marker i+1's start IS the device time of everything between them, with
+  // no per-launch instrumentation and no dependence on
+  // get_profiling_info<command_start/command_end> returning sane durations.
+  // This is the ONLY way to attribute wall-clock to a region on this box,
+  // where the driver records submit==start==end for real kernels while they
+  // still execute and write the sink (see AGENTS.md "The profiling defect").
+  //
+  // The marker itself is a submit + a wait on the NEXT marker, so it costs
+  // 1 submit + 1 wait per region. It is a DIAGNOSTIC, off by default, and
+  // must never be used as a decision input: it measures host wall-clock
+  // between two in-order points, which is load-sensitive. Decide on
+  // nk/nw/nr, never on a timeline figure.
+  namespace {
+    struct TimelineMarker { const char* tag; sycl::event ev; };
+    std::vector<TimelineMarker> g_timeline;
+    bool g_timeline_on = false;
+    bool g_timeline_init = false;
+  }
+  void timeline_mark(sycl::queue& q, const char* tag) {
+    if(!g_timeline_init){
+      g_timeline_init = true;
+      g_timeline_on = (std::getenv("INTFER_TIMELINE") != nullptr);
+      if(g_timeline_on) std::fprintf(stderr, "[timeline] device-timeline markers ON\n");
+    }
+    if(!g_timeline_on) return;
+    sycl::event ev = q.submit([&](sycl::handler& h){
+      h.parallel_for(sycl::range<1>(1), [](sycl::item<1>){});
+    });
+    g_timeline.push_back({tag, ev});
+    g_gpu_profile.timeline_marker_count++;
+  }
+  void timeline_dump(){
+    if(!g_timeline_on) return;
+    if(g_timeline.size() < 2) return;
+    // Drain every marker so the last one's end is known.
+    for(auto& m : g_timeline) m.ev.wait();
+    auto ns = [](const sycl::event& e){
+      return (long long)(e.get_profiling_info<sycl::info::event_profiling::command_end>()
+               - e.get_profiling_info<sycl::info::event_profiling::command_start>());
+    };
+    std::fprintf(stderr, "[timeline] %zu markers:\n", g_timeline.size());
+    for(size_t i = 0; i + 1 < g_timeline.size(); ++i){
+      long long gap = ns(g_timeline[i+1].ev) - ns(g_timeline[i].ev);
+      // The gap between marker i's END and marker i+1's START is the device
+      // time of the region between them. command_end of i minus
+      // command_start of i+1 is negative when the queue is busy; the
+      // region time is the complement. Both forms are reported: the
+      // in-order interpretation is that the queue was busy for the whole
+      // gap, so the region's device time is (start[i+1] - end[i]) when
+      // positive, i.e. the idle gap. The useful figure is the total busy
+      // span: end[i+1] - start[i].
+      long long start_i = (long long)g_timeline[i].ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+      long long end_i   = (long long)g_timeline[i].ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+      long long start_n = (long long)g_timeline[i+1].ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+      long long end_n   = (long long)g_timeline[i+1].ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+      std::fprintf(stderr, "[timeline]   %s -> %s: region=%lld ns (end[%s]=%lld start[%s]=%lld)\n",
+                   g_timeline[i].tag, g_timeline[i+1].tag,
+                   start_n - end_i, g_timeline[i].tag, end_i, g_timeline[i+1].tag, start_n);
+      (void)gap; (void)end_n; (void)start_i;
+    }
+  }
   namespace gemm {
   void profile_note_launch() { g_gpu_profile.kernel_count++; }
   }  // namespace gemm
@@ -2665,6 +3360,27 @@ bool Engine::ensure_shard_built(int tensor_index) {
   // cache would be dead host RAM (~9.4GB on 27B-sc) — skip populating it.
   const bool cacheable =
       (sc.scheme != gemm::WeightScheme::FP16) && !skip_host_cache_;
+  // *** INTFER_MLP_PARTIAL_DOWN: K-split full-N shard. *** Only the DOWN
+  // tensor needs it (the partial-sum gather requires full-N partials), and
+  // only when the flag is on, K splits evenly across devices, and the split
+  // lands on a group boundary. The shard is built per device: device d gets
+  // K-slice d (full N). It is INDEPENDENT of the column-split shard (which
+  // the default path still uses), so both coexist — ~2x the down weight
+  // memory while the flag is on (~100MB on 27B), acceptable for an opt-in.
+  // DPAS48 shards decline inside run_mlp_partial_down, so never build the
+  // ksplit shard for them (the repack layout would differ).
+  const bool ksplit_ok =
+      (std::getenv("INTFER_MLP_PARTIAL_DOWN") != nullptr) &&
+      (t.role == TensorRole::MLP_DOWN) &&
+      (devices_.size() == 2) &&
+      (t.K % devices_.size() == 0) &&
+      (t.qcfg.group_size == 0 || t.K % (t.qcfg.group_size * devices_.size()) == 0);
+  sc.ksplit = ksplit_ok;
+  sc.ksplit_K = sc.ksplit ? (t.K / devices_.size()) : 0;
+  if (sc.ksplit) {
+    sc.ksplit_code_usm.resize(devices_.size());
+    sc.ksplit_scale_usm.resize(devices_.size());
+  }
 
   for (size_t d = 0; d < devices_.size(); ++d) {
     auto& dev = devices_[d];
@@ -2776,6 +3492,44 @@ bool Engine::ensure_shard_built(int tensor_index) {
 
     // NOTE: no per-shard act/out — run_linear_tp writes into the shared
     // per-device workspaces (ensure_workspace, grow-only).
+    //
+    // *** INTFER_MLP_PARTIAL_DOWN: K-split shard build. *** Device d's shard
+    // covers full N (start=0, end=t.N) x K-slice [d*ksplit_K, (d+1)*ksplit_K)
+    // -- the strided pack shard_weight(..., k_off=d*ksplit_K, k_len=ksplit_K)
+    // now emits row-major codes + per-(row,group) scales for that slice. The
+    // host cache is retained across evict+rebuild exactly like the
+    // column-split shard. This is a DIFFERENT layout from code_usm[d], so it
+    // needs its own host cache vectors (ksplit_code_host/scale_host).
+    if (sc.ksplit) {
+      const uint32_t k_off = sc.ksplit_K * (uint32_t)d;
+      gemm::GemmWeightBuffers wk =
+          shard_weight(model_, t, 0, t.N, q, k_off, sc.ksplit_K);
+      const size_t code_bytes_k = wk.code_store.size();
+      const size_t scale_bytes_k = wk.scale_store.size() * sizeof(uint16_t);
+      if (!cacheable) {
+        sc.ksplit_code_usm[d] =
+            static_cast<std::uint8_t*>(pool_acquire(d, code_bytes_k));
+        sc.ksplit_scale_usm[d] =
+            static_cast<std::uint16_t*>(pool_acquire(d, scale_bytes_k));
+        shard_fill(q, sc.ksplit_code_usm[d], wk.code_store.data(), code_bytes_k);
+        shard_fill(q, sc.ksplit_scale_usm[d], wk.scale_store.data(), scale_bytes_k);
+      } else {
+        if (sc.ksplit_code_host.size() != devices_.size()) {
+          sc.ksplit_code_host.resize(devices_.size());
+          sc.ksplit_scale_host.resize(devices_.size());
+        }
+        sc.ksplit_code_host[d] = wk.code_store;
+        sc.ksplit_scale_host[d] = wk.scale_store;
+        sc.ksplit_code_usm[d] =
+            static_cast<std::uint8_t*>(pool_acquire(d, code_bytes_k));
+        sc.ksplit_scale_usm[d] =
+            static_cast<std::uint16_t*>(pool_acquire(d, scale_bytes_k));
+        shard_fill(q, sc.ksplit_code_usm[d],
+                 sc.ksplit_code_host[d].data(), code_bytes_k);
+        shard_fill(q, sc.ksplit_scale_usm[d],
+                 sc.ksplit_scale_host[d].data(), scale_bytes_k);
+      }
+    }
   }
   if (cacheable) sc.has_host_cache = true;
 #ifdef INTFER_PROFILE_GPU
@@ -2787,6 +3541,251 @@ bool Engine::ensure_shard_built(int tensor_index) {
 #endif
   return true;
 }
+
+// *** INTFER_MLP_PARTIAL_DOWN (2026-10-14). ***
+// TP=2 MLP down-projection as a partial-sum gather, behind the default-OFF
+// presence-spelled INTFER_MLP_PARTIAL_DOWN. Device d keeps its gate/up
+// outputs ON DEVICE (wv_ slots 1/2), fuses silu(gate)*up via the existing
+// silumul_to_half into a per-device M*inter FP16 buffer, then runs the down
+// GEMM over its K-sliced FULL-N shard (N=td.N, K=td.K/devices_.size()),
+// writing an FP16 partial. The host waits once and sums the two partials in
+// FP32 into md. Removes the full-inter D2H + the host silu loop + the full
+// inter H2D + the separate down GEMM round trips that the default TP=2 path
+// pays; adds 1 silumul launch + 1 partial-down launch + 1 wait/device vs the
+// default's 2. NOT bit-exact (two FP16 partials summed in FP32 vs the tiled
+// kernel's single FP32-accumulate-then-FP16-store) -> tolerance contract,
+// never stream identity. Returns false (caller keeps the host gateup path) on
+// the flag unset, TP!=2, DPAS48 shards, bad shapes, or K not splittable into
+// a group-aligned K-slice.
+bool Engine::run_mlp_partial_down(int gate_ti, int up_ti, int down_ti,
+                                  const std::vector<float>& rin,
+                                  std::vector<float>& md, uint32_t M) {
+  if (devices_.size() != 2) return false;
+  if (!std::getenv("INTFER_MLP_PARTIAL_DOWN")) return false;
+  if (M == 0) M = 1;
+  for (int ti : {gate_ti, up_ti, down_ti}) {
+    if (ti < 0 || (size_t)ti >= model_.tensors.size()) return false;
+    if (!shard_cache_[(size_t)ti].built && !ensure_shard_built(ti))
+      return false;
+    if (shard_cache_[(size_t)ti].dpas48) return false;
+  }
+  const auto& tg = model_.tensors[(size_t)gate_ti];
+  const auto& tu = model_.tensors[(size_t)up_ti];
+  const auto& td = model_.tensors[(size_t)down_ti];
+  const auto& scg = shard_cache_[(size_t)gate_ti];
+  const auto& scu = shard_cache_[(size_t)up_ti];
+  const auto& scd = shard_cache_[(size_t)down_ti];
+  const uint32_t inter = tg.N;
+  if (tu.N != inter || tu.K != tg.K) return false;
+  if (td.K != inter) return false;
+  // Only INT2+INT2 gate/up are supported (the fused gateup kernel has no
+  // other body); the down tensor must also be INT2 for the ksplit shard to
+  // match the scheme.
+  if (tg.qcfg.scheme != QuantScheme::INT2) return false;
+  if (scg.code_usm.size() != 2 || scu.code_usm.size() != 2) return false;
+  if (!scd.ksplit || scd.ksplit_code_usm.size() != 2) return false;
+  for (size_t d = 0; d < 2; ++d) {
+    if (!scg.code_usm[d] || !scg.scale_usm[d] ||
+        !scu.code_usm[d] || !scu.scale_usm[d]) return false;
+    if (!scd.ksplit_code_usm[d] || !scd.ksplit_scale_usm[d]) return false;
+  }
+  if (rin.size() != (size_t)M * tg.K) return false;
+  if (md.size() != (size_t)M * td.N) md.resize((size_t)M * td.N);
+  // Zero md for the FP32 partial sum.
+  for (size_t i = 0; i < (size_t)M * td.N; ++i) md[i] = 0.0f;
+
+  // Shared FP32->FP16 staging for the gate/up input.
+  const size_t need = (size_t)M * tg.K;
+  if (act_staging_.size() != need) act_staging_.resize(need);
+  ++act_staging_gen_;
+  dashq::float_to_half_batch(rin.data(), act_staging_.data(), need);
+
+  // Wave workspace: slot 0 = shared act, slot 1 = gate out (compact M*Nl_g),
+  // slot 2 = up out (compact M*Nl_u). Nl_g/Nl_u <= inter, and we need M*inter
+  // for silumul output. The down workspace ws_ is sized for M x td.K (=inter)
+  // act and M x td.N out.
+  ensure_wave_workspace(M, 3, tg.K, std::max(tg.N, tu.N));
+  ensure_workspace(M, td.K, td.N);
+
+  const float ag = scg.has_global_divisor ? scg.global_host : 1.0f;
+  const float au = scu.has_global_divisor ? scu.global_host : 1.0f;
+  const float ad = scd.has_global_divisor ? scd.global_host : 1.0f;
+
+  std::vector<sycl::event> all_events;
+  all_events.reserve(6);
+
+  for (size_t d = 0; d < 2; ++d) {
+    auto& dev = devices_[d];
+    sycl::queue& q = dev.queue;
+    std::uint16_t* act_ptr = wv_[d * wv_W_ + 0].act;
+
+    // Upload shared activation to device d (slot 0).
+#ifdef INTFER_PROFILE_GPU
+    auto t_w0 = std::chrono::high_resolution_clock::now();
+#endif
+    std::memcpy(act_ptr, act_staging_.data(), need * sizeof(std::uint16_t));
+#ifdef INTFER_PROFILE_GPU
+    {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      g_gpu_profile.total_usm_write_us +=
+          std::chrono::duration<double, std::micro>(t1 - t_w0).count();
+      g_gpu_profile.usm_write_count += 1;
+    }
+#endif
+
+    const uint32_t Nl_g = static_cast<uint32_t>(
+        shards_[gate_ti].ranges[d].second - shards_[gate_ti].ranges[d].first);
+    const uint32_t Nl_u = static_cast<uint32_t>(
+        shards_[up_ti].ranges[d].second - shards_[up_ti].ranges[d].first);
+    const uint32_t start_g = shards_[gate_ti].ranges[d].first;
+    const uint32_t start_u = shards_[up_ti].ranges[d].first;
+
+    // *** Phase 1+2 (INTFER_MLP_GATEUP_SILUMUL_FUSE, default OFF). ***
+    //
+    // FUSE SET: ONE launch computes gate+up AND silu(gate)*up, writing the
+    // compact [M*(Nl_g+Nl_u)] FP16 activation straight into ws_[d].act.
+    // The separate gateup launch below must NOT also run -- the fused
+    // kernel re-computes the same dot products into the same slots, so
+    // running both would DOUBLE the gate+up GEMM work per device while
+    // writing identical bytes. (Found 2026-10-14: the original wiring ran
+    // Phase 1 unconditionally and Phase 2's fused kernel on top, so the
+    // "fusion" ADDED a launch instead of replacing one -- the exact
+    // vacuous-gate shape the audit log warns about. The announcement
+    // fired, the launch count went UP, and nothing in the gate arm could
+    // see it because the stream was still correct.)
+    //
+    // FUSE UNSET: the two-launch chain -- compact gate+up GEMM into
+    // slots 1/2, then silumul_to_half chained off its event into
+    // ws_[d].act. Bit-exact in both branches: the fused kernel's
+    // accumulators, kg/j element order and wtab are the compact gateup
+    // kernel's, and the silu-mul epilogue is silumul_to_half's FP32 order
+    // and RNE FP16 store.
+    sycl::event e_silu;
+    if (std::getenv("INTFER_MLP_GATEUP_SILUMUL_FUSE")) {
+      e_silu = gemm::quant_gemm_forward_usm_gateup_compact_silumul(
+          q, act_ptr,
+          scg.code_usm[d], scg.scale_usm[d], ag,
+          wv_[d * wv_W_ + 1].out,
+          scu.code_usm[d], scu.scale_usm[d], au,
+          wv_[d * wv_W_ + 2].out,
+          M, tg.N, tu.N, tg.K, scg.group_size,
+          start_g, Nl_g, start_u, Nl_u,
+          scg.scheme, scu.scheme,
+          sycl::event{},
+          ws_[d].act);
+      all_events.push_back(e_silu);
+    } else {
+      sycl::event e_gu = gemm::quant_gemm_forward_usm_gateup_compact(
+          q, act_ptr,
+          scg.code_usm[d], scg.scale_usm[d], ag,
+          wv_[d * wv_W_ + 1].out,
+          scu.code_usm[d], scu.scale_usm[d], au,
+          wv_[d * wv_W_ + 2].out,
+          M, tg.N, tu.N, tg.K, scg.group_size,
+          start_g, Nl_g, start_u, Nl_u,
+          scg.scheme, scu.scheme,
+          sycl::event{});
+      all_events.push_back(e_gu);
+#ifdef INTFER_PROFILE_GPU
+      g_gpu_profile.submit_count += 1;
+#endif
+      gemm::SiluMulParams sp;
+      sp.mg_fp16 = wv_[d * wv_W_ + 1].out;
+      sp.mu_fp16 = wv_[d * wv_W_ + 2].out;
+      sp.act_fp16 = ws_[d].act;
+      sp.n = M * inter;
+      e_silu = gemm::silumul_to_half(q, sp, e_gu);
+      all_events.push_back(e_silu);
+    }
+#ifdef INTFER_PROFILE_GPU
+    // Launch counting: the non-FUSE branch's gateup launch adds its own
+    // submit_count above (the gateup kernel submits explicitly, so the
+    // post-wait profiling loop would miss it); the FUSE branch's single
+    // launch is counted in the post-wait loop below like every other
+    // event-pushed launch. Neither branch double-counts.
+#endif
+
+    // Phase 3: partial down GEMM over K-slice (ws_[d].act -> ws_[d].out).
+    sycl::event e_down = gemm::quant_gemm_forward_usm(
+        q, ws_[d].act,
+        scd.ksplit_code_usm[d], scd.ksplit_scale_usm[d], ad,
+        ws_[d].out,
+        M, td.N, scd.ksplit_K, scd.group_size, scd.scheme,
+        e_silu);
+    all_events.push_back(e_down);
+#ifdef INTFER_PROFILE_GPU
+    g_gpu_profile.submit_count += 1;
+#endif
+  }
+
+  // Wait for all device chains.
+  for (auto& e : all_events) e.wait();
+#ifdef INTFER_PROFILE_GPU
+  for (auto& e : all_events) {
+    try {
+      auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
+      auto t1 = e.get_profiling_info<sycl::info::event_profiling::command_end>();
+      g_gpu_profile.total_kernel_us += (double)(t1 - t0) / 1000.0;
+      g_gpu_profile.kernel_count++;
+    } catch (...) {}
+  }
+  g_gpu_profile.wait_count += all_events.size();
+#endif
+
+  // Host FP32 partial sum: md += partial_0 + partial_1.
+  // NOTE: there is NO D2H transfer here. ws_[d].out is USM (malloc_shared),
+  // so the host reads the partials straight from device memory -- this is
+  // half of the win (the default path's full-inter D2H is gone). The loop is
+  // host-side FP16->FP32, not a device transfer, so it is NOT counted as a
+  // readback (readback_count counts D2H transfers, and there are none here).
+  // It is load-sensitive and is deliberately not bucketed into any host
+  // accumulator -- the counters that matter are nk/nw/nr and the submit
+  // buckets, which are device-driven.
+  //
+  // *** BATCHED, NOT SCALAR (2026-10-15). *** The original loop called
+  // dashq::half_to_float once per element -- the last scalar conversion site
+  // in the tree (every default readback at engine.cpp:1346/1632/1788/2231/
+  // 2254/2372/2513/2934 uses half_to_float_batch). half_to_float_batch takes
+  // the F16C path (_mm256_cvtph_ps, 8 lanes) when available; FP16->FP32 is an
+  // EXACT conversion, so the FP32 bytes are identical to the scalar twiddle's
+  // and the md values are bit-for-bit what the scalar loop produced. The
+  // +0.0f seed above is KEPT rather than fused into d==0's store: +0.0f +
+  // (-0.0f) is +0.0f while a direct seed would propagate -0.0f, and the seed
+  // costs one FP32 pass against a gather that converts 2*M*td.N halves.
+  if (pd_gather_.size() < (size_t)M * td.N) pd_gather_.resize((size_t)M * td.N);
+  for (size_t d = 0; d < 2; ++d) {
+    dashq::half_to_float_batch(ws_[d].out, pd_gather_.data(),
+                               (size_t)M * td.N);
+    const float* part = pd_gather_.data();
+    for (size_t i = 0; i < (size_t)M * td.N; ++i) md[i] += part[i];
+  }
+
+  // Once-per-process announcement.
+  static bool announced_pd = false;
+  if (!announced_pd) {
+    announced_pd = true;
+    const uint32_t Nl_g_ann =
+        shards_[gate_ti].ranges[0].second - shards_[gate_ti].ranges[0].first;
+    const uint32_t Nl_u_ann =
+        shards_[up_ti].ranges[0].second - shards_[up_ti].ranges[0].first;
+    std::fprintf(stderr,
+                 "[mlp-partial-down] ACTIVE (INTFER_MLP_PARTIAL_DOWN=1, "
+                 "Ng=%u Nu=%u inter=%u K=%u group=%u scheme=%d, "
+                 "two FP16 partials per device -> host FP32 sum)\n",
+                 tg.N, tu.N, inter, tg.K, scg.group_size,
+                 (int)scg.scheme);
+    if (std::getenv("INTFER_MLP_GATEUP_SILUMUL_FUSE")) {
+      std::fprintf(stderr,
+                   "[mlp-gateup-silumul-fuse] ACTIVE (INTFER_MLP_GATEUP_SILUMUL_FUSE=1, "
+                   "Ng=%u Nu=%u Nl_g=%u Nl_u=%u K=%u group=%u): gate+up GEMM and "
+                   "silu(gate)*up epilogue in ONE launch per device\n",
+                   tg.N, tu.N, Nl_g_ann, Nl_u_ann, tg.K, scg.group_size);
+    }
+    std::fflush(stderr);
+  }
+  return true;
+}
+
 
 bool Engine::load_language_weights(const std::string& safetensors_path) {
   SafetensorsReader r;

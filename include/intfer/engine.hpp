@@ -139,7 +139,27 @@ class Engine {
   bool run_mlp_gateup(int gate_ti, int up_ti,
                       const std::vector<float>& rin,
                       std::vector<float>& mg, std::vector<float>& mu,
-                      uint32_t M);
+                      uint32_t M, bool readback = true,
+                       std::vector<sycl::event>* chain_out = nullptr);
+
+  // *** INTFER_MLP_PARTIAL_DOWN (2026-10-14). ***
+  // TP=2 MLP down-projection as a partial-sum gather, behind the default-OFF
+  // presence-spelled INTFER_MLP_PARTIAL_DOWN. Device d keeps its gate/up
+  // outputs ON DEVICE (wv_ slots 1/2), fuses silu(gate)*up via the existing
+  // silumul_to_half into a per-device M*inter FP16 buffer, then runs the down
+  // GEMM over its K-sliced FULL-N shard (N=td.N, K=td.K/devices_.size()),
+  // writing an FP16 partial. The host waits once and sums the two partials in
+  // FP32 into md. Removes the full-inter D2H + the host silu loop + the full
+  // inter H2D + the separate down GEMM round trips that the default TP=2 path
+  // pays; adds 1 silumul launch + 1 partial-down launch + 1 wait/device vs the
+  // default's 2. NOT bit-exact (two FP16 partials summed in FP32 vs the tiled
+  // kernel's single FP32-accumulate-then-FP16-store) -> tolerance contract,
+  // never stream identity. Returns false (caller keeps the host gateup path) on
+  // the flag unset, TP!=2, DPAS48 shards, bad shapes, or K not splittable into
+  // a group-aligned K-slice.
+  bool run_mlp_partial_down(int gate_ti, int up_ti, int down_ti,
+                            const std::vector<float>& rin,
+                            std::vector<float>& md, uint32_t M);
 
   // Device-act GEMM seam (L4 la_out fusion): run tensor ti reading M*K FP16
   // activation bits from a caller-owned device buffer (no host convert, no
@@ -153,7 +173,35 @@ class Engine {
   bool run_linear_tp_devact(int tensor_index, const std::uint16_t* dev_act,
                             std::vector<float>& out, uint32_t M,
                             const sycl::event& dep = {});
-  
+
+  // Pre-flight for run_linear_tp_devact_tp2: every STATIC precondition the
+  // seam can check without touching device state. The TP=2 la_out fusion
+  // calls this BEFORE submitting the SSM chain kernel, because the chain
+  // advances the recurrent state in place and a decline after that would
+  // corrupt it (the fusion would have to re-run the recurrence to produce
+  // c_ncore for the host path). This is the shipped "eligibility predicate
+  // consulted before the launch" pattern (run_linear_tp_dpas48 at
+  // engine.cpp:1270) -- the kernel re-checks the same facts, so this is
+  // defence in depth, not the thing being certified.
+  bool la_out_tp2_eligible(int tensor_index, uint32_t M, size_t out_elems) const;
+
+  // TP=2 twin of run_linear_tp_devact (INTFER_LA_OUT_TP2). Same device-act
+  // contract (caller-owned FP16 activation per device, no host convert, no
+  // H2D, dep-chained after the producer kernel) but every rank runs its OWN
+  // N-slice: dev_act[d] is device d's copy of the M*K FP16 act, ws_[d].out is
+  // device d's workspace, and the readback scatters each rank back into
+  // out.data() + m*t.N + start by ranges[d] -- byte-identical to the
+  // run_linear_tp tail, so the only difference from the host path is WHERE
+  // the activation bits came from. Requires the tensor to be column-sharded
+  // across exactly 2 ranks; every other shape returns false so the caller
+  // keeps its host path. No P2P is needed or assumed: the caller is
+  // responsible for placing the act bytes in each device's context (the
+  // same contract run_mlp_gateup documents -- distinct USM per rank).
+  bool run_linear_tp_devact_tp2(int tensor_index,
+                                const std::uint16_t* const* dev_act,
+                                std::vector<float>& out, uint32_t M,
+                                const sycl::event& dep = {});
+
   // FP16 x FP16 GEMM for non-quantized final heads (lm_head/embed).
   // C[1,N] = x[1,K] * W[N,K]^T. All row-major. Outputs FP32 logits.
   void run_linear_f16_tp(const sycl::half* x, const sycl::half* w,
@@ -282,6 +330,35 @@ class Engine {
     bool use_dpas = true;  // TODO 6: enable XMX DPAS path when eligible
     uint32_t N_local = 0;   // N rows on this device (post-shard)
     uint32_t K = 0;
+    // *** INTFER_MLP_PARTIAL_DOWN (2026-10-14): K-split full-N shard. ***
+    // The down-projection at TP=2 cannot fuse the way run_mlp_fused (TP=1)
+    // does: gate/up are column-parallel, so device d owns only its slice of
+    // the inter, while down has K = the FULL inter and therefore needs the
+    // other device's half too. There is no P2P on this box (grep returns
+    // nothing), so the intermediate must cross the host -- that is the
+    // structural limit recorded in AGENTS.md, and it is real.
+    //
+    // The workaround is to split the OTHER dimension. Instead of device d
+    // owning rows [H*d/2, H*(d+1)/2) x full K (the column-split shard), give
+    // it the full N (5120 rows) x a K-slice (8704 cols) shard: device d
+    // computes partial_d[n] = sum_{k in K-slice d} W[n,k]*act[k] for ALL n,
+    // and the host sums partial_0 + partial_1 in FP32. Same total bytes as
+    // the column-split shard (5120*8704 == 2560*17408), g16-aligned on the
+    // 27B (K/2 = 8704 = 544 groups of 16), so scales/codes pack exactly as
+    // shard_weight already does. The shard is built by a STRIDED pack from
+    // the model tensor (shard_weight's k_off parameter) -- NOT by slicing the
+    // column-split shard, which would be rows [2560d,2560(d+1)) x K-slice d
+    // and would never compute the cross terms device 0's n-range needs.
+    //
+    // ksplit_code_usm[d] holds K-slice d's shard ON device d (USM is
+    // per-device; device d reads its own K-slice from its own buffer). The
+    // host cache ksplit_code_host[d] is the strided payload for K-slice d.
+    bool ksplit = false;
+    uint32_t ksplit_K = 0;             // K per ksplit shard (= t.K / n_devices)
+    std::vector<std::uint8_t*>  ksplit_code_usm;   // [device]
+    std::vector<std::uint16_t*> ksplit_scale_usm;  // [device]
+    std::vector<std::vector<std::uint8_t>>  ksplit_code_host;   // [device]
+    std::vector<std::vector<std::uint16_t>> ksplit_scale_host;  // [device]
     // Per-device persistent USM pointers (size = devices_.size()).
     std::vector<std::uint8_t*>  code_usm;   // packed codes (FP16: 2*N*K bytes; INT*: packed)
     std::vector<std::uint16_t*> scale_usm;  // FP16 scale broadcast, N_local*n_groups
@@ -325,6 +402,23 @@ class Engine {
   // Reusable FP16 activation staging for run_linear_tp (M*K). Resized only
   // when the shape grows: steady-state zero mallocs per GEMM call.
   std::vector<std::uint16_t> act_staging_;
+  // Reusable FP32 staging for run_mlp_partial_down's host partial-sum gather
+  // (M*td.N). The gather converts each device's FP16 partial with
+  // half_to_float_batch (the DEFAULT readback path's converter, engine.cpp
+  // :1346 etc. — F16C cvtph is exact, so the bytes are identical to the
+  // scalar per-element form it replaced, which was the last scalar
+  // half_to_float site in the tree). Resized only when the shape grows:
+  // steady-state zero mallocs per MLP call.
+  std::vector<float> pd_gather_;
+  // Reusable staging that preserves ONE (pointer, bytes) input pair across
+  // run_linear_wave's Phase-1 dedup. The local it replaces was a fresh
+  // std::vector per call, so every wave call with a reused input paid a
+  // heap malloc of M*K halves (~1 MB on 27B prefill chunks — above glibc's
+  // mmap threshold, so mmap+munmap plus first-touch page faults on every
+  // call). Resized only when the shape grows. Staleness: content is read
+  // only under `dup`, and `shared_valid` is false at every call start, so
+  // a previous call's bytes can never be admitted as a dup.
+  std::vector<std::uint16_t> wave_shared_staging_;
   // INTFER_FUSE_ACT (default OFF). Identity of the FP16 activation currently
   // sitting in ws_[d].act for EVERY device: the host vector pointer it was
   // converted from, plus the shape it was converted for.
@@ -461,6 +555,14 @@ class Engine {
 
 #ifdef INTFER_PROFILE_GPU
 // GPU profiling helpers (enabled via -DINTFER_PROFILE_GPU).
+// Device-timeline marker API (INTFER_TIMELINE=1): submit a 1-work-item
+// empty kernel on `q` and record its event, so the gap between consecutive
+// markers measures the device time of the region between them without
+// trusting per-event timestamps. See engine.cpp:timeline_mark.
+namespace intfer {
+  void timeline_mark(sycl::queue& q, const char* tag);
+  void timeline_dump();
+}
 struct GpuProfileSnapshot {
   // Aggregate accumulated times (host-side chrono + device timestamps where available).
   double kernel_us;
@@ -482,6 +584,16 @@ struct GpuProfileSnapshot {
   // the wave path emits one usm_write + one submit + one readback PER
   // GEMM, the fused path emits them once for both.
   uint64_t submit_count, usm_write_count;
+  // Device-timeline markers (INTFER_TIMELINE=1): a 1-work-item empty kernel
+  // per region. On an in-order queue the gap between marker i's end and
+  // marker i+1's start IS the device time of everything between them, with
+  // no per-launch instrumentation and no dependence on
+  // get_profiling_info<command_start/command_end> returning sane durations.
+  // This exists because the driver records submit==start==end for real
+  // kernels on this box (see AGENTS.md "The profiling defect"), so the
+  // per-event kernel bucket is unmeasurable and the only way to attribute
+  // wall-clock to a region is a marker pair. See engine.cpp:timeline_mark.
+  uint64_t timeline_marker_count;
 };
 namespace intfer {
   GpuProfileSnapshot get_gpu_profile();
