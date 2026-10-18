@@ -48,6 +48,14 @@ endif()
 
 add_library(intfer_onemkl STATIC ${CMAKE_CURRENT_SOURCE_DIR}/gemm_onemkl.cpp)
 target_include_directories(intfer_onemkl PUBLIC ${CMAKE_SOURCE_DIR}/include)
+# add_sycl_to_target is called UNCONDITIONALLY, not just under
+# INTFER_ENABLE_MKL: gemm_onemkl.cpp #includes "intfer/gemm/quant_gemm.hpp"
+# (line 23, OUTSIDE the #ifdef) and that header #includes <sycl/sycl.hpp>, so
+# the TU needs the SYCL include path in BOTH branches. It used to live inside
+# the #ifdef, so with the default OFF build the compile line carried only the
+# project include and failed: 'fatal error: sycl/sycl.hpp file not found'.
+# The MKL-specific header dir is added on top of this inside the #ifdef below.
+add_sycl_to_target(TARGET intfer_onemkl SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/gemm_onemkl.cpp)
 if(INTFER_ENABLE_MKL)
   target_compile_definitions(intfer_onemkl PUBLIC INTFER_ENABLE_MKL=1)
 
@@ -93,18 +101,13 @@ if(INTFER_ENABLE_MKL)
   # per-box -DCMAKE_CXX_FLAGS hand-edit.
 get_filename_component(_MKL_PREFIX "${_MKL_LIB_DIR}" DIRECTORY)
   message(STATUS "onemkl: wrapper=${MKL_SYCL_BLAS} _MKL_PREFIX=${_MKL_PREFIX}")
-  # NOTE: the oneMKL include dir is NOT applied with target_include_directories
-  # here. add_sycl_to_target() (called below) runs
-  # set_source_files_properties(${source} PROPERTIES INCLUDE_DIRECTORIES
-  # "${__sycl_cxx_include_directories}") for every source it is given, and a
-  # per-source INCLUDE_DIRECTORIES property OVERRIDES the target's for that
-  # file. So anything set before that call is silently dropped from the flags
-  # that actually reach the compiler -- observed live: the configure message
-  # said "ADDING include dir" and the generated flags.make still carried only
-  # the project include, so gemm_onemkl.cpp failed to find
-  # <oneapi/mkl/blas.hpp>. The union goes on the source property AFTER the
-  # macro call, which is what the compile line consumes.
-  add_sycl_to_target(TARGET intfer_onemkl SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/gemm_onemkl.cpp)
+# NOTE: add_sycl_to_target() was moved OUT of this #ifdef (to the target's
+  # definition, above) -- gemm_onemkl.cpp #includes "intfer/gemm/quant_gemm.hpp"
+  # outside the #ifdef and that header pulls <sycl/sycl.hpp>, so the SYCL
+  # include path is needed in BOTH branches. The MKL-specific header dir is
+  # added on top of it inside this #ifdef, below.
+  # The union goes on the source property AFTER the macro call, which is what
+  # the compile line consumes.
 
   # *** DERIVE THE MKL HEADER DIR FROM THE LIBRARY, DO NOT GUESS IT. ***
   # gemm_onemkl.cpp's real body #includes <oneapi/mkl/blas.hpp>, which lives

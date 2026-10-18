@@ -55,9 +55,34 @@ sycl::event gemm_onemkl_fp16(sycl::queue& q, sycl::half* C,
   // Row-major C[M,N] = A[M,K] * B[K,N]^T. oneMKL's SYCL BLAS is COLUMN-major,
   // so this row-major product is computed as its own transpose:
   //   C^T[N,M] = (A*B^T)^T = B * A^T
-  // i.e. in MKL terms, gemm(nontrans, trans, M=N, N=M, K, ...) over B (=W,
-  // [N,K] row-major) and A (=x, [M,K] row-major), which is the same
-  // transposition llama.cpp uses for its SYCL BLAS fallback.
+  // i.e. in MKL terms, gemm(m=N, n=M, k=K) over B (=W, [N,K] row-major) and
+  // A (=x, [M,K] row-major).
+  //
+  // *** THE TRANSPOSE FLAGS, AND WHY THE OBVIOUS SPELLING IS WRONG. ***
+  // MEASURED 2026-10-15 by examples/onemkl_probe (M8-N128-K128), never before
+  // because the gate's gate_require_build built into $ROOT/build while it ran
+  // the binary from $GATE_BUILD_DIR -- so the probe it ran was the MKL-OFF one
+  // and every arm exited SKIP. The shipped spelling was
+  //   gemm(nontrans, trans, N, M, K, alpha, B, K, A, K, beta, C, N)
+  // and it computed a DIFFERENT product: max_rel 64.6, 1023/1024 elements
+  // differing from the host reference, worst at m=0 n=5.
+  //
+  // A row-major [R, Lc] buffer IS its own column-major transpose [Lc, R] when
+  // read with leading dimension Lc: element (i, j) sits at buf[j*Lc + i]. For
+  // the weight buffer W (=B, row-major [N, K]) that buffer is a column-major
+  // [K, N] matrix holding W^T, so it can serve MKL's `a` when MKL wants
+  // op(a) == W, i.e. when transa=T and a is declared k x m (K x N). Likewise
+  // the activation A (row-major [M, K]) read as column-major [K, M] holds
+  // A^T, so it serves MKL's `b` when transb=N and b is declared k x n (K x M).
+  // The product is then W (N x K) * A^T (K x M) = C^T (N x M), stored with
+  // ldc=N into the row-major C[M, N] buffer -- element (i, j) at C[j*N + i].
+  //
+  // With the flags the other way round (nontrans, trans) MKL reads
+  // op(a) as the N x K matrix W^T and op(b) -- declared with ldb=K, which for
+  // transb=T MKL reads as an n x k = M x K column-major buffer, i.e. only
+  // M rows -- so the K index runs off the end of the activation buffer and the
+  // arithmetic is a different product entirely. The ld arguments themselves are
+  // unchanged; only the two flags were swapped.
   //
   // *** THE PATH ANNOUNCES ITSELF, ONCE. *** This arm is NOT bit-exact by
   // construction, so a stream comparison is not just a vacuity risk -- it is
@@ -75,8 +100,11 @@ sycl::event gemm_onemkl_fp16(sycl::queue& q, sycl::half* C,
                  (unsigned long long)K);
     std::fflush(stderr);
   }
-  oneapi::mkl::blas::gemm(q, oneapi::mkl::transpose::nontrans,
-                          oneapi::mkl::transpose::trans, N, M, K,
+  // transa=T, transb=N -- see the transpose derivation above. The WRONG
+  // (nontrans, trans) spelling this replaces is recorded there with its
+  // measured effect.
+  oneapi::mkl::blas::gemm(q, oneapi::mkl::transpose::trans,
+                          oneapi::mkl::transpose::nontrans, N, M, K,
                           alpha, B, K, A, K, beta,
                           reinterpret_cast<sycl::half*>(C), N);
   return sycl::event{};

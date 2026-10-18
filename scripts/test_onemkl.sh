@@ -4,10 +4,21 @@
 # INTFER_ONEMKL=1 routes quant_gemm_f16 (M >= 8) through oneMKL SYCL BLAS.
 # That arm is NOT bit-exact -- oneMKL's FP32 accumulation order is its own --
 # so this gate compares against a host FP32 reference under an AGREED
-# tolerance, and asserts the `[onemkl] ... ACTIVE` announcement that makes the
-# run's having reached the branch observable. Without the announcement a flag
-# that never reached the kernel would pass a tolerance comparison just as
-# easily as one that did.
+# tolerance.
+#
+# *** WHERE THE ANNOUNCEMENT ASSERTION ACTUALLY LIVES (the header claim was
+# wrong, and rule 5 of the audit log is "a guard whose stated rationale does
+# not apply is worse than none"). *** This gate does NOT grep for
+# `[onemkl] ... ACTIVE` -- it relays the probe's rc. The assertion that makes
+# the run's having reached the branch observable lives in the PROBE:
+# `examples/onemkl_probe/main.cpp:363-374` (M=1 arm: `ann` true => FAIL) and
+# `381-433` (M>=8 arms: `ever_announced` false => FAIL), both of which
+# return non-zero, so a flag that never reached the kernel fails the gate's
+# rc relay just as loudly as a grep would. The gate's own contributions are the
+# lld wiring check (88-100) and the timeout-as-SKIP (120-127). Recording this
+# here rather than adding a grep that duplicates the probe's assertion: two
+# assertions on one line is the "the checker duplicates the thing it checks"
+# shape, and the probe's return code already carries the verdict.
 #
 # The probe also carries the M=1 negative direction (--m1): the arm must
 # DECLINE at M=1, where FP16 already runs at 98-123% of the memory roofline
@@ -34,7 +45,7 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
-GATE_BUILD_DIR="${INTFER_ONEMKL_BUILD_DIR:-$ROOT/build/onemkl_gate}"
+GATE_BUILD_DIR="${INTFER_ONEMKL_BUILD_DIR:-$BUILD_DIR/onemkl_gate}"
 
 # ---- 1. Is the MKL option even available on this box? ----
 # NAMED BY THIS GATE. The census (check_flag_gate_coverage.sh) harvests the
@@ -60,7 +71,7 @@ fi
 # cannot produce a PASS from a binary that no longer exists.
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 CXX="$(which icpx || echo /opt/intel/oneapi/compiler/latest/bin/icpx)"
-GATE_BUILD_DIR="${INTFER_ONEMKL_BUILD_DIR:-$ROOT/build/onemkl_gate}"
+GATE_BUILD_DIR="${INTFER_ONEMKL_BUILD_DIR:-$BUILD_DIR/onemkl_gate}"
 mkdir -p "$GATE_BUILD_DIR"
 if ! cmake -S "$ROOT" -B "$GATE_BUILD_DIR" -G "Unix Makefiles" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -78,6 +89,19 @@ fi
 # INTFER_BUILD_DIR, so point it at the throwaway dir configured above and let
 # it do the build -- that is the same stale-artifact protection every other
 # gate gets, rather than a hand-rolled equivalent that can drift.
+# *** BUILD_DIR IS THE GUARD'S OWN VARIABLE, NOT THE ENV. *** gate_require_build
+# resolves its build dir as ${BUILD_DIR:-${INTFER_BUILD_DIR:-$ROOT/build}}, so
+# the env override INTFER_BUILD_DIR above is DEAD unless BUILD_DIR is unset --
+# and this gate sets BUILD_DIR="$ROOT/build" at line 47, before GATE_BUILD_DIR
+# exists. Measured live: the gate configured the throwaway dir, built
+# onemkl_probe into it by hand, then gate_require_build ran
+# `cmake --build $ROOT/build --target onemkl_probe` and refused on
+# "No rule to make target 'onemkl_probe'" -- a green gate on a binary this
+# gate never built, with the stale-artifact protection pointing at the wrong
+# tree. So BUILD_DIR is pointed at the throwaway dir here, explicitly, and the
+# env override is kept as the secondary seam (a gate that forgets both would
+# fall back to $ROOT/build, which is correct for every other gate).
+BUILD_DIR="$GATE_BUILD_DIR"
 INTFER_BUILD_DIR="$GATE_BUILD_DIR" \
 INTFER_GATE_NO_BUILD=0 \
 . "$SCRIPT_DIR/_gate_build.sh"
