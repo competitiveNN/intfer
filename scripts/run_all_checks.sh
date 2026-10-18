@@ -211,6 +211,20 @@ dispatch() { # $1 = label -> runs it
       # exits 2 if the pin cannot be resolved, which reads as UNPROVEN rather
       # than as a pass.
       timeout -k 30 1800 bash "$SCRIPT_DIR/check_l0_cite.sh"; return $? ;;
+    knob_sweep.sh)
+       # The GRIMOIRE-survey gap closure: an operator-run product sweep over the
+       # three intra-device geometry knobs (INTFER_DECODE1_WG, INTFER_XMX_WG,
+       # INTFER_LA_CONV_PREP_WG), which AGENTS.md records as the one harness gap
+       # intfer owned. OPERATOR-ONLY -- it loads the 27B -- so it is scheduled in
+       # the non-QUICK band alongside the roofline gates and an agent session
+       # running INTFER_QUICK=1 never reaches it. DECIDES ON COUNTERS
+       # (nk/nw/nr exact, host buckets relative) and prints no tok/s; a ROUND is
+       # recorded SKIPPED-CONTENDED and publishes no figure when load1 crosses its
+       # quiet threshold (loadlog_arm returns the CLI's rc, so its verdict is read
+       # separately via loadlog_usable -- a contended round arrives with rc=0 AND a
+       # scrapeable profile line), and every delta is spread-floor-checked across
+       # >= 2 paired rounds against the usable set.
+       timeout -k 30 7200 bash "$SCRIPT_DIR/knob_sweep.sh"; return $? ;;
     check_gate_pop.sh)
       # Self-check for the SHARED stamp-population helper. Synthetic tree, no
       # build state touched. Gated on the two defects the helper actually
@@ -308,6 +322,26 @@ dispatch() { # $1 = label -> runs it
       # shared-device-function alternative cost 231 114 ms) and deliberate
       # duplication is only acceptable while it is pinned.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_decode1_copies.sh"; return $? ;;
+    check_tp2_pass_exit.sh)
+      # A gate script's verdict is its exit code (run_ten_gates.sh:79: rc 0 ->
+      # GPASS). This pins scripts/test_tp2_27b.sh against the defect that was
+      # shipping in the working tree until today: it set PASS=1 at :715 and
+      # PASS=0 on every failure, then fell off the end at `rm -f "$LOG"` with
+      # exit 0 -- so the gate that certifies the 27B --tp 2 target reported
+      # PASS with EVERY arm failing. Source-based, no GPU, no model, no build:
+      # it greps the gate's own text for the PASS -> exit conversion.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_tp2_pass_exit.sh"; return $? ;;
+    check_gate_exit_verdict.sh)
+      # The SWEEP. check_tp2_pass_exit.sh pins ONE gate; this runs it over the
+      # whole population, derived from scripts/test_*.sh (never a hand list),
+      # and asserts the harvest count -- "0 findings" and "looked at nothing"
+      # are different claims, and a sweep that harvested zero gates would be
+      # reporting on an empty corpus. It also found what the single-gate
+      # checker could not: only 5 of 18 gates write a PASS variable; the other
+      # 13 relay the probe's rc, so the checker now CLASSIFIES each gate and
+      # applies the predicate set that governs its family. No GPU, no model,
+      # no build: it greps the gates' own text.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_gate_exit_verdict.sh"; return $? ;;
     check_decode1_shipped_anchor.sh)
       # Pins the bisect-3 `SHIPPED` arm (examples/roofline_probe_bisect3/main.cpp)
       # to the engine's INT2-tab path in src/gemm/quant_gemm.cpp::
@@ -320,6 +354,47 @@ dispatch() { # $1 = label -> runs it
       # build. Runs BEFORE check_scripts_live.sh so its presence does not count as
       # an unreachable script.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_decode1_shipped_anchor.sh"; return $? ;;
+    check_s1_predicates.sh)
+       # SOURCE-level certification of the S1 uncached-host-USM doorbell probe's
+       # four STRUCTURAL guards (examples/uncached_doorbell_probe/main.cpp). No
+       # GPU, no model, no build: the subject is the probe's TEXT, and its eight
+       # predicates each refuse the shape of a defect that was planted and
+       # measured by mutate_s1_predicates.sh. It exists because the probe's timing
+       # is operator-only by design, so the only thing certifiable from here is
+       # that its guards still hold -- and a probe whose same-buffer guard was
+       # deleted would still print a PASS-shaped number, which is worse than a
+       # silent failure. Comments are stripped before the predicate harvest, or
+       # p_no_verdict refuses the probe's own prose (measured: 3 comment hits on
+       # the healthy source). Runs BEFORE check_scripts_live.sh so its presence
+       # does not count as an unreachable script.
+       timeout -k 30 600 bash "$SCRIPT_DIR/check_s1_predicates.sh"; return $? ;;
+    check_knob_sweep_contract.sh)
+       # SOURCE-level certification of the operator-run knob sweep's CONTRACT
+       # (scripts/knob_sweep.sh). No GPU, no model, no build: the subject is that
+       # script's TEXT. TWELVE predicates, each refusing the shape of a defect
+       # planted and measured by mutate_knob_sweep_contract.sh -- the catalogue
+       # covering the three intra-device geometry knobs, the INTFER_SWEEP_KNOBS
+       # override, the baseline running FIRST, the counters coming from the CLI's
+       # own event-timestamped [GPU profile @decode] line, the nk/nw/nr field
+       # regexes, the spread floor (usable>=2 AND max of the two spreads, with
+       # both verdicts announced), no eval, no tok/s, the operator-only
+       # preconditions, and the durable tee'd table.
+       #
+       # THE PREDICATE THAT MATTERS MOST IS p_load_gate, and it is the reason
+       # whole-line comments are stripped before the harvest: knob_sweep.sh's own
+       # header comment names SKIPPED-CONTENDED and loadlog_usable, so an
+       # unstripped grep would pass a file whose comment describes the withhold
+       # while its code withholds nothing. That is not hypothetical -- it is the
+       # defect the first revision of knob_sweep.sh SHIPPED (loadlog_arm returns
+       # the CLI's rc, so a CONTENDED round arrived with rc=0 AND a scrapeable
+       # profile line, was counted usable, and fed the median and the spread
+       # floor, while the comment claimed the figure was withheld). MEASURED:
+       # rebuilding that exact shape -- prose claims the withhold, code has none
+       # -- is refused by p_load_gate alone. Anti-vacuity halves proven: a
+       # missing, an empty, and a comments-only subject all FAIL, never pass.
+       # Runs BEFORE check_scripts_live.sh so its presence does not count as an
+       # unreachable script.
+       timeout -k 30 600 bash "$SCRIPT_DIR/check_knob_sweep_contract.sh"; return $? ;;
     check_scripts_live.sh)
       # MEASURED 2026-10-05, not predicted: a full reference-graph derivation of
       # scripts/ found SIXTEEN entries that no code referenced -- a superseded
@@ -339,6 +414,16 @@ dispatch() { # $1 = label -> runs it
       # verdict -- two earlier versions of the rule passed while a defect was
       # planted. Read-only, no GPU, no build.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_dri_probe.sh"; return $? ;;
+    check_pipefail_grep_q.sh)
+      # ROOT CAUSE, MEASURED 2026-10-15: `printf '%s' "$code" | grep -qE` under
+      # pipefail in gate_inventory.sh failed 16/60 -- grep -q exits at the first
+      # match, the writer's next write() gets SIGPIPE (exit 141), and pipefail
+      # turns the match into a failure. The rule refuses a quiet grep as the
+      # READING end of a pipe in any script that sets pipefail; file-backed
+      # greps, non-quiet greps and no-pipefail scripts are the converses. A
+      # seven-case planted self-check gates the verdict. Read-only, no GPU, no
+      # build, no execution of the graded scripts.
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_pipefail_grep_q.sh"; return $? ;;
     check_trap_release.sh)
       # AUDIT #31. A cleanup trap must release on EXIT/INT/TERM *and* the INT/TERM
       # handlers must TERMINATE. `trap ... EXIT INT TERM` -- the AUDIT #29 remedy --
@@ -486,6 +571,15 @@ dispatch() { # $1 = label -> runs it
       # the CONVERSE: a single-minor liveness probe must stay clean, without which
       # a rule that flagged everything would satisfy D-A..D-D.
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_dri_probe.sh"; return $? ;;
+    mutate_pipefail_grep_q.sh)
+      # Every state damages the CORPUS the rule grades, handed over through
+      # INTFER_SCRIPTS_DIR; the checker that runs is the real one reading that
+      # corpus -- weakening the CHECKER would be unobservable (AUDIT #21). P-F is
+      # the CONVERSE: non-quiet, file-backed and no-grep pipefail scripts must
+      # stay clean, without which a rule that flagged every grep would satisfy
+      # P-B..P-E. The defect this pins cost a full gate run: 16/60 identical
+      # runs failed on 2026-10-15 with nothing in the repo changed.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_pipefail_grep_q.sh"; return $? ;;
     mutate_trap_release.sh)
       # Every state damages a CORPUS script's cleanup trap via INTFER_SCRIPTS_DIR;
       # the checker is correct by construction, so weakening the CHECKER would be
@@ -546,6 +640,38 @@ dispatch() { # $1 = label -> runs it
       # PO-1 empties the log directory: the classifier must report INCONCLUSIVE,
       # NOT "nothing pending" -- different claims, and only one is reassuring.
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_pending_operator.sh"; return $? ;;
+    mutate_s1_predicates.sh)
+       # Eight states, each planting ONE structural defect into a temp copy of
+       # examples/uncached_doorbell_probe/main.cpp and requiring
+       # check_s1_predicates.sh to REFUSE it for its OWN named predicate. This
+       # matrix found three defects in the CHECKER rather than the probe, and all
+       # three standing fixes are asserted here rather than intended: (1) the dead
+       # conjunction -- a shell function returns only its LAST statement's status,
+       # so a predicate chain silently dropped every guard before the last; (2) the
+       # inverted-polarity state that DELETED getenv and thereby made the source
+       # MORE compliant than the healthy original, so "it refused" proved nothing;
+       # (3) the unlanded mutation whose \n stayed a literal two-character escape,
+       # gluing the planted claim onto the line it was meant to be absent from.
+       # Fix (3) is the load-bearing one: every state asserts it LANDED (cmp
+       # against the live source) BEFORE it is graded, so a no-op mutation is
+       # reported vacuous instead of counted as a catch.
+       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_s1_predicates.sh"; return $? ;;
+    mutate_knob_sweep_contract.sh)
+       # TWELVE states, each planting ONE structural defect into a temp copy of
+       # scripts/knob_sweep.sh (NOT a synthetic log -- a log built from the fixed
+       # script would pass by construction) and requiring
+       # check_knob_sweep_contract.sh to REFUSE it for its OWN named predicate.
+       # Every state follows the three standing fixes from the S1 matrix: the
+       # mutation engine asserts its anchors BEFORE substituting (exit 3,
+       # vacuous), asserts the file CHANGED before writing (exit 4, no-op), and
+       # the harness re-asserts landing with cmp before grading it -- so a no-op
+       # is reported FAIL, never counted as a catch. KS-loadgate rebuilds the
+       # shipped defect verbatim: delete the loadlog_usable guard, the withheld-
+       # round record, and both filter exclusions, while the header comment still
+       # names SKIPPED-CONTENDED. No GPU, no model, no build, and knob_sweep.sh
+       # is never EXECUTED -- the matrix is a source mutation, which is the only
+       # kind an agent session may run against an operator-only harness.
+       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_knob_sweep_contract.sh"; return $? ;;
     mutate_destructive_git.sh)
       # DG-2 is the state that makes the comment-strip load-bearing: without it
       # the mutate_tp2_selfcheck.sh DECOY is flagged. DG-4 is the anti-vacuity
@@ -610,6 +736,33 @@ dispatch() { # $1 = label -> runs it
       # NOTE there is only ONE arm for this matrix; a second was added by mistake
       # and the stack's own 0c step reported it as "scheduled MORE THAN ONCE".
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_decode1_copies.sh"; return $? ;;
+    mutate_tp2_pass_exit.sh)
+      # Same AUDIT #11 direction as the decode1 pair: the checker is correct
+      # by construction on a clean tree, so the matrix mutates the ARTIFACT
+      # (test_tp2_27b.sh) rather than weakening the checker. Four states, all
+      # REFUSE: the conversion deleted (the shipped defect), a green verdict
+      # gate, the conversion moved above the trailing rm, and PASS=1 deleted.
+      # Every state runs on a TEMP COPY, so the tracked gate is never modified
+      # and there is nothing to restore (the residue check re-proves it).
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_tp2_pass_exit.sh"; return $? ;;
+    mutate_gate_exit_verdict.sh)
+       # The sweep's OWN matrix. check_gate_exit_verdict.sh does not run the
+       # gates (no model, no GPU) and the per-gate predicates (a/b/c/d) are
+       # pinned by mutate_tp2_pass_exit.sh (7/7), so this matrix does NOT
+       # re-test them: it mutates the SWEEP on temp copies and grades the
+       # sweep's own verdict logic -- the population derivation, the family
+       # label, the harvest/unsafe tallies, and the harvest-vs-N guard. A
+       # sweep that silently dropped a gate (18 -> 17) would certify "all
+       # gates safe, verdict reaches exit" while one gate was never examined
+       # at all, which is the population-equivalent of the vacuous green the
+       # single-gate checker prevents at one gate. Four states, all REFUSE:
+       # the harvest loop deleted (harvested 0), the unsafe tally removed,
+       # N hardcoded to 19, and the population narrowed to 1 gate.
+       # GE-6/GE-7 (harvest-vs-N guard deletion; family-label inversion)
+       # are EXCLUDED, not scored: on an all-safe tree neither changes any
+       # outcome, and GE-1/GE-3/GE-4 cover the same defect classes by
+       # planting the defect directly.
+       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_gate_exit_verdict.sh"; return $? ;;
     mutate_decode1_shipped_anchor.sh)
       # Audit #21 direction: the checker is correct by construction on a clean
       # tree, so the matrix drifts the ARTIFACT instead of weakening the checker.
@@ -839,7 +992,8 @@ for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
   b="$(basename "$f")"
   N_DISPATCHABLE=$((N_DISPATCHABLE + 1))
   grc=0
-  printf '%s\n' "$ARMS" | grep -qxF -- "$b" >/dev/null 2>&1 || grc=$?
+  printf '%s\n' "$ARMS" >"$BUILD_DIR/.run_all_arms.txt"
+  grep -qxF -- "$b" "$BUILD_DIR/.run_all_arms.txt" >/dev/null 2>&1 || grc=$?
   if [ "$grc" -ge 2 ]; then
     # The lookup failed; saying "no dispatch arm" here would be a verdict
     # about a query that never ran.
@@ -883,7 +1037,7 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_decode1_shipped_anchor.sh check_flag_gate_coverage.sh check_hw_constants.sh check_dpas_shape_audit.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_scripts_live.sh"
+  STEPS="gate_inventory.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_decode1_shipped_anchor.sh check_s1_predicates.sh check_knob_sweep_contract.sh check_tp2_pass_exit.sh check_gate_exit_verdict.sh check_flag_gate_coverage.sh check_hw_constants.sh check_dpas_shape_audit.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_scripts_live.sh check_pipefail_grep_q.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   # A REAL gate, but it needs a GPU and takes ~30 s, so it sits in the
   # same INTFER_QUICK-off band as check_l0_cite.sh. Quick mode is meant to be
@@ -893,8 +1047,17 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
     STEPS="$STEPS test_roofline_probe.sh test_roofline_bisect.sh test_roofline_bisect1.sh test_roofline_bisect3.sh test_roofline_bisect4.sh test_rowpair_equiv.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS check_l0_cite.sh"
+  # The GRIMOIRE-survey gap closure (AGENTS.md: "intfer owns every knob ... but has
+  # no harness that enumerates a product over one and prints a table"). It is an
+  # OPERATOR-ONLY 27B --tp 2 A/B and it DECIDES ON COUNTERS, never on a tok/s, so it
+  # belongs in the same non-QUICK band as the roofline gates: an agent session runs
+  # INTFER_QUICK=1 and never reaches it. It was left unreferenced for a whole
+  # session, which is why check_scripts_live.sh filed it unreachable -- a script
+  # nothing can run is the audit-#18 shape, not a safe default.
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh"
+    STEPS="$STEPS knob_sweep.sh"
+  [ "${INTFER_QUICK:-0}" = "1" ] || \
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_tp2_pass_exit.sh mutate_gate_exit_verdict.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_s1_predicates.sh mutate_knob_sweep_contract.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh mutate_pipefail_grep_q.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
@@ -953,7 +1116,8 @@ else
     # anything. It is tested BEFORE the `case` because a case branch cannot hold a
     # compound command -- the first attempt put the `if` inside one and bash blamed
     # a token three lines later.
-    if head -40 "$f" | grep -q '^# POST-STACK:'; then
+    head -40 "$f" >"$BUILD_DIR/.run_all_head.txt"
+  if grep -q '^# POST-STACK:' "$BUILD_DIR/.run_all_head.txt"; then
       # *** AND IT MUST NOT ALSO BE SCHEDULED. *** The exemption says "this grades
       # the certificate the stack WRITES, so it runs after". A file that is both
       # exempt and scheduled does the opposite: it grades the cert it is supposed to
