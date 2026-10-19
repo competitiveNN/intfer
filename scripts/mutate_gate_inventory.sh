@@ -135,7 +135,7 @@ ANCHOR_PATTERNS=(
   'strip_comments() { sed -e '"'"'s/[[:space:]]#.*$//'"'"''
   'elif grep -q '"'"'gate_gpu_count'"'"' "$1"; then'
   '  [ "$p" = "per-arm" ] ||'
-  'grep -qE '"'"'SKIPPED_(TP2|SUB)|PARTIAL'"'"' ||'
+  'grep -qE '"'"'SKIPPED_(TP2|SUB)|PARTIAL'"'"' "$codefile" ||'
   'unplaceable require classified'
   'PARSE_SK="$(printf '"'"'%s'"'"' "$txt" | sed -nE '"'"'s/.*[,/] ?([0-9]+) SKIPPED.*/\1/p'"'"')"'
   'doc-tally: SKIPPED'
@@ -497,10 +497,15 @@ run_state M4 "invert the per-arm self-check expectation" "CAUGHT-selfcheck" <<'P
   [ "$p" = "WHOLE-gate" ] || { echo "SELFCHECK: per-arm gate misread as '$p'" >&2; bad=1; }
 PATCH
 
+# NOTE the old side is the PIPED form (`printf | grep`). It went stale on
+# 2026-10-15 when the SIGPIPE race (gate_inventory.sh:306-321, 16-in-60 failures
+# under `set -o pipefail`) was fixed by grepping the already-written $codefile
+# instead. The anchor pre-flight is what said so, again -- which is why the state
+# is re-pointed at the file-backed line and the anchor is not loosened.
 run_state M5 "disable the per-arm NO-SKIP-REPORT check" "CAUGHT-selfcheck" <<'PATCH'
-    printf '%s\n' "$code" | grep -qE 'SKIPPED_(TP2|SUB)|PARTIAL' || {
+    grep -qE 'SKIPPED_(TP2|SUB)|PARTIAL' "$codefile" || {
 |||
-    printf '%s\n' "$code" | grep -qE 'ZZZ_NEVER_MATCHES' || {
+    grep -qE 'ZZZ_NEVER_MATCHES' "$codefile" || {
 PATCH
 
 # NOTE the old side names gate_require_device too. When audit #16 taught
