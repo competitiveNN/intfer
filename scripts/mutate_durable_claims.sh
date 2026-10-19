@@ -146,22 +146,23 @@ run_state() { # $1 = state name, $2 = expected predicate (or "corpus" for a hard
     # DC-engines-only.
     DC-no-pairs)
       python3 - "${allf[@]}" <<'PY'
-import sys
-SHAS = ['4313556ca71c4dfc74161ded2531a00d42c7f72a8800ce06261415177a280ae8',
-        'b1869bfbb8677171ec8ef64eb328e483de765eec821507e10c53cf1ab3b4057d']
-# accumulate, do NOT assert per file: the surface now includes records that carry no
-# pair, and a per-file assert would die on the first such record AFTER having already
-# rewritten the earlier ones -- a state that "lands" by accident of argv order.
+import sys, re
+# DYNAMIC anchor, NOT hardcoded shas. This matrix previously named the 2026-10-18
+# pair (4313556.../b1869bfb...) literally; that pair is no longer a full string on
+# the surface (it survives only abridged in prose), so the three pair states below
+# silently no-op'd and a matrix state that never lands cannot report a tally. Harvest
+# whatever pair the surface carries TODAY and erase it: wrap-independent because the
+# pair regex tolerates the HISTORY.md line wrap, and the stub is non-hex so the
+# census grep finds zero pairs (p_pair_harvest trips, not a later predicate).
+pat = re.compile(r'[0-9a-f]{64} -> [0-9a-f]{64}')
 hit = 0
 for p in sys.argv[1:]:
     s = open(p).read()
-    out = s
-    for x in SHAS:
-        out = out.replace(x, 'ERASED')
+    out = pat.sub('ERASED -> ERASED', s)
     if out != s:
         open(p, 'w').write(out)
         hit += 1
-assert hit >= 1, 'no pair sha found anywhere on the surface to erase'
+assert hit >= 1, 'no pair found anywhere on the surface to erase'
 PY
       ;;
     # ---- a fabricated BEFORE sha is visible without running anything ----------
@@ -170,9 +171,11 @@ PY
 import re, sys
 p = sys.argv[1]
 s = open(p).read()
-s = re.sub(r'4313556ca71c4dfc74161ded2531a00d42c7f72a8800ce06261415177a280ae8',
-           '0' * 64, s, count=1)
-open(p, 'w').write(s)
+m = re.search(r'[0-9a-f]{64}( -> )', s)
+assert m, 'no pair BEFORE sha found to forge'
+out = s[:m.start()] + '0' * 64 + s[m.start() + 64:]
+assert out != s, 'the BEFORE-sha forge did not land'
+open(p, 'w').write(out)
 PY
       ;;
     # ---- the pair must carry a disposition ------------------------------------
@@ -192,16 +195,26 @@ PY
     # the predicate's point of view and would be graded as an unlanded state.
     DC-phantom)
       python3 - "${allf[@]}" <<'PY'
-import sys
-OLD = 'REGEN(bash scripts/mutate_knob_sweep_contract.sh))'
-NEW = 'REGEN(bash scripts/zz_never_shipped.sh))'
+import re, sys
+PAIR = re.compile(r'[0-9a-f]{64} -> [0-9a-f]{64}')
 hit = 0
 for p in sys.argv[1:]:
-    s = open(p).read()
-    if OLD in s:
-        open(p, 'w').write(s.replace(OLD, NEW))
+    lines = open(p).read().split('\n')
+    changed = False
+    for i, ln in enumerate(lines):
+        # TARGET THE PAIR'S DISPOSITION, paren-count-agnostic. The old anchor named
+        # a double-paren spelling (`...sh))`) that matches only outer prose
+        # parentheses `(REGEN(bash scripts/mutate_knob_sweep_contract.sh))`, NOT the
+        # pair line's single-paren disposition -- so it corrupted 4 prose mentions
+        # and left the real disposition intact, grading 'wrong reason' or nothing.
+        if PAIR.search(ln) and 'scripts/mutate_knob_sweep_contract.sh' in ln:
+            lines[i] = ln.replace('scripts/mutate_knob_sweep_contract.sh',
+                                  'scripts/zz_never_shipped.sh')
+            changed = True
+    if changed:
+        open(p, 'w').write('\n'.join(lines))
         hit += 1
-assert hit >= 1, 'the REGEN marker to corrupt was not found anywhere on the surface'
+assert hit >= 1, 'the pair disposition marker was not found on any surface record'
 PY
       ;;
     # ---- a REGEN naming a real script that carries no equivalence hook --------
@@ -212,16 +225,24 @@ PY
     # corroborate -- so a state for it must corrupt both.)
     DC-no-hook)
       python3 - "${allf[@]}" <<'PY'
-import sys
-OLD = 'REGEN(bash scripts/mutate_knob_sweep_contract.sh))'
-NEW = 'REGEN(bash scripts/check_s1_predicates.sh))'
+import re, sys
+PAIR = re.compile(r'[0-9a-f]{64} -> [0-9a-f]{64}')
+HOOK_TARGET = 'scripts/check_s1_predicates.sh'
 hit = 0
 for p in sys.argv[1:]:
-    s = open(p).read()
-    if OLD in s:
-        open(p, 'w').write(s.replace(OLD, NEW))
+    lines = open(p).read().split('\n')
+    changed = False
+    for i, ln in enumerate(lines):
+        # Point the PAIR's disposition at a real script that carries NO residue
+        # equivalence hook -- paren-count-agnostic (replaces the script name), so it
+        # targets the single-paren disposition on the pair line, not prose.
+        if PAIR.search(ln) and 'scripts/mutate_knob_sweep_contract.sh' in ln:
+            lines[i] = ln.replace('scripts/mutate_knob_sweep_contract.sh', HOOK_TARGET)
+            changed = True
+    if changed:
+        open(p, 'w').write('\n'.join(lines))
         hit += 1
-assert hit >= 1, 'the REGEN marker to corrupt was not found anywhere on the surface'
+assert hit >= 1, 'the pair disposition marker was not found on any surface record'
 PY
       ;;
     # ---- live state without chronology: exactly how an invented figure looks ---
@@ -234,10 +255,8 @@ PY
 import re, sys
 p = sys.argv[1]
 s = open(p).read()
-A = '4313556ca71c4dfc74161ded2531a00d42c7f72a8800ce06261415177a280ae8'
-B = 'b1869bfbb8677171ec8ef64eb328e483de765eec821507e10c53cf1ab3b4057d'
-out = s.replace(A, 'A-ERASED-FROM-CHRONOLOGY')
-out = out.replace(B, 'B-ERASED-FROM-CHRONOLOGY')
+pat = re.compile(r'[0-9a-f]{64} -> [0-9a-f]{64}')
+out, n = pat.subn('A-ERASED-FROM-CHRONOLOGY -> B-ERASED-FROM-CHRONOLOGY', s)
 assert out != s, 'the pair shas to erase were not found in the chronology'
 open(p, 'w').write(out)
 PY

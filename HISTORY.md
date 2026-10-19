@@ -3251,7 +3251,8 @@ and the child died on the residue assertion, producing
 `23107030085f33d35a7e2d19a549010ef616448e5572a33aac43c5872cfd5bb9 ~> deb505bd56bd5d7422ddeb08c0c01b9387a4d87e1d0ef26a5f0766b663410422` (SUPERSEDED — subject sha now `8deaec05...`).
 The plant was removed and its absence asserted afterwards.
 The re-measured pair against the fixed subject (sha now `8deaec05f8d389a15b6de79a15b2dcfb7b3ebcb15ed05f7d6846c708469aa536`) is:
-`8deaec05f8d389a15b6de79a15b2dcfb7b3ebcb15ed05f7d6846c708469aa536 -> 2dcd246becd761146bcb85c73dd99c7f7feea10efc155d1d3107e729e761847b` REGEN(bash scripts/mutate_knob_sweep_contract.sh).
+`53e0ed8c2494281485052927b646f3d424aaaedd5c0d31caebebb8522aae0b3c -> 9ae9951b28660246064135e1310a2430dfa7714d1eb5d239304dc84b97c221a6` REGEN(bash scripts/mutate_knob_sweep_contract.sh).
+[REPLACED 2026-10-19 subject now 53e0ed8c2494281485052927b646f3d424aaaedd5c0d31caebebb8522aae0b3c] the knob_sweep.sh default model path changed (repo-relative -> on-disk v2 artifact), so the live subject sha moved. The previous pair 8deaec05... -> 2dcd24... had a BEFORE sha no longer matching any file in scripts/; per p_pair_before it was removed rather than kept as a stale record. Re-measured pair above, against the LIVE subject.
 
 **The matrix's clean-tree precondition is stated, not worked around.**
 `mutate_knob_sweep_contract.sh`'s final guard refuses a TRACKED-file change under

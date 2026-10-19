@@ -184,12 +184,5 @@ refuse, and it correctly refused. The re-measurement was made by the harness's O
 planted-copy mechanism (the residue plant appended to a copy of the LIVE subject, then the
 child died on the residue assertion), NOT by a replication, and produced
 [SUPERSEDED 2026-10-18 subject now 8deaec05f8d389a15b6de79a15b2dcfb7b3ebcb15ed05f7d6846c708469aa536] 23107030085f33d35a7e2d19a549010ef616448e5572a33aac43c5872cfd5bb9 ~> deb505bd56bd5d7422ddeb08c0c01b9387a4d87e1d0ef26a5f0766b663410422. The plant was removed
-8deaec05f8d389a15b6de79a15b2dcfb7b3ebcb15ed05f7d6846c708469aa536 -> 2dcd246becd761146bcb85c73dd99c7f7feea10efc155d1d3107e729e761847b   REGEN(bash scripts/mutate_knob_sweep_contract.sh) and its absence asserted afterwards.
-THE MATRIX'S CLEAN-TREE PRECONDITION IS STATED, NOT
-WORKED AROUND: mutate_knob_sweep_contract.sh's final guard refuses a TRACKED-file change
-under scripts/knob_sweep.sh, so while this fix is uncommitted the matrix grades all 13
-states to CAUGHT and then REFUSES at the residue comparison -- the correct behaviour,
-because a residue assertion is meaningless against a tree the reader cannot reproduce.
-It turns green for the operator on the first clean tree after this lands. The old pair is
-kept above as the record of the run it measured and is not edited to match today's bytes.
-This record carries (REGEN(bash scripts/mutate_knob_sweep_contract.sh)).
+53e0ed8c2494281485052927b646f3d424aaaedd5c0d31caebebb8522aae0b3c -> 9ae9951b28660246064135e1310a2430dfa7714d1eb5d239304dc84b97c221a6   REGEN(bash scripts/mutate_knob_sweep_contract.sh).
+[REPLACED 2026-10-19 subject now 53e0ed8c2494281485052927b646f3d424aaaedd5c0d31caebebb8522aae0b3c] the knob_sweep.sh default model path changed (repo-relative path -> on-disk v2 artifact), so the live subject sha moved. The previous pair 8deaec05... -> 2dcd24... (abridged here) had a BEFORE sha that is no longer the sha of any file in scripts/; per p_pair_before it was removed rather than kept as a stale record. Re-measured by the harness's planted-copy mechanism (residue plant appended to a copy of the LIVE subject, child died on the residue assertion). The plant was removed and its absence asserted afterwards.
