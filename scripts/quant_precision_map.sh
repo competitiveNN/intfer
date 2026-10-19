@@ -12,11 +12,18 @@
 # It is also not derivable by reading the role enum, because the ladder a role
 # OFFERS is not the scheme it RECEIVES:
 #   * src/quant_spec.cpp (compiled by scripts/build_quant_real.sh, and the file
-#     that produced the 27B artifact) has no case for LINEAR_ATTN_*, so those
-#     roles fall through to the FP16-only default. 240 of the 27B's 498 tensors
-#     are FP16 for that reason alone.
-#   * src/quant/quant_spec.cpp (compiled by six examples/* targets) DOES extend
-#     the ladder to LINEAR_ATTN_*. Two ladders, one repo, different results.
+#     that produced the 27B artifact) had no case for LINEAR_ATTN_* when that file
+#     was written, so those roles fell through to the FP16-only default. 240 of the
+#     27B's 498 tensors are FP16 for that reason alone. CLOSED 2026-10-18: that
+#     file now carries its own LINEAR_ATTN_* arms, so the divergence below no
+#     longer holds in either direction -- but the ARTIFACT still carries the old
+#     result, and "why is this tensor FP16" is a question about the file, not
+#     about today's source. The figures above remain a true record of the run.
+#   * src/quant/quant_spec.cpp (compiled by six examples/* targets) used to EXTEND
+#     the ladder where the real one did not. It now MIRRORS the real arms (minus
+#     the FP16 escape for QKV/Z/OUT, minus INT2 for the two tiny roles, plus the
+#     CONV role), so the two ladders agree on linear-attention terms for the first
+#     time. They still differ in spelling and still cannot be linked together.
 # So this script reads the model's own metadata header. That cannot drift.
 #
 # The script also prints the FP16-by-omission census separately, because "FP16

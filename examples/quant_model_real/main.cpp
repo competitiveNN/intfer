@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
   int layer_count = -1;  // -1 = no upper bound (use max_layers as the inclusive upper bound)
   double budget_frac = 0.30;
   double max_mem_frac = 0.90;   // max fraction of available RAM for the fp16_buf
+  bool no_lm_head = false;   // exclude lm_head from this chunk (see note at the loader)
   uint64_t max_mem_mib = 0;     // explicit cap in MiB; overrides max_mem_frac if nonzero
   bool no_embed = false;
   std::string out_path;
@@ -179,6 +180,7 @@ int main(int argc, char** argv) {
     else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
     else if (a == "--dump" && i + 1 < argc) dump_path = argv[++i];
     else if (a.rfind("--", 0) != 0) path = a;
+    else if (a == "--no-lm-head") no_lm_head = true;
   }
   // --layer-start + --layer-count define a half-open range [start, start+count).
   // They take precedence over --layers (which is treated as the inclusive upper bound).
@@ -266,6 +268,18 @@ int main(int argc, char** argv) {
     }
     if (t.shape.size() != 2) { ++skipped; continue; }
     if (no_embed && role == TensorRole::EMBED) { ++skipped; continue; }
+    // --no-lm-head: LM_HEAD (248320x5120 = 2428 MiB fp16) carries no layer
+    // index, so the layer-range guard above never filters it. With only
+    // --no-embed, EVERY chunk re-loads it, and both the chunk's `fp16_bytes`
+    // (hence its RCO budget) and its cheapest allocation grow by its INT4 floor
+    // (643 MiB). Measured on a 2-layer LIN+LIN chunk at 27B: loaded fp16
+    // 3886.9 MiB = lm_head 2428 + layers 1462, so a --budget-frac of 0.20 gave
+    // a 778 MiB budget against an 871 MiB floor and RCO correctly REFUSED
+    // ("infeasible allocation"). Chunks >0 that only carry layers must exclude
+    // it, or the frac needed to stay feasible is set by lm_head rather than by
+    // the layers the chunk actually quantizes. Chunk 0 keeps it (it is the one
+    // place the embedding/head pair is selected once).
+    if (no_lm_head && role == TensorRole::LM_HEAD) { ++skipped; continue; }
     uint32_t N = (uint32_t)t.shape[0];
     uint32_t K = (uint32_t)t.shape[1];
 

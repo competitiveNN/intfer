@@ -245,6 +245,17 @@ dispatch() { # $1 = label -> runs it
       # every free of that buffer must clear the cache. Function-scoped, because
       # the alias `w` names ws_ in one function and ws48_ in another.
       timeout -k 30 600 bash "$SCRIPT_DIR/check_act_cache_invalidation.sh"; return $? ;;
+    check_ladder_sync.sh)
+      # The per-role candidate ladder lives in TWO files that cannot be linked
+      # (duplicate symbols), so divergence between them is SILENT -- and it went
+      # wrong in BOTH directions: originally the mirror offered INT2/INT4/INT8 to
+      # LINEAR_ATTN_* where the real file offered only FP16 (the reason 56.8% of the
+      # 19 GB artifact's bytes were FP16), and with the arms in place the mirror
+      # carried an FP16 escape the real file withholds. Their mk() helpers take
+      # the 3rd/4th parameters in OPPOSITE orders, so a text comparison is wrong
+      # by construction: this compiles both TUs and diffs the candidate tables.
+      # Read-only, no GPU, no build (two throwaway g++ TUs in a mktemp dir).
+      timeout -k 30 600 bash "$SCRIPT_DIR/check_ladder_sync.sh"; return $? ;;
     check_hw_constants.sh)
       # AUDIT #33 (2026-10-05). A hardware capability figure in a document must
       # name its source. Written because "512 Xe cores / ~179 GB/s" sat in
@@ -656,6 +667,17 @@ dispatch() { # $1 = label -> runs it
       # AC-1 removes an invalidation (a use-after-free no stream test finds);
       # AC-4 inverts the checker's own comparison -- the bug it shipped with.
       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_act_cache_invalidation.sh"; return $? ;;
+    mutate_ladder_sync.sh)
+      # LS-1 reintroduces the FP16 rung that made 56.8% of the 19 GB model FP16;
+      # LS-2 swaps the XMX g32-before-g16 scale-traffic policy; LS-3 drops the
+      # INT2 rungs (the "weights stay INT2" mandate silently unenforceable);
+      # LS-4 is a divergence the STATIC predicates cannot see, so only the
+      # compiled diff rejects it; LS-5 is a benign prose edit that must stay
+      # GREEN, or the checker is not distinguishable from always-red. Unlike every
+      # other matrix this one NEVER writes a tracked file: the working tree holds
+      # another session's uncommitted src/quant_spec.cpp work, and the checker's
+      # own INTFER_LADDER_REAL seam makes in-place editing unnecessary.
+      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_ladder_sync.sh"; return $? ;;
     mutate_nullglob_sites.sh)
       # NS-2 covers a blind spot the scanner REALLY had: a same-line
       # ( shopt -s nullglob; cmd GLOB ) was invisible to a line-start regex, and
@@ -1113,7 +1135,7 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_decode1_shipped_anchor.sh check_s1_predicates.sh check_knob_sweep_contract.sh check_durable_claims.sh check_tally_propagation.sh check_tp2_pass_exit.sh check_gate_exit_verdict.sh check_flag_gate_coverage.sh check_hw_constants.sh check_dpas_shape_audit.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_scripts_live.sh check_pipefail_grep_q.sh"
+  STEPS="gate_inventory.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_decode1_shipped_anchor.sh check_s1_predicates.sh check_knob_sweep_contract.sh check_durable_claims.sh check_tally_propagation.sh check_tp2_pass_exit.sh check_gate_exit_verdict.sh check_flag_gate_coverage.sh check_hw_constants.sh check_dpas_shape_audit.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_ladder_sync.sh check_scripts_live.sh check_pipefail_grep_q.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   # A REAL gate, but it needs a GPU and takes ~30 s, so it sits in the
   # same INTFER_QUICK-off band as check_l0_cite.sh. Quick mode is meant to be
@@ -1133,7 +1155,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS knob_sweep.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_tp2_pass_exit.sh mutate_gate_exit_verdict.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_s1_predicates.sh mutate_knob_sweep_contract.sh mutate_durable_claims.sh mutate_tally_propagation.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh mutate_pipefail_grep_q.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_tp2_pass_exit.sh mutate_gate_exit_verdict.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_s1_predicates.sh mutate_knob_sweep_contract.sh mutate_durable_claims.sh mutate_tally_propagation.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_ladder_sync.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh mutate_pipefail_grep_q.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------

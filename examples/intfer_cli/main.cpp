@@ -71,6 +71,7 @@ static void segv_handler(int sig){
 #include <fcntl.h>
 #include <errno.h>
 
+#include "intfer/draft_async.hpp"
 #include "intfer/safetensors.hpp"
 #include "intfer/output.hpp"
 #include "intfer/quant/dashq.hpp"
@@ -11241,15 +11242,19 @@ int main(int argc, char** argv){
   if(spec_cap > 16) spec_cap = 16;
   bool greedy = (temperature <= 0.f && top_k==0 && top_p<=0.f);
   bool use_spec = greedy && (spec_cap > 0);
-  // N-gram drafter: last occurrence of the current token in the committed
-  // history; the following tokens are free drafts (no model cost).
-  auto ngram_drafts = [&](int tok, int K){
+  // Pure n-gram draft computation, parameterised on the history vectors so the
+  // ASYNCHRONOUS producer (INTFER_DRAFT_ASYNC) can run the SAME logic on a
+  // request-time snapshot without touching live state. The shipped lambda below
+  // passes the live vectors, so the synchronous result is unchanged: the two
+  // callers cannot diverge because there is exactly one implementation.
+  auto ngram_from = [](const std::vector<int>& gen, const std::vector<int>& pr,
+                       int tok, int K){
     std::vector<int> d;
     // Search generated first (most recent), then the prompt.
-    for(int occ = (int)generated.size()-1; occ >= 0 && (int)d.size() < K; --occ){
-      if(generated[(size_t)occ] == tok){
-        for(int j = occ+1; j < (int)generated.size() && (int)d.size() < K; ++j)
-          d.push_back(generated[(size_t)j]);
+    for(int occ = (int)gen.size()-1; occ >= 0 && (int)d.size() < K; --occ){
+      if(gen[(size_t)occ] == tok){
+        for(int j = occ+1; j < (int)gen.size() && (int)d.size() < K; ++j)
+          d.push_back(gen[(size_t)j]);
         if((int)d.size() >= K) break;
         // Ran off the end of generated: continue into nothing (generated
         // already includes everything after the prompt). Stop here.
@@ -11257,19 +11262,24 @@ int main(int argc, char** argv){
       }
     }
     if((int)d.size() < K){
-      for(int occ = (int)prompt_ids.size()-1; occ >= 0 && (int)d.size() < K; --occ){
-        if(prompt_ids[(size_t)occ] == tok){
-          for(int j = occ+1; j < (int)prompt_ids.size() && (int)d.size() < K; ++j)
-            d.push_back(prompt_ids[(size_t)j]);
+      for(int occ = (int)pr.size()-1; occ >= 0 && (int)d.size() < K; --occ){
+        if(pr[(size_t)occ] == tok){
+          for(int j = occ+1; j < (int)pr.size() && (int)d.size() < K; ++j)
+            d.push_back(pr[(size_t)j]);
           // Prompt followers lead into generated[0..]; append those too.
-          for(int j = 0; j < (int)generated.size() && (int)d.size() < K; ++j)
-            d.push_back(generated[(size_t)j]);
+          for(int j = 0; j < (int)gen.size() && (int)d.size() < K; ++j)
+            d.push_back(gen[(size_t)j]);
           break;
         }
       }
     }
     if((int)d.size() > K) d.resize(K);
     return d;
+  };
+  // N-gram drafter: last occurrence of the current token in the committed
+  // history; the following tokens are free drafts (no model cost).
+  auto ngram_drafts = [&](int tok, int K){
+    return ngram_from(generated, prompt_ids, tok, K);
   };
   // ------------------------------------------------------------------------
   // DRAFT-SOURCE SEAM (docs/DFLASH_ON_NPU.txt sec.1/sec.3).
@@ -11435,6 +11445,18 @@ int main(int argc, char** argv){
   // consume (no request tag).
   static const bool draft_cancel_stale =
       (std::getenv("INTFER_DRAFT_CANCEL_STALE") != nullptr);
+  // Asynchronous producer (DFlash2-on-NPU sec.1 item 3). The pinned ring shipped
+  // WITHOUT a producer thread: query_drafts computed the n-gram draft and read it
+  // straight back, so the ring's producer half had nothing serving it. The doc's
+  // item 3 is exactly that missing half -- a producer that runs on its own while
+  // the consumer is elsewhere. INTFER_DRAFT_ASYNC (presence-spelled, default OFF,
+  // meaningful only with the pinned ring) starts a REAL producer thread serving
+  // the ring; a real NPU/DPU producer would occupy the same slot. Output is
+  // unchanged (the thread runs the SAME ngram_from on a request-time snapshot)
+  // and the loop cannot hang (a missed deadline falls back to the inline path).
+  static const bool draft_async = (std::getenv("INTFER_DRAFT_ASYNC") != nullptr);
+  static const int draft_async_deadline_ms = 50;
+  std::unique_ptr<intfer::DraftAsyncProducer> draft_producer;
   DraftRing draft_ring;
   // Producer confidence for the last window (position w-1 confidence in
   // scores[w-1]); filled only on the pinned path. Empty => EMA-only.
@@ -11482,7 +11504,36 @@ int main(int argc, char** argv){
     // consumes for the same window keep the same tag; the tag moves only when
     // the caller asks for a new window (i.e. the verify path advanced).
     if(draft_cancel_stale) draft_ring.want++;
-    std::vector<int> d = ngram_drafts(tok, K);
+    std::vector<int> d;
+    if(draft_async){
+      static bool announced_async = false;
+      if(!announced_async){
+        announced_async = true;
+        std::fprintf(stderr,
+                     "[draft-async] producer-thread ring=2-slot deadline_ms=%d "
+                     "snapshot-per-request ACTIVE "
+                     "(INTFER_DRAFT_ASYNC=1; the producer computes off-thread and "
+                     "a miss falls back to the inline n-gram path)\n",
+                     draft_async_deadline_ms);
+        std::fflush(stderr);
+      }
+      if(!draft_producer){
+        // The thread runs the SAME ngram_from the shipped path runs, so the
+        // drafts are identical by construction -- a scheduling change, not an
+        // arithmetic one, and there is no numerics contract to agree.
+        draft_producer.reset(new intfer::DraftAsyncProducer(ngram_from));
+      }
+      // Snapshot the history ON THIS (the consumer) THREAD: the producer must
+      // never read `generated` while emit_tok() is appending to it. The copy is
+      // the stand-in cost an NPU producer would not pay (it keeps its own state).
+      std::vector<int> gen_snap = generated, prompt_snap = prompt_ids;
+      if(!draft_producer->request(gen_snap, prompt_snap, tok, K,
+                                  draft_async_deadline_ms, d)){
+        d = ngram_drafts(tok, K);  // deadline miss/error: the shipped inline path
+      }
+    } else {
+      d = ngram_drafts(tok, K);
+    }
     int tmp[SPEC_MAX_K];
     for(size_t i = 0; i < d.size() && i < (size_t)SPEC_MAX_K; ++i) tmp[i] = d[i];
     if(!draft_ring.publish(tmp, (int)d.size())) return {}; // back-pressure: refuse

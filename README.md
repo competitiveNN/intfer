@@ -101,6 +101,14 @@ silently falling back to the default one.
 The separate host-only Stage-1 quantizer (`scripts/build_quant_real.sh`) has its
 own tree, `build_quant_real/`, and its own override `$INTFER_QUANT_REAL_BIN`;
 the `quant_27b_*` / `run_27b_*` chunk scripts resolve their binary through it.
+Chunk then merge, in that order: `run_27b_int2_v2.sh` writes one `.intifer` per
+2-layer chunk into `$INTFER_CHUNK_DIR`, and `merge_27b_v2.sh` streams those
+chunks into the final artifact. The merge is long enough to outlive a tool
+timeout, so it must be detached (`setsid nohup ... < /dev/null & disown`); it
+writes `.payload` then `.final` and renames, so an interrupted run leaves a
+recoverable partial rather than a truncated artifact. `run_27b_int2_v2.sh`'s
+budget fractions are per-class (`INTFER_FRAC_LAYER` for chunks carrying layers
+only, `INTFER_FRAC_HEAD` for chunk 0, which keeps EMBED + LM_HEAD).
 
 ---
 

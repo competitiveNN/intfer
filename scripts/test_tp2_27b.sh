@@ -1557,6 +1557,121 @@ else
       grep -aq 'if(cancel_stale && req\[s\] != want){ cons\[s\]++; continue; }' "$DCSB/main.cpp" \
         && { echo "GATE FAIL: self-check the arm ACCEPTED a source with the staleness guard removed" >&2; PASS=0; }
       rm -rf "$DCSB"
+# --- INTFER_DRAFT_ASYNC certification (2026-10-19, DFlash sec.1 item 3) ------
+      # The pinned draft ring shipped the RING DISCIPLINE (back-pressure,
+      # handshake, staleness) but the producer stayed SYNCHRONOUS: query_drafts
+      # computed the n-gram draft and read it straight back, so the ring's
+      # producer half had nothing serving it. That missing half IS docs/
+      # DFLASH_ON_NPU.txt sec.1 item 3. INTFER_DRAFT_ASYNC (presence-spelled,
+      # default OFF) starts a REAL producer thread (include/intfer/draft_async.hpp)
+      # serving the ring; the thread runs the SAME ngram_from the shipped path
+      # runs, and a missed deadline falls back to the inline path, so the output
+      # is unchanged and the loop cannot hang.
+      #
+      # This arm is STRUCTURAL for the CLI (no model, no GPU -- the STOP forbids
+      # the run). The MECHANISM is EXECUTED separately, host-only and model-free,
+      # by examples/draft_async_probe: parity vs the synchronous reference,
+      # liveness over 5000 requests, the deadline fallback, and the
+      # superseded-answer rule. A structural grep alone would certify nothing
+      # about whether the thread actually delivers.
+      DA_SRC="$ROOT/examples/intfer_cli/main.cpp"
+      DA_HDR="$ROOT/include/intfer/draft_async.hpp"
+      grep -aqF '[draft-async]' "$DA_SRC" \
+        || { echo "GATE FAIL: no [draft-async] announcement; the seam does not exist" >&2; PASS=0; }
+      grep -aq 'INTFER_DRAFT_ASYNC' "$DA_SRC" \
+        || { echo "GATE FAIL: INTFER_DRAFT_ASYNC is not read" >&2; PASS=0; }
+      grep -aq '#include "intfer/draft_async.hpp"' "$DA_SRC" \
+        || { echo "GATE FAIL: the async producer header is not included" >&2; PASS=0; }
+      # ONE implementation: the thread must run the SAME ngram_from, or the two
+      # paths can diverge and "bit-exact by construction" stops being true.
+      grep -aq 'new intfer::DraftAsyncProducer(ngram_from)' "$DA_SRC" \
+        || { echo "GATE FAIL: the producer does not run the shared ngram_from" >&2; PASS=0; }
+      grep -aq 'draft_producer->request(gen_snap, prompt_snap, tok, K,' "$DA_SRC" \
+        || { echo "GATE FAIL: the async request call site is missing" >&2; PASS=0; }
+      grep -aq 'deadline miss/error: the shipped inline path' "$DA_SRC" \
+        || { echo "GATE FAIL: the deadline-miss fallback to the inline path is missing" >&2; PASS=0; }
+      # Liveness lives in the HEADER: the wait must be deadline-bounded, or a
+      # stalled producer can hang the decode loop.
+      grep -aq 'wait_for(lk, std::chrono::milliseconds(deadline_ms)' "$DA_HDR" \
+        || { echo "GATE FAIL: the producer wait is not deadline-bounded" >&2; PASS=0; }
+      # The header must not pull in SYCL, or the model-free host probe cannot
+      # compile it -- checked by ACTUAL usage, not by the word in a comment.
+      grep -aqE 'sycl::|#include <sycl' "$DA_HDR" \
+        && { echo "GATE FAIL: the async header uses SYCL; the model-free probe cannot build" >&2; PASS=0; }
+      # *** REACHABILITY, and it is not incidental. *** INTFER_DRAFT_ASYNC is a
+      # SUB-FLAG of the pinned path: query_drafts early-returns
+      # `if(!draft_pinned) return ngram_drafts(tok, K);`, so running the async
+      # flag WITHOUT INTFER_DRAFT_SOURCE=pinned reaches no producer thread at
+      # all. A structural arm that only greps for the flag certifies the flag,
+      # not the branch -- the "opt-in flag no gate can reach" class this repo's
+      # census kills. So assert the ordering (pinned guard BEFORE the async
+      # branch) and assert the dependency is RECORDED where a reader sees it,
+      # so the next session cannot "fix" the ordering into a dead flag.
+      # *** ONE DEFINITION, THREE CONSUMERS. *** These three predicates were
+      # first written INLINE and proven only against the healthy source, which
+      # left their negative direction unexercised: an inline predicate that
+      # nothing ever runs against a mutant is a rule fixed at one site and
+      # re-derived (as a weaker inline copy) at another -- the audit-#3 shape
+      # the DECODE1_MR arm's copied arm_ok already cost. They now live ONCE in
+      # da_reachability_ok, called by the healthy-source arm AND by the two
+      # mutants below, so a weakening of either half turns the mutant red by
+      # construction rather than by a copy staying in agreement.
+      da_reachability_ok() { # $1 = source file. 0 = the branch is provably reachable
+        local pin asy
+        pin="$(grep -naF 'if(!draft_pinned) return ngram_drafts(tok, K);' "$1" | head -1 | cut -d: -f1)"
+        asy="$(grep -naF 'if(draft_async){' "$1" | head -1 | cut -d: -f1)"
+        [ -n "${pin:-}" ] && [ -n "${asy:-}" ] || return 1   # presence
+        [ "${pin:-0}" -lt "${asy:-0}" ] 2>/dev/null || return 1  # ordering
+        grep -aq 'meaningful only with the pinned ring' "$1" || return 1  # recorded
+        return 0
+      }
+      da_reachability_ok "$DA_SRC" \
+        || { echo "GATE FAIL: the pinned early-return or the async branch is absent, or the async branch is not downstream of the pinned early-return, or the pinned-only reachability is not recorded at the flag" >&2; PASS=0; }
+      # *** MUTANT 1 -- PURE REORDER. *** Move the pinned early-return BELOW the
+      # async branch, so the async flag ALSO starts a thread on the NON-pinned
+      # path -- the defect the ordering half exists to catch. The LINE IS MOVED,
+      # NOT DELETED: the preflight asserts it still exists exactly once, so a
+      # refusal caused by presence rather than ordering cannot pass for one.
+      DA_M1="$(mktemp -d)"
+      cp "$DA_SRC" "$DA_M1/main.cpp"
+      perl -0777 -pi -e 's/    if\(!draft_pinned\) return ngram_drafts\(tok, K\);\n    \{\n      static bool announced = false;\n/    \{\n      static bool announced = false;\n/s' "$DA_M1/main.cpp"
+      perl -0777 -pi -e 's/(    \} else \{\n      d = ngram_drafts\(tok, K\);\n    \}\n)/$1    if(!draft_pinned) return ngram_drafts(tok, K);\n/s' "$DA_M1/main.cpp"
+      DA_M1_N="$(grep -acF 'if(!draft_pinned) return ngram_drafts(tok, K);' "$DA_M1/main.cpp")"
+      [ "${DA_M1_N:-0}" -eq 1 ] \
+        || { echo "GATE FAIL: self-check mutant-1 builder moved or deleted the pinned early-return (count=$DA_M1_N, want 1); the reorder state proves nothing about the ordering half" >&2; PASS=0; }
+      da_reachability_ok "$DA_M1/main.cpp" \
+        && { echo "GATE FAIL: self-check the arm ACCEPTED the async branch hoisted above the pinned early-return; the ordering half is not enforced" >&2; PASS=0; }
+      rm -rf "$DA_M1"
+      # *** MUTANT 2 -- THE RECORDED DEPENDENCY DELETED. *** Rewrite the flag's
+      # own comment so the pinned-only reachability is no longer recorded where
+      # the next session reads the flag. The pattern names the WHOLE line: a
+      # bare-comma perl no-op'd here once (the comma and the phrase are split
+      # across the comment wrap), which is why the preflight asserts 1 -> 0
+      # rather than trusting the substitution.
+      DA_M2="$(mktemp -d)"
+      cp "$DA_SRC" "$DA_M2/main.cpp"
+      DA_M2_BEFORE="$(grep -acF 'meaningful only with the pinned ring' "$DA_M2/main.cpp")"
+      [ "${DA_M2_BEFORE:-0}" -eq 1 ] \
+        || { echo "GATE FAIL: self-check mutant-2 builder preflight: the dependency sentence is absent (count=$DA_M2_BEFORE, want 1)" >&2; PASS=0; }
+      perl -0777 -pi -e 's/  \/\/ meaningful only with the pinned ring\) starts a REAL producer thread serving/  \/\/ starts a REAL producer thread serving/s' "$DA_M2/main.cpp"
+      DA_M2_AFTER="$(grep -acF 'meaningful only with the pinned ring' "$DA_M2/main.cpp")"
+      [ "${DA_M2_AFTER:-0}" -eq 0 ] \
+        || { echo "GATE FAIL: self-check mutant-2 builder perl no-opted (dependency sentence still present, count=$DA_M2_AFTER, want 0)" >&2; PASS=0; }
+      da_reachability_ok "$DA_M2/main.cpp" \
+        && { echo "GATE FAIL: self-check the arm ACCEPTED a source that no longer records the pinned-only reachability at the flag" >&2; PASS=0; }
+      rm -rf "$DA_M2"
+      # *** REFUSAL DIRECTION, ON A TEMP COPY OF main.cpp. *** Drop the fallback
+      # so a deadline miss leaves the draft empty -- the "the flag reads but a
+      # miss silently changes the output" defect. The arm must refuse it.
+      DASB="$(mktemp -d)"
+      cp "$DA_SRC" "$DASB/main.cpp"
+      perl -0777 -pi -e 's/d = ngram_drafts\(tok, K\);  \/\/ deadline miss\/error: the shipped inline path/noop_removed_fallback();  \/\/ fallback removed/s' "$DASB/main.cpp"
+      DA_FB_NOW="$(grep -ac 'deadline miss/error: the shipped inline path' "$DASB/main.cpp")"
+      [ "${DA_FB_NOW:-0}" -eq 0 ] \
+        || { echo "GATE FAIL: self-check builder perl no-op'd (fallback intact)" >&2; PASS=0; }
+      grep -aq 'deadline miss/error: the shipped inline path' "$DASB/main.cpp" \
+        && { echo "GATE FAIL: self-check the arm ACCEPTED a source with the deadline fallback removed" >&2; PASS=0; }
+      rm -rf "$DASB"
 # --- INTFER_LMHEAD_DEVARGMAX_TP2 certification (2026-10-16) ------------------
       # The scalar device-argmax hook (run_lm_head_best) was TP=1 ONLY: the
       # TP2+DPAS arm flaked (dev1 tiles read inf, torn (d,t) partials) so every

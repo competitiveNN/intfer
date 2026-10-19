@@ -48,23 +48,57 @@ std::vector<QuantConfig> default_candidates(TensorRole role) {
     case TensorRole::ATTN_Q:
     case TensorRole::ATTN_K:
     case TensorRole::ATTN_V:
-    case TensorRole::ATTN_O:
-    case TensorRole::MLP_GATE:
-    case TensorRole::MLP_UP:
-    case TensorRole::MLP_DOWN:
-    case TensorRole::LINEAR_ATTN_QKV:
-    case TensorRole::LINEAR_ATTN_Z:
-    case TensorRole::LINEAR_ATTN_B:
-    case TensorRole::LINEAR_ATTN_A:
-    case TensorRole::LINEAR_ATTN_OUT:
-      // Bulk of params -> INT2 target; FP16 escape at the end.
-      // LINEAR_ATTN_B and _A have tiny N (n_v_heads ~16-64) and
-      // unrotated scalars, so we keep them at INT4/INT8 floor; DASH-Q
-      // will still try the lower bit-widths in the candidate set.
+      // Input projections: first layer forced >= INT4 by RCO, so an FP16
+      // escape is offered as the last resort (src/quant_spec.cpp:120-131).
       out.push_back(mk(QuantScheme::INT2, 16));
       out.push_back(mk(QuantScheme::INT2, 32));
       out.push_back(mk(QuantScheme::INT4, 64));
       out.push_back(mk(QuantScheme::INT8, 32));
+      out.push_back(mk(QuantScheme::FP16, 0, false, ActScheme::FP16));
+      break;
+    case TensorRole::ATTN_O:
+    case TensorRole::MLP_GATE:
+    case TensorRole::MLP_UP:
+    case TensorRole::MLP_DOWN:
+      // Bulk of params -> INT2 target, NO FP16 escape: offering one is what
+      // let RCO hand the whole model back un-quantized
+      // (src/quant_spec.cpp:132-141).
+      out.push_back(mk(QuantScheme::INT2, 16));
+      out.push_back(mk(QuantScheme::INT2, 32));
+      out.push_back(mk(QuantScheme::INT4, 64));
+      out.push_back(mk(QuantScheme::INT8, 32));
+      break;
+    // LINEAR_ATTN_* arms MIRROR src/quant_spec.cpp -- the file that actually
+    // produced Qwen3.8-27B-int2.intifer -- as of 2026-10-18. Port the DECISION
+    // and re-spell the arguments: this mk() is (sch, g, glob, act) while the real
+    // one is (sch, g, act, glob), so copying a call site between the two files
+    // silently writes an ActScheme into a bool.
+    case TensorRole::LINEAR_ATTN_QKV:
+    case TensorRole::LINEAR_ATTN_Z:
+    case TensorRole::LINEAR_ATTN_OUT:
+      // NO FP16 rung, deliberately: offering one is what let the budget search
+      // hand the whole tensor back un-quantized, and these three roles are
+      // 56.8% of the shipped model's bytes. g32 is offered BEFORE g16 because
+      // the XMX path stages one BK=32 tile per joint_matrix step and reads ONE
+      // scale per group, so g32 is exactly one group per tile (g16 doubles the
+      // scale traffic, g64 spans two tiles).
+      out.push_back(mk(QuantScheme::INT2, 32));
+      out.push_back(mk(QuantScheme::INT2, 16));
+      out.push_back(mk(QuantScheme::INT4, 64));
+      out.push_back(mk(QuantScheme::INT8, 32));
+      break;
+    case TensorRole::LINEAR_ATTN_A:
+    case TensorRole::LINEAR_ATTN_B:
+      // N = n_v_heads ~16-64 unrotated scalars: too small for INT2 to pay
+      // (48 codes per row against a scale row of 5120/32 FP16), and
+      // precision-critical gate inputs. INT4 floor ONLY -- before these arms
+      // existed the comment above claimed exactly this while the grouped case
+      // actually handed them INT2.
+      out.push_back(mk(QuantScheme::INT4, 64));
+      out.push_back(mk(QuantScheme::INT8, 32));
+      break;
+    case TensorRole::LINEAR_ATTN_CONV:
+      // conv1d (conv_k, conv_dim) is not a Linear; stays elementwise-exact.
       out.push_back(mk(QuantScheme::FP16, 0, false, ActScheme::FP16));
       break;
     case TensorRole::NORM:

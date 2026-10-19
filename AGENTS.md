@@ -1588,6 +1588,33 @@ keeps only live directives; the full decision record (staleness cancellation,
 want/req tagging, refuse+retire, announcement, gate arm + refusal direction)
 lives there. [DANGLING 2026-10-18: HISTORY.md was truncated and this section's BODY no longer exists -- the banner near the top of HISTORY.md ("The 11 dated entries whose HISTORY.md detail is gone") is the record, and it instructs that these titles must not be quoted as if HISTORY.md carried them. This summary is now the surviving record; re-derive the detail from source, never invent it.]
 
+## INTFER_DRAFT_ASYNC — the async draft producer, DFlash2 sec.1 item 3 (2026-10-19)
+
+Presence-spelled, default OFF, and **a SUB-FLAG of `INTFER_DRAFT_SOURCE=pinned`**:
+`query_drafts` early-returns `if(!draft_pinned)` (`examples/intfer_cli/main.cpp:11466`)
+BEFORE the async branch (`:11508`), so the flag alone starts no thread. Starts a
+REAL producer thread (`include/intfer/draft_async.hpp`, header-only, SYCL-free so
+the mechanism is executable model-free) running the SAME `ngram_from` the inline
+path calls, with a deadline-bounded wait and inline fallback on a miss or a throw,
+so a stalled producer cannot hang the decode loop and cannot change a token. The
+`seq_`-keyed predicate drops a late answer to an ABANDONED request at the publish
+site rather than handing it to the wrong caller. Execution evidence is
+model-free and GPU-free (`examples/draft_async_probe`, 8 host-only predicates):
+parity vs the synchronous reference, liveness over 5000 sequential requests, the
+deadline fallback returning AT the bound rather than blocking, and the
+superseded-answer rule. **The defect the gate arm exists for is REACHABILITY, not
+arithmetic** — a structural grep certifies the flag, not the branch — so the arm
+derives both anchors' line numbers and requires the pinned guard to precede the
+async branch, with two in-arm mutants (pure reorder; deletion of the
+recorded-dependency sentence) each carrying a builder preflight, and the three
+predicates living ONCE in `da_reachability_ok` so a weakening turns the mutant
+red by construction. Announcement `[draft-async] producer-thread ring=2-slot
+deadline_ms=50`. HOST-SIDE (no numerics contract) and UNMEASURED by rule: no
+device round trip added or removed, so `nk`/`nw`/`nr` have nothing to attribute;
+decide on an operator-only 27B `--tp 2` A/B, never on a tok/s. Full record:
+HISTORY.md "2026-10-19: INTFER_DRAFT_ASYNC" and the `SHIPPED 2026-10-19` entry in
+`engines_sources.txt`.
+
 ## Drop 0.8B — DECISIVE POSITION (2026-10-16)
 
 Moved to HISTORY.md ("2026-10-16: 0.8B removed from code defaults/paths"). This

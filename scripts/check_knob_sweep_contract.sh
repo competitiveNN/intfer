@@ -15,12 +15,18 @@
 # guards at source, with no execution and no GPU -- and the sweep's own numbers
 # stay UNMEASURED on purpose, for the operator.
 #
-# THE TWELVE PREDICATES. Each refuses the shape of a defect that was actually
+# THE FOURTEEN PREDICATES. Each refuses the shape of a defect that was actually
 # planted and measured (mutate_knob_sweep_contract.sh). The count is DERIVED, not
-# remembered: it must equal the number of `note p_` sites this file emits and the
-# `evaluated=` line below, which is what the stale "ELEVEN" here actually was -- the
-# list had twelve entries and the title disagreed with itself:
+# remembered: the `preds=` tally below counts the `note p_` sites THIS file emits,
+# and is asserted against the literal in the `if [ "$preds" -ne N ]` test and the
+# `evaluated=` line, so a predicate added without bumping both cannot grade green.
+# THIS LIST WAS ITSELF THE STALE ARTIFACT TWICE, and both are recorded rather than
+# quietly fixed: it read "ELEVEN" above twelve entries, and it still read TWELVE
+# after the THIRTEENTH (p_product_enum) was added without being named here -- the
+# same drift the checker exists to catch, in the checker's own header:
 #   p_knob_catalog   the 3 geometry knobs are the default catalogue (KS-catalog)
+#   p_product_enum   the product ACTUALLY ENUMERATES -- EXECUTED, not grepped (KS-product)
+#   p_knob_consumed  every catalogued knob HAS A CONSUMER -- EXECUTED      (KS-consumed)
 #   p_knob_override  INTFER_SWEEP_KNOBS overrides that catalogue  (KS-override)
 #   p_baseline_first the baseline runs before every combo          (KS-baseline)
 #   p_profile_scrape counters come from [GPU profile @decode]      (KS-scrape)
@@ -94,6 +100,123 @@ for a in 'INTFER_DECODE1_WG:-,16,64,256' \
   fi
 done
 if [ "$cat_ok" -eq 1 ]; then note p_knob_catalog "ok (DECODE1_WG / XMX_WG / LA_CONV_PREP_WG)"; else fails+=(p_knob_catalog); fi
+
+# --- 1b. the Cartesian product ACTUALLY ENUMERATES (EXECUTED, not grepped) -----
+# THE DEFECT THIS EXISTS FOR. The shipped harness's walk() read its values with
+# `while IFS= read -r v` -- a NEWLINE split -- while the documented spec form is
+# comma-separated (`KNOB:-,16,64,256`, per this file's own header). So a knob's
+# whole comma list collapsed into ONE value: PRODUCT held a single entry whose env
+# string was `INTFER_DECODE1_WG=-,16,64,256`, `export` set the knob to that
+# literal, and the CLI's atoi() of it is 0 = the SHIPPED DEFAULT. The sweep then
+# ran ONE arm indistinguishable from the baseline and printed a
+# baseline-relative table of deltas against itself.
+# Every one of the 12 predicates above that existed at the time passed it:
+# they grade "the catalogue names the knobs" and "the field regexes are right",
+# never "the product has more than one arm". A source grep cannot see it --
+# `tr ',' '\n'` and `IFS= read` are both correct-looking in isolation.
+# So this one RUNS the real parse, from the real source, and compares the arm
+# count against the count derived from the spec's own comma lists. A predicate
+# that cannot fail on a one-arm product is not covering the thing that mattered.
+prod_run="$(mktemp "${TMPDIR:-/tmp}/ksprod.XXXXXX")"
+{
+  printf 'set -u\n'
+  printf "DEFAULT_KNOBS='%s'\n" "$(grep -m1 '^DEFAULT_KNOBS=' "$CODE" \
+      | cut -d= -f2- | sed "s/^'//; s/'\$//")"
+  # the real parse block, harvested from the subject so a rewritten walk()
+  # is what gets executed rather than a reconstruction of it
+  printf 'KNOB_SPEC="${INTFER_SWEEP_KNOBS:-$DEFAULT_KNOBS}"\n'
+  sed -n '/^declare -a KNOB_NAMES=()/,/^walk 0 ""/p' "$CODE"
+  printf 'echo "NKNOBS=$NKNOBS"\necho "PRODUCT=${#PRODUCT[@]}"\n'
+  printf 'for i in "${!PRODUCT[@]}"; do echo "ARM[$i]<<${PRODUCT[$i]}>>"; done\n'
+} >"$prod_run"
+# derive the expected arm count from the spec TEXT: one branch per listed value,
+# because walk() emits one branch per value and a "-" branch adds no env pair
+exp=1
+OLDIFS="$IFS"; IFS='|'
+# NOTE: grep the FILE ($CODE), never `printf '%s\n' "$CODE" | grep` -- that pipes
+# the mktemp PATH as text, matches nothing, and leaves exp at 1, which reads as
+# "the spec derives one arm" and fails a healthy product. Hit once already.
+for pair in $(grep -m1 '^DEFAULT_KNOBS=' "$CODE" | cut -d= -f2-); do
+  n="$(printf '%s' "${pair#*:}" | awk -F, '{print NF}')"
+  exp=$((exp * n))
+done
+IFS="$OLDIFS"
+if bash "$prod_run" >"$prod_run.out" 2>"$prod_run.err"; then
+  nk="$(sed -n 's/^NKNOBS=//p' "$prod_run.out")"
+  nprod="$(sed -n 's/^PRODUCT=//p' "$prod_run.out")"
+  if [ "${nprod:-0}" -gt 1 ] && [ "${exp:-0}" -gt 1 ] \
+     && [ "$nprod" -eq "$exp" ]; then
+    note p_product_enum "ok (EXECUTED: $nk knob(s) -> $nprod arm(s), matches the"
+    note "" "             derived count $exp; a one-arm product would FAIL here)"
+  else
+    note p_product_enum "FAIL -- the harness's own parse yields $nprod arm(s) from"
+    note "" "             $nk knob(s) while the spec derives $exp. A product that"
+    note "" "             does not enumerate runs one arm against itself and still"
+    note "" "             prints a baseline-relative table -- the exact vacuity this"
+    note "" "             checker's other 13 predicates could not see."
+    fails+=(p_product_enum)
+  fi
+else
+  note p_product_enum "FAIL -- the harness's own parse could not be executed:"
+  sed 's/^/        /' "$prod_run.err" | head -3
+  fails+=(p_product_enum)
+fi
+rm -f "$prod_run" "$prod_run.out" "$prod_run.err"
+
+# --- 1c. every catalogued knob HAS A CONSUMER, proved by EXECUTING the harvest --
+# THE DEFECT CLASS THIS EXISTS FOR. A knob the catalogue enumerates that NO source
+# file reads is an INERT ARM GENERATOR: the product still enumerates (so
+# p_product_enum is satisfied), all three shipped names are still present (so
+# p_knob_catalog is satisfied), every arm exports a value for a flag nothing reads,
+# every arm then runs the IDENTICAL shipped default -- and the sweep prints a
+# confident baseline-relative table of deltas against itself. That is the same
+# vacuous-but-green shape as the one-arm product, one layer further out, and
+# knob_sweep.sh cannot refuse it: its spec parser validates only that a knob NAME
+# is non-empty, never that anything consumes it. INTFER_SWEEP_KNOBS makes the case
+# reachable without editing this harness at all, so an operator sweeping a retired
+# or typo'd knob gets N arms and no warning.
+# WHY THE SEARCH INCLUDES examples/ AND include/, and not src/ alone: the four
+# DFlash draft knobs the HISTORY.md runbook sweeps
+# (INTFER_DRAFT_SOURCE/_ASYNC/_CANCEL_STALE/_SCORE_POLICY) are all read in
+# examples/intfer_cli/main.cpp, so a src/-only predicate would REDDEN the operator
+# runbook this checker's sibling section documents -- a checker wrong about its own
+# subject is worse than the gap it was written to close. MEASURED, not assumed:
+# all six DFlash/SPEC knob names resolve in examples/, all three geometry knobs
+# resolve in src/gemm/quant_gemm.cpp.
+cons_spec="$(grep -m1 '^DEFAULT_KNOBS=' "$CODE" | cut -d= -f2- | sed "s/^'//; s/'\$//")"
+cons_ok=1; cons_n=0; cons_bad=""
+if [ -n "$cons_spec" ]; then
+  OLDIFS3="$IFS"; IFS='|'
+  # shellcheck disable=SC2206
+  read -ra CONS_PAIRS <<<"$cons_spec"
+  IFS="$OLDIFS3"
+  for ck in "${CONS_PAIRS[@]}"; do
+    cn="${ck%%:*}"
+    [ -n "$cn" ] || continue
+    cons_n=$((cons_n + 1))
+    chits="$(grep -rlF --include='*.cpp' --include='*.hpp' "getenv(\"$cn\")" \
+            "$ROOT/src" "$ROOT/examples" "$ROOT/include" 2>/dev/null | wc -l)"
+    if [ "$chits" -lt 1 ]; then
+      cons_ok=0; cons_bad="$cons_bad $cn"
+    fi
+  done
+fi
+if [ "$cons_ok" -eq 1 ] && [ "$cons_n" -ge 1 ]; then
+  note p_knob_consumed "ok (EXECUTED: all $cons_n catalogued knob(s) have a getenv"
+  note "" "                   reader under src/ examples/ include/; an inert arm"
+  note "" "                   generator would FAIL here despite a real product)"
+elif [ "$cons_n" -lt 1 ]; then
+  note p_knob_consumed "FAIL -- harvested ZERO knobs from DEFAULT_KNOBS;"
+  note "" "                   'every knob is consumed' is vacuously true of an"
+  note "" "                   empty catalogue, which must not read as a pass"
+  fails+=(p_knob_consumed)
+else
+  note p_knob_consumed "FAIL -- no source file reads:$cons_bad"
+  note "" "                   Every arm exports a value for that flag and nothing"
+  note "" "                   reads it, so all N arms run the identical shipped"
+  note "" "                   default and the table reports deltas against itself"
+  fails+=(p_knob_consumed)
+fi
 
 # --- 2. the catalogue is env-overridable, and the override is the spec --------
 if grep -Fq 'KNOB_SPEC="${INTFER_SWEEP_KNOBS:-$DEFAULT_KNOBS}"' "$CODE" \
@@ -268,7 +391,21 @@ else
   fails+=(p_table)
 fi
 
-evaluated=12
+# p_product_enum was added 2026-10-19 (the one-arm-product defect) and
+# p_knob_consumed the same day (the inert-consumer product). The count is
+# DERIVED from the `note p_*` sites above and asserted against the literal, so a
+# predicate added without bumping anything grades green only if it is also named
+# here -- and a name added here with no site is a vacuous predicate the same way.
+# count the sites in THIS checker, not in the subject it grades
+preds="$(grep -o 'note p_[a-z_]* ' "${BASH_SOURCE[0]}" 2>/dev/null | sort -u | wc -l)"
+if [ "$preds" -ne 14 ]; then
+  echo "KS-CONTRACT: FAIL -- this checker derives $preds distinct p_* predicate(s)"
+  echo "                but asserts 14; the literal and the sites have drifted, so"
+  echo "                neither can be trusted and the count must be reconciled"
+  echo "RESULT: FAIL"
+  exit 1
+fi
+evaluated=14
 echo "KS-CONTRACT: evaluated $evaluated predicate(s) on $(basename "$SUBJ")"
 if [ "${#fails[@]}" -eq 0 ]; then
   echo "KS-CONTRACT: PASS (all $evaluated predicates hold)"

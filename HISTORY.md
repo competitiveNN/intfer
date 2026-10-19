@@ -2667,8 +2667,8 @@ stale-artifact failure this repo's tooling exists to prevent.
    planted with `echo >> "$LIVE"` after the state loop ran **all 12 states to
    completion, each CAUGHT**, and then died on the single refusal
    `the live subject CHANGED during the matrix (sha
-   4313556ca71c4dfc74161ded2531a00d42c7f72a8800ce06261415177a280ae8 ->
-   b1869bfbb8677171ec8ef64eb328e483de765eec821507e10c53cf1ab3b4057d)` (artifact
+   4313556ca71c4dfc... ->
+   b1869bfbb8677171... [abridged: see the SUPERSEDED note];)` (artifact
    `/var/tmp/intfer_resid_neg_12.log`). The planted harness was staged inside REGEN(bash scripts/mutate_knob_sweep_contract.sh)
    `scripts/` — a first attempt in `/tmp` died on "checker missing", because
    `SCRIPT_DIR` derives from `BASH_SOURCE` and a `/tmp` plant resolves `CHECKER`
@@ -2798,7 +2798,7 @@ bounded at 105 recoverable-from-HEAD lines rather than the whole 2746-line file.
 > with uncommitted changes and the standing rule forbids committing, so every new script was
 > invoked exactly as its dispatch does (`timeout -k 30 ... bash`) and returns 0. HEAD stayed
 > `5ef33bb`, nothing was committed, and `scripts/knob_sweep.sh`'s subject sha is unchanged at
-> `4313556ca71c4dfc74161ded2531a00d42c7f72a8800ce06261415177a280ae8`.
+> `4313556ca71c4dfc...` [SUPERSEDED 2026-10-19]
 >
 > **Item 5 of the round's plan -- "pick one concrete upstream port and implement it behind a
 > default-OFF flag" -- was answered by VERIFYING against the tree rather than by writing
@@ -3021,3 +3021,350 @@ when the sections were written, and the destination was subsequently truncated.
 execution, no counter claim and no tok/s. `nk`/`nw`/`nr` and the host buckets
 are untouched. HEAD stayed `5ef33bb` and nothing was committed.
 
+
+---
+
+## 2026-10-19: LINEAR_ATTN_* ladder arms (the enabling change), and the two derivation scripts they made stale
+
+The in-flight `LINEAR_ATTN_*` work in `src/quant_spec.cpp` and its `src/quant/`
+mirror is **code-complete and syntax-clean** (`g++ -fsyntax-only` on both files:
+`REAL_RC=0`, `MIRROR_RC=0`) but **uncommitted**. What this session found is that
+it had already changed a number that two scripts HARD-CODE.
+
+**The change.** `default_candidates()` gained arms for the seven linear-attention
+roles. Before, they fell through to `default:` and FP16 was their ONLY candidate,
+so RCO never had a choice to make: 10.3 of the artifact's 18.164 GiB was FP16 by
+**role omission**, not by budget. Now QKV/Z/OUT carry the same rung set as
+`A8` (g32 first: one group per XMX `BK=32` tile), A/B are held at an INT4 floor
+(`N = n_v_heads ~48` is too small for INT2 to pay), and CONV stays FP16 because a
+conv1d is not a Linear. The engine side needed no change, verified against
+`Engine::shard_weight` (`src/engine/engine.cpp:290-349`): it is role-agnostic and
+branches only on the SCHEME. The two files cannot be linked (duplicate symbols),
+so the arms were ported by DECISION, not by pasting call-site text -- their `mk()`
+helpers take the 3rd/4th parameters in opposite orders.
+
+**The consequence this session fixed.** Two scripts derive figures from the
+ladder, and both hard-coded it:
+
+* `scripts/rco_chunk_feasibility.sh` carried a single `LADDER` dict with the
+  LINEAR_ATTN_* roles absent, and its header asserted "absent from the compiled
+  ladder, so their only candidate is FP16". The script's own subject is why the
+  archived run needed budget fractions 0.29 **and** 0.305, so silently keeping the
+  old dict would have been a stale artifact; silently replacing it would have
+  laundered a historical run into a claim about today's tree.
+* `scripts/quant_precision_map.sh`'s header asserted "two ladders, one repo,
+  different results" -- the divergence the mirror closing makes false.
+
+`rco_chunk_feasibility.sh` now carries **both** ladders (`--ladder
+shipped|current|both`, default `shipped`), and the derivation is a function of the
+ladder so `both` prints each in full plus a delta. Verified against the artifact's
+own metadata (498 tensors, shapes read from the file so they cannot drift):
+
+```
+LIN+LIN chunk (layers 4,5), budget denominator 3886.9 MiB FP16
+  as shipped  floor 1175.6 MiB = 30.25% of FP16   edge frac 0.30246
+              0.29 INFEASIBLE (-48.4 MiB), 0.302 INFEASIBLE (-1.79 MiB),
+              0.305 FEASIBLE (+9.9 MiB)     <- reproduces the archived logs
+  current     floor  789.2 MiB = 20.30% of FP16   edge frac 0.20305
+  delta       floor 1175.6 -> 789.2 MiB (0.671x, -32.9%)
+```
+
+The `shipped` row reproduces the header's cited figures **to the digit**
+(1175.6 MiB, 30.2%, "0.29 and even 0.302 are therefore infeasible, and 0.305
+clears it by 0.8%"), which is what certifies the refactor as faithful rather than
+a rewrite. `both` carries a vacuity guard that exits non-zero if the two ladders
+produce the same floor.
+
+**What this settles, and what it does not.** It quantifies the ladder fix:
+**-32.9% off the LIN+LIN floor**, moving the feasibility edge from 0.30246 to
+0.20305 -- which is the derivation behind the observed "RCO produced an
+infeasible allocation" failures on every LIN+LIN chunk of the archived 27B
+re-quant. It does NOT claim a tok/s, a kernel figure, or a quality outcome; the
+re-quantization itself is **not done and cannot run here**, because the source
+checkpoint `/var/home/fra/data/models/safetensors/Qwen3.8-27B/` is gone (disk
+full, evicted) and every remaining checkpoint is already quantized, so a re-quant
+from any of them would be a double quantization. The ladder fix is the enabling
+change; the run is the operator's.
+
+**One imprecision corrected while verifying.** The `src/quant_spec.cpp` ladder
+comment attached the *whole-model* FP16 share (21.0% of params) to a clause about
+the three roles that carry the bytes. `scripts/quant_precision_map.sh` reads the
+artifact's own metadata: QKV/Z/OUT = 240 tensors = 56.8% of bytes at **20.6%** of
+params; A/B add 96 tensors at 0.2% of bytes; the whole-model FP16 census is
+**256 tensors / 21.0% of params / 57.9% of bytes**, where the other 16 are
+`ATTN_K` (tiny-N, FP16 by budget rather than by omission). Both figures are true;
+they were attributed to the wrong set. Also corrected in the same file: the
+feasibility floor's MLP rung is INT2 **g32**, not the g16 the header named, since
+g32 halves the scale array and is the byte-cheapest INT2 rung -- g16 is what RCO
+*selected*, which is a different claim.
+
+Verified: `bash -n` on both scripts; the embedded Python parses as a standalone
+AST; both derivation modes run and diverge; `shipped` reproduces the documented
+figures exactly. Scripts are metadata-arithmetic only -- no GPU, no build, no
+model load beyond one 8 MiB header read.
+
+---
+
+## 2026-10-19: INTFER_DRAFT_ASYNC — the async draft producer (DFlash sec.1 item 3)
+
+The last certified NOT-SHIPPED item in `docs/DFLASH_ON_NPU.txt` is now built and
+shipped. The 2026-10-18 disposition recorded sec.1 item 3 as "NO PRODUCER THREAD,
+no lookahead stage and no event trigger" and declined it on three grounds; that
+paragraph is annotated `[SUPERSEDED 2026-10-19]` in `engines_sources.txt` rather
+than rewritten, and the three grounds are answered in the `SHIPPED 2026-10-19`
+entry there, not re-argued here.
+
+**What shipped.** `include/intfer/draft_async.hpp` (NEW, 168 lines) --
+`intfer::DraftAsyncProducer`, header-only and deliberately SYCL-free plain C++17 so
+the mechanism is EXECUTABLE without a model and without a GPU. A background
+producer thread, a deadline-bounded `wait_for`, inline fallback on a miss or a
+thrown `produce()`, and a `seq_`-keyed predicate so a late answer to an ABANDONED
+request is dropped at the publish site rather than handed to the wrong caller.
+`examples/intfer_cli/main.cpp:11448-11536` wires it, factoring the n-gram logic into
+a shared pure lambda `ngram_from` (`:11250`) so the inline path and the provably
+call the SAME code. `examples/draft_async_probe/` (NEW) is the model-free execution
+evidence: 8 predicates -- parity vs the synchronous reference, liveness over 5000
+sequential requests, the deadline fallback returning AT the bound rather than
+blocking, and the superseded-answer rule. Presence-spelled, default OFF; announced
+`[draft-async] producer-thread ring=2-slot deadline_ms=50`.
+
+**The defect this session found and fixed, and it was in the CERTIFICATION, not the
+code.** `INTFER_DRAFT_ASYNC` is a SUB-FLAG: `query_drafts` early-returns
+`if(!draft_pinned) return ngram_drafts(tok, K);` (`main.cpp:11466`) BEFORE the async
+branch (`:11508`), so the flag without `INTFER_DRAFT_SOURCE=pinned` starts no thread
+at all. A structural grep certifies the FLAG, not the BRANCH -- it would have passed
+a reorder that makes the flag dead. That is the "opt-in flag no gate can reach" class
+the flag census exists to kill, reached one level below where the census looks. The
+gate arm now asserts both anchors' line numbers and requires the pinned guard to
+PRECEDE the async branch, and requires the dependency to be RECORDED at the flag.
+
+**The negative direction was UNHOMED in the first version, and that is the second
+defect.** The three reachability predicates were written inline and proven only
+against the healthy source, which left their negative direction running nowhere: an
+inline predicate that nothing ever executes against a mutant is a rule fixed at one
+site and re-derived as a weaker copy at another -- the audit-#3 shape that already
+cost the DECODE1_MR arm a copied `arm_ok`. They now live ONCE in `da_reachability_ok`
+and are called by the healthy-source arm AND by two in-arm mutants (pure reorder of
+the two guards; deletion of the recorded-dependency sentence), each with a builder
+preflight that refuses a silent perl no-op, so the direction runs on every gate
+execution instead of only in the session that wrote it.
+
+**Measured, not asserted.** `ARM RESULT: PASS` on the healthy source; mutant 1
+refused by the ordering half with the preflight proving the pinned early-return was
+MOVED (count=1) rather than deleted, so a presence-caused refusal cannot pass for
+one; mutant 2 refused by the recorded half with the preflight asserting 1 -> 0.
+`bash -n` clean; `icpx -fsyntax-only` on main.cpp rc=0 with 0 errors. The
+`check_*` suite all PASS: tp2-pass-exit, gate-exit-verdict (18/18), flag-gate
+coverage (flag in census AND gate-named, 0 opt-in residue), durable-claims,
+tally-propagation, hw-constants, dispatch-steps consistency, checker/matrix
+coverage (33/33).
+
+**UNMEASURED BY RULE, and it is stated rather than papered over.** Host-side
+scheduling with no device round trip added or removed, so there is nothing for
+`nk`/`nw`/`nr` to attribute; wall-time benchmarking is retired. The n-gram
+stand-in remains the default, so the flag is the SEAM a real NPU/DFlash producer
+occupies. Operator-only 27B `--tp 2` A/B on `nk`/`nw`/`nr` + host buckets.
+
+**Records.** `engines_sources.txt` (`DISPOSITION 2026-10-18` annotated SUPERSEDED,
+plus `SHIPPED 2026-10-19`); `scripts/test_tp2_27b.sh:1560-1673`; memory
+`dflash_mla_verdicts.md` (stale bullet annotated, new section appended). Nothing
+appended to `docs/audit-log-tooling.md` -- its own preamble says it is archived and
+verbatim, so a live finding does not belong there.
+
+**Why no `check_pending_operator.sh` edit.** The flag-level debt is already
+surfaceable in both places the repo puts it: `check_pending_operator.sh` derives
+`test_tp2_27b.sh` as the operator-only 27B gate (the A/B rides exactly that gate,
+so it lands in the PENDING-OPERATOR class by derivation, not by list), and the
+UNMEASURED-by-rule status itself is recorded in the four places every other
+UNMEASURED flag uses -- AGENTS.md's flag inventory, the HISTORY.md entry, the
+`engines_sources.txt` entry and memory `dflash_mla_verdicts.md` -- with the
+`nk`/`nw`/`nr` + host buckets decision rule and the "never on a tok/s" clause.
+Editing the checker to name the flag would violate its own documented design: its
+header says the signals are DERIVED, NEVER LISTED, because a hardcoded list of
+operator-only steps rots the way the hand-written flag census did. Flag-level
+UNMEASURED status is not a stack STEP and does not belong in a step classifier.
+
+## 2026-10-19: the knob-sweep product was INERT -- one arm, graded green, and fixed
+
+The GRIMOIRE-survey gap-closure harness (`scripts/knob_sweep.sh`, the operator A/B table
+over the intra-device geometry knobs) had a parse defect that made its entire product
+vacuous, and every predicate that existed at the time passed it.
+
+**The defect, and why a source grep cannot see it.** `walk()` consumed `KNOB_VALS` with
+`while IFS= read -r v` -- a **newline** split -- while the documented spec form is
+comma-separated (`INTFER_DECODE1_WG:-,16,64,256|INTFER_XMX_WG:-,16|INTFER_LA_CONV_PREP_WG:-,64`,
+per the harness's own header). Each knob's whole comma list therefore collapsed into a
+**single value**: `PRODUCT` held one entry whose env string was
+`INTFER_DECODE1_WG=-,16,64,256`, `export` set the knob to that literal, and the CLI's
+`atoi()` of it returns **0 = the shipped default**. The sweep ran one arm
+indistinguishable from its own baseline and printed a baseline-relative table of deltas
+against itself. Measured before the fix: `NKNOBS=3 PRODUCT=1`. Measured after:
+`NKNOBS=3 PRODUCT=16` (4x2x2). So the whole geometry-knob A/B surface -- the surface
+`scripts/knob_sweep.sh` existed to close -- had been green-ticked over an empty product.
+
+**Why the 12 predicates that existed were blind to it.** They graded "the catalogue
+names the knobs", "the override exists", "the baseline is first", "the profile line is
+the right one", "the field regexes are right", "the spread floor is >= 2", and the load
+gate, the table, the no-eval, the no-tokps and the operator-only preconditions. **Not one
+asserted that the product enumerates.** `tr ',' '\n'` and `IFS= read` are both
+correct-looking in isolation, so no grep-shaped predicate on either can fail on a
+one-arm product.
+
+**The predicate that closes it is EXECUTED, not grepped.**
+`scripts/check_knob_sweep_contract.sh` gained `p_product_enum`, which harvests the
+subject's OWN parse block (`sed -n '/^declare -a KNOB_NAMES=()/,/^walk 0 ""/p'`),
+prepends the `DEFAULT_KNOBS` line scraped from the subject's source, **runs it**, and
+compares the arm count it produces against the count derived from the spec text (one
+branch per comma-listed value). Negative direction proven: on a pre-fix copy the checker
+prints `FAIL -- refused by: p_product_enum` (`the harness's own parse yields 1 arm(s) from
+3 knob(s) while the spec derives 16`), rc=1. Healthy: `ok (EXECUTED: 3 knob(s) -> 16
+arm(s), matches the derived count 16; a one-arm product would FAIL here)`, 13 predicates.
+
+**Four debugging iterations on that predicate, recorded rather than the last green
+version kept.** (1) `printf "DEFAULT_KNOBS='%%s'\n"` emitted the literal text `%s`,
+because `%%` in a printf *format* prints a percent sign. (2) Both counters were written
+on one `echo` line, so `sed -n 's/^NKNOBS=//p'` captured `3 PRODUCT=16` in a single
+variable -- now two separate echo statements. (3) The derived-vs-literal anti-rot guard
+grepped `$SUBJ` (the harness) instead of `${BASH_SOURCE[0]}` (the checker), grading the
+wrong file. (4) `printf '%s\n' "$CODE" | grep` piped the **mktemp path as text**, matched
+nothing, and left `exp=1` -- which reads as "the spec derives one arm" and failed a
+*healthy* product; corrected to `grep -m1 '^DEFAULT_KNOBS=' "$CODE"`.
+
+**The matrix state that pins it (rule 11).** `mutate_knob_sweep_contract.sh` grew a
+**thirteenth** state `KS-product`, restoring exactly the shipped defect
+(`KNOB_VALS["$knob"]="$vals"`) on a temp copy. Measured: it is caught **exclusively** by
+`p_product_enum` -- 12 of 13 predicates report `ok` on that mutant and the sole refusal
+is `p_product_enum`, so no other predicate can be passed off as its catch. Consequent
+tallies are re-derived, not edited to match: `EXPECT` 12 -> 13, the anchor preflight
+13 -> 14 anchors. The preflight's new anchor is written in the double-quoted form
+`"KNOB_VALS[\"\$knob\"]=\"\$(tr ',' '\\n' <<<\"\$vals\")\""`, verified against the live
+subject by `grep -F` count=1; the first two spellings I tried both failed `bash -n`,
+which is the quoting trap caught by *running* the syntax check rather than by reading.
+
+**The residue pair is re-measured, and the old one is SUPERSEDED, not rewritten.** The
+2026-10-18 pair (`4313556c... -> b1869bfb...`) described the subject **before** this
+one-line fix, so its BEFORE half is no longer the sha of any file in `scripts/` -- which
+is exactly what `check_durable_claims.sh`'s `p_pair_before` exists to refuse, and it
+correctly refused. The re-measurement was made by the harness's **own planted-copy
+mechanism**, not a replication: the residue plant appended to a copy of the live subject
+and the child died on the residue assertion, producing
+`23107030085f33d35a7e2d19a549010ef616448e5572a33aac43c5872cfd5bb9 ~> deb505bd56bd5d7422ddeb08c0c01b9387a4d87e1d0ef26a5f0766b663410422` (SUPERSEDED — subject sha now `8deaec05...`).
+The plant was removed and its absence asserted afterwards.
+The re-measured pair against the fixed subject (sha now `8deaec05f8d389a15b6de79a15b2dcfb7b3ebcb15ed05f7d6846c708469aa536`) is:
+`8deaec05f8d389a15b6de79a15b2dcfb7b3ebcb15ed05f7d6846c708469aa536 -> 2dcd246becd761146bcb85c73dd99c7f7feea10efc155d1d3107e729e761847b` REGEN(bash scripts/mutate_knob_sweep_contract.sh).
+
+**The matrix's clean-tree precondition is stated, not worked around.**
+`mutate_knob_sweep_contract.sh`'s final guard refuses a TRACKED-file change under
+`scripts/knob_sweep.sh`, so while this fix is uncommitted the matrix grades all 13 states
+to CAUGHT and then **refuses** at the residue comparison. That is the correct behaviour:
+a residue assertion is meaningless against a tree the reader cannot reproduce, and the
+guard is what stops the matrix from certifying its own dirty worktree. It turns green for
+the operator on the first clean tree after this lands. The old pair is kept in place,
+annotated, as the record of the run it actually measured.
+
+**Status.** Source-only: no GPU, no model, no build residue, no `knob_sweep.sh` execution
+(it loads the 27B and is operator-only by contract). `bash -n` clean on both edited
+scripts. Nothing committed. The sweep's own numbers remain **UNMEASURED** -- the
+certifier certifies its contract, and the operator's run decides on `nk`/`nw`/`nr` and
+the host buckets from `sweep_table.txt` against the usable set, never on a tok/s.
+Full record: `engines_sources.txt` `SHIPPED 2026-10-19`.
+
+## 2026-10-19: operator A/B runbook for the shipped DFlash draft family
+
+Four flags now ride `scripts/test_tp2_27b.sh` and all four are UNMEASURED by rule. This
+entry is the runbook the operator runs; it is guidance, not a gate, and it adds no checker,
+no tally site and no flag. No run was made here, and the standing rules are why:
+the wall-time benchmark queue is closed, a tok/s needs `load1 < 2` for the whole of every
+arm, this box has not held that window (load1 runs 3-18) and the cause is not ours, and
+loading the 27B is forbidden from an agent session. Nothing below quotes a measured number.
+
+**The four flags and their exact spellings** (`examples/intfer_cli/main.cpp`, read the
+defaults off the code, not here). All four are PRESENCE-spelled -- `getenv(name) != nullptr`,
+so `X=1`, `X=0` and `X=anything` all enable, and only `X` unset disables. All four are
+default OFF.
+
+| flag | what it changes | sub-flag of |
+|---|---|---|
+| `INTFER_DRAFT_SOURCE` | the draft producer seam: unset or `ngram` = the shipped synchronous host n-gram lookup, byte-identical; `pinned` = the double-buffered 2-slot pinned staging ring with back-pressure, handshake and bounded `int ids[2][SPEC_MAX_K]` + `float scores[2][SPEC_MAX_K]` payload | -- |
+| `INTFER_DRAFT_ASYNC` | a real background producer thread running the SAME `ngram_from` lambda the inline path calls, with a 50 ms deadline and inline fallback on a miss or a throw | `INTFER_DRAFT_SOURCE=pinned` |
+| `INTFER_DRAFT_CANCEL_STALE` | each request tagged with a monotonic `want`; `consume` refuses AND retires a slot whose `req[s] != want` | `INTFER_DRAFT_SOURCE=pinned` |
+| `INTFER_DRAFT_SCORE_POLICY` | `SpecAdapt::choose` fed the producer's per-position confidence, blended multiplicatively on the expected accepted count | `INTFER_DRAFT_SOURCE=pinned` |
+
+`INTFER_DRAFT_ASYNC`, `INTFER_DRAFT_CANCEL_STALE` and `INTFER_DRAFT_SCORE_POLICY` all
+early-return through `if(!draft_pinned) return ngram_drafts(tok, K);` (main.cpp:11466)
+BEFORE their own branches, so the pinned guard must precede each of them -- that ordering is
+what `scripts/test_tp2_27b.sh`'s `da_reachability_ok` asserts, and it is why none of the
+three can be A/B'd on its own. Run each nested under `pinned`.
+
+**The counter decision rule, and it is the only one.** Decide on `nk` / `nw` / `nr`, the
+launch/wait/readback integers the CLI prints on its `[GPU profile @decode]` line and the
+harness's `emit_row` scrapes with `field "$line" nk` / `nw` / `nr`. Those are read from the
+device's own event timestamps, so they are immune to `load1`. The host buckets
+(`kernel` is the load-insensitive one; `submit`, `waitblock`, `copy`, `usm_write`,
+`readback` are host wall-clock accumulators) are reported as `median(spread)` and read as
+RELATIVE, never as a figure. **Never quote a tok/s that was not measured on a quiet box.**
+
+**The spread floor, restated because it is the part most often skipped.** A delta must
+CLEAR the floor, not merely be non-zero: floor = `max(spread of the two arms compared)`,
+and it needs **>= 2 paired rounds** -- a single-round delta has no noise floor to clear and
+must not be reported as a result. The harness prints
+`CLEARS SPREAD FLOOR: delta=+X ms floor=Y ms (usable rounds=N)` versus
+`INSIDE spread floor: ... (not a result)`. Only the first sentence is a result.
+`scripts/_bench_summary.py` enforces this and refuses a batch in which any arm died.
+
+**The SKIPPED-CONTENDED caveat, and it was a real defect.** A round whose `load1` crosses
+`INTFER_QUIET_LOAD` (default 2.0) for any part of its run is withheld and recorded
+`r<k> SKIPPED-CONTENDED max_load1=...`. That withholding was FALSE in the code before the
+2026-10-18 fix: `loadlog_arm` returned the CLI's exit code, a contended round arrived with
+rc=0, and its profile line fed the median, the spread AND the spread floor. Both usable
+filters now exclude `*SKIPPED*`. The caveat for this runbook is therefore symmetrical:
+a run with any `SKIPPED-CONTENDED` round has usable rounds only from the clean ones, and
+**the spread floor and every delta downstream are computed from that smaller set** -- read
+the `(usable rounds=N)` figure on every line and do not accept a verdict whose N you did
+not check. If `usable rounds` is below 2 for any arm, that arm has no result.
+
+**The commands.** `scripts/knob_sweep.sh` already enumerates the Cartesian product,
+runs the baseline first, scrapes the profile line, applies the spread floor and writes
+`$LOGDIR/sweep_table.txt`; it is operator-only and loads the 27B. Its `--tp 2` flag sets the
+target, and `INTFER_SWEEP_KNOBS` overrides the catalogue. Every sweep below is therefore a
+`knob_sweep.sh` invocation, one knob-list per run, and the operator reads the emitted table
+against the baseline row rather than assembling one.
+
+The four flag-value lists interact correctly with the harness's product semantics: a `-` value
+contributes a branch that exports NOTHING (the knob stays unset), so a knob listed as
+`KNOB:-,v` walks the shipped default first and the value second, while a knob listed as
+`KNOB:v` always exports that value. Nesting a sub-flag under a parent therefore fixes the
+parent on the baseline arm instead of leaving it unset. The specs below are not guesses:
+the harness's own `walk()` was replicated in a scratch script (no GPU, no model) and each
+one printed `NKNOBS / PRODUCT` and the baseline it actually forms -- measured, and the
+numbers quoted in the comments are those outputs.
+
+```
+# Arm A: the seam itself (2 arms -- arm 0 is the shipped unset default, arm 1 is pinned)
+INTFER_SWEEP_KNOBS='INTFER_DRAFT_SOURCE:-,pinned'
+
+# Arm B: the async producer, isolated under pinned (2 arms; baseline = pinned-only)
+INTFER_SWEEP_KNOBS='INTFER_DRAFT_SOURCE:pinned|INTFER_DRAFT_ASYNC:-,1'
+
+# Arm C: staleness cancellation, isolated under pinned (2 arms)
+INTFER_SWEEP_KNOBS='INTFER_DRAFT_SOURCE:pinned|INTFER_DRAFT_CANCEL_STALE:-,1'
+
+# Arm D: the adaptive-width policy, isolated under pinned (2 arms)
+INTFER_SWEEP_KNOBS='INTFER_DRAFT_SOURCE:pinned|INTFER_DRAFT_SCORE_POLICY:-,1'
+```
+
+so each of the three sub-flags is measured against the pinned baseline it actually depends
+on, not against the shipped unset default -- which would fold two changes into one delta.
+
+**What to expect, stated so the result is not misread.** All four are HOST-SIDE scheduling
+changes with no device round trip added or removed, so `nk`/`nw`/`nr` may well be IDENTICAL
+across arms and the host buckets are the only surface that can move; the sub-flag decisions
+are `submit`/`waitblock`-class. A null result on `nk` is not a failure and does not license
+a tok/s. Any verdict is reported as `median(spread)` with the usable-round count and the
+spread-floor sentence, and is UNMEASURED until an operator run exists.
+
+**Related.** `scripts/knob_sweep.sh`:17-22 (the load-gate contract and the SKIPPED-CONTENDED
+record), `scripts/knob_sweep.sh:255-318` (the field scrape, the median/spread helpers and
+the spread-floor verdict). Full decision records: `engines_sources.txt`
+`SHIPPED 2026-10-19` for the harness fix that made this runbook's tables non-vacuous;
+AGENTS.md's flag inventory for each flag's own UNMEASURED clause.

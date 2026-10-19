@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -x
 # Operator-run knob-sweep A/B for the intra-device geometry knobs:
 #   INTFER_DECODE1_WG, INTFER_XMX_WG, INTFER_LA_CONV_PREP_WG
 #
@@ -35,8 +36,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${INTFER_BUILD_DIR:-$ROOT/build}}"
 BIN="$BUILD_DIR/examples/intfer_cli/intfer_cli"
-MODEL="${1:-${INTFER_MODEL:-${INTFER_08B:-$ROOT/test/models/Qwen3.8-27B-int2.intifer}}}"
+MODEL="${1:-${INTFER_MODEL:-${INTFER_08B:-}}}"
 ROUNDS="${2:-2}"
+if [ -z "$MODEL" ]; then
+  # Prefer the acceptable-size v2 artifact (12.59 GB, ~92% INT4); fall back to the
+  # 19 GB INT2 artifact only if v2 is absent. Keep the repo-relative path as last
+  # resort so a local checkout can still place a model under test/models/.
+  if [ -f "/var/home/fra/data/models/intfer/Qwen3.8-27B-int2-v2.intifer" ]; then
+    MODEL="/var/home/fra/data/models/intfer/Qwen3.8-27B-int2-v2.intifer"
+  elif [ -f "/var/home/fra/data/models/intfer/Qwen3.8-27B-int2.intifer" ]; then
+    MODEL="/var/home/fra/data/models/intfer/Qwen3.8-27B-int2.intifer"
+  else
+    MODEL="$ROOT/test/models/Qwen3.8-27B-int2.intifer"
+  fi
+fi
 
 [ -x "$BIN" ] || { echo "FAIL: cli binary missing: $BIN" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "FAIL: model missing: $MODEL" >&2; exit 1; }
@@ -74,7 +87,18 @@ for p in "${PAIRS[@]}"; do
   [ -n "$vals" ] || { echo "FAIL: no values for knob $knob" >&2; exit 1; }
   KNOBS+=("$knob")
   KNOB_NAMES+=("$knob")
-  KNOB_VALS["$knob"]="$vals"
+  # *** COMMAS, NOT NEWLINES. *** The documented spec form is `KNOB:v1,v2|KNOB:v1,v2`
+  # (the header at the top of this file says so), but KNOB_VALS is consumed by
+  # `while IFS= read -r v`, which splits on NEWLINES ONLY -- so a comma list
+  # collapsed into a SINGLE value: PRODUCT came out with ONE entry whose env
+  # string was `INTFER_DECODE1_WG=-,16,64,256`, `export` set the knob to that
+  # literal, and the CLI's atoi() of it is 0 = the SHIPPED DEFAULT. The sweep
+  # therefore reported one arm that was indistinguishable from the baseline,
+  # printing a baseline-relative table of deltas against itself -- a green tick
+  # over an empty product, which is the vacuity failure mode in the very tool
+  # built to close a different one. Split here so the comment two lines above
+  # ("KNOB -> newline-separated values") becomes TRUE rather than aspirational.
+  KNOB_VALS["$knob"]="$(tr ',' '\n' <<<"$vals")"
 done
 NKNOBS=${#KNOBS[@]}
 

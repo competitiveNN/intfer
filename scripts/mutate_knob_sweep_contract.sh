@@ -36,6 +36,8 @@
 #   KS-tokps     print a tok/s                            -> p_no_tokps
 #   KS-precond   drop gate_require_gpus 2                 -> p_operator_only
 #   KS-table     stop tee-ing the durable table           -> p_table
+#   KS-product   the comma/newline parse collapse (one arm) -> p_product_enum
+#   KS-consumed  a catalogued knob nothing READS           -> p_knob_consumed
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -173,6 +175,38 @@ def main():
     elif state == 'KS-table':
         # the table exists only on the terminal and cannot be re-derived
         s = sub(s, '} | tee "$LOGDIR/sweep_table.txt"', '} | cat', what='tee anchor')
+
+    elif state == 'KS-product':
+        # THE SHIPPED DEFECT, restored: KNOB_VALS keeps the raw comma list while
+        # walk() reads with `while IFS= read -r v`, a NEWLINE split. Each knob's
+        # whole list then collapses to ONE value, PRODUCT holds one arm whose env
+        # string is `INTFER_DECODE1_WG=-,16,64,256`, the CLI's atoi() of that is 0
+        # (the SHIPPED DEFAULT), and the sweep runs one arm indistinguishable from
+        # the baseline -- a baseline-relative table of deltas against itself.
+        # Deliberately the ONLY mutation no grep-based predicate can see: the
+        # catalogue is intact, the override is intact, the scrape/fields/floor are
+        # intact, and both the comma list and `IFS= read` look correct in
+        # isolation. p_product_enum is the predicate that RUNS the parse, so it
+        # alone must refuse this state.
+        s = sub(s, 'KNOB_VALS["$knob"]="$(tr \',\' \'\\n\' <<<"$vals")"',
+                'KNOB_VALS["$knob"]="$vals"', what='comma->newline split')
+
+    elif state == 'KS-consumed':
+        # A catalogued knob that NOTHING READS -- an inert arm generator. The
+        # catalogue keeps all three shipped names (p_knob_catalog stays green) and
+        # the product still enumerates: 4x2x2x3 = 24 arms, exactly the count the
+        # spec text derives (p_product_enum stays green). The fourth knob exports
+        # a value for a flag no source file reads, so all 24 arms run the
+        # IDENTICAL shipped default and the sweep prints a baseline-relative table
+        # of deltas against itself. Deliberately the only state p_knob_consumed can
+        # refuse, and the reason that predicate searches examples/ and include/
+        # too: a src/-only version would still catch this state but would ALSO
+        # redden the DFlash runbook's knobs, which live in
+        # examples/intfer_cli/main.cpp.
+        s = sub(s,
+                "DEFAULT_KNOBS='INTFER_DECODE1_WG:-,16,64,256|INTFER_XMX_WG:-,16|INTFER_LA_CONV_PREP_WG:-,64'",
+                "DEFAULT_KNOBS='INTFER_DECODE1_WG:-,16,64,256|INTFER_XMX_WG:-,16|INTFER_LA_CONV_PREP_WG:-,64|INTFER_NOPE_WG:-,16,256'",
+                what='inert catalogue knob')
 
     else:
         sys.stderr.write('unknown state %s\n' % state)
@@ -459,11 +493,13 @@ for a in 'INTFER_XMX_WG:-,16|' \
          '    for kv in "$@"; do' \
          'echo "raw logs: $LOGDIR"' \
          'gate_require_gpus 2 || exit 2' \
-         '} | tee "$LOGDIR/sweep_table.txt"'; do
+         '} | tee "$LOGDIR/sweep_table.txt"' \
+         "DEFAULT_KNOBS='INTFER_DECODE1_WG:-,16,64,256|INTFER_XMX_WG:-,16|INTFER_LA_CONV_PREP_WG:-,64'" \
+         "KNOB_VALS[\"\$knob\"]=\"\$(tr ',' '\\n' <<<\"\$vals\")\""; do
   n="$(grep -c -F -- "$a" "$LIVE")"
   if [ "$n" -lt 1 ]; then die "anchor absent from the live subject: $a"; fi
 done
-echo "KS-MUT: anchor preflight ok (13 anchors)"
+echo "KS-MUT: anchor preflight ok (15 anchors)"
 
 # ---- BASELINE. The unmutated subject must PASS the checker, or every "caught"
 #      below is indistinguishable from a checker that refuses everything.
@@ -479,9 +515,10 @@ BEFORE="$(sha256sum "$LIVE" | cut -d' ' -f1)"
 
 STATES_REAL=0
 STATES_CAUGHT=0
-EXPECT=12
+EXPECT=14
 for st in KS-catalog KS-override KS-baseline KS-scrape KS-fields KS-floor \
-          KS-loadgate KS-guardafter KS-eval KS-tokps KS-precond KS-table; do
+          KS-loadgate KS-guardafter KS-eval KS-tokps KS-precond KS-table \
+          KS-product KS-consumed; do
   f="$SANDBOX/$st.sh"
   cp -f "$LIVE" "$f"
   if ! python3 "$SANDBOX/mut.py" "$st" "$f" >"$SANDBOX/$st.land" 2>&1; then
