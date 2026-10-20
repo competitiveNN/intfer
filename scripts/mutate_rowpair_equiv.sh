@@ -18,6 +18,21 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT" || exit 2
 . "$SCRIPT_DIR/_gate_patch.sh"
 
+# ENVIRONMENT, NOT BOX STATE -- and not a code defect either. setup_state() configures
+# a per-state CMake tree with -DCMAKE_CXX_COMPILER=icpx, so this matrix cannot run in a
+# shell that never sourced setvars.sh: MEASURED 2026-10-19 standalone, every state read
+# "configure failed" / "MISSED baseline" with rc=1. That is an UNPREPARED SHELL, and the
+# report for it is "source setvars.sh", never "the matrix is broken". run_all_checks.sh
+# does NOT source it (it relies on the caller), so this matrix only ever ran because the
+# operator had already done so by hand.
+#
+# The `set +u` dance is verbatim from check_e2_ctx.sh:42 / gate_inventory.sh:39 -- setvars.sh
+# is not nounset-clean and aborts this script under its own `set -u` at line 14. Guarded on
+# `command -v icpx` so an already-prepared shell is not sourced twice.
+if ! command -v icpx >/dev/null 2>&1; then
+  set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u
+fi
+
 GATE="scripts/test_rowpair_equiv.sh"
 SRC="src/gemm/quant_gemm.cpp"
 BUILD="${INTFER_BUILD_DIR:-$ROOT/build}"
