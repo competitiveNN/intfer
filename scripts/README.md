@@ -53,7 +53,7 @@ build if a file moves, and none of them is a stylistic preference.**
    `check_checker_matrix_coverage.sh:31-32`,
    `check_gate_exit_verdict.sh:36-37`, `run_ten_gates.sh`'s `GATE_GLOB`,
    `check_pending_operator.sh:38`, `mutate_e2_ctx.sh:3`,
-   `check_scripts_live.sh:35`. A subdirectory removes a file from its family
+   `check_scripts_live.sh:83`. A subdirectory removes a file from its family
    *without deleting it* — which is exactly what `archive/` is for.
 
 2. **`check_scripts_live.sh` enumerates at `-maxdepth 1`** (`:83`). Its own
@@ -64,11 +64,12 @@ build if a file moves, and none of them is a stylistic preference.**
 
 3. **`check_durable_claims.sh` `p_target_exists` / `p_pair_hook`** (`:43`) require
    every `REGEN(...)` marker and every sha pair to name a script that **exists in
-   `scripts/`**. ~150 live `REGEN(bash scripts/<name>.sh)` markers in `AGENTS.md`
-   and `HISTORY.md` would all break.
+   `scripts/`**. 24 live `REGEN(...)` markers in `AGENTS.md` and `HISTORY.md` —
+   23 of them naming one of 16 distinct scripts — would all break. Re-derive with
+   `grep -ohE 'REGEN\([^)]*scripts/[A-Za-z0-9_.-]+\.sh' AGENTS.md HISTORY.md`.
 
-4. **`HISTORY.md` carries ~108 `scripts/...` citations, and rewriting a true
-   historical record to point at today's path is the laundering failure
+4. **`HISTORY.md` carries 125 `scripts/...` citations over 48 distinct files, and
+   rewriting a true historical record to point at today's path is the laundering failure
    `AGENTS.md` explicitly refuses.** Moving files would either rewrite history or
    leave citations that cannot be re-derived.
 
