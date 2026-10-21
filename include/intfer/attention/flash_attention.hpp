@@ -19,7 +19,7 @@
 // device softmax-attention kernel on any path: the 27B decodes
 // through the GatedDeltaNet SSM recurrence (host fallback,
 // main.cpp:5180-5210) and the is_full softmax decode is host-only
-// scalar (main.cpp:4948-4970). Do not mistake these kernels for a
+// scalar (main.cpp:5580-5622). Do not mistake these kernels for a
 // reachable decode path -- a device paged-KV softmax-decode kernel
 // does not exist in this tree, so GQA head-group packing (vllm-xpu
 // decode_policy_qpacked_head) has nothing to attach to.
