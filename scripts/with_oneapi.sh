@@ -12,7 +12,7 @@
 # So this is the "prefix one command" form. It resolves the ACTIVE compiler
 # version's lib dir only, because globbing every installed compiler is what
 # produces a libur_loader/libsycl version clash -- the same reasoning, and nearly
-# the same code, as scripts/run.sh (which execs hello_sycl) and scripts/build.sh.
+# the same code, as scripts/run/run.sh (which execs hello_sycl) and scripts/build.sh.
 # That duplication is deliberate and bounded; if you change the resolution rule,
 # change all three together.
 #

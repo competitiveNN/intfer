@@ -42,17 +42,17 @@ if ! command -v sycl-ls >/dev/null 2>&1; then
 fi
 
 # The shared vacuity guard: a checker that cannot harvest its subject cannot
-# certify it. Sourced, not executed (sibling of scripts/_gate_precond.sh).
+# certify it. Sourced, not executed (sibling of scripts/lib/_gate_precond.sh).
 # Placed AFTER the oneAPI-env block -- a first version landed INSIDE it, so it
 # was sourced only when sycl-ls happened to be missing from PATH, and the call
 # site 400 lines later failed with "command not found" on the normal path.
 # A guard sourced conditionally is a guard that is usually absent.
-# shellcheck source=scripts/_gate_enum.sh
-. "$SCRIPT_DIR/_gate_enum.sh"
+# shellcheck source=scripts/lib/_gate_enum.sh
+. "$SCRIPT_DIR/lib/_gate_enum.sh"
 enum_reset
 
-GATES=$(ls scripts/test_*.sh 2>/dev/null | sort)
-[ -n "$GATES" ] || { echo "FAIL: no scripts/test_*.sh found" >&2; exit 1; }
+GATES=$(ls scripts/gates/test_*.sh 2>/dev/null | sort)
+[ -n "$GATES" ] || { echo "FAIL: no scripts/gates/test_*.sh found" >&2; exit 1; }
 
 # --- CODE vs COMMENT (audit #14) ---------------------------------------------
 # Both classification columns used to grep the RAW file. A gate's own explanatory
@@ -172,7 +172,7 @@ selfcheck_classifier() {
   # audit-#13 defect shape, verbatim in structure: whole-gate require retained
   # while the per-arm machinery is still present.
   cat >"$tmp" <<'GATE'
-. "$SCRIPT_DIR/_gate_precond.sh"
+. "$SCRIPT_DIR/lib/_gate_precond.sh"
 gate_require_gpus 2 || exit 2
 N_GPUS="$(gate_gpu_count)" || N_GPUS=0
 HAVE_TP2=0; [ "$N_GPUS" -ge 2 ] && HAVE_TP2=1
@@ -182,7 +182,7 @@ GATE
   [ "$w" = "WHOLE-gate" ] || { echo "SELFCHECK: audit-#13 shape misread as '$w'" >&2; bad=1; }
   # a real per-arm gate must NOT be read as whole-gate
   cat >"$tmp" <<'GATE'
-. "$SCRIPT_DIR/_gate_precond.sh"
+. "$SCRIPT_DIR/lib/_gate_precond.sh"
 N_GPUS="$(gate_gpu_count)" || N_GPUS=0
 HAVE_TP2=0; [ "$N_GPUS" -ge 2 ] && HAVE_TP2=1
 GATE
@@ -191,7 +191,7 @@ GATE
   [ "$p" = "per-arm" ] || { echo "SELFCHECK: per-arm gate misread as '$p'" >&2; bad=1; }
   # the real whole-gate gate must be seen as whole-gate
   cat >"$tmp" <<'GATE'
-. "$SCRIPT_DIR/_gate_precond.sh"
+. "$SCRIPT_DIR/lib/_gate_precond.sh"
 gate_require_gpus 2 || exit 2
 GATE
   strip_comments "$tmp" >"$tmp.c"
@@ -200,7 +200,7 @@ GATE
   # a PROSE mention of the token must not create a precondition (the bug)
   cat >"$tmp" <<'GATE'
 # an earlier revision put a `gate_require_gpus 2 || exit 2` here, which was wrong
-. "$SCRIPT_DIR/_gate_precond.sh"
+. "$SCRIPT_DIR/lib/_gate_precond.sh"
 N_GPUS="$(gate_gpu_count)" || N_GPUS=0
 GATE
   strip_comments "$tmp" >"$tmp.c"
@@ -211,7 +211,7 @@ GATE
   # the anchor and it flips to WHOLE-gate, i.e. an equivalent mutation on the
   # real gates becomes a caught one here.
   cat >"$tmp" <<'GATE'
-. "$SCRIPT_DIR/_gate_precond.sh"
+. "$SCRIPT_DIR/lib/_gate_precond.sh"
 need_tp2() { gate_require_gpus 2 || exit 2; }
 N_GPUS="$(gate_gpu_count)" || N_GPUS=0
 GATE
@@ -223,7 +223,7 @@ GATE
   # so without it a mutation disabling the MISSING branch is EQUIVALENT and
   # would silently pass.
   cat >"$tmp" <<'GATE'
-. "$SCRIPT_DIR/_gate_build.sh"
+. "$SCRIPT_DIR/lib/_gate_build.sh"
 gate_require_build intfer_cli || exit 1
 setsid nohup "$BIN" -m "$MODEL" --gpu --tp 1 --serve-http &
 GATE
@@ -232,7 +232,7 @@ GATE
   [ "$r" = "MISSING" ] || { echo "SELFCHECK: unguarded GPU gate read '$r', want MISSING" >&2; bad=1; }
   # ...and the same gate WITH the guard must read render-node, so the case is not
   # satisfied by a function that always says MISSING.
-  printf '. "$SCRIPT_DIR/_gate_precond.sh"\ngate_require_render_node || exit 2\n' >>"$tmp"
+  printf '. "$SCRIPT_DIR/lib/_gate_precond.sh"\ngate_require_render_node || exit 2\n' >>"$tmp"
   strip_comments "$tmp" >"$tmp.c"
   r="$(gpu_guard_state "$tmp.c")"
   [ "$r" = "render-node" ] || { echo "SELFCHECK: guarded GPU gate read '$r', want render-node" >&2; bad=1; }
@@ -421,7 +421,7 @@ done
 # With 2+ GPUs visible every gate would exit 0, so a doc still claiming
 # PARTIAL/SKIPPED is then stale in the other direction and this catches that too.
 echo
-. "$SCRIPT_DIR/_gate_precond.sh"
+. "$SCRIPT_DIR/lib/_gate_precond.sh"
 # `|| NDEV=0`, and stderr is NOT redirected: the helper's "cannot count" note is
 # the only thing distinguishing "box has no GPU" from "we cannot see the box"
 # (audit #14). A 0 here must not be silently indistinguishable from a failure to
@@ -514,7 +514,7 @@ else
       # match -- the same SIGPIPE-under-pipefail shape that made the $code
       # harvest above fail 16/60 (see the fix at the granularity_of harvest).
       # $txt is one doc line, so it never bit HERE, but the rule is now
-      # mechanical: scripts/check_pipefail_grep_q.sh refuses the pipe form, so
+      # mechanical: scripts/checks/check_pipefail_grep_q.sh refuses the pipe form, so
       # this exclusion reads the already-collected doc instead.
       if grep -qiE 'audit-#|COUNTING TRAP|HISTORICAL|CITATION|at the time|superseded|re-derive' <<<"$txt"; then
         excluded=$((excluded + 1))
@@ -557,7 +557,7 @@ else
   # above already exits 2 for the same reason one notch louder.
   [ "$box_short" -eq 0 ] || TALLY_UNPROVEN=1
   VIOLATIONS=$((VIOLATIONS + bad_tally))
-  # Routed through the SHARED vacuity guard (scripts/_gate_enum.sh) rather than
+  # Routed through the SHARED vacuity guard (scripts/lib/_gate_enum.sh) rather than
   # a second hand-rolled copy of the same rule -- the audit #7/#8 "rule fixed at
   # one site, re-derived at another" shape. Verified to behave identically here:
   # rc=1 with sites_found=0, and silent on the normal path.

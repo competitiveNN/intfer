@@ -119,7 +119,7 @@ REPRODUCIBLE").
 | GRIMOIRE mechanism | intfer status |
 |---|---|
 | 1. cold-eviction before each rep | **Not portable as a number** (B70 256-GRF sizing), and not portable as a *discipline* until the profiling defect is fixed — a rebind, not a code change (`scripts/gpu_recover.sh`). Recorded so nobody ports the `768<<20` literal. |
-| 2. min-of-3 | **Refused** — a refinement of the retired instrument. The repo's load-insensitive floor is `max(spread of the two arms compared)` with >= 2 paired rounds, enforced by `scripts/_bench_summary.py`. |
+| 2. min-of-3 | **Refused** — a refinement of the retired instrument. The repo's load-insensitive floor is `max(spread of the two arms compared)` with >= 2 paired rounds, enforced by `scripts/lib/_bench_summary.py`. |
 | 3. reference from a NAMED baseline | **Already shipped** — the gates' refusal directions are built from a named healthy source, and every arm asserts its own announcement. |
 | 4. `REJECT_NUMERIC` / `NO VALID CONFIGURATION` | **Already shipped in substance** — every non-bit-exact arm is tolerance-gated and every gate refuses a vacuous run. Worth copying *verbatim as a shape* only if a future tolerance-class sweep has more than one candidate. |
 | 5. deterministic constant synthetic | **Already shipped** — model-free probes (`rowpair_equiv`, `xmx_probe`, `gateup_equiv`) exist precisely so a numerics gate measures arithmetic and not weights. |

@@ -147,7 +147,7 @@ tie-order assertion.
 GPU stream-identity gates OWED on the fleet box (dev container has no Arc
 L0 device — only CPU indifference verified: --no-gpu -n6 base==flag
 279 6511 314 279 5364 314, expected since the flag is GPU-only).
-Required before any use: scripts/test_device_argmax.sh (TP1 -n6 8-way
+Required before any use: scripts/gates/test_device_argmax.sh (TP1 -n6 8-way
 matrix base==flag==HOSTPREP==SSM==SSMxflag==FLAG+SSMxHOSTPREP==
 TP2-base==TP2-flag, INTFER_ARGMAX_DBG non-triviality both ways, sampling
 count smoke, spec-verify end-to-end, cpu parity + http batch + gpu-optin
@@ -191,7 +191,7 @@ decode lines go to stderr) and now PASSES on this box: TP1/TP2 8-way
 279 6511 279 3046 13, cpu parity + http batch + gpu-optin PASS.
 
 RE-RUN 2026-09-24 (HEAD 71e878d, binary current, load ~2.5 — stream-identity
-only, no wall-time read): scripts/test_device_argmax.sh DEVICE-ARGMAX TEST:
+only, no wall-time read): scripts/gates/test_device_argmax.sh DEVICE-ARGMAX TEST:
 PASS — TP1/TP2 8-way matrix all 279 6511 314 279 3046 13, [argmax] counter
 fires 1 line on flag / 0 off, sampling count 6/6, spec base==flag
 279 6511 279 3046 13 with [argmax] firing, cpu parity + http batch +

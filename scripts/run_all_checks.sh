@@ -199,18 +199,18 @@ dispatch() { # $1 = label -> runs it
       # matrix sets the correct flag by name; nothing else may silence this
       # column, and the default (unset) runs it in full.
       if [ "${INTFER_DEVICE_PRECOND_SKIP_HEALTHY:-0}" = "1" ]; then
-        INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1 timeout -k 30 1800 bash "$SCRIPT_DIR/check_device_precond.sh"
+        INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1 timeout -k 30 1800 bash "$SCRIPT_DIR/checks/check_device_precond.sh"
       else
-        timeout -k 30 3600 bash "$SCRIPT_DIR/check_device_precond.sh"
+        timeout -k 30 3600 bash "$SCRIPT_DIR/checks/check_device_precond.sh"
       fi
       return $? ;;
     check_e2_ctx.sh)
-      timeout -k 30 3600 bash "$SCRIPT_DIR/check_e2_ctx.sh"; return $? ;;
+      timeout -k 30 3600 bash "$SCRIPT_DIR/checks/check_e2_ctx.sh"; return $? ;;
     check_l0_cite.sh)
       # Needs network on first run (clones compute-runtime sparse, ~1 min) and
       # exits 2 if the pin cannot be resolved, which reads as UNPROVEN rather
       # than as a pass.
-      timeout -k 30 1800 bash "$SCRIPT_DIR/check_l0_cite.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/checks/check_l0_cite.sh"; return $? ;;
     knob_sweep.sh)
        # The GRIMOIRE-survey gap closure: an operator-run product sweep over the
        # three intra-device geometry knobs (INTFER_DECODE1_WG, INTFER_XMX_WG,
@@ -230,21 +230,21 @@ dispatch() { # $1 = label -> runs it
       # build state touched. Gated on the two defects the helper actually
       # produced during conversion (false LEAK, vacuous assertion) plus the
       # fail-closed case its own check then found.
-      timeout -k 30 300 bash "$SCRIPT_DIR/check_gate_pop.sh"; return $? ;;
+      timeout -k 30 300 bash "$SCRIPT_DIR/checks/check_gate_pop.sh"; return $? ;;
     check_verdict_scope.sh)
       # AUDIT #29. Closes AUDIT #28 defect #1 as a FAMILY: every non-verifier in
       # scripts/ that emits a spread-bounded verdict must be the one owner or a
       # declared site, and the owner's gate must be over the rounds the two arms
       # hold IN COMMON. Read-only, no GPU, no build; plants its own counter-
       # examples in a temp tree.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_verdict_scope.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_verdict_scope.sh"; return $? ;;
     check_act_cache_invalidation.sh)
       # INTFER_FUSE_ACT caches FP16 activation bytes in ws_[d].act and skips a
       # host convert + upload per device when the same vector arrives twice. That
       # is bit-exact ONLY while the cached bytes are the bytes the GEMM reads, so
       # every free of that buffer must clear the cache. Function-scoped, because
       # the alias `w` names ws_ in one function and ws48_ in another.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_act_cache_invalidation.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_act_cache_invalidation.sh"; return $? ;;
     check_ladder_sync.sh)
       # The per-role candidate ladder lives in TWO files that cannot be linked
       # (duplicate symbols), so divergence between them is SILENT -- and it went
@@ -255,7 +255,7 @@ dispatch() { # $1 = label -> runs it
       # the 3rd/4th parameters in OPPOSITE orders, so a text comparison is wrong
       # by construction: this compiles both TUs and diffs the candidate tables.
       # Read-only, no GPU, no build (two throwaway g++ TUs in a mktemp dir).
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_ladder_sync.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_ladder_sync.sh"; return $? ;;
     check_hw_constants.sh)
       # AUDIT #33 (2026-10-05). A hardware capability figure in a document must
       # name its source. Written because "512 Xe cores / ~179 GB/s" sat in
@@ -263,7 +263,17 @@ dispatch() { # $1 = label -> runs it
       # session's optimization strategy was built on it. Plants its own
       # counter-examples, so a vacuous green is impossible. Read-only, no GPU,
       # no build.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_hw_constants.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_hw_constants.sh"; return $? ;;
+    check_history_pointers.sh)
+      # AGENTS.md was split on 2026-10-04 and its long sections MOVED to
+      # HISTORY.md, leaving `Moved to HISTORY.md ("<title>")` pointers, and
+      # HISTORY.md was later TRUNCATED. The naive predicate ("the title must
+      # exist as a heading") refuses ten of the thirteen live citations, so the
+      # checker honours all four resolution rules -- real heading /
+      # destroyed-entries banner / verbatim text / in-place [DANGLING -- and
+      # refuses a title none of them accounts for. Text-only: no GPU, no model,
+      # no build.
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_history_pointers.sh"; return $? ;;
     check_dpas_shape_audit.sh)
       # DPAS SHAPE. The three ESIMD DPAS kernels derive nT = N/16 and nOp =
       # K/32 with no bounds check inside the kernel, so a shape that does not
@@ -277,14 +287,14 @@ dispatch() { # $1 = label -> runs it
       # A 14-case behavioural self-check gates the run, and the negative
       # direction is proven by planting a violating model. Read-only, no GPU,
       # no build, no model loading.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_dpas_shape_audit.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_dpas_shape_audit.sh"; return $? ;;
     check_nullglob_sites.sh)
       # AUDIT #32 by ENUMERATION: derives every file that enables nullglob and
       # every glob-bearing command in those regions, so the next site is caught
       # when it is written rather than when it misleads. Finding only the site you
       # remember is exactly how the original survived a session that diagnosed it
       # in detail.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_nullglob_sites.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_nullglob_sites.sh"; return $? ;;
     check_dispatch_steps_consistency.sh)
       # The dispatch case labels and the STEPS lists must AGREE. 0b asks whether
       # every script HAS an arm; 0c asks whether every script is SCHEDULED;
@@ -292,13 +302,13 @@ dispatch() { # $1 = label -> runs it
       # names a script that cannot run. Also asserts each arm executes the script
       # its LABEL names -- the spaced-filename bug that shipped once and that
       # `bash -n` cannot see.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_dispatch_steps_consistency.sh" check_pending_operator.sh; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_dispatch_steps_consistency.sh" check_pending_operator.sh; return $? ;;
     check_pending_operator.sh)
       # Splits the stack's unproven steps into OPERATOR-DEFERRED (needs the 27B
       # gate run, which an agent session must not drive) vs locally clearable,
       # read from each step's own RESULT line. Makes rc=2 actionable rather than
       # an undifferentiated "something is unproven".
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_pending_operator.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_pending_operator.sh"; return $? ;;
     check_destructive_git.sh)
       # No script may destroy uncommitted work: any script performing
       # `git reset --hard` / `git clean -f` / `git checkout --` must refuse to run
@@ -307,7 +317,7 @@ dispatch() { # $1 = label -> runs it
       # comment explaining that it deliberately needs no guard. Also asserts the
       # AGENTS.md standing rule exists, which is the only cover for the case that
       # actually destroyed work: a destructive command typed at a prompt.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_destructive_git.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_destructive_git.sh"; return $? ;;
     check_env_not_box_state.sh)
       # The device preconditions must name an unprepared shell as an ENVIRONMENT
       # problem, never as box state. This session misattributed a missing
@@ -316,7 +326,7 @@ dispatch() { # $1 = label -> runs it
       # a timeout. Its final assertion is a LIVE probe -- it runs the helper with
       # a PATH that has no sycl-ls -- so the banner is proved to print rather than
       # merely to exist.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_env_not_box_state.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_env_not_box_state.sh"; return $? ;;
     check_flag_gate_coverage.sh)
       # Classifies the ungated-flag residue: only the OPT-IN class is a
       # certification gap. No GPU, no model, no build. Exists because AGENTS.md's
@@ -324,7 +334,7 @@ dispatch() { # $1 = label -> runs it
       # than it supported -- the residue also holds kill switches, diagnostics and
       # operational knobs, and a gate arm for one of those certifies the DEFAULT
       # path, which the gates already test.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_flag_gate_coverage.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_flag_gate_coverage.sh"; return $? ;;
     check_decode1_copies.sh)
       # The two inline copies of the M=1 decode arithmetic must AGREE. No GPU,
       # no model, no build: it reads src/gemm/quant_gemm.cpp and compares
@@ -332,19 +342,19 @@ dispatch() { # $1 = label -> runs it
       # duplication is deliberate (quant_gemm_fused_decode1 measured that the
       # shared-device-function alternative cost 231 114 ms) and deliberate
       # duplication is only acceptable while it is pinned.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_decode1_copies.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_decode1_copies.sh"; return $? ;;
     check_tp2_pass_exit.sh)
       # A gate script's verdict is its exit code (run_ten_gates.sh:79: rc 0 ->
-      # GPASS). This pins scripts/test_tp2_27b.sh against the defect that was
+      # GPASS). This pins scripts/gates/test_tp2_27b.sh against the defect that was
       # shipping in the working tree until today: it set PASS=1 at :715 and
       # PASS=0 on every failure, then fell off the end at `rm -f "$LOG"` with
       # exit 0 -- so the gate that certifies the 27B --tp 2 target reported
       # PASS with EVERY arm failing. Source-based, no GPU, no model, no build:
       # it greps the gate's own text for the PASS -> exit conversion.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_tp2_pass_exit.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_tp2_pass_exit.sh"; return $? ;;
     check_gate_exit_verdict.sh)
       # The SWEEP. check_tp2_pass_exit.sh pins ONE gate; this runs it over the
-      # whole population, derived from scripts/test_*.sh (never a hand list),
+      # whole population, derived from scripts/gates/test_*.sh (never a hand list),
       # and asserts the harvest count -- "0 findings" and "looked at nothing"
       # are different claims, and a sweep that harvested zero gates would be
       # reporting on an empty corpus. It also found what the single-gate
@@ -352,7 +362,7 @@ dispatch() { # $1 = label -> runs it
       # 13 relay the probe's rc, so the checker now CLASSIFIES each gate and
       # applies the predicate set that governs its family. No GPU, no model,
       # no build: it greps the gates' own text.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_gate_exit_verdict.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_gate_exit_verdict.sh"; return $? ;;
     check_decode1_shipped_anchor.sh)
       # Pins the bisect-3 `SHIPPED` arm (examples/roofline_probe_bisect3/main.cpp)
       # to the engine's INT2-tab path in src/gemm/quant_gemm.cpp::
@@ -364,7 +374,7 @@ dispatch() { # $1 = label -> runs it
       # fails loudly instead of measuring against a phantom. Read-only, no GPU, no
       # build. Runs BEFORE check_scripts_live.sh so its presence does not count as
       # an unreachable script.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_decode1_shipped_anchor.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_decode1_shipped_anchor.sh"; return $? ;;
     check_s1_predicates.sh)
        # SOURCE-level certification of the S1 uncached-host-USM doorbell probe's
        # four STRUCTURAL guards (examples/uncached_doorbell_probe/main.cpp). No
@@ -378,7 +388,41 @@ dispatch() { # $1 = label -> runs it
        # p_no_verdict refuses the probe's own prose (measured: 3 comment hits on
        # the healthy source). Runs BEFORE check_scripts_live.sh so its presence
        # does not count as an unreachable script.
-       timeout -k 30 600 bash "$SCRIPT_DIR/check_s1_predicates.sh"; return $? ;;
+       timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_s1_predicates.sh"; return $? ;;
+    check_xmx_attrib.sh)
+       # SOURCE-level certification of the engine's XMX attribution line
+       # ([xmx-attrib], src/engine/engine.cpp) and of the five
+       # examples/intfer_cli/main.cpp dump sites that print it beside nk/nw/nr.
+       # No GPU, no model, no build. SIX predicates, each refusing a shape
+       # planted and measured by mutate_xmx_attrib.sh: the line exists as CODE
+       # and not as prose, it carries the three-way verdict field
+       # matrix_engines=, all three counters are named, the ABSENCE is named
+       # rather than printed as an XVE-shaped zero, EVERY [GPU profile] site
+       # prints it (a DERIVED count comparison, not a hand total), and every XMX
+       # dispatch attempt is noted exactly once. Comments are stripped before
+       # the harvest: [xmx-attrib] appears three times in engine.cpp and only
+       # one of them is the construction. Runs BEFORE check_scripts_live.sh so
+       # its presence does not count as an unreachable script.
+       timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_xmx_attrib.sh"; return $? ;;
+    check_uncached_alloc.sh)
+       # SOURCE-level certification of the S1 uncached-host-USM ALLOCATOR that
+       # actually shipped (INTFER_UNCACHED_HOST_USM in src/engine/engine.cpp +
+       # include/intfer/engine.hpp) -- NOT the probe, which is what
+       # check_s1_predicates.sh certifies. Different subject, different file,
+       # different failure modes, so it is a checker of its own rather than a
+       # second opinion on the probe's four shape guards. TEN predicates: the
+       # uncached slot is tracked per-workspace, zeMemAllocHost and the
+       # ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED flag are both named, zeMemFree (not
+       # sycl::free) releases a flag-carrying allocation, the act path NEVER
+       # carries the flag, and zeMemFree UNMAPS so a torn-down Engine with work
+       # in flight is refused. No GPU, no model, no build: the subject is the two
+       # engine files as TEXT. Its negative direction, mutate_uncached_alloc.sh,
+       # carries TEN planted states and its own residue assertion over both
+       # subjects. Was left unregistered by the session that added it, which
+       # check_checker_matrix_coverage.sh refuses (a matrix with no dispatch arm
+       # never runs -- the audit #18 shape); registered here in the same pass as
+       # the scripts/ hierarchy move that exposed the gap.
+       timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_uncached_alloc.sh"; return $? ;;
     check_knob_sweep_contract.sh)
        # SOURCE-level certification of the operator-run knob sweep's CONTRACT
        # (scripts/knob_sweep.sh). No GPU, no model, no build: the subject is that
@@ -405,12 +449,12 @@ dispatch() { # $1 = label -> runs it
        # missing, an empty, and a comments-only subject all FAIL, never pass.
        # Runs BEFORE check_scripts_live.sh so its presence does not count as an
        # unreachable script.
-       timeout -k 30 600 bash "$SCRIPT_DIR/check_knob_sweep_contract.sh"; return $? ;;
+       timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_knob_sweep_contract.sh"; return $? ;;
     check_durable_claims.sh)
        # SOURCE-level certification of the DURABLE RECORDS -- that every figure
        # they assert in prose is either re-derivable or explicitly marked not.
-       # No GPU, no model, no build: the subject is HISTORY.md plus
-       # engines_sources.txt as TEXT, and the sha of the scripts the records cite.
+       # No GPU, no model, no build: the subject is HISTORY.md, AGENTS.md, docs/*.md
+       # and docs/engines/*.txt as TEXT, and the sha of the tracked files the records cite.
        #
        # WHY IT EXISTS. The residue-pair episode (2026-10-18): HISTORY.md asserted
        # a 12-state re-measurement whose SECOND sha appeared in no artifact
@@ -434,12 +478,38 @@ dispatch() { # $1 = label -> runs it
        # harvest is case-insensitive because history.md records one as lowercase.
        # Runs BEFORE check_scripts_live.sh so its presence does not count as an
        # unreachable script.
-       timeout -k 30 600 bash "$SCRIPT_DIR/check_durable_claims.sh"; return $? ;;
+       timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_durable_claims.sh"; return $? ;;
+    check_durable_reads.sh)
+       # SOURCE-level certification of the DURABLE-READ POPULATION of the mutation
+       # matrices: every matcher whose assertions depend on the literal text of a
+       # durable record (HISTORY.md, AGENTS.md, docs/*.md, docs/engines/*.txt) must
+       # carry a uniform SUBJECT_READS= marker naming the surfaces it reads.
+       #
+       # WHY IT EXISTS. The five matrices whose assertions read durable text were
+       # each pinned individually, but the POPULATION was a comment: a sixth matcher
+       # could start reading a durable record, never be marked, and the dependency
+       # would stay invisible until that matrix silently MISSED on an anchor drift.
+       # This checker derives the population from comment-stripped EXECUTABLE code,
+       # so a prose citation (a durable name inside an echo/die string) is not a
+       # read -- MEASURED: a name-mention sweep returns TEN matchers and the
+       # executable-code derivation returns SIX, the difference being exactly the
+       # prose citations.
+       #
+       # ANTI-VACUITY, both halves. A corpus that resolves to nothing FAILS, and a
+       # harvest of ZERO readers FAILS: "nothing to check" must never read as
+       # "checked, nothing found". A marker on a matcher that reads nothing is also
+       # refused, so a marker cannot be decorative, and a marker naming a surface the
+       # code never reads is refused, so it cannot be a stale claim.
+       #
+       # NO GPU, no model, no build: the subject is scripts/ as TEXT plus the corpus
+       # files it names. Runs BEFORE check_scripts_live.sh so its presence does not
+       # count as an unreachable script.
+       timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_durable_reads.sh"; return $? ;;
     check_tally_propagation.sh)
        # SOURCE-level certification of a DIFFERENT question from the checker above:
        # not "does this tally carry a marker" but "does the marker re-derive THIS
        # tally". Measured: a line recording mutate_fold_matrix.sh's 7/7 marked
-       # REGEN(bash scripts/mutate_tp2_pass_exit.sh) satisfies check_durable_claims.sh
+       # REGEN(bash scripts/matrices/mutate_tp2_pass_exit.sh) satisfies check_durable_claims.sh
        # twice over -- p_tally_regen sees a disposition and p_target_exists sees a
        # script that exists -- while re-running the marker re-derives another matrix
        # entirely. That is the propagation defect: the re-measurement never reached
@@ -450,7 +520,7 @@ dispatch() { # $1 = label -> runs it
        # no GPU, no model, no build, and mutators are never executed.
        # Runs BEFORE check_scripts_live.sh so its presence does not count as an
        # unreachable script.
-       timeout -k 30 600 bash "$SCRIPT_DIR/check_tally_propagation.sh"; return $? ;;
+       timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_tally_propagation.sh"; return $? ;;
     check_scripts_live.sh)
       # MEASURED 2026-10-05, not predicted: a full reference-graph derivation of
       # scripts/ found SIXTEEN entries that no code referenced -- a superseded
@@ -462,14 +532,14 @@ dispatch() { # $1 = label -> runs it
       # runner's own GATE_GLOB parsed out of run_ten_gates.sh) and proves both
       # polarities on planted trees, so scripts/ cannot drift back. No GPU, no
       # build, no model.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_scripts_live.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_scripts_live.sh"; return $? ;;
     check_dri_probe.sh)
       # Closes the /dev/dri family: no script may identify a GPU card by its DRM
       # minor, which is not stable (the 2nd B580 became card2/renderD130). The
       # rule is derived from scripts/, and a four-case planted self-check gates the
       # verdict -- two earlier versions of the rule passed while a defect was
       # planted. Read-only, no GPU, no build.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_dri_probe.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_dri_probe.sh"; return $? ;;
     check_pipefail_grep_q.sh)
       # ROOT CAUSE, MEASURED 2026-10-15: `printf '%s' "$code" | grep -qE` under
       # pipefail in gate_inventory.sh failed 16/60 -- grep -q exits at the first
@@ -479,7 +549,7 @@ dispatch() { # $1 = label -> runs it
       # greps, non-quiet greps and no-pipefail scripts are the converses. A
       # seven-case planted self-check gates the verdict. Read-only, no GPU, no
       # build, no execution of the graded scripts.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_pipefail_grep_q.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_pipefail_grep_q.sh"; return $? ;;
     check_trap_release.sh)
       # AUDIT #31. A cleanup trap must release on EXIT/INT/TERM *and* the INT/TERM
       # handlers must TERMINATE. `trap ... EXIT INT TERM` -- the AUDIT #29 remedy --
@@ -489,7 +559,7 @@ dispatch() { # $1 = label -> runs it
       # trap behind a foreground command, so a plain `sleep 30` delays it further.
       # The population is derived from scripts/, and a five-case planted self-check
       # gates the verdict. Read-only, no GPU, no build.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_trap_release.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_trap_release.sh"; return $? ;;
     check_guard_identity.sh)
       # AUDIT #31. A guard keyed on a resource NAME cannot see duplicates when the
       # name carries the per-instance discriminator: an earlier RESULT-filler
@@ -498,13 +568,13 @@ dispatch() { # $1 = label -> runs it
       # artifacts stayed clean. Requires a shared lock whose own name does NOT carry
       # the discriminator. The converse is load-bearing: a FIXED-name refusal is
       # self-protecting and needs none. Read-only, no GPU, no build.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_guard_identity.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_guard_identity.sh"; return $? ;;
     check_stack_cert.sh)
       # AUDIT #29. Re-derives build/stack_cert/cert against THIS tree: sha, rc,
       # the census, and a clean tree. A seven-case behavioural self-check runs
       # FIRST and gates the verdict; a nested run (the self-check itself) skips it
       # and SAYS SO. Read-only, no GPU, no build.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_stack_cert.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_stack_cert.sh"; return $? ;;
     check_engine_cert.sh)
       # AUDIT #24. run_all_checks certifies the TOOLING; scripts/run_ten_gates.sh
       # certifies the ENGINE. This is what stops the two being reconciled by
@@ -513,7 +583,7 @@ dispatch() { # $1 = label -> runs it
       # engine edit, nor needlessly invalidated by a docs-only one.
       # Read-only, no GPU, no build. rc=2 (no artifact) is UNPROVEN, not a
       # regression, and the 2b re-run path handles it.
-      timeout -k 30 300 bash "$SCRIPT_DIR/check_engine_cert.sh"; return $? ;;
+      timeout -k 30 300 bash "$SCRIPT_DIR/checks/check_engine_cert.sh"; return $? ;;
     test_roofline_bisect.sh)
       # Bisect-2 of the M=1 INT2 GEMV probe ladder: the four clone arms (VERBATIM
       # control + VERB+HALF / VERB+TAIL / VERB+MP single-change arms) in one
@@ -521,13 +591,13 @@ dispatch() { # $1 = label -> runs it
       # bound; device event timestamps; claims only ITS OWN ratios -- SHIPPED is
       # anchored from examples/roofline_probe. The TU is bounded below the runner's
       # budget so a hang can never surface as rc=124 (a phantom regression).
-      timeout -k 30 1800 bash "$SCRIPT_DIR/test_roofline_bisect.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/gates/test_roofline_bisect.sh"; return $? ;;
     test_roofline_bisect1.sh)
       # Bisect-1 of the M=1 INT2 GEMV probe ladder: the `table` control vs the
       # transcribed SHIPPED source (`VERBATIM`) in a tiny engine-free TU, interleaved
       # with its own always-red twin. Establishes the VERBATIM baseline and the
       # within-run table/VERBATIM ratio. No model bound; device event timestamps.
-      timeout -k 30 1800 bash "$SCRIPT_DIR/test_roofline_bisect1.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/gates/test_roofline_bisect1.sh"; return $? ;;
     test_roofline_bisect3.sh)
       # Bisect-3 of the M=1 INT2 GEMV probe ladder: `VERBATIM` plus single-change
       # arms `VERB+TAIL` / `VERB+MP` and the `SHIPPED` anchor, all four in one TU
@@ -535,7 +605,7 @@ dispatch() { # $1 = label -> runs it
       # arms (not cross-binary, where register pressure would differ). The ~4.5-5x
       # of the 5.6-6.4x gap that survives the module move (1.26x) and the branch
       # (1.007x) sits between VERBATIM and SHIPPED -- this is where it is measured.
-      timeout -k 30 1800 bash "$SCRIPT_DIR/test_roofline_bisect3.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/gates/test_roofline_bisect3.sh"; return $? ;;
      test_roofline_bisect4.sh)
        # Bisect-4 of the M=1 INT2 GEMV probe ladder: the DIFFERENTIAL between the
        # bisect-2 VERBATIM body and the roofline_probe int2_variant<0> transcription.
@@ -545,7 +615,7 @@ dispatch() { # $1 = label -> runs it
        # cosmetic single-changes" -- it does not (every arm lands at ~1.11x), so
        # the gap is in the shared text, not in any of these four changes. No model
        # bound; device event timestamps; the same always-red twin as bisect-2.
-       timeout -k 30 1800 bash "$SCRIPT_DIR/test_roofline_bisect4.sh"; return $? ;;
+       timeout -k 30 1800 bash "$SCRIPT_DIR/gates/test_roofline_bisect4.sh"; return $? ;;
     test_rowpair_equiv.sh)
       # The MEASURED bitwise-equivalence check for INTFER_DECODE1_ROWPAIR. Runs the
       # binary TWICE in two processes -- quant_gemm_forward_usm reads the flag into
@@ -555,7 +625,7 @@ dispatch() { # $1 = label -> runs it
       # first version double-offset a row-relative multi_ptr and lost the device on
       # both INT2 shapes, while passing on the FP16 and INT4 shapes the branch
       # never reaches.
-      timeout -k 30 1800 bash "$SCRIPT_DIR/test_rowpair_equiv.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/gates/test_rowpair_equiv.sh"; return $? ;;
     test_roofline_probe.sh)
       # AUDIT #33 follow-on. The allocator-vs-kernel discriminator for decode's
       # bandwidth deficit. Device event timestamps (load-insensitive), binds NO
@@ -563,7 +633,7 @@ dispatch() { # $1 = label -> runs it
       # quarter of the bytes must take about a quarter of the time, or the GB/s
       # figures are not tracking traffic and the run exits 1. That twin caught two
       # real bugs in the probe itself.
-      timeout -k 30 900 bash "$SCRIPT_DIR/test_roofline_probe.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/gates/test_roofline_probe.sh"; return $? ;;
     run_ten_gates.sh)
       # AUDIT #24 -- SELF-CHECK ONLY, never the gates themselves. run_ten_gates.sh
       # runs the engine on both GPUs for tens of minutes and is deliberately NOT a
@@ -578,40 +648,40 @@ dispatch() { # $1 = label -> runs it
       # trusting a hand-written total. Wired, and its own matrix is
       # mutate_checker_matrix_coverage.sh -- otherwise this checker would be the
       # very drift it reports.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_checker_matrix_coverage.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_checker_matrix_coverage.sh"; return $? ;;
     check_gpu_recover.sh)
       # Stubbed probe; nothing real is modified. Pins the RECOVERY TOOL's exit
       # codes, especially 2=unmeasurable vs 1=still-broken -- the distinction
       # that keeps "the probe could not count" from being read as a device
       # count. Needs no GPU.
-      timeout -k 30 600 bash "$SCRIPT_DIR/check_gpu_recover.sh"; return $? ;;
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_gpu_recover.sh"; return $? ;;
     check_gate_enum.sh)
       # Behavioural self-check for the SHARED vacuity guard. Four cases plus a
       # converse: must reject 0/empty/non-numeric/below-minimum, and must
       # ACCEPT well-formed input SILENTLY -- without that, a helper that
       # rejects everything would score 3/3 and prove nothing.
-      timeout -k 30 300 bash "$SCRIPT_DIR/check_gate_enum.sh"; return $? ;;
+      timeout -k 30 300 bash "$SCRIPT_DIR/checks/check_gate_enum.sh"; return $? ;;
     check_build_dir_consumers.sh)
       # Static: derives the artifact-consumer population from the CMake
       # add_executable list plus every script touching a build tree, then fails
       # on any that hardcodes one. No GPU, no build, seconds.
-      timeout -k 30 900 bash "$SCRIPT_DIR/check_build_dir_consumers.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/checks/check_build_dir_consumers.sh"; return $? ;;
     mutate_build_dir_consumers.sh)
       # Proves check_build_dir_consumers.sh is non-vacuous: plants a consumer that
       # hardcodes "$ROOT/build" (and "${ROOT}/build"), rejects it, then verifies
       # a comment-only mention is NOT graded as a consumer and that a compliant
       # override is accepted. Sandbox OUTSIDE $BUILD_DIR, never touches scripts/.
-      timeout -k 30 1200 bash "$SCRIPT_DIR/mutate_build_dir_consumers.sh"; return $? ;;
+      timeout -k 30 1200 bash "$SCRIPT_DIR/matrices/mutate_build_dir_consumers.sh"; return $? ;;
     mutate_e2_ctx.sh)
       # Proves check_e2_ctx.sh's SELF-CHECK half. The real-run half is not
       # mutation-testable (its artifact is correct by construction) and one
       # state is excluded as unobservable -- see the matrix's SCOPE block.
-      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_e2_ctx.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/matrices/mutate_e2_ctx.sh"; return $? ;;
     mutate_gpu_recover.sh)
       # Fixtures live in a mktemp sandbox OUTSIDE $BUILD_DIR, and the matrix
       # asserts the enumerated stamp-DIRECTORY set is unchanged, so its own
       # artefacts cannot join the population step 3/3 compares.
-      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_gpu_recover.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/matrices/mutate_gpu_recover.sh"; return $? ;;
     mutate_verdict_scope.sh)
       # AUDIT #29. Every state damages the TREE the checker grades, in a copy of
       # scripts/, and the checker that runs is the sandbox's OWN copy -- the
@@ -619,14 +689,14 @@ dispatch() { # $1 = label -> runs it
       # states unobservable by construction. V-F is an isolation case, not a
       # mutation: it empties the harvest with the self-tests disabled so the
       # enumeration guard is the only thing that can fire.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_verdict_scope.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_verdict_scope.sh"; return $? ;;
     mutate_dri_probe.sh)
       # Every state damages the CORPUS the rule grades, handed over through
       # INTFER_SCRIPTS_DIR; the checker that runs is the real one reading that
       # corpus -- weakening the CHECKER would be unobservable (AUDIT #21). D-E is
       # the CONVERSE: a single-minor liveness probe must stay clean, without which
       # a rule that flagged everything would satisfy D-A..D-D.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_dri_probe.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_dri_probe.sh"; return $? ;;
     mutate_pipefail_grep_q.sh)
       # Every state damages the CORPUS the rule grades, handed over through
       # INTFER_SCRIPTS_DIR; the checker that runs is the real one reading that
@@ -635,38 +705,38 @@ dispatch() { # $1 = label -> runs it
       # stay clean, without which a rule that flagged every grep would satisfy
       # P-B..P-E. The defect this pins cost a full gate run: 16/60 identical
       # runs failed on 2026-10-15 with nothing in the repo changed.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_pipefail_grep_q.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_pipefail_grep_q.sh"; return $? ;;
     mutate_trap_release.sh)
       # Every state damages a CORPUS script's cleanup trap via INTFER_SCRIPTS_DIR;
       # the checker is correct by construction, so weakening the CHECKER would be
       # unobservable (AUDIT #21). T-E is the CONVERSE: the compliant shape and a
       # `trap -` disarm must stay clean, without which a rule that flagged every
       # trap would satisfy T-A..T-D.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_trap_release.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_trap_release.sh"; return $? ;;
     mutate_guard_identity.sh)
       # Same artifact-defect shape, on the guard-identity rule. G-E is the state
       # that gets forgotten and the one that would have caught the first version of
       # the rule: a FIXED-name refusal owes no lock, so demanding one there would
       # force a pointless lock onto every idempotent re-run.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_guard_identity.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_guard_identity.sh"; return $? ;;
     mutate_stack_cert.sh)
       # AUDIT #29. Breaks the census DERIVATION and the dirty-tree test, both of
       # which the self-check cannot see because every fixture derives its census
       # from the same expression the verdict uses (the AUDIT #12 S4 shape). S-B
       # cannot use the shared `rc != 0` predicate -- neutering the guard turns
       # rc 1 into rc 0 -- so both halves are asserted there explicitly.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_stack_cert.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_stack_cert.sh"; return $? ;;
     mutate_engine_cert.sh)
       # AUDIT #24. Plants ten_gates/HEAD into a SANDBOX build dir (via
       # INTFER_BUILD_DIR) so the real certification is never touched, and drives
       # the four verdict paths. Its own E-D state weakens the input filter while
       # the artifact is deliberately stale -- legitimate only because the planted
       # artifact is itself defective (the AUDIT #21 rule).
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_engine_cert.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_engine_cert.sh"; return $? ;;
     mutate_act_cache_invalidation.sh)
       # AC-1 removes an invalidation (a use-after-free no stream test finds);
       # AC-4 inverts the checker's own comparison -- the bug it shipped with.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_act_cache_invalidation.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_act_cache_invalidation.sh"; return $? ;;
     mutate_ladder_sync.sh)
       # LS-1 reintroduces the FP16 rung that made 56.8% of the 19 GB model FP16;
       # LS-2 swaps the XMX g32-before-g16 scale-traffic policy; LS-3 drops the
@@ -677,12 +747,12 @@ dispatch() { # $1 = label -> runs it
       # other matrix this one NEVER writes a tracked file: the working tree holds
       # another session's uncommitted src/quant_spec.cpp work, and the checker's
       # own INTFER_LADDER_REAL seam makes in-place editing unnecessary.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_ladder_sync.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_ladder_sync.sh"; return $? ;;
     mutate_nullglob_sites.sh)
       # NS-2 covers a blind spot the scanner REALLY had: a same-line
       # ( shopt -s nullglob; cmd GLOB ) was invisible to a line-start regex, and
       # the scan reported POPULATION 0 over a tree that contained one.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_nullglob_sites.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_nullglob_sites.sh"; return $? ;;
     mutate_hw_constants.sh)
       # AUDIT #33 matrix. Degrades the RULE (each unit class, the CITATION
       # requirement, case-insensitivity, the corpus floor) and requires the
@@ -690,7 +760,7 @@ dispatch() { # $1 = label -> runs it
       # self-check gate too and requires the degraded rule to accept a defective
       # corpus, which is what makes HW-1's catch attributable. Runs entirely
       # against copies under build/ -- the tracked tree is never edited.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_hw_constants.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_hw_constants.sh"; return $? ;;
     mutate_dpas_shape_audit.sh)
       # DS-1/DS-3 plant synthetic .intifer models (the artifact under test is the
       # model's tensor table, so the checker must REJECT a defective one -- AGENTS
@@ -698,15 +768,15 @@ dispatch() { # $1 = label -> runs it
       # (the rule-4 "remembered constant" in one line); DS-4 inverts the checker's
       # own violation test. Runs entirely against copies under build/ -- the
       # tracked tree is never edited, and the residue assertion re-proves it.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_dpas_shape_audit.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_dpas_shape_audit.sh"; return $? ;;
     mutate_dispatch_steps_consistency.sh)
       # DS-1 re-arms the bug that shipped: a dispatch arm whose path becomes a
       # filename containing a space. Valid shell, rc=127 at runtime.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_dispatch_steps_consistency.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_dispatch_steps_consistency.sh"; return $? ;;
     mutate_pending_operator.sh)
       # PO-1 empties the log directory: the classifier must report INCONCLUSIVE,
       # NOT "nothing pending" -- different claims, and only one is reassuring.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_pending_operator.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_pending_operator.sh"; return $? ;;
     mutate_s1_predicates.sh)
        # Eight states, each planting ONE structural defect into a temp copy of
        # examples/uncached_doorbell_probe/main.cpp and requiring
@@ -722,11 +792,37 @@ dispatch() { # $1 = label -> runs it
        # Fix (3) is the load-bearing one: every state asserts it LANDED (cmp
        # against the live source) BEFORE it is graded, so a no-op mutation is
        # reported vacuous instead of counted as a catch.
-       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_s1_predicates.sh"; return $? ;;
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_s1_predicates.sh"; return $? ;;
+    mutate_xmx_attrib.sh)
+       # SIX states, each planting ONE structural defect and requiring
+       # check_xmx_attrib.sh to REFUSE it for its OWN named predicate. FIVE
+       # mutate the builder (src/engine/engine.cpp) and ONE (XA-dump) mutates
+       # the printer (examples/intfer_cli/main.cpp), because the defect it
+       # plants -- a dump site with no attribution line -- only exists in the
+       # printer. XA-engines plants a near-miss SPELLING (matrix_engine=) rather
+       # than a deletion: the three integers still print, so only a
+       # verdict-field predicate can see it. Two anchor counts are DERIVED
+       # rather than literals, so a new printer call or dispatch seam updates
+       # the state instead of failing it. Every state asserts it LANDED (cmp)
+       # BEFORE it is graded, and BOTH live subjects are re-hashed at the end.
+       # There is deliberately no git-status residue check: this repo's standing
+       # state is a dirty tree, so a status reading would die on the session's
+       # own uncommitted work, and the sha byte comparison is the real check.
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_xmx_attrib.sh"; return $? ;;
+    mutate_uncached_alloc.sh)
+       # TEN states against the S1 uncached-allocator CHECKER (not the probe's
+       # pair, whose names this deliberately does not reuse). Sandboxes a copy of
+       # src/engine/engine.cpp + include/intfer/engine.hpp -- the only matrix whose
+       # subjects are engine files rather than scripts/ -- and requires the
+       # checker to REFUSE each planted defect, with LANDED asserted per state and
+       # a residue assertion over BOTH subjects (entry/exit sha plus a git status
+       # comparison, because the subjects are DIRTY tracker files in this repo's
+       # standing "nothing committed" state). No GPU, no model, no build.
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_uncached_alloc.sh"; return $? ;;
     mutate_durable_claims.sh)
        # SIXTEEN states, but the subject is a TEMP ROOT rather than a temp copy of
-       # one file: the checker's subject is HISTORY.md + engines_sources.txt plus
-       # the sha of every script in scripts/, so the matrix stamps a complete fake
+       # many files: the checker's subject is HISTORY.md, AGENTS.md, docs/*.md and docs/engines/*.txt plus
+       # the sha of every tracked file, so the matrix stamps a complete fake
        # root and grades the checker against that. Mutating the live records in
        # place would rewrite the very history this checker exists to protect, so
        # they are only ever READ (copied in), and the residue assertion at the end
@@ -741,7 +837,27 @@ dispatch() { # $1 = label -> runs it
        # Each state asserts it LANDED with cmp before grading, so a no-op is
        # reported unlanded rather than counted as a catch. No GPU, no model, no
        # build, and the live records are never modified.
-       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_durable_claims.sh"; return $? ;;
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_durable_claims.sh"; return $? ;;
+    mutate_durable_reads.sh)
+       # SIX states on a TEMP ROOT of scripts/ plus the corpus, so no state ever
+       # touches the live tree: the checker derives its population from $ROOT/scripts,
+       # so a mutation must reach a COPY of scripts/, and the residue check then
+       # proves the live paths came out byte-identical.
+       #
+       # THREE of the six states are SELF-COLLISION cases, which is where this
+       # matrix earned its keep -- all three MEASURED by running it, not predicted:
+       # DR-1's anchor must match exactly once (an INDENTED marker still counts, so
+       # the anchor is a statement, not a column position); DR-5 must patch BOTH the
+       # primary corpus line AND the docs glob, because the glob re-populates CORPUS
+       # and the refusal then comes from the wrong predicate; and DR-6's payload must
+       # be a REGEX THAT CANNOT SELF-MATCH, because this matrix is itself INSIDE the
+       # harvest population (it copies the corpus) and a bare token written into it is
+       # by construction present in it.
+       #
+       # Every state asserts it LANDED and the reason is HARVESTED from the checker's
+       # own output, so a state that trips a different predicate is reported as
+       # MISSED rather than counted as a catch. No GPU, no model, no build.
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_durable_reads.sh"; return $? ;;
     mutate_tally_propagation.sh)
        # FOUR states on a TEMP ROOT of the durable records (text-only -- the sweep
        # resolves no script, so copying scripts/ would be a fiction). TP-wrong-target
@@ -753,7 +869,7 @@ dispatch() { # $1 = label -> runs it
        # anti-vacuity halves, which must FAIL rather than pass over an empty
        # population. Every state cmp-asserts it LANDED before grading, and the residue
        # half proves the live records were never modified.
-       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_tally_propagation.sh"; return $? ;;
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_tally_propagation.sh"; return $? ;;
     mutate_knob_sweep_contract.sh)
        # TWELVE states, each planting ONE structural defect into a temp copy of
        # scripts/knob_sweep.sh (NOT a synthetic log -- a log built from the fixed
@@ -769,24 +885,33 @@ dispatch() { # $1 = label -> runs it
        # names SKIPPED-CONTENDED. No GPU, no model, no build, and knob_sweep.sh
        # is never EXECUTED -- the matrix is a source mutation, which is the only
        # kind an agent session may run against an operator-only harness.
-       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_knob_sweep_contract.sh"; return $? ;;
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_knob_sweep_contract.sh"; return $? ;;
     mutate_destructive_git.sh)
       # DG-2 is the state that makes the comment-strip load-bearing: without it
       # the mutate_tp2_selfcheck.sh DECOY is flagged. DG-4 is the anti-vacuity
       # test -- a harvest matching nothing must be refused, not read as "all
       # guarded, nothing to check".
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_destructive_git.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_destructive_git.sh"; return $? ;;
     mutate_env_not_box_state.sh)
-      # Mutates scripts/_gate_precond.sh. EN-2 is the state that keeps EN-1
+      # Mutates scripts/lib/_gate_precond.sh. EN-2 is the state that keeps EN-1
       # honest: delete the banner TEXT while every call site survives, so a
       # call-site count alone cannot pass.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_env_not_box_state.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_env_not_box_state.sh"; return $? ;;
     mutate_flag_gate_coverage.sh)
       # FG-1/FG-4 are the two states that FOUND real holes in the checker: a
       # census query with no floor of its own, and an opt-in class with no
       # non-empty floor. FG-3 is the inverse that proves the floors are what does
       # the catching rather than the state passing for an unrelated reason.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_flag_gate_coverage.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_flag_gate_coverage.sh"; return $? ;;
+    mutate_history_pointers.sh)
+      # HP-1/HP-2 are a PAIR and the pair is the point: the same unaccounted
+      # title is REFUSED, then the same title plus its [DANGLING annotation is
+      # ACCEPTED. A single state would not distinguish a checker that refuses
+      # unaccounted titles from one that refuses every new title. States mutate
+      # SANDBOX COPIES of AGENTS.md/HISTORY.md -- the live files are tracked and
+      # dirty, so in-place mutation is the destructive probe the standing rule
+      # exists for.
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_history_pointers.sh"; return $? ;;
     mutate_roofline_bisect.sh)
       # The gate for test_roofline_bisect.sh enforces EXIT SEMANTICS rather than
       # source correctness, and those semantics were themselves the defect: the
@@ -794,28 +919,28 @@ dispatch() { # $1 = label -> runs it
       # REGRESSION and which cost it the whole step budget. 4 states, all caught,
       # against a STUB probe so no real GPU job is launched; 2 states excluded with
       # their reason and 1 dropped with its reason, all recorded in the file.
-      timeout -k 30 1200 bash "$SCRIPT_DIR/mutate_roofline_bisect.sh"; return $? ;;
+      timeout -k 30 1200 bash "$SCRIPT_DIR/matrices/mutate_roofline_bisect.sh"; return $? ;;
     mutate_roofline_bisect1.sh)
       # The gate for test_roofline_bisect1.sh (bisect-1: table vs VERBATIM) enforces
       # EXIT SEMANTICS via the probe-timeout bound; states run against a STUB probe
       # so no real GPU job is launched.
-      timeout -k 30 1200 bash "$SCRIPT_DIR/mutate_roofline_bisect1.sh"; return $? ;;
+      timeout -k 30 1200 bash "$SCRIPT_DIR/matrices/mutate_roofline_bisect1.sh"; return $? ;;
     mutate_roofline_bisect3.sh)
       # The gate for test_roofline_bisect3.sh (bisect-3: VERBATIM / VERB+TAIL /
       # VERB+MP / SHIPPED) enforces EXIT SEMANTICS via the probe-timeout bound; states
       # run against a STUB probe so no real GPU job is launched.
-      timeout -k 30 1200 bash "$SCRIPT_DIR/mutate_roofline_bisect3.sh"; return $? ;;
+      timeout -k 30 1200 bash "$SCRIPT_DIR/matrices/mutate_roofline_bisect3.sh"; return $? ;;
      mutate_roofline_bisect4.sh)
        # The gate for test_roofline_bisect4.sh enforces EXIT SEMANTICS via the
        # probe-timeout bound; states run against a STUB probe so no real GPU job is
        # launched.
-       timeout -k 30 1200 bash "$SCRIPT_DIR/mutate_roofline_bisect4.sh"; return $? ;;
+       timeout -k 30 1200 bash "$SCRIPT_DIR/matrices/mutate_roofline_bisect4.sh"; return $? ;;
     mutate_roofline_probe.sh)
       # The gate for test_roofline_probe.sh enforces EXIT SEMANTICS (the probe
       # exits 1 on a vacuous run) AND a numeric ceiling floor. States run against
       # a pre-produced log via INTFER_PROBE_LOG/INTFER_PROBE_RC, so no real GPU
       # job is launched and the matrix grades the GATE, not the probe.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_roofline_probe.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_roofline_probe.sh"; return $? ;;
     mutate_decode1_copies.sh)
       # AUDIT #11 direction: these states mutate the ARTIFACT (quant_gemm.cpp),
       # not the checker, because an artifact that is correct by construction
@@ -833,7 +958,7 @@ dispatch() { # $1 = label -> runs it
       # shift-into-mask EQUALITY comparison had to be added before DC-2 could fire.
       # NOTE there is only ONE arm for this matrix; a second was added by mistake
       # and the stack's own 0c step reported it as "scheduled MORE THAN ONCE".
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_decode1_copies.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_decode1_copies.sh"; return $? ;;
     mutate_tp2_pass_exit.sh)
       # Same AUDIT #11 direction as the decode1 pair: the checker is correct
       # by construction on a clean tree, so the matrix mutates the ARTIFACT
@@ -842,7 +967,7 @@ dispatch() { # $1 = label -> runs it
       # gate, the conversion moved above the trailing rm, and PASS=1 deleted.
       # Every state runs on a TEMP COPY, so the tracked gate is never modified
       # and there is nothing to restore (the residue check re-proves it).
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_tp2_pass_exit.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_tp2_pass_exit.sh"; return $? ;;
     mutate_gate_exit_verdict.sh)
        # The sweep's OWN matrix. check_gate_exit_verdict.sh does not run the
        # gates (no model, no GPU) and the per-gate predicates (a/b/c/d) are
@@ -860,7 +985,7 @@ dispatch() { # $1 = label -> runs it
        # are EXCLUDED, not scored: on an all-safe tree neither changes any
        # outcome, and GE-1/GE-3/GE-4 cover the same defect classes by
        # planting the defect directly.
-       timeout -k 30 900 bash "$SCRIPT_DIR/mutate_gate_exit_verdict.sh"; return $? ;;
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_gate_exit_verdict.sh"; return $? ;;
     mutate_decode1_shipped_anchor.sh)
       # Audit #21 direction: the checker is correct by construction on a clean
       # tree, so the matrix drifts the ARTIFACT instead of weakening the checker.
@@ -868,7 +993,7 @@ dispatch() { # $1 = label -> runs it
       # copied into a git-archive sandbox and patched (one byte-offset drifts
       # off-by-one); the checker must REJECT the drifted anchor and PASS the
       # restored one. No change to scripts/ or src/; sandbox via mktemp.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_decode1_shipped_anchor.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_decode1_shipped_anchor.sh"; return $? ;;
     mutate_scripts_live.sh)
       # SL states weaken the reachability RULE (the corpus is a temp tree, never
       # the tracked scripts/), which is the audit #21 direction for a checker
@@ -876,7 +1001,7 @@ dispatch() { # $1 = label -> runs it
       # AND to stay quiet before either version is believed. SL-C is the state
       # that would have caught the first version of the checker, whose own header
       # prose named real scripts and so satisfied the rule with itself.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_scripts_live.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_scripts_live.sh"; return $? ;;
     mutate_tp2_selfcheck.sh)
       # AUDIT #31. The DECODE1_MR arm's --self-check in test_tp2_27b.sh. It runs
       # ONLY the stubbed --self-check half on temp copies -- NO GPU, NO MODEL, NO
@@ -884,7 +1009,7 @@ dispatch() { # $1 = label -> runs it
       # never be driven from here (the standing rule: the user runs the 27B
       # gates). That is also why this matrix is cheap enough to be an ordinary
       # step rather than the excluded POST-STACK class.
-      timeout -k 30 900 bash "$SCRIPT_DIR/mutate_tp2_selfcheck.sh"; return $? ;;
+      timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_tp2_selfcheck.sh"; return $? ;;
     mutate_rowpair_equiv.sh)
       # AUDIT #21 direction for the test_rowpair_equiv.sh REWRITE (2026-10-07):
       # that rewrite added the base-order kill-switch restoration, the reference-
@@ -896,35 +1021,35 @@ dispatch() { # $1 = label -> runs it
       # (NOT the whole tree -- the test/ model weights are ~2.2 GB and a whole-tree
       # copy OOM-killed this matrix) and configures its own build dir, so the
       # tracked tree is never touched.
-      timeout -k 60 1800 bash "$SCRIPT_DIR/mutate_rowpair_equiv.sh"; return $? ;;
+      timeout -k 60 1800 bash "$SCRIPT_DIR/matrices/mutate_rowpair_equiv.sh"; return $? ;;
     mutate_checker_matrix_coverage.sh)
       # Each state BOTH poisons the tree with an unmated checker AND removes the
       # requirement that would catch it -- weakening alone is unobservable while
       # the real tree has full coverage (AUDIT #21).
-      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_checker_matrix_coverage.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/matrices/mutate_checker_matrix_coverage.sh"; return $? ;;
     mutate_gate_pop.sh)
       # Removes ONE case (its echo AND its own counter) from check_gate_pop.sh.
       # patch_literal is called with THREE arguments -- file, exact-old,
       # exact-new -- and old/new each span a literal newline. Passing one quoted
       # string per LINE was the original bug: five states, all "PATCH VERIFY
       # FAIL", found with bash -x rather than by guessing.
-      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_gate_pop.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/matrices/mutate_gate_pop.sh"; return $? ;;
     mutate_gate_enum.sh)
       # Patches SANDBOX COPIES under the build tree, never scripts/, so a
       # mutated helper cannot leak into a later glob of that directory.
-      timeout -k 30 1800 bash "$SCRIPT_DIR/mutate_gate_enum.sh"; return $? ;;
+      timeout -k 30 1800 bash "$SCRIPT_DIR/matrices/mutate_gate_enum.sh"; return $? ;;
     mutate_l0_cite.sh)
       # Mutates a COPY of the pinned upstream tree under build/, never tracked
       # source, so this matrix is safe to run alongside the rest of the stack.
-      timeout -k 30 3600 bash "$SCRIPT_DIR/mutate_l0_cite.sh"; return $? ;;
+      timeout -k 30 3600 bash "$SCRIPT_DIR/matrices/mutate_l0_cite.sh"; return $? ;;
     mutate_fold_matrix.sh)
-      timeout -k 30 7200 bash "$SCRIPT_DIR/mutate_fold_matrix.sh"; return $? ;;
+      timeout -k 30 7200 bash "$SCRIPT_DIR/matrices/mutate_fold_matrix.sh"; return $? ;;
     mutate_gate_inventory.sh)
-      timeout -k 30 7200 bash "$SCRIPT_DIR/mutate_gate_inventory.sh"; return $? ;;
+      timeout -k 30 7200 bash "$SCRIPT_DIR/matrices/mutate_gate_inventory.sh"; return $? ;;
     mutate_device_precond.sh)
-      timeout -k 30 7200 bash "$SCRIPT_DIR/mutate_device_precond.sh"; return $? ;;
+      timeout -k 30 7200 bash "$SCRIPT_DIR/matrices/mutate_device_precond.sh"; return $? ;;
     mutate_run_all_checks.sh)
-      timeout -k 30 3600 bash "$SCRIPT_DIR/mutate_run_all_checks.sh"; return $? ;;
+      timeout -k 30 3600 bash "$SCRIPT_DIR/matrices/mutate_run_all_checks.sh"; return $? ;;
     *)
       # Seam: an external step directory. It exists because this script is the
       # ENTRY POINT for a ~45 minute stack, so a mutation matrix that invoked it
@@ -1055,8 +1180,8 @@ echo "  ok    sc_ok->ok, sc_unproven->unproven, sc_fail->fail, sc_stale->stale"
 # undispatched and this FAILS LOUDLY -- a coverage check that silently passes
 # because it parsed nothing is worse than no check.
 echo "== 0b dispatch coverage (every check_*/mutate_* must have a dispatch arm) =="
-# shellcheck source=scripts/_gate_enum.sh
-. "$SCRIPT_DIR/_gate_enum.sh"
+# shellcheck source=scripts/lib/_gate_enum.sh
+. "$SCRIPT_DIR/lib/_gate_enum.sh"
 enum_reset
 
 # *** THE QUERY'S OWN RESULT CLASS IS CHECKED, NOT JUST ITS OUTPUT. ***
@@ -1135,7 +1260,7 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_decode1_shipped_anchor.sh check_s1_predicates.sh check_knob_sweep_contract.sh check_durable_claims.sh check_tally_propagation.sh check_tp2_pass_exit.sh check_gate_exit_verdict.sh check_flag_gate_coverage.sh check_hw_constants.sh check_dpas_shape_audit.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_ladder_sync.sh check_scripts_live.sh check_pipefail_grep_q.sh"
+  STEPS="gate_inventory.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_decode1_shipped_anchor.sh check_s1_predicates.sh check_xmx_attrib.sh check_uncached_alloc.sh check_knob_sweep_contract.sh check_durable_claims.sh check_tally_propagation.sh check_tp2_pass_exit.sh check_gate_exit_verdict.sh check_flag_gate_coverage.sh check_hw_constants.sh check_dpas_shape_audit.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_ladder_sync.sh check_durable_reads.sh check_scripts_live.sh check_pipefail_grep_q.sh check_history_pointers.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   # A REAL gate, but it needs a GPU and takes ~30 s, so it sits in the
   # same INTFER_QUICK-off band as check_l0_cite.sh. Quick mode is meant to be
@@ -1155,7 +1280,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS knob_sweep.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_tp2_pass_exit.sh mutate_gate_exit_verdict.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_s1_predicates.sh mutate_knob_sweep_contract.sh mutate_durable_claims.sh mutate_tally_propagation.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_ladder_sync.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh mutate_pipefail_grep_q.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_tp2_pass_exit.sh mutate_gate_exit_verdict.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_s1_predicates.sh mutate_xmx_attrib.sh mutate_uncached_alloc.sh mutate_knob_sweep_contract.sh mutate_durable_claims.sh mutate_tally_propagation.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_ladder_sync.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh mutate_pipefail_grep_q.sh mutate_history_pointers.sh mutate_durable_reads.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
@@ -1511,8 +1636,8 @@ write_cert() { # $1 rc, $2 one-word verdict
     # wrong except that three numbers with three meanings were quoted in prose.
     # The certificate is the artifact of record, so the census belongs here.
     echo "scripts=$N_DISPATCHABLE"
-    echo "checks=$(ls "$SCRIPT_DIR"/check_*.sh 2>/dev/null | wc -l | tr -d ' ')"
-    echo "matrices=$(ls "$SCRIPT_DIR"/mutate_*.sh 2>/dev/null | wc -l | tr -d ' ')"
+    echo "checks=$(ls "$SCRIPT_DIR"/checks/check_*.sh 2>/dev/null | wc -l | tr -d ' ')"
+    echo "matrices=$(ls "$SCRIPT_DIR"/matrices/mutate_*.sh 2>/dev/null | wc -l | tr -d ' ')"
     echo "stamp_dirs=$(find "$STAMP_DIR" -name '*last_pass.stamp' -type f 2>/dev/null \
       | sed 's|/[^/]*$||' | sort -u | wc -l | tr -d ' ')"
     echo "quick=${INTFER_QUICK:-0}"
@@ -1528,7 +1653,7 @@ if [ "$FAILED" -ne 0 ]; then
   echo "  certified in $CERT (rc=1)" >&2
   echo "  A REAL REGRESSION: see the FAIL lines above and the per-step logs in" >&2
   echo "  $BUILD_DIR/run_all_*.log. Fix, re-run, then verify with" >&2
-  echo "  scripts/check_stack_cert.sh." >&2
+  echo "  scripts/checks/check_stack_cert.sh." >&2
   exit 1
 fi
 if [ "$STALE" -ne 0 ] || [ "$UNPROVEN" -ne 0 ]; then
@@ -1538,7 +1663,7 @@ if [ "$STALE" -ne 0 ] || [ "$UNPROVEN" -ne 0 ]; then
   echo "  wrong with the code; the proof is just older than the tree." >&2
   echo "  Re-run the named matrix (or all of them) so its stamp names $HEAD_SHORT." >&2
   echo "  certified in $CERT (rc=2)" >&2
-  echo "  STALE EVIDENCE, not a regression: scripts/check_stack_cert.sh gives the" >&2
+  echo "  STALE EVIDENCE, not a regression: scripts/checks/check_stack_cert.sh gives the" >&2
   echo "  same verdict this run gave; re-run the stack so the stamps name HEAD." >&2
   exit 2
 fi
@@ -1553,11 +1678,11 @@ echo "  certified in $CERT (rc=0)"
 # *** PRINT THE POINTER, so the next session is told BY THE TOOL. *** A
 # certification nobody re-derives is a transcript with a filename: for three
 # sessions running, each one hand-ran the same six probes before it could say the
-# stack passes. scripts/check_stack_cert.sh does that now, and it is POST-STACK BY
+# stack passes. scripts/checks/check_stack_cert.sh does that now, and it is POST-STACK BY
 # DESIGN (it grades the certificate this run writes), so it must be run after --
 # the one step a reader cannot infer from this output unless it is stated here.
 echo
-echo "  VERIFY IT NOW:  scripts/check_stack_cert.sh"
+echo "  VERIFY IT NOW:  scripts/checks/check_stack_cert.sh"
 echo "    rc=0 -> this certificate is evidence for THIS commit"
 echo "    rc=1 -> re-run the stack (the evidence is older than the tree)"
 echo "    rc=2 -> unproven, no certificate"

@@ -60,9 +60,9 @@ fi
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 
 # ---- shared helpers (sourced, never executed) ----
-. "$SCRIPT_DIR/_gate_build.sh"
-. "$SCRIPT_DIR/_gate_precond.sh"
-. "$SCRIPT_DIR/_gate_loadlog.sh"
+. "$SCRIPT_DIR/lib/_gate_build.sh"
+. "$SCRIPT_DIR/lib/_gate_precond.sh"
+. "$SCRIPT_DIR/lib/_gate_loadlog.sh"
 
 gate_require_build intfer_cli || exit 1
 gate_require_device || exit 2
@@ -181,7 +181,19 @@ run_combo() { # $1 = label; remaining args = "KNOB=v ..." env prefix
       result_lines["$label"]+="r$r NO_PROFILE log=$log"$'\n'
       continue
     fi
-    result_lines["$label"]+="r$r $prof"$'\n'
+    # ---- the XMX verdict word, scraped from the SAME round's log ----
+    # The engine's [xmx-attrib] line (engine.cpp xmx_attrib_line) sits beside the
+    # profile dump in every round's log, and its matrix_engines= word is how this
+    # sweep can decide a knob on matrix-engine REACHABILITY rather than on a
+    # device count. Same anchored first-match discipline as the profile selector:
+    # taking the last match would read a line from a later round. The verdict
+    # alphabet is closed ([a-z-]: not-requested / active / requested-all-declined),
+    # and an absent line publishes `missing` -- never an empty value, which is the
+    # shape that reads as "zero XMX" without having measured it.
+    mex="$(grep -a '\[xmx-attrib\]' "$log" | head -1 \
+           | sed -n 's/.*matrix_engines=\([a-z-]\{1,\}\).*/\1/p')"
+    [ -n "$mex" ] || mex=missing
+    result_lines["$label"]+="r$r $prof matrix_engines=$mex"$'\n'
   done
 }
 
@@ -210,6 +222,7 @@ field() { # $1 = profile line, $2 = field name
     nk)       re='nk=([0-9]+)' ;;
     nw)       re='nw=([0-9]+)' ;;
     nr)       re='nr=([0-9]+)' ;;
+    matrix_engines)re='matrix_engines=([a-z-]+)' ;;
     *)        return 1 ;;
   esac
   [[ $line =~ $re ]] && printf '%s' "${BASH_REMATCH[1]}"
@@ -231,10 +244,10 @@ echo "knob_sweep: model=$MODEL rounds=$ROUNDS build=$BUILD_DIR"
 echo "knobs: $KNOB_SPEC"
 echo "baseline: $BASELINE"
 echo
-printf '%-34s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n' \
-  'combo' 'kernel' 'submit' 'waitblock' 'rebuild' 'usm_write' 'readback' 'copy' 'nk' 'nw' 'nr'
-printf '%-34s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n' \
-  '----------' '--------' '--------' '--------' '--------' '--------' '--------' '--------' '--------' '--------' '--------'
+printf '%-34s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n' \
+  'combo' 'kernel' 'submit' 'waitblock' 'rebuild' 'usm_write' 'readback' 'copy' 'nk' 'nw' 'nr' 'matrix_engines'
+printf '%-34s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n' \
+  '----------' '--------' '--------' '--------' '--------' '--------' '--------' '--------' '--------' '--------' '--------' '--------------'
 
 emit_row() { # $1 = label
   local label="$1" vals="${result_lines[$label]:-}"
@@ -246,11 +259,11 @@ emit_row() { # $1 = label
   done <<<"$vals"
   local n=${#rows[@]}
   if [ "$n" -eq 0 ]; then
-    printf '%-34s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n' "$label" '-' '-' '-' '-' '-' '-' '-' '-' '-' '-' '-'
+    printf '%-34s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n' "$label" '-' '-' '-' '-' '-' '-' '-' '-' '-' '-' '-'
     return
   fi
   # collect per-field values across usable rounds (non-FAILED, non-NO_PROFILE)
-  local -a k s wb rb uw rbc cp nk nw nr=()
+  local -a k s wb rb uw rbc cp nk nw nr mx=()
   local usable=0
   local line
   for line in "${rows[@]}"; do
@@ -268,9 +281,10 @@ emit_row() { # $1 = label
     nk=("${nk[@]}" "$(field "$line" nk)")
     nw=("${nw[@]}" "$(field "$line" nw)")
     nr=("${nr[@]}" "$(field "$line" nr)")
+    mx+=("$(field "$line" matrix_engines)")
   done
   if [ "$usable" -eq 0 ]; then
-    printf '%-34s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n' "$label" '-' '-' '-' '-' '-' '-' '-' '-' '-' '-' '-'
+    printf '%-34s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n' "$label" '-' '-' '-' '-' '-' '-' '-' '-' '-' '-' '-'
     return
   fi
   printf '%-34s ' "$label"
@@ -284,6 +298,10 @@ emit_row() { # $1 = label
   printf '%8s' "$(printf '%s\n' "${nk[@]}" | head -1)"
   printf '%8s' "$(printf '%s\n' "${nw[@]}" | head -1)"
   printf '%8s' "$(printf '%s\n' "${nr[@]}" | head -1)"
+  # the XMX verdict is a WORD, not a median: head -1, exactly as nk/nw/nr do. It
+  # is a per-round observation of what asked for the matrix engines, so the table's
+  # job is to show it verbatim, never to average verdicts into a number.
+  printf '%14s' "$(printf '%s\n' "${mx[@]}" | head -1)"
   printf '\n'
   # ---- spread-floor deltas vs baseline ----
   if [ "$label" != "BASELINE($BASELINE)" ] && [ "$usable" -ge 2 ]; then

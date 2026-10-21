@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the CORRECTNESS GATES (scripts/test_*.sh) and certify the engine against the
+# Run the CORRECTNESS GATES (scripts/gates/test_*.sh) and certify the engine against the
 # current tree, leaving an on-disk artifact that names HEAD.
 #
 # WHY THIS EXISTS. `run_all_checks.sh` certifies the TOOLING. It does not run the
@@ -9,11 +9,11 @@
 # evidence: it is the same shape AUDIT #22 stopped accepting when a tok/s was
 # published with no artifact behind it. A number at the end of a session needs a
 # file on disk that says which tree produced it. This is that file.
-# `scripts/check_engine_cert.sh` is what keeps this artifact honest afterwards.
+# `scripts/checks/check_engine_cert.sh` is what keeps this artifact honest afterwards.
 #
 # *** WHY THE ARTIFACT IS NOT NAMED last_pass.stamp ***
 # Deliberate. `run_all_checks.sh` enumerates `find build -name '*last_pass.stamp'`
-# and fails on any directory it does not recognise; scripts/_gate_pop.sh derives
+# and fails on any directory it does not recognise; scripts/lib/_gate_pop.sh derives
 # that recognised set from `mutate_*.sh` alone. A stamp from a suite that is not
 # a mutation matrix would therefore be reported as a LEAK, and the only ways out
 # would be to loosen a green guard or to reclassify this as a matrix. Neither is
@@ -34,8 +34,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT" || exit 2
-# shellcheck source=scripts/_gate_enum.sh
-. "$SCRIPT_DIR/_gate_enum.sh"
+# shellcheck source=scripts/lib/_gate_enum.sh
+. "$SCRIPT_DIR/lib/_gate_enum.sh"
 
 BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
 # Seam: the self-check drives this with STUBS so it can prove the tally can fail
@@ -45,7 +45,7 @@ BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
 # to exercise its own failure path.
 GATE_GLOB="${INTFER_GATE_GLOB:-test_*.sh}"
 GATE_TIMEOUT="${INTFER_GATE_TIMEOUT:-2400}"
-GATE_DIR="${INTFER_GATE_DIR:-$SCRIPT_DIR}"
+GATE_DIR="${INTFER_GATE_DIR:-$SCRIPT_DIR/gates}"
 # The tally lives in globals set by run_gates. They are declared HERE because
 # the self-check calls run_gates directly and reads them afterwards under `set -u`.
 GPASS=0; GPARTIAL=0; GSKIP=0; GFAIL=0; GFAILED=""
@@ -156,7 +156,7 @@ self_check() {
   GATE_DIR="$SB/g4"
   mkdir -p "$SB/o4"; run_gates "$SB/o4" > "$SB/o4.out" 2>&1
   GATE_DIR="$SAVED_DIR"
-  n_real="$(ls "$SCRIPT_DIR"/test_*.sh 2>/dev/null | wc -l | tr -d ' ')"
+  n_real="$(ls "$SCRIPT_DIR"/gates/test_*.sh 2>/dev/null | wc -l | tr -d ' ')"
   if [ "$n_real" -lt 5 ]; then
     echo "  FAIL  S4: only $n_real real gate scripts -- the census cannot be trusted"
     bad=$((bad+1))

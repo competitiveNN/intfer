@@ -13,7 +13,7 @@
   almost every section describes a defect that is since FIXED.
 
   Live rules are in AGENTS.md; live tooling is derived by `scripts/gate_inventory.sh`,
-  `scripts/check_checker_matrix_coverage.sh` and `scripts/run_all_checks.sh`.
+  `scripts/checks/check_checker_matrix_coverage.sh` and `scripts/run_all_checks.sh`.
 -->
 
    === 2026-09-30 AUDIT #7: gate hygiene, family 3 tree-wide + shared helper ===
@@ -27,9 +27,9 @@
    audit #6 touched four. Same damage as http_batch: a failed build leaves the
    previous binary runnable, so the gate judges code that no longer exists.
    (HISTORICAL COUNT: nine was correct for audits #7/#8. There are TEN gates now
-   — scripts/test_dpas_fold.sh was added later; see the EXPERIMENT SHIPPED
+   — scripts/gates/test_dpas_fold.sh was added later; see the EXPERIMENT SHIPPED
    block. Do not read "nine" below as the current count.)
-   Fix: ONE shared, sourced helper `scripts/_gate_build.sh` with
+   Fix: ONE shared, sourced helper `scripts/lib/_gate_build.sh` with
    `gate_require_build <cmake-target>`, called by all nine gates
    (`. "$SCRIPT_DIR/_gate_build.sh"; gate_require_build <target> || exit 1`).
    Rationale: nine hand-rolled copies of the block is precisely how the family
@@ -126,7 +126,7 @@
    (~19GB vs ~12GB), aborting inside Level Zero's page-fault manager.
    Timeline fits the loss: gpu_optin (TP=1+TP=2 arms) PASSED earlier in the
    same run, then the second GPU vanished before the last gate.
-   ACTION: re-run scripts/test_tp2_27b.sh once BOTH GPUs enumerate again
+   ACTION: re-run scripts/gates/test_tp2_27b.sh once BOTH GPUs enumerate again
    (`sycl-ls` must print 2 [level_zero:gpu] lines). Until then treat the
    9-gate result as 8/9 with TP=2 coverage unverified, not as a code failure.
    ~~SCOPED, NOT ATTEMPTED: the engine should reject `--tp N` when
@@ -228,7 +228,7 @@
    checkout, full output captured per state (an earlier draft asserted the
    M2-alone row by inference; it was WRONG, corrected below, and S4 added
    because the real question is whether the readback earns its place).
-   RE-RUNNABLE: ./scripts/mutate_fold_matrix.sh (7/7 as characterized;
+   RE-RUNNABLE: ./scripts/matrices/mutate_fold_matrix.sh (7/7 as characterized;
    S5+S6 added in AUDIT #13 — see the 7-state table there, this one is the
    original 5):
      S0 clean                contract pass    index pass  readback pass          rc=0
@@ -255,7 +255,7 @@
 S1=20, S2=31, S3=42, S4=722, S5=4, S6=810 — note this file previously said
 "S4=2", a pre-index-check figure; per-COLUMN counts are in the report and differ,
 e.g. S3's contract column is 40 not 42).
-   THE MATRIX IS NOW A SCRIPT, NOT PROSE: scripts/mutate_fold_matrix.sh
+   THE MATRIX IS NOW A SCRIPT, NOT PROSE: scripts/matrices/mutate_fold_matrix.sh
    re-derives S0-S6 (each state alone from a clean header, per-state logs,
    restore + residue re-verified) and ASSERTS each state's character. 7/7 as
    characterized (S5/S6 added in AUDIT #13), stamped with the HEAD sha it was
@@ -386,7 +386,7 @@ e.g. S3's contract column is 40 not 42).
    assertion about a path it never took, and a red gate that means "the box"
    teaches everyone to ignore red gates. And gpu_optin was worse still — it
    reported PASS, because identity assertions on a re-run tp=1 trivially hold.
-   All three now go through scripts/_gate_precond.sh, PER ARM where 1-GPU
+   All three now go through scripts/lib/_gate_precond.sh, PER ARM where 1-GPU
    coverage exists. Never exit 0 (that would claim coverage nobody got) and
    never exit 1 (indistinguishable from a real regression). Helper paths
    unit-checked: require-met -> 0, require-unmet -> 2, empty arg -> 1,
@@ -505,10 +505,10 @@ e.g. S3's contract column is 40 not 42).
    STALE-qualifying path is RETAINED, not deleted to make a report green: it is
    the behaviour that makes the rc=0 mean something.
    MUTATION-TESTED, because the previous checker was not. The evidence is
-   COMMITTED as a re-runnable script, scripts/mutate_gate_inventory.sh, NOT
+   COMMITTED as a re-runnable script, scripts/matrices/mutate_gate_inventory.sh, NOT
    left in a transcript: a mutation that exists only in a commit message cannot
    be re-run, so the next session re-derives (or re-asserts) it. It mirrors
-   scripts/mutate_fold_matrix.sh — dirty-tree guard, EXIT trap + `git checkout
+   scripts/matrices/mutate_fold_matrix.sh — dirty-tree guard, EXIT trap + `git checkout
    --` restore, an anchor pre-flight asserting each of the 6 targets occurs
    EXACTLY ONCE, per-state logs + summary.txt, a byte-identical restore check,
    a residue scan, and a sha/date stamp. 6/6 mutations refused the checker
@@ -578,7 +578,7 @@ e.g. S3's contract column is 40 not 42).
   ROOT CAUSE, precisely: gate_inventory's GRANULARITY column classified
   "needs no device" and "needs a device and forgot to say so" IDENTICALLY, both
   as "none". Two different things, one label, and on a healthy box both exit 0.
-   FIX. gate_require_render_node() in scripts/_gate_precond.sh, sibling of
+   FIX. gate_require_render_node() in scripts/lib/_gate_precond.sh, sibling of
    gate_require_gpus, exits 2 (SKIP) with the same "BOX STATE, not a code
    failure" framing. It is the STRICTER and more correct of the two
    preconditions: a missing libumf makes sycl-ls report zero devices on a
@@ -592,7 +592,7 @@ e.g. S3's contract column is 40 not 42).
    that re-derives GPU dependence from each gate's own code (--gpu / sycl-ls /
    level_zero / xpu-smi / dpas_fold_probe) and fails a GPU gate carrying no
    guard, so a newly added GPU gate cannot reopen this. M7 in
-   scripts/mutate_gate_inventory.sh proves it can fail, and M7's own history is
+   scripts/matrices/mutate_gate_inventory.sh proves it can fail, and M7's own history is
    the argument: the FIRST M7 neutered the loop's `rnode="MISSING"` branch and
    was scored MISSED, correctly, because every GPU gate on the real tree is
    guarded so that branch is UNREACHABLE. Fixed by hoisting the verdict into
@@ -610,7 +610,7 @@ e.g. S3's contract column is 40 not 42).
   Found by the final verification pass, and it is the same class as everything
   else above — family 3, stale artifact — except that the harness that CAUSES it
   is the one written to prove the checks work.
-  `scripts/mutate_fold_matrix.sh` restores the SOURCE with `git checkout --` and
+  `scripts/matrices/mutate_fold_matrix.sh` restores the SOURCE with `git checkout --` and
   nothing else. Its last state is S6, so the `dpas_fold_probe` binary left in the
   build tree is the MUTATED one. Any later gate that reuses the build without
   rebuilding (`INTFER_GATE_NO_BUILD=1`) then judges mutated code. Observed live:
@@ -642,18 +642,18 @@ e.g. S3's contract column is 40 not 42).
   common one on THIS box — still produced a RED line from test_dpas_fold /
   test_http_batch / test_serve_load. The helper's own comment already said
   callers needing a count "use both", and no gate did.
-    FIX: `gate_require_device()` in scripts/_gate_precond.sh checks BOTH, node
+    FIX: `gate_require_device()` in scripts/lib/_gate_precond.sh checks BOTH, node
   first (a direct syscall, free) then the count, exit 2 on either. All three
   gates now route through it, and test_gpu_optin / test_device_argmax had their
   INLINE render-node probes replaced with the shared helper — two fewer
   hand-rolled copies of the same probe, which is how this family reopened the
-  first time. Zero hand-rolled `renderD128` probes remain in scripts/test_*.sh.
+  first time. Zero hand-rolled `renderD128` probes remain in scripts/gates/test_*.sh.
     Verified in ALL THREE directions with in-tree fixtures
   (scripts/fixtures/{no-device,no-render-node}): node open + 1 GPU -> rc=0;
   node unreachable -> every device gate rc=2; node open + 0 devices -> every
   device gate rc=2. (Measured by hand first; since AUDIT #17 this is a COMMITTED
-  HARNESS, not a transcript claim — run `scripts/check_device_precond.sh` for the
-  12-cell matrix and `scripts/mutate_device_precond.sh` for its 3/3
+  HARNESS, not a transcript claim — run `scripts/checks/check_device_precond.sh` for the
+  12-cell matrix and `scripts/matrices/mutate_device_precond.sh` for its 3/3
   non-vacuity proof. Note there are SIX GPU gates, not five: test_tp2_27b.sh is
   count-guarded and was outside the original five.) The fixtures exist because a
   proof that lives in a transcript cannot be re-run (audit #13/#14), and because
@@ -674,7 +674,7 @@ e.g. S3's contract column is 40 not 42).
       so the count was always empty and (by the bug above) always passed. The
       guard now runs after setvars, which is the only point at which sycl-ls
       exists to be counted.
-  (2) The anchor pre-flight in scripts/mutate_gate_inventory.sh parsed its table
+  (2) The anchor pre-flight in scripts/matrices/mutate_gate_inventory.sh parsed its table
   with `IFS='|'` while the anchor PATTERNS themselves contain `|` — ERE
   alternation and `||`. Every such row was silently TRUNCATED at the first `|`,
   and because a truncated prefix is still a substring, the pre-flight went on
@@ -711,7 +711,7 @@ e.g. S3's contract column is 40 not 42).
   DEFINITION, not for its uses.
 
 - **AUDIT #17: THE FIXTURES WERE COMMITTED, THE DRIVER THAT RUNS THEM WAS NOT**
-  (scripts/check_device_precond.sh + scripts/mutate_device_precond.sh; no
+  (scripts/checks/check_device_precond.sh + scripts/matrices/mutate_device_precond.sh; no
   engine/quant/schedule code touched). Audit #16 added two stubs —
   `scripts/fixtures/{no-device,no-render-node}` — and recorded the measured
   result at AGENTS.md:946-948. Enumerating the tree, not the transcript:
@@ -723,9 +723,9 @@ e.g. S3's contract column is 40 not 42).
   A stub with no driver is a comment with a shebang. Meanwhile
   `mutate_gate_inventory.sh` (audit #16) was exactly the pattern that was
   already right in this repo, so the omission was not a judgement call.
-    FIX: `scripts/check_device_precond.sh` runs 6 GPU gates x 2 failure
+    FIX: `scripts/checks/check_device_precond.sh` runs 6 GPU gates x 2 failure
   directions (12 cells) and asserts rc=2 AND the correct DIAGNOSTIC per cell;
-  `scripts/mutate_device_precond.sh` proves it can fail (3/3). Both stamp the
+  `scripts/matrices/mutate_device_precond.sh` proves it can fail (3/3). Both stamp the
   sha. Four load-bearing pieces, each added because a weaker version was
   measurably vacuous:
     * SEAM DISCRIMINATION. `gate_require_device` turns BOTH "0 devices" and
@@ -754,13 +754,13 @@ e.g. S3's contract column is 40 not 42).
   coverage hole too: it said "all FIVE device gates"; there are SIX GPU gates
   and test_tp2_27b was never exercised in either direction.
   NAMING IS LOAD-BEARING. The checker must NOT be named `test_*.sh`.
-  `ls scripts/test_*.sh` IS the definition of the gate population
+  `ls scripts/gates/test_*.sh` IS the definition of the gate population
   `gate_inventory.sh` classifies, and this checker's own CODE names the stub
   path (`NODEV_STUB=".../fixtures/no-device/sycl-ls"`), so as a `test_*` it
   would be classified a GPU gate carrying no device guard — a false MISSING row,
   against a checker that by design needs no device. Caught before it happened by
   asking what the glob would classify, not after.
-  MUTATION MATRIX 3/3, 0 unattributed (scripts/mutate_device_precond.sh):
+  MUTATION MATRIX 3/3, 0 unattributed (scripts/matrices/mutate_device_precond.sh):
     * M-A strip a real gate's device guard -> classification cross-check
       catches "needs a device but carries NO guard at all".
     * M-B clear a fixture's EXECUTE BIT. The nastiest shape: PATH lookup skips
@@ -846,8 +846,8 @@ e.g. S3's contract column is 40 not 42).
   the writer), recurring in the tooling that verifies those very fixes.
 
 - **AUDIT #17b: THREE BLIND SPOTS IN THE DEVICE-PRECOND PROOF, AND A DRIVER FOR
-  THE WHOLE STACK** (scripts/check_device_precond.sh healthy column,
-  scripts/mutate_device_precond.sh now 6 states, NEW scripts/run_all_checks.sh;
+  THE WHOLE STACK** (scripts/checks/check_device_precond.sh healthy column,
+  scripts/matrices/mutate_device_precond.sh now 6 states, NEW scripts/run_all_checks.sh;
   still no engine/quant/schedule code touched). Audit #17 closed the "fixtures
   with no driver" gap. This pass asked the question #17 should have asked first:
   **which claimed mechanism is actually exercised by a state that exists?**
@@ -949,7 +949,7 @@ e.g. S3's contract column is 40 not 42).
   reasons, fold 7/7, gate-inventory 9/9, 4/4 stamps current, `run_all_checks`
   rc=0 with the 2b re-run visibly reporting "ok (evidence now current)".
 - **AUDIT #17c: THE ENTRY POINT HAD NO MATRIX, NO SELF-CHECK, AND THE SEAM THAT
-  MADE IT TESTABLE BROKE IT** (NEW scripts/mutate_run_all_checks.sh, 4/4;
+  MADE IT TESTABLE BROKE IT** (NEW scripts/matrices/mutate_run_all_checks.sh, 4/4;
   run_all_checks.sh gains a gating self-check + three seams; no engine/quant/
   schedule code touched). `run_all_checks.sh` is the ENTRY POINT for the whole
   verification stack and was the one script in it with neither a mutation matrix
@@ -1289,7 +1289,7 @@ e.g. S3's contract column is 40 not 42).
       so the CMake harvest was **0** and the checker exited 2 looking like a
       working check that simply found no consumers.
     FIX, structural rather than three separate patches: **one shared guard**,
-    `scripts/_gate_enum.sh` (`enum_require_nonempty` / `enum_require_min`),
+    `scripts/lib/_gate_enum.sh` (`enum_require_nonempty` / `enum_require_min`),
     now used by `check_doc_counts.sh`, `check_build_dir_consumers.sh` AND
     `gate_inventory.sh` — the last of which previously carried its own hand-rolled
     copy of the `sites_found == 0` rule, i.e. the AUDIT #7/#8 "rule fixed at one
@@ -1299,7 +1299,7 @@ e.g. S3's contract column is 40 not 42).
       * **A `WARN ... skip` path in a correctness checker is a defect.** If the
         subject is missing the checker is broken, not the input optional.
       * Never write a numeric test that a non-numeric value can satisfy.
-        `scripts/check_gate_enum.sh` asserts `""` and `"abc"` FAIL CLOSED, because
+        `scripts/checks/check_gate_enum.sh` asserts `""` and `"abc"` FAIL CLOSED, because
         `[ "" -gt 0 ]` is FALSE and a naive implementation would pass them.
     *** AND THE MUTATION-TESTING RESULT, which is the argument for the rest. ***
     Every checker added this session failed on its first run, and every failure
@@ -1483,7 +1483,7 @@ e.g. S3's contract column is 40 not 42).
       the wait, then route every arm through the shared gate, and the warn text
       now states the consequence that actually happens (the leg's `TPS` is
       recorded `SKIPPED-CONTENDED`).
-    - **THE SINGLE HOME: `scripts/_gate_loadlog.sh`.** `loadlog_arm <label> <cmd…>`
+    - **THE SINGLE HOME: `scripts/lib/_gate_loadlog.sh`.** `loadlog_arm <label> <cmd…>`
       samples load1 every `$INTFER_LOAD_SAMPLE` sec for the arm's WHOLE duration
       into `<dir>/<label>.load`, runs the command tee'd to `<dir>/<label>.log`, and
       publishes `_LL_LOG` / `_LL_MAX` / `_LL_USABLE`; usable iff the MAXIMUM over
@@ -1518,7 +1518,7 @@ e.g. S3's contract column is 40 not 42).
       produced which line — an ambiguous log is the artifact problem all over
       again. Hence HEAD and PID in the name.
     - **CHECKER + MATRIX, and the population is derived so a new harness is
-      covered automatically.** `scripts/check_bench_load_gate.sh` asserts four
+      covered automatically.** `scripts/checks/check_bench_load_gate.sh` asserts four
       things per derived harness: it routes through the one helper; its figure
       comes from `$(loadlog_tps_field …)`; it does not REDEFINE
       `loadlog_arm`/`loadlog_tps_field` (a redefinition would leave the first
@@ -1529,7 +1529,7 @@ e.g. S3's contract column is 40 not 42).
       must WITHHOLD, and against a quiet fixture and must PUBLISH — both
       directions required, since a gate that can only say USABLE is the bug and one
       that can only say CONTENDED is useless (always-red converse).
-      `scripts/mutate_bench_load_gate.sh` is **7/7** (states B-A..B-G; read live
+      `scripts/matrices/mutate_bench_load_gate.sh` is **7/7** (states B-A..B-G; read live
       figures from `build/bench_load_gate_mutate/last_pass.stamp`, never from
       here). `B-F` regresses `bench_chat.sh` to publishing unconditionally — TWO
       hunks, because removing only the branch would leave the helper sourced and
@@ -1693,7 +1693,7 @@ e.g. S3's contract column is 40 not 42).
         - **THE RESTORE-STRATEGY AUDIT, DERIVED — AND THE AUDIT ITSELF WAS WRONG FIRST.**
           `scripts/run_ten_gates.sh` is a better tool than the argument it replaced,
           but the class-closing move was applying the snapshot lesson to every
-          other matrix. Enumerated from `scripts/mutate_*.sh`, not remembered:
+          other matrix. Enumerated from `scripts/matrices/mutate_*.sh`, not remembered:
             SNAPSHOT (mechanism):  mutate_bench_load_gate.sh, mutate_run_all_checks.sh
             git checkout (tracked): mutate_device_precond.sh, mutate_fold_matrix.sh,
                                     mutate_gate_inventory.sh
@@ -1722,7 +1722,7 @@ e.g. S3's contract column is 40 not 42).
           sound reasoning and it is NOT evidence — it is AUDIT #22's shape exactly:
           a number whose backing is an argument about the tree rather than a file
           on disk. `scripts/run_ten_gates.sh` now derives the gate population from
-          `scripts/test_*.sh` (never a list of ten names, which would rot when a
+          `scripts/gates/test_*.sh` (never a list of ten names, which would rot when a
           gate is added), tallies **by exit code** — the only non-double-countable
           measure, per the AUDIT #13 trap — and writes `build/ten_gates/gates.log`
           plus `build/ten_gates/HEAD` naming the tree it certified.
@@ -1750,7 +1750,7 @@ e.g. S3's contract column is 40 not 42).
       NOT A HAND-MADE ARGUMENT.** The previous round's last weak point was that
       "10 PASS / 0 PARTIAL / 0 SKIPPED" was reconciled with the tooling stamps by [SUPERSEDED 2026-10-04: an 11th gate, test_ksplit_contract, was added; re-derive with scripts/gate_inventory.sh]
       ME, by hand, with a diff argument. Sound reasoning; still not evidence.
-    - **`scripts/check_engine_cert.sh` mechanises exactly that argument**, so it
+    - **`scripts/checks/check_engine_cert.sh` mechanises exactly that argument**, so it
       cannot be skipped or forgotten. Four verdicts, all exercised:
       artifact names HEAD → **certified here** (0); artifact older and **no engine
       input moved** → the evidence **CARRIES** (0); artifact older **and an engine
@@ -1760,7 +1760,7 @@ e.g. S3's contract column is 40 not 42).
       that fires on every commit is a check people learn to ignore — which is how
       such a check gets "fixed" by weakening it.
       The "engine input" set is **derived**, not listed: `src/`, `examples/`,
-      `include/`, `scripts/test_*` and the shared gate helpers those tests source.
+      `include/`, `scripts/gates/test_*` and the shared gate helpers those tests source.
     - **`scripts/run_ten_gates.sh` HAS A SELF-CHECK, AND THE STACK ENFORCES IT.**
       `--self-check` drives the tally with STUBS in seconds — no engine, no GPU —
       and proves pass / fail / PARTIAL(rc=2) / empty-census all classify. This
@@ -2014,7 +2014,7 @@ e.g. S3's contract column is 40 not 42).
       round*; with FAILED rows present, an arm missing round 1 would shift every
       later row down one and turn the comparison into "round 2 vs round 1". A
       fixture that loses round 2 only requires the delta over rounds **1,3**.
-      (c) **The summary moved out of the harness into `scripts/_bench_summary.py`.**
+      (c) **The summary moved out of the harness into `scripts/lib/_bench_summary.py`.**
       That is the testability half: as a heredoc the only way to drive it was to
       run a 27B benchmark, which is exactly why this survived until a real run
       died. *An assumption the harness cannot redirect is one it cannot test* —
@@ -2180,7 +2180,7 @@ e.g. S3's contract column is 40 not 42).
       * `build/run_all_mutate/last_pass.stamp` → `caught=`, `baselines=`, `states=`
         — and **`states=` is itself derived** now, from the states that actually ran.
       * `build/stack_cert_mutate/last_pass.stamp` → the cert-checker matrix.
-      * `scripts/check_stack_cert.sh` re-derives all of it against the live tree;
+      * `scripts/checks/check_stack_cert.sh` re-derives all of it against the live tree;
         it is **POST-STACK** by design, because it grades the certificate the stack
         *writes*, and `run_all_checks.sh` prints that pointer at the end of every
         verdict path.
@@ -2226,7 +2226,7 @@ e.g. S3's contract column is 40 not 42).
     incrementing its counter only in the success branch, so a MISSED run would have
     vanished from the list — **the exact defect the field exists to make visible**.
     Each block now names itself; the list is asserted free of placeholders.
-  - **THE FAMILY IS NOW CLOSED, NOT THE INSTANCE.** `scripts/check_verdict_scope.sh`
+  - **THE FAMILY IS NOW CLOSED, NOT THE INSTANCE.** `scripts/checks/check_verdict_scope.sh`
     **derives** the population of files that emit a spread-bounded verdict
     (`CLEARS the spread` / `INSIDE the spread` / `NO SPREAD ESTIMATE`), requires
     every non-verifier to be the single OWNER (`_bench_summary.py`) or a DECLARED
@@ -2238,7 +2238,7 @@ e.g. S3's contract column is 40 not 42).
     data, `bench_quiet_ab.sh` and `bench_chat.sh` print no verdict at all.
     **Its scope is stated, not implied:** `check_*`/`mutate_*` are excluded as
     VERIFIERS by name prefix — load-bearing for the same reason it is in
-    `gate_inventory.sh` (`ls scripts/test_*.sh` DEFINES the gate population,
+    `gate_inventory.sh` (`ls scripts/gates/test_*.sh` DEFINES the gate population,
     AUDIT #17) — and the cost is named: a `check_*` that genuinely re-derived the
     rule would be excluded too. A checker claiming completeness it lacks is worse
     than one that names its scope.
@@ -2482,14 +2482,14 @@ e.g. S3's contract column is 40 not 42).
     **35 scripts, all dispatched**; 0c confirms all scheduled.
 - **2026-10-03: THE SECOND GPU CAME BACK, AND THE ONE GATE THAT HAD NEVER RUN
   NOW PASSES.** Verified at the **driver API**, not `sycl-ls` alone:
-  `scripts/l0_enumerate.sh` → `zeDeviceGet rc=0 DEVICES=2`, UUIDs `…-0400-…`
+  `scripts/l0/l0_enumerate.sh` → `zeDeviceGet rc=0 DEVICES=2`, UUIDs `…-0400-…`
   (04:00.0) and `…-8600-…` (86:00.0), both `0xe20b`. It returned **without any change
   in this repo** — no rebind was run here — so this is the host/driver-side state
   of AUDIT #11 holding for a fourth time. Note the DRM minor **flipped back** to
   `renderD129` (it had been `renderD130` hours earlier): **derive a card from
   `/dev/dri/by-path/pci-<slot>-render`, never from `/dev/dri/renderD<n>`** — that is
-  now enforced by `scripts/check_dri_probe.sh`, see AUDIT #30.
-  ==> **`scripts/test_tp2_27b.sh`: PASS — `GPU backend: 2 device(s) (TP=sharded)`.**
+  now enforced by `scripts/checks/check_dri_probe.sh`, see AUDIT #30.
+  ==> **`scripts/gates/test_tp2_27b.sh`: PASS — `GPU backend: 2 device(s) (TP=sharded)`.**
   This is the gate whose *sole* arm is `--tp 2` on 27B, and it had been unrunnable
   for the entire 1-GPU era (rc=2 SKIPPED). It is the only thing that could certify
   TP=2 coverage at 27B, so this closes the last unverified coverage item. Kernel
@@ -2553,7 +2553,7 @@ e.g. S3's contract column is 40 not 42).
   `caught=13/13 baselines=13/13`, and it now reports **16/16** (N-P, N-Q, N-R,
   N-S added). Read the live figures from `build/run_all_mutate/last_pass.stamp`,
   never from a paragraph like this one.
-- **`scripts/check_stack_cert.sh` — THE CERT IS NOW A CHECK, NOT A CLAIM.** For
+- **`scripts/checks/check_stack_cert.sh` — THE CERT IS NOW A CHECK, NOT A CLAIM.** For
   three sessions running, every session hand-ran the same six probes (cert sha vs
   HEAD, rc, stale/unproven, tree clean, lock absent, census) before it could say
   "the stack passes" — and one of them mis-quoted a mid-sequence failure as the
@@ -2713,7 +2713,7 @@ e.g. S3's contract column is 40 not 42).
     3. State M-I asserted the guard's own FAIL line while the scorer checked
        absence — but for that state the guard firing **IS** the success.
   **RULE: a bare `grep -q "$expect"` is not an assertion, it is a convention
-  nobody can read.** Use `scripts/_gate_pred.sh`'s `pred_expect_absent` /
+  nobody can read.** Use `scripts/lib/_gate_pred.sh`'s `pred_expect_absent` /
   `pred_expect_present`, which NAME the polarity at the call site and print it
   in the verdict (`verdict-polarity=expect-absent`). A state written for the
   wrong polarity then fails LOUDLY with the polarity named instead of silently
@@ -2741,7 +2741,7 @@ e.g. S3's contract column is 40 not 42).
   which side the marker is on before touching the checker.
 
 - **`patch_literal` IS STILL DUPLICATED IN THREE MATRICES — DELIBERATE, WITH A
-    TRIGGER.** `scripts/_gate_patch.sh` (added AUDIT #20) owns `patch_literal`,
+    TRIGGER.** `scripts/lib/_gate_patch.sh` (added AUDIT #20) owns `patch_literal`,
     `verify_patched` and `residue_scan` for NEW matrices. `mutate_fold_matrix.sh`,
     `mutate_device_precond.sh` and `mutate_run_all_checks.sh` still carry their own
     copies. **This is a known, accepted duplication, not an oversight**, and the
@@ -2763,9 +2763,9 @@ e.g. S3's contract column is 40 not 42).
     function (per-hunk, not whole-block) and is not a candidate for this helper.
     Do NOT convert it "for consistency".
     *** TRIGGERS CHECKED 2026-10-02, NONE FIRED — measured, not assumed. ***
-        git log -1 --format=%h -- scripts/mutate_fold_matrix.sh       -> b49e164
-        git log -1 --format=%h -- scripts/mutate_device_precond.sh    -> 8d6ac55
-        git log -1 --format=%h -- scripts/mutate_run_all_checks.sh    -> bfa7d26
+        git log -1 --format=%h -- scripts/matrices/mutate_fold_matrix.sh       -> b49e164
+        git log -1 --format=%h -- scripts/matrices/mutate_device_precond.sh    -> 8d6ac55
+        git log -1 --format=%h -- scripts/matrices/mutate_run_all_checks.sh    -> bfa7d26
     All three are exactly where they were when this decision was written, so
     trigger 1 (a copy edited without the others) has NOT happened, no divergence
     exists to repair, and trigger 3 did not apply this round. Trigger 2 still has
@@ -2798,7 +2798,7 @@ e.g. S3's contract column is 40 not 42).
     `mutate_run_all_checks.sh` at `1adf06f`), and no copy has been edited
     without the others, so there is no divergence to repair. To re-check before
     assuming the decision still holds:
-        git log -1 --format=%h -- scripts/mutate_fold_matrix.sh   # etc.
+        git log -1 --format=%h -- scripts/matrices/mutate_fold_matrix.sh   # etc.
     If ANY of those shas has moved recently, trigger 2 has fired and the
     conversion is due.
 
@@ -2836,7 +2836,7 @@ e.g. S3's contract column is 40 not 42).
     evidence nor a regression, and the two call for opposite actions). The
     comparison uses `$HEAD_NOW`, so a moved HEAD is not additionally misreported
     as 5 phantom STALE stamps. Mutated by state **N-K** in
-    `scripts/mutate_run_all_checks.sh` (11/11 caught, 12 baselines — the extra two EPHEMERAL(historical: this paragraph's own next lines already redirect to the live figures in the mutator's stamp, so the number here is a dated record, not a claim to re-run)
+    `scripts/matrices/mutate_run_all_checks.sh` (11/11 caught, 12 baselines — the extra two EPHEMERAL(historical: this paragraph's own next lines already redirect to the live figures in the mutator's stamp, so the number here is a dated record, not a claim to re-run)
    are the N-K converse; read the live figures from its stamp; a synthetic
     `step_commit` makes the move reproducible without disarming the mutant's
     dirty-tree guard). If you see "HEAD MOVED under this run", finish the other
@@ -2901,7 +2901,7 @@ e.g. S3's contract column is 40 not 42).
    0 violations. MUTATION-PROVEN non-vacuous twice: (1) weakening the stride
    guard back to `< nOp` -> rc=1; (2) corrupting `dst[nOp+o] = sf` to
    `dst[o] = sf` -> rc=1 with the value comparison firing on M=1. Both reverted.
-   It is wrapped as `scripts/test_dpas_fold.sh` — the TENTH correctness gate,
+   It is wrapped as `scripts/gates/test_dpas_fold.sh` — the TENTH correctness gate,
    and the last build-artifact consumer that had no build guard. It calls
    `gate_require_build dpas_fold_probe` (own log
    `gate_test_dpas_fold_build.log`, derived automatically by the shared helper
@@ -2914,7 +2914,7 @@ e.g. S3's contract column is 40 not 42).
    FULLY CLOSED: 10 guarded correctness gates, 8 measurement harnesses
    deliberately unguarded by decision, 10 model-prep/microbench scripts
    honoring their tree's override. Nothing is both unguarded and unintentional.
-   `scripts/test_gpu_optin.sh` gained 4 arms, PASS at TP=1 AND TP=2:
+   `scripts/gates/test_gpu_optin.sh` gained 4 arms, PASS at TP=1 AND TP=2:
    DPAS48+FOLD == DPAS48 (n=24), DPAS48+PREQ+FOLD == DPAS48 (n=24), WIDE
    DPAS48+FOLD == DPAS48 (~97-token prompt => one ~97-row batch, the arm that
    actually exercises the M>1 row stride), and FOLD-alone == base (inert
@@ -2975,7 +2975,7 @@ e.g. S3's contract column is 40 not 42).
      * build_quant_real tree — quant_27b_chunks_redo.sh, quant_27b_re.sh,
        run_27b_chunks.sh, run_27b_int2_chunks.sh (quant_model_real):
        hardcoded "./build_quant_real/...", ignoring the INTFER_QUANT_REAL_BIN
-       override that scripts/build_quant_real.sh documents and defines.
+       override that scripts/build/build_quant_real.sh documents and defines.
    All 10 now use the SCRIPT_DIR/ROOT idiom and their tree's override.
    Verified WITHOUT running them (they launch 27B quantization jobs): a probe
    evals only the prefix up to the assignment line, run from a real file in
@@ -3211,7 +3211,7 @@ e.g. S3's contract column is 40 not 42).
   are measured dead-ends above (do not retry as-is). INT8-KV
   (INTFER_INT8_KV / INTFER_KV_Q8) + SSM-chain (ssm_forward_chain via
   INTFER_SSM_GPU) exist as opt-in paths, certified stream-identical on
-  GPU by scripts/test_gpu_optin.sh (10/10: base/KV/Q8/Q8+HAD/SSM_GPU x
+  GPU by scripts/gates/test_gpu_optin.sh (10/10: base/KV/Q8/Q8+HAD/SSM_GPU x
   TP1/TP2, .intifer stream 279/6511/314/279) — wall-time comparison
   still needs quiet box (load<2). SCOPE CAVEAT (audit #3b above): the
   SSM_GPU identity holds only on the FP16 GEMM path; its ~1ulp device/host
@@ -3230,7 +3230,7 @@ e.g. S3's contract column is 40 not 42).
   device counters unchanged, first-request jump identical — prefetch is a
   no-op hint for shared USM on this Level Zero driver (do not retry as-is;
   note in engine.cpp preload_all). Mitigation: one warmup request after
-  /health goes live (scripts/serve_27b.sh does this, INTFER_NO_WARMUP=1
+  /health goes live (scripts/run/serve_27b.sh does this, INTFER_NO_WARMUP=1
   skips). A startup touch-kernel over all 496 shards would only move the
   cost, not eliminate it — unscoped.
 - Wave-submit + vectorized host math (2026-09-18, wave 7d7ca72, AVX2
@@ -3404,7 +3404,7 @@ e.g. S3's contract column is 40 not 42).
   L4 4-way identical, cpu parity + http batch + gpu-optin (10/10) PASS on
   the final binary; [l4] counter proves the path fires (72 calls/run).
   Wall-time A/B NOT run (box load 8.78, rising — quiet rule load1<2):
-  run scripts/bench_quiet_ab.sh on a quiet box before any perf claim.
+  run scripts/bench/bench_quiet_ab.sh on a quiet box before any perf claim.
   L0 verdict stands: raw command lists measured same-floor (27.6 vs
   25.2us), so no L0 scaffolding was built — the multi-submit-single-wait
   chain IS the achievable amortization on in-order UR queues, and the
@@ -3631,7 +3631,7 @@ e.g. S3's contract column is 40 not 42).
     branch, asserted by the arm. So "the two runs matched" now means "the MR
     path ran and produced the same tokens".
   - **EVIDENCE IN THE TREE, NOT A TRANSCRIPT** (audit #17/#19): new
-    `scripts/mutate_tp2_selfcheck.sh`. States are judged on their **own**
+    `scripts/matrices/mutate_tp2_selfcheck.sh`. States are judged on their **own**
     expected marker, never on rc alone — a state can go red for an unrelated
     reason. Anchor pre-flight runs first, so a drifted anchor fails in the
     second second instead of masquerading as a weak state. Live figures from
@@ -3679,7 +3679,7 @@ e.g. S3's contract column is 40 not 42).
 === 2026-10-05 AUDIT #32: `shopt -s nullglob` + A BARE `ls` LISTS THE WRONG
    DIRECTORY, AND THE VACUOUS CASE IT CREATES IS THE DANGEROUS ONE ===
 
-Added while writing scripts/check_pending_operator.sh, which exists to classify
+Added while writing scripts/checks/check_pending_operator.sh, which exists to classify
 the stack's unproven steps into OPERATOR-DEFERRED (needs the 27B gate run, which an
 agent session must not drive) and CLEARABLE HERE. Its whole point is the EMPTY
 case: no logs means INCONCLUSIVE, not "nothing pending".
@@ -3738,11 +3738,11 @@ something that deliberately broke the world noticed.
 === 2026-10-12 AUDIT #34: A CHECKER WHOSE PREDICATE HALF COULD NOT FAIL, AND
    THE FOUR WAYS IT WAS DEAD BEFORE THE MATRIX RAN ===
 
-scripts/check_dpas_shape_audit.sh enumerates every tensor in the model's
+scripts/checks/check_dpas_shape_audit.sh enumerates every tensor in the model's
 .intifer header and asserts that the shape constraints the three ESIMD DPAS
 kernels require are met -- N%16==0, K%32==0, (bits,group) in the combo set --
 and that the predicate this audit re-derives is the SAME predicate
-scripts/_dpas_pred.sh defines, which is the one the engine consults.
+scripts/lib/_dpas_pred.sh defines, which is the one the engine consults.
 
 It is not a gate. It reads the header (never the weights) and derives every
 shard from engine.cpp's own integer-division split, so it is load-insensitive
@@ -3790,7 +3790,7 @@ printed message and the tested variable were different sentences. Fixed by
 parsing `PREDICATE_DRIFT` into a shell variable and gating on it.
 
 *THE DRIFT DETECTOR WAS STRUCTURALLY INERT.* The re-derived predicate was
-deleted and rewritten to call scripts/_dpas_pred.sh via subprocess, because
+deleted and rewritten to call scripts/lib/_dpas_pred.sh via subprocess, because
 the original implementation ran a probe that called `dpas_eligible` WITHOUT
 echoing its rc, so the probe emitted 0 lines for N cases, the assertion
 `len(out) == len(cases)` fired, and the comparison never executed. A second
@@ -3825,7 +3825,7 @@ pass without touching the citation line.
 gate tally: 18 PASS, 0 PARTIAL, 0 SKIPPED
 ```
 
-This is the same tally derived from `scripts/test_*.sh` (15 no-precondition +
+This is the same tally derived from `scripts/gates/test_*.sh` (15 no-precondition +
 2 per-arm + 1 whole-gate at 2 GPUs), kept here as the live reconciliation site.
 Rewrite both lines together when the gate population changes.
 
@@ -3838,7 +3838,8 @@ artifact behind it" — but arriving through a grep or a command rather than a n
 
 **Instance 1 — grepping the REPO and concluding "no artifact exists."** A request to
 record an upstream survey was refused on the grounds that `grep -rn strata` over
-/var/home/fra/dev/intfer found only a bare URL (engines_sources.txt:7) and a
+/var/home/fra/dev/intfer found only a bare URL on the source index (SOURCES.txt, history files
+now living under docs/engines/) and a
 cross-reference (docs/FORK_B580_SUMMARY.md:542). The conclusion written into the
 permanent record was "NO Strata survey exists in this repo's record." The upstream
 clones live in a SIBLING directory, /var/home/fra/dev/intfer-upstream/ (Arcaine,
@@ -3879,8 +3880,8 @@ world. Before recording "X is absent":
 
 === TOOLING FAILURE MODE #36 (2026-10-18): a mutation matrix that caught 8 states and taught nothing — the three checker defects it found ===
 
-The S1 predicate matrix (`scripts/check_s1_predicates.sh` +
-`scripts/mutate_s1_predicates.sh`, 8 states, 8/8 CAUGHT, residue byte-identical) REGEN(bash scripts/mutate_s1_predicates.sh)
+The S1 predicate matrix (`scripts/checks/check_s1_predicates.sh` +
+`scripts/matrices/mutate_s1_predicates.sh`, 8 states, 8/8 CAUGHT, residue byte-identical) REGEN(bash scripts/matrices/mutate_s1_predicates.sh)
 was built to close a durability gap: its first two generations lived only under
 /var/tmp and their driver scripts were lost, leaving eight `.cpp` mutants and two
 logs that no later session could re-run. The rebuild earned its place by finding

@@ -33,7 +33,7 @@
 # using the xe driver (while i915 worked fine with small BAR)". Our two cards
 # are on DIFFERENT PCI roots (04:00.0 on pci0000:00, 86:00.0 on pci0000:80),
 # which is exactly where Resizable BAR support commonly differs.
-# Citations are machine-checked by scripts/check_l0_cite.sh.
+# Citations are machine-checked by scripts/checks/check_l0_cite.sh.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MISSING_SLOT="${INTFER_MISSING_SLOT:-0000:86:00.0}"
@@ -146,7 +146,7 @@ cmd_diag() {
     set +u; . /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u
   fi
   export LD_LIBRARY_PATH="/opt/intel/oneapi/umf/1.1/lib:${LD_LIBRARY_PATH:-}"
-  "$ROOT/scripts/l0_enumerate.sh" 2>&1 | grep -E 'driver\[|TOTAL' | sed 's/^/  /'
+  "$ROOT/scripts/l0/l0_enumerate.sh" 2>&1 | grep -E 'driver\[|TOTAL' | sed 's/^/  /'
   echo "  Group 4 of the UUID encodes PCI bus:dev:function. One device with"
   echo "  group 4 == 0400 means card0 survives and 86:00.0 is absent."
 
@@ -239,7 +239,7 @@ enum_devices() {
   # Honours the same overrides the probe does, so a run against an alternate
   # build tree or driver lib is measured on THAT tree (audit #8).
   local out n
-  out="$("$ROOT/scripts/l0_enumerate.sh" 2>&1)"
+  out="$("$ROOT/scripts/l0/l0_enumerate.sh" 2>&1)"
   printf '%s\n' "$out" | grep -E 'driver\[|uuid|TOTAL' | sed 's/^/  /'
   n="$(printf '%s\n' "$out" | sed -n 's/^TOTAL LEVEL ZERO DEVICES: //p')"
   if [ -z "$n" ] || ! printf '%s' "$n" | grep -qE '^[0-9]+$'; then
@@ -269,7 +269,7 @@ cmd_verify() {
     echo "  Follow the next-session trigger in AGENTS.md:"
     echo "    1. sycl-ls | grep -c '\\[level_zero:gpu\\]'  -> must be 2"
     echo "    2. re-run scripts/run_all_checks.sh end-to-end (stamps must name HEAD)"
-    echo "    3. re-run scripts/test_tp2_27b.sh  (the only gate whose sole arm"
+    echo "    3. re-run scripts/gates/test_tp2_27b.sh  (the only gate whose sole arm"
     echo "       is --tp 2 on 27B)"
     exit 0
   fi

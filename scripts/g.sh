@@ -7,7 +7,7 @@
 # made three times in one session -- twice against scripts/, once in a report
 # grep -- and twice the "failure" was mistaken for a finding.
 #
-# scripts/_gate_enum.sh (grep_classify) now guards this INSIDE the verification
+# scripts/lib/_gate_enum.sh (grep_classify) now guards this INSIDE the verification
 # tooling. This covers the other half: greps typed by hand.
 #
 #   g.sh PATTERN FILE...      fixed string (like grep -F); no FILE = stdin

@@ -114,7 +114,7 @@ internally inconsistent hand total, i.e. exactly the AGENTS.md rule-4 defect
 ("a hand-written total is a citation, not a claim"). It is replaced by:
 
 ```
-scripts/model_byte_roofline.sh            # reads code_bytes from the .intifer
+scripts/model/model_byte_roofline.sh            # reads code_bytes from the .intifer
 ```
 
 which derives GB total, N_local at TP=2, and the per-token per-device share per
