@@ -491,6 +491,12 @@ class Engine {
   struct Workspace {
     std::uint16_t* act = nullptr;  // M * K FP16
     std::uint16_t* out = nullptr;  // M * Nl FP16
+    // S1 (uncached host-USM output, INTFER_UNCACHED_HOST_USM): true when `out`
+    // was allocated with zeMemAllocHost + ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED
+    // instead of sycl::malloc_shared, in which case it is released with
+    // zeMemFree rather than sycl::free. `act` NEVER carries this flag -- see
+    // the direction constraint in the engine.cpp helper.
+    bool out_uncached = false;
     uint32_t M = 0, K = 0, Nl = 0;
   };
   std::vector<Workspace> ws_;
@@ -500,7 +506,12 @@ class Engine {
   // grow-only single-threaded contract as ws_: slots are written+consumed
   // within one run_linear_wave call. Sized for the max wave width seen
   // (steady state: LA qkv/z/b/a = 4 slots).
-  struct WaveSlot { std::uint16_t* act = nullptr; std::uint16_t* out = nullptr; };
+  struct WaveSlot {
+    std::uint16_t* act = nullptr;
+    std::uint16_t* out = nullptr;
+    // S1 provenance, same contract as Workspace::out_uncached.
+    bool out_uncached = false;
+  };
   std::vector<WaveSlot> wv_;  // [device * wv_W_ + slot]
   uint32_t wv_M_ = 0, wv_K_ = 0, wv_Nl_ = 0, wv_W_ = 0;
   void ensure_wave_workspace(uint32_t M, uint32_t W, uint32_t K, uint32_t Nl);
@@ -594,9 +605,26 @@ struct GpuProfileSnapshot {
   // per-event kernel bucket is unmeasurable and the only way to attribute
   // wall-clock to a region is a marker pair. See engine.cpp:timeline_mark.
   uint64_t timeline_marker_count;
+  // Matrix-engine (XMX joint_matrix) launch accounting (2026-10-19), so the
+  // "the matrix engines are idle on the hot path" verdict is RE-DERIVABLE from
+  // a run's own counter dump instead of remembered. These are ENGINE-SIDE
+  // dispatch observations, NOT hardware XVE counters: the XMX kernel writes
+  // its own `ran` verdict, so a declined attempt is counted separately and the
+  // triple below distinguishes three states that a bare launch count conflates
+  // -- "never requested" (no attempt), "requested but every tile declined"
+  // (attempted, nothing submitted), and "actually ran". The hardware counters
+  // (XVE_INST_EXECUTED_XMX_*) stay UNKNOWN here: xmxmon is an external Level
+  // Zero metric streamer and this box runs dev.xe.observation_paranoid=1, so
+  // scripts/xmx_profile.sh is the path that joins them, not the engine.
+  uint64_t xmx_attempt_count, xmx_launch_count, xmx_decline_count;
 };
 namespace intfer {
   GpuProfileSnapshot get_gpu_profile();
   void reset_gpu_profile();
+  // One-line matrix-engine attribution for the [GPU profile] dump, printed
+  // beside nk/nw/nr. It ALWAYS names the absence of the hardware counters
+  // rather than printing a zero that reads as a measurement -- see the field
+  // comment above.
+  std::string xmx_attrib_line(const GpuProfileSnapshot& p);
 }
 #endif

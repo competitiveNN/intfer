@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sycl/sycl.hpp>
+#include <atomic>
 #include <chrono>
 #include <vector>
 // ...
@@ -37,6 +38,104 @@
 
 namespace intfer {
 
+// ---------------------------------------------------------------------------
+// S1 -- uncached host-USM OUTPUT buffers (Strata, informed-from-scratch).
+//
+// WHAT THIS IS. Upstream Strata allocates its doorbell buffer with
+// zeMemAllocHost + ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED
+// (sycl/include/strata/sycl_queue.hpp:63-79), so the HOST's read of a word
+// the DEVICE wrote is served from memory instead of the host's stale cache
+// line. CITATION(https://github.com/Niko1221/Strata -- docs/engines/strata.txt, the
+// S1 row: informed-from-scratch, nothing copied as-is).
+//
+// WHY IT IS SAFE HERE, AND THE CONSTRAINT THAT MAKES IT SAFE.
+//   * The buffer is DEVICE-WRITES / HOST-READS. The host never writes a .out
+//     buffer (the only host writes into a workspace are the std::memcpy calls
+//     into .act), so the buffer is strictly one-directional.
+//   * .act IS EXCLUDED BY CONSTRUCTION AND MUST STAY THAT WAY. .act is
+//     HOST-WRITES / DEVICE-READS, and BIAS_UNCACHED gives no DEVICE-side
+//     guarantee -- the Level Zero spec says "No other agent is guaranteed to
+//     see the memory as uncached" -- so an uncached .act could hand the device
+//     a stale line. The helper below is therefore reachable ONLY from the .out
+//     allocation sites; .act keeps sycl::malloc_shared unconditionally.
+//
+// PRECONDITION, NOT MEASURED ON THIS BOX. Whether B580's xe driver keeps the
+// host's uncached read coherent with a DEVICE KERNEL STORE is exactly what
+// examples/uncached_doorbell_probe/ measures: its one_round() submits a
+// parallel_for that writes the buffer and then verifies EVERY BYTE on the
+// host, which is the same shape as the .out readback. UNMEASURED here
+// (operator-only). The flag stays DEFAULT OFF until that probe is run.
+//
+// DEFAULT OFF. INTFER_UNCACHED_HOST_USM is PRESENCE-spelled (any value
+// enables; unset disables).
+// ---------------------------------------------------------------------------
+namespace uncached_out {
+
+// Presence-spelled, read once per process.
+inline bool s1_enabled() {
+  static const bool on = (std::getenv("INTFER_UNCACHED_HOST_USM") != nullptr);
+  return on;
+}
+
+// Allocate `bytes` of device-accessible host memory with the uncached bias.
+// Returns nullptr when the uncached path is unavailable or refused; the
+// caller then falls back to sycl::malloc_shared, which is the shipped path.
+inline void* alloc(std::size_t bytes, const device::DeviceContext& dev) {
+#ifdef INTFER_HAS_L0
+  if (s1_enabled() && dev.has_l0() && dev.ze_context != nullptr) {
+    ze_host_mem_alloc_desc_t d{};
+    d.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
+    d.flags = ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED;
+    void* p = nullptr;
+    if (zeMemAllocHost(dev.ze_context, &d, bytes, 64, &p) == ZE_RESULT_SUCCESS &&
+        p != nullptr) {
+      return p;
+    }
+  }
+#else
+  (void)bytes;
+  (void)dev;
+#endif
+  return nullptr;
+}
+
+// Release a pointer obtained from alloc(). Only ever called for a pointer
+// whose out_uncached flag is set, i.e. one that came from alloc() and not
+// from the sycl::malloc_shared fallback.
+inline void release(void* p, const device::DeviceContext& dev) {
+#ifdef INTFER_HAS_L0
+  if (p != nullptr && dev.ze_context != nullptr) {
+    (void)zeMemFree(dev.ze_context, p);
+  }
+#else
+  (void)p;
+  (void)dev;
+#endif
+}
+
+// Once-per-process announcement. It is emitted ONLY when the flag is set, so
+// the shipped (flag-unset) run prints nothing -- the same contract as the
+// [decode1-wg] line, whose un-gated form once broke a shipped gate by
+// printing a marker on the BASE run.
+inline void announce(const char* site, bool took_uncached) {
+  // Gated on the env read INSIDE the announcement, not only at the call site:
+  // the shipped (flag-unset) run must print nothing. The [decode1-wg] line once
+  // printed on the BASE run and broke a shipped gate, so the gate belongs here.
+  if (!s1_enabled()) return;
+  static std::atomic<bool> done{false};
+  bool expected = false;
+  if (!done.compare_exchange_strong(expected, true)) return;
+  std::fprintf(stderr,
+               "[uncached-host-usm] %s (INTFER_UNCACHED_HOST_USM=%s) %s "
+               "buffers=out-only act=excluded\n",
+               site, std::getenv("INTFER_UNCACHED_HOST_USM"),
+               took_uncached ? "ACTIVE alloc=zeMemAllocHost|BIAS_UNCACHED"
+                             : "FALLBACK alloc=sycl::malloc_shared");
+  std::fflush(stderr);
+}
+
+}  // namespace uncached_out
+
 Engine::~Engine() {
   if (backing_.base && backing_.size) ::munmap(backing_.base, backing_.size);
   backing_.base = nullptr;
@@ -48,12 +147,34 @@ Engine::~Engine() {
       for (void* p : vec) sycl::free(p, devices_[d].queue);
       vec.clear();
     }
+  // S1: DRAIN BEFORE RELEASE. An uncached .out buffer is a HOST ALLOCATION
+  // (zeMemAllocHost), and zeMemFree UNMAPS it -- so a device kernel still
+  // writing to it would fault. Strata's own note on this driver: "an Arc Pro
+  // B70 (xe) page-faults on it (ccs0, FaultType 0, address in the CPU's mmap
+  // range) and the card times out the job". The two GROWTH paths already
+  // drain (ensure_wave_workspace and ensure_workspace both queue.wait() before
+  // freeing the old buffer), but the DESTRUCTOR did not, so an Engine torn
+  // down with work in flight could unmap a buffer the device was still
+  // writing. THE DRAIN IS CONDITIONAL on an uncached buffer existing, so the
+  // shipped (flag-unset) path is unchanged in both behaviour and cost.
+  {
+    bool any_uncached = false;
+    for (size_t d = 0; d < ws_.size() && !any_uncached; ++d)
+      if (ws_[d].out_uncached) any_uncached = true;
+    for (size_t i = 0; i < wv_.size() && !any_uncached; ++i)
+      if (wv_[i].out_uncached) any_uncached = true;
+    if (any_uncached)
+      for (size_t d = 0; d < devices_.size(); ++d) devices_[d].queue.wait();
+  }
   // Free the shared act/out workspaces (2 live allocs per device max).
   for (size_t d = 0; d < ws_.size() && d < devices_.size(); ++d) {
     act_cache_ptr_ = nullptr; act_cache_M_ = 0; act_cache_K_ = 0;
     if (ws_[d].act) sycl::free(ws_[d].act, devices_[d].queue);
-    if (ws_[d].out) sycl::free(ws_[d].out, devices_[d].queue);
-    ws_[d].act = nullptr; ws_[d].out = nullptr;
+    if (ws_[d].out) {
+      if (ws_[d].out_uncached) uncached_out::release(ws_[d].out, devices_[d]);
+      else sycl::free(ws_[d].out, devices_[d].queue);
+    }
+    ws_[d].act = nullptr; ws_[d].out = nullptr; ws_[d].out_uncached = false;
   }
   // Free the DPAS act workspaces (3 live allocs per device max).
   for (size_t d = 0; d < ws48_.size() && d < devices_.size(); ++d) {
@@ -70,8 +191,12 @@ Engine::~Engine() {
     const size_t dd = wv_W_ > 0 ? i / wv_W_ : 0;
     if (dd < devices_.size()) {
       if (wv_[i].act) sycl::free(wv_[i].act, devices_[dd].queue);
-      if (wv_[i].out) sycl::free(wv_[i].out, devices_[dd].queue);
+      if (wv_[i].out) {
+        if (wv_[i].out_uncached) uncached_out::release(wv_[i].out, devices_[dd]);
+        else sycl::free(wv_[i].out, devices_[dd].queue);
+      }
       wv_[i].act = nullptr; wv_[i].out = nullptr;
+      wv_[i].out_uncached = false;
     }
   }
   wv_.clear(); wv_W_ = 0; wv_M_ = wv_K_ = wv_Nl_ = 0;
@@ -173,8 +298,30 @@ void Engine::pool_release(size_t device, void* ptr, size_t bytes) {
     // Device-timeline markers (INTFER_TIMELINE=1): count of 1-work-item
     // empty kernels submitted as region boundaries. See timeline_mark().
     uint64_t timeline_marker_count = 0;
+    // Matrix-engine (XMX joint_matrix) launch accounting (2026-10-19):
+    // engine-side dispatch observations, NOT hardware XVE counters. See
+    // GpuProfileSnapshot's field comment in include/intfer/engine.hpp -- the
+    // attempt/launch/decline triple exists because a bare launch count cannot
+    // distinguish "never requested" from "requested, every tile declined".
+    uint64_t xmx_attempt_count = 0;
+    uint64_t xmx_launch_count = 0;
+    uint64_t xmx_decline_count = 0;
   };
   static GpuProfile g_gpu_profile;
+
+  // ---- Matrix-engine (XMX) launch accounting (2026-10-19) ----
+  // ONE call per XMX dispatch attempt, carrying the kernel's own `ran`
+  // verdict. A helper rather than the counter logic open-coded at the four
+  // dispatch sites (run_linear_tp, run_mlp_gateup's gate and up, la_out_tp2,
+  // run_linear_wave) so the triple cannot drift between them: a site that
+  // counted a DECLINE as a launch, or an attempt that never happened as one,
+  // would make the [xmx-attrib] three-way verdict wrong in exactly the
+  // direction the AGENTS.md XMX verdict depends on.
+  void xmx_note_dispatch(bool ran) {
+    g_gpu_profile.xmx_attempt_count += 1;
+    if (ran) g_gpu_profile.xmx_launch_count += 1;
+    else     g_gpu_profile.xmx_decline_count += 1;
+  }
 #endif
 
 using namespace sycl::ext::oneapi::experimental;
@@ -716,8 +863,23 @@ void Engine::ensure_wave_workspace(uint32_t M, uint32_t W, uint32_t K,
       WaveSlot s;
       s.act = static_cast<std::uint16_t*>(sycl::malloc_shared(
           (size_t)nM * nK * sizeof(uint16_t), dev.sycl_device, dev.sycl_context));
-      s.out = static_cast<std::uint16_t*>(sycl::malloc_shared(
-          (size_t)nM * nNl * sizeof(uint16_t), dev.sycl_device, dev.sycl_context));
+      // S1: the .out slot is DEVICE-WRITES / HOST-READS, so it is the only
+      // buffer eligible for the uncached-host allocation. .act stays
+      // malloc_shared (host-writes / device-reads -- see uncached_out).
+      {
+        void* uc = uncached_out::alloc(
+            (size_t)nM * nNl * sizeof(uint16_t), dev);
+        if (uc != nullptr) {
+          s.out = static_cast<std::uint16_t*>(uc);
+          s.out_uncached = true;
+          uncached_out::announce("wave", true);
+        } else {
+          s.out = static_cast<std::uint16_t*>(sycl::malloc_shared(
+              (size_t)nM * nNl * sizeof(uint16_t), dev.sycl_device,
+              dev.sycl_context));
+          uncached_out::announce("wave", false);
+        }
+      }
       if (!s.act || !s.out) {
         std::fprintf(stderr,
                      "[intfer] FATAL: wave workspace alloc failed on device %zu "
@@ -733,7 +895,12 @@ void Engine::ensure_wave_workspace(uint32_t M, uint32_t W, uint32_t K,
     const size_t dd = wv_W_ > 0 ? i / wv_W_ : 0;
     if (dd < devices_.size()) {
       if (wv_[i].act) sycl::free(wv_[i].act, devices_[dd].queue);
-      if (wv_[i].out) sycl::free(wv_[i].out, devices_[dd].queue);
+      if (wv_[i].out) {
+        if (wv_[i].out_uncached)
+          uncached_out::release(wv_[i].out, devices_[dd]);
+        else
+          sycl::free(wv_[i].out, devices_[dd].queue);
+      }
     }
   }
   wv_ = std::move(nwv);
@@ -762,12 +929,34 @@ void Engine::ensure_workspace(uint32_t M, uint32_t K, uint32_t Nl_max) {
     // skip an upload into memory that no longer exists.
     act_cache_ptr_ = nullptr; act_cache_M_ = 0; act_cache_K_ = 0;
     if (w.act) { sycl::free(w.act, devices_[d].queue); w.act = nullptr; }
-    if (w.out) { sycl::free(w.out, devices_[d].queue); w.out = nullptr; }
+    if (w.out) {
+      if (w.out_uncached) uncached_out::release(w.out, devices_[d]);
+      else sycl::free(w.out, devices_[d].queue);
+      w.out = nullptr;
+    }
+    w.out_uncached = false;
     auto& dev = devices_[d];
     w.act = static_cast<std::uint16_t*>(sycl::malloc_shared(
         (size_t)nM * nK * sizeof(uint16_t), dev.sycl_device, dev.sycl_context));
-    w.out = static_cast<std::uint16_t*>(sycl::malloc_shared(
-        (size_t)nM * nNl * sizeof(uint16_t), dev.sycl_device, dev.sycl_context));
+    // S1: .out is DEVICE-WRITES / HOST-READS, so it is the only buffer
+    // eligible for the uncached-host allocation. This one buffer is what the
+    // three named seams read back through -- run_linear_tp (ws_[d].out),
+    // run_mlp_partial_down (ws_[d].out) and la_out_tp2 (ws_[0].out) -- so one
+    // allocation site covers all three. .act stays malloc_shared (host-writes
+    // / device-reads -- see uncached_out).
+    {
+      void* uc = uncached_out::alloc((size_t)nM * nNl * sizeof(uint16_t), dev);
+      if (uc != nullptr) {
+        w.out = static_cast<std::uint16_t*>(uc);
+        w.out_uncached = true;
+        uncached_out::announce("device", true);
+      } else {
+        w.out = static_cast<std::uint16_t*>(sycl::malloc_shared(
+            (size_t)nM * nNl * sizeof(uint16_t), dev.sycl_device,
+            dev.sycl_context));
+        uncached_out::announce("device", false);
+      }
+    }
     if (!w.act || !w.out) {
       std::fprintf(stderr,
                    "[intfer] FATAL: workspace alloc failed on device %zu "
@@ -1527,6 +1716,7 @@ void Engine::run_linear_tp(int tensor_index, const std::vector<float>& x,
                                   sc.scheme,
                                   sycl::event{});
       }
+      xmx_note_dispatch(xmx_ran);
       // Announce the tile scheduler state ONCE per process, ONLY when the
       // XMX path actually ran. The line prints n_tiles and nWG so the gate
       // can verify the work-stealing path was taken. Gating on `xmx_ran`
@@ -2043,6 +2233,11 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
           wv_[d * wv_W_ + 1].out,
           M, Nl_g, tg.K, scg.group_size, scg.scheme,
           sycl::event{}, &xmx_ran_g[d], xmx_tile_ctr.data() + 2 * d);
+      // Count the gate dispatch BEFORE the if/else below: its verdict is
+      // already valid, and the note must fire on BOTH branches (the decline
+      // branch and the XMX-ran branch are one attempt, not two). Placing it
+      // after the fallback `}` would split the `}` / `else` chain.
+      xmx_note_dispatch(xmx_ran_g[d]);
       if (!xmx_ran_g[d]) {
         e = gemm::quant_gemm_forward_usm_gateup(
             q, act_ptr,
@@ -2078,6 +2273,7 @@ bool Engine::run_mlp_gateup(int gate_ti, int up_ti,
               M, Nl_u, tu.K, scu.group_size, scu.scheme,
               sycl::event{});
         }
+        xmx_note_dispatch(xmx_ran_u);
         // Push up's event instead of waiting it inline: the shared wait
         // loop and the post-wait profiling loop below then cover it, so
         // the kernel/submit/wait counters stay true in the mixed arm (an
@@ -2484,6 +2680,7 @@ bool Engine::run_linear_tp_devact_tp2(int tensor_index,
       } else {
         xmx_ran_any = true;
       }
+      xmx_note_dispatch(xmx_ran);
     } else {
       kernel_evt = gemm::quant_gemm_forward_usm(
           q, const_cast<std::uint16_t*>(dev_act[d]), sc.code_usm[d],
@@ -3064,6 +3261,7 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
                                         sc.scheme,
                                         sycl::event{});
         }
+        xmx_note_dispatch(xmx_ran);
         // Announce once per process, ONLY when the kernel actually
         // ran -- the same xmx_ran-gated polarity as run_linear_tp's
         // announcement (engine.cpp:1487): a log where the kernel
@@ -3173,9 +3371,65 @@ void Engine::run_linear_wave(const LinearWaveItem* items, size_t n,
             g_gpu_profile.kernel_count, g_gpu_profile.wait_count,
             g_gpu_profile.copy_count, g_gpu_profile.readback_count,
             g_gpu_profile.submit_count, g_gpu_profile.usm_write_count,
-            g_gpu_profile.timeline_marker_count};
+            g_gpu_profile.timeline_marker_count,
+            g_gpu_profile.xmx_attempt_count,
+            g_gpu_profile.xmx_launch_count,
+            g_gpu_profile.xmx_decline_count};
   }
   void reset_gpu_profile() { g_gpu_profile = GpuProfile{}; }
+
+  // ---- [xmx-attrib]: matrix-engine attribution for the counter dump ----
+  // WHY IT PRINTS WHEN THE ANSWER IS UNKNOWN. AGENTS.md's standing verdict is
+  // "the matrix engines are idle on the hot path", derived from measured runs.
+  // A verdict a future session must re-derive is only useful if the dump SAYS
+  // which of the three states this run was in, so the line always carries the
+  // engine-side triple and NEVER substitutes a hardware figure it did not
+  // read. xmxmon is an external Level Zero metric streamer; this box runs
+  // dev.xe.observation_paranoid=1 with no sudo, so the observation session
+  // cannot open from the engine, and scripts/xmx_profile.sh is the path that
+  // joins XVE_INST_EXECUTED_XMX_* with these buckets.
+  std::string xmx_attrib_line(const GpuProfileSnapshot& p) {
+    const char* verdict = "not-requested";
+    if (p.xmx_attempt_count > 0)
+      verdict = (p.xmx_launch_count > 0) ? "active"
+                                         : "requested-all-declined";
+    // The absence is NAMED. Printing nothing (or an XVE-shaped zero) would be
+    // the vacuous-green shape: a reader would read "0 XMX" as a measurement.
+    std::string found;
+    if (const char* e = std::getenv("XMXMON")) {
+      struct stat st;
+      if (::stat(e, &st) == 0 && (st.st_mode & S_IXUSR)) found = e;
+    }
+    if (found.empty()) {
+      const char* cands[] = {"/tmp/xmxmon", "./xmxmon"};
+      for (const char* c : cands) {
+        struct stat st;
+        if (::stat(c, &st) == 0 && (st.st_mode & S_IXUSR)) { found = c; break; }
+      }
+    }
+    std::string s = "[xmx-attrib] attempts=";
+    s += std::to_string(p.xmx_attempt_count);
+    s += " launches=";
+    s += std::to_string(p.xmx_launch_count);
+    s += " declined=";
+    s += std::to_string(p.xmx_decline_count);
+    s += " matrix_engines=";
+    s += verdict;
+    if (!found.empty()) {
+      s += " | xmxmon=";
+      s += found;
+      s += " (engine does NOT read XVE_INST_EXECUTED_XMX_*; run "
+           "scripts/xmx_profile.sh to join the hardware counters with these "
+           "buckets)";
+    } else {
+      s += " | XVE_INST_EXECUTED_XMX_*: NOT READ -- no xmxmon binary "
+           "(XMXMON=/path/to/xmxmon, /tmp/xmxmon or ./xmxmon; build: g++ -O2 "
+           "-o xmxmon xmxmon.cpp -lze_loader). Hardware XMX counters "
+           "UNKNOWN on this box (dev.xe.observation_paranoid=1); the counts "
+           "above are engine-side dispatch observations only";
+    }
+    return s;
+  }
   // ---- Device-timeline markers (INTFER_TIMELINE=1) ----
   // GRIMOIRE's mark() pattern: submit a 1-work-item empty kernel and record
   // its event. On an in-order queue the gap between marker i's end and

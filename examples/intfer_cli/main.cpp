@@ -11046,7 +11046,8 @@ int main(int argc, char** argv){
         p.readback_us/1000.0, p.readback_count,
         p.copy_us/1000.0, p.copy_count,
         p.kernel_count, p.wait_count, p.readback_count);
-      reset_gpu_profile();
+    std::fprintf(stderr, "%s\n", xmx_attrib_line(p).c_str());
+    reset_gpu_profile();
     }
 #endif
     auto t_d0 = std::chrono::high_resolution_clock::now();
@@ -11088,6 +11089,7 @@ int main(int argc, char** argv){
         p.readback_us/1000.0, p.readback_count,
         p.copy_us/1000.0, p.copy_count,
         p.kernel_count, p.wait_count, p.readback_count);
+      std::fprintf(stderr, "%s\n", xmx_attrib_line(p).c_str());
     }
 #endif
     // Single-prompt scheduler runs keep the exact stdout contract (prompt
@@ -11161,6 +11163,10 @@ int main(int argc, char** argv){
       p.rebuild_us/1000.0, p.rebuild_count,
       p.usm_write_us/1000.0, p.readback_us/1000.0, p.copy_us/1000.0,
       p.kernel_count, p.wait_count, p.readback_count);
+    // The XMX attribution triple, printed at this dump site as well: an
+    // operator reading THIS prefill line gets the same three-way verdict as
+    // the other four, so a missing line reads as a defect, not an asymmetry.
+    std::fprintf(stderr, "%s\n", xmx_attrib_line(p).c_str());
     reset_gpu_profile();
   }
 #endif
@@ -11693,6 +11699,7 @@ int main(int argc, char** argv){
       p.readback_us/1000.0, p.readback_count,
       p.copy_us/1000.0, p.copy_count,
       p.kernel_count, p.wait_count, p.readback_count);
+    std::fprintf(stderr, "%s\n", xmx_attrib_line(p).c_str());
   }
 #endif
 #ifdef INTFER_PROFILE_GPU
@@ -11716,6 +11723,8 @@ int main(int argc, char** argv){
       p.rebuild_count,
       p.peak_wait_depth,
       100.0 * (p.kernel_us / 1000.0) / std::max(1.0, decode_ms));
+    // The three-way verdict for the run as a whole, beside the other buckets.
+    std::fprintf(stderr, "%s\n", xmx_attrib_line(p).c_str());
   }
   // Device-timeline markers (INTFER_TIMELINE=1): the region-by-region
   // device wall-clock breakdown, which is the ONLY way to attribute time
