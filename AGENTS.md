@@ -10,7 +10,7 @@ exists to prevent. The 2026-10-04 cleanup that split the original
 
 ### Box: both B580s enumerate (verified 2026-10-04 at the driver API)
 
-`scripts/l0_enumerate.sh` -> `zeDeviceGet rc=0 DEVICES=2`, UUIDs `...-0400-...`
+`scripts/l0/l0_enumerate.sh` -> `zeDeviceGet rc=0 DEVICES=2`, UUIDs `...-0400-...`
 (= 04:00.0) and `...-8600-...` (= 86:00.0); `sycl-ls` prints 2 `[level_zero:gpu]`
 lines.
 
@@ -27,7 +27,7 @@ It is HOST-SIDE driver enumeration state, not a code fault. Three consequences:
   not run; the second time the same omission hung `check_device_precond.sh` to a
   timeout. `SYCL: sycl-ls not available` is a statement about **PATH**, not about
   the machine. The preconditions now print an `ENVIRONMENT, NOT BOX STATE` banner
-  with the remedy, pinned by `scripts/check_env_not_box_state.sh` (whose last
+  with the remedy, pinned by `scripts/checks/check_env_not_box_state.sh` (whose last
   assertion is a live probe, so the banner is proved to print).
 * Any tally that depends on visible device count (PARTIAL / SKIPPED) is only
   meaningful together with the count it was measured at. **Re-derive it with
@@ -45,7 +45,7 @@ It is HOST-SIDE driver enumeration state, not a code fault. Three consequences:
     `/dev/dri/renderD<n>`.** The DRM minor has flipped `card1`->`card2` /
     `renderD129`->`renderD130`->`renderD129` across sessions. `renderD128` is the
     stable liveness probe; two or more distinct minors in one script is the defect
-    `scripts/check_dri_probe.sh` refuses.
+    `scripts/checks/check_dri_probe.sh` refuses.
   * **IF A REBIND STOPS WORKING, the deeper investigation kit is in
     `scripts/archive/`**, one rung below the remedy above: `gpu_health_check.sh`
     (diffs the two cards at the kernel/sysfs layer), `l0_enum_trace.sh` (runs the
@@ -57,7 +57,7 @@ It is HOST-SIDE driver enumeration state, not a code fault. Three consequences:
 ### Gates: all PASS, nothing PARTIAL, nothing SKIPPED
 
 **Do not read a gate count off this file.** `scripts/gate_inventory.sh` derives
-the population from `scripts/test_*.sh` and reconciles any tally it finds
+the population from `scripts/gates/test_*.sh` and reconciles any tally it finds
 against that derivation, so adding a gate makes every hand-written count stale
 *by design* — that is the mechanism working, not a defect to silence. Run it:
 
@@ -78,7 +78,7 @@ correct behaviour and not something to work around. Rewrite it when the gate
 population changes; the checker fails if you do not.
 
 ```
-gate tally: 18 PASS, 0 PARTIAL, 0 SKIPPED CITATION(`scripts/gate_inventory.sh` derives 18 from `scripts/test_*.sh`)
+gate tally: 18 PASS, 0 PARTIAL, 0 SKIPPED CITATION(`scripts/gate_inventory.sh` derives 18 from `scripts/gates/test_*.sh`)
 ```
 
 * Historical lines recording the 1-GPU-era tally are **records of that era**.
@@ -120,7 +120,12 @@ not re-run arms to fill them, do not move them to archive. Measured reasons,
 **The load-insensitive counters stay, and they are how every optimization gets
 decided.** `kernel` / `submit` / `waitblock` / `copy` / `usm_write` / `readback`
 and the exact integers `nk` / `nw` / `nr` are read from the **device's own event
-timestamps**, so they are immune to `load1`. This is the mechanism, not a hedge:
+timestamps**, so they are immune to `load1`. So is the engine-side **XMX dispatch
+triple** `xmx_attempt_count` / `xmx_launch_count` / `xmx_decline_count`: it counts
+the engine's own dispatch observations, which is neither a device timestamp nor a
+hardware counter, so a contended box cannot move it. It is what makes the
+"matrix engines are idle" verdict ("XMX verdict" below) a question an operator
+run's own log can settle. This is the mechanism, not a hedge:
 
 * **four** optimizations were killed *by counters* and would have survived a tok/s:
   L5 LA-front, DPAS48 at M=1, host-private DPAS staging, SYCL command graphs;
@@ -138,7 +143,7 @@ read as *relative*, never as a figure.
 **A delta must CLEAR the spread floor, not merely be non-zero.** The floor is
 `max(spread of the two arms compared)` and it needs >= 2 paired rounds — a
 single-round delta has no noise floor to clear and must not be reported as a
-result. `scripts/_bench_summary.py` enforces this and refuses a batch in which any
+result. `scripts/lib/_bench_summary.py` enforces this and refuses a batch in which any
 arm died (`FAILED=` records, empty `BUCKETS`, incomplete `nk`/`nw`/`nr`).
 
 ### The correctness gates are unchanged and still binding
@@ -151,8 +156,9 @@ trustworthy: if the streams are identical, a kernel delta is attributable to the
 kernel.
 
 Report results in **load-insensitive buckets** (`kernel`/`submit`/`waitblock`/
-`copy`/`usm_write`/`readback`, `nk`/`nw`/`nr`) and never quote a tok/s that was not
-measured on a quiet box.
+`copy`/`usm_write`/`readback`, `nk`/`nw`/`nr`) and the load-insensitive **XMX
+dispatch integers** `xmx_attempt_count`/`xmx_launch_count`/`xmx_decline_count`,
+and never quote a tok/s that was not measured on a quiet box.
 
 ### ALWAYS AIM FOR KERNEL FUSION to reduce CPU-GPU communication overhead
 
@@ -219,6 +225,34 @@ it deliberately asserts nothing about the ids (not even the prefill token).
 UNMEASURED — operator-only 27B `--tp 2` A/B on the kernel bucket; decide on
 `nk`/`nw`/`nr` and the host buckets, never on a tok/s.
 
+**2026-10-19: the verdict is now an ENGINE LINE, certificate and all.**
+`Engine::xmx_attrib_line` (engine.cpp, printed beside `nk`/`nw`/`nr` at every
+`[GPU profile]` dump site under `INTFER_PROFILE_GPU`) emits
+`[xmx-attrib] attempts= launches= declined= matrix_engines=<verdict>`, where the
+verdict is a **word, not a zero**: `not-requested`, `active`, or
+`requested-all-declined`. The absence is NAMED — the line says in words that
+`XVE_INST_EXECUTED_XMX_*` is NOT READ and points at `scripts/tools/xmx_profile.sh` —
+because an XVE-shaped zero read as a measurement is the vacuous-green shape. The
+three integers are what distinguishes "never requested" from "requested, every
+tile declined", which a bare launch count conflates; the helper
+`xmx_note_dispatch` is called once per dispatch attempt so the triple cannot
+drift between the five seams (run_linear_tp, run_mlp_gateup's gate and its up,
+la_out_tp2, run_linear_wave). Structural certification:
+`scripts/checks/check_xmx_attrib.sh` (six predicates, comments stripped first — the
+`[xmx-attrib]` literal appears three times in `engine.cpp` and only one of them
+is the construction) with `scripts/matrices/mutate_xmx_attrib.sh` as its negative
+direction, each state refusing for its own predicate and both live subjects
+re-hashed at the end.
+**The checker found a REAL defect the day it was written.** The dump sites then
+carried four `xmx_attrib_line` calls against five `[GPU profile]` markers, so the
+batch prefill site printed the load-insensitive counters and NO XMX verdict at
+all — precisely the line an operator reads to answer "did the matrix engines
+run?". The missing call was added, and the predicate now compares a DERIVED call
+count against a DERIVED marker count, so a site added to either file cannot leave
+the checker asserting a stale total. UNMEASURED on the 27B target: the line prints
+in every `INTFER_PROFILE_GPU` run, but reading its verdict for an XMX-armed run
+is the operator's, and that A/B decides on the counters named above.
+
 **2026-10-14, same day: the dispatch is now on ALL THREE prefill GEMM seams.**
 `Engine::run_mlp_gateup` (the default TP=2 MLP path) tries XMX first for gate
 and up independently, each with a mandatory fallback and its own `ran` flag:
@@ -272,7 +306,7 @@ DPAS-issuing kernels in the tree: `quant_gemm_dpas48` (`INTFER_DPAS48=1`,
 default **OFF** — a net loss at every tested shape), `quant_gemm_dpas_s8w`
 (lm_head only), and E4's `quant_gemm_dpas48_tiled` (`INTFER_DPAS48_TILED`,
 default **OFF**). Per xmxmon docs, mixed-precision DPAS counts under the WIDER
-operand (W2A8 -> INT8 counter). Harness `scripts/xmx_profile.sh` joins xmxmon
+operand (W2A8 -> INT8 counter). Harness `scripts/tools/xmx_profile.sh` joins xmxmon
 capture with internal buckets and degrades gracefully when the streamer is blocked
 (this box: `dev.xe.observation_paranoid=1`, no sudo).
 
@@ -306,7 +340,7 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_DPAS_PREQ` | device-side GA64 act-quant pre-pass | recovers 52.7 ms of 2559.2 ms host act-quant but pays +30720 launches. **DO NOT PROMOTE** |
 | `INTFER_DPAS_ROW` | one WI owns many tiles | ~460x slower. Historical dead end, mutually exclusive with E4 |
 | `INTFER_TILE_SCHED` | PLAN.md 1.3 — per-device SLM work-stealing claim queue for the tiled DPAS kernel, replacing the fixed `block % nWG` assignment. `!= nullptr` spelling (PRESENCE enables). **Implemented 2026-10-11, gated in `test_tp2_27b.sh` with a 3-part self-check.** Pure DISPATCH change (each tile computes the same dot products in the same order), so bit-exact vs the fixed-assignment path and no numerics contract. Only reachable when `INTFER_DPAS48=1` (`run_linear_tp_dpas48`); inert on the default prefill path (`quant_gemm_forward_usm`'s 64x64 tiled body is not touched). Announced `[tile-sched] INTFER_TILE_SCHED=on|off n_blocks=.. nWG=..` once per process. **UNMEASURED — operator-only 27B prefill A/B.** The verdict rests on `nk`/`nw`/`nr` and the host buckets; the `kernel` bucket is unverified for the engine on this box (AGENTS.md "The profiling defect"), so no tok/s and no kernel figure is claimed. |
-| `INTFER_ONEMKL` | PLAN.md 1.4 — oneMKL SYCL BLAS fallback for large contiguous FP16, taken by `quant_gemm_f16` when `onemkl_available() && M >= 8`. `!= nullptr` spelling (PRESENCE enables). **Implemented 2026-10-11; ARMED 2026-10-13 in `scripts/test_onemkl.sh`** (build-conditional on `INTFER_ENABLE_MKL`; `examples/onemkl_probe` runs synthetic M>=8 FP16 tensors against a host FP32 reference under an agreed tolerance, plus the M=1 negative direction, and asserts the `[onemkl] ... ACTIVE` announcement). NOT bit-exact by construction (oneMKL's FP32 accumulation order is its own) -- **TOLERANCE-GATED, never bitwise.** Cannot pay at M=1 (decode FP16 already at 98-123% of the memory roofline); prefill/large-M only. **UNMEASURED** -- operator-only on real 27B prefill; the probe certifies reachability and tolerance, not a tok/s. **2026-10-12: the BUILD BLOCKER IS CLOSED** — `src/gemm/CMakeLists.txt` now derives the oneMKL header dir AND all four component libs (`mkl_sycl_blas`, `mkl_intel_lp64`, `mkl_core`, `mkl_gnu_thread`) from the wrapper's own directory, and a clean throwaway build (`/tmp/onemkl_verify`, no hand-typed linker flags) links `intfer_cli` with all five `.so`s bound and `--help` exiting 0. The gate-shape blocker is closed by the probe, which runs `quant_gemm_f16` directly on synthetic M>=8 tensors and never needs the 27B model. |
+| `INTFER_ONEMKL` | PLAN.md 1.4 — oneMKL SYCL BLAS fallback for large contiguous FP16, taken by `quant_gemm_f16` when `onemkl_available() && M >= 8`. `!= nullptr` spelling (PRESENCE enables). **Implemented 2026-10-11; ARMED 2026-10-13 in `scripts/gates/test_onemkl.sh`** (build-conditional on `INTFER_ENABLE_MKL`; `examples/onemkl_probe` runs synthetic M>=8 FP16 tensors against a host FP32 reference under an agreed tolerance, plus the M=1 negative direction, and asserts the `[onemkl] ... ACTIVE` announcement). NOT bit-exact by construction (oneMKL's FP32 accumulation order is its own) -- **TOLERANCE-GATED, never bitwise.** Cannot pay at M=1 (decode FP16 already at 98-123% of the memory roofline); prefill/large-M only. **UNMEASURED** -- operator-only on real 27B prefill; the probe certifies reachability and tolerance, not a tok/s. **2026-10-12: the BUILD BLOCKER IS CLOSED** — `src/gemm/CMakeLists.txt` now derives the oneMKL header dir AND all four component libs (`mkl_sycl_blas`, `mkl_intel_lp64`, `mkl_core`, `mkl_gnu_thread`) from the wrapper's own directory, and a clean throwaway build (`/tmp/onemkl_verify`, no hand-typed linker flags) links `intfer_cli` with all five `.so`s bound and `--help` exiting 0. The gate-shape blocker is closed by the probe, which runs `quant_gemm_f16` directly on synthetic M>=8 tensors and never needs the 27B model. |
 | `INTFER_DECODE1_MR` | 4 outputs per WI at M=1 INT2, **one shared activation load per K step reused by all 4** (quant_gemm.cpp:1558-1560) | **2.3x slower** (kernel 2055.1 -> 4698.7 ms, 27B --tp 2 decode M=1, n=8). Do not use. **This IS the judge's "vectorized multi-output decode arm" (one WI, 4 adjacent outputs, shared activation load, 4 accumulators, bit-exact by construction) -- it is not a new candidate, it is the measured-losing MR. The 4x activation-traffic cut is real and it still lost: at M=1 the WI count IS N, so 4/WI quarters an already-starved parallelism budget (N~2048/rank over 20 Xe cores ~4 threads/EU). The kernel is parallelism-bound, not bandwidth-bound, so cutting traffic cannot pay.** CITATION(techpowerup arc-b580.c4244) |
 | `INTFER_DECODE1_SPLITK` | split-K block-cyclic M=1 INT2 decode: `N*S` work-items + coalesced weight loads. Exactly `=1`; kill switch `INTFER_NO_DECODE1_SPLITK` | **MEASURED LOSS.** Stream-identical to base on 27B (so the numerics contract held), but kernel 267 -> 384 ms (+43.8%, 3/3 same sign, clears the 6 ms spread floor; `nk/nw/nr` identical). Both halves of the hypothesis delivered and it still lost. **Do not promote.** |
 | `INTFER_DECODE1_SUBGROUP` | llama.cpp mmvq shape: one SUB-GROUP per output row, lanes split K, reduced by `sycl::reduce_over_group` -- no `local_accessor`, no barrier. **REMOVED 2026-10-05**: numerically wrong (ids `'279 12 12'` vs base `'13 198 760'`) and the cause is not located. See `AGENTS.md` "INTFER_DECODE1_SUBGROUP is QUARANTINED, not fixed". |
@@ -323,7 +357,7 @@ Re-derive the whole population with the `git grep` recipe above.
 | `INTFER_DECODE1_WVEC` | INT2 weight bytes via one `sycl::vec<uint8_t,2>` load from the row-base multi_ptr (PLAN.md 1.7) | bit-exact by construction, model-free MEASURED (rowpair_equiv `wv` order); performance UNKNOWN — kernel bucket only, liveness unverified for the engine. default OFF |
 | `INTFER_WAVE_ALIAS` | alias an UN-ROTATED wave input (qkv/z/b/a, q/k/v) to the caller's own normed buffer instead of memcpying it into a per-item scratch buffer | **bit-exact by construction** (an un-rotated tensor's staging buffer held a byte-for-byte copy of normed; rot_apply fully overwrites its target so a rotated tensor still gets its own buffer). Host-side only -- same kernels, same buffers, same output assembly -- so nk/nw/nr are provably unchanged and the effect is confined to the copy/usm_write buckets. The paying part is the engine's shared-input dedup (src/engine/engine.cpp:2025, POINTER IDENTITY plus an equal M*K): with all aliased items pointing at one vector the FP32->FP16 convert runs ONCE instead of once per item, plus the M*H host memcpys here disappear. 6 sites: step()'s decoder wave-4, prefill_layer_outer's Phase C M-row wave-4, step_batch's M-row mirror wave-4, and the three attention wave-3s (q/k/v). default OFF; PRESENCE enables. Gate: test_gpu_optin.sh asserts the stream matches base AND that the `[wave-alias]` decision line appeared -- a stream comparison alone is vacuous here because the two arms are bit-identical by construction and a flag that never reached the branch would also match; the line prints aliased=N (not ACTIVE-only) so it still appears, reporting aliased=0, on a fully-rotated model. |
 | `INTFER_WAVE_LAUNCH_FUSE` | fuse a wave's N independent GEMMs into ONE parallel_for per device over the union of their output elements, instead of N separate launches. **COVERS BOTH prefill AND decode** (2026-10-15 re-check): the decode path reaches it via `step()`'s wave-4 (`main.cpp:5364`) -> `eng->run_linear_wave(eitems, ne, 1)` (`main.cpp:1154`) -> `run_linear_wave_fused`, and the wave kernel is fully M-general (per-item prefix sums, `quant_gemm.cpp:2775`), so M=1 items fuse exactly like M=128 ones. Distinct from the measured-losing `INTFER_DECODE1_MR`: the wave fusion keeps one work-item per output column and coalesces host phases; MR puts 4 outputs in one work-item and quarters parallelism | **bit-exact by construction** (each item keeps its own accumulator, ascending kg, ascending j, its own group scale and wtab; the items are interleaved in the instruction stream, never summed together -- the same argument the gate+up kernel uses, which is measured, not argued). TP=2-valid: every item is column-parallel and device-local, and the activation for item i lives in its own wave slot, so nothing crosses the host. Removes N-1 submits + N-1 waits + N-1 D2H readbacks per device per wave (the prefill hot path). Declines on a mismatched M/K/group across items, on INT8 items (which take the host-quant DPAS path), or on any item the fused kernel does not support, so the default path is byte-for-byte the old one when the flag is unset. **UNMEASURED** -- operator-only 27B --tp 2 A/B on the submit bucket. Gate: test_tp2_27b.sh, announcement `[wave-launch-fuse] ... ACTIVE wave=qkv|qkvzba|gateup|zba|named items=N M=... K=... group=...` with a 5-part self-check. | **WIDENED 2026-10-10 (commit after the audit): the kernel now derives each item's group width and group count from its OWN K and group_size (quant_gemm.cpp:2211-2212), so the engine precondition no longer requires items to share K or group_size -- only a shared M. It also runs the fused Phase 3 (wait) and Phase 4 (readback) itself (engine.cpp:2040-2089), because the caller `return`s on success and would otherwise leave live[i]->out stale and the device work undrained -- that was a fatal bug in the shipped commit, invisible to the gate's --self-check because the self-check builds synthetic logs and never touches the engine. The only remaining refusal is the base path's INT8 DPAS branch (quant_gemm.cpp:337: scheme==INT8 && M>=8 && K%32==0 && N%16==0 && group_size==0), which is a different kernel; an INT8 item that misses those conditions takes the same generic dequant and is fusible.** |
-| `INTFER_SAMPLE_TOPK_DIRECT` | FORK_B580 §8 #313 — when top-k is the FIRST active sampler stage (top_k>0, top_p<=0, temperature>0), select the k largest logits directly and softmax over only those, instead of the base's full-vocab softmax + nth_element prune + renormalize. `!= nullptr` spelling (PRESENCE enables). **Implemented 2026-10-15; gated in `scripts/test_tp2_27b.sh`** with a 6-predicate structural arm (announcement exists and echoes the env, the branch's presence gate is the env-read itself, the announcement sits inside the branch, the guard precedes the branch, the guard is read BEFORE the branch) plus 2 refusal directions (gate := true; announcement deleted), each with a builder preflight. **BIT-EXACT BY CONSTRUCTION, no numerics contract** — the base's survivor set is `{i : probs[i] >= kth_prob}` and it zeroes only `p < kth` (so ties at kth survive); because `probs[i] = expf((logits[i]-mx)/T)` is strictly monotone in logits[i] and `kth_prob == expf((kthl-mx)/T)` where kthl is the top_k-th largest logit, `{i : probs[i] >= kth_prob} == {i : logits[i] >= kthl}` — the same set this selects, independent of nth_element's permutation. The per-token expf values, the renormalized probs and the inverse-CDF draw over the same vector are then byte-identical, so a stream A/B is a formality. The guard's predicate (`topk_direct && top_k > 0 && top_p <= 0.f && temperature > 0.f && (int)logits.size() > top_k`) deliberately excludes the greedy path (which uses the device argmax `outs[m].best`, `main.cpp:8013/8117`) and the top-p path (which needs the full sorted index for the cumulative cutoff), so the flag is inert on those. **UNMEASURED** — the sampler is host-side CPU and runs per token in every decode step, so its cost is a host-timing question, not a kernel one; no operator run exists and the standing rule forbids loading the 27B in an agent session. Decide on host buckets (submit/waitblock/copy/readback) from an operator A/B, never on a tok/s. |
+| `INTFER_SAMPLE_TOPK_DIRECT` | FORK_B580 §8 #313 — when top-k is the FIRST active sampler stage (top_k>0, top_p<=0, temperature>0), select the k largest logits directly and softmax over only those, instead of the base's full-vocab softmax + nth_element prune + renormalize. `!= nullptr` spelling (PRESENCE enables). **Implemented 2026-10-15; gated in `scripts/gates/test_tp2_27b.sh`** with a 6-predicate structural arm (announcement exists and echoes the env, the branch's presence gate is the env-read itself, the announcement sits inside the branch, the guard precedes the branch, the guard is read BEFORE the branch) plus 2 refusal directions (gate := true; announcement deleted), each with a builder preflight. **BIT-EXACT BY CONSTRUCTION, no numerics contract** — the base's survivor set is `{i : probs[i] >= kth_prob}` and it zeroes only `p < kth` (so ties at kth survive); because `probs[i] = expf((logits[i]-mx)/T)` is strictly monotone in logits[i] and `kth_prob == expf((kthl-mx)/T)` where kthl is the top_k-th largest logit, `{i : probs[i] >= kth_prob} == {i : logits[i] >= kthl}` — the same set this selects, independent of nth_element's permutation. The per-token expf values, the renormalized probs and the inverse-CDF draw over the same vector are then byte-identical, so a stream A/B is a formality. The guard's predicate (`topk_direct && top_k > 0 && top_p <= 0.f && temperature > 0.f && (int)logits.size() > top_k`) deliberately excludes the greedy path (which uses the device argmax `outs[m].best`, `main.cpp:8013/8117`) and the top-p path (which needs the full sorted index for the cumulative cutoff), so the flag is inert on those. **UNMEASURED** — the sampler is host-side CPU and runs per token in every decode step, so its cost is a host-timing question, not a kernel one; no operator run exists and the standing rule forbids loading the 27B in an agent session. Decide on host buckets (submit/waitblock/copy/readback) from an operator A/B, never on a tok/s. |
 
 ### Upstream-port survey, 2026-10-12 (SYCL / Xe kernels)
 
@@ -548,7 +582,7 @@ inform. Fixed at quant_gemm.cpp:544-573: `on[8]`, `note_o` clamps the index, and
 enumerates every live arm. The default production state sets zero opt-in flags, so the refusal is
 unreachable on the hot path and no arithmetic moves. Verified `icpx -fsyntax-only` GEMM_RC=0.
 
-**And the checker that pins it, per rule 11.** `scripts/check_decode1_copies.sh` gained an
+**And the checker that pins it, per rule 11.** `scripts/checks/check_decode1_copies.sh` gained an
 enumeration section asserting on the guard's *source* (not a synthetic log): (b) CAPACITY -- the
 name array size is derived from the arms that feed it, and note_o's clamp bound is derived from the
 array, so planting `on[2]` fires the clamp check rather than the extraction; (a) ARITY -- the
@@ -558,8 +592,8 @@ right answer cannot detect the wrong one -- how this checker once passed a plant
 default-state non-vacuity half (a guard that refused production would be tuned away until it refused
 nothing). An earlier draft synthesised a log and asserted three indented names appeared in it; that
 proved nothing, because the log was built from the *fixed* guard and passed by construction. The
-negative direction is therefore a SOURCE mutation: `scripts/mutate_decode1_copies.sh` DC-8 plants
-`on[2]` + `"%s and %s"` and requires the checker to REFUSE. **Matrix: 8/8 states caught** REGEN(bash scripts/mutate_decode1_copies.sh)
+negative direction is therefore a SOURCE mutation: `scripts/matrices/mutate_decode1_copies.sh` DC-8 plants
+`on[2]` + `"%s and %s"` and requires the checker to REFUSE. **Matrix: 8/8 states caught** REGEN(bash scripts/matrices/mutate_decode1_copies.sh)
 (DC-1..DC-5 + DC-8 arity-coupled + DC-9 arity-isolated + DC-10 clamp), residue byte-identical.
 The engine TU was also syntax-checked (`icpx -fsyntax-only` on `src/engine/engine.cpp`, no
 `-DINTFER_HAS_GPU_BACKEND=1`): ENGINE_RC=0.
@@ -600,11 +634,11 @@ a recorded violation, not a re-derivation; it must be re-derived by the operator
 lifted.** `check_dispatch_steps_consistency.sh` (text-only, no box probe) was within the permitted
 set and its PASS stands on its own.
 
-The clone at `intfer-int8-dpas-work/scripts/test_tp2_27b.sh:748` carries it. Appended after the
+The clone at `intfer-int8-dpas-work/scripts/gates/test_tp2_27b.sh:748` carries it. Appended after the
 `rm -f "$LOG"` line at `test_tp2_27b.sh:1812`, so the conversion is the last statement and the
 trailing-rm escape hatch (conversion above the rm, exit 0 on FAIL) is closed. `bash -n` rc=0.
 
-**And the checker that pins it, per rule 11.** `scripts/check_tp2_pass_exit.sh` is a SOURCE-based
+**And the checker that pins it, per rule 11.** `scripts/checks/check_tp2_pass_exit.sh` is a SOURCE-based
 four-predicate checker (no synthetic log -- a log built from the fixed gate would pass by
 construction, which is the trap the decode1 enumeration section already fell into): (a) a
 `[ "$PASS" = N ] … exit` conversion exists; (b) an `exit 1; fi` FAIL branch exists AND no
@@ -614,7 +648,7 @@ hatch). Both polarities proven on temp copies: baseline on the fixed gate → PA
 a temp copy of the pre-fix gate → FAIL(a) rc=1; refusal on the escape-hatch mutant (conversion
 moved above the rm) → FAIL(d) rc=1.
 
-**The negative direction is a SOURCE mutation:** `scripts/mutate_tp2_pass_exit.sh` plants four
+**The negative direction is a SOURCE mutation:** `scripts/matrices/mutate_tp2_pass_exit.sh` plants four
 defect shapes on temp copies and requires the checker to REFUSE each for its own reason:
 - PE-1: conversion deleted (the shipped defect) → expect FAIL(a)
 - PE-2: FAIL branch exits 0 (green verdict gate) → expect FAIL(b)
@@ -623,7 +657,7 @@ defect shapes on temp copies and requires the checker to REFUSE each for its own
 
 Includes anchor preflight (all 3 anchors must match exactly once), baseline (unmutated gate must
 PASS the checker), residue check (tracked file byte-identical to its pre-run state), verdict block,
-stamp write. **Matrix: 7/7 states caught**, each for its own reason, residue byte-identical. REGEN(bash scripts/mutate_tp2_pass_exit.sh)
+stamp write. **Matrix: 7/7 states caught**, each for its own reason, residue byte-identical. REGEN(bash scripts/matrices/mutate_tp2_pass_exit.sh)
 Both registered in `run_all_checks.sh` (dispatch arms at 311 and 641, STEPS entries in the
 checker and matrix lists) per rule 9; `check_dispatch_steps_consistency.sh` → PASS (75 arms,
 74 scheduled + 1 POST-STACK exempt).
@@ -664,8 +698,8 @@ all hold and only (d) can fire -- and the predicate itself had to change from "w
 reaches past a planted `exit 0` into the conversion line above it and passes. A predicate that
 looks for the right answer cannot detect the wrong one.
 
-**The sweep itself (`scripts/check_gate_exit_verdict.sh`):** derives the population from
-`scripts/test_*.sh`, asserts the harvest count (the count itself is DERIVED by the sweep's own
+**The sweep itself (`scripts/checks/check_gate_exit_verdict.sh`):** derives the population from
+`scripts/gates/test_*.sh`, asserts the harvest count (the count itself is DERIVED by the sweep's own
 harvest assertion — it refuses a corpus it harvested nothing from, so "0 findings" is distinguishable from
 "looked at nothing"), and runs the checker over each. Baseline: **18/18 gates safe** (5 CITATION(build/run_all_check_gate_exit_verdict_sh.log)
 PASS-variable, 13 probe-relay). Negative direction proven on a temp copy: a conversion moved
@@ -785,6 +819,17 @@ LA_CONV_PREP_WG knobs) decided by operator A/B on `nk`/`nw`/`nr`, never by new s
 
 **Round 10 (2026-10-15) -- the standing-state round.** Re-surveyed all three trees since the 2026-10-12 cutoff: llama.cpp `ggml/src/ggml-sycl/` (15 new commits), sgl-kernel-xpu `src/sycl/` (15 new commits), vllm-xpu-kernels (10 new commits). Two upstream GDN/SSM commits were found -- llama.cpp `ff30363a` "fuse the delta-net alpha gate" (2026-10-15) and sgl-kernel-xpu `92a91a95` "GDN: split the fused kernel" (2026-10-15). Both touch the same `g = -expf(A_log) * sigmoid(a + dt_bias)` computation that intfer's device SSM kernel `la_conv_prep` already computes inline at `quant_gemm.cpp:4307-4308` (`sp = log1p(expf(a+dt)); g = -expf(A_log)*sp`). The upstream "fuse" is intfer's standing state; the sgl "split" is its inverse. All other candidates (FlashAttention head_size=72/80 MoonViT, Qwen4Exp MoE, FP8 scale-routing bugfix, M-RoPE interleaved, RecoverSSM speculative decode, MoE align_block_size) fail the fusion test or target ops/weight-formats intfer does not run. **Zero adoptable items; the survey is closed across ten rounds.** Full record in `docs/upstream_sgl_survey.md`.
 
+**Round 11 (2026-10-17) -- `Niko1221/Strata` is a FOURTH tree, and it is the first survey round to produce a SHIPPED probe.** The clone at `/var/home/fra/dev/intfer-upstream/Strata` is a dpct-flavoured CUDA->SYCL port (oneAPI `dpct`, not SYCL-native), OFF by default behind `STRATA_ENABLE_SYCL` (`CMakeLists.txt:12-14`). Four candidates were surveyed; **the verdict is INFORMED-FROM-SCRATCH for all four** -- the DashQ INT2 weight format and no-P2P prevent a code transplant, so intfer adopts the TECHNIQUES, not code. Full record: `docs/engines/strata.txt`; S1's decision record: HISTORY.md ("2026-10-17: S1 uncached-host-USM doorbell probe — SHIPPED (informed-from-scratch from Strata)").
+
+* **S1 -- uncached-hint host-USM doorbell (`sycl/include/strata/sycl_queue.hpp:63-79`). SHIPPED AS A PROBE.** `host_malloc_polled()` allocates host memory with `zeMemAllocHost` + `ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED`, tracked in a `detail::uncached_set` and freed by `host_free_polled`. Upstream measured, on `xe`, a system-scope atomic load of cached host USM never observing the host's own store (a 263 ms bound-hit wait per round trip) against microseconds with the hint, and a plain device store reaching the host only at kernel end. intfer's seam is the same class of buffer: `run_linear_tp`'s host gather, `INTFER_MLP_PARTIAL_DOWN`, `INTFER_LA_OUT_TP2` -- all pay a full event-wait where a doorbell would spin on a word the device wrote mid-kernel. **Zero launch delta, no weight-format wall, not blocked by no-P2P.** The only open question is this box's own cache-visibility spread, which is a driver property rather than a code one, so it was shipped as `examples/uncached_doorbell_probe/` -- CLI args only (no `INTFER_` variable, so the flag census is untouched), no model load, operator-run -- and certified structurally by `scripts/checks/check_s1_predicates.sh` plus `scripts/matrices/mutate_s1_predicates.sh` (eight planted states, each refusing for its own named predicate; the matrix found three defects in the CHECKER, all fixed and now asserted). **UNMEASURED on real weights: the B580 probe is operator-only, per the standing rule.**
+* **S2 -- host M-row sort (`src/prefill/mmq_resident_sort.hpp:12-60`). REJECTED, MoE-shaped.** The sort key is a resident-expert count a dense model does not have, and intfer's prefill activations are already contiguous per device, so it coalesces nothing.
+* **S3 -- XMX prompt attention with an FP16 hi/lo Q/P split (`sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp:73-74,112-116`). REJECTED, no seam.** intfer's prefill attention is host-side FP32 per-row causal, so there is no device producer to attach the split to; the wider-mantissa trick has no consumer in this tree.
+* **S4 -- fused GDN step + per-head norm (`sycl/src/kernels/cuda/fused_gdn.dp.cpp`). REJECTED, duplicate.** The 2-pass fold it demonstrates is intfer's shipped `INTFER_SSM_FUSE` (commit `881c02f`); a second flag naming it is the two-flags-naming-one-design defect.
+
+Ten further near-misses are rejected with reasons in `docs/engines/strata.txt` -- MoE grouped XMX GEMM (intfer is dense, no expert grid), K^T/interleaved-V pack (already the DashQ INT2 layout), device-plan expert exchange and layer split (no P2P; a layer split is the shape FORK_B580 sec.18 records as harmful for the state-space class), MTP coupling (no draft-model machinery), copy engine / `dma_batch` / chunked fill (adds a queue, removes no round trip), alias-check guards (`INTFER_WAVE_ALIAS` already ships pointer-identity dedup), and SYCL command graphs -- **an already counter-measured LOSS in this tree, killed by the load-insensitive counters. DO NOT REVIVE.**
+
+**The survey is now closed across eleven rounds and four trees.**
+
 ### Default ON, with a kill switch
 
 `INTFER_NO_FUSE_SILUMUL` (fused MLP, TP=1 only — the shipped +13%), `INTFER_NO_WAVE`
@@ -845,7 +890,7 @@ CLOSED, not open.** What remains is the reproducible finding: the shipped INT2 d
 runs at ~49 GB/s on MLP_GATE against a 456 GB/s ceiling, ~10.7% of peak. Full account:
 HISTORY.md "THE 6.39x ITSELF IS NOT REPRODUCIBLE".
 CITATION(build/roofline_bisect4.log 2026-10-06, clone arm 55.1 GB/s vs shipped ~40-49 GB/s;
-         scripts/test_roofline_bisect4.sh)
+         scripts/gates/test_roofline_bisect4.sh)
 
 ### The profiling defect: LOCATED 2026-10-08, it is the driver, not the code
 
@@ -993,7 +1038,7 @@ Decide on those, never on `kernel`.
   (silu-mul) with the consumer (partial down GEMM). **NOT bit-exact** (two FP16
   partials summed in FP32 vs the tiled kernel's single
   FP32-accumulate-then-FP16-store) → **tolerance contract, never stream
-  identity**; the gate arm in `scripts/test_tp2_27b.sh` asserts REACHABILITY
+  identity**; the gate arm in `scripts/gates/test_tp2_27b.sh` asserts REACHABILITY
   (the flag reached the branch, the run exited 0 producing tokens) and asserts
   NOTHING about the ids. The compact-write mode on the gateup kernel
   (`quant_gemm_forward_usm_gateup(..., compact=true)`, default false) is the
@@ -1008,7 +1053,7 @@ Decide on those, never on `kernel`.
   flag is on, K splits evenly across devices, and the split lands on a group
   boundary; it coexists with the column-split shard (~2x the down weight
   memory while the flag is on, ~100MB on 27B, acceptable for an opt-in).
-  Gate: `scripts/test_tp2_27b.sh`, once-per-process announcement
+  Gate: `scripts/gates/test_tp2_27b.sh`, once-per-process announcement
   `[mlp-partial-down] ACTIVE ... two FP16 partials per device -> host FP32
   sum`, plus a negative-direction self-check (the flag-unset control run must
   NOT announce). UNMEASURED — operator-only 27B `--tp 2` A/B; decide on
@@ -1026,7 +1071,7 @@ Decide on those, never on `kernel`.
   submit + 1 wait per device per MLP layer — **launch count, not transfer
   count** (partial-down has no D2H readback in either branch). Announces
   `[mlp-gateup-silumul-fuse] ACTIVE ...` nested inside the partial-down block.
-  Gate: decline arm in `scripts/test_gpu_optin.sh` (INT4 fixture — the fused
+  Gate: decline arm in `scripts/gates/test_gpu_optin.sh` (INT4 fixture — the fused
   kernel has an INT2+INT2 body only, so it must decline and the two-launch
   base must run bit-exactly); reachability on the 27B INT2 fixture via the
   partial-down arm. **DEFECT FIXED 2026-10-14:** the original wiring ran the
@@ -1061,7 +1106,7 @@ Decide on those, never on `kernel`.
   after the first request. Same prompt back-to-back measured 9.28 s then 2.75 s,
   2.75 s. `q.prefetch()` was built and **reverted — a no-op hint for shared USM on
   this driver**; do not retry. Mitigation is one warmup request after `/health`
-  (`scripts/serve_27b.sh`, `INTFER_NO_WARMUP=1` skips).
+  (`scripts/run/serve_27b.sh`, `INTFER_NO_WARMUP=1` skips).
 * **Submit inflates under device saturation**: ~84 us/launch at M=1 to ~600 us at
   M=128. Fewer host phases only convert to throughput where the device has idle gaps.
 * **SSM/norm kernels submit through `quant_gemm` free functions**, so their launches
@@ -1133,14 +1178,14 @@ by grep rather than remembered. Every consumer of `g_gpu_profile.total_kernel_us
   (973-976). It is the instrument whose zero-on-this-box defect is documented
   above; its vacuity guard refuses rather than substituting a host timer. It is
   not part of the engine and never was.
-* **`scripts/_bench_summary.py`** — the summary printer (REQUIRED tuple at line
+* **`scripts/lib/_bench_summary.py`** — the summary printer (REQUIRED tuple at line
   38, per-round print at 209-213, delta verdict at 241-252). It *reports* the
   kernel bucket and refuses a batch in which any arm died or produced fewer than
   2 paired rounds. It does not decide: the PARAMOUNT DIRECTIVE's decision rule
   ("decide on `nk`/`nw`/`nr` and the host buckets, never on `kernel`") is a
   directive to the operator, and the summary's spread-floor enforcement is the
   mechanism that makes a kernel delta claimable only when it clears noise.
-* **`scripts/model_byte_roofline.sh`** — a CITATION-bearing helper. It hard-codes
+* **`scripts/model/model_byte_roofline.sh`** — a CITATION-bearing helper. It hard-codes
   the `total_kernel_us 1187601.2 / 5 tokens` citation from `perf_base.err` and
   prints an achieved-vs-ceiling percentage for a `kernel_ms` the operator fills
   in. It is a calculator over a recorded number, not a live measurement path.
@@ -1150,7 +1195,9 @@ by grep rather than remembered. Every consumer of `g_gpu_profile.total_kernel_us
 loops) and consumed by exactly the four surfaces above, none of which feeds a
 flag, a gate, or an optimization decision. The only load-insensitive integers
 that *do* drive decisions are `nk`/`nw`/`nr` (+ `submit_count`/`usm_write_count`/
-`readback_count`/`wait_count`/`copy_count` since `23837c2`/`a868c3b`), and the
+`readback_count`/`wait_count`/`copy_count` since `23837c2`/`a868c3b`, and the XMX
+dispatch triple `xmx_attempt_count`/`xmx_launch_count`/`xmx_decline_count`, which
+is an engine-side dispatch observation rather than a device timestamp), and the
 probe's zero is not evidence that the engine's instrument is also zero — that
 empirical question remains UNVERIFIED and its practical consequence does not
 depend on the answer, as recorded above.
@@ -1216,7 +1263,7 @@ per-item INTFER_XMX_GEMM dispatch skipped for this wave (n_items=.. M=..)
 flags together, and no arm grepped the line — so a precedence that cannot be
 seen is an accident of call order. An operator who armed both flags believing
 XMX would run on the prefill wave would get the EU/ALU kernel with no way to
-know. Gated 2026-10-15 in `scripts/test_tp2_27b.sh` as a combined-flags arm:
+know. Gated 2026-10-15 in `scripts/gates/test_tp2_27b.sh` as a combined-flags arm:
 
 * Runs `INTFER_XMX_GEMM=1 INTFER_WAVE_LAUNCH_FUSE=1` together on the 27B
   `--tp 2` target.
@@ -1613,7 +1660,7 @@ deadline_ms=50`. HOST-SIDE (no numerics contract) and UNMEASURED by rule: no
 device round trip added or removed, so `nk`/`nw`/`nr` have nothing to attribute;
 decide on an operator-only 27B `--tp 2` A/B, never on a tok/s. Full record:
 HISTORY.md "2026-10-19: INTFER_DRAFT_ASYNC" and the `SHIPPED 2026-10-19` entry in
-`engines_sources.txt`.
+`docs/engines/dflash.txt`.
 
 ## Drop 0.8B — DECISIVE POSITION (2026-10-16)
 
@@ -1702,7 +1749,7 @@ beyond fusion — reminder #9 evaluation"):
    kernels (not SYCL/Xe) and declare their own model type, so they cannot be
    ported to intfer's DashQ INT2 GQA weights (re-quantisation, not a
    micro-optimisation) and MLA fails the fusion test on intfer's existing path
-   (recorded DECLINED-PORT in `engines_sources.txt:13-14` and HISTORY.md:
+   (recorded DECLINED-PORT in `docs/engines/mla.txt` and HISTORY.md:
    "INTFER_MLA_ATTN — MLA/GA latent-projection attention (opt-in, future
    models)"). intfer implements its OWN MLA/GA latent-projection attention
    behind `INTFER_MLA_ATTN` (`q_a`/`q_b`/`kv_a`/`kv_b` down/up-projection with
@@ -1724,12 +1771,12 @@ test their defaults) and omitted five that are genuine opt-in gaps. A hand-kept
 list is a citation that decays into a guess:
 
 ```
-scripts/check_flag_gate_coverage.sh     # classifies and prints every class
+scripts/checks/check_flag_gate_coverage.sh     # classifies and prints every class
 ```
 
 The five opt-in gaps (`INTFER_DECODE1_ANNOUNCE_EVERY`, `INTFER_LMHEAD_SPLIT0`,
 `INTFER_SPEC_ADAPT`, `INTFER_SSM_FUSE_ANNOUNCE_EVERY`, `INTFER_TIMELINE`) are
-now all gated in `scripts/test_tp2_27b.sh` with structural arms and refusal
+now all gated in `scripts/gates/test_tp2_27b.sh` with structural arms and refusal
 directions; `check_flag_gate_coverage.sh` reports CFG_RC=0 with the opt-in
 residue EMPTY (92 flags, 92 gate-named, 0 opt-in gap). The decision record and
 per-flag certification details live in HISTORY.md ("2026-10-16: Flag gate
@@ -1747,7 +1794,7 @@ identity/no performance figure disclaimer) lives there. [DANGLING 2026-10-18: HI
 ## Checker/matrix re-run ledger, 2026-10-15 (real re-run, NO STOP in force)
 
 Every checker and matrix below was re-run after this session's four source
-fixes (`scripts/test_onemkl.sh`, `src/gemm/gemm_onemkl.cpp`,
+fixes (`scripts/gates/test_onemkl.sh`, `src/gemm/gemm_onemkl.cpp`,
 `src/gemm/quant_gemm.cpp`, `examples/onemkl_probe/main.cpp`), on the CLEAN
 worktree commit `644bc12` in `/var/home/fra/dev/intfer-stack` with
 `/opt/intel/oneapi/setvars.sh` sourced, through `scripts/run_all_checks.sh`.
@@ -1765,16 +1812,16 @@ as a pass.
 |---|---|
 | `check_dispatch_steps_consistency.sh` | PASS (76 arms, 75 STEPS) -- CITATION(`build/run_all_check_dispatch_steps_consistency_sh.log`) |
 | `check_flag_gate_coverage.sh` | PASS (98 engine flags, 92 gate-named, opt-in residue EMPTY -- the checker FAILs on an empty residue by design, forcing AGENTS.md to be revisited) -- CITATION(`build/run_all_check_flag_gate_coverage_sh.log`) |
-| `check_gate_exit_verdict.sh` | PASS (18/18 gates safe; pass-variable=5, probe-relay=13) -- CITATION(`build/run_all_check_gate_exit_verdict_sh.log`)  REGEN(bash scripts/check_gate_exit_verdict.sh) |
+| `check_gate_exit_verdict.sh` | PASS (18/18 gates safe; pass-variable=5, probe-relay=13) -- CITATION(`build/run_all_check_gate_exit_verdict_sh.log`)  REGEN(bash scripts/checks/check_gate_exit_verdict.sh) |
 | `check_tp2_pass_exit.sh` | TP2-PASS-EXIT PIN: PASS |
 | `check_checker_matrix_coverage.sh` | PASS (29 checkers, 39 matrices, 0 drift) |
-| `check_destructive_git.sh` | PASS (4/4 guarded; the rule is in AGENTS.md)  REGEN(bash scripts/check_destructive_git.sh) |
+| `check_destructive_git.sh` | PASS (4/4 guarded; the rule is in AGENTS.md)  REGEN(bash scripts/checks/check_destructive_git.sh) |
 | `check_pipefail_grep_q.sh` | PIPEFAIL GREP-Q: PASS (28 scripts set pipefail, 28 clean) -- CITATION(`build/run_all_check_pipefail_grep_q_sh.log`) |
 | `check_hw_constants.sh` | HW CONSTANTS: PASS (every capability figure in AGENTS.md, `docs/audit-log-tooling.md` and `docs/FORK_B580_SUMMARY.md` cited) -- CITATION(`build/run_all_check_hw_constants_sh.log`) |
 | `check_pending_operator.sh` | PASS (re-measured 2026-10-16: 1 operator-deferred, 2 locally clearable) -- **DEFECT FIXED.** The classifier's predicate was `run_ten_gates\\.sh\|run_ten_gates\\b`, which matched the checker's own OUTPUT as well as its remediation advice, so two TEXT-ONLY steps (`check_scripts_live.sh`, `check_build_dir_consumers.sh`) were filed under "remediation needs the 27B run" -- the operator was told to spend tens of minutes and both GPUs on steps that only grep source. Both were re-run here and PASS. The predicate now requires the imperative form (`run`/`re-run` + `scripts/run_ten_gates.sh`). Pinned by matrix states PO-4 (correct predicate leaves it CLEARABLE) and PO-4b (the original predicate is proved, not assumed, still capable of misfiling it); **matrix 5/5**. |
 | `check_gate_pop.sh` / `check_gate_enum.sh` / `check_gpu_recover.sh` / `check_nullglob_sites.sh` / `check_dpas_shape_audit.sh` / `check_verdict_scope.sh` / `check_trap_release.sh` / `check_build_dir_consumers.sh` / `check_act_cache_invalidation.sh` / `check_decode1_shipped_anchor.sh` / `check_dri_probe.sh` / `check_guard_identity.sh` / `check_decode1_copies.sh` / `check_env_not_box_state.sh` | PASS |
 | `run_ten_gates.sh`, `test_roofline_probe.sh`, `test_roofline_bisect{,_1,_3,_4}.sh`, `test_rowpair_equiv.sh`, `check_l0_cite.sh` | ok -- **the seven previously-red gates were a PATH fault, not a box state**: every one failed on `icpx: command not found` and every one passes with `/opt/intel/oneapi/setvars.sh` sourced, on real hardware. Also measured on this run: `build/examples/hello_sycl/hello_sycl` and `build/examples/roofline_probe/roofline_probe --device 0` both PASS, so the injected premise that "GPU SYCL kernels hang on this box; CPU SYCL works" is FALSE and must not be trusted again. **Three gates in the same population go red on a healthy box for reasons unrelated to the code and are excluded, not fixed** -- see "KNOWN-RED ON A HEALTHY BOX" below: `test_http_batch.sh` + `test_serve_load.sh` (model-missing under the harness's `cd`-based `SCRIPT_DIR`), `test_gpu_optin.sh` (the `--steal` clause of the XMX arm cannot be satisfied by the probe's own contract), `test_tp2_27b.sh` (rc=134 at layer 16, a pre-existing upstream `run_linear_wave` fault). |
-| `mutate_fold_matrix.sh` | PASS -- 7/7 states caught, S0..S6 all AS EXPECTED -- CITATION(`build/fold_matrix/summary.txt`, stamp `sha=644bc12`) REGEN(bash scripts/mutate_fold_matrix.sh) |
+| `mutate_fold_matrix.sh` | PASS -- 7/7 states caught, S0..S6 all AS EXPECTED -- CITATION(`build/fold_matrix/summary.txt`, stamp `sha=644bc12`) REGEN(bash scripts/matrices/mutate_fold_matrix.sh) |
 | `check_engine_cert.sh` | UNPROVEN rc=2 (stale evidence, not a regression) -- EXPECTED: it grades the 27B engine run, which is operator-only. |
 | `check_e2_ctx.sh`, `check_device_precond.sh` | FAIL **in the fresh worktree only** -- 12 of 13 precond assertions and every e2_ctx arm died on `model missing: .../test/models/Qwen3.5-0.8B.intifer`; the 0.8B fixtures are gitignored build products, so a worktree has none. Remedy already applied (symlinks into `intfer-stack/test/models/`); NOT YET RE-MEASURED. |
 | `check_scripts_live.sh` | PASS (re-measured: 124 script(s), 106 NAMED, 18 GLOB, 0 unreachable). `measure_load_attribution.sh` was `git mv`'d into `scripts/archive/` because the wall-time benchmark queue the PARAMOUNT DIRECTIVE retired was its only subject. Every scripts/ entry is reachable from a live source or the gate glob; scripts/archive/ is excluded by construction. |
@@ -1892,7 +1939,7 @@ FIXED-and-verified (2, along with `test_device_argmax.sh` which inherited it).**
 **The four defects this re-run found and fixed** (all four are code/gate
 defects, not box-state readings):
 
-1. **`scripts/test_onemkl.sh` could never test the oneMKL arm.** It set
+1. **`scripts/gates/test_onemkl.sh` could never test the oneMKL arm.** It set
    `BUILD_DIR=$ROOT/build` before `GATE_BUILD_DIR` existed, so
    `gate_require_build`'s `${BUILD_DIR:-${INTFER_BUILD_DIR:-$ROOT/build}}`
    resolution never reached the env seam: every run ended in "No rule to make
@@ -1941,7 +1988,7 @@ condition, not a code one, ended it:
 Both cards are still bound to `xe` and both render nodes open O_RDWR, but the
 compute runtime enumerates **one** device, with group 4 == `0400`: card
 `04:00.0` survives and `86:00.0` is absent from Level Zero. CITATION(
-`scripts/gpu_recover.sh diag`, 2026-10-16; `scripts/l0_enumerate.sh` to
+`scripts/gpu_recover.sh diag`, 2026-10-16; `scripts/l0/l0_enumerate.sh` to
 `TOTAL LEVEL ZERO DEVICES: 1`).
 
 **This is the documented host-side enumeration fault, not a code fault.** It

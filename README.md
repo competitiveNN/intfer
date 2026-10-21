@@ -10,7 +10,7 @@ The project is being built in three stages:
 | :--- | :--- | :--- |
 | **1** | INT2/low-bit quantization pipeline (SpinQuant → DASH-Q → RCO) | Implemented; 0.8B + 27B quantized, `.intfer` + `.gguf` artifacts |
 | **2** | Native SYCL/L0 execution engine (quant GEMM, FlashAttention, tensor-parallel) | Implemented (TP=2 sharded decode on 2× B580; DPAS INT8/W4A8/W2A8; INT8-KV opt-in) |
-| **3** | High-throughput serving (continuous batching, spec decoding) | Done (`--serve`/`--serve-http` servers, iteration scheduler, mixed-batch M-row forward, joint prefill+decode, chunked prefill, round-robin fairness, n-gram speculative decode). Gates: `scripts/test_cpu_parity.sh` (oracle + split==joint), `scripts/test_http_batch.sh` (cross-request batch parity), `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8: req/s, tok/s, P50/P99 latency, solo-vs-loaded parity). Measured 2026-09-17 (0.8B INT2, GPU TP=1, max_tokens=8, idle box): C=1 8.16 tok/s / P50 1.0s, C=4 15.33 tok/s / P50 2.0s, C=8 17.98 tok/s / P50 3.3s (x2.20 C=1->C=8; batch-full probe C=8/MT=64: 36.3 tok/s aggregate, near the 40 target; the 2026-09-16 run was 4-5x lower under box contention) |
+| **3** | High-throughput serving (continuous batching, spec decoding) | Done (`--serve`/`--serve-http` servers, iteration scheduler, mixed-batch M-row forward, joint prefill+decode, chunked prefill, round-robin fairness, n-gram speculative decode). Gates: `scripts/gates/test_cpu_parity.sh` (oracle + split==joint), `scripts/gates/test_http_batch.sh` (cross-request batch parity), `scripts/gates/test_serve_load.sh` (concurrency sweep C=1/4/8: req/s, tok/s, P50/P99 latency, solo-vs-loaded parity). Measured 2026-09-17 (0.8B INT2, GPU TP=1, max_tokens=8, idle box): C=1 8.16 tok/s / P50 1.0s, C=4 15.33 tok/s / P50 2.0s, C=8 17.98 tok/s / P50 3.3s (x2.20 C=1->C=8; batch-full probe C=8/MT=64: 36.3 tok/s aggregate, near the 40 target; the 2026-09-16 run was 4-5x lower under box contention) |
 
 ---
 
@@ -98,7 +98,7 @@ runs a built binary resolves it through that variable, so pointing
 `INTFER_BUILD_DIR` at another tree benchmarks/builds *that* tree rather than
 silently falling back to the default one.
 
-The separate host-only Stage-1 quantizer (`scripts/build_quant_real.sh`) has its
+The separate host-only Stage-1 quantizer (`scripts/build/build_quant_real.sh`) has its
 own tree, `build_quant_real/`, and its own override `$INTFER_QUANT_REAL_BIN`;
 the `quant_27b_*` / `run_27b_*` chunk scripts resolve their binary through it.
 Chunk then merge, in that order: `run_27b_int2_v2.sh` writes one `.intifer` per
@@ -122,7 +122,7 @@ Built under `examples/` (enabled by `INTFER_BUILD_EXAMPLES`):
 - `quant_pipeline` — full SpinQuant → DASH-Q → RCO pipeline (needs `INTFER_BUILD_QUANT`).
 - `gemm_demo` — quantized GEMM / DPAS kernel.
 
-Run via `scripts/run.sh` / `scripts/run_bin.sh` after building, or prefix any command
+Run via `scripts/run/run.sh` / `scripts/run/run_bin.sh` after building, or prefix any command
 with `scripts/with_oneapi.sh` — a bare shell cannot enumerate either B580 (libumf
 is off the default `LD_LIBRARY_PATH`, so every UR adapter fails to load), and
 `source setvars.sh` cannot be used to prefix a command because it ends in `exit`.
@@ -160,11 +160,11 @@ scripts/             build.sh / run.sh / run_bin.sh / with_oneapi.sh
   OpenAI-compatible server with continuous batching
   (iteration scheduler, mixed-batch M-row forward, joint prefill+decode,
   chunked prefill, round-robin fairness), free n-gram speculative decode
-  (`INTFER_SPEC_K=N`), and gates: `scripts/test_cpu_parity.sh`
-  (oracle + split==joint + rotcheck + INT8-KV), `scripts/test_tp2_27b.sh`,
-  `scripts/bench_serve.sh` (req/s, tok/s, latency),
-  `scripts/test_http_batch.sh` (cross-request batch parity over HTTP),
-  `scripts/test_serve_load.sh` (concurrency sweep C=1/4/8 with req/s,
+  (`INTFER_SPEC_K=N`), and gates: `scripts/gates/test_cpu_parity.sh`
+  (oracle + split==joint + rotcheck + INT8-KV), `scripts/gates/test_tp2_27b.sh`,
+  `scripts/bench/bench_serve.sh` (req/s, tok/s, latency),
+  `scripts/gates/test_http_batch.sh` (cross-request batch parity over HTTP),
+  `scripts/gates/test_serve_load.sh` (concurrency sweep C=1/4/8 with req/s,
   tok/s, P50/P99 latency + solo-vs-loaded parity; 2026-09-18
   (quiet-box start, fused default-ON): MT=8 sweep C=1 3.3, C=4 4.2,
   C=8 3.1 tok/s (prefill-dominated short requests; C=8 scaling inverts

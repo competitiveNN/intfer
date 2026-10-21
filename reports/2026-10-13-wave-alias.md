@@ -45,7 +45,7 @@ accumulators, which are host wall-clock sums reported as `median(spread)`.
 
 ## The gate (already written, TP-2 covered)
 
-`scripts/test_gpu_optin.sh:785-845` (also re-runs TP=1 and the fully-rotated negative):
+`scripts/gates/test_gpu_optin.sh:785-845` (also re-runs TP=1 and the fully-rotated negative):
 
 - (a) TP=2: stream identity vs base **AND** `[wave-alias]` line present.
 - (b) TP=1: same, so the claim is not TP-polar.

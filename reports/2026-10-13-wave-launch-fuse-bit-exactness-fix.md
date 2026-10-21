@@ -49,5 +49,5 @@ The wave-launch-fuse arm in `test_tp2_27b.sh` compares token streams (`mr_stream
 
 ## Files changed
 - `src/gemm/quant_gemm.cpp` (kernel fix)
-- `scripts/test_tp2_27b.sh` (audit annotation updated)
+- `scripts/gates/test_tp2_27b.sh` (audit annotation updated)
 - `reports/2026-10-13-wave-launch-fuse-bit-exactness-fix.md` (this report)

@@ -1,12 +1,12 @@
 https://github.com/vllm-project/vllm-xpu-kernels # int4 Marlin WNA16 (2026-10-14): falsified — Marlin vs DashQ INT2 weight-format wall; port would require re-laying all 27B weights
 https://github.com/sgl-project/sgl-kernel-xpu # FMHA/MLA Cutlass attention + fused elementwise + MoE w4a16 (2026-10-13/14): all candidates falsified — wrong ops for intfer, adds H2D, expert grid intfer lacks
-https://github.com/cosmonomic/pulsarlm
+https://github.com/cosmonomic/pulsarlm # pulsarlm.txt — CUDA-only single-GPU engine survey (2026-10-20): REJECTED WITH REASON, 0 candidates ported. Seven recorded in pulsarlm.txt, every one blocked by the CUDA-only backend wall (no SYCL/HIP/Vulkan kernels anywhere in the tree) and/or the paged-KV model intfer does not run — intfer's attention is host-side FP32 per-row causal and its KV is full contiguous per rank under a hard INTFER_KV_CAP exit, with prefix-cache snapshot/resume already shipped, so pulsarlm's eviction policy and host-page-pool have no consumer
 https://github.com/Anbeeld/beellama.cpp # KVarN (2026-10-16): common/fit-kvarn-tail.{h,cpp} (retry-state only, REPEATED_CANDIDATE/ACCEPT/RETRY verdicts) + src/llama-kvarn.{h,cpp} + ggml/src/ggml-cuda/{kvarn,fattn-kvarn-*}.cu{h} + ggml-vulkan kv-shaders + src/llama-kv-cache-kvarn. DECLINED: the KVarN KV record layout (token_group=128 packed bits + Hadamard + sinkhorn quant) requires re-laying every DashQ weight (same wall as mmvq/vllm-int4); the CUDA/Vulkan attention kernels target a paged-KV + native-mask backend intfer does not run on B580; the fit-tail is a host retry-state with no kernel consumer. NO port.
 https://github.com/ggml-org/llama.cpp # norm.cpp sub-group-per-row GEOMETRY -> INTFER_LA_CONV_PREP_WG (butterfly NOT taken)
 https://github.com/Torchit1/llama.cpp # ./docs/FORK_B580_SUMMARY.md  (sec.5 GGML_SYCL_CONV_CHAIN -> intfer la_conv_prep; the un-taken half is >1 work-item = INTFER_LA_CONV_PREP_WG)
 https://github.com/Niko1221/Strata # SYCL/Xe upstream survey (2026-10-17; clone at /var/home/fra/dev/intfer-upstream/Strata): dpct-flavoured CUDA->SYCL port. Verdict: INFORMED-FROM-SCRATCH — nothing copied as-is (no shared file layout, no shared kernel naming); intfer adopts the TECHNIQUES, not code.
 
-PILOT CANDIDATE — S1 uncached-hint host-USM doorbell (sycl/include/strata/sycl_queue.hpp:63-79): host_malloc_polled() allocates host memory via zeMemAllocHost with ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED (env STRATA_HOST_UNCACHED, default ON; falls back to sycl::malloc_host; tracked in a detail::uncached_set under a mutex, freed by host_free_polled). This is a pure ALLOCATION-FLAG technique — no kernel, no launch, no arithmetic — and it targets exactly the sort of host buffer intfer's TP=2 run_linear_tp per-rank D2H gather reads through. PRECONDITION, MUST BE PROBED BEFORE ANY CODE IS WRITTEN: whether B580's `xe` driver reproduces Strata's measured 263 ms -> 2.4 us cache-snoop spread. STRATA'S NUMBERS ARE A770 / A750 / B60, NOT B580. If the spread does not reproduce on this box, S1 is dead and nothing gets written. Operator-only probe (needs a GPU run).
+PILOT CANDIDATE — S1 uncached-hint host-USM doorbell (sycl/include/strata/sycl_queue.hpp:63-79): ALLOCATOR HALF shipped (examples/uncached_doorbell_probe/, informed-from-scratch); doorbell half REFUSED — upstream measured 5,907,703 spins over 500 ms never running the kernel; wait must poll driver, not spin on uncached host USM.
 
 S2 host M-row sort (src/prefill/mmq_resident_sort.hpp:12-60): mmq_resident_sort_rows() stable-sorts M-rows ascending by resident count, fills slot/src while preserving token-major/rank-major traversal and the original within-expert row order, so prefill activation reads coalesce. ADOPT AS AN IDEA ONLY: it is a host-side O(M log M) sort per wave, and intfer's prefill activations are already contiguous per device; intfer is also dense, so the expert-count key has no analogue. MoE-shaped, not general.
 
@@ -41,7 +41,7 @@ Reminder #9 INTFER_KV_KVARN | N/A | per-group variance-normalized KV quantizatio
 
 https://github.com/Neroued/ninfer # project origin — port ninfer to local 2×B580 setup; 27B TP=2 is the perf target
 https://github.com/jitllm/jitllm
-https://github.com/gufo-org/gufo
+https://github.com/gufo-org/gufo # gufo.txt — single-GPU HIP/ROCm engine survey (2026-10-21): every HIP kernel blocked by the DashQ INT2 weight-format wall AND no-P2P (gufo is single-GPU too, so the two trees share that constraint rather than solving each other's); only host-side scheduling transfers, no code copied. Three candidates: the adaptive draft-length controller is INFORMED-FROM-SCRATCH and partly SHIPPED as INTFER_SPEC_ADAPT (the per-cohort relative-cost tables are not); prefix-cache divergence-point learning is an open gap (effort S); the batched DFlash2 selector half is already shipped, its scratch-reserve half is a knob, not a kernel
 https://github.com/ashhart/TensorFold
 https://github.com/doopeworld/GRIMOIRE # harness survey (2026-10-15): refused — GPL-3.0 pattern citation only, wall-clock decision instrument retired, no kernel ports transferable
 https://github.com/SearchSavior/Arcaine
@@ -186,3 +186,79 @@ child died on the residue assertion), NOT by a replication, and produced
 [SUPERSEDED 2026-10-18 subject now 8deaec05f8d389a15b6de79a15b2dcfb7b3ebcb15ed05f7d6846c708469aa536] 23107030085f33d35a7e2d19a549010ef616448e5572a33aac43c5872cfd5bb9 ~> deb505bd56bd5d7422ddeb08c0c01b9387a4d87e1d0ef26a5f0766b663410422. The plant was removed
 53e0ed8c2494281485052927b646f3d424aaaedd5c0d31caebebb8522aae0b3c -> 9ae9951b28660246064135e1310a2430dfa7714d1eb5d239304dc84b97c221a6   REGEN(bash scripts/mutate_knob_sweep_contract.sh).
 [REPLACED 2026-10-19 subject now 53e0ed8c2494281485052927b646f3d424aaaedd5c0d31caebebb8522aae0b3c] the knob_sweep.sh default model path changed (repo-relative path -> on-disk v2 artifact), so the live subject sha moved. The previous pair 8deaec05... -> 2dcd24... (abridged here) had a BEFORE sha that is no longer the sha of any file in scripts/; per p_pair_before it was removed rather than kept as a stale record. Re-measured by the harness's planted-copy mechanism (residue plant appended to a copy of the LIVE subject, child died on the residue assertion). The plant was removed and its absence asserted afterwards.
+
+## PULSARLM UPSTREAM SURVEY — pipe-delimited record (2026-10-20)
+# Format: NAME | upstream file:line | what it does | intfer seam | round trips/launches removed | weight-format wall? no-P2P? | effort | already shipped?
+# Backend: CUDA-only (sm_89/sm_120). No SYCL, HIP, or Vulkan kernels. Porting any candidate requires a full backend rewrite, not a micro-optimisation.
+PulsarLM attention-mass kernel (paged_attention.cu:270-292) | paged_attention.cu:270-292 | fused paged attention with softmax inside the kernel | none (intfer attention is host-side FP32 per-row causal) | 0 (rejected) | CUDA-only; no P2P analogue | N/A (backend wall) | no (rejected)
+PulsarLM prefill flash attention (paged_prefill.cuh:322-360) | paged_prefill.cuh:322-360 | flash attention prefill with paged KV | none (intfer prefill is host-side FP32 per-row causal) | 0 (rejected) | CUDA-only; no P2P analogue | N/A (backend wall) | no (rejected)
+PulsarLM eviction policy (eviction.cpp:48-92, eviction.hpp:14-46) | eviction.cpp:48-92, eviction.hpp:14-46 | LRU + frequency-based page eviction for paged KV | none (intfer KV is full contiguous per rank) | 0 (rejected) | CUDA-only; no P2P analogue | N/A (backend wall) | no (rejected)
+PulsarLM pinned-host LRU (host_page_pool.hpp:14-46) | host_page_pool.hpp:14-46 | pinned host page pool with LRU for async page copies | none (intfer has no paged KV, no async page copy) | 0 (rejected) | CUDA-only; no P2P analogue | N/A (backend wall) | no (rejected)
+PulsarLM KV cache page copy (page_copy.cu:14-40) | page_copy.cu:14-40 | async H2D/D2H page copies for paged KV | none (intfer KV is full contiguous, no page copies) | 0 (rejected) | CUDA-only; no P2P analogue | N/A (backend wall) | no (rejected)
+PulsarLM snapshot/resume (kv_cache.cpp:392-430) | kv_cache.cpp:392-430 | KV cache snapshot + resume for speculative decoding | none (intfer has no speculative decoding machinery) | 0 (rejected) | CUDA-only; no P2P analogue | N/A (backend wall) | no (rejected)
+PulsarLM flash attention demo (flash_attention.hpp:9-25) | flash_attention.hpp:9-25 | flash attention kernel (demo only, not used in production paths) | none (intfer uses host-side causal attention) | 0 (rejected) | CUDA-only; no P2P analogue | N/A (backend wall) | no (rejected)
+
+## PULSARLM RE-SURVEY 2026-10-21 — REJECTED-WITH-REASON, corroborated, and the four near-misses named
+
+**The verdict is UNCHANGED and it is now corroborated rather than asserted.** The 2026-10-20 record
+above rejected every candidate on the CUDA-only backend wall, and that remains correct and
+load-bearing: `pulsarlm-core/xmake.lua:13` (`sm_89,sm_120`), `README.md:71` (CUDA 13, driver >= 580),
+11 `.cu` files with `ATen/cuda` / `cudaMemcpyAsync`, and zero SYCL/HIP/Vulkan anywhere in the tree.
+A re-survey is not redundant when the original reason was a single property and the question was
+whether some candidate survived on a SECOND one.
+
+**The premise was re-derived from intfer's own tree, not assumed, because every rejection above
+hangs on it.** intfer has no device softmax-attention kernel on any inference path:
+`include/intfer/attention/flash_attention.hpp:9-25` states the two FlashAttention kernels are
+demo/reference-only; `engine.cpp:32` is a bare `#include` with zero calls; the only call sites are
+`examples/flash_attention_demo/main.cpp:117,130,174,203` and `examples/qwen_forward_gpu/main.cpp:227`.
+The 27B decodes through the GDN SSM recurrence, and the `is_full` softmax decode is HOST scalar
+(`main.cpp:4948-4970`, plus the prefill per-row causal loop at `main.cpp:6462+` with running-max
+arrays). KV is host FP32 `std::vector` (`main.cpp:4225`) with opt-in INT8 and Q8 mirrors
+(`main.cpp:4227-4240`). So there is no device seam to attach any paged-attention kernel to.
+
+**FOUR NEAR-MISSES, each rejected for its own measured reason rather than deferred.** These are the
+rows the single-property rejection hid, and each names why the candidate LOOKED transferable:
+
+* **Fused per-page attention mass** (`paged_attention.cu:292-312` `accumulate_group_mass`, and
+  `paged_prefill.cuh:322-360` "Pass 2: recompute QK^T and accumulate per-key mass"). Rejected on
+  three independent grounds: (i) intfer has no device attention kernel to add the accumulator to, so
+  "one pass computing both the softmax output and the mass" would first require WRITING a device
+  paged-attention kernel -- a new kernel, not a port; (ii) the mass exists to drive page eviction,
+  and intfer's KV is host-resident with a hard cap and no eviction policy, so the signal has no
+  consumer; (iii) it is arithmetic-only, removing no round trip and no launch, so it fails the
+  standing fusion test on both counts. Effort: large.
+* **Bounded-context eviction** (`eviction.hpp:14-46` `struct eviction_policy`,
+  `eviction.cpp:48-92` `pages_to_evict`: per-page EMA density age-corrected by the EMA weight of the
+  queries at or after a page's first key, evicting below the bar `tau/(1-tau)` sets, always keeping
+  `n_sink` plus `n_working`). Rejected: intfer's `INTFER_KV_CAP` is a hard abort
+  (`main.cpp:4431-4436`) rather than an eviction, and `PrefixCache` (`main.cpp:9032+`) already solves
+  the bounded-context problem by snapshotting completed requests to host and resuming. This is a
+  different mechanism, not an optimisation of the shipped one. Effort: large.
+* **Pinned-host LRU state pool** (`host_page_pool.hpp:14-46`, `kv_cache.cpp:392-430`,
+  `page_copy.cu:14-40` `copy_segments_kernel` with a 16-byte vectorised path). Rejected: it moves the
+  OPPOSITE direction to the standing objective, because intfer's KV is already host-resident and the
+  goal is to REMOVE host-device round trips, not add a pinned tier. The one transferable sub-idea --
+  vectorised 16-byte segment copies -- is already intfer's mechanism (`engine.cpp:1164-1166`, "one
+  wide memcpy, not scalar half-stores into malloc_shared"), and `malloc_host` appears NOWHERE in
+  `src/` or `include/`. Effort: medium.
+* **Snapshot/resume of context** (`pulsarlm/store.py`, 305 lines, plus `checkpoint.py`, 197 lines:
+  page-hash-chained states in an external store with a pinned-host LRU). Rejected as ALREADY SHIPPED
+  under a different name: intfer's `PrefixCache` (`main.cpp:9032-9140`) is a multi-entry LRU with
+  per-layer KV and INT8/Q8 mirrors and SSM/conv recurrent-grid snapshots, kill-switched by
+  `INTFER_NO_PREFIX_CACHE`. Porting the second one would be the two-flags-naming-one-design defect.
+
+**ONE SUB-QUESTION LEFT OPEN, recorded rather than closed by guessing.** Whether intfer's readbacks
+are shared-USM host reads or DMA into pageable buffers, which would decide whether pinning the
+H2D/H2H staging buffers is a transfer-speed candidate at all. The `engine.cpp:1330-1420` read that
+settles it was issued and returned during the survey but never processed. It is WEAK regardless --
+pinning removes no round trip and no launch, so it fails the fusion test on both counts -- which is
+why it is recorded as a leftover rather than as work.
+
+**FRAMING CORRECTION, annotated rather than rewritten, because the row above is a true record of
+what was measured then.** Two of the pipe rows under-state the seam in a way the re-survey can now
+name: the eviction row says intfer's KV is "full contiguous per rank" where the precise fact is that
+it carries a hard-cap abort and a prefix cache instead of an eviction policy; the snapshot/resume
+row says intfer has "no speculative decoding machinery" where the accurate analogue is the shipped
+`PrefixCache`. Neither correction changes a verdict; both change what a future session would
+re-derive them from.
