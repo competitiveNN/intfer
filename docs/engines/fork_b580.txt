@@ -1,0 +1,4 @@
+# llama.cpp FORK_B580 (Torchit1) -- the B580 PTQ1_0 ternary fork summary
+# https://github.com/Torchit1/llama.cpp -- docs/FORK_B580_SUMMARY.md; full survey in AGENTS.md.
+
+https://github.com/Torchit1/llama.cpp # ./docs/FORK_B580_SUMMARY.md  (sec.5 GGML_SYCL_CONV_CHAIN -> intfer la_conv_prep; the un-taken half is >1 work-item = INTFER_LA_CONV_PREP_WG)

@@ -1,0 +1,4 @@
+# beellama.cpp (Anbeeld) -- KVarN variance-normalized KV cache
+# https://github.com/Anbeeld/beellama.cpp -- history of the review of this source (dated).
+
+https://github.com/Anbeeld/beellama.cpp # KVarN (2026-10-16): common/fit-kvarn-tail.{h,cpp} (retry-state only, REPEATED_CANDIDATE/ACCEPT/RETRY verdicts) + src/llama-kvarn.{h,cpp} + ggml/src/ggml-cuda/{kvarn,fattn-kvarn-*}.cu{h} + ggml-vulkan kv-shaders + src/llama-kv-cache-kvarn. DECLINED: the KVarN KV record layout (token_group=128 packed bits + Hadamard + sinkhorn quant) requires re-laying every DashQ weight (same wall as mmvq/vllm-int4); the CUDA/Vulkan attention kernels target a paged-KV + native-mask backend intfer does not run on B580; the fit-tail is a host retry-state with no kernel consumer. NO port.

@@ -1,0 +1,5 @@
+# llama.cpp (ggml-org) -- ggml-sycl SYCL/Xe kernels
+# https://github.com/ggml-org/llama.cpp -- the full survey history lives in AGENTS.md
+# ("Upstream-port survey" rounds 1-11); this file records the engines_sources.txt finding.
+
+https://github.com/ggml-org/llama.cpp # norm.cpp sub-group-per-row GEOMETRY -> INTFER_LA_CONV_PREP_WG (butterfly NOT taken)

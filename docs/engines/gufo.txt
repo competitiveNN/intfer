@@ -1,0 +1,188 @@
+# gufo (gufo-org) -- single-GPU HIP/ROCm LLM engine (Flash-Next / qwen3.8 models)
+# https://github.com/gufo-org/gufo -- history of the review of this source (dated).
+# Survey 2026-10-21, clone at /var/home/fra/dev/intfer-upstream/gufo, read-only.
+# Verdict: every HIP kernel is blocked by the DashQ INT2 weight-format wall and by
+# no-P2P (gufo is single-GPU too, so it has no P2P either -- the two trees share
+# that constraint rather than solving each other's). Only HOST-SIDE SCHEDULING
+# knowledge transfers. Three candidates recorded: one informed-from-scratch and
+# ALREADY SHIPPED in this tree, two informed-from-scratch and open. No code copied.
+
+## pipe-delimited record (2026-10-21)
+# Format: NAME | upstream file:line | what it does | intfer seam | round trips/launches removed | weight-format wall? no-P2P? | effort | already shipped?
+DFlash2 adaptive draft-length controller | src/models/qwen/dflash_policy.hpp:37-121,220-251 | per-request geometric acceptance model (mean_/last_full_width_) updated by Observe(); Choose() maximises expected_emitted_tokens/cost over width 1..cap using offline-measured per-cohort relative-cost tables (kQ4RelativeCost, kQ4PairedRelativeCost, kQ4FourRequest/KQ4SixRequest/KQ4EightRequest/Q8 variants) plus a context-scaled attention term (context_scale * context_multiplier, kQ4ContextCost) | engine scheduling / speculative verify: examples/intfer_cli/main.cpp:11188-11250 (SpecAdapt), read at 11580-11583 | 0 launches (host-side policy; it removes wasted VERIFY work -- rejected drafts -- not a round trip) | no weight-format wall (host-side); no P2P | S | YES -- SHIPPED as INTFER_SPEC_ADAPT, but only the 1-D accept-EMA half; the per-cohort relative-cost tables are NOT shipped
+Prefix-cache divergence-point learning | docs/KV-CACHE.md:209-236 (learned divergence points), :143-182 (leader/follower) | beyond fixed grid checkpoints, learn the actual divergence point between two prompts: on a miss with >=512 newly shared tokens stop prefill there and retain an extra checkpoint; a cold request sharing a long prefix with a resident prefilling request PARKS and is admitted when the leader publishes a checkpoint at N | prefix cache: main.cpp:6098-6134 (pc_note_row grid harvest), 9254-9479 (PrefixCache LRU) | 0 (host-side bookkeeping; removes redundant PREFILL of shared prefixes across different requests, not a device round trip) | no weight-format wall (host-side); no P2P | S | no (gap -- the two mechanisms gufo has and intfer does not are named below)
+Batched DFlash2 selector + FFN-scratch reserve | docs/models/qwen3.8-27b/EXPERIMENTS.md:60; src/models/qwen38_flash_next/kernels/rocm/executor.cpp:180-262 | during a saturated speculative cycle gufo runs the draft selector in two launches instead of 56 and reuses FFN scratch; separate from that, the snapshot allocator keeps a bounded spare-block reserve (kSpareBlocks=2, SpareBytes) and a device slack (kSnapshotDeviceSlackBytes = 512 MiB, "bounded spare block a checkpoint must not consume") that a commit must not consume (Fits() keeps reserve_ free) | main.cpp:11590-11600 (the K+1 verify rows already batched into one prefill_layer_outer call) | 0 launches on the batching half (already shipped); the scratch-reserve half is a KNOB, not a kernel, so it removes nothing and adds nothing | no weight-format wall (host-side accounting); no P2P | S | batching half YES (shipped); scratch reserve NO -- suggest INTFER_SPEC_SCRATCH_RESERVE
+Near-miss in-kernel Q/K l2norm | sgl-kernel-xpu chunk_gated_delta_rule (surveyed via intfer's own sgl round) | in-kernel normalisation of q/k via reduce_over_group | none | 0 | N/A | N/A | no -- ALREADY FALSIFIED in this repo: docs/upstream_sgl_survey.md:20,82 ("in-kernel l2norm fails fusion test": intfer's Q/K normaliser is host-side and qn_rows/kn_rows are already device USM, so porting would ADD an H2D and remove a host kernel that touches no device memory)
+Near-miss MoE gate+up fused epilogue | (sgl-kernel-xpu moe_grouped_mm_nt_xe20 fuse_act) | silu(gate)*up inside the GEMM kernel | quant_gemm_forward_usm_gateup + silumul_to_half | 0 | N/A | N/A | no -- ALREADY SHIPPED (Engine::run_mlp_gateup, engine.cpp:2052; the fusion call is engine.cpp:1960, the kernel itself quant_gemm.cpp:4209); a second flag naming it is the two-flags-naming-one-design defect
+Near-miss component-level KV cache redesign | docs/models/qwen3.8-flash-next/ (RFC) | componentised KV layout | none | 0 | N/A | N/A | no -- RFC scoped to Flash-Next's own model, not applicable to intfer's 27B GQA + GDN layer kinds
+Near-miss huge-page / pinned weights | docs/models/qwen3.8-flash-next/EXPERIMENTS.md:18 | registered huge-page storage and coherent/noncoherent pinned weights | none | 0 | N/A | N/A | no -- REJECTED UPSTREAM TOO (:18 "did not improve decode"), and intfer's own q.prefetch() was reverted as a no-op for shared USM on this driver (AGENTS.md "First-touch migration is real and one-shot")
+Near-miss host-side no-upload dedup | (INTFER_WAVE_ALIAS analogue) | alias an un-rotated wave input instead of memcpying into per-item scratch | INTFER_WAVE_ALIAS | 0 | N/A | N/A | no -- ALREADY SHIPPED (pointer-identity dedup in Engine::run_linear_wave; see the flag inventory for the line, which is not re-derived here)
+Near-miss INTFER_MLP_PARTIAL_DOWN / INTFER_LA_OUT_TP2 | (intfer's own TP=2 seams) | two-kernel K-split down-projection; chained SSM+norm+la_out at TP=2 | intfer only | 0 | N/A; no P2P | N/A | no gufo analogue -- gufo is single-GPU with no P2P either, so neither seam has an upstream counterpart to compare against
+
+
+## 1. DFlash2 adaptive draft-length controller -- INFORMED-FROM-SCRATCH, and the SHIPPED half is already in this tree
+
+Upstream mechanism, read from the source: `DFlashLengthController` keeps a
+per-request geometric acceptance model. `Observe(accepted, drafted)`
+(dflash_policy.hpp:220-235) updates `mean_` with censoring-aware increments (a
+completed block adds 0.25*accepted, an incomplete one decays 0.75*mean_ +
+0.25*accepted) and records `last_full_width_` so a saturated request keeps
+probing the widest profitable block. `Choose(budget, position, greedy_batch_size)`
+(dflash_policy.hpp:49-121) maximises expected emitted tokens per unit of cost over
+width 1..cap, using the survival product `survival *= probability` (:107-108) and
+`score = expected_tokens / cost` (:114), where the cost is an OFFLINE-MEASURED
+per-cohort relative cost table selected by batch size (:78-100) plus a
+context-scaled attention term (:74-75, :105-113). The measured tables are stated in
+the file, not inferred: "Q8 C2 complete cycles cost 158/161/161/172/178/211/187 ms"
+(dflash_policy.hpp:254-257).
+
+intfer's seam and what it already ships, re-derived from the tree rather than
+assumed: `SpecAdapt` (main.cpp:11205-11245) carries the SAME objective --
+`int choose(int cap, const std::vector<float>& producer_scores)` maximises
+`expected / cost` with `expected = w * accept_ema` and `cost = w + 1`
+(main.cpp:11215-11236) -- and its own header comment names gufo as the source
+(main.cpp:11188: "INTFER_SPEC_ADAPT=1 (gufo's dflash_policy.hpp)"). `observe(
+accepted, tried)` is an EMA with 0.05/0.95 clamps (main.cpp:11238-11244), and the
+verify loop reads it at main.cpp:11580-11583 with the cost model stated as measured
+("intfer's verify is exactly an M=K+1 batched prefill, so the cost model is
+measured, not assumed", main.cpp:1192-1194). So this candidate is NOT open work:
+recording it as pending would be a claim the tree already refutes.
+
+What is genuinely NOT shipped is the COHORT half: intfer's cost is a flat
+`w + 1`, whereas gufo's is a per-batch-size measured table plus the
+context-scaled attention term. That half is worth an operator A/B, not a port:
+intfer's verify cost is dominated by one batched M=K+1 prefill (its draft rows are
+free n-gram tokens), so the projection-cost jump a cohort table exists to model
+does not have the same shape here.
+
+Round trips/launches removed: 0 -- it is pure policy, and it reduces wasted
+verify work (rejected drafts), not a round trip or a launch. Numerics: none
+needed, because a policy picks HOW MANY drafts, never WHICH tokens, so greedy
+output parity is preserved by construction (the same argument intfer's own
+`INTFER_SPEC_ADAPT` header makes at main.cpp:1196-1200). No P2P and no
+weight-format wall: the mechanism is host-side arithmetic over counts.
+
+
+## 2. Prefix-cache divergence-point learning -- INFORMED-FROM-SCRATCH, an OPEN gap
+
+Upstream mechanism: gufo's grid checkpoints sit at fixed positions, so a second
+conversation restores only the last grid point inside the shared prefix and
+prefills the rest again -- its own worked example is a shared 4,500-token prefix
+whose grid lands at 2,048, leaving 2,450 shared tokens re-prefilled
+(docs/KV-CACHE.md:211-222). The fix is to compare an arriving request against every
+retained checkpoint and live frontier, and when the longest common prefix adds at
+least 512 tokens to what the request can already restore, stop prefill there and
+retain an extra checkpoint at that position, held with the priority of a stable
+boundary so it is not evicted as an optional copy (docs/KV-CACHE.md:224-236). The
+second mechanism is temporal rather than spatial: a cold request that shares a long
+prefix with a request already prefilling it waits for that one, holds no session
+meanwhile, and is admitted once the leader publishes a checkpoint at the shared
+position (docs/KV-CACHE.md:143-182).
+
+intfer's seam and what it lacks, verified against source: intfer harvests SSM grid
+snapshots only at `INTFER_PCACHE_K` multiples (default 16, clamped 1..1024 --
+main.cpp:6103-6108) and only for non-full-attention layers (`if(ly.is_full) return;`
+at main.cpp:6111, because full-attention KV truncates freely by absolute position),
+then bounds transient memory by keeping the lowest `keep_lo`=4 and highest
+`keep_hi`=12 positions and evicting the middle (main.cpp:6119-6133). The LRU itself
+(main.cpp:9254-9479) matches on a plain longest common token prefix capped at the
+entry's `state_len` (main.cpp:9383-9386) and installs from the largest grid position
+<= the hit (main.cpp:9412-9417). There is NO divergence-point learning -- nothing
+records token 4,500 because a second prompt showed the two differ -- and no
+leader-publishes/follower-waits mechanism at all.
+
+Why it is worth doing here specifically: intfer's SSM state is small (see the
+model-level knowledge below), so extra checkpoints are affordable, and the win is
+confined to the host: it removes redundant prefill of shared prefixes across
+DIFFERENT requests and touches no device round trip. Effort S. Numerics: none --
+it changes which positions carry a snapshot, and the recurrent state at a given
+position is byte-identical however it was harvested.
+
+
+## 3. Batched DFlash2 selector + FFN-scratch reserve -- one half SHIPPED, one half a KNOB
+
+The batching half is already in this tree, verified: intfer assembles the prompt
+row plus every draft row and runs them through ONE `prefill_layer_outer` call with
+M = K+1 -- `toks` gets `token` then every draft (main.cpp:11590-11592),
+`Hv.assign((size_t)(K+1)*cfg.H, 0.f)` (main.cpp:11593), and the call itself is
+main.cpp:11599-11600. So gufo's "two launches instead of 56 per saturated C4 cycle"
+(docs/models/qwen3.8-27b/EXPERIMENTS.md:60) has nothing to add here: the 56-launch
+problem does not exist in intfer's verify path.
+
+The half that does NOT exist is the explicit scratch-reserve accounting. gufo's
+snapshot allocator keeps a bounded spare-block reserve
+(`kSpareBlocks = 2`, `SpareBytes(block) = kSpareBlocks * block`, at
+src/models/qwen38_flash_next/kernels/rocm/executor.cpp:201,248-250) and a device
+slack that storage must never grow into
+(`kSnapshotDeviceSlackBytes = 512ULL << 20`, with the comment "Device memory kept
+free beyond the executor's own lazy scratch, for the runtime and driver. Snapshot
+storage never grows into it", executor.cpp:180-182); every commit is admitted only
+if `Fits(bytes)` holds, which requires `free >= bytes && free - bytes >= reserve_`
+(executor.cpp:255-261). The failure it prevents is a long speculative cycle that
+OOMs mid-verify, which intfer has no guard against: its verify state is host
+`std::vector` growth (Hv at main.cpp:11593, spec_rows snapshots at 11595) and its
+device path has no equivalent reserve.
+
+Recommendation recorded as a KNOB, not a kernel: `INTFER_SPEC_SCRATCH_RESERVE`,
+an operator-set bound the verify path checks before entering a wide round. It
+removes no round trip and adds no launch, so it cannot be decided on `nk`/`nw`/`nr`
+-- it is a robustness change whose value is "does not abort mid-verify on a 12 GiB
+card", which is an operator measurement. Effort S. No numerics contract.
+
+
+## MODEL-LEVEL KNOWLEDGE (confirmed against source; no code to port)
+
+- Layer-kind structure: `full_attention_interval` decides full-attention versus
+  GatedDeltaNet by position, and the two kinds carry DISJOINT weight sets --
+  attn_q/k/v/output(+q_norm/k_norm) for a full layer, attn_qkv/gate/ssm_a/ssm_conv1d/
+  ssm_dt/ssm_alpha/ssm_beta/ssm_norm/ssm_out for a GDN one (weights.cpp:190-244),
+  with the layer-kind expectation asserted per layer at weights.cpp:250-260
+  ("Unexpected Qwen layer kind at blk.N"). This CONFIRMS intfer's `ly.is_full`
+  dispatch is already correct -- those sites are main.cpp:6339/6349 (full-attn branch
+  closes, GDN branch opens, in prefill_layer_outer) and main.cpp:11639 (the spec
+  restore's per-kind state rebuild). No change warranted.
+- GDN state is TINY, so the SSM is launch/transfer-bound, not bandwidth-bound. The
+  size is derived from v_heads x head_dim^2 plus the conv history:
+  `recurrent = ssm_num_v_heads * ssm_head_dim * ssm_head_dim` and
+  `conv = (ssm_conv_kernel - 1) * SsmConvChannels()`
+  (src/models/qwen38_flash_next/kernels/rocm/executor.cpp:807-809), with the retained
+  model's figure tabulated as "GDN recurrent matrix | private f32, per linear layer |
+  3,145,728/layer" (docs/models/qwen3.8-flash-next/CONTINUATION-ADAPTER.md:22) against
+  24,576 bytes per target token of attention K/V on the same table (:18). This
+  independently corroborates intfer's INTFER_SSM_FUSE decision: when the state is
+  ~3 MB per layer class, the recurrence's cost is submits and transfers, which is
+  exactly what the 2-pass fold buys, and the decision rests on `nk`/`nw`/`nr`.
+- gufo's own rejected byte-exact micro-optimisations corroborate the PARAMOUNT
+  DIRECTIVE from the other side: its experiments table rejects a long list of
+  register/LDS/scheduling micro-opts that were byte-exact but slower --
+  "Sixteen-row Q5 row-first FMA operand schedules" and "Compact sixteen-row Q5
+  staging and register activation sums" (docs/models/qwen3.8-27b/EXPERIMENTS.md:54,59),
+  and "Non-temporal paired expert-code loads"
+  (docs/models/qwen3.8-flash-next/EXPERIMENTS.md:102)
+  -- and RETAINS the launch-count ones ("Skip unused SSM activation copies and
+  routed-row clears | Retained: 96 fewer launches per pp2048",
+  docs/models/qwen3.8-flash-next/EXPERIMENTS.md:9). Fusion and launch reduction,
+  not arithmetic, is the direction in both trees.
+- COMPILER-ARTEFACT LESSON, worth carrying as a standing rule: a regression that
+  was NOT a code change but a compiler's register allocation was caught by measuring
+  emitted resources, not tok/s. gufo's "Clang 23 prefill GEMM spills | Retained: a
+  `sched_barrier` fence per K block in BK=2 W8A8 tiles, no K-block unroll in BK=4
+  tiles, SLP off for the two K-quant units. Clang 23 (ROCm 10.0) Q8 pp2048 291 ->
+  464, pp64 112 -> 308, Q4 pp64 230 -> 335 ... Greedy output and prefill validation
+  are byte-identical. Clang 22: pp2048 and decode do not change, 16-64 token prefill
+  is 1.2-1.7% slower." (docs/models/qwen3.8-27b/EXPERIMENTS.md:103). The same family
+  shows up as "clang 23's address-selected private cache (80 B, 0 spills)" in the
+  flash-next table (:95). A   byte-identical-output slowdown with a compiler-version boundary is a BUILD
+  ARTEFACT, not a code fault, and the instrument that sees it is a resource
+  counter, which is the load-insensitive class this repo's own counters belong to.
+
+## CONCLUSION
+
+Nothing ports as code. The HIP kernels are blocked by the DashQ INT2
+weight-format wall and by no-P2P (which gufo shares), and the candidate that looked
+newest -- the adaptive draft-length controller -- is already shipped here as
+INTFER_SPEC_ADAPT, so the honest record is a gap in ONE half of it (the per-cohort
+cost table) rather than an unimplemented whole. The two open items are host-side
+and cheap: learn the prefix-cache divergence point (effort S), and add an explicit
+speculative-scratch reserve (effort S). Both are decided by operator runs, neither
+by a tok/s.

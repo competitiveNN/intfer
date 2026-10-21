@@ -1,0 +1,4 @@
+# sgl-kernel-xpu -- FMHA/MLA Cutlass attention, fused elementwise, MoE w4a16
+# https://github.com/sgl-project/sgl-kernel-xpu -- history of the review of this source (dated).
+
+https://github.com/sgl-project/sgl-kernel-xpu # FMHA/MLA Cutlass attention + fused elementwise + MoE w4a16 (2026-10-13/14): all candidates falsified — wrong ops for intfer, adds H2D, expert grid intfer lacks

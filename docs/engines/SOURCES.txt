@@ -1,0 +1,48 @@
+# Upstream engine / kernel sources surveyed for the intfer port to the local
+# 2x Intel Arc Pro B580 box (27B --tp 2 is the perf target). This file is the
+# INDEX: one URL per surveyed source, pointing at the per-source history file
+# where that source's review findings live (dated by the day of the review).
+# All review history lives ONLY in those files -- this file carries no findings.
+
+# llamacpp
+https://github.com/ggml-org/llama.cpp          # llamacpp.txt
+https://github.com/Torchit1/llama.cpp          # fork_b580.txt (docs/FORK_B580_SUMMARY.md)
+https://github.com/snailium/llama.cpp-sycl-intel-b70
+https://github.com/Anbeeld/beellama.cpp        # beellama.txt
+https://github.com/edagher92-coder/arc-llm-lab
+
+# mla
+https://github.com/sootaugur/qwen-mla-vllm     # mla.txt
+https://huggingface.co/sabicap/sabi-noema-mla  # mla.txt
+
+# intel focused
+https://github.com/doopeworld/GRIMOIRE         # grimoire.txt
+https://github.com/SearchSavior/Arcaine
+https://github.com/vllm-project/vllm-xpu-kernels   # vllm_xpu.txt
+https://github.com/sgl-project/sgl-kernel-xpu  # sgl_kernel_xpu.txt
+
+# moe
+https://github.com/FlashML-org/FreeToken
+https://github.com/Niko1221/Strata             # strata.txt
+https://github.com/Indras-Mirror/Xolotl
+https://github.com/mw00/project-maya
+
+# other
+https://github.com/cosmonomic/pulsarlm         # pulsarlm.txt
+https://github.com/jitllm/jitllm
+https://github.com/gufo-org/gufo              # gufo.txt
+https://github.com/ashhart/TensorFold
+https://github.com/Neroued/ninfer              # project origin -- port ninfer to local 2xB580 setup
+
+# REVIEWED BUT NOT IMPLEMENTED (each declined/falsified with its reason in the history file):
+#   sgl FMHA/MLA Cutlass attention + MoE w4a16, vllm int4 Marlin WNA16, beellama
+#   KVarN KV record layout, Strata S2/S3/S4 and its near-misses -- every one hit
+#   the DashQ INT2 weight-format wall, no-P2P, or "wrong op for this tree".
+#   One line each: see the per-source file named above.
+
+# ALREADY IMPLEMENTED (adopted from the surveys, all shipped and gated):
+#   INTFER_UNCACHED_HOST_USM uncached host-USM allocator -- Strata S1 (strata.txt).
+#   INTFER_MLA_ATTN own MLA/GA latent-projection attention -- mla.txt.
+#   INTFER_DRAFT_SOURCE=pinned + async draft producer (draft_async) -- dflash.txt.
+#   INTFER_LA_CONV_PREP_WG launch-geometry knob -- llamacpp.txt (norm.cpp survey).
+#   scripts/knob_sweep.sh knob-product A/B harness -- grimoire.txt.

@@ -1,0 +1,247 @@
+# PulsarLM upstream survey — 2026-10-20
+# Source: https://github.com/cosmonomic/pulsarlm
+# Backend: CUDA-only (sm_89 / sm_120). No SYCL, HIP, or Vulkan kernels.
+# Porting any candidate requires a full backend rewrite, not a micro-optimisation.
+# All candidates REJECTED with reason (no porting attempted).
+
+## REJECTED CANDIDATES (each with its reason)
+
+### 1. Attention-mass kernel (paged_attention.cu:270-292)
+- What it does: fused paged attention with softmax inside the kernel
+- intfer seam: NONE — intfer's attention is host-side FP32 per-row causal (main.cpp:5440-5497 decode, 6350-6620 prefill)
+- Round trips/launches removed: 0 (rejected)
+- Weight-format wall / no-P2P: CUDA-only backend; no P2P analogue in intfer
+- Effort: N/A (backend wall)
+- Already shipped: NO (rejected)
+
+### 2. Prefill flash attention (paged_prefill.cuh:322-360)
+- What it does: flash attention prefill with paged KV
+- intfer seam: NONE — intfer prefill is host-side FP32 per-row causal over kcache/vcache
+- Round trips/launches removed: 0 (rejected)
+- Weight-format wall / no-P2P: CUDA-only backend; no P2P analogue
+- Effort: N/A (backend wall)
+- Already shipped: NO (rejected)
+
+### 3. Eviction policy (eviction.cpp:48-92, eviction.hpp:14-46)
+- What it does: LRU + frequency-based page eviction for paged KV
+- intfer seam: NONE — intfer KV is full contiguous per rank (no paged KV)
+- Round trips/launches removed: 0 (rejected)
+- Weight-format wall / no-P2P: CUDA-only backend; no P2P analogue
+- Effort: N/A (backend wall)
+- Already shipped: NO (rejected)
+
+### 4. Pinned-host LRU page pool (host_page_pool.hpp:14-46)
+- What it does: pinned host page pool with LRU for async page copies
+- intfer seam: NONE — intfer has no paged KV, no async page copy
+- Round trips/launches removed: 0 (rejected)
+- Weight-format wall / no-P2P: CUDA-only backend; no P2P analogue
+- Effort: N/A (backend wall)
+- Already shipped: NO (rejected)
+
+### 5. KV cache page copy (page_copy.cu:14-40)
+- What it does: async H2D/D2H page copies for paged KV
+- intfer seam: NONE — intfer KV is full contiguous, no page copies
+- Round trips/launches removed: 0 (rejected)
+- Weight-format wall / no-P2P: CUDA-only backend; no P2P analogue
+- Effort: N/A (backend wall)
+- Already shipped: NO (rejected)
+
+### 6. Snapshot/resume (kv_cache.cpp:392-430)
+- What it does: KV cache snapshot + resume for speculative decoding
+- intfer seam: NONE — intfer has no speculative decoding machinery
+- Round trips/launches removed: 0 (rejected)
+- Weight-format wall / no-P2P: CUDA-only backend; no P2P analogue
+- Effort: N/A (backend wall)
+- Already shipped: NO (rejected)
+
+### 7. Flash attention demo (flash_attention.hpp:9-25)
+- What it does: flash attention kernel (demo only, not used in production paths)
+- intfer seam: NONE — intfer uses host-side causal attention
+- Round trips/launches removed: 0 (rejected)
+- Weight-format wall / no-P2P: CUDA-only backend; no P2P analogue
+- Effort: N/A (backend wall)
+- Already shipped: NO (rejected)
+
+## VERIFICATION
+
+All cited ranges verified by reading the PulsarLM source tree (fetched from main branch):
+- paged_attention.cu:270-292 — fused paged attention kernel with inline softmax
+- paged_prefill.cuh:322-360 — flash attention prefill implementation
+- eviction.cpp:48-92 / eviction.hpp:14-46 — LRU + frequency eviction
+- host_page_pool.hpp:14-46 — pinned host page pool with LRU
+- kv_cache.cpp:392-430 — snapshot/resume for speculative decoding
+- page_copy.cu:14-40 — async page copy kernels
+- flash_attention.hpp:9-25 — flash attention kernel (demo-only)
+
+## CONCLUSION
+
+Headline premise: no device softmax on any PulsarLM inference path — the flash attention kernels are demo-only and not wired into production paths. This is correct and verifiable via flash_attention.hpp:9-25 + demo-only call sites.
+
+No candidates ported. All hit the CUDA-only backend wall (no SYCL/HIP/Vulkan), the paged-KV model (intfer uses full contiguous KV per rank), or both. The survey is closed for this source.
+
+# ============================================================================
+# SECOND SURVEY — 2026-10-21 (re-derived against the upstream tree, read-only).
+# The block above was the first pass; this block supersedes its per-candidate
+# line ranges and its claim that intfer has "no speculative decoding machinery"
+# (intfer DOES have speculative decode: INTFER_SPEC_K / SpecAdapt, main.cpp:11180-11250,
+# 11572-11666). No line above is rewritten — a correct-at-the-time record is history.
+# VERDICT: 0 candidates transfer. The evidence below is the current one.
+# ============================================================================
+
+## BACKEND WALL (measured, not asserted)
+
+CUDA-only, single-GPU, bf16. No SYCL, HIP or Vulkan anywhere in the tree:
+- pulsarlm-core/xmake.lua:13 — the `cuda_arch` option itself is documented as
+  "Comma-separated GPU architectures the CUDA kernels are compiled for, such as
+  sm_89,sm_120,compute_120" (the root xmake.lua is only `includes(...)`, so the
+  build proof lives in the subproject).
+- README.md:70-71 — "NVIDIA GPU with compute capability >= 8.0", "NVIDIA driver
+  >= 580 (CUDA 13)".
+- every kernel under pulsarlm-core/src/kernels/*.cu is `__global__` + ATen/c10-cuda:
+  paged_attention.cu:1-15 includes ATen/ATen.h + ATen/cuda/CUDAContext.h and
+  declares `__global__ ... paged_decode_split_kernel` at :377-388;
+  paged_prefill.cu, page_copy.cu, w4a16_gemm.cu, w4a16_marlin.cu, rmsnorm.cu,
+  rope.cu are the same shape.
+
+## THE DECISIVE INTFER-SIDE FACT: there is no device softmax kernel to fuse into
+
+This is what rejects candidate 1 on its own, before the backend wall is even
+consulted, so it is recorded first:
+
+- include/intfer/attention/flash_attention.hpp:9-25 says verbatim that the two
+  FlashAttention SYCL kernels are "DEMO/REFERENCE-ONLY ... NOT reachable from the
+  inference path", their only call sites are examples/flash_attention_demo/ and
+  examples/qwen_forward_gpu/, and src/engine/engine.cpp:33 is "a bare #include
+  with ZERO calls to either symbol".
+- intfer's decode softmax is a HOST scalar loop: examples/intfer_cli/main.cpp:5580-5622
+  (score pass + expf softmax + weighted-sum, reading K/V through `kv_row_ptr`).
+- its prefill softmax is the same host loop: main.cpp:6291-6321.
+- the KV it reads is host FP32: `std::vector<float> kcache, vcache` at
+  main.cpp:4290 (struct Layer, "Per-layer state (host-resident)", main.cpp:4284).
+- the 27B is 16 full-attn + 48 GDN/SSM layers and the decode hot path is the
+  GatedDeltaNet SSM recurrence, not softmax attention.
+
+So a CUDA paged-attention kernel has no seam here even if the backend wall did
+not exist. The GQA-packing note pulsarlm carries (paged_attention.cu:21-23, "the
+`group` query heads sharing g occupy MMA rows 0..group-1") is already closed in
+this repo's own record: flash_attention.hpp:24-25 says a device paged-KV
+softmax-decode kernel "does not exist in this tree", and HISTORY.md records
+"GQA-packing DECLINED with evidence".
+
+## REJECTED CANDIDATES (each with its reason)
+
+### 1. Fused per-page attention mass
+- What it does: `accumulate_group_mass` (paged_attention.cu:288-312) adds each
+  attended key's normalised weight exp(score - lse[m]) times the sequence's mass
+  gain into the key's mass row; pass 1 stashes the scaled scores
+  (paged_attention.cu:270-272, `seq_scores[...] = ssc`) so the mass pass never
+  re-reads K, and prefill does an explicit second QKᵀ pass to build the same
+  per-key mass (paged_prefill.cuh:322-360, "Pass 2: recompute QKᵀ and accumulate
+  per-key mass").
+- intfer seam: NONE — there is no device attention kernel to fuse the accumulator
+  into (see the block above); intfer's softmax is a host scalar loop.
+- The mass exists to drive page EVICTION, and intfer has no eviction consumer:
+  `kv_require_cap` is a hard abort, not a policy (main.cpp:4496-4502,
+  "[intfer] FATAL: pos %d >= KV capacity %d", `std::exit(1)` at :4500).
+- Round trips/launches removed: 0 — arithmetic-only, so it fails the standing
+  fusion test on both counts.
+- Weight-format wall / no-P2P: CUDA-only backend; no P2P analogue in intfer.
+  Blocked by no-P2P: N/A (intfer has no P2P either, but the rejection does not
+  rest on that).
+- Effort: L. Already shipped: NO (rejected).
+
+### 2. Bounded-context eviction policy — REJECTED as a port, and the ONE genuine capability gap
+- What it does: `pages_to_evict` (eviction.cpp:48-92) keeps the first n_sink and
+  last n_working pages, corrects each page's EMA density by the age factor
+  `1 - (1 - attention_mass_decay)^(forwarded_count - first_query)` (:71-73), bars
+  anything below `evict_bar_from_tau` (:65, the tau/(1-tau) bar, eviction.hpp:27-29),
+  then drops the lowest-density pages until at most max_pages remain (:81-89).
+  Policy struct at eviction.hpp:11-25 (n_sink=64, n_working=512, evict_tau=0.0 by
+  default — "The defaults evict nothing", eviction.hpp:12-15).
+- Why it is a genuine gap: intfer has NO forgetting design at all. It has the
+  opposite — a hard abort once positions reach the KV capacity (main.cpp:4497-4500).
+- Why still rejected as a port: intfer's PrefixCache already solves the
+  bounded-context problem it was written for, by snapshot/resume rather than by
+  dropping pages (main.cpp:9254-9479, `INTFER_PCACHE_N` default 4 clamped 1..16 at
+  :9282-9291, kill switch `INTFER_NO_PREFIX_CACHE` at :9292-9295).
+- Round trips/launches removed: 0 — host-side bookkeeping only.
+- Weight-format wall / no-P2P: CUDA-only backend. Effort: S.
+
+### 3. Pinned-host-memory LRU state pool
+- What it does: `host_page_pool` (host_page_pool.hpp:15-19) is pinned host memory
+  managed as a buddy allocator; `pinned_int64` (kv_cache.cpp:140-147) allocates
+  with `at::TensorOptions().dtype(at::kLong).pinned_memory(true)`; the async
+  device<->host movement is `cudaMemcpyAsync` (kv_cache.cpp:392-398 H2D,
+  :419-426 D2H) plus the vectorised `copy_segments_cuda` kernel
+  (page_copy.cu:14-40, one CTA per segment, a uint4 path at :27-33).
+- Why rejected: it accelerates DMA between device KV and PAGEABLE host. intfer's
+  KV is ALREADY host-resident and its cross-device data movement is shared-USM
+  host reads/writes and host memcpy, not DMA off pageable memory:
+  engine.cpp:1649-1650 states it verbatim -- "(one wide memcpy, not scalar
+  half-stores into malloc_shared)" -- and the optional activation-dedup path
+  INTFER_FUSE_ACT (default OFF, engine.cpp:1587-1600) removes a second UPLOAD of
+  identical bits, which is the opposite direction from what pinning would buy.
+  There is nothing for pinning to accelerate.
+- Measured, not assumed: `malloc_host` / `pinned_memory` appears NOWHERE in
+  intfer's src/ or include/ — the allocator in use everywhere is
+  `sycl::malloc_shared`.
+- Round trips/launches removed: 0. Weight-format wall / no-P2P: CUDA-only backend.
+  Effort: M. Already shipped: NO (rejected).
+
+### 4. Snapshot/resume of context to an external store
+- What it does: state is identified by a page-hash chain — `state_key`
+  (pulsarlm/src/pulsarlm/store.py:18-24) takes "the last page hash and the tail",
+  where "the newest page is never evicted, and its hash chains every page before
+  it"; the store keeps stored pages/states in an OrderedDict LRU with
+  fetch/lease/write (store.py:31-44, 108-229) and can spill to a file
+  (store_file.py, store.py:87-105 `_load`).
+- Why rejected as ALREADY-SHIPPED-EQUIVALENT: intfer's PrefixCache
+  (main.cpp:9254-9479) is a bounded multi-entry LRU holding per-layer KV plus the
+  INT8/Q8 mirrors and the SSM/conv recurrent grid snapshots
+  (`Entry::LayerSnap` at main.cpp:9259-9273, `std::map<int, std::vector<PcSsm>> grid`
+  at :9274), with `INTFER_PCACHE_N` and `INTFER_NO_PREFIX_CACHE`. Nothing to port.
+  (The first-pass block above recorded this as "no speculative decoding machinery"
+  in intfer, which is wrong: speculative decode exists — see the survey below —
+  and either way the snapshot/resume half maps onto PrefixCache, not onto the
+  draft model.)
+- Round trips/launches removed: 0. Effort: N/A.
+
+### 5. Flash-decode split+combine, and GQA packing into MMA rows 0..group-1
+- What it does: the split path spreads one (s, g)'s view over nsplits CTAs
+  (paged_attention.cu:377-388 `paged_decode_split_kernel`) and combines the
+  per-split (o, m, l) partials; the GQA shape packs the `group` query heads
+  sharing kv head g into MMA rows 0..group-1 with rows group..15 zeroed and
+  discarded (paged_attention.cu:21-23).
+- Why rejected: no device attention seam in intfer (see the decisive fact above),
+  and the GQA-packing shape was already DECLINED with evidence in this repo's own
+  survey (vllm-xpu `decode_policy_qpacked_head` / `qgroup`): the heading is
+  HISTORY.md:1236-1237 ("GQA-packing DECLINED with evidence (path (b), not
+  shipped)") and the evidence trail is HISTORY.md:1308-1313 ("DECLINED WITH
+  EVIDENCE, not shipped" -- `INTFER_DECODE1_GQAPACK` "does not exist in the tree
+  and will not be added"), corroborated by the note at flash_attention.hpp:24-25.
+- Round trips/launches removed: 0. Effort: L.
+
+## THE DECISIVE GENERAL FACTS (all three apply)
+
+- The DashQ INT2 weight-format wall applies: intfer's weights are packed INT2 codes
+  + per-(row, K-group) FP16 scales + a host global divisor; any port of a foreign
+  weight-layout kernel is a re-quantisation of the whole 27B, not a
+  micro-optimisation.
+- No-P2P applies: intfer has no P2P/IPC (only comments mention it), so no
+  cross-device collective has a consumer.
+- This engine's KV design is the OPPOSITE of what intfer is optimising for. PulsarLM's
+  whole transfer-reduction apparatus (pinned staging pool, async page DMA, page
+  reuse) exists because its KV lives on the DEVICE and pages must move. intfer's
+  objective is the reverse — get the intermediate OFF the host and keep work
+  device-resident — so those ideas point the wrong way for this tree.
+
+## CONCLUSION (second survey)
+
+0 candidates, nothing transfers. The first-pass per-candidate line ranges above
+are superseded by this block where they disagree; its one factual error (the
+"no speculative decoding machinery" line) is annotated in place rather than
+rewritten. Closing reason, in one sentence: a CUDA-only single-GPU device-resident-paged-KV
+engine has neither the backend nor the device-attention seam nor the memory
+objective this tree is optimising for, and its one genuine capability gap
+(eviction policy) is already solved here by a different mechanism
+(snapshot/resume prefix cache).

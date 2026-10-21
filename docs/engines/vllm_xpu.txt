@@ -1,0 +1,4 @@
+# vllm-xpu-kernels vLLM XPU int4 GEMM survey
+# https://github.com/vllm-project/vllm-xpu-kernels -- history of the review of this source (dated).
+
+https://github.com/vllm-project/vllm-xpu-kernels # int4 Marlin WNA16 (2026-10-14): falsified — Marlin vs DashQ INT2 weight-format wall; port would require re-laying all 27B weights
