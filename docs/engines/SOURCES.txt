@@ -10,6 +10,7 @@ https://github.com/Torchit1/llama.cpp          # fork_b580.txt (docs/FORK_B580_S
 https://github.com/snailium/llama.cpp-sycl-intel-b70
 https://github.com/Anbeeld/beellama.cpp        # beellama.txt
 https://github.com/edagher92-coder/arc-llm-lab
+https://github.com/IST-DASLab/disaggregated-llama.cpp.git
 
 # mla
 https://github.com/sootaugur/qwen-mla-vllm     # mla.txt
