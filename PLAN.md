@@ -11,7 +11,7 @@ is still a true record of when it was written.
 
 **Objective (standing):** 27B `--tp 2` decode 40 tok/s, prefill
 4000 tok/s. Measured state (derive, never quote from prose):
-`scripts/model_byte_roofline.sh` — 9.752 GB/device/token against
+`scripts/model/model_byte_roofline.sh` — 9.752 GB/device/token against
 456.0 GB/s peak; `kernel 237.5 ms/tok -> 41.1 GB/s = 9.0%`.
 
 ---
@@ -52,13 +52,13 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
   verdict would rest on `nk`/`nw`/`nr` alone, which a load-forming
   change does not move.
 * **It is not implementable as specified, and that is the geometry, not
-  a judgement call.** The shipped INT2-tab body (`quant_gemm.cpp:1115`,
-  `CC = 8`) reads **two** weight bytes per 8-code chunk — `code_u8[b0]`
+  a judgement call.** The shipped INT2-tab body (`quant_gemm.cpp:1055-1062`,
+  the `use_verbhalf` branch, `CC = 8`) reads **two** weight bytes per 8-code chunk — `code_u8[b0]`
   and `code_u8[b0+1]`, 16 bits over 8 codes. `block_load<uint8_t,128>`
   is 128 B across the subgroup, i.e. **64 codes** at 2 bits each. There
   is no chunk size in the shipped kernel that a 128-B gather would
   service; the 256-B variant is worse still. The row's own comment
-  (`quant_gemm.cpp:549-558`) already says the arm is "SUBGROUP's body
+  (`quant_gemm.cpp:700-714`) already says the arm is "SUBGROUP's body
   with the two `code_u8[b0]`/`[b0+1]` reads replaced by one
   `block_load<uint8_t,128>` per 32 codes" — 32 codes is 64 B, still not
   128, and the replacement is not written anywhere. Writing it means
@@ -69,7 +69,7 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
   `block_load` number on this box is a working device-event profiling
   path (PLAN.md section 5), which is a measurement fix, not an
   optimization, and is itself blocked on the driver. The code comment
-  at `quant_gemm.cpp:548-558` is the record; it is not a TODO.
+  at `quant_gemm.cpp:700-714` is the record; it is not a TODO.
 * **Gate:** none, and none is warranted — a flag with no implementation
   has nothing to certify. (The row's old "arm in `test_tp2_27b.sh`"
   was aspirational and is removed.)
@@ -79,8 +79,8 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
 * **Why:** fusion is the standing directive; both `gate` and `up` are
   column-parallel over the same split and device-local, and each
   output's K accumulation is untouched, so it is bit-exact. The two
-  existing fusion seams (`run_mlp_fused` `engine.cpp:1352`,
-  `run_linear_tp_devact` `engine.cpp:1484`) are **TP=1 ONLY** and
+  existing fusion seams (`run_mlp_fused` `engine.cpp:1858`,
+  `run_linear_tp_devact` `engine.cpp:2506`) are **TP=1 ONLY** and
   are dead code at the target — do not route through them.
 * **Gain:** removes one submit + one wait per MLP per token. The
   fused-MLP-down precedent is +13% decode for exactly that.
@@ -91,7 +91,7 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
   streams agree. The first version of this arm was REPORTED only, because
   the engine printed nothing on success and the two streams alone cannot
   separate a real fusion from the wave fallback they replace (bit-identical
-  by construction). See `scripts/test_tp2_27b.sh` for the arm's own
+  by construction). See `scripts/gates/test_tp2_27b.sh` for the arm's own
   self-check, which exercises the ACTIVE-line predicate in both directions.
 
 **AUDIT 2026-10-08 — two defects found and fixed in the 1.2 implementation:**
@@ -143,7 +143,7 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
 * **Does NOT apply to M=1 decode:** one output per work-item, nothing
   to steal. Do not attempt it there.
 * **Where:** `quant_gemm_dpas48_tiled<R>` (`src/gemm/quant_gemm.cpp`),
-  reached via `run_linear_tp_dpas48` (`src/engine/engine.cpp:1163`) —
+  reached via `run_linear_tp_dpas48` (`src/engine/engine.cpp:1248`) —
   i.e. only when `INTFER_DPAS48=1`. On the default prefill path
   (`sc.dpas48 == false`) the kernel is `quant_gemm_forward_usm`'s
   64x64 tiled body, which this flag does NOT touch.
@@ -166,35 +166,81 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
   unreachable rather than wrong. Announced
   `[onemkl] FP16 gemm via oneMKL SYCL BLAS ACTIVE (M=.. N=.. K=..)`,
   once per process. **There is no gate arm for this flag anywhere in
-  `scripts/test_*.sh`** (`git grep INTFER_ONEMKL -- scripts/test_*.sh`
+  `scripts/gates/test_*.sh`** (`git grep INTFER_ONEMKL -- scripts/gates/test_*.sh`
   returns nothing), so `check_flag_gate_coverage.sh` files it as the
   sole remaining opt-in REAL GAP and its own disposition block
   (`check_flag_gate_coverage.sh` header, the authoritative flag-by-flag
   record) does not list it among the armed flags. The row's old "Gate
   arm in `test_tp2_27b.sh`" was aspirational prose, not a measurement;
   it is struck here and in AGENTS.md:233.
+  **[SUPERSEDED 2026-10-21 by re-measurement: every claim in the paragraph above is
+  now false, and it is annotated rather than rewritten because rewriting a true
+  historical record to match today is the other direction of the same laundering
+  failure.]** (a) `git grep INTFER_ONEMKL -- 'scripts/gates/test_*.sh'` returns
+  **8 hits in `scripts/gates/test_onemkl.sh`**, not nothing — that gate names the
+  flag literally, and self-checks that it does (`if ! grep -qE '\bINTFER_ONEMKL\b' "$0"`
+  -> `FAIL: this gate does not name INTFER_ONEMKL -- the flag census would file it as
+  an ungated opt-in gap`), so a gate that loses the name cannot pass its own
+  preflight. (b) `check_flag_gate_coverage.sh` returns rc=0 reporting
+  `the opt-in residue is EMPTY: every opt-in flag is now named by a gate` and
+  `FLAG/GATE COVERAGE: PASS (106 engine flags, 94 gate-named, 37 ungated: 0 of them
+  opt-in = the real gap)`, so this row has not been "the sole remaining opt-in REAL
+  GAP" since 2026-10-13. (c) The `AGENTS.md:233` citation names the wrong subject:
+  line 233 is inside the `[xmx-attrib]` paragraph (the `matrix_engines=<verdict>`
+  word-not-a-zero contract), with nothing to do with this row; the authoritative
+  onemkl record in AGENTS.md is `INTFER_ONEMKL — DEFECT, FIXED` and the
+  `test_onemkl.sh could never test the oneMKL arm` entry. The gate itself is
+  build-conditional and SKIPs (exit 2) when `libmkl_sycl_blas` is absent, so on a
+  stock box it is red-by-precondition-free rather than falsely red.
   * **Why no gate can reach it on this box, and it is two independent
     blockers, not one.** (a) BUILD CONFIG: the real oneMKL body lives
     under `#ifdef INTFER_ENABLE_MKL` in `gemm_onemkl.cpp`; that is a
     CMake option, OFF by default (`CMakeLists.txt:23`), and NO gate
     script passes `-DINTFER_ENABLE_MKL=ON` (`src/gemm/CMakeLists.txt:39-54`
     only turns the #ifdef on and links `libmkl_sycl_blas` when the
+    option is ON)
+    **[SUPERSEDED 2026-10-21 by measurement, not by reading: exactly one gate
+    script passes it — `scripts/gates/test_onemkl.sh:78`, in its own throwaway
+    build dir (`GATE_BUILD_DIR="${INTFER_ONEMKL_BUILD_DIR:-$BUILD_DIR/onemkl_gate}"`,
+    configured with `-DINTFER_ENABLE_MKL=ON -DCMAKE_PREFIX_PATH=.../mkl/latest`)
+    precisely so the operator's default build stays MKL-free. The accurate claim is
+    "no gate passes it into the default build", and the neighbouring claim about the
+    arm being unreachable by gate shape is separately closed by
+    `examples/onemkl_probe`, which runs `quant_gemm_f16` directly on synthetic
+    M>=8 tensors and needs no 27B load.]**
     option is ON). With the default build `onemkl_available()` returns
     false and `quant_gemm_f16` never takes the arm -- unreachable by
     build configuration, not by flag. (b) GATE SHAPES: even in an MKL
     build the predicate is
     `onemkl_available() && getenv(INTFER_ONEMKL) && M >= 8`
-    (`quant_gemm.cpp:2281-2283`). Every gate on this box either runs no
+    (`quant_gemm.cpp:3073-3075`). Every gate on this box either runs no
     FP16 GEMM at all, or runs one at M=1 (decode, and the lm_head at
     `main.cpp:1374/2147/2422`, all M=1 or M<8). The only M>=8 caller is
     the 27B prefill path, which no gate runs (standing rule 1). So the
     arm cannot be reached by any gate that is permitted to run here.
+    **[CITATION DEFECT, 2026-10-21: those three lines are lm_head buffer
+    SIZING and guard lines, not FP16 GEMM call sites, so they cannot support "all
+    M=1 or M<8" for any caller.]** Measured against `examples/intfer_cli/main.cpp`:
+    1374 is `lm_head_*M_dev_`/`lm_head_cM_cap_` sizing, 2147 sits inside the
+    `INTFER_LMHEAD_DEVARGMAX_TP2` comment block, and 2422 is `lm_head_xM_dev_`
+    assignment. The actual `quant_gemm_f16` sites are **1451, 1948, 2248, 2535**,
+    and the M-row ones carry a *variable* M — line 1451 passes
+    `quant_gemm_f16(q, x_row, ..._w_dev_[d][t], lm_head_cM_dev_[d][t], M, Nlt, K)`
+    with M the prefill chunk width, while the scalar decode sites pass M=1. So
+    "every gate runs an FP16 GEMM only at M=1 or M<8" is NOT established by the
+    lines cited, and the M-row premise needs a run to settle rather than a
+    citation. It does not change the row's verdict — reachability is governed by
+    the build config above (superseded: `test_onemkl.sh` now configures its own
+    throwaway MKL build), and by `examples/onemkl_probe`, which reaches the branch
+    on synthetic M>=8 tensors and so closes the gate-shape half independently of
+    any engine M. Both halves are re-derived here rather than assumed.
   * **The arm itself is sound and the default path is untouched.** The
     branch is in `quant_gemm_f16`, called by every FP16 GEMM, and the
-    flag is explicit (`getenv != nullptr` at `quant_gemm.cpp:2282`), so
-    enabling the build does NOT change the default path -- the default
+    flag is explicit (`getenv != nullptr` at `quant_gemm.cpp:3074`),
+    so enabling the build does NOT change the default path -- the default
     build is byte-for-byte the MKL-free tiled kernel
-    (`gemm_onemkl.cpp:34-35`). The blocker is the build config, exactly
+    (`gemm_onemkl.cpp:115-124`, the `#else !INTFER_ENABLE_MKL` empty
+    fallbacks). The blocker is the build config, exactly
     the shape `INTFER_ENABLE_L0` already solves in `scripts/build.sh:28`.
   * **Arming it is operator-only, not agent-only.** It needs a build +
     a gate run, which is measurement work and is retired on this box
@@ -205,7 +251,7 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
     the arm real; then a tolerance-gated prefill comparison certifies
     it. Until that run exists this row is a genuine opt-in gap whose
     remedy is operator-only.
-* **Why:** llama.cpp `ggml-sycl.cpp:3115` shape.
+* **Why:** llama.cpp `ggml-sycl.cpp:3115` shape. **[EXTERNAL CITATION 2026-10-21: `ggml-sycl.cpp` is not in this tree (`ls ggml-sycl.cpp` -> No such file or directory), so this line cannot be resolved locally and is not a stale local reference. It names llama.cpp's `ggml/src/ggml-sycl/gemm.hpp` upstream; re-derive it against a fetched clone, never against this repo.]**
 * **Why it is fourth:** FP16 is 57.9% of decode traffic but already
   runs at 98-123% of the memory roofline (LA_QKV 559.9 GB/s, LA_OUT
   477.1 GB/s) — at the wall. This cannot pay on decode; it is a
@@ -291,6 +337,36 @@ load-insensitive counters (`kernel` bucket), clearing the spread floor.
   27B engine arm in `test_tp2_27b.sh` asserts the stream
   identity on real weights; the operator measures the delta.
 
+### 1.8 Every remaining UNMEASURED item is DECLINED-WITH-REASON for an agent session, and the reason is measured
+
+**Status: DISPOSITIONED 2026-10-21. There is no un-declined item left in this backlog.** The
+shipped-but-unmeasured flags above (1.2, 1.3, 1.4, 1.7 and their siblings) each read
+`UNMEASURED — operator-only A/B`, and that phrase is not a deferral: each is **declined from an
+agent session for a measured reason**, carrying the exact command an operator runs. The full
+runbook is HISTORY.md "the operator-only backlog, DISPOSITIONED WITH EXACT COMMANDS" — this
+row is the plan-side pointer and the backlog consequence, not a second copy.
+
+**The four reasons are measured, not recited.** (a) Loading the 27B is forbidden by the standing
+rule: the shard USM is tens of GiB and a raw load is tens of minutes, which is not a box probe a
+session may spend. (b) The wall-time benchmark queue is **RETIRED**: a tok/s needs `load1 < 2`
+for the whole of every arm and this box has not held that window. (c) The device-event profiling
+defect means `kernel` cannot be a decision bucket here, so the load-insensitive integers
+`nk`/`nw`/`nr` are the decision surface and only an operator run produces them. (d)
+`scripts/knob_sweep.sh` already refuses a contended round `SKIPPED-CONTENDED` and excludes it
+from both usable filters, so it is the operator's tool **by construction** — a session that ran
+it would either spend the load or withhold its own figures.
+
+**The two decisions that are NOT operator-only and therefore still open here.** Promote only
+what clears the spread floor on ≥2 paired rounds (a single-round delta has no floor to clear),
+and never quote a tok/s that was not measured on a quiet box. Both are standing rules, not
+backlog work.
+
+**DECLINED as well, with the reason not being "not yet attempted".** `INTFER_MLA_ATTN` — no MLA
+model exists on this box, so the arm cannot be run at all (the capability gap, that it realises
+none of MLA's KV-cache memory win, is the verdict in `engines_sources.txt` line 50);
+`INTFER_KV_KVARN` — not implemented, because it needs an agreed tolerance contract before any
+code and the KV cache is correctness-gated with no tok/s claim.
+
 ## 2. Not a backlog item (measured, closed)
 
 Every row here has a measurement in HISTORY.md or the dead-ends table
@@ -341,7 +417,7 @@ in AGENTS.md. Do not re-attempt as-is.
 **llama.cpp SYCL** (`ggml/src/ggml-sycl/`) — leans on oneDNN/oneMKL
 for matmul; hand-written subgroup tile kernels for the quant path.
 `DnnlGemmWrapper::row_gemm` probes `dnnl::matmul` and rejects the
-`"ref"` impl (`ggml-sycl.cpp:123`); `oneapi::mkl::blas::column_major::gemm`
+`"ref"` impl (`ggml-sycl.cpp:123` **[external — see the EXTERNAL CITATION note under "Why:"; upstream llama.cpp, absent from this tree]**); `oneapi::mkl::blas::column_major::gemm`
 fallback (`:3115`); quantized matvec in `dmmv.cpp`/`mmq.cpp` with
 `reqd_sub_group_size(WARP_SIZE)`, dequant-on-the-fly and
 `permute_sub_group_by_xor` warp reduction — **no DPAS/XMX**, EU vector
