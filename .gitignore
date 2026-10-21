@@ -22,6 +22,10 @@ compile_commands.json
 *.swp
 .DS_Store
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Local secrets (API keys); never commit
 .envrc
 *.gguf
