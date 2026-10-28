@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -28,6 +30,36 @@ namespace intfer {
 
 PipelineResult run_pipeline(const ModelIR& input, const PipelineConfig& cfg) {
   PipelineResult res;
+
+  // ---- INTFER_QUANT_CODEBOOK (learned vs fixed/transposed) ----
+  // "learned" (default) = intfer's learned 4-entry symmetric INT2 codebooks.
+  // "fixed" = Greatjedi-style transposed fixed canonical codebooks (linear
+  // codebook: INT2 = {-1,-1/3,+1/3,+1} already produced by canonical_codebook).
+  // Both produce the same dequant FORMAT (linear codebook + per-group FP16
+  // microscale + per-tensor FP32 alpha), so this is a codebook SOURCE choice,
+  // not a new numerics class. The announcement fires once per process when the
+  // var is set, so the flag's reachability is observable.
+  const char* cb_env = std::getenv("INTFER_QUANT_CODEBOOK");
+  bool learn_cb = cfg.learn_codebook;
+  if (cb_env) {
+    learn_cb = (std::strcmp(cb_env, "learned") == 0);
+    static bool announced = false;
+    if (!announced) {
+      announced = true;
+      const char* which = learn_cb ? "learned"
+        : "fixed (Greatjedi transposed canonical: INT2=(-1,-1/3,+1/3,+1))";
+      std::fprintf(stderr, "[quant-codebook] variant=%s (INTFER_QUANT_CODEBOOK=%s) "
+                   "ACTIVE (candidates: canonical codebook %s, per-group FP16 scale, FP32 alpha)\n",
+                   which, cb_env, which);
+      std::fflush(stderr);
+    }
+  }
+
+  // ---- INTFER_QUANT_GROUP override (microscaling group width) ----
+  // 0/absent = use the role default from default_candidates (typically 16 or
+  // 32; NPU prefill uses 32 to match the XMX BK=32 tile width).
+  auto parse_int = [](const char* e) -> int { if(!e) return 0; return std::atoi(e); };
+  const int g_override = parse_int(std::getenv("INTFER_QUANT_GROUP"));
 
   // ---- t3: SpinQuant orthogonal rotation preprocessing ----
   SpinQuantResult sqr = spinquant_preprocess(input, cfg.sq, cfg.use_calibration ? &cfg.calib : nullptr);
@@ -118,8 +150,17 @@ PipelineResult run_pipeline(const ModelIR& input, const PipelineConfig& cfg) {
           continue;
         QuantConfig c = base;
         c.rotation_id = t.qcfg.rotation_id; // carry SpinQuant id if t3 ran first
+        // INTFER_QUANT_GROUP overrides the candidate's microscaling group
+        // size (0/absent = use the role default from default_candidates).
+        // The group size is the ONLY thing that changes the arithmetic
+        // shape of the dequant -- codes are still 2/4/8-bit indices into
+        // the same linear codebook, and the scale is still one FP16 per
+        // group -- so this stays inside the DASH-Q contract and does not
+        // need a new numerics class.
+        if (g_override > 0 && c.group_size > 0)
+          c.group_size = (uint16_t)g_override;
         const dashq::QuantResult r = dashq::quantize(W.data(), t.N, t.K, c, H,
-                                              cfg.learn_codebook);
+                                              learn_cb);
 
         TensorIR cand;
         cand.name = t.name;

@@ -2788,6 +2788,52 @@ rm -rf "$WFSB2"
         && { echo "GATE FAIL: arm ACCEPTED a source where INTFER_TIMELINE is dead" >&2; PASS=0; }
       rm -rf "$TL_SB"
 
+    # --- INTFER_QUANT_CODEBOOK certification (Greatjedi INT2/INT4 linear codebook) -
+    # The quantization pipeline reads INTFER_QUANT_CODEBOOK from the environment
+    # in src/quant/pipeline.cpp. "learned" (default) = intfer's learned 4-entry
+    # symmetric codebooks; "fixed" = Greatjedi-style transposed canonical
+    # codebook (INT2={-1,-1/3,+1/3,+1} via canonical_codebook). Both produce
+    # the same dequant format (linear codebook + per-group FP16 scale + per-tensor
+    # FP32 alpha), so the stream identity is guaranteed by construction.
+    # STRUCTURAL (no model, no GPU) — source assertion + refusal direction.
+    QC_SRC="$ROOT/src/quant/pipeline.cpp"
+    grep -aq 'INTFER_QUANT_CODEBOOK' "$QC_SRC" \
+      || { echo "GATE FAIL: INTFER_QUANT_CODEBOOK is not read in pipeline.cpp" >&2; PASS=0; }
+    grep -aq '\[quant-codebook\]' "$QC_SRC" \
+      || { echo "GATE FAIL: [quant-codebook] announcement missing" >&2; PASS=0; }
+    grep -aq 'std::strcmp(cb_env, "learned")' "$QC_SRC" \
+      || { echo "GATE FAIL: codebook variant is not strcmp-derived" >&2; PASS=0; }
+    QC_SB="$(mktemp -d)"
+    cp "$QC_SRC" "$QC_SB/pipeline.cpp"
+    QC_DEAD_BEFORE="$(grep -ac 'INTFER_QUANT_CODEBOOK' "$QC_SB/pipeline.cpp")"
+    [ "${QC_DEAD_BEFORE:-0}" -ge 1 ] \
+      || { echo "GATE FAIL: self-check builder preflight: INTFER_QUANT_CODEBOOK absent" >&2; PASS=0; }
+    perl -0777 -pi -e 's/std::getenv\("INTFER_QUANT_CODEBOOK"\)/nullptr/' "$QC_SB/pipeline.cpp"
+    QC_DEAD_AFTER="$(grep -ac 'INTFER_QUANT_CODEBOOK' "$QC_SB/pipeline.cpp")"
+    [ "${QC_DEAD_AFTER:-0}" -ge 1 ] \
+      || { echo "GATE FAIL: self-check builder perl no-op'd" >&2; PASS=0; }
+    grep -aq 'std::strcmp(cb_env, "learned")' "$QC_SB/pipeline.cpp" \
+      && { echo "GATE FAIL: arm ACCEPTED a dead codebook knob" >&2; PASS=0; }
+    rm -rf "$QC_SB"
+
+    # --- INTFER_QUANT_GROUP certification (microscaling group width override) -
+    QG_SRC="$ROOT/src/quant/pipeline.cpp"
+    grep -aq 'INTFER_QUANT_GROUP' "$QG_SRC" \
+      || { echo "GATE FAIL: INTFER_QUANT_GROUP is not read in pipeline.cpp" >&2; PASS=0; }
+    QG_SB="$(mktemp -d)"
+    cp "$QG_SRC" "$QG_SB/pipeline.cpp"
+    QG_DEAD_BEFORE="$(grep -ac 'INTFER_QUANT_GROUP' "$QG_SB/pipeline.cpp")"
+    [ "${QG_DEAD_BEFORE:-0}" -ge 1 ] \
+      || { echo "GATE FAIL: self-check builder preflight" >&2; PASS=0; }
+    perl -0777 -pi -e 's/std::getenv\("INTFER_QUANT_GROUP"\)/nullptr/' "$QG_SB/pipeline.cpp"
+    QG_DEAD_AFTER="$(grep -ac 'INTFER_QUANT_GROUP' "$QG_SB/pipeline.cpp")"
+    [ "${QG_DEAD_AFTER:-0}" -ge 1 ] \
+      || { echo "GATE FAIL: self-check builder perl no-op'd" >&2; PASS=0; }
+    grep -aq 'INTFER_QUANT_GROUP' "$QG_SB/pipeline.cpp" \
+      && { echo "GATE FAIL: arm ACCEPTED a dead group knob" >&2; PASS=0; }
+    rm -rf "$QG_SB"
+
+
 rm -f "$LOG"  # *_OUT/*_ERR are handled by the EXIT trap (kept on FAIL)
 # *** PASS -> EXIT (2026-10-15). *** Appended AFTER the rm so the conversion is
 # the last statement and the trailing-rm escape hatch (a conversion above the
