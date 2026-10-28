@@ -1,5 +1,12 @@
 # Greatjedi Intel Arc Tuned GGUF: Engineering Takeaways for intfer
 
+> **STATUS: comparison BLOCKED.** The Greatjedi Qwen3.8-27B-Intel-Arc-Tuned-GGUF checkpoint
+> is NOT present locally. The policy lines below are quoted from the upstream docs and are NOT
+> measured on our weights — they have not been converted into a quantization-accuracy claim in
+> this repo. The code-level change (INTFER_QUANT_CODEBOOK=fixed) selects intfer's `canonical_codebook()`,
+> whose INT2 codes `{-1,-1/3,+1/3,+1}` equal the Greatjedi transposed linear codebook, but that
+> is a parity of STORAGE FORMAT, not evidence of Greatjedi's accuracy.
+
 ## 1. Model availability
 - The Greatjedi model `Greatjedi/Qwen3.8-27B-Intel-Arc-Tuned-GGUF` is **not present** in the local model cache or test fixtures.
 - HuggingFace source: `https://huggingface.co/Greatjedi/Qwen3.8-27B-Intel-Arc-Tuned-GGUF`
