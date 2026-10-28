@@ -1,2 +1,6 @@
 add_executable(uncached_doorbell_probe main.cpp)
 add_sycl_to_target(TARGET uncached_doorbell_probe SOURCES main.cpp)
+if(ZE_LOADER)
+  target_include_directories(uncached_doorbell_probe PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(uncached_doorbell_probe PRIVATE ${ZE_LOADER} dl)
+endif()

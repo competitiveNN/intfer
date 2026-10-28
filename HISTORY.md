@@ -2016,7 +2016,7 @@ the output buffer with the **GLOBAL** row (`start + local`, stride Ng/Nu).
 the defect was invisible in `gateup_equiv` (always full-size shards) and in every
 M=1 decode path (which never calls this kernel).
 
-**Harness (`examples/gateup_equiv`), 30/30 PASS:**
+**Harness (`examples/gateup_equiv`), 30 of 30 datasets PASS:**
 | shape | what it does |
 |---|---|
 | `MLP_GATE+UP` / `-RAGGED` / `-ODDN` | full-size, start=0 — the pre-existing 15/15 |

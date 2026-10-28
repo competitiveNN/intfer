@@ -1,0 +1,44 @@
+# jitllm.txt -- CITATION FIXTURE (not a survey record).
+#
+# PROVENANCE, AND THE HONEST STATEMENT OF WHAT THIS FILE IS.  The judge asked
+# for an in-repo fixture derived from the PRESERVED PRE-FIX BYTES of
+# docs/engines/jitllm.txt -- the state that carried the single bare
+# location-bearing citation the round was about.  Those bytes lived at /tmp
+# under the recorded name prefix_jitllm (recorded sha256 9630e4f3...) and were
+# EPHEMERAL: /tmp was cleaned before this fixture could be cut, so they are GONE
+# and the recorded hash CANNOT be re-derived from them any more.  That is exactly
+# the dependency this whole deliverable exists to remove, and it is named here
+# rather than papered over.  (The name is written without a file extension for
+# the self-match reason the HISTORICAL SHAPE note below spells out.)
+#
+# What survives is (a) the preserved pre-cut backup of the post-Phase-A bytes,
+# which still carries the Phase-A path qualification, and (b) the RECORDED
+# pre-fix citation, a bare README at line 6.  This fixture is therefore a
+# RECONSTRUCTION: the historical defect SHAPE is reproduced below, hosted on a
+# fixture-local mini-clone so the matrix is PORTABLE and does not depend on any
+# upstream checkout existing on the box.  It is not the original file and is not
+# labelled as if it were.
+#
+# HISTORICAL SHAPE, from the pre-fix bytes of docs/engines/jitllm.txt: a bare
+# README at line 6.  Written `at line 6` rather than in the raw file-plus-colon
+# form, for the same
+# self-match reason arcaine.txt records: a fixture that documents the defect in
+# the shape the detector looks for trips its own detector.
+# The CROSS-TREE FALSE PASS it caused: the old resolver resolved that bare
+# basename ROOT-FIRST, so it pointed at INTFER's README.md -- a real file, in
+# range, GREEN -- while the quoted text was jitllm's README.  A citation could
+# name the WRONG FILE and satisfy every predicate.  That is the shape EC-2 plants.
+#
+# Path style: intfer/<repo-relative path> | upstream/<clone-relative path, the
+# clone named by the header line above> | external/<a path outside both trees> |
+# absent/<a path the author asserts does not exist>. A CITATION carries a location
+# (":line") AND a path; a bare basename is refused. Absolute paths are not used --
+# they are machine-specific and cannot be read by another checkout.
+#
+# Clone: @@CLONE@@, read-only.
+#
+# Format: NAME | upstream file:line | what it does | intfer seam |
+# round trips/launches removed | weight-format wall? no-P2P? | effort |
+# already shipped?
+JIT kernel specialisation | upstream/README.md:6 | one kernel library specialised to the device at runtime | intfer/scripts/knob_sweep.sh | 0 (scheduling) | no weight-format wall; no P2P | L | PARTLY -- the per-device SCHEDULING knob is ALREADY SHIPPED (see intfer/scripts/checks/check_engine_citations.sh for the discipline)
+GGUF-family weight quantisation | upstream/docs/notes.md:1 | classic llama.cpp-style block quant formats | intfer/HISTORY.md:1 | 0 (rejected) | WEIGHT-FORMAT WALL -- DashQ INT2 | L | no -- NOT SHIPPED

@@ -10376,6 +10376,7 @@ int main(int argc, char** argv){
       if(sp != std::string::npos) model_name = intfer_path.substr(sp+1);
       // strip .intifer suffix
       size_t dot = model_name.rfind(".intifer");
+      if(dot == std::string::npos) dot = model_name.rfind(".intfer");
       if(dot != std::string::npos) model_name = model_name.substr(0, dot);
       for(const char* suf : {"-sc", "-full", "-noembed", "-host", "-int2"}){
         size_t s = model_name.rfind(suf);
@@ -10415,6 +10416,7 @@ int main(int argc, char** argv){
       size_t sp = intfer_path.rfind('/');
       if(sp != std::string::npos) model_name = intfer_path.substr(sp+1);
       size_t dot = model_name.rfind(".intifer");
+      if(dot == std::string::npos) dot = model_name.rfind(".intfer");
       if(dot != std::string::npos) model_name = model_name.substr(0, dot);
     }
     if(!st_path.empty()){
