@@ -24,6 +24,24 @@ Greatjedi transquantizes **non-linear I-Quants** (IQ3_S, IQ4_XS, IQ3_XXS) from t
 - **Target paths:** DPAS (Direct Accumulation) and XMX matrix engines on Intel Arc, where the linear codebooks can be consumed directly by the matrix engine MMA units.
 - **Relationship to IQ codes:** The original `IQ3_S`, `IQ4_XS`, `IQ3_XXS` formats use non-linear (GPTQ-style) quantization with per-tensor/per-layer scales. Greatjedi's transquantization step converts these into the linear `Q4_K`/`Q3_K`/`Q2_K` format that Intel Arc can consume without runtime dequantization beyond the per-group scale multiply.
 
+## 3b. Measured comparison (0.8B, run via examples/quant_pipeline)
+
+INTFER_QUANT_CODEBOOK=fixed vs learned on the real 0.8B-derived 16-tensor fixture, same
+budget (41676 bytes, INT2 stress, ~99.18% used), same microscaling group sizes, same
+INT4/INT8 candidate ladder, same total eff bits/weight (3.926 in both runs):
+
+| codebook variant | total weighted error | notes |
+|---|---|---|
+| learned (intfer default) | 2.260855 | intfer DASH-Q non-uniform symmetric via learn_codebook_tensor |
+| fixed (Greatjedi transposed canonical) | 2.603012 | INT2={-1,-1/3,+1/3,+1}, canonical_codebook (no learn) |
+
+Conclusion: on this fixture the FIXED Greatjedi-shaped codebook is WORSE than the LEARNED
+intfer codebook (~0.34 absolute WER in favour of learned). So the assumption that simply
+adopting Greatjedi's transposed codebook improves quality is FALSIFIED for this data set.
+The INTFER_QUANT_CODEBOOK=fixed option stays for interoperability (matching GGUF/Greatjedi
+dequant bytes stream-identically) but is not an accuracy win. Operator decision: default ON =
+learned.
+
 ## 3. Intfer DASH-Q quantization scheme (current implementation)
 Intfer's pipeline uses **linear codebooks** with learned codebooks + microscaling, not k-quants. Key characteristics:
 

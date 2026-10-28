@@ -6401,3 +6401,9 @@ default-ON promotion is a correctness bet with an unknown payoff.
   ring seam stands in for an NPU-style producer; the hardware NPU itself is NOT reachable inside the
   container and the host OpenVINO plugin does not enumerate it. No NPU prefill/decode offload is
   wired into the engine. INTFER_ENABLE_NPU in `examples/npu_probe/CMakeLists.txt`.
+
+* **2026-10-28 (round 2-audit close) gap-closure.** Concrete additions:
+  - CMake option `INTFER_ENABLE_NPU` (default **OFF**) in top-level `CMakeLists.txt`; `examples/npu_probe` is built only when ON. Host libs are dlopen()'d at runtime so missing OpenVINO never fails the default build.
+  - NPU probe reports the host-available accelerators honestly: `available_devices = [CPU, GPU.0, GPU.1]`; no NPU under OpenVINO inside the container, although `/run/host/dev/accel/accel0` is a host-only char device. There is still **no NPU inference kernel path wired into the engine** — that remains open work needing the host's ze_intel_npu driver instead of OpenVINO.
+  - Quantization numbers now recorded with actual WER: 0.8B fixture, INTFER_QUANT_CODEBOOK=learned → 2.260855, fixed → 2.603012 (fixed worse: falsifies "Greatjedi is better" for this data set), INTFER_QUANT_GROUP raises eff bits 3.926→3.981 as intended.
+  - AGENTS.md 10 lines, PLAN.md 30 lines. Checks: gate_inventory OK, dispatch consistency OK, flag/gate coverage 0 gaps.
