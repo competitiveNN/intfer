@@ -35,10 +35,14 @@ trap 'rm -rf "$WORK"; exit 143' TERM
 # assignments we control. Pointing the helper at a synthetic tree is what makes
 # the prefix cases testable at all.
 SYN="$WORK/scripts"; BD="$WORK/build"
-mkdir -p "$SYN" "$BD"
-cp "$SCRIPT_DIR/../lib/_gate_pop.sh" "$SYN/"
+# THE SYNTHETIC TREE MIRRORS THE REAL LAYOUT (lib/ + matrices/), because the helper
+# derives its population as "$sd"/../matrices/mutate_*.sh. After the 2026-10-21
+# restructure a FLAT synthetic tree matched nothing, so every real prefix form was
+# reported as unowned -- the always-red shape this self-check exists to catch.
+mkdir -p "$SYN/lib" "$SYN/matrices" "$BD"
+cp "$SCRIPT_DIR/../lib/_gate_pop.sh" "$SYN/lib/"
 # load_helper: source the helper with INTFER_BUILD_DIR set (the normal case)
-load_helper() { ( set +u; . "$SYN/_gate_pop.sh"; ) >/dev/null 2>&1; }
+load_helper() { ( set +u; . "$SYN/lib/_gate_pop.sh"; ) >/dev/null 2>&1; }
 
 bad=0
 echo "== GATE POP SELF-CHECK (_gate_pop.sh) =="
@@ -55,23 +59,23 @@ echo "-- (a) prefix forms: every form a real matrix writes is OWNED --"
 # The heredocs below carry the literal prefix forms ON PURPOSE -- they are the
 # fixtures under test, not paths this script resolves. Tagged so the
 # build-dir consumer checker does not read them as an AUDIT #8 violation.
-cat > "$SYN/mutate_m1.sh" <<'EOF'   # MUTANT payload
+cat > "$SYN/matrices/mutate_m1.sh" <<'EOF'   # MUTANT payload
 LOG_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/device_precond_matrix"
 EOF
-cat > "$SYN/mutate_m2.sh" <<'EOF'   # MUTANT payload
+cat > "$SYN/matrices/mutate_m2.sh" <<'EOF'   # MUTANT payload
 STAMP="$BUILD_DIR/fold_matrix"
 EOF
-cat > "$SYN/mutate_m3.sh" <<'EOF'   # MUTANT payload
+cat > "$SYN/matrices/mutate_m3.sh" <<'EOF'   # MUTANT payload
 WORK="$BUILD_DIR/run_all_mutate"
 EOF
-cat > "$SYN/mutate_m4.sh" <<'EOF'   # MUTANT payload
+cat > "$SYN/matrices/mutate_m4.sh" <<'EOF'   # MUTANT payload
 STAMP="$PWD/build/l0_cite_mutate"
 EOF
 mkdir -p "$BD"/{device_precond_matrix,fold_matrix,run_all_mutate,l0_cite_mutate}
 for d in device_precond_matrix fold_matrix run_all_mutate l0_cite_mutate; do
   echo "sha=deadbeef" > "$BD/$d/last_pass.stamp"
 done
-got="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; known_dirs")"
+got="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/lib/_gate_pop.sh'; known_dirs")"
 miss=""
 for d in device_precond_matrix fold_matrix run_all_mutate l0_cite_mutate; do
   case " $got " in *" $d "*) ;; *) miss="$miss $d";; esac
@@ -88,7 +92,7 @@ fi
 
 # ---- (b) the converse: a clean synthetic tree must be QUIET ----------------
 echo "-- (b) converse: a clean tree is NOT reported as leaking --"
-out="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; pop_assert_no_leak clean")"; rc=$?
+out="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/lib/_gate_pop.sh'; pop_assert_no_leak clean")"; rc=$?
 if [ "$rc" -eq 0 ]; then
   echo "  ok    ok -- the assertion stays SILENT on a clean tree"
   n_b=$((n_b+1))
@@ -100,7 +104,7 @@ fi
 # ---- (c) and it must go RED on a genuinely foreign directory ---------------
 echo "-- (c) a foreign directory IS reported (the check can fail) --"
 mkdir -p "$BD/fixture_leak"; echo x > "$BD/fixture_leak/last_pass.stamp"
-out="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; pop_assert_no_leak planted")"; rc=$?
+out="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/lib/_gate_pop.sh'; pop_assert_no_leak planted")"; rc=$?
 rm -rf "$BD/fixture_leak"
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'fixture_leak'; then
   echo "  ok    rejected, and it named fixture_leak"
@@ -114,8 +118,8 @@ fi
 # The (b) defect: the helper demanded the exported variable and died when a
 # caller set only the local. Both shapes must work.
 echo "-- (d) variable shape: exported INTFER_BUILD_DIR OR local BUILD_DIR --"
-r1="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; pop_dirs | wc -l")"
-r2="$(BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; pop_dirs | wc -l")"
+r1="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/lib/_gate_pop.sh'; pop_dirs | wc -l")"
+r2="$(BUILD_DIR="$BD" bash -c ". '$SYN/lib/_gate_pop.sh'; pop_dirs | wc -l")"
 if [ "$r1" = "$r2" ] && [ "$r1" -gt 0 ]; then
   echo "  ok    both shapes enumerate the same $r1 dir(s)"
   n_d=$((n_d+1))
@@ -126,7 +130,7 @@ fi
 
 # ---- (e) and with NEITHER set it must fail LOUDLY, not silently enumerate -
 echo "-- (e) with neither variable set it must fail closed --"
-out="$(env -u INTFER_BUILD_DIR -u BUILD_DIR bash -c ". '$SYN/_gate_pop.sh'; pop_dirs" 2>&1)"; rc=$?
+out="$(env -u INTFER_BUILD_DIR -u BUILD_DIR bash -c ". '$SYN/lib/_gate_pop.sh'; pop_dirs" 2>&1)"; rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "  ok    refused (rc=$rc) instead of reporting an empty population as ok"
   n_e=$((n_e+1))
@@ -144,12 +148,12 @@ fi
 # derivation exists to prevent. Both directions are required: the comment must be
 # IGNORED, and the real declaration in the same file must still be harvested.
 echo "-- (f) a comment quoting a declaration is ignored; the real one is not --"
-cat > "$SYN/mutate_f.sh" <<'EOF'   # MUTANT payload
+cat > "$SYN/matrices/mutate_f.sh" <<'EOF'   # MUTANT payload
 # e.g. mutate_l0_cite.sh: STAMP="$BUILD_DIR/quoted_example_mutate"
 LOG_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/real_decl_mutate"
 EOF
-k="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/_gate_pop.sh'; known_dirs")"
-rm -f "$SYN/mutate_f.sh"
+k="$(INTFER_BUILD_DIR="$BD" bash -c ". '$SYN/lib/_gate_pop.sh'; known_dirs")"
+rm -f "$SYN/matrices/mutate_f.sh"
 if printf '%s' "$k" | tr ' ' '\n' | grep -qx 'real_decl_mutate' \
    && ! printf '%s' "$k" | tr ' ' '\n' | grep -qx 'quoted_example_mutate'; then
   echo "  ok    real declaration harvested, the commented one ignored"

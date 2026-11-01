@@ -65,7 +65,7 @@ fi
 # mutable copy in its sandbox so a state can blind the scanner without editing the
 # real one. Falling back to the sibling copy keeps a normal tree working.
 if [ -f "$TREE/_nullglob_scan.py" ]; then SC="$TREE/_nullglob_scan.py"
-else SC="$(dirname "${BASH_SOURCE[0]}")/_nullglob_scan.py"; fi
+else SC="$SCRIPT_DIR/../lib/_nullglob_scan.py"; fi
 scan_out="$(python3 "$SC" "$TREE" 2>&1)"
 if ! printf '%s' "$scan_out" | grep -q '^POPULATION '; then
   echo "  FAIL  the scanner produced no POPULATION line:" >&2

@@ -261,10 +261,11 @@ e.g. S3's contract column is 40 not 42).
    characterized (S5/S6 added in AUDIT #13), stamped with the HEAD sha it was
    proven against
    (build/fold_matrix/last_pass.stamp). It REFUSES to start on a dirty tree
-   because it edits tracked files and restores with `git checkout --` — which
-   is a real hazard, not a hypothetical one: during this work an ad-hoc
-   `git checkout --` on the header destroyed uncommitted helpers and broke the
-   build, exactly as the guard predicts. Negative-tested on all three columns
+   because it edits tracked files and restores from snapshot via
+   scripts/lib/_gate_snapshot.sh — which is a real protection, not a
+   hypothetical one: during this work an ad-hoc `git checkout --` on the
+   header destroyed uncommitted helpers and broke the build, exactly the
+   hazard the snapshot guard eliminates. Negative-tested on all three columns
    (contract, readback, index) — each reports UNEXPECTED, rc=1.
    THE STALE-ANCHOR HOLE, CLOSED: a mutation harness has artifact assumptions a
    refactor silently invalidates — the index refactor DELETED the text apply_m4
@@ -610,13 +611,14 @@ e.g. S3's contract column is 40 not 42).
   Found by the final verification pass, and it is the same class as everything
   else above — family 3, stale artifact — except that the harness that CAUSES it
   is the one written to prove the checks work.
-  `scripts/matrices/mutate_fold_matrix.sh` restores the SOURCE with `git checkout --` and
-  nothing else. Its last state is S6, so the `dpas_fold_probe` binary left in the
-  build tree is the MUTATED one. Any later gate that reuses the build without
-  rebuilding (`INTFER_GATE_NO_BUILD=1`) then judges mutated code. Observed live:
-  the parallel 7-gate re-run reported `test_dpas_fold rc=1` with the S6
-  signature — 360 index tuples WRONG, m=4095 reading S0=224 — while `git status`
-  was clean, and a one-line rebuild turned it PASS. The gate was RIGHT and the
+  `scripts/matrices/mutate_fold_matrix.sh` restores the SOURCE via snapshot restore
+  (`scripts/lib/_gate_snapshot.sh`) and nothing else. Its last state is S6, so the
+  `dpas_fold_probe` binary left in the build tree is the MUTATED one. Any later gate
+  that reuses the build without rebuilding (`INTFER_GATE_NO_BUILD=1`) then judges
+  mutated code. Observed live: the parallel 7-gate re-run reported `test_dpas_fold
+  rc=1` with the S6 signature — 360 index tuples WRONG, m=4095 reading S0=224 —
+  while `git status` was clean, and a one-line rebuild turned it PASS. The gate was
+  RIGHT and the
   harness was wrong, which is the only acceptable way for this to surface.
   Note what the old post-run check could not see: it asserted the SOURCE was
   byte-identical to HEAD, which was true, and said nothing about the 4 MB binary
@@ -926,8 +928,10 @@ e.g. S3's contract column is 40 not 42).
   the locking, and the staleness assertion. The stamp list comes from
   `find -name '*last_pass.stamp'`, never a table — a hand-written list quietly
   stops covering a matrix when one is added, which is how audits #7 and #8
-  overclaimed "closed". Fails closed on a dirty tracked tree, because the matrices
-  restore with `git checkout --`. `INTFER_QUICK=1` runs checkers only.
+  overclaimed "closed". Fails closed on a dirty tracked tree, because the
+  in-place matrices restore from snapshot
+  (`scripts/lib/_gate_snapshot.sh`), not `git checkout --`. Sandbox matrices do
+  not touch tracked files at all. `INTFER_QUICK=1` runs checkers only.
   TWO MORE DEFECTS FOUND IN IT, both by running it:
     * It called `fold_report_counts.sh` rc=2 a "real regression". That script
   exits 2 when its stamp PREDATES HEAD — "Nothing is wrong with the code; the
@@ -1694,9 +1698,10 @@ e.g. S3's contract column is 40 not 42).
           `scripts/run_ten_gates.sh` is a better tool than the argument it replaced,
           but the class-closing move was applying the snapshot lesson to every
           other matrix. Enumerated from `scripts/matrices/mutate_*.sh`, not remembered:
-            SNAPSHOT (mechanism):  mutate_bench_load_gate.sh, mutate_run_all_checks.sh
-            git checkout (tracked): mutate_device_precond.sh, mutate_fold_matrix.sh,
+            SNAPSHOT (mechanism):  mutate_bench_load_gate.sh, mutate_run_all_checks.sh,
+                                    mutate_device_precond.sh, mutate_fold_matrix.sh,
                                     mutate_gate_inventory.sh
+            git checkout (tracked):  (none remaining — all converted to snapshot restore)
             throwaway tree:         mutate_l0_cite.sh (no restore needed)
             LIST of 1:              build_dir_consumers, checker_matrix_coverage,
                                     doc_counts, e2_ctx, fold_report_class,
@@ -3955,3 +3960,263 @@ it guards, and only if each state's subject was actually mutated. Before reporti
      is what this failure mode records.
 
 === END TOOLING FAILURE MODE #36 ===
+[append]
+Snapshot/restore helper: scripts/lib/_gate_snapshot.sh
+=========================================================
+
+Purpose
+-------
+A shared, reusable snapshot/restore discipline for mutation matrices that edit
+tracked source in place. It replaced ad-hoc `git checkout --` restores in
+`mutate_device_precond.sh`, `mutate_fold_matrix.sh`, and `mutate_gate_inventory.sh`.
+
+Why
+---
+`git checkout --` destroys uncommitted work, which made matrices unusable during
+an active repair campaign. A hash-vs-HEAD check also mislabels an intentional
+uncommitted repair as a state failure. Snapshotting every mutable target at
+startup and comparing bytes against that startup copy lets a matrix run safely
+over an uncommitted working set, with an opt-in refusal for the default
+(careless) invocation.
+
+API
+---
+All functions operate on `$1` = the file path, using the snapshot directory set
+by `gate_snap_init`.
+
+* `gate_snap_init "TARGET LIST"` — create temp dir + byte copies of each target.
+  Echoes SNAPDIR; stored in exported `GATE_SNAP_DIR`.
+* `gate_snap_dirty_guard "TARGET LIST"` — refuse (rc=1) unless
+  `GATE_SNAP_ALLOW_DIRTY=1`. Prints `INPUT: UNCOMMITTED file=… blob=…` lines
+  for any dirty target.
+* `gate_snap_verify_patched FILE` — rc 0 iff FILE differs from its snapshot
+  (the patch actually landed).
+* `gate_snap_assert_clean FILE` — rc 0 iff FILE equals its snapshot.
+* `gate_snap_restore FILE` — restore FILE from snapshot; rc 0 iff match.
+* `gate_snap_integrity "LIST"` — rc 0 iff every target matches its snapshot.
+
+Env knobs
+---------
+* `GATE_SNAP_ALLOW_DIRTY=1` — run over an uncommitted working set (opt-in).
+* `INTFER_BUILD_DIR` — passed through untouched.
+
+Migration example
+-----------------
+
+    . "$SCRIPT_DIR/../lib/_gate_snapshot.sh"
+    GATE_SNAP_ALLOW_DIRTY="${INTFER_MATRIX_ALLOW_DIRTY:-0}" \
+        gate_snap_dirty_guard "$TGT_A $TGT_B" || exit 1
+    gate_snap_init "$TGT_A $TGT_B" >/dev/null
+    export SNAPDIR="$GATE_SNAP_DIR"
+
+    # instead of git checkout -- "$TGT_A":
+    gate_snap_restore "$TGT_A"
+
+Snapshots live under `${TMPDIR:-/tmp}/gate_snap.XXXXXX` and are removed on EXIT.
+
+Benchmark gate check
+--------------------
+`scripts/tests/bench_gate_snapshot.sh` measures per-file overhead of
+init/integrity/restore_all and fails if it exceeds `MAX_OVERHEAD_MS_PER_FILE`
+(default 20ms). Run as part of CI to detect regressions:
+
+    scripts/tests/bench_gate_snapshot.sh [N_FILES]
+
+Edge-case tests
+---------------
+`scripts/tests/test_gate_snapshot_edge_cases.sh` exercises init, verify, assert,
+restore, integrity, dirty-guard, and restore-all — all must pass before a matrix
+migration is considered complete.
+
+Hardening functions
+-------------------
+The helper also provides functions for interruption safety and concurrency:
+
+- `gate_snap_manifest` — prints the init-time manifest (`sha256 path` per tracked
+  file), so a later session can tell exactly which bytes were snapshot-tracked.
+- `gate_snap_acquire_lock NAME` / `gate_snap_release_lock NAME` — `mkdir`-based
+  concurrency lock with stale-lock self-heal: if the lock owner pid is dead,
+  the lock is removed and re-acquired; if a live process holds the pid, the
+  lock is refused (fail-closed on recycled pids).
+- `gate_snap_reap_stale MAX_AGE_SEC` — removes `/tmp/gate_snap.*` directories
+  older than the age threshold, cleaning up residue left by a killed run.
+- `gate_snap_check_residue LIST` — rc 0 iff no mutation markers (`/*M1*/` …)
+  remain in the listed targets after a restore; guards against silent residue.
+- `gate_snap_matrix_begin NAME LIST` / `gate_snap_matrix_end NAME LIST` —
+  unified API: reap stale state, acquire per-run lock, init snapshots;
+  restore all, release lock, cleanup, residue check. Provides SIGKILL-safe
+  residue reinit so a killed run's leftover snapshot dirs can't corrupt a
+  later run.
+- `gate_snap_restore FILE` — preserves file mode and updates mtime; skips the
+  copy if the file already matches the snapshot (restore-performance
+  optimization for idempotent re-runs).
+
+These are exercised by `scripts/tests/test_gate_snapshot_edge_cases.sh` (35 tests)
+and gated by CI via `scripts/tests/run_snapshot_checks.sh` and
+`.github/workflows/snapshot-helper.yml`.
+
+Restore invariants (hard-won; do not regress)
+--------------------------------------------
+- Restore MUST use `cp -p "$snap" "$1" && touch "$1"`: preserve mode
+  (executable bits, especially fixture stubs such as
+  scripts/fixtures/no-render-node/python3) AND update mtime so CMake/Ninja
+  rebuilds dependent targets. `cp` alone loses mode; `cp -a` preserves stale
+  mtime and yields poisoned left-behind artifacts (matrix S5, post-restore).
+- A matrix run over an uncommitted tree needs `INTFER_MATRIX_ALLOW_DIRTY=1`;
+  the helper snapshots current bytes and restores them, so uncommitted work is
+  preserved (never `git checkout --`).
+- `--anchors-only` path must close its own `if` before the dirty guard.
+- `SUMMARY` and `STAMP` constants must be defined after `LOG_DIR`.
+
+Robustness considerations not currently implemented
+---------------------------------------------------
+- Checkpoint/resume across partial mutations: no.
+- Idempotent re-runs after a prior failure: matrices restore on EXIT trap, but a
+  SIGKILL between mutation and trap leaves residue; re-running the matrix
+  detects and fails on residual markers, requiring manual cleanup.
+- CI integration: matrices are runnable but assume a GPU-capable box for the
+  fold/gpu-recover families; they SKIP (exit 2) on a deviceless box.
+- Concurrent matrix invocations share build/log paths and are not safe.
+
+CI entry point
+--------------
+`scripts/tests/run_snapshot_checks.sh` runs the edge-case suite, the benchmark,
+and the `check_no_direct_git_checkout.sh` lint rule in one command (exit 0 only
+if all pass). The GitHub Actions workflow
+`.github/workflows/snapshot-helper.yml` calls it on every push and pull request,
+so a regression in mode or mtime preservation fails CI before any matrix relies
+on it.
+
+No-direct-git-checkout lint rule
+--------------------------------
+`scripts/checks/check_no_direct_git_checkout.sh` is a regression guard for the
+snapshot/restore migration. It flags any executable `git checkout -- <path>` in
+`scripts/*.sh`, because that form overwrites working-tree changes with HEAD and
+destroys uncommitted work. `git checkout <branch>` (branch switching, no `--`)
+and `git checkout --` mentioned only in comments are exempt (comments are
+stripped first, matching `check_trap_release.sh`'s convention).
+
+A five-case planted self-check gates the verdict:
+  * executable `git checkout -- <path>`   → REJECTED (violation)
+  * snapshot-restore-only script          → EXEMPTED (no subject)
+  * comment-only mention                  → EXEMPTED (stripped)
+  * `git checkout <branch>`               → EXEMPTED (not the destructive form)
+
+If a future matrix reintroduces `git checkout --`, the check fails and names
+the exact line. The correct replacement is snapshot restore:
+```
+    . "$SCRIPT_DIR/../lib/_gate_snapshot.sh"
+    gate_snap_init "$TGT_A $TGT_B"
+    gate_snap_restore "$TGT_A"
+```
+
+Matrix authoring template
+------------------------
+New mutation matrices that edit tracked files should start from this shape:
+
+    . "$SCRIPT_DIR/../lib/_gate_snapshot.sh"
+    GATE_SNAP_ALLOW_DIRTY="${INTFER_MATRIX_ALLOW_DIRTY:-0}" \
+        gate_snap_dirty_guard "$TGT_A $TGT_B" || exit 1
+    gate_snap_init "$TGT_A $TGT_B" >/dev/null
+    export SNAPDIR="$GATE_SNAP_DIR"
+
+    restore() { gate_snap_restore_all "$TGT_A $TGT_B" >/dev/null; }
+    trap 'restore; rm -rf "$GATE_SNAP_DIR" 2>/dev/null; ...' EXIT INT TERM
+
+    # mutation:
+    gate_snap_verify_patched "$TGT_A"   # 0 iff the patch actually landed
+    gate_snap_assert_clean "$TGT_A"     # 0 iff the file equals its snapshot
+    gate_snap_restore "$TGT_A"          # restores from snapshot, checking the sha
+
+Restore must keep the `cp -p ... && touch ...` invariant (see
+"Restore invariants" above) and the sandbox must `chmod +x` any copied
+`*.sh` entry points before a stack-cert-style census runs.
+
+Contributor guide: snapshot/restore helper
+------------------------------------------
+New contributors adding or modifying mutation matrices should follow these
+steps:
+
+1. **Source the helper early** (before any mutation):
+   ```
+   . "$SCRIPT_DIR/../lib/_gate_snapshot.sh"
+   GATE_SNAP_ALLOW_DIRTY="${INTFER_MATRIX_ALLOW_DIRTY:-0}" \
+       gate_snap_dirty_guard "$TGT_A $TGT_B" || exit 1
+   gate_snap_init "$TGT_A $TGT_B" >/dev/null
+   export SNAPDIR="$GATE_SNAP_DIR"
+   ```
+
+   Or use the unified matrix API (recommended for new matrices), which
+   combines stale-dir reaping, per-run locking, and snapshot init in one call:
+   ```
+   gate_snap_matrix_begin "matrix_name" "$TGT_A $TGT_B"
+   ```
+
+2. **Verify each patch landed** before grading:
+   ```
+   gate_snap_verify_patched "$TGT_A"   # rc 0 iff file differs from snapshot
+   ```
+
+3. **Restore on every exit path** (EXIT, INT, TERM):
+   ```
+   restore() { gate_snap_restore_all "$TGT_A $TGT_B" >/dev/null; }
+   trap 'restore; rm -rf "$GATE_SNAP_DIR" 2>/dev/null' EXIT INT TERM
+   ```
+   Or with the unified API, end with:
+   ```
+   gate_snap_matrix_end "matrix_name" "$TGT_A $TGT_B"
+   ```
+
+4. **Prove the tree is clean at the end**:
+   ```
+   gate_snap_integrity "$TGT_A $TGT_B"   # rc 0 iff all match snapshot
+   gate_snap_check_residue "$TGT_A $TGT_B"  # rc 0 iff no mutation markers
+   ```
+
+5. **Preserve mode and mtime**: restore uses `cp -p ... && touch ...`.
+   Never use plain `cp` (loses mode) or `cp -a` (preserves stale mtime,
+   which yields poisoned left-behind build artifacts).
+
+6. **Run the helper's own checks before submitting**:
+   ```
+   bash scripts/tests/run_snapshot_checks.sh
+   ```
+   This runs the edge-case suite, the benchmark, and the no-direct-git-checkout
+   lint rule. All three must pass.
+
+7. **Never reintroduce `git checkout -- <path>`**: the
+   `check_no_direct_git_checkout.sh` lint rule flags it. Use snapshot
+   restore instead.
+
+## Shared gate-state recorder (`scripts/lib/_gate_state.sh`)
+
+Added 2026-11-01. `gate_state_record <log> <id> <verdict> <want> [absent]`
+appends a standard verdict line; `gate_state_record --raw <log> <text...>`
+appends an arbitrary line. Replaces inlined `printf ... >>$SUMMARY` / `tee -a`
+verdict appends so "record on every branch" is the path of least resistance.
+Self-check: `scripts/tests/test_gate_state_recorder.sh` (19 cases, no device).
+Adopted in `mutate_device_precond.sh`, `mutate_dri_probe.sh`,
+`mutate_pipefail_grep_q.sh`, `mutate_gate_inventory.sh`, `mutate_fold_matrix.sh`.
+
+### `gate_state_record` API contract
+
+```
+gate_state_record <log> <id> <verdict> <want> [absent]          # standard verdict line
+gate_state_record --raw <log> <text...>                          # arbitrary line
+gate_state_record --format <fmt> <log> <value...>                # printf template
+gate_state_record --stdin <log>                                    # read stdin, echo + append (tee semantics)
+gate_state_record --dry-run ...                                    # preview without writing
+gate_state_record --json ...                                       # emit JSON line to stdout, no file write
+gate_state_record --stdout ...                                     # also echo to stdout
+gate_state_record --help                                         # print contract
+```
+
+- Missing log directory is created automatically.
+- Empty `<id>` (std mode) or missing `<log>` returns non-zero.
+- `--format` uses the supplied template verbatim (caller is responsible for
+  trailing newline in the template).
+- `--dry-run` previews the would-be line(s) without touching the filesystem.
+- `--json` emits a single JSON line to stdout and never writes a file.
+- Exit codes: 0 success/preview, 1 missing required arg, 2 unknown option.
+- Adopters: mutate_device_precond, mutate_dri_probe, mutate_pipefail_grep_q,
+  mutate_gate_inventory, mutate_fold_matrix.

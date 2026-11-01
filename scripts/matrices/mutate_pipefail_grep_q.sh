@@ -36,6 +36,7 @@ trap 'rm -rf "$SB"; exit 143' TERM
 
 . "$SCRIPT_DIR/../lib/_gate_pred.sh"
 . "$SCRIPT_DIR/../lib/_gate_enum.sh"
+. "$SCRIPT_DIR/../lib/_gate_state.sh"
 
 # A corpus that looks like the real one: pipefail scripts that use the SANCTIONED
 # forms (file-backed grep -q, non-quiet grep on a pipe, no grep at all).
@@ -81,20 +82,20 @@ run_reject() {
   mk_corpus
   if ! MUTATE_FN; then
     echo "  $id MISSED -- the mutation did not apply (STATE fault, not a mechanism)"
-    echo "$id MISSED (mutation fn)" >>"$SUMMARY"; mk_corpus; return 1
+    gate_state_record --raw "$SUMMARY" "$id MISSED (mutation fn)"; mk_corpus; return 1
   fi
   local o r
   o="$(run_check)"; r=$?
   printf '%s\n' "$o" >"$LOG/$id.log"
   if [ "$r" -eq 0 ]; then
     echo "  $id MISSED -- checker still exited 0 with the defect present ($why)"
-    echo "$id MISSED (rc=0)" >>"$SUMMARY"; mk_corpus; return 1
+    gate_state_record --raw "$SUMMARY" "$id MISSED (rc=0)"; mk_corpus; return 1
   fi
   if ! pred_expect_present "$id rejection" "$o" 'PIPEFAIL GREP-Q: FAIL'; then
-    echo "$id MISSED (rejection not reported)" >>"$SUMMARY"; mk_corpus; return 1
+    gate_state_record --raw "$SUMMARY" "$id MISSED (rejection not reported)"; mk_corpus; return 1
   fi
   echo "  $id caught -- rc=$r, verdict-polarity=expect-present: $why"
-  echo "$id caught" >>"$SUMMARY"; caught=$((caught + 1)); return 0
+  gate_state_record --raw "$SUMMARY" "$id caught"; caught=$((caught + 1)); return 0
 }
 
 mk_bad() { printf '%s\n' "$1" >"$SB/zz_bad.sh"; }
@@ -124,10 +125,10 @@ o="$(run_check)"; r=$?
 printf '%s\n' "$o" >"$LOG/P-E.log"
 if [ "$r" -ne 0 ] && grep -q 'never harvested' <<<"$o"; then
   echo "  P-E caught -- rc=$r, a corpus with no pipefail script is REFUSED, not passed"
-  echo "P-E caught" >>"$SUMMARY"; caught=$((caught + 1))
+  gate_state_record --raw "$SUMMARY" "P-E caught"; caught=$((caught + 1))
 else
   echo "  P-E MISSED -- rc=$r; a corpus with no pipefail script was not refused"
-  echo "P-E MISSED" >>"$SUMMARY"
+  gate_state_record --raw "$SUMMARY" "P-E MISSED"
 fi
 mk_corpus
 
@@ -143,10 +144,10 @@ if [ "$r" -eq 0 ] && grep -q 'zz_nonquiet.sh' <<<"$o" \
    && grep -q 'zz_filebacked.sh' <<<"$o" && grep -q 'zz_nogrep.sh' <<<"$o" \
    && ! grep -q '^  FAIL' <<<"$o"; then
   echo "  P-F caught -- rc=0, non-quiet/file-backed/no-grep all ACCEPTED (converse holds)"
-  echo "P-F caught" >>"$SUMMARY"; caught=$((caught + 1))
+  gate_state_record --raw "$SUMMARY" "P-F caught"; caught=$((caught + 1))
 else
   echo "  P-F MISSED -- rc=$r; a sanctioned grep form was not accepted cleanly"
-  echo "P-F MISSED" >>"$SUMMARY"
+  gate_state_record --raw "$SUMMARY" "P-F MISSED"
 fi
 
 echo

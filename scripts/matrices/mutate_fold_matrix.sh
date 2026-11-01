@@ -58,8 +58,31 @@ BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
 LOG_DIR="$BUILD_DIR/fold_matrix"
 SUMMARY="$LOG_DIR/summary.txt"
 STAMP="$LOG_DIR/last_pass.stamp"
+# -- shared snapshot helper (opt-in dirty guard + in-place restore) --
+. "$SCRIPT_DIR/../lib/_gate_snapshot.sh"
+. "$SCRIPT_DIR/../lib/_gate_state.sh"
+GATE_SNAP_ALLOW_DIRTY="${INTFER_MATRIX_ALLOW_DIRTY:-0}" gate_snap_dirty_guard "$HDR $SRC" || exit 1
+gate_snap_init "$HDR $SRC" >/dev/null
+export SNAPDIR="$GATE_SNAP_DIR"
 ANCHORS_ONLY=0
 [ "${1:-}" = "--anchors-only" ] && ANCHORS_ONLY=1
+
+# *** WIPE LOCK, TAKEN OUTSIDE THE TREE IT WIPES. *** LOG_DIR below is a FIXED path
+# and is rm -rf'd at start, so two concurrent invocations share it and one empties
+# the other's mid-state (MEASURED 2026-10-21). $LOCK sits under $BUILD_DIR, OUTSIDE
+# $LOG_DIR, and is taken BEFORE the wipe. Derived from source by
+# check_matrix_sandbox_locks.sh.
+LOCK="$BUILD_DIR/.mutate_fold_matrix.lock"
+mkdir -p "$BUILD_DIR" 2>/dev/null || true
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "FAIL: another .mutate_fold_matrix.lock is running (lock: $LOCK)" >&2
+  exit 1
+fi
+# Installed HERE, not with the restore traps below: the anchor pre-flight can exit
+# before those exist, and a lock released only by a later trap leaks on that path.
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 130' INT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 143' TERM
 
 # --- ANCHOR PRE-FLIGHT -----------------------------------------------------
 # A mutation harness has its own artifact assumptions, and a refactor silently
@@ -176,6 +199,9 @@ has_residue() {
   return 1
 }
 
+# Removed local has_residue(): replaced by shared gate_snap_check_residue()
+# in scripts/lib/_gate_snapshot.sh.
+
 selfcheck() {
   local bad=0 tmp m
   if [ "$(emit_summary)" != "$EXPECTED_SUMMARY" ]; then
@@ -185,10 +211,10 @@ selfcheck() {
   tmp="$(mktemp "${TMPDIR:-/tmp}/fold_matrix_selfcheck.XXXXXX")"
   for m in M1 M2 M4 M5 M6; do
     printf 'int x; /*%s*/\n' "$m" >"$tmp"
-    has_residue "$tmp" || { echo "SELFCHECK: residue scan misses a /*$m*/ marker" >&2; bad=1; }
+    gate_snap_check_residue "$tmp" && { echo "SELFCHECK: residue scan misses a /*$m*/ marker" >&2; bad=1; }
   done
   printf 'int clean;\n' >"$tmp"
-  has_residue "$tmp" && { echo "SELFCHECK: residue scan false-positives on clean input" >&2; bad=1; }
+  gate_snap_check_residue "$tmp" 2>/dev/null || { echo "SELFCHECK: residue scan false-positives on clean input" >&2; bad=1; }
   rm -f "$tmp"
   return $bad
 }
@@ -201,14 +227,16 @@ if [ "$ANCHORS_ONLY" = "1" ]; then
   echo "FOLD MATRIX ANCHORS: OK"
   exit 0
 fi
-
-# --- fail closed on a dirty tree: we are about to git checkout -- tracked files
-if ! git diff --quiet -- "$HDR" "$SRC" || ! git diff --cached --quiet -- "$HDR" "$SRC"; then
-  echo "FAIL: $HDR or $SRC has uncommitted changes." >&2
-  echo "  This script edits tracked files and restores them with 'git checkout --'," >&2
-  echo "  which would DESTROY that work. Commit or stash first, then re-run." >&2
+# --- opt-in dirty guard (snapshot-based, never destroy uncommitted work) ---
+GATE_SNAP_ALLOW_DIRTY="${INTFER_MATRIX_ALLOW_DIRTY:-0}"
+if ! git diff --quiet -- "$HDR" "$SRC" 2>/dev/null && [ "$GATE_SNAP_ALLOW_DIRTY" != "1" ]; then
+  echo "  Set GATE_SNAP_ALLOW_DIRTY=1 to run over them." >&2
   exit 1
 fi
+# print INPUT lines if dirty
+for f in "$HDR" "$SRC"; do
+  git diff --quiet -- "$f" 2>/dev/null || echo "  INPUT: UNCOMMITTED file=$f blob=$(git hash-object "$f")" >&2
+done
 if [ -n "$(git ls-files --others --exclude-standard -- "$HDR" "$SRC")" ]; then
   echo "FAIL: untracked files present at $HDR / $SRC" >&2
   exit 1
@@ -218,16 +246,12 @@ selfcheck || { echo "FAIL: this script's own invariants are broken" >&2; exit 1;
 preflight_anchors || exit 1
 
 restore() {
-  git checkout -- "$HDR" "$SRC" 2>/dev/null
-  # Never leave a mutation behind, even on Ctrl-C.
-  if ! git diff --quiet -- "$HDR" "$SRC"; then
-    echo "RESTORING: $HDR/$SRC were not clean; discarding mutation residue" >&2
-    git checkout -- "$HDR" "$SRC"
-  fi
+  gate_snap_restore_all "$HDR $SRC" || echo "RESTORING FAIL" >&2
+  # Use snapshot as source-of-truth; nothing else.
 }
-trap 'restore' EXIT
-trap 'restore; exit 130' INT
-trap 'restore; exit 143' TERM
+trap 'restore; rm -rf "$GATE_SNAP_DIR" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'restore; rm -rf "$GATE_SNAP_DIR" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true; exit 130' INT
+trap 'restore; rm -rf "$GATE_SNAP_DIR" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true; exit 143' TERM
 
 rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR" || exit 1
@@ -365,15 +389,17 @@ run_state() {
   [ "$ix" = "$want_ix" ] || verdict="$verdict index(want=$want_ix got=$ix)"
 
   if [ -z "$verdict" ]; then
-    printf '  %-26s rc=%s  readback_fail=%-2s contract=%-8s index=%-6s  AS EXPECTED\n' \
-      "$label" "$rc" "$rb" "$ct" "$ix" | tee -a "$SUMMARY"
+    _line="$(printf '  %-26s rc=%s  readback_fail=%-2s contract=%-8s index=%-6s  AS EXPECTED\n' \
+      "$label" "$rc" "$rb" "$ct" "$ix")"
   else
-    printf '  %-26s rc=%s  readback_fail=%-2s contract=%-8s index=%-6s  UNEXPECTED:%s\n' \
-      "$label" "$rc" "$rb" "$ct" "$ix" "$verdict" | tee -a "$SUMMARY"
+    _line="$(printf '  %-26s rc=%s  readback_fail=%-2s contract=%-8s index=%-6s  UNEXPECTED:%s\n' \
+      "$label" "$rc" "$rb" "$ct" "$ix" "$verdict")"
     FAILED=$((FAILED + 1))
   fi
+  printf '%s\n' "$_line"
+  gate_state_record --raw "$SUMMARY" "$_line"
   grep -E '^  contract: [0-9]+ \(nOp,stride\)|^  index: |^  readback ' "$log" \
-    | sed 's/^/       /' >>"$SUMMARY"
+    | sed 's/^/       /' | gate_state_record --stdin "$SUMMARY"
 }
 
 echo "=== DPAS fold mutation matrix (non-vacuity proof) ==="
@@ -417,15 +443,16 @@ run_state S6_index_s0        1 none clean  wrong
 # -- and it also catches an artifact poisoned by an EARLIER run, which a
 # byte-identical-restore check cannot see at all.
 restore
+# The disarm below would otherwise DROP the EXIT trap without running it, leaving
+# the lock behind on every successful run; release it explicitly first.
+rmdir "$LOCK" 2>/dev/null || true
 trap - EXIT INT TERM
-
 echo
-if git diff --quiet -- "$HDR" "$SRC"; then
-  echo "restore: $HDR and $SRC are byte-identical to HEAD"
+if gate_snap_integrity "$HDR $SRC"; then
+  echo "restore: $HDR and $SRC are byte-identical to their startup snapshot"
 else
   echo "FAIL: restore left the tree dirty" >&2; FAILED=$((FAILED + 1))
 fi
-
 echo "rebuild: dpas_fold_probe from the restored source (not the mutated one)"
 . "$SCRIPT_DIR/../lib/_gate_build.sh"
 if gate_require_build dpas_fold_probe; then
@@ -440,10 +467,10 @@ if gate_require_build dpas_fold_probe; then
 else
   echo "FAIL: could not rebuild dpas_fold_probe after restore" >&2; FAILED=$((FAILED + 1))
 fi
-if has_residue "$HDR" "$SRC"; then
-  echo "FAIL: mutation residue left in tracked sources" >&2; FAILED=$((FAILED + 1))
-else
+if gate_snap_check_residue "$HDR $SRC"; then
   echo "residue: none (no M1/M2/M4/M5/M6 markers in tracked sources)"
+else
+  echo "FAIL: mutation residue left in tracked sources" >&2; FAILED=$((FAILED + 1))
 fi
 
 echo
@@ -452,11 +479,13 @@ if [ "$FAILED" = "0" ]; then
   # session can tell "the matrix passed" from "the matrix passed on THIS code".
   # Without it, a refactor can move the anchors and the only signal is a
   # failure buried in someone's gate log.
+  gate_snap_attest "$STAMP.attestation" >/dev/null 2>&1 || true
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "states=S0,S1,S2,S3,S4,S5,S6"
   } >"$STAMP" 2>/dev/null
+  cat "$STAMP.attestation" 2>/dev/null >>"$STAMP" || true
   echo "FOLD MUTATION MATRIX: PASS (7/7 states behaved as characterized)"
   emit_summary
   echo "  stamped $(git rev-parse --short HEAD 2>/dev/null) -> $STAMP"

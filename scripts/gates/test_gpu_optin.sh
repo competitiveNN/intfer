@@ -470,6 +470,11 @@ for tp in $TPS; do
       | grep -aoE 'group=[0-9]+' | head -1 \
       | sed -E 's/group=([0-9]+)/\1/'
   }
+  int8kvg_knob_echo() { # $1 = log -> prints the INTFER_INT8_KV_G value echoed, or nothing
+    grep -aoE '\[int8-kv-g\].*INTFER_INT8_KV_G=[0-9]+' "$1" | head -1 \
+      | grep -aoE 'INTFER_INT8_KV_G=[0-9]+' | head -1 \
+      | sed -E 's/INTFER_INT8_KV_G=([0-9]+)/\1/'
+  }
   int8kvg_ok() {   # $1 = log, $2 = expected group. 0=accept.
     [ "$(int8kvg_group "$1")" = "$2" ]
   }
@@ -516,6 +521,187 @@ for tp in $TPS; do
     fi
     rm -rf "$GSB"
   }
+
+
+  # --- INTFER_KV_Q8 / INTFER_KV_Q4 / INTFER_KV_Q4_HAD / INTFER_KV_Q5_1 /
+  #     INTFER_KV_Q5_1_HAD / INTFER_KV_KVARN: KV cache quantisation variants ---
+  # Each flag selects a different KV codec on top of the shared INT8-KV infra
+  # (group size via INTFER_INT8_KV_G for the groupwise codecs; q8 is per-token
+  # G64 and does NOT read INTFER_INT8_KV_G -- it uses hardcoded ng=hd/64).
+  # q8, q5_1, q5_1_had and kvarn are lossless enough on this 0.8B prompt
+  # that the argmax stream matches base (asserted by stream identity).
+  #   NOTE (fixture-scoped): the q8 stream-identity claim above is verified on
+  #   the 0.8B fixture only. q8 is tolerance-class in general (8-bit
+  #   quantisation error is not zero), so at larger scales / longer prompts the
+  #   stream may move without a codec regression. Reachability -- the
+  #   ` Q8-G64` tag in the [int8-kv-g] announcement -- is the real
+  #   certification; stream identity is a bonus that happens to hold here.
+  # q4 AND q4_had are tolerance-class: 4-bit quantisation error is not zero
+  #   and the Hadamard rotation spreads it across every group element, so the
+  #   stream moves (q4: 264 3177 303 279 vs base 279 6511 314 279; q4_had:
+  #   264 3177 13 198 vs base 279 6511 314 279). Both assert reachability via
+  #   the [int8-kv-g] announcement only -- no stream identity. The
+  # announcement echoes the active variant tag (Q8-G64 / Q4 / Q4+HAD / Q5_1 /
+  # Q5_1+HAD / KVARn), so a flag that never reached kv_append cannot pass.
+  #
+  # GROUP HONESTY (a SECOND predicate on the same line, not a third assertion
+  # on the tag): the announcement must name the group the codec ACTUALLY used.
+  # q8 uses hardcoded 64-dim groups and never reads INTFER_INT8_KV_G; the
+  # groupwise codecs use the shared knob. A line that echoed the knob for q8
+  # would say group=32 while q8 used 64 -- a silent mismatch the tag check
+  # cannot see, because the tag is identical either way. The arm therefore
+  # also asserts group=<expected>, with the groupwise expectation derived
+  # from the env knob under the SAME clamp the code applies (1..1024, else
+  # 32). Without this the q8 arm would certify a line that lies about the
+  # very thing q8 is distinguished by.
+  #
+  # Self-checks mirror INT8_KV_G at line 447+: (b) refusal -- a log whose
+  # announcement omits the tag must be refused; (c) vacuity -- an empty log
+  # must fail. Both are built from the real fixture so the predicate can fire.
+  # The group-honesty predicate carries its own two directions (b2/c2): a log
+  # whose group= number was rewritten must be refused, and an empty log must
+  # be refused.
+
+  kv_var_tag() { # $1 = variant name -> prints the tag the announcement echoes
+    case "$1" in
+      q4)      echo " Q4" ;;
+      q4_had)  echo " Q4+HAD" ;;
+      q5_1)    echo " Q5_1" ;;
+      q5_1_had) echo " Q5_1+HAD" ;;
+      q8)      echo " Q8-G64" ;;
+      kvarn)   echo " KVARn" ;;
+      *)       echo "" ;;
+    esac
+  }
+  # q4_had is tolerance-class: 4-bit + Hadamard rotates energy across every
+  # group element before quantisation, so the dequantised row differs from FP32
+  # by more than argmax noise can absorb. The other variants happen to be
+  # lossless enough on this 0.8B prompt that the stream matches base.
+  kv_var_stream_identical() { # $1 = variant name -> 1 if stream must equal base
+    case "$1" in
+      q4 | q4_had)  echo "0" ;;
+      *)       echo "1" ;;
+    esac
+  }
+  kv_var_announced() { # $1 = log, $2 = variant tag -> 0 if tag appears
+    grep -aqF "$2" "$1"
+  }
+  kv_var_env() { # $1 = variant name -> prints the env var string
+    case "$1" in
+      q4)      echo "INTFER_KV_Q4=1" ;;
+      q4_had)  echo "INTFER_KV_Q4=1 INTFER_KV_Q4_HAD=1" ;;
+      q5_1)    echo "INTFER_KV_Q5_1=1" ;;
+      q5_1_had) echo "INTFER_KV_Q5_1=1 INTFER_KV_Q5_1_HAD=1" ;;
+      q8)      echo "INTFER_KV_Q8=1" ;;
+      kvarn)   echo "INTFER_KV_KVARN=1" ;;
+      *)       echo "" ;;
+    esac
+  }
+  # Expected effective group named by [int8-kv-g] per variant: q8 uses hardcoded
+  # 64-dim groups (G64) regardless of INTFER_INT8_KV_G; the groupwise codecs
+  # (q4/q5_1/kvarn) use the shared knob. The knob's value is derived from the
+  # environment with the SAME clamp the code applies (1..1024, else 32), so an
+  # ambient INTFER_INT8_KV_G does not produce a false failure and a clamped
+  # value cannot silently disagree with the line.
+  kv_var_expected_group() { # $1 = variant name -> expected group number
+    case "$1" in
+      q8) echo "64" ;;
+      *)
+        _g="${INTFER_INT8_KV_G:-32}"
+        case "$_g" in
+          ''|*[!0-9]*) echo "32" ;;
+          *) if [ "$_g" -ge 1 ] && [ "$_g" -le 1024 ]; then echo "$_g"; else echo "32"; fi ;;
+        esac ;;
+    esac
+  }
+  for variant in q4 q4_had q5_1 q5_1_had q8 kvarn; do
+    TAG="$(kv_var_tag "$variant")"
+    ENVSTR="$(kv_var_env "$variant")"
+    STREAM_ID="$(kv_var_stream_identical "$variant")"
+    [ -n "$TAG" ] || { echo "GATE FAIL: no tag for variant $variant" >&2; PASS=0; continue; }
+    [ -n "$ENVSTR" ] || { echo "GATE FAIL: no env for variant $variant" >&2; PASS=0; continue; }
+    {
+      V_OUT="$(mktemp)"; V_ERR="$(mktemp)"
+      # shellcheck disable=SC2086
+      env $ENVSTR "$BIN" --gpu --tp "$tp" -m "$MODEL" -p "$PROMPT" \
+        -n "${N:-4}" --no-stream --ids $TOK >"$V_OUT" 2>"$V_ERR"; V_RC=$?
+      if [ "$V_RC" -ne 0 ]; then
+        fail "TP=$tp [$ENVSTR] run exited rc=$V_RC"; tail -10 "$V_ERR" >&2
+      else
+        V_IDS="$(ids_of "$tp" $ENVSTR)"
+        echo "TP=$tp [$ENVSTR]: '$V_IDS'"
+        [ -n "$V_IDS" ] || fail "TP=$tp [$ENVSTR] stream EMPTY"
+        if [ "$STREAM_ID" = "1" ]; then
+          [ "$V_IDS" = "$BASE" ] \
+            || fail "TP=$tp [$ENVSTR] '$V_IDS' != base '$BASE' (KV quantisation must not move the stream)"
+        else
+          echo "TP=$tp [$ENVSTR]: stream differs from base (tolerance-class, 4-bit+HAD); reachability asserted via announcement only"
+        fi
+        kv_var_announced "$V_ERR" "$TAG" \
+          || { echo "GATE FAIL: TP=$tp [$ENVSTR] announcement does not name $TAG" >&2; PASS=0; }
+        # GROUP HONESTY: the [int8-kv-g] line must name the group the codec
+        # ACTUALLY used. q8 uses hardcoded 64-dim groups and does NOT read
+        # INTFER_INT8_KV_G; the groupwise codecs use the shared knob. A line
+        # that echoed the knob for q8 would report group=32 while q8 used 64
+        # -- a silent mismatch that the tag check alone cannot see (the tag
+        # is the same either way).
+        V_GROUP="$(int8kvg_group "$V_ERR")"
+        V_EGROUP="$(kv_var_expected_group "$variant")"
+        [ "$V_GROUP" = "$V_EGROUP" ] \
+          || { echo "GATE FAIL: TP=$tp [$ENVSTR] announcement reports group=$V_GROUP, expected $V_EGROUP (the line must name the group the codec actually used)" >&2; PASS=0; }
+      fi
+      rm -f "$V_OUT" "$V_ERR"
+    }
+    # Self-check: (b) refusal -- strip the tag from a real announcement and
+    # require the predicate to refuse; (c) vacuity -- empty log must fail.
+    VSB="$(mktemp -d)"
+    env $ENVSTR "$BIN" --gpu --tp 1 -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$VSB/good.out" 2>"$VSB/good.err" || true
+    if ! kv_var_announced "$VSB/good.err" "$TAG"; then
+      echo "TP=$tp [$ENVSTR] self-check SKIPPED: fixture produced no $TAG announcement" >&2
+    else
+      cp "$VSB/good.err" "$VSB/not.err"
+      sed -i "s|$TAG||" "$VSB/not.err"
+      : >"$VSB/empty.err"
+      if kv_var_announced "$VSB/not.err" "$TAG"; then
+        fail "TP=$tp [$ENVSTR] self-check (b): announcement without $TAG was accepted (refusal broken)"
+      fi
+      if kv_var_announced "$VSB/empty.err" "$TAG"; then
+        fail "TP=$tp [$ENVSTR] self-check (c): empty log accepted $TAG (vacuity broken)"
+      fi
+      # Same two directions for the GROUP-HONESTY predicate: a line whose
+      # group= number has been rewritten must be refused, and an empty log
+      # must be refused. Built from the REAL announcement so the predicate
+      # can actually fire (a synthetic log would pass by construction).
+      cp "$VSB/good.err" "$VSB/badgroup.err"
+      sed -i 's|group=[0-9][0-9]*|group=999999|' "$VSB/badgroup.err"
+      if [ "$(int8kvg_group "$VSB/badgroup.err")" = "$V_EGROUP" ]; then
+        fail "TP=$tp [$ENVSTR] self-check (b2): announcement with a rewritten group was accepted (group-honesty refusal broken)"
+      fi
+      if [ "$(int8kvg_group "$VSB/empty.err")" = "$V_EGROUP" ]; then
+        fail "TP=$tp [$ENVSTR] self-check (c2): empty log accepted the group (group-honesty vacuity broken)"
+      fi
+    fi
+    rm -rf "$VSB"
+  done
+
+  # --- STRUCTURAL REACHABILITY: each codec's append call site exists ----------
+  # The announcement tag proves the codec was activated at layer setup, but not
+  # that its append function is actually called during token appends. A
+  # regression could remove the call sites while keeping the announcement --
+  # the tag would still appear but the codec would be dead code. Verify each
+  # codec's append call site exists in main.cpp (kv_append dispatcher at line
+  # 4704-4711).
+  for append_site in \
+    "kv_q8_append(ly, n_kv, hd, pos, true)" \
+    "kv_q4_append(ly, n_kv, hd, pos, true)" \
+    "kv_q5_1_append(ly, n_kv, hd, pos, true)" \
+    "kv_kvarn_append(ly, n_kv, hd, pos, true)"; do
+    if ! grep -qF "$append_site" examples/intfer_cli/main.cpp; then
+      fail "STRUCTURAL REACHABILITY: append call site missing in main.cpp: $append_site"
+    fi
+  done
+  echo "STRUCTURAL REACHABILITY: all 4 KV codec append call sites present in main.cpp"
 
 
   # --- INTFER_L4_ROWS: FNV row-fidelity hash, TP=1 only ---------------------
@@ -1370,6 +1556,57 @@ for tp in $TPS; do
 
 
 done
+
+# --- INTFER_KV_Q4 / Q5_1 / KVARn: TP=2 knob-enforcement check -----------------
+# At TP=2 the argmax stream is vacuous (token=0 every step), so stream
+# identity cannot certify anything there. The per-variant group-honesty
+# predicate already asserts group=<expected>, but when the knob equals its
+# default (32) a codec that IGNORES the knob and always reports 32 would
+# still pass. This pass runs each groupwise variant at TP=2 with
+# INTFER_INT8_KV_G=16 (a non-default value) and asserts the announcement
+# reports group=16 -- proving the knob is actually READ at TP=2, not merely
+# compared against its default. q8 is excluded: it never reads
+# INTFER_INT8_KV_G (hardcoded G64), which the group-honesty predicate above
+# already certifies as group=64 at TP=1 and TP=2 alike.
+# Placed AFTER the tp loop so it runs ONCE, and guarded on HAVE_TP2 so a
+# 1-GPU box skips it loudly rather than certifying a TP=2 claim it could
+# not make (the gate exits 2 in that case, so a PARTIAL PASS is never
+# mistaken for the full matrix).
+if [ "$HAVE_TP2" = 1 ]; then
+  for env_knob in "INTFER_KV_Q4=1 INTFER_INT8_KV_G=16" \
+                  "INTFER_KV_Q4=1 INTFER_KV_Q4_HAD=1 INTFER_INT8_KV_G=16" \
+                  "INTFER_KV_Q5_1=1 INTFER_INT8_KV_G=16" \
+                  "INTFER_KV_Q5_1=1 INTFER_KV_Q5_1_HAD=1 INTFER_INT8_KV_G=16" \
+                  "INTFER_KV_KVARN=1 INTFER_INT8_KV_G=16"; do
+    KE_OUT="$(mktemp)"; KE_ERR="$(mktemp)"
+    # shellcheck disable=SC2086
+    env $env_knob "$BIN" --gpu --tp 2 -m "$MODEL" -p "$PROMPT" \
+      -n "${N:-4}" --no-stream --ids $TOK >"$KE_OUT" 2>"$KE_ERR"; KE_RC=$?
+    if [ "$KE_RC" -ne 0 ]; then
+      fail "TP=2 [$env_knob] run exited rc=$KE_RC"; tail -10 "$KE_ERR" >&2
+    else
+      KE_GROUP="$(int8kvg_group "$KE_ERR")"
+      [ "$KE_GROUP" = "16" ] \
+        || { echo "GATE FAIL: TP=2 [$env_knob] announcement reports group=$KE_GROUP, expected 16 (knob not read at TP=2)" >&2; PASS=0; }
+      KE_KNOB="$(int8kvg_knob_echo "$KE_ERR")"
+      [ "$KE_KNOB" = "16" ] \
+        || { echo "GATE FAIL: TP=2 [$env_knob] announcement does not echo INTFER_INT8_KV_G=$KE_KNOB, expected 16 (the line must echo the knob value)" >&2; PASS=0; }
+      echo "TP=2 [$env_knob]: announcement group=$KE_GROUP knob=$KE_KNOB (knob enforced)"
+    fi
+    rm -f "$KE_OUT" "$KE_ERR"
+  done
+
+  # --- self-check (b-direction): the knob-echo predicate must refuse a broken echo ---
+  KE_SB="$(mktemp)"
+  printf '[int8-kv-g] INT8 KV group ACTIVE (group=16 cap=1024 Q4; INTFER_INT8_KV_G=32)\n' > "$KE_SB"
+  KE_BROKEN="$(int8kvg_knob_echo "$KE_SB")"
+  if [ "$KE_BROKEN" = "16" ]; then
+    fail "TP=2 knob-enforcement self-check (b): echo predicate accepted INTFER_INT8_KV_G=32 as 16"
+  fi
+  rm -f "$KE_SB"
+else
+  echo "TP=2 knob-enforcement check SKIPPED: need 2 GPUs, ${N_GPUS:-0} visible." >&2
+fi
 
 if [ "$PASS" != 1 ]; then
   echo "GPU-OPTIN TEST: FAIL" >&2

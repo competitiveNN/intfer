@@ -34,6 +34,21 @@ STAMP="$BUILD_DIR/l0_cite_mutate"
 MUT="$BUILD_DIR/cr.mut"
 LOG="$STAMP/states"
 
+# *** WIPE LOCK, OUTSIDE THE TREE IT WIPES (check_matrix_sandbox_locks.sh). ***
+# MUT is a fixed path wiped and rebuilt per state (line ~98), so two concurrent
+# runs share it: the second's rm -rf deletes the first's tree mid-state. The lock
+# sits beside MUT under $BUILD_DIR, never inside it, and is taken before the first
+# wipe; it is released on EXIT/INT/TERM so a dead run cannot brick the next.
+LOCK="$BUILD_DIR/.mutate_l0_cite.lock"
+mkdir -p "$BUILD_DIR" 2>/dev/null || true
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "FAIL: another mutate_l0_cite.sh is running (lock: $LOCK)" >&2
+  exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 130' INT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 143' TERM
+
 # The checker itself must work before we judge its ability to fail.
 if [ ! -d "$SRC_TREE/.git" ]; then
   echo "SKIP: no pinned compute-runtime tree at $SRC_TREE"

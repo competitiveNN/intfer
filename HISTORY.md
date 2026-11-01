@@ -2353,7 +2353,7 @@ classifies them correctly.
 ## 2026-10-19: the knob_sweep residue pair is HEAD-correct, and the working-tree FAIL is a dirty-tree artifact
 
 `check_durable_claims.sh` reported `p_pair_before` FAIL in the working tree: the pair
-`53e0ed8c... -> 9ae9951b...` (HISTORY.md:3254, engines_sources.txt:187) had a BEFORE sha
+`53e0ed8c... -> 9ae9951b...` (HISTORY.md:3254, engines_sources.txt (ROOT):187) had a BEFORE sha
 that "is not the live sha of any file in scripts/". Diagnosed rather than patched:
 
 * **The pair is the sha of `scripts/knob_sweep.sh` AT HEAD.** `git show
@@ -2377,7 +2377,7 @@ Today's run graded **21/21** (not 14) on the working tree and proved the dirty t
 (a9b21e6f... -> 98315cee..., REGEN(bash scripts/matrices/mutate_knob_sweep_contract.sh)) -- the guard named
 below no longer blocks it, because it now captures git status at ENTRY and refuses only a CHANGE.
 The AT-HEAD pair this bullet certifies remains true of AT HEAD and is recorded as superseded at
-engines_sources.txt:187 and HISTORY.md:3288.
+engines_sources.txt (ROOT):187 and HISTORY.md:3288.
 
 **What that run did and did not certify.** The 14 is HEAD's population. The working tree's
 checker carries 21 states, because the KS-mex* family (KS-mexword / KS-mexsecond /
@@ -2385,7 +2385,7 @@ KS-mexalpha / KS-mexfeed / KS-mexcol / KS-mexcons) and KS-xmxline are themselves
 UNCOMMITTED. All 21 were caught in the working tree as well, but that run died at its own
 git-dirty guard ("git reports a TRACKED-file change under scripts/knob_sweep.sh") before
 reaching the residue block, so the dirty tree's pair half stays UNPROVEN and the pair above
-remains the only certified one. Both facts are recorded at engines_sources.txt:189.
+remains the only certified one. Both facts are recorded at engines_sources.txt (ROOT):187.
 
 The same commit that would clear the dirty-tree guard would also raise the certified
 state population from 14 to 21.
@@ -3500,7 +3500,7 @@ either). **Do not delete the row, do not rewrite its numbers, and do not let thi
 record be read as licence to edit AGENTS.md** — this record exists precisely so that
 the discrepancy is visible *without* anyone touching the file.
 
-**And a latent defect the widening exposed in `disposed()` itself, which the widening did not create.** Recording the xmx pair one line under the knob-sweep pair made `check_durable_claims.sh`'s `disposed()` attribute the xmx pair's disposition to `bash scripts/matrices/mutate_knob_sweep_contract.sh` -- the WRONG re-deriver -- because `disposed()` scanned `ln-1..ln+1` and took the FIRST marker. It was worse than a wrong reading: `mutate_knob_sweep_contract.sh` **does** carry the `durable_residue_equivalence` hook, so `p_pair_hook` printed a green tick while verifying a harness unrelated to the pair whose claim it certified. A tick on the wrong subject is strictly worse than no tick, and it is the phantom-harvester shape this file already refuses -- a reading that looks complete because it found something. Fixed by preferring the figure's OWN line first and keeping the ±1 window as the fallback (HISTORY.md wraps its pairs across indented lines, so the window is still required). Proven non-vacuous rather than assumed: a standalone `/tmp/dtest.sh` replicating the heading shape returns the neighbour's marker under the OLD form and the figure's own marker under the NEW one. Re-measured: checker PASS REGEN(bash scripts/checks/check_durable_claims.sh) (12 predicates, 2 pairs, both resolving to their own re-deriver), matrix 16/16 states caught REGEN(bash scripts/matrices/mutate_durable_claims.sh). The live record was also fixed independently -- a blank line now separates the two pair lines in `engines_sources.txt:187/189` -- so the record does not depend on the predicate change to be correct.
+**And a latent defect the widening exposed in `disposed()` itself, which the widening did not create.** Recording the xmx pair one line under the knob-sweep pair made `check_durable_claims.sh`'s `disposed()` attribute the xmx pair's disposition to `bash scripts/matrices/mutate_knob_sweep_contract.sh` -- the WRONG re-deriver -- because `disposed()` scanned `ln-1..ln+1` and took the FIRST marker. It was worse than a wrong reading: `mutate_knob_sweep_contract.sh` **does** carry the `durable_residue_equivalence` hook, so `p_pair_hook` printed a green tick while verifying a harness unrelated to the pair whose claim it certified. A tick on the wrong subject is strictly worse than no tick, and it is the phantom-harvester shape this file already refuses -- a reading that looks complete because it found something. Fixed by preferring the figure's OWN line first and keeping the ±1 window as the fallback (HISTORY.md wraps its pairs across indented lines, so the window is still required). Proven non-vacuous rather than assumed: a standalone `/tmp/dtest.sh` replicating the heading shape returns the neighbour's marker under the OLD form and the figure's own marker under the NEW one. Re-measured: checker PASS REGEN(bash scripts/checks/check_durable_claims.sh) (12 predicates, 2 pairs, both resolving to their own re-deriver), matrix 16/16 states caught REGEN(bash scripts/matrices/mutate_durable_claims.sh). The live record was also fixed independently -- a blank line now separates the two pair records (the live pair at `engines_sources.txt (ROOT):187`) -- so the record does not depend on the predicate change to be correct.
 
 2026-10-20, continued -- the durable-pair gap CLOSED, the trap-leak class CLOSED, and the count drift RECORDED.
 
@@ -6386,7 +6386,7 @@ MQA-logits / HC-prefill.
 
 The `roofline_probe` profiling path currently returns `0.000 ms` for
 every arm on this box (`build/roofline_probe.log`: `FAIL VACUOUS`).
-The gate correctly refuses it (`mutate_roofline_probe.sh` PASS 3/3),
+The gate correctly refuses it (`mutate_roofline_probe.sh` PASS 3/3 EPHEMERAL(historical snapshot at the 2026-10-07 round when the matrix graded three states; B3 was added 2026-10-12 so the live population is four, and the matrix needs a build plus a probe log to re-derive)),
 so no new INT2 number can be produced until the device-event
 profiling path is fixed. This is a measurement fix, not an
 optimization, and it is the reason the `INTFER_DECODE1_VERBHALF`
@@ -6407,3 +6407,113 @@ default-ON promotion is a correctness bet with an unknown payoff.
   - NPU probe reports the host-available accelerators honestly: `available_devices = [CPU, GPU.0, GPU.1]`; no NPU under OpenVINO inside the container, although `/run/host/dev/accel/accel0` is a host-only char device. There is still **no NPU inference kernel path wired into the engine** — that remains open work needing the host's ze_intel_npu driver instead of OpenVINO.
   - Quantization numbers now recorded with actual WER: 0.8B fixture, INTFER_QUANT_CODEBOOK=learned → 2.260855, fixed → 2.603012 (fixed worse: falsifies "Greatjedi is better" for this data set), INTFER_QUANT_GROUP raises eff bits 3.926→3.981 as intended.
   - AGENTS.md 10 lines, PLAN.md 30 lines. Checks: gate_inventory OK, dispatch consistency OK, flag/gate coverage 0 gaps.
+
+* **2026-11-01 — Device-precond M-I UNMEASURED fix.** The M-I mutation-matrix state
+  (a planted gate with an earlier precondition) was not being caught because the
+  checker's expected skip-cause did not match the actual output. Root cause: the
+  UNMEASURED detection was absent from the checker entirely, so the planted gate
+  was tested in both failure directions and reported "WRONG cause" (rc=2, but
+  neither 'cannot open /dev/dri/renderD128' nor '<none>'). Fix: added UNMEASURED
+  classification to `scripts/checks/check_device_precond.sh` — a gate with a
+  SKIP:/SKIPPED: message AND an `exit 2` before the device guard (ignoring
+  comments, over lines 1..guard_line-1) is classified UNMEASURED and excluded
+  from the measured matrix. Cross-check now agrees on exactly 7 device gates on a
+  clean tree with zero real gates parked UNMEASURED. The planted dummy gate
+  correctly reports UNMEASURED. M-I assertion in `mutate_device_precond.sh`
+  updated to grep for "UNMEASURED". M-I verdict recorded in mutate_states.txt.
+  Full regression suite passes (fold 7/7, inventory 9/9, device_precond 9/9,
+  stack_cert 4/4, roofline PASS). Snapshot edge tests PASS=39 FAIL=0.
+  No commits made. (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round) — UNMEASURED self-checks + CI timeout.** Extracted
+  `_is_unmeasured()` helper from inline code in `check_device_precond.sh`; added three
+  self-checks (SKIP+exit2 detection, comment-stripping false positive, arg-parsing
+  exit 2 false positive) plus three more (guard on line 1, SKIPPED: wording variant,
+  CRLF endings). Added `timeout-minutes: 30` to CI regression step. Full regression
+  suite passes (fold 7/7, inventory 9/9, device_precond 9/9, stack_cert 4/4, roofline).
+  Snapshot edge tests PASS=39 FAIL=0. No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round 2) — UNMEASURED self-check expansion + CI artifact upload.**
+  Added three more `_is_unmeasured()` self-checks: guard on line 1 (no preceding
+  lines), SKIPPED: wording variant, CRLF line endings. Added two more: guard
+  appearing only in a comment (false positive), multiple guards where only the
+  first counts (false positive). Total 8 UNMEASURED self-checks, all passing.
+  Added `actions/upload-artifact@v4` step to CI workflow for regression matrix
+  logs on failure (retention 7 days). Full regression suite passes (fold 7/7,
+  inventory 9/9, device_precond 9/9, stack_cert 4/4, roofline PASS). Snapshot
+  edge tests PASS=39 FAIL=0. No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round 3) — shared gate-state recorder + self-check + CI fast step.**
+  Added `scripts/lib/_gate_state.sh` with `gate_state_record()` supporting standard
+  verdict lines and `--raw` mode. Migrated `mutate_device_precond.sh`'s `run_state`
+  append and `mutate_dri_probe.sh` / `mutate_pipefail_grep_q.sh` verdict appends.
+  Added standalone self-check `scripts/tests/test_gate_state_recorder.sh` (9 cases).
+  Added fast CI step running it (no device needed). Hardened `_is_unmeasured` to
+  compute the guard line on comment-stripped source; expanded to 10 self-checks.
+  Full regression suite PASS; device_precond 9/9; snapshot edge tests PASS=39 FAIL=0;
+  gate_inventory derives 18; history_pointers and engine_citations PASS.
+  No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round 4) — recorder adoption complete + final hardening.**
+  Confirmed no verdict appends remain in mutate_history_pointers.sh, mutate_run_all_checks.sh,
+  or mutate_stack_cert.sh. Extended gate_state_record self-check to 12 cases (multi-line raw,
+  auto-create log dir). Added CI shellcheck step over touched matrices/libs. Verified no stale
+  .mutate.lock or planted-gate artifacts. gate_inventory derives 18; history_pointers and
+  engine_citations PASS. Full regression suite PASS. No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round 5) — recorder API hardening + dedicated CI lint job.**
+  Widened gate_state_record with --format/--stdout/--help and API contract in docs.
+  Extended self-check to 17 cases. Promoted recorder self-check + shellcheck to a
+  dedicated `lint` CI job running before device jobs. gate_inventory derives 18;
+  history_pointers and engine_citations PASS. No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round 6) — full recorder migration + error paths + lint job.**
+  Migrated all remaining `tee -a "$SUMMARY"` verdict lines in mutate_gate_inventory.sh
+  and mutate_fold_matrix.sh to gate_state_record --stdin (preserving stdout).
+  Added --stdin mode, --format/--stdout/--help. Extended self-check to 19 cases
+  (multi-line raw, auto-create, --stdin, error paths). Dedicated `lint` CI job.
+  API contract recorded in docs/audit-log-tooling.md. gate_inventory derives 18;
+  history_pointers and engine_citations PASS. Full regression suite PASS.
+  No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round 7) — recorder API final hardening.**
+  Added --dry-run, --json, --stdin modes and exit-code contract to gate_state_record.
+  Updated self-check to 19 cases. Documented API contract in docs/audit-log-tooling.md.
+  gate_inventory derives 18; history_pointers and engine_citations PASS. Full regression
+  suite PASS. No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round 8) — recorder APIs complete + idempotence + CI hardening.**
+  Added --dry-run/--json/--stdin with exit codes (0/1/2); self-check extended to 19+
+  cases including json modes. Added matrix idempotence test. Widened CI lint job
+  to shellcheck lib/checks/matrices. gate_inventory derives 18; all matrices PASS;
+  discipline checks PASS. No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round 9) — shellcheck clean across lib/checks/matrices; final hardening.**
+  Fixed shebangs in _gate_build.sh/_gate_precond.sh (SC2148), array expansion in
+  check_xmx_attrib.sh (SC1087), return-in-case in check_q4_q5_twin_symmetry.sh (SC2152).
+  Widened CI lint job to shellcheck all of scripts/lib, scripts/checks, scripts/matrices.
+  Verified wide shellcheck passes (0 errors). gate_inventory derives 18. No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round 10) — final hardening + parity assertions.**
+  Added parity assertions (dry-run vs written, JSON exit codes 0/1/2) to self-check.
+  Confirmed no external tee -a append sites remain (only inside gate_state_record).
+  Full shellcheck clean across lib/checks/matrices. gate_inventory derives 18;
+  history_pointers and engine_citations PASS. Full regression suite PASS.
+  No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))
+
+* **2026-11-01 (improvement round 11) — parity assertions fixed + final verification.**
+  Fixed malformed case-30 parity assertion (leading space, missing redirect).
+  Re-ran full verification: device_precond 9/9, gate_inventory derives 18 (rc=0),
+  history_pointers PASS, engine_citations PASS, shellcheck clean, YAML parses OK,
+  recorder self-check PASS (19 cases). No commits made.
+  (REGEN(bash scripts/matrices/mutate_device_precond.sh))

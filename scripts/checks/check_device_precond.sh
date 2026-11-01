@@ -103,8 +103,8 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT" || exit 1
 LOG_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/device_precond_matrix"
 STAMP="$LOG_DIR/last_pass.stamp"
-NODEV_STUB="$SCRIPT_DIR/fixtures/no-device/sycl-ls"
-NONODE_DIR="$SCRIPT_DIR/fixtures/no-render-node"
+NODEV_STUB="$SCRIPT_DIR/../fixtures/no-device/sycl-ls"
+NONODE_DIR="$SCRIPT_DIR/../fixtures/no-render-node"
 mkdir -p "$LOG_DIR" || exit 1
 
 FAILURES=0
@@ -183,6 +183,18 @@ expect_skip() {
 # --- assertion 5: behavioural self-check ------------------------------------
 # Runs the assertion above against synthetic gates. If expect_skip cannot fail,
 # the whole matrix proves nothing, so this runs FIRST and gates the run.
+_is_unmeasured() {
+  local gate="$1" guard_line earlier skip_msg
+  guard_line="$(sed 's/#.*$//' "$gate" | grep -nE 'gate_require_device|gate_require_render_node' | head -1 | cut -d: -f1)"
+  [ -z "$guard_line" ] && return 1
+  [ "$guard_line" -le 1 ] && return 1
+  earlier="$(sed -n "1,$((guard_line - 1))p" "$gate" | sed -e 's/#.*$//' | grep -cE 'SKIP:|SKIPPED:|exit 2' || true)"
+  skip_msg="$(sed -n "1,$((guard_line - 1))p" "$gate" | sed -e 's/#.*$//' | grep -cE 'SKIP:|SKIPPED:' || true)"
+  [ "${skip_msg:-0}" -eq 0 ] && return 1
+  [ "${earlier:-0}" -gt 0 ] && return 0
+  return 1
+}
+
 selfcheck() {
   local d bad_=0 g
   d="$(mktemp -d "$LOG_DIR/.selfcheck.XXXXXX")"
@@ -238,10 +250,185 @@ G
     bad_=1; SUPPRESS=1
   fi
 
+  # (d) UNMEASURED detection: a gate with a SKIP message + exit 2 before
+  #     the device guard must be classified UNMEASURED.
+  g="$d/unmeasured_gate.sh"
+  cat >"$g" <<'G'
+#!/usr/bin/env bash
+echo "SKIP: fixture precondition: not installed" >&2
+exit 2
+gate_require_device || exit 2
+echo "would run"
+G
+  chmod +x "$g"
+  if _is_unmeasured "$g"; then
+    ok "SELFCHECK: UNMEASURED detection catches SKIP + exit 2 before guard"
+  else
+    SUPPRESS=0; bad "SELFCHECK: UNMEASURED detection MISSED a gate with SKIP + exit 2"
+    bad_=1; SUPPRESS=1
+  fi
+
+  # (e) UNMEASURED false positive: trailing comment with "exit 2" must NOT
+  #     trigger UNMEASURED (comment-stripping must handle it).
+  g="$d/comment_exit2.sh"
+  cat >"$g" <<'G'
+#!/usr/bin/env bash
+# This gate exits 2 on failure # exit 2
+gate_require_device || exit 2
+echo "would run"
+G
+  chmod +x "$g"
+  if _is_unmeasured "$g"; then
+    SUPPRESS=0; bad "SELFCHECK: UNMEASURED false-positive on trailing comment with exit 2"
+    bad_=1; SUPPRESS=1
+  else
+    ok "SELFCHECK: UNMEASURED ignores exit 2 in comments"
+  fi
+
+  # (f) UNMEASURED false positive: arg-parsing exit 2 (no SKIP message) must
+  #     NOT trigger UNMEASURED.
+  g="$d/argparse_exit2.sh"
+  cat >"$g" <<'G'
+#!/usr/bin/env bash
+case "$1" in
+  *) echo "unknown arg" >&2; exit 2 ;;
+esac
+gate_require_device || exit 2
+echo "would run"
+G
+  chmod +x "$g"
+  if _is_unmeasured "$g"; then
+    SUPPRESS=0; bad "SELFCHECK: UNMEASURED false-positive on arg-parsing exit 2"
+    bad_=1; SUPPRESS=1
+  else
+    ok "SELFCHECK: UNMEASURED ignores arg-parsing exit 2 (no SKIP message)"
+  fi
+
+  # (g) UNMEASURED false positive: guard on line 1 (no preceding lines) must
+  #     NOT trigger UNMEASURED.
+  g="$d/guard_line1.sh"
+  printf '#!/usr/bin/env bash\ngate_require_device || exit 2\necho would run\n' >"$g"
+  chmod +x "$g"
+  if _is_unmeasured "$g"; then
+    SUPPRESS=0; bad "SELFCHECK: UNMEASURED false-positive when guard is on line 1"
+    bad_=1; SUPPRESS=1
+  else
+    ok "SELFCHECK: UNMEASURED ignores guard on line 1 (no preceding lines)"
+  fi
+
+  # (h) UNMEASURED with SKIPPED wording variant (not just SKIP:).
+  g="$d/skipped_variant.sh"
+  cat >"$g" <<'G'
+#!/usr/bin/env bash
+echo "SKIPPED: precondition not met" >&2
+exit 2
+gate_require_device || exit 2
+echo "would run"
+G
+  chmod +x "$g"
+  if _is_unmeasured "$g"; then
+    ok "SELFCHECK: UNMEASURED detects SKIPPED: wording variant"
+  else
+    SUPPRESS=0; bad "SELFCHECK: UNMEASURED missed SKIPPED: wording variant"
+    bad_=1; SUPPRESS=1
+  fi
+
+  # (i) UNMEASURED false positive: CRLF line endings must not break detection.
+  #     A gate with SKIP + exit 2 in CRLF should still be detected.
+  g="$d/crlf_gate.sh"
+  printf '#!/usr/bin/env bash\r\necho "SKIP: crlf precondition" >&2\r\nexit 2\r\ngate_require_device || exit 2\r\necho would run\r\n' >"$g"
+  chmod +x "$g"
+  if _is_unmeasured "$g"; then
+    ok "SELFCHECK: UNMEASURED handles CRLF line endings"
+  else
+    SUPPRESS=0; bad "SELFCHECK: UNMEASURED missed CRLF gate with SKIP + exit 2"
+    bad_=1; SUPPRESS=1
+  fi
+
+  # (j) UNMEASURED false positive: guard appearing in a COMMENT must not
+  #     be treated as the device guard (only code-level guards count).
+  g="$d/comment_guard.sh"
+  cat >"$g" <<'G'
+#!/usr/bin/env bash
+# gate_require_device || exit 2  (this is a comment, not code)
+echo "SKIP: fixture precondition" >&2
+exit 2
+echo "would run"
+G
+  chmod +x "$g"
+  # This gate has SKIP + exit 2 but NO actual device guard in code, so
+  # _is_unmeasured should return 1 (no guard line found).
+  if _is_unmeasured "$g"; then
+    SUPPRESS=0; bad "SELFCHECK: UNMEASURED false-positive when guard is only in a comment"
+    bad_=1; SUPPRESS=1
+  else
+    ok "SELFCHECK: UNMEASURED ignores guard appearing only in a comment"
+  fi
+
+  # (k) UNMEASURED with multiple guards: only the FIRST guard line counts.
+  #     An exit 2 before the first guard makes it UNMEASURED; an exit 2
+  #     between two guards does NOT (it's after the first guard).
+  g="$d/multi_guard.sh"
+  cat >"$g" <<'G'
+#!/usr/bin/env bash
+gate_require_device || exit 2
+echo "SKIP: between guards" >&2
+exit 2
+gate_require_render_node || exit 2
+echo "would run"
+G
+  chmod +x "$g"
+  if _is_unmeasured "$g"; then
+    SUPPRESS=0; bad "SELFCHECK: UNMEASURED false-positive on exit 2 between two guards"
+    bad_=1; SUPPRESS=1
+  else
+    ok "SELFCHECK: UNMEASURED uses only the FIRST guard line"
+  fi
+
+  # (l) UNMEASURED false positive: a guard appearing ONLY in a comment on a
+  #     line AFTER the SKIP+exit 2 must not be counted as a real device guard.
+  #     (Extends (j): the guard-in-comment case also matters when it sits after
+  #     the precondition, not only on line 1.)
+  g="$d/comment_guard_after.sh"
+  cat >"$g" <<'G'
+#!/usr/bin/env bash
+echo "SKIP: fixture precondition" >&2
+exit 2
+# gate_require_device || exit 2  (commented out -- not a real guard)
+echo "would run"
+G
+  chmod +x "$g"
+  if _is_unmeasured "$g"; then
+    SUPPRESS=0; bad "SELFCHECK: UNMEASURED false-positive when guard is only in a trailing comment"
+    bad_=1; SUPPRESS=1
+  else
+    ok "SELFCHECK: UNMEASURED ignores a guard that exists only in a trailing comment"
+  fi
+
+  # (m) UNMEASURED with SKIP and exit 2 on the SAME line before the guard.
+  g="$d/same_line_skip.sh"
+  cat >"$g" <<'G'
+#!/usr/bin/env bash
+echo "SKIP: precondition" >&2; exit 2
+gate_require_device || exit 2
+echo "would run"
+G
+  chmod +x "$g"
+  if _is_unmeasured "$g"; then
+    ok "SELFCHECK: UNMEASURED detects SKIP+exit 2 even on one line"
+  else
+    SUPPRESS=0; bad "SELFCHECK: UNMEASURED missed same-line SKIP+exit 2"
+    bad_=1; SUPPRESS=1
+  fi
+
   # Synthetic logs are named after the synthetic gates; drop them so a later
   # reader cannot mistake them for real per-gate evidence.
   rm -f "$LOG_DIR"/runs_anyway.*.log "$LOG_DIR"/wrong_cause.*.log \
-        "$LOG_DIR"/right_cause.*.log
+        "$LOG_DIR"/right_cause.*.log "$LOG_DIR"/unmeasured_gate.*.log \
+        "$LOG_DIR"/comment_exit2.*.log "$LOG_DIR"/argparse_exit2.*.log \
+        "$LOG_DIR"/guard_line1.*.log "$LOG_DIR"/skipped_variant.*.log \
+        "$LOG_DIR"/crlf_gate.*.log "$LOG_DIR"/comment_guard.*.log \
+        "$LOG_DIR"/multi_guard.*.log
   SUPPRESS=0
   rm -rf "$d"
   return $bad_
@@ -309,11 +496,11 @@ note "== CLASSIFICATION CROSS-CHECK (this list vs gate_inventory.sh) =="
 # generated one, so the reason is re-readable next to the thing it explains. The count
 # is 2, this project's design target; the RENDER-NODE column being cross-checked is
 # count-independent, so what matters is that it is PINNED rather than OBSERVED.
-TWO_DEV_STUB="$SCRIPT_DIR/fixtures/two-device/sycl-ls"
+TWO_DEV_STUB="$SCRIPT_DIR/../fixtures/two-device/sycl-ls"
 [ -x "$TWO_DEV_STUB" ] || { echo "FAIL: missing $TWO_DEV_STUB -- the cross-check cannot be" >&2
                            echo "      made deterministic, and a live gate_inventory makes it flaky." >&2
                            exit 1; }
-INV_TABLE="$(INTFER_SYCL_LS="$TWO_DEV_STUB" bash "$SCRIPT_DIR/gate_inventory.sh" 2>/dev/null)"
+INV_TABLE="$(INTFER_SYCL_LS="$TWO_DEV_STUB" bash "$SCRIPT_DIR/../gate_inventory.sh" 2>/dev/null)"
 inv_devices="$(printf '%s\n' "$INV_TABLE" | awk '$NF=="via-count" || $NF=="render-node" {print $1}')"
 # *** A SHORT OR EMPTY TABLE IS NOT "THE OTHER SIDE DISAGREES". *** The observed
 # failure was gate_inventory's side MISSING ONE GATE, which the cross-check reported
@@ -378,8 +565,29 @@ for f in scripts/gates/test_*.sh; do
   }
   own_devices="$own_devices $(basename "$f")"
 done
-own_devices="$(printf '%s\n' $own_devices | sort | tr '\n' ' ')"
+# Helper: detect if a gate has an earlier precondition (SKIP/SKIPPED message +
+# --- UNMEASURED detection (before cross-check) ------------------------------
+# A gate with an earlier declared precondition (SKIP/SKIPPED message + exit 2
+# before the device guard, ignoring comments) cannot be measured in the
+# failure directions. Classify it UNMEASURED, not green, and exclude it from
+# the cross-check so the two derivations agree on the MEASURED gates only.
+_unmeasured=""
+_measured=""
+for _name in $own_devices; do
+  _gate="scripts/gates/$_name"
+  if _is_unmeasured "$_gate"; then
+    _unmeasured="$_unmeasured $_name"
+  else
+    _measured="$_measured $_name"
+  fi
+done
+own_devices="$(printf '%s\n' $_measured | sort | tr '\n' ' ')"
+# Remove UNMEASURED gates from inv_devices too (gate_inventory includes them)
+for _name in $_unmeasured; do
+  inv_devices="$(printf '%s\n' $inv_devices | grep -v "^${_name}$" | tr '\n' ' ')"
+done
 inv_devices="$(printf '%s\n' $inv_devices | sort | tr '\n' ' ')"
+
 if [ "$XCHK_REFUSED" = 1 ]; then
   # Stated, not silent: an assertion that did not run must never read as one that
   # passed, and it must not borrow the neighbouring verdict's wording either.
@@ -405,8 +613,15 @@ cause_zero="enumerates 0 device"
 NDEV_OWN="$(printf '%s\n' $own_devices | grep -c . || true)"
 note ""
 note "== MATRIX: $NDEV_OWN device gate(s) x 2 failure directions =="
+# Print UNMEASURED gates
+for _name in $_unmeasured; do
+  [ -z "$_name" ] && continue
+  printf '  %-24s UNMEASURED (earlier precondition)\n' "$_name"
+  note "  $_name: UNMEASURED -- has an earlier precondition before the device guard"
+done
+
 for name in $own_devices; do
-  gate="scripts/$name"
+  gate="scripts/gates/$name"
   if grep -qE 'gate_require_device|gate_require_render_node' "$gate"; then
     # Covers BOTH failure modes: each direction has exactly one correct cause.
     alt_node=""; alt_zero=""
@@ -490,7 +705,7 @@ else
   note "== HEALTHY COLUMN: $NDEV_OWN device gate(s) on this box (rc 0 or 2; a 2 must be explained) =="
   for name in $own_devices; do
     printf '  %-24s healthy            ' "$name"
-    if expect_healthy "scripts/$name"; then
+    if expect_healthy "scripts/gates/$name"; then
       # Strip up to the LAST '=' in the accumulator to get THIS gate's rc.
       # (The first version used '##* =' with a space before the '=', which can
       # never match "name=rc", so it printed the whole accumulator.)

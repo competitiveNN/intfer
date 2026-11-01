@@ -46,7 +46,16 @@ trap 'rm -rf "$SB"' EXIT
 trap 'rm -rf "$SB"; exit 130' INT
 trap 'rm -rf "$SB"; exit 143' TERM
 SBD="$SB/scripts"
-restore() { rm -rf "$SBD"; cp -a "$SCRIPT_DIR" "$SBD"; }
+# THE SANDBOX KEEPS THE REAL FAMILY LAYOUT (checks/ + lib/), because the checker
+# sources its helpers as `$SCRIPT_DIR/../lib/...` and the owner it certifies is
+# lib/_bench_summary.py. Before the 2026-10-21 restructure both lived flat in
+# scripts/, so `cp -a` of one directory was enough; after it, a flat copy made the
+# owner anchor vanish (PREFLIGHT FAIL) and the checker die on its own source line.
+restore() {
+  rm -rf "$SBD"; mkdir -p "$SBD/checks" "$SBD/lib"
+  cp -a "$SCRIPT_DIR/../checks/." "$SBD/checks/" || return 1
+  cp -a "$SCRIPT_DIR/../lib/." "$SBD/lib/" || return 1
+}
 # *** THE SANDBOX COPY IS WHAT RUNS, NOT THE REAL CHECKER. *** The first version
 # ran "$CHECK" (the real file) with only its SUBJECT tree redirected, so the two
 # checker-patching states were unobservable by construction -- the mutation had
@@ -55,9 +64,9 @@ restore() { rm -rf "$SBD"; cp -a "$SCRIPT_DIR" "$SBD"; }
 # assumes a sandbox means. Its self-tests still terminate: case (c) re-invokes
 # BASH_SOURCE (now the sandbox copy) with INTFER_VERDICT_SCOPE_CASES=0, so the
 # recursion guard is what breaks the cycle, not an accident of which file runs.
-run_check() { INTFER_SCRIPTS_DIR="$SBD" bash "$SBD/check_verdict_scope.sh" 2>&1; }
-summary="$SBD/_bench_summary.py"
-checker_sb="$SBD/check_verdict_scope.sh"
+run_check() { INTFER_SCRIPTS_DIR="$SBD" bash "$SBD/checks/check_verdict_scope.sh" 2>&1; }
+summary="$SBD/lib/_bench_summary.py"
+checker_sb="$SBD/checks/check_verdict_scope.sh"
 
 # ---- the anchors, asserted BEFORE the baseline (AUDIT #17's rule) -----------
 # Occurring EXACTLY ONCE, not merely present: an anchor matching twice would let

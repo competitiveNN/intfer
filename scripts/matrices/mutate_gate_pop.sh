@@ -40,17 +40,32 @@ trap 'rm -rf "$SB"; exit 130' INT
 trap 'rm -rf "$SB"; exit 143' TERM
 
 [ -f "$CHECK" ] || { echo "SKIP: $CHECK missing"; exit 2; }
-git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null || {
-  echo "FAIL: $CHECK is dirty; this matrix edits a sandbox copy."; exit 2; }
+# *** THE CHECKER IS READ, NEVER WRITTEN -- SO AN UNCOMMITTED CHECKER IS A NAMED
+# INPUT, NOT A HAZARD. *** The old guard refused when the checker was dirty, which
+# is correct for a matrix that MUTATES its target in place; this one copies it into
+# a sandbox and edits only the copy. Refusing here blocked every session that
+# improves the checker (MEASURED 2026-10-30, three matrices blocked at once). The
+# blob hash is printed and stamped instead, so the verdict names exactly which
+# source was graded even when that source is uncommitted.
+CHECK_BLOB="$(git -C "$ROOT" hash-object "$CHECK" 2>/dev/null || echo unknown)"
+if ! git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null; then
+  CHECK_DIRTY=yes
+  echo "  INPUT: UNCOMMITTED file=$CHECK blob=$CHECK_BLOB (graded; the original is never written)"
+else
+  CHECK_DIRTY=no
+fi
 
-# The checker resolves its helper as "$SCRIPT_DIR/../lib/_gate_pop.sh", and a
-# sandboxed run has $SCRIPT_DIR == the sandbox -- so without this copy it found
-# no helper at all and read "exported=0 local=0", i.e. a PHANTOM baseline
-# failure caused by the sandbox rather than by the code.
-cp "$SCRIPT_DIR/../lib/_gate_pop.sh" "$SB/_gate_pop.sh"
-cp "$CHECK" "$SB/check_gate_pop.sh"; ORIG="$SB/.orig"; cp "$SB/check_gate_pop.sh" "$ORIG"
-restore() { cp "$ORIG" "$SB/check_gate_pop.sh"; }
-run_check() { "$SB/check_gate_pop.sh" 2>&1; }
+# The checker resolves its helper as "$SCRIPT_DIR/../lib/_gate_pop.sh", so the
+# sandbox copy must keep the REAL family layout (checks/ + lib/). A flat copy put
+# $SCRIPT_DIR at the sandbox root, the helper was looked for at <sandbox>/../lib,
+# and the run died with "known_dirs: command not found" -- a PHANTOM baseline
+# failure caused by the sandbox rather than by the code (MEASURED 2026-10-30, when
+# the checker's own source line moved with the scripts/ restructure).
+STAGE="$SB/stage/scripts"; mkdir -p "$STAGE/checks" "$STAGE/lib"
+cp "$SCRIPT_DIR/../lib/_gate_pop.sh" "$STAGE/lib/_gate_pop.sh"
+cp "$CHECK" "$STAGE/checks/check_gate_pop.sh"; ORIG="$SB/.orig"; cp "$STAGE/checks/check_gate_pop.sh" "$ORIG"
+restore() { cp "$ORIG" "$STAGE/checks/check_gate_pop.sh"; }
+run_check() { "$STAGE/checks/check_gate_pop.sh" 2>&1; }
 
 # ---- anchors must occur EXACTLY ONCE before any state runs ----------------
 check_anchor() { # $1 file, $2 exact text, $3 description
@@ -84,11 +99,11 @@ INTFER_BUILD_DIR="$BUILD_DIR" pop_assert_no_leak "clean" || exit 1
 
 echo
 echo "== anchors (exactly once, before any state) =="
-check_anchor "$SB/check_gate_pop.sh" 'ok    all four prefix forms recognised' "M-A prefix forms"
-check_anchor "$SB/check_gate_pop.sh" 'ok    ok -- the assertion stays SILENT on a clean tree' "M-B converse"
-check_anchor "$SB/check_gate_pop.sh" 'ok    rejected, and it named' "M-C foreign dir"
-check_anchor "$SB/check_gate_pop.sh" 'ok    both shapes enumerate the same' "M-D variable shape"
-check_anchor "$SB/check_gate_pop.sh" 'ok    refused (rc=' "M-E fail-closed"
+check_anchor "$STAGE/checks/check_gate_pop.sh" 'ok    all four prefix forms recognised' "M-A prefix forms"
+check_anchor "$STAGE/checks/check_gate_pop.sh" 'ok    ok -- the assertion stays SILENT on a clean tree' "M-B converse"
+check_anchor "$STAGE/checks/check_gate_pop.sh" 'ok    rejected, and it named' "M-C foreign dir"
+check_anchor "$STAGE/checks/check_gate_pop.sh" 'ok    both shapes enumerate the same' "M-D variable shape"
+check_anchor "$STAGE/checks/check_gate_pop.sh" 'ok    refused (rc=' "M-E fail-closed"
 
 echo
 echo "== baseline =="
@@ -103,16 +118,16 @@ caught=0; total=0
 run_state() { # $1 id, $2 marker, $3 absent-RE
   local id="$1" marker="$2" expect="$3"
   total=$((total+1)); restore
-  local before; before="$(cat "$SB/check_gate_pop.sh")"
+  local before; before="$(cat "$STAGE/checks/check_gate_pop.sh")"
   if ! MUTATE_FN; then
     echo "  $id MISSED -- mutation fn failed"; echo "$id MISSED (fn)" >> "$LOG/summary.txt"; restore; return 1
   fi
-  [ "$before" = "$(cat "$SB/check_gate_pop.sh")" ] && {
+  [ "$before" = "$(cat "$STAGE/checks/check_gate_pop.sh")" ] && {
     echo "  $id MISSED -- no-op"; echo "$id MISSED (no-op)" >> "$LOG/summary.txt"; restore; return 1; }
-  grep -q -- "$marker" "$SB/check_gate_pop.sh" || {
+  grep -q -- "$marker" "$STAGE/checks/check_gate_pop.sh" || {
     echo "  $id MISSED -- marker absent (stale anchor)"
     echo "$id MISSED (anchor)" >> "$LOG/summary.txt"; restore; return 1; }
-  bash -n "$SB/check_gate_pop.sh" 2>/dev/null || {
+  bash -n "$STAGE/checks/check_gate_pop.sh" 2>/dev/null || {
     echo "  $id MISSED -- patch left the checker broken (STATE fault)"
     echo "$id MISSED (syntax)" >> "$LOG/summary.txt"; restore; return 1; }
   local o r; o="$(run_check)"; r=$?
@@ -147,57 +162,57 @@ echo "== states =="
 # M-A: the prefix-form case -- the FALSE LEAK this helper shipped ($PWD/build assumed
 # where the matrices write $ROOT/build)
 MUTATE_FN() {
-  patch_literal "$SB/check_gate_pop.sh" \
+  patch_literal "$STAGE/checks/check_gate_pop.sh" \
     'echo "  ok    all four prefix forms recognised: $got"
   n_a=$((n_a+1))' \
     ': # MUT_A -- this case is no longer measured
   n_a=$((n_a))' \
-  && verify_patched "$SB/check_gate_pop.sh" 'MUT_A'
+  && verify_patched "$STAGE/checks/check_gate_pop.sh" 'MUT_A'
 }
 run_state "M-A" 'MUT_A' 'ok    all four prefix forms recognised'
 
 # M-B: the CONVERSE -- without it a checker that rejects everything passes the rest
 MUTATE_FN() {
-  patch_literal "$SB/check_gate_pop.sh" \
+  patch_literal "$STAGE/checks/check_gate_pop.sh" \
     'echo "  ok    ok -- the assertion stays SILENT on a clean tree"
   n_b=$((n_b+1))' \
     ': # MUT_B -- this case is no longer measured
   n_b=$((n_b))' \
-  && verify_patched "$SB/check_gate_pop.sh" 'MUT_B'
+  && verify_patched "$STAGE/checks/check_gate_pop.sh" 'MUT_B'
 }
 run_state "M-B" 'MUT_B' 'stays SILENT on a clean tree'
 
 # M-C: the can-go-red direction -- without it a stub always returning 0 would pass
 MUTATE_FN() {
-  patch_literal "$SB/check_gate_pop.sh" \
+  patch_literal "$STAGE/checks/check_gate_pop.sh" \
     'echo "  ok    rejected, and it named fixture_leak"
   n_c=$((n_c+1))' \
     ': # MUT_C -- this case is no longer measured
   n_c=$((n_c))' \
-  && verify_patched "$SB/check_gate_pop.sh" 'MUT_C'
+  && verify_patched "$STAGE/checks/check_gate_pop.sh" 'MUT_C'
 }
 run_state "M-C" 'MUT_C' 'named fixture_leak'
 
 # M-D: the exported-vs-local variable shape -- the defect that made an assertion
 # report itself vacuous
 MUTATE_FN() {
-  patch_literal "$SB/check_gate_pop.sh" \
+  patch_literal "$STAGE/checks/check_gate_pop.sh" \
     'echo "  ok    both shapes enumerate the same $r1 dir(s)"
   n_d=$((n_d+1))' \
     ': # MUT_D -- this case is no longer measured
   n_d=$((n_d))' \
-  && verify_patched "$SB/check_gate_pop.sh" 'MUT_D'
+  && verify_patched "$STAGE/checks/check_gate_pop.sh" 'MUT_D'
 }
 run_state "M-D" 'MUT_D' 'both shapes enumerate the same'
 
 # M-E: the fail-closed case -- the third defect, an empty path enumerated at rc=0
 MUTATE_FN() {
-  patch_literal "$SB/check_gate_pop.sh" \
+  patch_literal "$STAGE/checks/check_gate_pop.sh" \
     'echo "  ok    refused (rc=$rc) instead of reporting an empty population as ok"
   n_e=$((n_e+1))' \
     ': # MUT_E -- this case is no longer measured
   n_e=$((n_e))' \
-  && verify_patched "$SB/check_gate_pop.sh" 'MUT_E'
+  && verify_patched "$STAGE/checks/check_gate_pop.sh" 'MUT_E'
 }
 run_state "M-E" 'MUT_E' 'refused \(rc='
 restore
@@ -208,16 +223,19 @@ if residue_scan "$SB" MUT_A MUT_B MUT_C MUT_D MUT_E; then
 else
   echo "  FAIL a mutation marker survived"; exit 1
 fi
-if cmp -s "$ORIG" "$SB/check_gate_pop.sh"; then
+if cmp -s "$ORIG" "$STAGE/checks/check_gate_pop.sh"; then
   echo "  ok    sandbox copy is byte-identical to the pristine source"
 else
   echo "  FAIL sandbox copy was left mutated"; exit 1
 fi
-# The REAL source must be untouched, byte for byte.
-if git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null; then
-  echo "  ok    the tracked checker was never modified"
+# The REAL source must be untouched BY THIS RUN -- compared against the blob the
+# run STARTED with, not against HEAD. Comparing to HEAD reports a pre-existing
+# uncommitted repair as this matrix's damage, the same snapshot-baseline lesson
+# mutate_trap_release.sh records: prove the run added nothing.
+if [ "$(git -C "$ROOT" hash-object "$CHECK" 2>/dev/null || echo unknown)" = "$CHECK_BLOB" ]; then
+  echo "  ok    the tracked checker was never modified (blob $CHECK_BLOB unchanged)"
 else
-  echo "  FAIL the tracked checker was modified"; exit 1
+  echo "  FAIL the tracked checker was modified by this run (blob moved from $CHECK_BLOB)"; exit 1
 fi
 
 echo
@@ -230,6 +248,7 @@ if [ "$caught" -eq "$total" ]; then
   { echo "stamp=gate_pop_mutate"
     echo "sha=$(git -C "$ROOT" rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "checker_blob=$CHECK_BLOB"; echo "checker_dirty=$CHECK_DIRTY"
     echo "states=$total"; echo "caught=$caught"; } > "$STAMP/last_pass.stamp"
   exit 0
 fi

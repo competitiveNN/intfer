@@ -71,6 +71,15 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SD="${INTFER_SCRIPTS_DIR:-$ROOT/scripts}"
+# THE POPULATION IS ONE LEVEL OF FAMILY SUBDIRS, not just $SD's own files. After the
+# 2026-10-21 restructure the owner lives at scripts/lib/_bench_summary.py, so a flat
+# `$SD/*.sh $SD/*.py` glob harvested ZERO emitters and printed the vacuous harvest
+# refusal instead of a verdict about the tree. archive/ and build/ are pruned for
+# the reason check_scripts_live.sh records: neither is a live entry point.
+pop_files() {
+  find "$SD" -maxdepth 2 -not -path "*/archive/*" -not -path "*/build/*" \
+       -type f \( -name '*.sh' -o -name '*.py' \) | sort
+}
 # shellcheck source=scripts/lib/_gate_enum.sh
 . "$SCRIPT_DIR/../lib/_gate_enum.sh"
 # shellcheck source=scripts/lib/_gate_pred.sh
@@ -81,7 +90,7 @@ enum_reset
 # "spread" alone would match prose and unrelated arithmetic, and a classifier that
 # cries wolf is worse than none.
 VOCAB="CLEARS the spread|INSIDE the spread|NO SPREAD ESTIMATE"
-OWNER="_bench_summary.py"
+OWNER="lib/_bench_summary.py"
 # Non-owner emitters that are legitimate, as "file why". EMPTY ON PURPOSE: an
 # empty list against a harvested population of one is the proof the derivation
 # can see the owner at all, rather than a coincidence of the classifier.
@@ -98,14 +107,19 @@ strip_comments() { sed -e 's/[[:space:]]*#.*$//'; }
 # self-tests exercise the code that runs in production rather than a second copy
 # of it (the AUDIT #3/#12 shape, appearing inside a checker).
 site_class() {
-  local f="$1" b
+  local f="$1" b rel
   b="$(basename "$f")"
+  # OWNER is a PATH RELATIVE TO THE SCRIPTS ROOT (lib/_bench_summary.py), because the
+  # 2026-10-21 restructure moved the owner one level down. Comparing basenames would
+  # either miss it ("owner missing") or, once the path form is used, classify the
+  # owner as an UNDECLARED second emitter -- the checker firing on its own subject.
+  rel="${f#"$SD"/}"
   # Comments are not mechanisms; strip them before deciding membership.
   strip_comments < "$f" | grep -qE "$VOCAB" || { echo not-a-site; return 0; }
   case "$b" in
     check_*|mutate_*) echo verifier; return 0 ;;
   esac
-  [ "$b" = "$OWNER" ] && { echo owner; return 0; }
+  [ "$rel" = "$OWNER" ] && { echo owner; return 0; }
   printf '%s' "$DECLARED" | grep -q "^$b " && { echo declared; return 0; }
   echo undeclared
   return 0
@@ -118,7 +132,7 @@ echo "   scripts dir: $SD"
 # ---- (a) the population is DERIVED, and the owner is in it -----------------
 echo "-- (a) derived population of spread-bounded verdicts --"
 emitters=""
-for f in "$SD"/*.sh "$SD"/*.py; do
+while IFS= read -r f; do
   [ -f "$f" ] || continue
   b="$(basename "$f")"
   case "$(site_class "$f")" in
@@ -135,7 +149,7 @@ for f in "$SD"/*.sh "$SD"/*.py; do
       bad=$((bad + 1)) ;;
   esac
   emitters="$emitters $b"
-done
+done < <(pop_files)
 # *** AND THE HARVEST MUST HAVE FOUND SOMETHING. *** Otherwise this checker is a
 # tautology that passes on a tree where the search is broken -- AUDIT #20.
 # enum_require_nonempty, NOT enum_require_min: the first takes the reason as its
@@ -194,7 +208,11 @@ trap 'rm -rf "$SB"' EXIT
 trap 'rm -rf "$SB"; exit 130' INT
 trap 'rm -rf "$SB"; exit 143' TERM
 mkdir -p "$SB/scripts"
-cp "$SD"/*.sh "$SD"/*.py "$SB/scripts/" 2>/dev/null
+# Copy the LAYOUT (one level of family subdirs), not just the top-level files: the
+# outer rule looks for the owner at lib/_bench_summary.py, and a sandbox without it
+# answers "owner missing" instead of grading the planted emitter.
+( cd "$SD" && find . -maxdepth 2 -not -path './archive/*' -not -path './build/*' \
+    -type f \( -name '*.sh' -o -name '*.py' \) -exec cp --parents {} "$SB/scripts/" \; )
 # A second summariser, correct in every way except that nobody decided about it.
 cat > "$SB/scripts/planted_summary.sh" <<'EOF'
 noise=$(awk '{if($1>m)m=$1}END{print m}' "$LOG")

@@ -209,7 +209,7 @@ else
     # trap check_durable_claims.sh documents for HISTORY.md's pairs.
     flat="$(tr '\n' ' ' < "$CODE" | tr -s ' ')"
     for lit in not-requested requested-all-declined active; do
-      if printf '%s' "$flat" | grep -qE "$feed[^;]*\"$lit\""; then
+      if printf '%s' "$flat" | grep -qE "${feed}[^;]*\"$lit\""; then
         n_sel=$((n_sel + 1))
       fi
     done

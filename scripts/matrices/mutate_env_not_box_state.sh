@@ -23,6 +23,22 @@ cd "$ROOT" || exit 2
 
 BUILD="${INTFER_BUILD_DIR:-$ROOT/build}"
 SB="$BUILD/env_box_state_matrix"
+# *** WIPE LOCK, OUTSIDE THE TREE IT WIPES (check_matrix_sandbox_locks.sh). ***
+# The sandbox below is a FIXED path wiped on every invocation, so two concurrent
+# runs share one tree: the second's wipe empties the first's mid-state and the
+# first then grades a corpus the other has just rebuilt (MEASURED 2026-10-21 on
+# mutate_durable_reads.sh). Taken BEFORE the first wipe and released on
+# EXIT/INT/TERM, so a run that dies mid-state does not brick the next.
+LOCK="$BUILD/.mutate_env_not_box_state.lock"
+mkdir -p "$BUILD" 2>/dev/null || true
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "FAIL: another mutate_env_not_box_state.sh is running (lock: $LOCK)" >&2
+  exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 130' INT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 143' TERM
+
 CHECK="scripts/checks/check_env_not_box_state.sh"
 ART="scripts/lib/_gate_precond.sh"
 

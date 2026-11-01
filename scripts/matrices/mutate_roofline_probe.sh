@@ -78,7 +78,7 @@ echo "== B0: derived vacuous log (RC=1, ceiling=0.000 ms) =="
 # INTFER_PROBE_LOG feeds the synthetic log; INTFER_BUILD_DIR stays on the real
 # build tree so gate_require_build's "no build system in $dir" guard passes.
 INTFER_PROBE_LOG="$TMPD/b0.log" INTFER_PROBE_RC=1 \
-  bash "$SCRIPT_DIR/test_roofline_probe.sh" \
+  bash "$ROOT/scripts/gates/test_roofline_probe.sh" \
   >"$TMPD/b0.out" 2>"$TMPD/b0.err"
   rc0=$?
   # The probe exits 1 on a vacuous run, so the gate's RC check must fire.
@@ -102,7 +102,7 @@ INTFER_PROBE_LOG="$TMPD/b0.log" INTFER_PROBE_RC=1 \
   # ceiling stays 0.000 ms -- no patch needed, the log already carries it.
   echo "== B1: RC=0, ceiling=0.000 ms (need_ceiling must fire) =="
   INTFER_PROBE_LOG="$TMPD/b1.log" INTFER_PROBE_RC=0 \
-  bash "$SCRIPT_DIR/test_roofline_probe.sh" \
+  bash "$ROOT/scripts/gates/test_roofline_probe.sh" \
   >"$TMPD/b1.out" 2>"$TMPD/b1.err"
   rc1=$?
   if [ "$rc1" -ne 0 ] && grep -q 'below the 0.012 ms floor' "$TMPD/b1.out" "$TMPD/b1.err"; then
@@ -119,7 +119,7 @@ INTFER_PROBE_LOG="$TMPD/b0.log" INTFER_PROBE_RC=1 \
   patch_ceiling "$TMPD/b2.log" "0.120"
   echo "== B2: RC=0, ceiling=0.120 ms (real run shape) =="
   INTFER_PROBE_LOG="$TMPD/b2.log" INTFER_PROBE_RC=0 INTFER_PROBE_SKIP_ARMS=1 \
-  bash "$SCRIPT_DIR/test_roofline_probe.sh" \
+  bash "$ROOT/scripts/gates/test_roofline_probe.sh" \
   >"$TMPD/b2.out" 2>"$TMPD/b2.err"
   rc2=$?
   if [ "$rc2" -eq 0 ] && grep -q 'ROOFLINE-PROBE TEST: PASS' "$TMPD/b2.out"; then
@@ -144,7 +144,7 @@ cp "$VAC_LOG" "$TMPD/b3.log"
 # ceiling is the real value the probe measured -- no patch.
 echo "== B3: REAL log (RC=0, ceiling=real) -- the gate must PASS =="
 INTFER_PROBE_LOG="$TMPD/b3.log" INTFER_PROBE_RC=0 \
-  bash "$SCRIPT_DIR/test_roofline_probe.sh" \
+  bash "$ROOT/scripts/gates/test_roofline_probe.sh" \
   >"$TMPD/b3.out" 2>"$TMPD/b3.err"
 rc3=$?
 if [ "$rc3" -eq 0 ] && grep -q 'ROOFLINE-PROBE TEST: PASS' "$TMPD/b3.out"; then

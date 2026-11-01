@@ -63,20 +63,26 @@ trap 'rm -rf "$SB"; exit 143' TERM
 . "$SCRIPT_DIR/../lib/_gate_patch.sh"
 
 # ---- the sandbox checker: a copy plus the helpers it sources --------------
-# SCRIPT_DIR inside the copy resolves to $SB, so the helpers must come with it or
-# the copy dies on a missing source and every state reports PATCH VERIFY FAIL for
-# a reason that has nothing to do with the mutation.
-restore_checker() { cp "$CHECK" "$SB/check.sh"; }
+# THE COPY KEEPS THE REAL LAYOUT, and the layout is load-bearing (MEASURED
+# 2026-10-30): after the 2026-10-21 restructure the checker sources its helpers as
+# `$SCRIPT_DIR/../lib/...`, so a copy dropped directly in $SB looked for
+# /dev/shm/lib/_gate_pred.sh, died on `enum_require_nonempty: command not found`,
+# and every state reported PATCH VERIFY FAIL for a reason that has nothing to do
+# with the mutation. Staging the copy at $SB/stage/scripts/checks/ with the helpers
+# at $SB/stage/scripts/lib/ makes SCRIPT_DIR resolve exactly as it does in the tree.
+STAGE="$SB/stage/scripts"
+CHECKCOPY="$STAGE/checks/check.sh"
+restore_checker() { mkdir -p "$STAGE/checks" "$STAGE/lib"; cp "$CHECK" "$CHECKCOPY"; }
 CHECK_SUM="$(cksum <"$CHECK")"
 restore_checker
-cp "$SCRIPT_DIR/../lib/_gate_pred.sh" "$SB/_gate_pred.sh"
-cp "$SCRIPT_DIR/../lib/_gate_enum.sh" "$SB/_gate_enum.sh"
+cp "$SCRIPT_DIR/../lib/_gate_pred.sh" "$STAGE/lib/_gate_pred.sh"
+cp "$SCRIPT_DIR/../lib/_gate_enum.sh" "$STAGE/lib/_gate_enum.sh"
 
 # ---- the trees -------------------------------------------------------------
 # $1 = none | wired | prose | archive. Every tree names wired.sh from a src/ file
 # so the ONLY unreachable script is the orphan under test.
 mk_tree() {
-  rm -rf "$SB/tree"; mkdir -p "$SB/tree/scripts" "$SB/tree/docs" "$SB/tree/reports" "$SB/tree/src"
+  rm -rf "$SB/tree"; mkdir -p "$SB/tree/scripts/gates" "$SB/tree/docs" "$SB/tree/reports" "$SB/tree/src"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$SB/tree/scripts/gates/test_gate_a.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$SB/tree/scripts/gates/test_gate_b.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$SB/tree/scripts/wired.sh"
@@ -98,7 +104,7 @@ mk_tree() {
   esac
 }
 run_scan() { INTFER_SCRIPTS_DIR="$SB/tree/scripts" INTFER_SL_ROOT="$SB/tree" \
-               bash "$SB/check.sh" --scan-only 2>&1; }
+               bash "$CHECKCOPY" --scan-only 2>&1; }
 
 : >"$LOG/summary.txt"
 total=0; caught=0; bad=0
@@ -139,11 +145,11 @@ state() {
   mk_tree "$tree"
   restore_checker                       # pristine -> baseline
   br="$(run_scan)"; brc=$?
-  if ! patch_literal "$SB/check.sh" "$old" "$new"; then
+  if ! patch_literal "$CHECKCOPY" "$old" "$new"; then
     echo "  $id MISSED -- patch_literal refused (anchor drifted or is ambiguous)"
     echo "$id MISSED (patch refused)" >>"$LOG/summary.txt"; bad=$((bad + 1)); return
   fi
-  if ! verify_patched "$SB/check.sh" "$marker"; then
+  if ! verify_patched "$CHECKCOPY" "$marker"; then
     echo "  $id MISSED -- the mutation did not apply"
     echo "$id MISSED (verify failed)" >>"$LOG/summary.txt"; bad=$((bad + 1)); return
   fi

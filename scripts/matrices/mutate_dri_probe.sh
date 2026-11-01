@@ -38,6 +38,7 @@ trap 'rm -rf "$SB"; exit 143' TERM
 # Sourced shared helpers, so this matrix does not carry a second copy.
 . "$SCRIPT_DIR/../lib/_gate_pred.sh"
 . "$SCRIPT_DIR/../lib/_gate_enum.sh"
+. "$SCRIPT_DIR/../lib/_gate_state.sh"
 
 # A corpus that looks like the real one: one compliant by-path probe, one
 # single-minor liveness probe. Both must stay clean in every state.
@@ -77,21 +78,21 @@ run_reject() {
   mk_corpus
   if ! MUTATE_FN; then
     echo "  $id MISSED -- the mutation did not apply (STATE fault, not a mechanism)"
-    echo "$id MISSED (mutation fn)" >>"$SUMMARY"; mk_corpus; return 1
+    gate_state_record --raw "$SUMMARY" "$id MISSED (mutation fn)"; mk_corpus; return 1
   fi
   local o r
   o="$(run_check)"; r=$?
   printf '%s\n' "$o" >"$LOG/$id.log"
   if [ "$r" -eq 0 ]; then
     echo "  $id MISSED -- checker still exited 0 with the defect present ($why)"
-    echo "$id MISSED (rc=0)" >>"$SUMMARY"; mk_corpus; return 1
+    gate_state_record --raw "$SUMMARY" "$id MISSED (rc=0)"; mk_corpus; return 1
   fi
   # POLARITY NAMED at the call site, never inferred.
   if ! pred_expect_present "$id rejection" "$o" 'DRI PROBE: FAIL'; then
-    echo "$id MISSED (rejection not reported)" >>"$SUMMARY"; mk_corpus; return 1
+    gate_state_record --raw "$SUMMARY" "$id MISSED (rejection not reported)"; mk_corpus; return 1
   fi
   echo "  $id caught -- rc=$r, verdict-polarity=expect-present: $why"
-  echo "$id caught" >>"$SUMMARY"; caught=$((caught + 1)); return 0
+  gate_state_record --raw "$SUMMARY" "$id caught"; caught=$((caught + 1)); return 0
 }
 
 D_A='probe() { for n in /dev/dri/renderD128 /dev/dri/renderD129; do :; done; }
@@ -133,10 +134,10 @@ o="$(run_check)"; r=$?
 printf '%s\n' "$o" >"$LOG/D-D.log"
 if [ "$r" -ne 0 ] && printf '%s' "$o" | grep -q 'never harvested'; then
   echo "  D-D caught -- rc=$r, an empty corpus is REFUSED, not passed"
-  echo "D-D caught" >>"$SUMMARY"; caught=$((caught + 1))
+  gate_state_record --raw "$SUMMARY" "D-D caught"; caught=$((caught + 1))
 else
   echo "  D-D MISSED -- rc=$r; a corpus with no render-node probe was not refused"
-  echo "D-D MISSED" >>"$SUMMARY"
+  gate_state_record --raw "$SUMMARY" "D-D MISSED"
 fi
 mk_corpus
 
@@ -150,10 +151,10 @@ printf '%s\n' "$o" >"$LOG/D-E.log"
 if [ "$r" -eq 0 ] && printf '%s' "$o" | grep -q 'zz_liveness.sh' \
    && ! printf '%s' "$o" | grep -q '^  FAIL'; then
   echo "  D-E caught -- rc=0, and the liveness probe was ACCEPTED (converse holds)"
-  echo "D-E caught" >>"$SUMMARY"; caught=$((caught + 1))
+  gate_state_record --raw "$SUMMARY" "D-E caught"; caught=$((caught + 1))
 else
   echo "  D-E MISSED -- rc=$r; a single-minor liveness probe was not accepted cleanly"
-  echo "D-E MISSED" >>"$SUMMARY"
+  gate_state_record --raw "$SUMMARY" "D-E MISSED"
 fi
 
 echo

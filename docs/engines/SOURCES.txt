@@ -11,6 +11,7 @@ https://github.com/snailium/llama.cpp-sycl-intel-b70
 https://github.com/Anbeeld/beellama.cpp        # beellama.txt
 https://github.com/edagher92-coder/arc-llm-lab
 https://github.com/IST-DASLab/disaggregated-llama.cpp.git
+https://github.com/ggml-org/llama.cpp/pull/30971
 
 # mla
 https://github.com/sootaugur/qwen-mla-vllm     # mla.txt
@@ -21,6 +22,7 @@ https://github.com/doopeworld/GRIMOIRE         # grimoire.txt
 https://github.com/SearchSavior/Arcaine
 https://github.com/vllm-project/vllm-xpu-kernels   # vllm_xpu.txt
 https://github.com/sgl-project/sgl-kernel-xpu  # sgl_kernel_xpu.txt
+https://github.com/rizagp/arcinferzero
 
 # moe
 https://github.com/FlashML-org/FreeToken

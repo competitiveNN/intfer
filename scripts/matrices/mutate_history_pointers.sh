@@ -37,6 +37,22 @@ cd "$ROOT" || exit 2
 
 BUILD="${INTFER_BUILD_DIR:-$ROOT/build}"
 SB="$BUILD/history_pointer_matrix"
+# *** WIPE LOCK, OUTSIDE THE TREE IT WIPES (check_matrix_sandbox_locks.sh). ***
+# The sandbox below is a FIXED path wiped on every invocation, so two concurrent
+# runs share one tree: the second's wipe empties the first's mid-state and the
+# first then grades a corpus the other has just rebuilt (MEASURED 2026-10-21 on
+# mutate_durable_reads.sh). Taken BEFORE the first wipe and released on
+# EXIT/INT/TERM, so a run that dies mid-state does not brick the next.
+LOCK="$BUILD/.mutate_history_pointers.lock"
+mkdir -p "$BUILD" 2>/dev/null || true
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "FAIL: another mutate_history_pointers.sh is running (lock: $LOCK)" >&2
+  exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 130' INT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 143' TERM
+
 CHECK="scripts/checks/check_history_pointers.sh"
 mkdir -p "$BUILD" "$SB" || exit 2
 rm -rf "$SB"; mkdir -p "$SB"
@@ -185,17 +201,26 @@ PY
 run_state HP-3 'banner entry no longer cited|banner entry' 1
 
 # ---- HP-4: relocate the annotation to the far end of the file ----
-# The target is NOT the first [DANGLING in the file. Twelve titles carry an
-# annotation and ELEVEN of them also carry a banner entry, so they resolve
-# anyway; moving one of those proves nothing. The one title whose ONLY
-# resolution is the annotation is INTFER_LMHEAD_FP16 reachability, and the
-# scanner's +/-3-line proximity window is what this state has to defeat -- the
-# first draft of this state grabbed line 1604's annotation, missed, and the
-# matrix correctly reported it.
+# The target is NOT the first [DANGLING in the file. Eleven titles carry an
+# annotation AND a banner entry, so they resolve anyway; moving one of those
+# proves nothing. The state therefore uses INTFER_LMHEAD_FP16 reachability, whose
+# ONLY resolution is the annotation, and defeats the scanner's +/-3-line proximity
+# window by moving it far away -- the first draft of this state grabbed line
+# 1604's annotation, missed, and the matrix correctly reported it.
+#
+# ITS PRECONDITION IS NOW ASSERTED RATHER THAN ASSUMED. When the long AGENTS.md
+# sections were relocated into HISTORY.md (2026-10-28), the LMHEAD_FP16 pointer was
+# copied with them, so the title is ALSO present verbatim as text in HISTORY.md
+# and the scanner's OK-TEXT rule resolves it no matter where the annotation sits --
+# measured: this state then MISSED, because moving the annotation changed nothing.
+# So the state strips that one verbatim occurrence from its OWN HISTORY.md copy
+# (P_HI, restored after the state by run_state), proving the strip LANDED before
+# grading. The annotation is the only remaining resolution again, which is the
+# condition the state was written for; without the strip it grades nothing.
 begin_state
-python3 - "$P_AG" <<'PY'
+python3 - "$P_AG" "$P_HI" <<'PY'
 import re, sys
-p = sys.argv[1]
+p, hi = sys.argv[1], sys.argv[2]
 txt = open(p).read()
 lines = txt.split("\n")
 cite = re.search(r'HISTORY\.md\s*\("([^"]*INTFER_LMHEAD_FP16\s+reachability[^"]*)"\)',
@@ -214,6 +239,17 @@ lines.append("X " + moved.strip() + "  (moved FAR from the pointer it excuses)")
 open(p, "w").write("\n".join(lines))
 print("  moved the annotation from line %d to line %d"
       % (idx + 1, len(lines) - 1))
+
+# Strip the title's verbatim occurrence so OK-TEXT cannot rescue it (see above).
+h = open(hi).read()
+title = "2026-10-11: INTFER_LMHEAD_FP16 reachability"
+want = re.sub(r"\s+", " ", title).strip()
+flat = lambda s: re.sub(r"\s+", " ", s)
+assert flat(h).count(want) >= 1, "the title is not present as text in HISTORY.md"
+h2 = h.replace(title, "the LMHEAD_FP16 decision record")
+assert h2 != h, "the HISTORY.md strip did not land"
+assert want not in flat(h2), "a verbatim copy of the title survived the strip"
+open(hi, "w").write(h2)
 PY
 [ $? -eq 0 ] || { echo "HPOINT-MUT: FAIL HP-4 plant did not land" >&2; exit 1; }
 run_state HP-4 'unaccounted pointer' 1

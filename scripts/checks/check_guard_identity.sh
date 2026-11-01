@@ -38,7 +38,12 @@
 #     re-run, which is how a check like this gets disabled.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPTS_DIR="${INTFER_SCRIPTS_DIR:-$SCRIPT_DIR}"
+# The corpus default is the SCRIPTS ROOT, not $SCRIPT_DIR. MEASURED repair
+# (2026-10-30): the 2026-10-21 restructure moved this file into scripts/checks/, so
+# a $SCRIPT_DIR default made the corpus the checker directory alone and the
+# population guard failed with "no script in scripts/ refuses an existing resource
+# path" -- a green-looking tree-wide rule that had harvested nothing.
+SCRIPTS_DIR="${INTFER_SCRIPTS_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 # classify is done in python, not grep, and the reason is worth recording: the
 # FIRST version harvested the discriminator from ANYWHERE in the file and matched a
@@ -228,9 +233,8 @@ else
   exit 1
 fi
 
-shopt -s nullglob
-SCRIPTS=("$SCRIPTS_DIR"/*.sh)
-shopt -u nullglob
+mapfile -t SCRIPTS < <(find "$SCRIPTS_DIR" -maxdepth 2 -not -path "*/archive/*" \
+                       -type f -name '*.sh' | sort)
 self_is() { [ "$1" = "$0" ]; }
 
 viol=0; sites=0

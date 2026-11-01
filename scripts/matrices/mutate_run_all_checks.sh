@@ -156,13 +156,41 @@ WORK="$BUILD_DIR/run_all_mutate"
 # and 'set -u' then killed the matrix mid-run with "STATES_SEEN: unbound variable".
 STATES_SEEN=""
 STAMP="$WORK/last_pass.stamp"
-LOCK="$WORK/.lock"
+# *** THE LOCK LIVES OUTSIDE THE TREE IT PROTECTS. *** MEASURED DEFECT (check_matrix_
+# sandbox_locks.sh): this was "$WORK/.lock", and $WORK is the path the matrix wipes
+# (rm -rf "$WORK" immediately below, and again in reset_mutant). A lock inside the
+# wiped tree is deleted by the wipe it exists to survive, and it was taken AFTER
+# that wipe, so two concurrent runs both acquired it. Under $BUILD_DIR, alongside
+# the other matrices' locks, it is reached by neither wipe.
+LOCK="$BUILD_DIR/.mutate_run_all_checks.lock"
 PROBE="$SB/scripts/_rac_dirty_probe.md"
 RESIDUE_PROBE="$SB/scripts/_rac_residue_probe.md"
 # A SECOND litter site, at the sandbox repo ROOT. The scripts/-only check that
 # N-I restores cannot see this one; the whole-work-tree diff can.
 ROOT_PROBE="$SB/_rac_root_litter.md"
 DUMMY="$SB/scripts/matrices/mutate_dummy.sh"
+# Acquired BEFORE the first wipe of $WORK (see LOCK above), and released by the
+# EXIT/INT/TERM traps installed here, so a run that dies mid-state cannot brick
+# the next one. cleanup() is defined before the traps are installed because an
+# early exit between the two would otherwise trap into an undefined function.
+mkdir -p "$BUILD_DIR" 2>/dev/null || true
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "FAIL: another mutate_run_all_checks.sh is running (lock: $LOCK)" >&2
+  exit 1
+fi
+# Always clean up the mutant, even on an abort: it lives in scripts/, and leaving
+# a mutated copy there would poison every later check that globs that directory.
+cleanup() {
+  rm -f "$PROBE" "$RESIDUE_PROBE" "$ROOT_PROBE" "$DUMMY"
+  rmdir "$LOCK" 2>/dev/null || true
+  rm -rf "$SYNTH"
+}
+trap cleanup EXIT
+# *** ${PROBE:-} IS DELIBERATELY NOT USED: these names are assigned above, and a
+# bare trap body is the shape check_matrix_sandbox_locks.sh reads. ***
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
 mkdir -p "$SB/scripts" "$SB/scripts/lib"
 rm -rf "$WORK"; mkdir -p "$WORK" || exit 1
 cp "$TARGET" "$MUTANT"; chmod +x "$MUTANT"
@@ -189,21 +217,6 @@ git -C "$SB" -c user.email=m@x -c user.name=matrix add -A >/dev/null 2>&1
 git -C "$SB" -c user.email=m@x -c user.name=matrix commit -q -m sandbox >/dev/null 2>&1
 SB_HEAD="$(git -C "$SB" rev-parse HEAD)" || { echo "FAIL: sandbox has no HEAD" >&2; exit 1; }
 export GIT_CONFIG_NOSYSTEM=1
-
-if ! mkdir "$LOCK" 2>/dev/null; then
-  echo "FAIL: another mutate_run_all_checks.sh is running (lock: $LOCK)" >&2
-  exit 1
-fi
-# Always clean up the mutant, even on an abort: it lives in scripts/, and leaving
-# a mutated copy there would poison every later check that globs that directory.
-cleanup() {
-  rm -f "$PROBE" "$RESIDUE_PROBE" "$ROOT_PROBE" "$DUMMY"
-  rmdir "$LOCK" 2>/dev/null || true
-  rm -rf "$SYNTH"
-}
-trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
 
 [ -e "$TARGET" ] || { echo "FAIL: $TARGET missing" >&2; exit 1; }
 if ! git diff --quiet || ! git diff --cached --quiet; then

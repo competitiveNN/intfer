@@ -4306,6 +4306,26 @@ struct Layer {
   std::vector<float> kscale_q8, vscale_q8;
   bool kv_q8 = false;
   bool kv_had = false;
+  // Groupwise-INT4 KV codec (opt-in via INTFER_KV_Q4=1; switchable
+  // Hadamard via INTFER_KV_Q4_HAD=1). One FP32 scale per (kv_head,
+  // group) over group*head_dim elements; symmetric 4-bit codes in [-8,7].
+  std::vector<int8_t> kcache_q4, vcache_q4;
+  std::vector<float> kscale_q4, vscale_q4;
+  bool kv_q4 = false;
+  bool kv_q4_had = false;
+  // Groupwise-INT5_1 KV codec (opt-in via INTFER_KV_Q5_1=1; switchable
+  // Hadamard via INTFER_KV_Q5_1_HAD=1). One FP32 scale per (kv_head,
+  // group); symmetric 5-bit codes in [-16,15].
+  std::vector<int8_t> kcache_q5_1, vcache_q5_1;
+  std::vector<float> kscale_q5_1, vscale_q5_1;
+  bool kv_q5_1 = false;
+  bool kv_q5_1_had = false;
+  // KVarN variance-normalized INT8 KV codec (opt-in via INTFER_KV_KVARN=1).
+  // One FP32 scale per (kv_head, group): s = max(3*stddev, eps)/127,
+  // symmetric INT8 codes. Host-side algorithmic change of the scale only.
+  std::vector<int8_t> kcache_kvarn, vcache_kvarn;
+  std::vector<float> kscale_kvarn, vscale_kvarn;
+  bool kv_kvarn = false;
 };
 
 // Groupwise-INT8 KV helpers. One FP32 scale per (kv_head, group) over
@@ -4345,6 +4365,26 @@ static inline bool kv_q8_enabled(){
 }
 static inline bool kv_had_enabled(){
   static const bool on = (std::getenv("INTFER_KV_HAD") != nullptr);
+  return on;
+}
+static inline bool kv_q4_enabled(){
+  static const bool on = (std::getenv("INTFER_KV_Q4") != nullptr);
+  return on;
+}
+static inline bool kv_q4_had_enabled(){
+  static const bool on = (std::getenv("INTFER_KV_Q4_HAD") != nullptr);
+  return on;
+}
+static inline bool kv_q5_1_enabled(){
+  static const bool on = (std::getenv("INTFER_KV_Q5_1") != nullptr);
+  return on;
+}
+static inline bool kv_q5_1_had_enabled(){
+  static const bool on = (std::getenv("INTFER_KV_Q5_1_HAD") != nullptr);
+  return on;
+}
+static inline bool kv_kvarn_enabled(){
+  static const bool on = (std::getenv("INTFER_KV_KVARN") != nullptr);
   return on;
 }
 // In-place unscaled Walsh-Hadamard transform (hd=256 is a power of two on
@@ -4445,6 +4485,151 @@ static void kv_q8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
     }
   }
 }
+// Groupwise-INT4 KV codec (INTFER_KV_Q4=1; switchable Hadamard via
+// INTFER_KV_Q4_HAD=1). Append-only: token `pos` is quantized once at append
+// into one FP32 scale per (kv_head, group). Group size via
+// INTFER_INT8_KV_G (shared with the legacy INT8 mirror). Symmetric 4-bit
+// codes in [-8, 7]. Optional Hadamard: row is forward-rotated before quant,
+// rotated back after dequant in kv_row_ptr.
+static void kv_q4_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
+  std::vector<int8_t>& ci = is_k ? ly.kcache_q4 : ly.vcache_q4;
+  std::vector<float>& sc = is_k ? ly.kscale_q4 : ly.vscale_q4;
+  const std::vector<float>& cf = is_k ? ly.kcache : ly.vcache;
+  const bool had = ly.kv_q4_had;
+  size_t kvrow = (size_t)n_kv * hd;
+  size_t need_i8 = (size_t)(pos + 1) * kvrow;
+  if(ci.size() < need_i8) ci.resize(need_i8, 0);
+  int GS = kv_group_size();
+  int smax = kv_capacity() / GS + 1;
+  if((int)sc.size() < n_kv * smax) sc.resize((size_t)n_kv * smax, 1.f);
+  int g = pos / GS;
+  int t0 = g * GS, t1 = pos;
+  static thread_local std::vector<float> work;
+  if((int)work.size() < hd) work.resize(hd);
+  for(int kvh = 0; kvh < n_kv; kvh++){
+    float mx = 0;
+    for(int t = t0; t <= t1; t++){
+      const float* src = &cf[((size_t)t * n_kv + kvh) * hd];
+      float* w = work.data();
+      for(int d = 0; d < hd; d++) w[d] = src[d];
+      if(had) kv_fwht(w, hd);
+      for(int d = 0; d < hd; d++){
+        float v = std::fabs(w[d]);
+        if(v > mx) mx = v;
+      }
+    }
+    float s = (mx > 0) ? mx / 7.f : 1.f;
+    sc[(size_t)kvh * smax + g] = s;
+    float inv = 1.f / s;
+    for(int t = t0; t <= t1; t++){
+      const float* src = &cf[((size_t)t * n_kv + kvh) * hd];
+      float* w = work.data();
+      for(int d = 0; d < hd; d++) w[d] = src[d];
+      if(had) kv_fwht(w, hd);
+      for(int d = 0; d < hd; d++){
+        float v = w[d] * inv;
+        int q = (int)(v >= 0 ? v + 0.5f : v - 0.5f);
+        if(q > 7) q = 7; else if(q < -8) q = -8;
+        ci[((size_t)t * n_kv + kvh) * hd + d] = (int8_t)q;
+      }
+    }
+  }
+}
+// Groupwise-INT5_1 KV codec (INTFER_KV_Q5_1=1; switchable Hadamard via
+// INTFER_KV_Q5_1_HAD=1). Append-only: token `pos` is quantized once at append
+// into one FP32 scale per (kv_head, group). Group size via
+// INTFER_INT8_KV_G. Symmetric 5-bit codes in [-16, 15]. Optional Hadamard:
+// row is forward-rotated before quant, rotated back after dequant in
+// kv_row_ptr.
+static void kv_q5_1_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
+  std::vector<int8_t>& ci = is_k ? ly.kcache_q5_1 : ly.vcache_q5_1;
+  std::vector<float>& sc = is_k ? ly.kscale_q5_1 : ly.vscale_q5_1;
+  const std::vector<float>& cf = is_k ? ly.kcache : ly.vcache;
+  const bool had = ly.kv_q5_1_had;
+  size_t kvrow = (size_t)n_kv * hd;
+  size_t need_i8 = (size_t)(pos + 1) * kvrow;
+  if(ci.size() < need_i8) ci.resize(need_i8, 0);
+  int GS = kv_group_size();
+  int smax = kv_capacity() / GS + 1;
+  if((int)sc.size() < n_kv * smax) sc.resize((size_t)n_kv * smax, 1.f);
+  int g = pos / GS;
+  int t0 = g * GS, t1 = pos;
+  static thread_local std::vector<float> work;
+  if((int)work.size() < hd) work.resize(hd);
+  for(int kvh = 0; kvh < n_kv; kvh++){
+    float mx = 0;
+    for(int t = t0; t <= t1; t++){
+      const float* src = &cf[((size_t)t * n_kv + kvh) * hd];
+      float* w = work.data();
+      for(int d = 0; d < hd; d++) w[d] = src[d];
+      if(had) kv_fwht(w, hd);
+      for(int d = 0; d < hd; d++){
+        float v = std::fabs(w[d]);
+        if(v > mx) mx = v;
+      }
+    }
+    float s = (mx > 0) ? mx / 15.f : 1.f;
+    sc[(size_t)kvh * smax + g] = s;
+    float inv = 1.f / s;
+    for(int t = t0; t <= t1; t++){
+      const float* src = &cf[((size_t)t * n_kv + kvh) * hd];
+      float* w = work.data();
+      for(int d = 0; d < hd; d++) w[d] = src[d];
+      if(had) kv_fwht(w, hd);
+      for(int d = 0; d < hd; d++){
+        float v = w[d] * inv;
+        int q = (int)(v >= 0 ? v + 0.5f : v - 0.5f);
+        if(q > 15) q = 15; else if(q < -16) q = -16;
+        ci[((size_t)t * n_kv + kvh) * hd + d] = (int8_t)q;
+      }
+    }
+  }
+}
+// KVarN variance-normalized INT8 KV codec (INTFER_KV_KVARN=1). Append-only:
+// one FP32 scale per (kv_head, group): s = max(3*stddev, eps)/127 where
+// eps is a small floor. Symmetric INT8 codes [-127,127]. Host-side algorithmic
+// change of the scale computation only (variance-normalized instead of max).
+static void kv_kvarn_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
+  std::vector<int8_t>& ci = is_k ? ly.kcache_kvarn : ly.vcache_kvarn;
+  std::vector<float>& sc = is_k ? ly.kscale_kvarn : ly.vscale_kvarn;
+  const std::vector<float>& cf = is_k ? ly.kcache : ly.vcache;
+  size_t kvrow = (size_t)n_kv * hd;
+  size_t need_i8 = (size_t)(pos + 1) * kvrow;
+  if(ci.size() < need_i8) ci.resize(need_i8, 0);
+  int GS = kv_group_size();
+  int smax = kv_capacity() / GS + 1;
+  if((int)sc.size() < n_kv * smax) sc.resize((size_t)n_kv * smax, 1.f);
+  int g = pos / GS;
+  int t0 = g * GS, t1 = pos;
+  static thread_local std::vector<float> work;
+  if((int)work.size() < hd) work.resize(hd);
+  for(int kvh = 0; kvh < n_kv; kvh++){
+    float mean = 0.f;
+    for(int t = t0; t <= t1; t++)
+      for(int d = 0; d < hd; d++)
+        mean += cf[((size_t)t * n_kv + kvh) * hd + d];
+    mean /= (float)((t1 - t0 + 1) * hd);
+    float var = 0.f;
+    for(int t = t0; t <= t1; t++)
+      for(int d = 0; d < hd; d++){
+        float diff = cf[((size_t)t * n_kv + kvh) * hd + d] - mean;
+        var += diff * diff;
+      }
+    var /= (float)((t1 - t0 + 1) * hd);
+    float stddev = std::sqrtf(var);
+    const float eps = 1e-5f;
+    float s = std::max(3.f * stddev, eps) / 127.f;
+    sc[(size_t)kvh * smax + g] = s;
+    float inv = 1.f / s;
+    for(int t = t0; t <= t1; t++)
+      for(int d = 0; d < hd; d++){
+        float v = cf[((size_t)t * n_kv + kvh) * hd + d] * inv;
+        int q = (int)(v >= 0 ? v + 0.5f : v - 0.5f);
+        if(q > 127) q = 127; else if(q < -127) q = -127;
+        ci[((size_t)t * n_kv + kvh) * hd + d] = (int8_t)q;
+      }
+  }
+}
 // Row pointer for (t, kvh): direct FP32 pointer when INT8 is off, else
 // dequantize into a thread-local scratch (K and V have separate buffers)
 // and return it. Safe: every read site consumes the row (dot/accumulate)
@@ -4452,7 +4637,7 @@ static void kv_q8_append(Layer& ly, int n_kv, int hd, int pos, bool is_k){
 // live simultaneously.
 static inline const float* kv_row_ptr(const Layer& ly, bool is_k, int t,
                                       int kvh, int n_kv, int hd){
-  if(!ly.kv_int8 && !ly.kv_q8)
+  if(!ly.kv_int8 && !ly.kv_q8 && !ly.kv_q4 && !ly.kv_q5_1 && !ly.kv_kvarn)
     return is_k ? &ly.kcache[((size_t)t * n_kv + kvh) * hd]
                 : &ly.vcache[((size_t)t * n_kv + kvh) * hd];
   static thread_local std::vector<float> tmp_k, tmp_v;
@@ -4471,6 +4656,33 @@ static inline const float* kv_row_ptr(const Layer& ly, bool is_k, int t,
     // Inverse Hadamard (self-inverse): undo the forward rotation applied
     // at append so attention sees the original activation space.
     if(ly.kv_had) kv_fwht(tmp.data(), hd);
+    return tmp.data();
+  }
+  if(ly.kv_q4 || ly.kv_q5_1){
+    // Groupwise 4-bit / 5-bit path: dequantize from the per-group scale.
+    int GS = kv_group_size();
+    int smax = kv_capacity() / GS + 1;
+    const std::vector<float>& sc45 = is_k ? ly.kscale_q4 : ly.vscale_q4;
+    const std::vector<float>& sc51 = is_k ? ly.kscale_q5_1 : ly.vscale_q5_1;
+    float s = ly.kv_q4 ? sc45[((size_t)kvh * smax + (size_t)(t / GS))]
+                       : sc51[((size_t)kvh * smax + (size_t)(t / GS))];
+    const std::vector<int8_t>& ci = ly.kv_q4 ? (is_k ? ly.kcache_q4 : ly.vcache_q4)
+                                              : (is_k ? ly.kcache_q5_1 : ly.vcache_q5_1);
+    const int8_t* row = &ci[((size_t)t * n_kv + kvh) * hd];
+    for(int d = 0; d < hd; d++) tmp[d] = (float)row[d] * s;
+    // Inverse Hadamard (self-inverse).
+    if(ly.kv_q4_had || ly.kv_q5_1_had) kv_fwht(tmp.data(), hd);
+    return tmp.data();
+  }
+  if(ly.kv_kvarn){
+    // KVarN variance-normalized INT8 path: same layout as legacy INT8.
+    int GS = kv_group_size();
+    int smax = kv_capacity() / GS + 1;
+    const std::vector<float>& kvarn_sc = is_k ? ly.kscale_kvarn : ly.vscale_kvarn;
+    float s = kvarn_sc[((size_t)kvh * smax + (size_t)(t / GS))];
+    const std::vector<int8_t>& ci = is_k ? ly.kcache_kvarn : ly.vcache_kvarn;
+    const int8_t* row = &ci[((size_t)t * n_kv + kvh) * hd];
+    for(int d = 0; d < hd; d++) tmp[d] = (float)row[d] * s;
     return tmp.data();
   }
   static thread_local std::vector<float> leg_k, leg_v;
@@ -4505,6 +4717,9 @@ static inline void kv_append(Layer& ly, int n_kv, int hd, int pos){
   kv_require_cap(pos);
   if(ly.kv_q8){ kv_q8_append(ly, n_kv, hd, pos, true); kv_q8_append(ly, n_kv, hd, pos, false); }
   if(ly.kv_int8){ kv_i8_append(ly, n_kv, hd, pos, true); kv_i8_append(ly, n_kv, hd, pos, false); }
+  if(ly.kv_q4){ kv_q4_append(ly, n_kv, hd, pos, true); kv_q4_append(ly, n_kv, hd, pos, false); }
+  if(ly.kv_q5_1){ kv_q5_1_append(ly, n_kv, hd, pos, true); kv_q5_1_append(ly, n_kv, hd, pos, false); }
+  if(ly.kv_kvarn){ kv_kvarn_append(ly, n_kv, hd, pos, true); kv_kvarn_append(ly, n_kv, hd, pos, false); }
 }
 
 // ============================================================================
@@ -9264,8 +9479,11 @@ struct PrefixCache {
       bool is_full = true;
       std::vector<float> kcache, vcache;
       std::vector<int8_t> kcache_i8, vcache_i8, kcache_q8, vcache_q8;
+      std::vector<int8_t> kcache_q4, vcache_q4, kcache_q5_1, vcache_q5_1, kcache_kvarn, vcache_kvarn;
       std::vector<float> kscale, vscale, kscale_q8, vscale_q8;
+      std::vector<float> kscale_q4, vscale_q4, kscale_q5_1, vscale_q5_1, kscale_kvarn, vscale_kvarn;
       bool kv_int8 = false, kv_q8 = false, kv_had = false;
+      bool kv_q4 = false, kv_q4_had = false, kv_q5_1 = false, kv_q5_1_had = false, kv_kvarn = false;
     };
     std::vector<LayerSnap> layers;
     // Grid recurrent states: pos_after -> per-layer (ssm, conv), harvested
@@ -9332,9 +9550,18 @@ struct PrefixCache {
       sn.kcache = ly.kcache; sn.vcache = ly.vcache;
       sn.kcache_i8 = ly.kcache_i8; sn.vcache_i8 = ly.vcache_i8;
       sn.kcache_q8 = ly.kcache_q8; sn.vcache_q8 = ly.vcache_q8;
+      sn.kcache_q4 = ly.kcache_q4; sn.vcache_q4 = ly.vcache_q4;
+      sn.kcache_q5_1 = ly.kcache_q5_1; sn.vcache_q5_1 = ly.vcache_q5_1;
+      sn.kcache_kvarn = ly.kcache_kvarn; sn.vcache_kvarn = ly.vcache_kvarn;
       sn.kscale = ly.kscale; sn.vscale = ly.vscale;
       sn.kscale_q8 = ly.kscale_q8; sn.vscale_q8 = ly.vscale_q8;
+      sn.kscale_q4 = ly.kscale_q4; sn.vscale_q4 = ly.vscale_q4;
+      sn.kscale_q5_1 = ly.kscale_q5_1; sn.vscale_q5_1 = ly.vscale_q5_1;
+      sn.kscale_kvarn = ly.kscale_kvarn; sn.vscale_kvarn = ly.vscale_kvarn;
       sn.kv_int8 = ly.kv_int8; sn.kv_q8 = ly.kv_q8; sn.kv_had = ly.kv_had;
+      sn.kv_q4 = ly.kv_q4; sn.kv_q4_had = ly.kv_q4_had;
+      sn.kv_q5_1 = ly.kv_q5_1; sn.kv_q5_1_had = ly.kv_q5_1_had;
+      sn.kv_kvarn = ly.kv_kvarn;
     }
     // Grid harvest: mid-prefill recurrent states recorded at grid positions
     // (pos_after <= state_len only — decode never records, but carried
@@ -9447,13 +9674,28 @@ struct PrefixCache {
         // (full-copied below).
         if(!trunc_prop(ly.kcache_q8, sn.kcache_q8)) return 0;
         if(!trunc_prop(ly.vcache_q8, sn.vcache_q8)) return 0;
+        if(!trunc_prop(ly.kcache_q4, sn.kcache_q4)) return 0;
+        if(!trunc_prop(ly.vcache_q4, sn.vcache_q4)) return 0;
+        if(!trunc_prop(ly.kcache_q5_1, sn.kcache_q5_1)) return 0;
+        if(!trunc_prop(ly.vcache_q5_1, sn.vcache_q5_1)) return 0;
+        if(!trunc_prop(ly.kcache_kvarn, sn.kcache_kvarn)) return 0;
+        if(!trunc_prop(ly.vcache_kvarn, sn.vcache_kvarn)) return 0;
         // Legacy INT8 scales are (kvh, group) with FIXED stride smax =
         // cap/G+1 (not length-proportional): full-copy so group indices
         // stay valid. (Q8 scales above are per-token: truncatable.)
         ly.kscale = sn.kscale; ly.vscale = sn.vscale;
         if(!trunc_prop(ly.kscale_q8, sn.kscale_q8)) return 0;
         if(!trunc_prop(ly.vscale_q8, sn.vscale_q8)) return 0;
+        if(!trunc_prop(ly.kscale_q4, sn.kscale_q4)) return 0;
+        if(!trunc_prop(ly.vscale_q4, sn.vscale_q4)) return 0;
+        if(!trunc_prop(ly.kscale_q5_1, sn.kscale_q5_1)) return 0;
+        if(!trunc_prop(ly.vscale_q5_1, sn.vscale_q5_1)) return 0;
+        if(!trunc_prop(ly.kscale_kvarn, sn.kscale_kvarn)) return 0;
+        if(!trunc_prop(ly.vscale_kvarn, sn.vscale_kvarn)) return 0;
         ly.kv_int8 = sn.kv_int8; ly.kv_q8 = sn.kv_q8; ly.kv_had = sn.kv_had;
+        ly.kv_q4 = sn.kv_q4; ly.kv_q4_had = sn.kv_q4_had;
+        ly.kv_q5_1 = sn.kv_q5_1; ly.kv_q5_1_had = sn.kv_q5_1_had;
+        ly.kv_kvarn = sn.kv_kvarn;
       } else {
         if(gs[L].ssm.size() != ly.ssm_state.size()) return 0;
         if(gs[L].conv.size() != ly.conv_state.size()) return 0;
@@ -10765,9 +11007,25 @@ int main(int argc, char** argv){
         // (INTFER_KV_HAD=1). Buffers grow lazily on first kv_q8_append.
         ly.kv_q8 = kv_q8_enabled();
         ly.kv_had = ly.kv_q8 && kv_had_enabled();
-        if(ly.kv_int8 || ly.kv_q8){
+        // Groupwise-INT4 KV (INTFER_KV_Q4=1) + switchable Hadamard
+        // (INTFER_KV_Q4_HAD=1). Buffers grow lazily on first kv_q4_append.
+        ly.kv_q4 = kv_q4_enabled();
+        ly.kv_q4_had = ly.kv_q4 && kv_q4_had_enabled();
+        // Groupwise-INT5_1 KV (INTFER_KV_Q5_1=1) + switchable Hadamard
+        // (INTFER_KV_Q5_1_HAD=1). Buffers grow lazily on first kv_q5_1_append.
+        ly.kv_q5_1 = kv_q5_1_enabled();
+        ly.kv_q5_1_had = ly.kv_q5_1 && kv_q5_1_had_enabled();
+        // KVarN variance-normalized INT8 KV (INTFER_KV_KVARN=1). Buffers grow
+        // lazily on first kv_kvarn_append.
+        ly.kv_kvarn = kv_kvarn_enabled();
+        if(ly.kv_int8 || ly.kv_q8 || ly.kv_q4 || ly.kv_q5_1 || ly.kv_kvarn){
           static bool logged = false;
           if(!logged){
+            // Effective quantiser group per active codec. q8 uses hardcoded
+            // 64-dim groups (G64, ng=hd/64) and does NOT read
+            // INTFER_INT8_KV_G; q4/q5_1/kvarn use the shared knob.
+            int effective_group = kv_group_size();
+            if (ly.kv_q8) effective_group = 64;
             // *** INTFER_INT8_KV_G ACCEPTANCE ANNOUNCEMENT. *** The group size is
             // the ONLY thing this knob changes: it re-partitions the same
             // quantiser over the same tokens, so a stream comparison is
@@ -10776,15 +11034,21 @@ int main(int argc, char** argv){
             // certifies the knob rather than a constant. Once per process,
             // keyed by tag, so it cannot suppress another arm's line.
             std::fprintf(stderr,
-                         "[int8-kv-g] INT8 KV group ACTIVE (group=%d cap=%d%s%s; "
+                         "[int8-kv-g] INT8 KV group ACTIVE (group=%d cap=%d%s%s%s%s%s%s%s; "
                          "INTFER_INT8_KV_G=%d)\n",
-                         kv_group_size(), kv_capacity(),
+                         effective_group, kv_capacity(),
                          ly.kv_q8 ? " Q8-G64" : "", ly.kv_had ? "+HAD" : "",
+                         ly.kv_q4 ? " Q4" : "", ly.kv_q4_had ? "+HAD" : "",
+                         ly.kv_q5_1 ? " Q5_1" : "", ly.kv_q5_1_had ? "+HAD" : "",
+                         ly.kv_kvarn ? " KVARn" : "",
                          kv_group_size());
             std::fflush(stderr);
-            std::fprintf(stderr, "[intfer] INT8 KV cache on (group %d, cap %d)%s%s\n",
-                         kv_group_size(), kv_capacity(),
-                         ly.kv_q8 ? " Q8-G64" : "", ly.kv_had ? "+HAD" : "");
+            std::fprintf(stderr, "[intfer] INT8 KV cache on (group %d, cap %d)%s%s%s%s%s%s%s\n",
+                         effective_group, kv_capacity(),
+                         ly.kv_q8 ? " Q8-G64" : "", ly.kv_had ? "+HAD" : "",
+                         ly.kv_q4 ? " Q4" : "", ly.kv_q4_had ? "+HAD" : "",
+                         ly.kv_q5_1 ? " Q5_1" : "", ly.kv_q5_1_had ? "+HAD" : "",
+                         ly.kv_kvarn ? " KVARn" : "");
             logged = true; }
         }
       } else {

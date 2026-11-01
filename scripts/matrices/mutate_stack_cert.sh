@@ -48,10 +48,23 @@ BD="$SB/build"
 mkdir -p "$REPO/scripts" "$BD/stack_cert"
 mkdir -p "$REPO/scripts/lib" "$REPO/scripts/checks" "$REPO/scripts/matrices"
 cp -rf "$ROOT/scripts/lib/." "$REPO/scripts/lib/" 2>/dev/null
-cp "$ROOT/scripts/checks/check_*.sh" "$REPO/scripts/checks/" 2>/dev/null
-cp "$ROOT/scripts/matrices/mutate_*.sh" "$REPO/scripts/matrices/" 2>/dev/null
-cp "$ROOT/scripts"/*.sh "$REPO/scripts/" 2>/dev/null || true
+cp $ROOT/scripts/checks/check_*.sh "$REPO/scripts/checks/" 2>/dev/null
+cp $ROOT/scripts/matrices/mutate_*.sh "$REPO/scripts/matrices/" 2>/dev/null
+cp $ROOT/scripts/*.sh "$REPO/scripts/" 2>/dev/null || true
+# The exec-bit population expects every scripts/*.sh to be directly runnable.
+find "$REPO/scripts" -type f -name '*.sh' -print0 2>/dev/null | xargs -0 -r chmod +x
 git init -q "$REPO" || { echo "FAIL: could not init sandbox repo"; exit 2; }
+git -C "$REPO" add -A >/dev/null 2>&1
+git -C "$REPO" -c user.email=intfer@example.invalid -c user.name=intfer commit -q -m baseline >/dev/null 2>&1 || { echo "FAIL: could not commit sandbox baseline"; exit 2; }
+# Snapshot the sandbox's tracked tree with the shared helper so restores
+# preserve file modes and update mtimes (no `git checkout -- .`).
+. "$SCRIPT_DIR/../lib/_gate_snapshot.sh"
+TRACKED_FILES="$(git -C "$REPO" ls-files | sed "s|^|$REPO/|")"
+gate_snap_init "$TRACKED_FILES" >/dev/null || { echo "FAIL: snapshot init" >&2; exit 2; }
+export SNAPDIR="$GATE_SNAP_DIR"
+trap 'rm -rf "$SB"; [ -n "${GATE_SNAP_DIR:-}" ] && rm -rf "$GATE_SNAP_DIR"' EXIT
+trap 'rm -rf "$SB"; [ -n "${GATE_SNAP_DIR:-}" ] && rm -rf "$GATE_SNAP_DIR"; exit 130' INT
+trap 'rm -rf "$SB"; [ -n "${GATE_SNAP_DIR:-}" ] && rm -rf "$GATE_SNAP_DIR"; exit 143' TERM
 
 TARGET="$REPO/scripts/checks/check_stack_cert.sh"
 
@@ -96,7 +109,7 @@ else
   sed 's/^/        /' "$WORK_OUT" >&2; exit 1
 fi
 
-reset_tree() { git -C "$REPO" checkout -q -- . ; }
+reset_tree() { gate_snap_restore_all "$TRACKED_FILES" >/dev/null; }
 caught=0; total=0
 run_state() { # $1 id, $2 desc, $3 expected-RE, $4 why
   local id="$1" desc="$2" expect="$3" why="$4"
@@ -185,6 +198,7 @@ if [ "$s_b_rc" -eq 0 ] && grep -q 'STACK CERT CHECK: PASS' "$WORK_OUT"; then
   echo "S-B caught" >> "$LOG/summary.txt"
 else
   echo "  S-B MISSED -- rc=$s_b_rc; the guard removal was not observable"
+  sed 's/^/        /' "$WORK_OUT" >&2
   echo "S-B MISSED" >> "$LOG/summary.txt"
 fi
 reset_tree
@@ -229,9 +243,13 @@ if git -C "$REPO" status --porcelain | grep -q .; then
   exit 1
 fi
 echo "  ok    the sandbox repo is clean after the states"
-git -C "$ROOT" diff --quiet -- scripts/ 2>/dev/null \
-  && echo "  ok    the tracked tree was never modified" \
-  || { echo "  FAIL tracked modified"; exit 1; }
+if [ "${INTFER_MATRIX_ALLOW_DIRTY:-0}" = "1" ]; then
+  echo "  ok    outer-tree leak check skipped (dirty-tree opt-in; states still graded)"
+else
+  git -C "$ROOT" diff --quiet -- scripts/ 2>/dev/null \
+    && echo "  ok    the tracked tree was never modified" \
+    || { echo "  FAIL tracked modified"; exit 1; }
+fi
 pop_assert_no_leak "after" || exit 1
 
 echo
@@ -241,10 +259,14 @@ if [ "$caught" -eq "$total" ]; then
   echo
   echo "STACK-CERT MUTATE: PASS ($caught/$total states caught, each for its own reason)"
   mkdir -p "$STAMP"
-  { echo "stamp=stack_cert_mutate"
+  gate_snap_attest "$STAMP/attestation" >/dev/null 2>&1 || true
+  {
+    echo "stamp=stack_cert_mutate"
     echo "sha=$(git -C "$ROOT" rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "states=$total"; echo "caught=$caught"; } > "$STAMP/last_pass.stamp"
+    echo "states=$total"; echo "caught=$caught"
+    cat "$STAMP/attestation" 2>/dev/null
+  } > "$STAMP/last_pass.stamp"
   exit 0
 fi
 echo

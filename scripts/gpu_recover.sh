@@ -113,7 +113,14 @@ cmd_diag() {
   echo
   echo "-- 3. THE DECISIVE TEST: VRAM BAR size vs VRAM size per slot --"
   echo "     (needs lspci, or root to read config space past the 64-byte header)"
-  if command -v lspci >/dev/null 2>&1; then
+  # *** A SEAM, SO THE UNMEASURED BRANCH IS TESTABLE ON EVERY BOX. *** Branching
+  # only on `command -v lspci` made this path observable ONLY on machines without
+  # pciutils: on a box that has it, check_gpu_recover.sh skipped the case, its
+  # mutation matrix could not catch the defect it plants (M-D scored MISSED rc=0,
+  # MEASURED 2026-10-30), and the "unmeasured is not a verdict" rule was therefore
+  # unproven wherever it was most likely to regress. Same shape as INTFER_SYCL_LS
+  # and INTFER_DRI_ROOT: the box stops being an input.
+  if [ "${INTFER_LSPCI_ABSENT:-0}" != 1 ] && command -v lspci >/dev/null 2>&1; then
     for s in "$PRESENT_SLOT" "$MISSING_SLOT"; do
       bus="${s#0000:}"; bus="${bus%%:*}"; dev="${bus#*:}"; dev="${dev%%.*}"
       echo "  --- $s ---"
@@ -134,8 +141,16 @@ cmd_diag() {
     # NOT an informational line. Without this measurement the small-BAR theory
     # is UNTESTED, and reporting a verdict anyway is the vacuous-green class
     # (AUDIT #20): the check cannot harvest its subject but certifies one.
-    echo "  !! DECISIVE TEST NOT MEASURED -- lspci is absent."
-    echo "     Install it (dnf install pciutils) or read config space as root."
+    # The REASON is a separate line so the verdict line is a single stable text
+    # that both the checker and its mutation matrix can anchor on, whichever way
+    # the measurement was withheld.
+    if command -v lspci >/dev/null 2>&1; then
+      lspci_reason="lspci query disabled for this run (INTFER_LSPCI_ABSENT=1)"
+    else
+      lspci_reason="lspci is absent (install pciutils, or read config space as root)"
+    fi
+    echo "  !! DECISIVE TEST NOT MEASURED -- the BAR comparison did not run."
+    echo "     Reason: $lspci_reason."
     echo "     Until then the small-BAR theory is UNTESTED, not refuted."
     BAR_STATE=NOT_MEASURED
   fi

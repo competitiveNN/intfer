@@ -104,11 +104,18 @@ trap 'rm -rf "$LOCK" 2>/dev/null || true; exit 143' TERM
 # is work they would destroy. Checking the whole tracked tree is derived, so a new
 # matrix target does not have to be added to a list here to stay safe.
 if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "FAIL: the tracked tree has uncommitted changes." >&2
+  # *** MACHINE-READABLE REFUSAL. *** A prose-only refusal forces the next
+  # session to diff the tree by hand to tell an INTENTIONAL known working set
+  # (a staged repair campaign) from accidental drift. The one-line token names
+  # the scope, the count and the reason; the `dirty:` rows name every path. This
+  # stays a REFUSAL -- the matrices restore with `git checkout --`, so running
+  # over uncommitted work would destroy it.
+  dirty_n="$(git status --porcelain --untracked-files=no | wc -l)"
+  echo "REFUSAL: DIRTY-TREE scope=tracked files=$dirty_n reason=matrices-restore-with-git-checkout" >&2
   echo "  The mutation matrices restore with 'git checkout --' and would destroy" >&2
   echo "  that work. Commit or stash first, then re-run." >&2
   echo "  (Untracked files are fine; only tracked changes are at risk.)" >&2
-  git status --porcelain --untracked-files=no >&2
+  git status --porcelain --untracked-files=no | sed 's/^/  dirty: /' >&2
   exit 1
 fi
 HEAD_SHA="$(git rev-parse HEAD)"
@@ -521,6 +528,36 @@ dispatch() { # $1 = label -> runs it
        # Runs BEFORE check_scripts_live.sh so its presence does not count as an
        # unreachable script.
        timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_tally_propagation.sh"; return $? ;;
+    check_engine_citations.sh)
+      # Every citation in the engine survey corpus (docs/engines/*.txt) must be
+      # LOCATION-BEARING and PATH-QUALIFIED (intfer/ upstream/ external/ absent/)
+      # and must resolve to a real line in the file it names. The resolver lives
+      # in scripts/lib/_engine_citations_scan.py; the rule was enforced only by a
+      # scratch /tmp tool before promotion. Text only: no GPU, model or build.
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_engine_citations.sh"; return $? ;;
+    check_engines_sources_paths.sh)
+      # TWO tracked files carry the name engines_sources.txt (root, 264 lines,
+      # nine S1 records; docs/engines/, 152 lines, zero), so a bare citation
+      # names a line that exists in one and not the other. Refuses the ambiguity.
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_engines_sources_paths.sh"; return $? ;;
+    check_closing_band_rows.sh)
+      # Source-level certification of scripts/closing_band.sh's classification
+      # record: every printing branch records its class and the three counts agree
+      # with the derived population. Born of the round-7 summary that reported
+      # "three DIFFERS" while the log said five. Text only.
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_closing_band_rows.sh"; return $? ;;
+    check_q4_q5_twin_symmetry.sh)
+      # Pins every KV activation site in examples/intfer_cli/main.cpp to its
+      # predicate and the three Hadamard-twin couplings to one structural shape.
+      # Born of the shipped `ly.kv_q4_had = false;` hardcode while its q5_1 twin
+      # read the flag. Text only: no GPU, no model, no build.
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_q4_q5_twin_symmetry.sh"; return $? ;;
+    check_matrix_sandbox_locks.sh)
+      # Derives, from SOURCE, which matrices wipe a FIXED sandbox at a fixed path
+      # and asserts each holds a lock OUTSIDE the tree it wipes. Measured on
+      # 2026-10-21: two concurrent instances of one such matrix corrupted each
+      # other's baseline. Text only -- the graded matrices are never executed.
+      timeout -k 30 600 bash "$SCRIPT_DIR/checks/check_matrix_sandbox_locks.sh"; return $? ;;
     check_scripts_live.sh)
       # MEASURED 2026-10-05, not predicted: a full reference-graph derivation of
       # scripts/ found SIXTEEN entries that no code referenced -- a superseded
@@ -870,6 +907,50 @@ dispatch() { # $1 = label -> runs it
        # population. Every state cmp-asserts it LANDED before grading, and the residue
        # half proves the live records were never modified.
        timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_tally_propagation.sh"; return $? ;;
+    mutate_engine_citations.sh)
+       # Negative direction for check_engine_citations.sh on an IN-REPO fixture
+       # (scripts/fixtures/engine-citations/): reconstructs the historical defect
+       # SHAPES (bare tokens, absolute paths, non-resolving lines) and requires the
+       # checker to refuse each. BOTH POLARITIES are graded -- EC-control plants a
+       # synthetic control the resolve() path must grade as CLEAN, so a checker that
+       # refused everything cannot pass. Text only.
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_engine_citations.sh"; return $? ;;
+    mutate_engines_sources_paths.sh)
+       # Negative direction for check_engines_sources_paths.sh: plants the bare
+       # `engines_sources.txt:NNN` ambiguity and requires the checker to name its
+       # own predicate. ESP-qualified is the CONVERSE (a valid qualified citation
+       # must stay clean) and ESP-detector-blind is the state only the control can
+       # catch. Never executes a graded script. Text only.
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_engines_sources_paths.sh"; return $? ;;
+    mutate_closing_band_rows.sh)
+       # AUDIT #29 direction: every planted defect lands in a scratch copy of
+       # scripts/closing_band.sh (the SUBJECT), never in the checker -- weakening
+       # the checker would be unobservable to its own run. TEN states, each
+       # requiring its OWN named predicate (CR-1 dropped cls_record call through
+       # CR-10). Text only: the script is never executed.
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_closing_band_rows.sh"; return $? ;;
+    mutate_q4_q5_twin_symmetry.sh)
+       # Pairs with check_q4_q5_twin_symmetry.sh: DC-1..DC-13 plant codec/scale/
+       # activation defects in main.cpp, DC-14/DC-15 are the BLIND mutants (q8 and
+       # kvarn codec-ON hardcoded false -- the shape that shipped) and T1 is the
+       # true-drift twin. Source mutation only: no GPU, no model, no build.
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_q4_q5_twin_symmetry.sh"; return $? ;;
+    mutate_kv_variants.sh)
+       # The KV variant arms in scripts/gates/test_gpu_optin.sh: every variant the
+       # loop names (q8, q4, q4_had, q5_1, q5_1_had, kvarn) has a dedicated state.
+       # Each plants a quantisation defect in main.cpp, REBUILDS intfer_cli and
+       # requires the argmax stream or the [int8-kv-g] announcement tag to move.
+       # This is the only matrix here that builds; it holds a lock outside the
+       # sandbox it wipes (see check_matrix_sandbox_locks.sh).
+       timeout -k 60 3600 bash "$SCRIPT_DIR/matrices/mutate_kv_variants.sh"; return $? ;;
+    mutate_matrix_sandbox_locks.sh)
+       # Negative direction for check_matrix_sandbox_locks.sh, on a synthetic
+       # corpus: MS-1..MS-6 plant each lock defect (undeclared, unacquired,
+       # unreleased, INSIDE the wiped tree, taken AFTER the wipe, population below
+       # the floor) and MS-7 is the CONVERSE -- an mktemp sandbox needs no lock and
+       # must not be red, without which a checker that flagged every matrix would
+       # satisfy MS-1..MS-6. Text only.
+       timeout -k 30 900 bash "$SCRIPT_DIR/matrices/mutate_matrix_sandbox_locks.sh"; return $? ;;
     mutate_knob_sweep_contract.sh)
        # TWELVE states, each planting ONE structural defect into a temp copy of
        # scripts/knob_sweep.sh (NOT a synthetic log -- a log built from the fixed
@@ -1210,7 +1291,7 @@ enum_require_nonempty "dispatch-arms" "$(printf '%s\n' "$ARMS" | grep -c . || tr
 UNDISPATCHED=""
 QUERY_FAILED=""
 N_DISPATCHABLE=0
-for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
+for f in "$SCRIPT_DIR"/checks/check_*.sh "$SCRIPT_DIR"/matrices/mutate_*.sh; do
   [ -f "$f" ] || continue
   b="$(basename "$f")"
   N_DISPATCHABLE=$((N_DISPATCHABLE + 1))
@@ -1260,7 +1341,7 @@ fi
 if [ -n "${INTFER_RUN_ALL_STEPS:-}" ]; then
   STEPS="$INTFER_RUN_ALL_STEPS"
 else
-  STEPS="gate_inventory.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_decode1_shipped_anchor.sh check_s1_predicates.sh check_xmx_attrib.sh check_uncached_alloc.sh check_knob_sweep_contract.sh check_durable_claims.sh check_tally_propagation.sh check_tp2_pass_exit.sh check_gate_exit_verdict.sh check_flag_gate_coverage.sh check_hw_constants.sh check_dpas_shape_audit.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_ladder_sync.sh check_durable_reads.sh check_scripts_live.sh check_pipefail_grep_q.sh check_history_pointers.sh"
+  STEPS="gate_inventory.sh check_device_precond.sh check_e2_ctx.sh check_gate_enum.sh check_gate_pop.sh check_gpu_recover.sh check_engine_cert.sh check_checker_matrix_coverage.sh check_build_dir_consumers.sh check_verdict_scope.sh check_dri_probe.sh check_trap_release.sh check_guard_identity.sh check_decode1_copies.sh check_decode1_shipped_anchor.sh check_s1_predicates.sh check_xmx_attrib.sh check_uncached_alloc.sh check_knob_sweep_contract.sh check_durable_claims.sh check_tally_propagation.sh check_tp2_pass_exit.sh check_gate_exit_verdict.sh check_flag_gate_coverage.sh check_engine_citations.sh check_engines_sources_paths.sh check_closing_band_rows.sh check_q4_q5_twin_symmetry.sh check_matrix_sandbox_locks.sh check_hw_constants.sh check_dpas_shape_audit.sh check_env_not_box_state.sh check_destructive_git.sh check_dispatch_steps_consistency.sh check_pending_operator.sh check_nullglob_sites.sh check_act_cache_invalidation.sh check_ladder_sync.sh check_durable_reads.sh check_scripts_live.sh check_pipefail_grep_q.sh check_history_pointers.sh"
 STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   # A REAL gate, but it needs a GPU and takes ~30 s, so it sits in the
   # same INTFER_QUICK-off band as check_l0_cite.sh. Quick mode is meant to be
@@ -1280,7 +1361,7 @@ STEPS="$STEPS run_ten_gates.sh"   # SELF-CHECK ONLY -- see the dispatch arm
   [ "${INTFER_QUICK:-0}" = "1" ] || \
     STEPS="$STEPS knob_sweep.sh"
   [ "${INTFER_QUICK:-0}" = "1" ] || \
-    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_tp2_pass_exit.sh mutate_gate_exit_verdict.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_s1_predicates.sh mutate_xmx_attrib.sh mutate_uncached_alloc.sh mutate_knob_sweep_contract.sh mutate_durable_claims.sh mutate_tally_propagation.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_ladder_sync.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh mutate_pipefail_grep_q.sh mutate_history_pointers.sh mutate_durable_reads.sh"
+    STEPS="$STEPS mutate_fold_matrix.sh mutate_gate_inventory.sh mutate_device_precond.sh mutate_run_all_checks.sh mutate_l0_cite.sh mutate_hw_constants.sh mutate_dpas_shape_audit.sh mutate_roofline_bisect.sh mutate_roofline_bisect1.sh mutate_roofline_bisect3.sh mutate_roofline_bisect4.sh mutate_roofline_probe.sh mutate_build_dir_consumers.sh mutate_gate_enum.sh mutate_gpu_recover.sh mutate_e2_ctx.sh mutate_gate_pop.sh mutate_engine_cert.sh mutate_checker_matrix_coverage.sh mutate_verdict_scope.sh mutate_stack_cert.sh mutate_dri_probe.sh mutate_trap_release.sh mutate_guard_identity.sh mutate_tp2_selfcheck.sh mutate_decode1_shipped_anchor.sh mutate_tp2_pass_exit.sh mutate_gate_exit_verdict.sh mutate_decode1_copies.sh mutate_flag_gate_coverage.sh mutate_env_not_box_state.sh mutate_destructive_git.sh mutate_dispatch_steps_consistency.sh mutate_pending_operator.sh mutate_s1_predicates.sh mutate_xmx_attrib.sh mutate_uncached_alloc.sh mutate_knob_sweep_contract.sh mutate_durable_claims.sh mutate_tally_propagation.sh mutate_nullglob_sites.sh mutate_act_cache_invalidation.sh mutate_ladder_sync.sh mutate_scripts_live.sh mutate_rowpair_equiv.sh mutate_pipefail_grep_q.sh mutate_history_pointers.sh mutate_durable_reads.sh mutate_engine_citations.sh mutate_engines_sources_paths.sh mutate_closing_band_rows.sh mutate_q4_q5_twin_symmetry.sh mutate_kv_variants.sh mutate_matrix_sandbox_locks.sh"
 fi
 
 # --- 0c every check_*/mutate_* is SCHEDULED, not merely dispatchable ---------
@@ -1326,7 +1407,7 @@ else
   POST_STACK=""
   bad_post=""
   N_SCHEDULABLE=0
-  for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
+  for f in "$SCRIPT_DIR"/checks/check_*.sh "$SCRIPT_DIR"/matrices/mutate_*.sh; do
     [ -f "$f" ] || continue
     b="$(basename "$f")"
     N_SCHEDULABLE=$((N_SCHEDULABLE + 1))
@@ -1403,7 +1484,7 @@ else
   # NON-IDEMPOTENT -- one that stamps, writes, takes the lock, or mutates source.
   # Then running it twice stops being cosmetic and becomes a wrong verdict.
   DUPED=""
-  for f in "$SCRIPT_DIR"/check_*.sh "$SCRIPT_DIR"/mutate_*.sh; do
+  for f in "$SCRIPT_DIR"/checks/check_*.sh "$SCRIPT_DIR"/matrices/mutate_*.sh; do
     [ -f "$f" ] || continue
     b="$(basename "$f")"
     n="$(printf '%s' "$STEPS" | tr ' ' '\n' | grep -cxF -- "$b" || true)"

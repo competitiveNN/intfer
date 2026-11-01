@@ -24,7 +24,7 @@
 # nothing to lock. That is the checker's own condition (1), stated in code rather
 # than in a comment.
 #
-# THE SEVEN STATES, each with its own refusal requirement:
+# THE EIGHT STATES, each with its own refusal requirement:
 #   MS-1 the lock is never declared            -> LOCK-NOT-DECLARED
 #   MS-2 the lock is declared but never taken  -> LOCK-NOT-ACQUIRED
 #   MS-3 the lock is taken but never released  -> LOCK-NOT-RELEASED
@@ -32,6 +32,8 @@
 #   MS-5 the lock is taken AFTER the wipe      -> LOCK-AFTER-WIPE
 #   MS-6 the population is below the floor     -> "derived only N matrix(es)"
 #   MS-7 CONVERSE: an mktemp sandbox needs no lock, and must not be red
+#   MS-8 the EXIT trap is DISARMED and the lock is released AFTER the disarm
+#                                              -> LOCK-DISARM-BEFORE-RELEASE
 # MS-7 is the anti-always-red half. Without it a checker that flagged EVERY matrix
 # -- including the mktemp-immune ones the checker's own condition (1) excludes --
 # would satisfy MS-1..MS-6 and read as proven.
@@ -50,9 +52,24 @@ trap 'rm -rf "$SB"' EXIT
 trap 'rm -rf "$SB"; exit 130' INT
 trap 'rm -rf "$SB"; exit 143' TERM
 
-git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null || {
-  echo "FAIL: $CHECK is dirty; this matrix runs the live one over a sandbox corpus." >&2
-  exit 2; }
+# *** THE CHECKER IS READ, NEVER WRITTEN, SO AN UNCOMMITTED CHECKER IS AN INPUT,
+# NOT A HAZARD. *** The original guard refused when $CHECK was dirty, which is the
+# right rule for a matrix that MUTATES its target and restores it with
+# `git checkout --` (that is how uncommitted work gets destroyed). This matrix
+# only READS the checker's source and grades a mktemp corpus, so refusing here
+# blocked every session that improves the checker -- measured 2026-10-30, the MS-8
+# campaign. The refusal is replaced by a NAMED INPUT: the checker's blob hash is
+# printed and stamped, so the verdict says exactly which source was graded even
+# when that source is uncommitted, and a verdict cannot be silently attributed to
+# a different revision.
+CHECK_BLOB="$(git -C "$ROOT" hash-object "$CHECK" 2>/dev/null || echo unknown)"
+if ! git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null; then
+  CHECK_DIRTY=yes
+  echo "  ..    INPUT: $CHECK is UNCOMMITTED (blob $CHECK_BLOB); that is the source"
+  echo "        graded below, and the stamp names it -- this matrix never writes it."
+else
+  CHECK_DIRTY=no
+fi
 
 # --- the corpus -------------------------------------------------------------
 # $CROOT/scripts/matrices/ holds FIXTURES whose declarations are the subject. The
@@ -207,6 +224,13 @@ state MS-5 3 's@^if ! mkdir "\$LOCK" 2>/dev/null; then$@@; s@^rm -rf "\$SB"$@rm 
 # MS-6 the population is below the checker's own floor
 state MS-6 2 '' '' 'derived only 2 matrix\(es\)' \
   'a population below the floor must not read as PASS'
+# MS-8 the EXIT handler is DISARMED and the release moved AFTER the disarm. This is
+# the subtle half of the 2026-10-30 campaign: a static `rmdir appears somewhere`
+# test reads it as released, but `trap - EXIT` never RUNS the handler, so the lock
+# leaks on exactly the path that runs the disarm. The acquire stays where it was,
+# so LOCK-NOT-ACQUIRED/LOCK-AFTER-WIPE cannot fire and mask this predicate.
+state MS-8 3 "s@^trap 'rmdir \"\$LOCK\" 2>/dev/null || true' EXIT\$@trap - EXIT #MUT_MS8\nrmdir \"\$LOCK\" 2>/dev/null || true@" MUT_MS8 'LOCK-DISARM-BEFORE-RELEASE' \
+  'a disarm drops the EXIT handler without running it, so a release after it never runs'
 # MS-7 CONVERSE: an mktemp sandbox is immune and must be left alone. This state
 # ADDS the immune fixture to a corpus that already passes and re-requires PASS.
 corpus 3
@@ -236,6 +260,7 @@ mkdir -p "$SB/stamp"
 { echo "stamp=matrix_sandbox_locks_mutate"
   echo "sha=$(git -C "$ROOT" rev-parse HEAD)"
   echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "checker_blob=$CHECK_BLOB"; echo "checker_dirty=$CHECK_DIRTY"
   echo "states=$total"; echo "caught=$caught"; } >"$SB/stamp/last_pass.stamp"
 echo "RESULT: PASS (every lock-class defect observed for its own named predicate)"
 exit 0

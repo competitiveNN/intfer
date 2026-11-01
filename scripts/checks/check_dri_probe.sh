@@ -49,7 +49,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # exist: the subject of this checker is OTHER scripts, so a mutation harness must be
 # able to hand it a corpus of its own. Without it the only way to test the rule is
 # to damage the real scripts/ directory.
-SCRIPTS_DIR="${INTFER_SCRIPTS_DIR:-$SCRIPT_DIR}"
+#
+# THE DEFAULT IS THE SCRIPTS ROOT, NOT $SCRIPT_DIR, and that is a MEASURED repair
+# (2026-10-30): after the 2026-10-21 restructure this file lives in scripts/checks/,
+# so a $SCRIPT_DIR default made the corpus the CHECKER DIRECTORY ALONE. The
+# population guard then found no probe at all and failed with "no script in
+# scripts/ probes render nodes", i.e. the checker certified nothing while reading
+# like a tree-wide verdict. The corpus is derived the same way check_scripts_live.sh
+# derives its population: one level of family subdirs, archive/ pruned.
+SCRIPTS_DIR="${INTFER_SCRIPTS_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 # classify <file>: 0 = clean, 1 = VIOLATION (identifies cards by minor)
 #                2 = not applicable (does not probe render nodes at all)
@@ -70,9 +78,8 @@ classify() {
   return 0
 }
 
-shopt -s nullglob
-SCRIPTS=("$SCRIPTS_DIR"/*.sh)
-shopt -u nullglob
+mapfile -t SCRIPTS < <(find "$SCRIPTS_DIR" -maxdepth 2 -not -path "*/archive/*" \
+                       -type f -name '*.sh' | sort)
 
 # *** SELF-EXCLUSION BY IDENTITY, NOT BY NAME. *** This file must be able to plant
 # the defect text, so including itself is a guaranteed false positive. Comparing to

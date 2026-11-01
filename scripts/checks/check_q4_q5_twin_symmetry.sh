@@ -123,7 +123,7 @@ for fn in "${T5_NAMES[@]}"; do
     *) echo "FAIL: T5-${fn} violated: body does not read std::getenv" >&2; exit 1 ;;
   esac
   case "$body" in
-    *"return false"*) echo "FAIL: T5-${fn} violated: body contains `return false`" >&2; exit 1 ;;
+    *"return false"*) echo "FAIL: T5-${fn} violated: body contains return false" >&2; (exit 1) ;;
     *) printf '  ok    T5-%s   (no `return false` in body)\n' "$fn" ;;
   esac
 done

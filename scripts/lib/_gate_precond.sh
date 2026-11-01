@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Shared preconditions for gate scripts. Sourced, never executed.
 #
 # Usage, after the gate has defined SCRIPT_DIR/ROOT:

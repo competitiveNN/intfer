@@ -1,0 +1,45 @@
+name: Snapshot Helper CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run gate-state recorder self-check (fast, no device)
+        run: bash scripts/tests/test_gate_state_recorder.sh
+      - name: Shellcheck all libs, checks, and matrices
+        run: |
+          shellcheck -S error scripts/lib/*.sh scripts/checks/*.sh scripts/matrices/*.sh
+
+  snapshot-helper:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect usable hardware session
+        id: hw
+        run: |
+          if bash scripts/checks/check_hw_session.sh; then
+            echo "usable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "usable=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run snapshot edge cases and benchmark
+        run: bash scripts/tests/run_snapshot_checks.sh
+      - name: Run regression matrix tests
+        if: steps.hw.outputs.usable == 'true'
+        timeout-minutes: 30
+        run: bash scripts/tests/regression_matrix_tests.sh
+      - name: Upload regression artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-matrix-logs
+          path: |
+            build/*_matrix/
+            build/regression_matrix/
+          retention-days: 7

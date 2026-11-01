@@ -51,6 +51,14 @@
 #   4. lock_before the mkdir acquiring the lock precedes the first wipe.
 #   5. exit_release the lock is released on EXIT (rmdir inside a trap naming EXIT),
 #                  so a run that dies mid-state does not brick the next one.
+#   6. disarm_release a `trap - ... EXIT` DISARM is not a release: it drops the
+#                  EXIT handler WITHOUT running it. A matrix that disarms must
+#                  therefore release the lock EXPLICITLY, on an earlier line.
+#                  MEASURED 2026-10-30: mutate_fold_matrix.sh and
+#                  mutate_gate_inventory.sh both ended `restore; trap - EXIT INT
+#                  TERM`, where restore did not release -- the lock leaked on the
+#                  disarm path, and a static "rmdir appears somewhere" test read
+#                  it as compliant.
 #
 # ANTI-VACUITY: the derived population must be non-empty (>= 3 members) or the
 # checker refuses rather than reading "nothing to check" as PASS.
@@ -161,7 +169,7 @@ for p in sorted(glob.glob(os.path.join(root, "scripts/matrices/mutate_*.sh"))):
         raw = lockraw
         if not (raw.startswith("$") or raw.startswith("/") or raw.startswith('"')):
             print("\x1f".join([name, "BAD", str(lockline), raw, str(acquire),
-                  "yes" if release else "no", ""]))
+                  "yes" if release else "no", "", "0", "0"]))
             continue
         lockpath = expand(lockpath, v)
     # RELEASE: the lock is removed AND an EXIT trap exists. The removal may sit
@@ -170,12 +178,30 @@ for p in sorted(glob.glob(os.path.join(root, "scripts/matrices/mutate_*.sh"))):
     # is searched across the file and the EXIT trap is required separately.
     release = False
     removes = False
-    for line in s.split("\n"):
+    relline = 0
+    slines = s.split("\n")
+    for i, line in enumerate(slines, 1):
+        hit = False
         if lockname and re.search(r'\brm(dir)?\b[^"]*"\$%s"' % re.escape(lockname), line):
-            removes = True
+            hit = True
         if lockpath and re.search(r'\brm(dir)?\b[^"]*%s' % re.escape(lockpath), line):
+            hit = True
+        if hit:
             removes = True
-    has_exit_trap = any(l.startswith("trap ") and "EXIT" in l for l in s.split("\n"))
+            if relline == 0:
+                relline = i
+    # *** A DISARM IS NOT A RELEASE. *** `trap - ... EXIT` drops the EXIT handler
+    # WITHOUT running it, so a lock released only by that handler leaks on the
+    # disarm path. MEASURED 2026-10-30 in mutate_fold_matrix.sh and
+    # mutate_gate_inventory.sh: both ran `restore; trap - EXIT INT TERM`, which
+    # released nothing after the disarm. A matrix that disarms therefore needs an
+    # EXPLICIT release line BEFORE the disarm; that is graded below.
+    disarm = 0
+    for i, line in enumerate(slines, 1):
+        if re.match(r'^[ \t]*trap[ \t]+-[ \t]+.*\bEXIT\b', line):
+            disarm = i
+            break
+    has_exit_trap = any(l.startswith("trap ") and "EXIT" in l for l in slines)
     release = bool(removes and has_exit_trap)
 
     # --- the fixed paths this matrix wipes ---
@@ -209,7 +235,8 @@ for p in sorted(glob.glob(os.path.join(root, "scripts/matrices/mutate_*.sh"))):
         continue
     print("\x1f".join([name, str(len(wiped)), str(lockline), lockpath or "",
                        str(acquire), "yes" if release else "no",
-                       ",".join("%d:%s:%s" % (w[0], w[1], w[2]) for w in wiped)]))
+                       ",".join("%d:%s:%s" % (w[0], w[1], w[2]) for w in wiped),
+                       str(disarm), str(relline)]))
 PYQ
 }
 
@@ -218,7 +245,7 @@ ROWS="$(derive)"
                    echo "        must not read as PASS" >&2; exit 1; }
 
 population=0; failed=0
-while IFS=$'\x1f' read -r name nfix lockline lockpath acquire release wiped; do
+while IFS=$'\x1f' read -r name nfix lockline lockpath acquire release wiped disarm relline; do
   [ -n "${name:-}" ] || continue
   # A "BAD" row is a matrix whose lock path is not an absolute path -- the shape a
   # propagation script produces when it writes the variable NAME as literal text
@@ -246,6 +273,15 @@ while IFS=$'\x1f' read -r name nfix lockline lockpath acquire release wiped; do
   first="$(printf '%s\n' "$wiped" | tr ',' '\n' | cut -d: -f1 | sort -n | head -1)"
   case "$first" in ''|*[!0-9]*) first="";; esac
   if [ -n "$first" ] && [ "${acquire:-0}" -gt "$first" ]; then bad="$bad LOCK-AFTER-WIPE"; fi
+  # *** A DISARM DROPS THE EXIT TRAP WITHOUT RUNNING IT. *** If the matrix disarms
+  # (`trap - ... EXIT`) and its only release is inside/after that disarm, the lock
+  # leaks on every run that reaches the disarm. The release must be EXPLICIT and
+  # on an EARLIER line. Derived from the same source the row came from; no list.
+  _disarm="${disarm:-0}"; _rel="${relline:-0}"
+  case "$_disarm$_rel" in ''|*[!0-9]*) _disarm=0; _rel=0;; esac
+  if [ "$_disarm" -gt 0 ] && { [ "$_rel" -eq 0 ] || [ "$_rel" -gt "$_disarm" ]; }; then
+    bad="$bad LOCK-DISARM-BEFORE-RELEASE(disarm line $_disarm, release line $_rel)"
+  fi
   if [ -n "$bad" ]; then
     failed=$((failed + 1))
     printf '  FAIL  %-40s %s\n' "$name" "$bad" >&2

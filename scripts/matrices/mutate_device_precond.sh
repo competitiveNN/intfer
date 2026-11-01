@@ -75,10 +75,16 @@
 # the lock below makes that structural, and each state re-asserts a clean
 # pre-state so a leftover from a killed run is caught rather than inherited.
 #
-# FAIL CLOSED on a dirty tree: this script edits tracked source and restores it
-# with `git checkout --`, which would destroy uncommitted work.
+# This script edits tracked source and restores it from a SNAPSHOT taken at startup,
+# so the dirty-tree refusal is OPT-IN (INTFER_MATRIX_ALLOW_DIRTY=1): when set, an
+# uncommitted target is snapshotted alongside the committed baseline and restored
+# byte-for-byte, instead of aborting. Default (unset) keeps the strict guard so a
+# careless invocation cannot destroy uncommitted work. Caller's working set is
+# named as INPUT: UNCOMMITTED with blob hashes in the stamp (same convention as
+# mutate_gate_pop.sh/mutate_gpu_recover.sh).
 #
 # Env: INTFER_BUILD_DIR  build tree (default $ROOT/build) for logs and the stamp.
+#      INTFER_MATRIX_ALLOW_DIRTY  1 = run over an uncommitted working set (opt-in).
 # Exit: 0 all states caught for the right reason; 1 otherwise.
 set -u
 
@@ -118,12 +124,31 @@ TGT_H="scripts/checks/check_device_precond.sh"
 TGT_P="scripts/lib/_gate_precond.sh"
 TGT_G="scripts/gate_inventory.sh"
 DIRTY="$TGT_A $TGT_C $TGT_B $TGT_H $TGT_P"
-if ! git diff --quiet -- $DIRTY || ! git diff --cached --quiet -- $DIRTY; then
-  echo "FAIL: uncommitted changes in: $DIRTY" >&2
-  echo "  This script edits them and restores with 'git checkout --', which would" >&2
-  echo "  DESTROY that work. Commit or stash first, then re-run." >&2
-  exit 1
+
+# shellcheck source=scripts/lib/_gate_snapshot.sh
+. "$SCRIPT_DIR/../lib/_gate_snapshot.sh"
+# shellcheck source=scripts/lib/_gate_state.sh
+. "$SCRIPT_DIR/../lib/_gate_state.sh"
+GATE_SNAP_ALLOW_DIRTY="${INTFER_MATRIX_ALLOW_DIRTY:-0}" gate_snap_dirty_guard "$DIRTY" || exit 1
+GATE_SNAP_DIR_PLACEHOLDER=0
+gate_snap_init "$DIRTY $TGT_G" >/dev/null
+export SNAPDIR="$GATE_SNAP_DIR"
+
+CHECKER_BLOB="$(git hash-object "$CHECKER" 2>/dev/null || sha256sum "$CHECKER" | cut -d' ' -f1)"
+if ! git diff --quiet -- "$CHECKER" 2>/dev/null; then
+  echo "  INPUT: UNCOMMITTED file=$CHECKER blob=$CHECKER_BLOB" >&2
+  CHECKER_DIRTY=yes
+else
+  CHECKER_DIRTY=no
 fi
+
+restore() {
+  gate_snap_restore_all "$DIRTY $TGT_G"
+}
+
+trap 'restore; rm -f "scripts/gates/test_zz_unmeasured_dummy.sh" "$LOG_DIR"/test_zz_unmeasured_dummy.*.log 2>/dev/null; rm -rf "$GATE_SNAP_DIR" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'restore; rm -f "scripts/gates/test_zz_unmeasured_dummy.sh" "$LOG_DIR"/test_zz_unmeasured_dummy.*.log 2>/dev/null; rm -rf "$GATE_SNAP_DIR" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true; exit 130' INT
+trap 'restore; rm -f "scripts/gates/test_zz_unmeasured_dummy.sh" "$LOG_DIR"/test_zz_unmeasured_dummy.*.log 2>/dev/null; rm -rf "$GATE_SNAP_DIR" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true; exit 143' TERM
 
 # --- ANCHOR PRE-FLIGHT ------------------------------------------------------
 # A refactor can move or delete a mutation's target; the patch then matches
@@ -153,7 +178,7 @@ check_anchor() { # $1 = file, $2 = literal text, $3 = description
 }
 A_GUARD='gate_require_device || exit 2'
 A_EXEC='exec /usr/bin/python3'
-A_TOKENS='(--gpu|sycl-ls|level_zero|xpu-smi|dpas_fold_probe)'
+A_TOKENS='(--gpu|sycl-ls|level_zero|xpu-smi|dpas_fold_probe|onemkl_probe)'
 A_NOTAVAIL='echo "SKIP: $sycl_ls not available; cannot count GPUs" >&2'
 # The gate_env_diagnose call inside that branch. SINGLE-quoted for the same reason
 # as A_NOTAVAIL: it contains $sycl_ls, and every double-quoted interpolation of
@@ -201,32 +226,17 @@ open(path, "w").write(src.replace(old, new))
 PY
 }
 
-# AND prove the patch landed. An unverified patch is worse than no state: if it
-# silently does nothing, the checker passes, and the log reports "the mechanism is
-# NOT load-bearing" -- a false conclusion about the CHECKER, when the real fault
-# is in the state. BOTH M-D and M-E failed this way on the first run (a sed
-# delimiter collision, and a rot that was too weak to reproduce the defect).
-# So every patch is followed by a changed-file assertion.
+# AND prove the patch landed. Compare hash to the SNAPSHOT baseline via shared helper.
 verify_patched() { # $1 = file, $2 = state id
-  if git diff --quiet -- "$1"; then
-    echo "  ABORT $2  the patch did NOT change $1." >&2
-    echo "         The state would score as 'not load-bearing' -- a conclusion" >&2
-    echo "         about the CHECKER that is actually a fault in the state." >&2
-    echo "         Fix the patch, not the checker. (A common cause: a sed" >&2
-    echo "         delimiter that occurs inside the pattern.)" >&2
-    exit 1
-  fi
+  if gate_snap_verify_patched "$1"; then return 0; fi
+  echo "  ABORT $2  the patch did NOT change $1." >&2
+  exit 1
 }
 
-assert_clean() { # $1 = file, $2 = state id -- must run BEFORE the mutation
-  if ! git diff --quiet -- "$1"; then
-    echo "  ABORT $2  pre-state DIRTY: $1 already modified (leftover from a killed" >&2
-    echo "         run, or real uncommitted work). Refusing to score a state whose" >&2
-    echo "         starting point is unknown -- that is how a state fakes a PASS." >&2
-    echo "         Inspect, then 'git checkout -- $1' if the change was ours." >&2
-    return 1
-  fi
-  return 0
+assert_clean() { # $1 = file, $2 = state id
+  if gate_snap_assert_clean "$1"; then return 0; fi
+  echo "  ABORT $2  pre-state DIRTY: $1 already modified." >&2
+  return 1
 }
 
 # $5 = OPTIONAL pattern that must be ABSENT from the log. Some defects are not
@@ -236,25 +246,42 @@ assert_clean() { # $1 = file, $2 = state id -- must run BEFORE the mutation
 # refusal and then ran the comparison anyway, so the log carried both the refusal
 # and the "classification drift" line they exist to suppress. Asserted through
 # _gate_pred.sh so the POLARITY is named at the call site, per the recorded rule.
-run_state() { # $1 = id, $2 = description, $3 = file to restore, $4 = expected reason, $5 = must-be-absent ERE
-  local id="$1" desc="$2" restore="$3" want="$4" absent="${5:-}" log rc reason verdict
+run_state() { # $1 = id, $2 = description, $3 = file to restore (- = none), $4 = expected reason, $5 = must-be-absent ERE, $6 = mode (fail|keep-green, default fail)
+  local id="$1" desc="$2" restore="$3" want="$4" absent="${5:-}" mode="${6:-fail}" log rc reason verdict keep_ok
   TOTAL=$((TOTAL + 1))
+  mkdir -p "$LOG_DIR" || exit 1
   log="$LOG_DIR/mutate_${id}.log"
   timeout 1800 bash "$CHECKER" >"$log" 2>&1
   rc=$?
   reason="$(grep -m1 -E 'FAIL' "$log" | cut -c1-170)"
   verdict=MISSED
-  if [ "$rc" -eq 0 ]; then
-    reason="<checker still exited 0>"
-  elif [ -z "$reason" ]; then
-    reason="<checker failed but named no assertion>"
-  elif ! printf '%s' "$reason" | grep -qF -- "$want"; then
-    reason="WRONG REASON: caught, but not by '$want' -> $reason"
-  elif [ -n "$absent" ] && ! pred_expect_absent "$id" "$(cat "$log")" "$absent"; then
-    reason="MISLEADING LINE STILL EMITTED: caught by '$want' AND also printed '$absent'"
+  if [ "$mode" = "keep-green" ]; then
+    # Converse: the checker must STAY GREEN (rc=0) and REPORT the wanted token.
+    # A state that makes the checker red, or silences the report, is MISSED.
+    if [ "$rc" -ne 0 ]; then
+      reason="checker exited $rc, want 0 (baseline broken)"
+    elif ! grep -q "UNMEASURED" "$log"; then
+      reason="no UNMEASURED reported for the planted gate"
+    elif ! grep -q "test_zz_unmeasured_dummy" "$log"; then
+      reason="planted gate not reported as UNMEASURED"
+    else
+      verdict=ok
+      CAUGHT=$((CAUGHT + 1))
+      reason="UNMEASURED reported, baseline stays green"
+    fi
   else
-    verdict=ok
-    CAUGHT=$((CAUGHT + 1))
+    if [ "$rc" -eq 0 ]; then
+      reason="<checker still exited 0>"
+    elif [ -z "$reason" ]; then
+      reason="<checker failed but named no assertion>"
+    elif ! printf '%s' "$reason" | grep -qF -- "$want"; then
+      reason="WRONG REASON: caught, but not by '$want' -> $reason"
+    elif [ -n "$absent" ] && ! pred_expect_absent "$id" "$(cat "$log")" "$absent"; then
+      reason="MISLEADING LINE STILL EMITTED: caught by '$want' AND also printed '$absent'"
+    else
+      verdict=ok
+      CAUGHT=$((CAUGHT + 1))
+    fi
   fi
   if [ "$verdict" = ok ]; then
     printf '  ok    %-4s caught for the right reason\n' "$id"
@@ -276,12 +303,13 @@ run_state() { # $1 = id, $2 = description, $3 = file to restore, $4 = expected r
         echo "            assertion named is not evidence of anything." | sed 's/^ *//' ;;
     esac
   fi
-  printf '%-4s verdict=%-6s want=%s absent=%s\n' "$id" "$verdict" "$want" "${absent:-none}" >>"$STATES_LOG"
-  # Restoring text is not restoring the experiment: prove the tree is clean
-  # afterwards, or the next state inherits this mutation. `git checkout --`
-  # restores the recorded mode too (verified: 644 -> 755), so M-B is covered.
-  git checkout -- "$restore" 2>/dev/null
-  if git diff --quiet -- "$restore"; then
+  gate_state_record "$STATES_LOG" "$id" "$verdict" "$want" "${absent:-none}"
+  # Restore from snapshot via shared helper (skip when no file was mutated).
+  if [ "$restore" = "-" ]; then
+    printf '         no restore needed (no tracked file mutated)\n'
+    return 0
+  fi
+  if gate_snap_restore "$restore"; then
     printf '         restored: %s clean\n' "$restore"
   else
     printf '  MISSED %-4s RESTORE FAILED for %s -- manual repair needed\n' "$id" "$restore"
@@ -300,6 +328,7 @@ echo "== MUTATION MATRIX: check_device_precond.sh =="
 # broken: the refusal guards fired AND the comparison ran anyway). Asserted
 # through pred_expect_absent so the polarity is named, not a bare grep -q.
 echo "-- baseline (unmutated tree must be GREEN and SILENT) --"
+mkdir -p "$LOG_DIR" || exit 1
 BASE_LOG="$LOG_DIR/mutate_baseline.log"
 timeout 1800 bash "$CHECKER" >"$BASE_LOG" 2>&1
 BASE_RC=$?
@@ -347,7 +376,7 @@ run_state "M-A" "device guard stripped from a real gate" "$TGT_A" "carries NO gu
 assert_clean "$TGT_C" M-C || exit 1
 sed -i 's/^gate_require_device || exit 2$/gate_require_render_node || exit 2/' "$TGT_C"
 verify_patched "$TGT_C" M-C
-run_state "M-C" "guard weakened to render_node-only (half a guard)" "$TGT_C" "exited rc=0, want 2"
+run_state "M-C" "guard weakened to render_node-only (half a guard)" "$TGT_C" "want 2 (SKIP)"
 
 # M-D: narrow ONLY this checker's token regex, so its list shrinks and the two
 # derivations disagree with every gate left intact. Replaces the alternation
@@ -416,7 +445,7 @@ run_state "M-F" "self-check case (c) made always-red" "$TGT_H" "CORRECT cause wa
 # lists when there was nothing to reconcile. Hence the must-be-absent assertion
 # (`$5`), which is why run_state grew that parameter.
 assert_clean "$TGT_G" M-G || exit 1
-printf '#!/bin/sh\nexit 2\n' >"$TGT_G"          # an early exit: NO table at all
+printf '#!/bin/sh\nexit 1\n' >"$TGT_G"          # an early exit: NO table at all
 chmod +x "$TGT_G"
 verify_patched "$TGT_G" M-G
 # The must-be-absent pattern is ANCHORED on the verdict line (`FAIL  <spaces>
@@ -447,6 +476,32 @@ verify_patched "$TGT_G" M-H
 run_state "M-H" "gate_inventory's table classifies NO device gate" "$TGT_G" \
   "classifies NO gate as needing" "$A_DRIFT_VERDICT"
 
+# M-I: a gate with an earlier declared precondition -- the UNMEASURED direction.
+# The harness must classify it UNMEASURED (never MEASURED), not green.
+M_I_GATE="scripts/gates/test_zz_unmeasured_dummy.sh"
+cat > "$M_I_GATE" <<'GATE'
+#!/usr/bin/env bash
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+. "$SCRIPT_DIR/../lib/_gate_precond.sh"
+. "$SCRIPT_DIR/../lib/_gate_build.sh"
+gate_require_build intfer_cli || exit 1
+if [ ! -f /nonexistent/intfer_unmeasured_fixture.so ]; then
+  echo "SKIP: fixture precondition: intfer_unmeasured_fixture.so not installed" >&2
+  exit 2
+fi
+gate_require_device || exit 2
+echo "would run --gpu --tp 1 arm"
+GATE
+chmod +x "$M_I_GATE"
+mkdir -p "$LOG_DIR" || exit 1
+run_state "M-I" "planted gate reads UNMEASURED, never MEASURED/PASS" "-" "UNMEASURED" "" keep-green
+rm -f "$M_I_GATE" "$LOG_DIR"/test_zz_unmeasured_dummy.*.log
+
+# final integrity: every mutated target must equal its startup snapshot (bytes + mode)
+if gate_snap_integrity "$DIRTY $TGT_G"; then :; else exit 1; fi
+
 echo
 if [ "$CAUGHT" -eq "$TOTAL" ]; then
   {
@@ -457,7 +512,16 @@ if [ "$CAUGHT" -eq "$TOTAL" ]; then
     echo "each_caught_for_its_own_reason=yes"
     echo "baseline=green_and_both_crosscheck_guards_silent"
     echo "healthy_column=skipped_by_design(INTFER_DEVICE_PRECOND_SKIP_HEALTHY=1)"
+  echo "checker_blob=$CHECKER_BLOB"
+  echo "checker_dirty=$CHECKER_DIRTY"
+  gate_snap_attest "$STAMP.attestation" >/dev/null 2>&1 || true
+  targets_dirty="${GATE_SNAP_ALLOW_DIRTY:-0}"
+  for f in $DIRTY $TGT_G; do
+    printf 'target_blob_%s=%s\n' "$(printf '%s' "$f" | tr / _)" "$(sha256sum "$f" | cut -d' ' -f1)"
+  done
+  echo "snapshot_dir=$GATE_SNAP_DIR"
   } >"$STAMP"
+  cat "$STAMP.attestation" 2>/dev/null >>"$STAMP" || true
   echo "DEVICE PRECOND MUTATION: PASS ($CAUGHT/$TOTAL caught, each for its OWN reason)"
   echo "  check_device_precond.sh is non-vacuous: every mechanism this matrix names"
   echo "  can be observed to fail, including the HALF-GUARD case a single-direction"

@@ -39,8 +39,20 @@ trap 'rm -rf "$SB"; exit 130' INT
 trap 'rm -rf "$SB"; exit 143' TERM
 
 [ -f "$CHECK" ] || { echo "SKIP: $CHECK missing"; exit 2; }
-git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null || {
-  echo "FAIL: $CHECK is dirty; this matrix edits a sandbox copy of it."; exit 2; }
+# *** THE CHECKER IS READ, NEVER WRITTEN -- SO AN UNCOMMITTED CHECKER IS A NAMED
+# INPUT, NOT A HAZARD. *** The old guard refused when the checker was dirty, which
+# is correct for a matrix that MUTATES its target in place; this one copies it into
+# a sandbox and edits only the copy. Refusing here blocked every session that
+# improves the checker (MEASURED 2026-10-30, three matrices blocked at once). The
+# blob hash is printed and stamped instead, so the verdict names exactly which
+# source was graded even when that source is uncommitted.
+CHECK_BLOB="$(git -C "$ROOT" hash-object "$CHECK" 2>/dev/null || echo unknown)"
+if ! git -C "$ROOT" diff --quiet -- "$CHECK" 2>/dev/null; then
+  CHECK_DIRTY=yes
+  echo "  INPUT: UNCOMMITTED file=$CHECK blob=$CHECK_BLOB (graded; the original is never written)"
+else
+  CHECK_DIRTY=no
+fi
 
 # Enumerate the stamp DIRECTORIES, so a leak is visible as a new directory and a
 # legitimate extra stamp inside a known one does not produce a false alarm.
@@ -101,10 +113,19 @@ if ! pop_assert_no_leak "as-found"; then
   exit 1
 fi
 
-cp "$CHECK" "$SB/check_gpu_recover.sh"
-cp "$SCRIPT_DIR/gpu_recover.sh" "$SB/gpu_recover.sh"
+# *** THE SANDBOX KEEPS THE REAL FAMILY LAYOUT. *** The checker resolves its
+# sibling as "$SCRIPT_DIR/../gpu_recover.sh" -- true in the tree since the
+# 2026-10-21 reorg (scripts/checks/check_gpu_recover.sh + scripts/gpu_recover.sh).
+# Staging both FLAT put the tool at <sandbox>/../gpu_recover.sh, i.e. OUTSIDE the
+# sandbox, so every diag/rebind call produced nothing and the baseline failed on
+# cases that pass against the real tree (MEASURED 2026-10-30). The matrix's own
+# copy path was stale too: "$SCRIPT_DIR/gpu_recover.sh" is scripts/matrices/,
+# where the tool has never lived.
+mkdir -p "$SB/checks"
+cp "$CHECK" "$SB/checks/check_gpu_recover.sh"
+cp "$SCRIPT_DIR/../gpu_recover.sh" "$SB/gpu_recover.sh"
 ORIG="$SB/.orig"; ORIGT="$SB/.origtool"
-cp "$SB/check_gpu_recover.sh" "$ORIG"; cp "$SB/gpu_recover.sh" "$ORIGT"
+cp "$SB/checks/check_gpu_recover.sh" "$ORIG"; cp "$SB/gpu_recover.sh" "$ORIGT"
 # The checker resolves its sibling scripts through $SCRIPT_DIR, so the sandbox
 # needs a copy of the tool it drives as well; both sit side by side.
 # *** RESTORE THE DIRECTORY, NOT A TWO-FILE LIST. *** mutate_bench_load_gate.sh
@@ -117,10 +138,12 @@ cp "$SB/check_gpu_recover.sh" "$ORIG"; cp "$SB/gpu_recover.sh" "$ORIGT"
 SBPRIS="$SB/.pristine_sb"
 cp -a "$SB" "$SBPRIS" 2>/dev/null
 restore() { local f
-            for f in "$SB"/*.sh; do rm -f "$f"; done
+            for f in "$SB"/*.sh "$SB"/checks/*.sh; do [ -e "$f" ] && rm -f "$f"; done
             for f in "$SBPRIS"/*.sh; do cp -a "$f" "$SB/"; done
-            CKB="$SB/check_gpu_recover.sh"; }
-run_check() { ( cd "$SB" && bash "$SB/check_gpu_recover.sh" 2>&1 ); }
+            mkdir -p "$SB/checks"
+            for f in "$SBPRIS"/checks/*.sh; do cp -a "$f" "$SB/checks/"; done
+            CKB="$SB/checks/check_gpu_recover.sh"; }
+run_check() { ( cd "$SB" && bash "$SB/checks/check_gpu_recover.sh" 2>&1 ); }
 
 # *** THE NO-OP GUARD MUST WATCH EVERY MUTABLE FILE, NOT A LIST. ***
 # This guard was dead twice over. First it compared `cmp -s "$before" "$CHECKER"`
@@ -134,7 +157,7 @@ run_check() { ( cd "$SB" && bash "$SB/check_gpu_recover.sh" 2>&1 ); }
 # "a state that damages a file nobody listed cannot leak into its successor". The
 # no-op guard has the same subject: the unit of mutation is the sandbox, so digest
 # every script in it. A hand list here would be the third copy of the bug.
-sb_digest() { cat "$SB"/*.sh 2>/dev/null | cksum; }
+sb_digest() { cat "$SB"/*.sh "$SB"/checks/*.sh 2>/dev/null | cksum; }
 
 echo "== baseline: clean checker must PASS, and must print the converse =="
 restore
@@ -173,7 +196,7 @@ run_state() {
     echo "$id MISSED (stale anchor)" >> "$LOG/summary.txt"; restore; return 1
   fi
   # ...and must not have broken the file, which would be a STATE fault.
-  { bash -n "$SB/check_gpu_recover.sh" && bash -n "$SB/gpu_recover.sh"; } 2>/dev/null || {
+  { bash -n "$SB/checks/check_gpu_recover.sh" && bash -n "$SB/gpu_recover.sh"; } 2>/dev/null || {
     echo "  $id MISSED -- patch left the checker syntactically broken (STATE fault)"
     echo "$id MISSED (syntax)" >> "$LOG/summary.txt"; restore; return 1; }
 
@@ -215,7 +238,7 @@ echo "== states =="
 # cannot tell that apart from a real measurement will call it 1 device -- the
 # audit #20(b) shape, in the direction that matters.
 MUTATE_FN() {
-  python3 - "$SB/check_gpu_recover.sh" <<'PYEOF'
+  python3 - "$SB/checks/check_gpu_recover.sh" <<'PYEOF'
 import sys
 p = sys.argv[1]; s = open(p).read()
 a = "mk_stub 'zeInit rc=0\n(this probe produced no device count)'"
@@ -223,14 +246,14 @@ b = "mk_stub 'zeInit rc=0\nTOTAL LEVEL ZERO DEVICES: 1'  # MUT_A"
 assert s.count(a) == 1, "anchor count %d" % s.count(a)
 open(p, "w").write(s.replace(a, b, 1))
 PYEOF
-  verify_patched "$SB/check_gpu_recover.sh" 'MUT_A'
+  verify_patched "$SB/checks/check_gpu_recover.sh" 'MUT_A'
 }
 run_state "M-A" 'MUT_A' 'ok    verify exits 2 \(distinct from 1\)'
 
 # M-B: the "2 devices" stub reports ONE. If the success branch is reachable with
 # a single device, case (a) proves nothing about the branch being real.
 MUTATE_FN() {
-  python3 - "$SB/check_gpu_recover.sh" <<'PYEOF'
+  python3 - "$SB/checks/check_gpu_recover.sh" <<'PYEOF'
 import sys
 p = sys.argv[1]; s = open(p).read()
 a = "TOTAL LEVEL ZERO DEVICES: 2'"
@@ -238,7 +261,7 @@ b = "TOTAL LEVEL ZERO DEVICES: 1'  # MUT_B"
 assert s.count(a) == 1, "anchor count %d" % s.count(a)
 open(p, "w").write(s.replace(a, b, 1))
 PYEOF
-  verify_patched "$SB/check_gpu_recover.sh" 'MUT_B'
+  verify_patched "$SB/checks/check_gpu_recover.sh" 'MUT_B'
 }
 run_state "M-B" 'MUT_B' 'ok    verify exits 0 and prints the next-session trigger'
 
@@ -261,13 +284,15 @@ PYEOF
 }
 run_state "M-C" 'MUT_C' 'ok    verify exits 1 and says MEASURED 1 device'
 
-# M-D: with lspci absent the TOOL emits a refutation verdict. The checker must
-# reject that -- an unmeasured BAR comparison is not a refutation.
+# M-D: with the BAR measurement withheld the TOOL emits a refutation verdict. The
+# checker must reject that -- an unmeasured BAR comparison is not a refutation. The
+# measurement is withheld deterministically (INTFER_LSPCI_ABSENT=1, set by the
+# checker), so the state no longer depends on this box lacking pciutils.
 MUTATE_FN() {
   python3 - "$SB/gpu_recover.sh" <<'PYEOF'
 import sys
 p = sys.argv[1]; s = open(p).read()
-a = 'DECISIVE TEST NOT MEASURED -- lspci is absent.'
+a = 'DECISIVE TEST NOT MEASURED -- the BAR comparison did not run.'
 b = 'BARs are identical -> the small-BAR theory is REFUTED.  # MUT_D'
 assert s.count(a) == 1, "anchor count %d" % s.count(a)
 open(p, "w").write(s.replace(a, b, 1))
@@ -328,6 +353,7 @@ if [ "$caught" -eq "$total" ]; then
   { echo "stamp=gpu_recover_mutate"
     echo "sha=$(git -C "$ROOT" rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "checker_blob=$CHECK_BLOB"; echo "checker_dirty=$CHECK_DIRTY"
     echo "states=$total"; echo "caught=$caught"; } > "$STAMP/last_pass.stamp"
   exit 0
 fi

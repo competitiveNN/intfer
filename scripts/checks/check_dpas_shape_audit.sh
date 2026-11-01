@@ -184,7 +184,7 @@ print("SHARD_VIOLATIONS=%d" % viol_shard)
 # PREDICATE_DRIFT was structurally 0 and the "predicate re-derived" half of
 # the verdict certified nothing. That was caught by DS-2 in the mutation
 # matrix, not by reading the code.
-pred = os.path.join(root, "scripts", "_dpas_pred.sh")
+pred = os.path.join(root, "scripts", "lib", "_dpas_pred.sh")
 pred_bad = 0
 TN, OP = 16, 32
 def want_eligible(scheme, gs, Nl, K):

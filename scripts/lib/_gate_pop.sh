@@ -59,7 +59,12 @@ known_dirs() {
   # behaviour). Kept deliberately in the strip list alongside the OTHER
   # comment-aware classifiers -- and check_gate_pop.sh's own self-check is where
   # this must stay honest, so it is recorded as its case (f) below.
-  for f in "$sd"/mutate_*.sh; do
+  # THE MATRICES LIVE ONE LEVEL DOWN (scripts/matrices/), and this glob is the
+  # derivation's whole population. MEASURED 2026-10-30: after the 2026-10-21
+  # restructure $sd is scripts/lib, so "$sd"/mutate_*.sh matched NOTHING and every
+  # stamp directory read as UNOWNED -- a leak assertion that fired on a healthy
+  # tree, which is the exact false alarm this file's header exists to prevent.
+  for f in "$sd"/../matrices/mutate_*.sh; do
     sed -e 's/[[:space:]]*#.*$//' "$f" 2>/dev/null
   done | grep -hoE '(WORK|LOG_DIR|STAMP)="[^"]*"' \
     | sed -e 's/^[A-Z_]*="//' -e 's/"$//' \

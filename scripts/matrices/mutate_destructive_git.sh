@@ -127,6 +127,12 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
 fi
 if ! git diff --quiet -- $DIRTY || ! git diff --cached --quiet -- $DIRTY; then
   echo "FAIL: uncommitted changes in: $DIRTY" >&2
+  ndirty=0; for f in $DIRTY; do git diff --quiet -- "$f" 2>/dev/null || ndirty=$((ndirty+1)); done
+  for f in $DIRTY; do
+    if ! git diff --quiet -- "$f" 2>/dev/null; then
+      echo "  INPUT: UNCOMMITTED file=$f blob=$(git hash-object "$f")" >&2
+    fi
+  done
   if [ "${1:-}" = "" ]; then
     echo "  This script edits and restores them; the standing no-commit rule blocks"
     echo "  committing or stashing, so export a CLEAN root instead:" >&2

@@ -91,25 +91,25 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT" || exit 1
 
 TGT=scripts/gate_inventory.sh
-# Second class of target: a GATE rather than the checker. Audit #15's end-to-end
-# proof (seed an unguarded GPU gate, watch the RENDER-NODE column catch it) lived
-# only in a transcript -- the exact defect #13/#14 exist to prevent, one level up
-# from the prose-table problem. M9 below makes it a re-runnable state.
 TGT2=scripts/gates/test_dpas_fold.sh
-LOG_DIR="${INTFER_BUILD_DIR:-$ROOT/build}/gate_inventory_matrix"
-SUMMARY="$LOG_DIR/summary.txt"
+BUILD_DIR="${INTFER_BUILD_DIR:-$ROOT/build}"
+LOG_DIR="$BUILD_DIR/gate_inventory_matrix"
 STAMP="$LOG_DIR/last_pass.stamp"
-
-# --- fail closed on a dirty tree: we are about to `git checkout --` it --------
-if ! git diff --quiet -- "$TGT" "$TGT2" || ! git diff --cached --quiet -- "$TGT" "$TGT2"; then
-  echo "FAIL: $TGT or $TGT2 has uncommitted changes." >&2
-  echo "  This script edits it and restores with 'git checkout --', which would" >&2
-  echo "  DESTROY that work. Commit or stash first, then re-run." >&2
-  exit 1
-fi
-
-# --- ANCHOR PRE-FLIGHT -------------------------------------------------------
-# A mutation harness carries artifact assumptions about the code it mutates, and
+SUMMARY="$LOG_DIR/summary.log"
+# --- opt-in dirty guard (snapshot-based) ---
+GATE_SNAP_ALLOW_DIRTY="${INTFER_MATRIX_ALLOW_DIRTY:-0}"
+. "$SCRIPT_DIR/../lib/_gate_snapshot.sh"
+. "$SCRIPT_DIR/../lib/_gate_state.sh"
+gate_snap_init "$TGT $TGT2" >/dev/null
+export SNAPDIR="$GATE_SNAP_DIR"
+for f in "$TGT" "$TGT2"; do
+  if ! git diff --quiet -- "$f" 2>/dev/null && [ "$GATE_SNAP_ALLOW_DIRTY" != "1" ]; then
+    echo "REFUSAL: DIRTY-TREE scope=targets files=1 reason=in-place-mutation-snapshot-restored" >&2
+    echo "  Set INTFER_MATRIX_ALLOW_DIRTY=1 to run over them." >&2
+    exit 1
+  fi
+  git diff --quiet -- "$f" 2>/dev/null || echo "  INPUT: UNCOMMITTED file=$f blob=$(git hash-object "$f")" >&2
+done
 # a refactor invalidates them silently: the replacement then matches nothing, the
 # file is unchanged, the checker passes, and the state reads AS EXPECTED for the
 # wrong reason. Every target is asserted to occur EXACTLY ONCE up front, so a
@@ -260,23 +260,32 @@ selfcheck() {
 selfcheck || { echo "FAIL: this script's own invariants are broken" >&2; exit 1; }
 anchors_ok || exit 1
 
+# *** WIPE LOCK, OUTSIDE THE TREE IT WIPES (check_matrix_sandbox_locks.sh). ***
+# LOG_DIR is a fixed path wiped below, so two concurrent runs share it. The lock
+# sits beside it under the build root (never inside LOG_DIR) and is taken BEFORE
+# the first wipe. The later restore traps are COMPOSED with the lock release
+# ({restore; rmdir}) instead of replacing it, and the explicit rmdir before the
+# `trap -` disarm keeps the disarm from dropping the EXIT trap without running it.
+LOCK="${INTFER_BUILD_DIR:-$ROOT/build}/.mutate_gate_inventory.lock"
+mkdir -p "${LOCK%/*}" 2>/dev/null || true
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "FAIL: another mutate_gate_inventory.sh is running (lock: $LOCK)" >&2
+  exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 130' INT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 143' TERM
+
 rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR" || exit 1
 : >"$SUMMARY"
 
 restore() {
-  git checkout -- "$TGT" "$TGT2" 2>/dev/null
-  if ! git diff --quiet -- "$TGT" "$TGT2"; then
-    echo "RESTORING: $TGT/$TGT2 were not clean; discarding mutation residue" >&2
-    git checkout -- "$TGT" "$TGT2"
-  fi
+  gate_snap_restore_all "$TGT $TGT2"
 }
-trap 'restore' EXIT
-trap 'restore; exit 130' INT
-trap 'restore; exit 143' TERM
-
-# Replace `old` with `new` in $1, from the patch file $2. Hard-fails unless every
-# `old` occurs exactly once AT THE TIME IT IS APPLIED -- a zero-match or
+trap 'restore; rm -rf "$GATE_SNAP_DIR" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'restore; rm -rf "$GATE_SNAP_DIR" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true; exit 130' INT
+# Replace `old` with `new` in $1, from the patch file $2.
 # multi-match is a stale anchor, not a mutation.
 #
 # MULTIPLE HUNKS. Hunks are separated by a line containing only "@@@" and applied
@@ -359,20 +368,20 @@ run_state() {
   cat >"$pf"
   restore
   if ! patch_once "$TGT" "$pf"; then
-    echo "  $label: PATCH ERROR (target not found exactly once; see above)" | tee -a "$SUMMARY"
+    echo "  $label: PATCH ERROR (target not found exactly once; see above)" | gate_state_record --stdin "$SUMMARY"
     FAILED=$((FAILED + 1)); rm -f "$pf"; return
   fi
   # The mutation must be SYNTACTICALLY VALID, or the checker would fail for the
   # wrong reason and every state would look "caught" for free.
   if ! bash -n "$TGT" 2>"$log"; then
     { echo "  $label: $desc -- MUTATION BROKE SYNTAX"
-      echo "    (scored MISSED: a syntax error is not evidence the mechanism is load-bearing)"; } | tee -a "$SUMMARY"
+      echo "    (scored MISSED: a syntax error is not evidence the mechanism is load-bearing)"; } | gate_state_record --stdin "$SUMMARY"
     FAILED=$((FAILED + 1)); rm -f "$pf"; restore; return
   fi
   # Prove the mutation actually changed the file, so a green state cannot come
   # from a no-op replacement the pre-flight did not catch.
   if git diff --quiet -- "$TGT"; then
-    echo "  $label: $desc -- MUTATION DID NOT CHANGE THE FILE" | tee -a "$SUMMARY"
+    echo "  $label: $desc -- MUTATION DID NOT CHANGE THE FILE" | gate_state_record --stdin "$SUMMARY"
     FAILED=$((FAILED + 1)); rm -f "$pf"; restore; return
   fi
 
@@ -385,13 +394,15 @@ run_state() {
   esac
   NC=$((NC + 1))
   if [ -z "$verdict" ]; then
-    printf '  %-4s rc=%-3s %-16s %-50s AS EXPECTED\n' "$label" "$rc" "$class" "$desc" | tee -a "$SUMMARY"
+    _line="$(printf '  %-4s rc=%-3s %-16s %-50s AS EXPECTED\n' "$label" "$rc" "$class" "$desc")"
   else
-    printf '  %-4s rc=%-3s %-16s %-50s UNEXPECTED: %s\n' "$label" "$rc" "$class" "$desc" "$verdict" | tee -a "$SUMMARY"
+    _line="$(printf '  %-4s rc=%-3s %-16s %-50s UNEXPECTED: %s\n' "$label" "$rc" "$class" "$desc" "$verdict")"
     FAILED=$((FAILED + 1))
   fi
+  printf '%s\n' "$_line"
+  gate_state_record --raw "$SUMMARY" "$_line"
   grep -m1 -E 'SELFCHECK|ANCHOR STALE|doc-tally: SKIPPED|PROBLEM\(S\)' "$log" \
-    | sed 's/^/       > /' | tee -a "$SUMMARY" || true
+    | sed 's/^/       > /' | gate_state_record --stdin "$SUMMARY" || true
   rm -f "$pf"
 }
 
@@ -406,15 +417,15 @@ run_gate_state() {
   cat >"$pf"
   restore
   if ! patch_once "$TGT2" "$pf"; then
-    echo "  $label: PATCH ERROR (target not found exactly once; see above)" | tee -a "$SUMMARY"
+    echo "  $label: PATCH ERROR (target not found exactly once; see above)" | gate_state_record --stdin "$SUMMARY"
     FAILED=$((FAILED + 1)); rm -f "$pf"; return
   fi
   if ! bash -n "$TGT2" 2>"$log"; then
-    echo "  $label: $desc -- MUTATION BROKE SYNTAX (scored MISSED)" | tee -a "$SUMMARY"
+    echo "  $label: $desc -- MUTATION BROKE SYNTAX (scored MISSED)" | gate_state_record --stdin "$SUMMARY"
     FAILED=$((FAILED + 1)); rm -f "$pf"; restore; return
   fi
   if git diff --quiet -- "$TGT2"; then
-    echo "  $label: $desc -- MUTATION DID NOT CHANGE THE FILE" | tee -a "$SUMMARY"
+    echo "  $label: $desc -- MUTATION DID NOT CHANGE THE FILE" | gate_state_record --stdin "$SUMMARY"
     FAILED=$((FAILED + 1)); rm -f "$pf"; restore; return
   fi
   bash "$TGT" >"$log" 2>&1
@@ -426,12 +437,14 @@ run_gate_state() {
   esac
   NC=$((NC + 1))
   if [ -z "$verdict" ]; then
-    printf '  %-4s rc=%-3s %-16s %-50s AS EXPECTED\n' "$label" "$rc" "$class" "$desc" | tee -a "$SUMMARY"
+    _line="$(printf '  %-4s rc=%-3s %-16s %-50s AS EXPECTED\n' "$label" "$rc" "$class" "$desc")"
   else
-    printf '  %-4s rc=%-3s %-16s %-50s UNEXPECTED: %s\n' "$label" "$rc" "$class" "$desc" "$verdict" | tee -a "$SUMMARY"
+    _line="$(printf '  %-4s rc=%-3s %-16s %-50s UNEXPECTED: %s\n' "$label" "$rc" "$class" "$desc" "$verdict")"
     FAILED=$((FAILED + 1))
   fi
-  grep -m1 -E 'NEEDS A GPU BUT HAS NO GUARD|MISSING' "$log" | sed 's/^/       > /' | tee -a "$SUMMARY" || true
+  printf '%s\n' "$_line"
+  gate_state_record --raw "$SUMMARY" "$_line"
+  grep -m1 -E 'NEEDS A GPU BUT HAS NO GUARD|MISSING' "$log" | sed 's/^/       > /' | gate_state_record --stdin "$SUMMARY" || true
   rm -f "$pf"
 }
 
@@ -455,14 +468,14 @@ echo "--- S0 baseline (rc=0, or rc=2 WITH its UNPROVEN diagnostic) ---"
 bash "$TGT" >"$LOG_DIR/S0_clean.log" 2>&1
 s0_rc=$?
 if [ "$s0_rc" -eq 0 ]; then
-  echo "  S0   rc=0  AS EXPECTED (clean tree, 2-GPU box)" | tee -a "$SUMMARY"
+  echo "  S0   rc=0  AS EXPECTED (clean tree, 2-GPU box)" | gate_state_record --stdin "$SUMMARY"
 elif [ "$s0_rc" -eq 2 ] && grep -q 'GATE INVENTORY: UNPROVEN' "$LOG_DIR/S0_clean.log"; then
-  echo "  S0   rc=2  AS EXPECTED (box cannot run the documented configuration;" | tee -a "$SUMMARY"
-  echo "        the UNPROVEN diagnostic is present, so this is a BOX verdict)" | tee -a "$SUMMARY"
+  echo "  S0   rc=2  AS EXPECTED (box cannot run the documented configuration;" | gate_state_record --stdin "$SUMMARY"
+  echo "        the UNPROVEN diagnostic is present, so this is a BOX verdict)" | gate_state_record --stdin "$SUMMARY"
 else
-  echo "  S0   FAILED -- rc=$s0_rc on a clean tree. rc=0 is healthy and rc=2 WITH" | tee -a "$SUMMARY"
-  echo "    the UNPROVEN diagnostic is healthy; anything else means the checker" | tee -a "$SUMMARY"
-  echo "    is broken, and every state below would be scored against it." | tee -a "$SUMMARY"
+  echo "  S0   FAILED -- rc=$s0_rc on a clean tree. rc=0 is healthy and rc=2 WITH" | gate_state_record --stdin "$SUMMARY"
+  echo "    the UNPROVEN diagnostic is healthy; anything else means the checker" | gate_state_record --stdin "$SUMMARY"
+  echo "    is broken, and every state below would be scored against it." | gate_state_record --stdin "$SUMMARY"
   FAILED=$((FAILED + 1))
 fi
 
@@ -550,23 +563,23 @@ rm -rf "$STUB"
 m6class="$(rc_class "$m6rc")"
 if [ "$m6class" = "CAUGHT-skip" ]; then
   printf '  %-4s rc=%-3s %-16s %-50s AS EXPECTED\n' M6 "$m6rc" "$m6class" \
-    "0-GPU box refused with exit 2" | tee -a "$SUMMARY"
+    "0-GPU box refused with exit 2" | gate_state_record --stdin "$SUMMARY"
   NC=$((NC + 1))
 else
   printf '  %-4s rc=%-3s %-16s %-50s UNEXPECTED: soft-skip regression\n' M6 "$m6rc" "$m6class" \
-    "0-GPU box refused with exit 2" | tee -a "$SUMMARY"
-  echo "    a box the checker cannot see must not exit 0" | tee -a "$SUMMARY"
+    "0-GPU box refused with exit 2" | gate_state_record --stdin "$SUMMARY"
+  echo "    a box the checker cannot see must not exit 0" | gate_state_record --stdin "$SUMMARY"
   FAILED=$((FAILED + 1))
 fi
-grep -m1 'doc-tally: SKIPPED' "$LOG_DIR/M6_zero_gpu.log" | sed 's/^/       > /' | tee -a "$SUMMARY" || true
+grep -m1 'doc-tally: SKIPPED' "$LOG_DIR/M6_zero_gpu.log" | sed 's/^/       > /' | gate_state_record --stdin "$SUMMARY" || true
 
 # --- restore and prove the tree survived -----------------------------------
 restore
+rmdir "$LOCK" 2>/dev/null || true
 trap - EXIT INT TERM
 
-echo
-if git diff --quiet -- "$TGT" "$TGT2"; then
-  echo "restore: $TGT and $TGT2 are byte-identical to HEAD"
+if gate_snap_integrity "$TGT $TGT2"; then
+  echo "restore: $TGT and $TGT2 are byte-identical to their startup snapshot"
 else
   echo "FAIL: restore left the tree dirty" >&2; FAILED=$((FAILED + 1))
 fi
@@ -575,15 +588,15 @@ if grep -qE 'ZZZ_NEVER_MATCHES' "$TGT" "$TGT2"; then
 else
   echo "residue: none (no ZZZ_NEVER_MATCHES marker in $TGT/$TGT2)"
 fi
-
-echo
 if [ "$FAILED" = "0" ]; then
+  gate_snap_attest "$STAMP.attestation" >/dev/null 2>&1 || true
   {
     echo "sha=$(git rev-parse HEAD)"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "states=S0,M1,M2,M3,M4,M5,M7,M8,M9,M6"
     echo "caught=$NC/$NC"
   } >"$STAMP" 2>/dev/null
+  cat "$STAMP.attestation" 2>/dev/null >>"$STAMP" || true
   echo "GATE-INVENTORY MUTATION MATRIX: PASS ($NC/$NC mutations refused the checker)"
   emit_summary
   echo "  stamped $(git rev-parse --short HEAD 2>/dev/null) -> $STAMP"

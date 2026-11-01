@@ -40,6 +40,22 @@ SB="$BUILD/dispatch_steps_matrix"
 CHECK="scripts/checks/check_dispatch_steps_consistency.sh"
 T="scripts/run_all_checks.sh"
 CERT="scripts/checks/check_stack_cert.sh"
+# *** SANDBOX LOCK, TAKEN OUTSIDE THE TREE IT WIPES. *** $SB below is a FIXED path
+# and is rm -rf'd at start, so two concurrent invocations share one sandbox: the
+# second empties the first's temp root mid-state and the first then grades a state
+# against a corpus the other just restored (MEASURED 2026-10-21). The lock lives
+# under $BUILD, OUTSIDE $SB, and is taken BEFORE the wipe. Derived from source by
+# check_matrix_sandbox_locks.sh.
+LOCK="$BUILD/.mutate_dispatch_steps_consistency.lock"
+mkdir -p "$BUILD" 2>/dev/null || true
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "FAIL: another .mutate_dispatch_steps_consistency.lock is running (lock: $LOCK)" >&2
+  exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 130' INT
+trap 'rmdir "$LOCK" 2>/dev/null || true; exit 143' TERM
+
 
 mkdir -p "$SB" || exit 2
 rm -rf "$SB"; mkdir -p "$SB"

@@ -41,6 +41,24 @@ LOG="$STAMP/states"
 [ -f "$CHECK" ] && [ -f "$HELPER" ] || { echo "SKIP: target missing"; exit 2; }
 mkdir -p "$LOG"; : > "$LOG/summary.txt"
 
+# *** SANDBOX LOCK, TAKEN OUTSIDE THE TREE IT WIPES. *** $SB below is a FIXED path
+# and is rm -rf'd at start, so two concurrent invocations share one sandbox and one
+# empties the other's mid-state (MEASURED 2026-10-21). $LOCK lives under $STAMP,
+# OUTSIDE $SB, and is taken BEFORE the wipe; the rmdir is folded into the existing
+# EXIT/INT/TERM handlers below so it composes with them instead of clobbering them.
+LOCK="$STAMP/.mutate_gate_enum.lock"
+mkdir -p "$STAMP" 2>/dev/null || true
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "FAIL: another .mutate_gate_enum.lock is running (lock: $LOCK)" >&2
+  exit 1
+fi
+# Installed IMMEDIATELY after the lock, before any early exit below can fire --
+# a trap installed after a `exit 2` check leaves the lock behind on that path.
+# ${SB:-} because an exit between here and the SB assignment must not trip `set -u`.
+trap 'rmdir "$LOCK" 2>/dev/null || true; rm -rf "${SB:-}"' EXIT
+trap 'rmdir "$LOCK" 2>/dev/null || true; rm -rf "${SB:-}"; exit 130' INT
+trap 'rmdir "$LOCK" 2>/dev/null || true; rm -rf "${SB:-}"; exit 143' TERM
+
 # Fixture work happens in a SANDBOX copy under $STAMP, never in scripts/ --
 # a mutated copy left in scripts/ would be picked up by every later glob that
 # scans that directory, including gate_inventory.sh's. AUDIT #17c's leak class,
@@ -57,9 +75,6 @@ CA="$(cd "$(dirname "$CHECK")" && pwd)"
 
 git -C "$ROOT" diff --quiet -- scripts/checks/check_gate_enum.sh scripts/lib/_gate_enum.sh 2>/dev/null || {
   echo "FAIL: targets are dirty; this matrix edits copies of them."; exit 2; }
-trap 'rm -rf "$SB"' EXIT
-trap 'rm -rf "$SB"; exit 130' INT
-trap 'rm -rf "$SB"; exit 143' TERM
 
 restore() { cp "$ORIG" "$CHECK"; }
 

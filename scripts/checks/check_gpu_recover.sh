@@ -35,8 +35,8 @@ trap 'rm -rf "$WORK"; exit 143' TERM
 
 bad=0
 mk_stub() { # $1 = body of the fake probe
-  rm -rf "$WORK/root"; mkdir -p "$WORK/root/scripts"
-  cp "$SCRIPT_DIR/gpu_recover.sh" "$WORK/root/scripts/"
+  rm -rf "$WORK/root"; mkdir -p "$WORK/root/scripts/l0"
+  cp "$SCRIPT_DIR/../gpu_recover.sh" "$WORK/root/scripts/"
   { echo '#!/usr/bin/env bash'; echo 'cat <<"STUBEOF"'; printf '%s\n' "$1"; echo 'STUBEOF'; } \
     > "$WORK/root/scripts/l0/l0_enumerate.sh"
   chmod +x "$WORK/root/scripts/l0/l0_enumerate.sh"
@@ -103,7 +103,7 @@ fi
 
 # rebind must refuse without root, and must not touch /sys
 echo "-- rebind refuses without root --"
-o="$("$SCRIPT_DIR/gpu_recover.sh" rebind 2>&1)"; rc=$?
+o="$("$SCRIPT_DIR/../gpu_recover.sh" rebind 2>&1)"; rc=$?
 if [ "$rc" -eq 3 ] && printf '%s' "$o" | grep -q 'needs root'; then
   echo "  ok    exit 3, and it said so"
 else
@@ -113,17 +113,17 @@ fi
 
 # the decisive BAR test must be marked NOT MEASURED when lspci is absent
 echo "-- diag marks the decisive BAR test when lspci is absent --"
-if command -v lspci >/dev/null 2>&1; then
-  echo "  skip lspci IS installed here; this case cannot be exercised"
+# *** FORCED, NOT OBSERVED. *** This case used to skip on any box with pciutils
+# installed, so the rule was unproven exactly where it is meant to hold, and its
+# mutation matrix could not catch the planted defect (M-D MISSED, MEASURED
+# 2026-10-30). INTFER_LSPCI_ABSENT makes the direction an input, not a box property.
+o="$(INTFER_LSPCI_ABSENT=1 "$SCRIPT_DIR/../gpu_recover.sh" diag 2>&1)"
+if printf '%s' "$o" | grep -q 'DECISIVE TEST NOT MEASURED' \
+   && printf '%s' "$o" | grep -q 'UNTESTED, not refuted'; then
+  echo "  ok    diag refuses to certify a refutation it did not measure"
 else
-  o="$("$SCRIPT_DIR/gpu_recover.sh" diag 2>&1)"
-  if printf '%s' "$o" | grep -q 'DECISIVE TEST NOT MEASURED' \
-     && printf '%s' "$o" | grep -q 'UNTESTED, not refuted'; then
-    echo "  ok    diag refuses to certify a refutation it did not measure"
-  else
-    echo "  FAIL  diag did not mark the decisive test as unmeasured"
-    bad=$((bad+1))
-  fi
+  echo "  FAIL  diag did not mark the decisive test as unmeasured"
+  bad=$((bad+1))
 fi
 
 # (e) THE RENDER-NODE ENUMERATION MUST BE BY PCI SLOT. MEASURED 2026-10-03: the
@@ -142,7 +142,7 @@ mk_dri() { # $1 = "slot:minor" pairs, space separated
     ln -s "../renderD$minor" "$DRI/by-path/pci-$slot-render"
   done
 }
-sec2() { INTFER_DRI_ROOT="$DRI" "$SCRIPT_DIR/gpu_recover.sh" diag 2>&1 \
+sec2() { INTFER_DRI_ROOT="$DRI" "$SCRIPT_DIR/../gpu_recover.sh" diag 2>&1 \
            | sed -n '/-- 2\./,/-- 3\./p'; }
 mk_dri '0000:04:00.0:128 0000:86:00.0:130'
 o="$(sec2)"

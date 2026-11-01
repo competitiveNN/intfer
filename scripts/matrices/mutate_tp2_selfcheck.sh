@@ -33,7 +33,7 @@ set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-TARGET="$SCRIPT_DIR/test_tp2_27b.sh"
+TARGET="$ROOT/scripts/gates/test_tp2_27b.sh"
 # *** DECLARED IN THE SHAPE scripts/lib/_gate_pop.sh's DERIVATION READS. *** MEASURED:
 # writing this as BUILD="${INTFER_BUILD_DIR:-$ROOT/build}/tp2_selfcheck_mutate"
 # plus STAMP="$BUILD/last_pass.stamp" made pop_assert_no_leak report this matrix's
